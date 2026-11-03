@@ -87,6 +87,7 @@ On GitHub, the Benchmark workflow runs the full suite on Linux, Windows and macO
 ## Reading the numbers
 
 - **Results move with the device and the OS.** A force on a consumer NVMe drive costs about a millisecond on Windows and less on Linux, and macOS issues `F_FULLFSYNC`. Compare engines within one machine.
+- **JMH adds the secondary counters up over the measurement iterations.** In JMH's own output and JSON, `bytesWritten`, `payloadBytes`, `sizeOnDisk`, `heapBytes` and `residentBytes` are the sum of the iterations; the workflow summaries divide them back to their value per iteration.
 - **`bytesWritten` is not measured the same way on each OS.** On Windows and Linux it counts the bytes passed to write calls; on macOS, the bytes written to disk. See `support.ProcessProbe`.
 - **`ReopenBenchmark` measures a warm start.** The files it opens were just copied, so they are in the OS page cache.
 - **LMDB's `sizeOnDisk` counts the pages in use.** On Windows, LMDB 0.9 creates its data file at the full map size, which the adapter sets to twice the data a workload expects.
