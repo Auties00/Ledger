@@ -140,12 +140,15 @@ class DurableLedgerTest {
         void rollover(@TempDir Path directory) throws Exception {
             var value = "v".repeat(300);
             var large = "L".repeat(40_000);
-            try (var ledger = small(directory)) {
+            var writing = small(directory);
+            try {
                 for (var i = 0; i < 100; i++) {
-                    ledger.commit(ledger.newBatch().put(NAMES, "k%03d".formatted(i), value)).awaitDurable();
+                    writing.commit(writing.newBatch().put(NAMES, "k%03d".formatted(i), value)).awaitDurable();
                 }
-                ledger.commit(ledger.newBatch().put(NAMES, "large", large)).awaitDurable();
-                ledger.commit(ledger.newBatch().deleteRange(NAMES, KeyRange.between("k000", "k050"))).awaitDurable();
+                writing.commit(writing.newBatch().put(NAMES, "large", large)).awaitDurable();
+                writing.commit(writing.newBatch().deleteRange(NAMES, KeyRange.between("k000", "k050"))).awaitDurable();
+            } finally {
+                crash(writing);
             }
             var count = segments(directory).size();
             assertTrue(count > 10, () -> count + " segments");
@@ -205,13 +208,16 @@ class DurableLedgerTest {
         /// then, if `next`, commits once more into the same segment.
         private static long loneCommit(Path directory, int length, boolean next) throws Exception {
             open(directory, NAMES).close();
-            try (var ledger = open(directory, NAMES)) {
+            var ledger = open(directory, NAMES);
+            try {
                 ledger.commit(ledger.newBatch().put(NAMES, "lone", "x".repeat(length))).awaitDurable();
                 var size = Files.size(segments(directory).getLast());
                 if (next) {
                     ledger.commit(ledger.newBatch().put(NAMES, "after", "next")).awaitDurable();
                 }
                 return size;
+            } finally {
+                crash(ledger);
             }
         }
     }
@@ -312,9 +318,12 @@ class DurableLedgerTest {
         @Test
         @DisplayName("a torn tail is dropped and the store goes on after it")
         void tornTail(@TempDir Path directory) throws IOException {
-            try (var ledger = open(directory, NAMES)) {
-                ledger.commit(ledger.newBatch().put(NAMES, "a", "1"));
-                ledger.commit(ledger.newBatch().put(NAMES, "b", "2"));
+            var crashed = open(directory, NAMES);
+            try {
+                crashed.commit(crashed.newBatch().put(NAMES, "a", "1"));
+                crashed.commit(crashed.newBatch().put(NAMES, "b", "2"));
+            } finally {
+                crash(crashed);
             }
             var segment = segments(directory).getLast();
             // A crash in the middle of the last frame: cut it short, then leave garbage after it
@@ -336,9 +345,12 @@ class DurableLedgerTest {
         @Test
         @DisplayName("damage before data written after a later force is refused, not dropped")
         void damageBeforeLaterGroup(@TempDir Path directory) throws Exception {
-            try (var ledger = open(directory, NAMES)) {
-                ledger.commit(ledger.newBatch().put(NAMES, "a", "1")).awaitDurable();
-                ledger.commit(ledger.newBatch().put(NAMES, "b", "2")).awaitDurable();
+            var crashed = open(directory, NAMES);
+            try {
+                crashed.commit(crashed.newBatch().put(NAMES, "a", "1")).awaitDurable();
+                crashed.commit(crashed.newBatch().put(NAMES, "b", "2")).awaitDurable();
+            } finally {
+                crash(crashed);
             }
             var segment = segments(directory).getLast();
             var bytes = Files.readAllBytes(segment);
@@ -353,11 +365,17 @@ class DurableLedgerTest {
         void foreignSegment(@TempDir Path base) throws IOException {
             var first = base.resolve("first");
             var second = base.resolve("second");
-            try (var ledger = open(first, NAMES)) {
-                ledger.commit(ledger.newBatch().put(NAMES, "a", "1"));
+            var crashed = open(first, NAMES);
+            try {
+                crashed.commit(crashed.newBatch().put(NAMES, "a", "1"));
+            } finally {
+                crash(crashed);
             }
-            try (var ledger = open(second, NAMES)) {
-                ledger.commit(ledger.newBatch().put(NAMES, "b", "2"));
+            var other = open(second, NAMES);
+            try {
+                other.commit(other.newBatch().put(NAMES, "b", "2"));
+            } finally {
+                crash(other);
             }
             // The second store's segment, renamed to the one the first store's next open would write
             Files.copy(segments(second).getFirst(), first.resolve("log").resolve(LogWriter.segmentName(2)));
@@ -367,8 +385,11 @@ class DurableLedgerTest {
         @Test
         @DisplayName("a segment cut short in its header is a crash while it was created, and is replaced")
         void tornCreation(@TempDir Path directory) throws IOException {
-            try (var ledger = open(directory, NAMES)) {
-                ledger.commit(ledger.newBatch().put(NAMES, "a", "1"));
+            var crashed = open(directory, NAMES);
+            try {
+                crashed.commit(crashed.newBatch().put(NAMES, "a", "1"));
+            } finally {
+                crash(crashed);
             }
             var torn = directory.resolve("log").resolve(LogWriter.segmentName(2));
             Files.write(torn, Arrays.copyOf(Files.readAllBytes(segments(directory).getFirst()), LogWriter.SEGMENT_HEADER / 2));
@@ -384,8 +405,11 @@ class DurableLedgerTest {
         @Test
         @DisplayName("a damaged header before written frames is refused, not deleted")
         void damagedHeader(@TempDir Path directory) throws IOException {
-            try (var ledger = open(directory, NAMES)) {
-                ledger.commit(ledger.newBatch().put(NAMES, "a", "1"));
+            var crashed = open(directory, NAMES);
+            try {
+                crashed.commit(crashed.newBatch().put(NAMES, "a", "1"));
+            } finally {
+                crash(crashed);
             }
             var segment = segments(directory).getLast();
             var bytes = Files.readAllBytes(segment);
@@ -394,6 +418,11 @@ class DurableLedgerTest {
             assertThrows(LedgerCorruptedException.class, () -> open(directory, NAMES));
             assertTrue(Files.exists(segment));
         }
+    }
+
+    /// Stops `ledger` as a process would once its commits are durable, leaving the log for the next open to replay.
+    private static void crash(Ledger ledger) {
+        ((LiveLedger) ledger).closeWithoutCheckpoint();
     }
 
     private static boolean contains(Path directory, String marker) throws IOException {

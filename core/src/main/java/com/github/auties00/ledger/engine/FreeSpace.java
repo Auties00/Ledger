@@ -1,0 +1,159 @@
+package com.github.auties00.ledger.engine;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.List;
+
+/// The pages of the data file a checkpoint may write.
+///
+/// A page is free when no durable state uses it and no reader may read it. A checkpoint frees the pages of the units
+/// its tree replaces, but readers that started before it was published may still read them through the tree they
+/// pinned, so those pages wait in a pending list stamped with the sequence the store had when the checkpoint was
+/// published, until every reader is past it ([#releasePassed(long)]). Pages a checkpoint took and then gave up never
+/// reached a durable state, and are free at once.
+///
+/// It is safe for concurrent use: the writer releases pages while a checkpoint takes them.
+final class FreeSpace {
+    private final Object lock;
+    private final BitSet free;
+    private int pageCount;
+    private final ArrayDeque<Pending> pending;
+
+    /// Creates the free space of a file of `pageCount` pages whose free pages are the set bits of `free`.
+    FreeSpace(int pageCount, BitSet free) {
+        this.lock = new Object();
+        this.free = free;
+        this.pageCount = pageCount;
+        this.pending = new ArrayDeque<>();
+    }
+
+    /// {@return the first page of a run of `pages` free pages, which are no longer free}
+    ///
+    /// It takes the first run that fits, or the pages past the end of the file.
+    int allocate(int pages) {
+        synchronized (lock) {
+            var start = free.nextSetBit(PageFormat.FIRST_UNIT_PAGE);
+            while (start >= 0 && start < pageCount) {
+                var end = Math.min(free.nextClearBit(start), pageCount);
+                if (end - start >= pages) {
+                    free.clear(start, start + pages);
+                    return start;
+                }
+                if (end == pageCount) {
+                    // The last run reaches the end of the file: grow it
+                    free.clear(start, end);
+                    pageCount = start + pages;
+                    return start;
+                }
+                start = free.nextSetBit(end);
+            }
+            var page = pageCount;
+            pageCount += pages;
+            return page;
+        }
+    }
+
+    /// Makes the `pages` pages from `page` free at once.
+    void release(int page, int pages) {
+        synchronized (lock) {
+            free.set(page, page + pages);
+        }
+    }
+
+    /// Frees `units` once every reader is past `published`.
+    void pend(long published, List<PageRef> units) {
+        if (units.isEmpty()) {
+            return;
+        }
+        synchronized (lock) {
+            pending.add(new Pending(published, units));
+        }
+    }
+
+    /// Frees the pending pages of every checkpoint published at a sequence below `oldestReader`.
+    ///
+    /// @param oldestReader the lowest sequence a reader reads at, or [Long#MAX_VALUE] if none is reading
+    void releasePassed(long oldestReader) {
+        synchronized (lock) {
+            while (!pending.isEmpty() && pending.peekFirst().published() < oldestReader) {
+                for (var unit : pending.pollFirst().units()) {
+                    free.set(unit.page(), unit.page() + unit.pages());
+                }
+            }
+        }
+    }
+
+    /// {@return the pages of the file in use, those past it being free}
+    int pageCount() {
+        synchronized (lock) {
+            return pageCount;
+        }
+    }
+
+    /// Ends the file before its trailing free pages.
+    ///
+    /// @return the new page count, or -1 if the file ends with a page in use
+    int trim() {
+        synchronized (lock) {
+            var last = free.previousClearBit(pageCount - 1);
+            var end = Math.max(PageFormat.FIRST_UNIT_PAGE, last + 1);
+            if (end >= pageCount) {
+                return -1;
+            }
+            free.clear(end, pageCount);
+            pageCount = end;
+            return end;
+        }
+    }
+
+    /// {@return the runs of pages a store reopened at the checkpoint being written may use, as pairs of first page and
+    /// length: the free pages, the pending ones and `alsoFree`, since a reopened store has no reader}
+    ///
+    /// @param alsoFree units the checkpoint frees
+    List<int[]> durableRuns(List<PageRef> alsoFree) {
+        synchronized (lock) {
+            var all = (BitSet) free.clone();
+            for (var waiting : pending) {
+                for (var unit : waiting.units()) {
+                    all.set(unit.page(), unit.page() + unit.pages());
+                }
+            }
+            for (var unit : alsoFree) {
+                all.set(unit.page(), unit.page() + unit.pages());
+            }
+            var runs = new ArrayList<int[]>();
+            var start = all.nextSetBit(PageFormat.FIRST_UNIT_PAGE);
+            while (start >= 0 && start < pageCount) {
+                var end = Math.min(all.nextClearBit(start), pageCount);
+                runs.add(new int[]{start, end - start});
+                start = all.nextSetBit(end);
+            }
+            return runs;
+        }
+    }
+
+    /// {@return whether `page` is free or pending, for tests}
+    boolean isUnused(int page) {
+        synchronized (lock) {
+            if (free.get(page) || page >= pageCount) {
+                return true;
+            }
+            for (var waiting : pending) {
+                for (var unit : waiting.units()) {
+                    if (page >= unit.page() && page < unit.page() + unit.pages()) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+    }
+
+    /// Pages a published checkpoint freed, waiting for the readers of the tree before it.
+    ///
+    /// @param published the latest sequence when the checkpoint was published
+    /// @param units the units it freed
+    private record Pending(long published, List<PageRef> units) {
+    }
+}

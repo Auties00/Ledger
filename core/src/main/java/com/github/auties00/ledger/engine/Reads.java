@@ -7,16 +7,21 @@ import com.github.auties00.ledger.Keyspace;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
 
-/// The reads of [com.github.auties00.ledger.View], over the entries a reader with a given bound sees.
+/// The reads of [com.github.auties00.ledger.View], over the entries a [ReadPoint] sees: the versions in memory up
+/// to its bound, over the tree of its checkpoint.
 ///
 /// A stamp is a commit sequence shifted left by [#OP_BITS], plus the position of the write in its batch: later writes
 /// of one batch override earlier ones, range removals included. A reader at sequence `s` reads with bound
 /// [#boundOf(long)] of `s`, which takes in every write of every commit up to `s`.
+///
+/// A key with a version in memory at or below the bound reads that version; any other key reads the tree, unless a
+/// range removal stamped after the tree's checkpoint and within the bound covers it.
 final class Reads {
     /// The bits of a stamp that number the writes of one batch.
     static final int OP_BITS = 24;
@@ -37,82 +42,229 @@ final class Reads {
     }
 
     @SuppressWarnings("unchecked")
-    private static <V> V value(KeyspaceState state, Keyspace<?, V> keyspace, Version version) {
-        return state.resident ? (V) version.decoded : keyspace.values().decode(version.value);
+    private static <V> V value(KeyspaceState state, Keyspace<?, V> keyspace, MemorySegment value, Object decoded) {
+        return state.resident ? (V) decoded : keyspace.values().decode(value);
     }
 
-    static <K, V> Optional<V> get(KeyspaceState state, Keyspace<K, V> keyspace, K key, long bound) {
+    /// {@return whether a range removal the tree of `point` does not hold, and `point` sees, covers `key`}
+    static boolean hiddenSinceTree(MemorySegment key, ReadPoint point, RangeRemoval[] removals) {
+        var treeBound = point.treeBound();
+        for (var removal : removals) {
+            if (removal.stamp() > treeBound && removal.stamp() <= point.bound() && removal.covers(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// {@return the value of `key` in the tree of `point`, or `null` if it holds none or a later removal hides it}
+    private static MemorySegment treeValue(KeyspaceState state, MemorySegment key, ReadPoint point, RangeRemoval[] removals) {
+        var root = point.root(state);
+        if (root == null) {
+            return null;
+        }
+        var hit = TreeSearch.find(point.pages(), root, key);
+        if (hit == null || hiddenSinceTree(key, point, removals)) {
+            return null;
+        }
+        return TreeSearch.value(point.pages(), hit.unit(), hit.entry());
+    }
+
+    /// {@return whether the tree of `point` holds `key` and no later removal `point` sees hides it}
+    static boolean inTree(KeyspaceState state, MemorySegment key, ReadPoint point, RangeRemoval[] removals) {
+        var root = point.root(state);
+        return root != null && TreeSearch.find(point.pages(), root, key) != null && !hiddenSinceTree(key, point, removals);
+    }
+
+    /// {@return whether `point` sees `key`}
+    static boolean exists(KeyspaceState state, MemorySegment key, ReadPoint point) {
+        var removals = state.removals;
+        var version = KeyspaceState.resolve(state.entries.get(key), key, point.bound(), removals);
+        if (version != null) {
+            return version != Version.HIDDEN;
+        }
+        return inTree(state, key, point, removals);
+    }
+
+    /// {@return the entries `point` sees from `from`, included, to `to`, excluded, either `null` for no bound}
+    ///
+    /// It reads the tree's nodes on the paths to the bounds, and looks up in the tree each key of the range that has a
+    /// version in memory.
+    static long count(KeyspaceState state, MemorySegment from, MemorySegment to, ReadPoint point) {
+        var removals = state.removals;
+        var root = point.root(state);
+        var total = 0L;
+        for (var entry : state.slice(from, to).entrySet()) {
+            var version = KeyspaceState.resolve(entry.getValue(), entry.getKey(), point.bound(), removals);
+            if (version == null) {
+                // Counted with the tree
+                continue;
+            }
+            var counted = root != null && inTree(state, entry.getKey(), point, removals);
+            total += (version == Version.HIDDEN ? 0 : 1) - (counted ? 1 : 0);
+        }
+        if (root == null) {
+            return total;
+        }
+        total += TreeSearch.count(point.pages(), root, from, to);
+        var hidden = new ArrayList<TreeUpdate.Range>();
+        var treeBound = point.treeBound();
+        for (var removal : removals) {
+            if (removal.stamp() > treeBound && removal.stamp() <= point.bound()) {
+                hidden.add(new TreeUpdate.Range(removal.from(), removal.to()));
+            }
+        }
+        for (var range : TreeUpdate.merge(hidden)) {
+            var low = from == null ? range.from() : range.from() == null || Segments.compare(range.from(), from) < 0 ? from : range.from();
+            var high = to == null ? range.to() : range.to() == null || Segments.compare(range.to(), to) > 0 ? to : range.to();
+            if (low == null || high == null || Segments.compare(low, high) < 0) {
+                total -= TreeSearch.count(point.pages(), root, low, high);
+            }
+        }
+        return total;
+    }
+
+    static <K, V> Optional<V> get(KeyspaceState state, Keyspace<K, V> keyspace, K key, ReadPoint point) {
         var encoded = Segments.encodeKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
-        var version = KeyspaceState.visible(state.entries.get(encoded), encoded, bound, state.removals);
-        return version == null ? Optional.empty() : Optional.of(value(state, keyspace, version));
+        var removals = state.removals;
+        var version = KeyspaceState.resolve(state.entries.get(encoded), encoded, point.bound(), removals);
+        if (version != null) {
+            return version == Version.HIDDEN ? Optional.empty() : Optional.of(value(state, keyspace, version.value, version.decoded));
+        }
+        var value = treeValue(state, encoded, point, removals);
+        return value == null ? Optional.empty() : Optional.of(keyspace.values().decode(value));
     }
 
-    static <K, V> List<Entry<K, V>> range(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, int limit, long bound) {
+    static <K, V> List<Entry<K, V>> range(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, int limit, ReadPoint point) {
         if (limit < 1) {
             throw new IllegalArgumentException("limit must be positive: " + limit);
         }
         var entries = new ArrayList<Entry<K, V>>(Math.min(limit, 64));
-        scan(state, keyspace, range, bound, (key, version) -> {
-            entries.add(new Entry<>(keyspace.keys().decode(key), value(state, keyspace, version)));
+        scan(state, keyspace, range, point, (key, value, decoded) -> {
+            entries.add(new Entry<>(keyspace.keys().decode(key), value(state, keyspace, value, decoded)));
             return entries.size() < limit;
         });
         return entries;
     }
 
-    static <K, V> long forEach(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, long bound,
+    static <K, V> long forEach(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, ReadPoint point,
                                BiPredicate<? super K, ? super V> visitor) {
         Objects.requireNonNull(visitor, "visitor");
-        return scan(state, keyspace, range, bound, (key, version) ->
-                visitor.test(keyspace.keys().decode(key), value(state, keyspace, version)));
+        return scan(state, keyspace, range, point, (key, value, decoded) ->
+                visitor.test(keyspace.keys().decode(key), value(state, keyspace, value, decoded)));
     }
 
-    static <K, V> Optional<Entry<K, V>> first(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, long bound) {
-        var found = range(state, keyspace, range, 1, bound);
+    static <K, V> Optional<Entry<K, V>> first(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, ReadPoint point) {
+        var found = range(state, keyspace, range, 1, point);
         return found.isEmpty() ? Optional.empty() : Optional.of(found.getFirst());
     }
 
-    static <K, R> Optional<R> readEncoded(KeyspaceState state, Keyspace<K, ?> keyspace, K key, long bound,
+    static <K, R> Optional<R> readEncoded(KeyspaceState state, Keyspace<K, ?> keyspace, K key, ReadPoint point,
                                           Function<? super MemorySegment, ? extends R> reader) {
         Objects.requireNonNull(reader, "reader");
         var encoded = Segments.encodeKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
-        var version = KeyspaceState.visible(state.entries.get(encoded), encoded, bound, state.removals);
-        return version == null ? Optional.empty() : Optional.of(Objects.requireNonNull(reader.apply(version.value), "reader returned null"));
+        var removals = state.removals;
+        var version = KeyspaceState.resolve(state.entries.get(encoded), encoded, point.bound(), removals);
+        MemorySegment value;
+        if (version != null) {
+            if (version == Version.HIDDEN) {
+                return Optional.empty();
+            }
+            value = version.value;
+        } else {
+            value = treeValue(state, encoded, point, removals);
+            if (value == null) {
+                return Optional.empty();
+            }
+        }
+        return Optional.of(Objects.requireNonNull(reader.apply(value), "reader returned null"));
     }
 
-    static <K> long forEachEncoded(KeyspaceState state, Keyspace<K, ?> keyspace, KeyRange<K> range, long bound,
+    static <K> long forEachEncoded(KeyspaceState state, Keyspace<K, ?> keyspace, KeyRange<K> range, ReadPoint point,
                                    BiPredicate<? super MemorySegment, ? super MemorySegment> visitor) {
         Objects.requireNonNull(visitor, "visitor");
-        return scan(state, keyspace, range, bound, (key, version) -> visitor.test(key, version.value));
+        return scan(state, keyspace, range, point, (key, value, _) -> visitor.test(key, value));
     }
 
-    /// Passes the entries of `range` a reader with `bound` sees to `consumer`, in the order of the range, until it
-    /// returns `false`.
+    /// Passes the entries of `range` `point` sees to `consumer`, in the order of the range, until it returns `false`.
+    ///
+    /// It merges the versions in memory with the tree: a key with a version in memory at or below the bound takes it,
+    /// and shadows the tree's entry for the same key.
     ///
     /// @return the number of entries passed
-    static <K> long scan(KeyspaceState state, Keyspace<K, ?> keyspace, KeyRange<K> range, long bound, Visitor consumer) {
+    static <K> long scan(KeyspaceState state, Keyspace<K, ?> keyspace, KeyRange<K> range, ReadPoint point, Visitor consumer) {
         Objects.requireNonNull(range, "range");
         var from = range.from().map(key -> Segments.encodeKey(keyspace.keys(), key)).orElse(null);
         var to = range.to().map(key -> Segments.encodeKey(keyspace.keys(), key)).orElse(null);
+        if (from != null && to != null && Segments.compare(from, to) >= 0) {
+            return 0;
+        }
+        var descending = range.descending();
         var removals = state.removals;
         var slice = state.slice(from, to);
-        var ordered = range.descending() ? slice.descendingMap() : slice;
+        var memory = (descending ? slice.descendingMap() : slice).entrySet().iterator();
+        var root = point.root(state);
+        var tree = root == null ? null : new TreeCursor(point.pages(), root, from, to, descending);
+        var inTree = tree != null && tree.next();
+        Map.Entry<MemorySegment, Version> held = memory.hasNext() ? memory.next() : null;
         var visited = 0L;
-        for (var entry : ordered.entrySet()) {
-            var version = KeyspaceState.visible(entry.getValue(), entry.getKey(), bound, removals);
-            if (version == null) {
-                continue;
+        while (held != null || inTree) {
+            int order;
+            if (held == null) {
+                order = 1;
+            } else if (!inTree) {
+                order = -1;
+            } else {
+                // Where the key in memory sorts against the tree's, in the order of the scan
+                order = -tree.compareKey(held.getKey());
+                if (descending) {
+                    order = -order;
+                }
             }
-            visited++;
-            if (!consumer.visit(entry.getKey(), version)) {
-                break;
+            if (order <= 0) {
+                var key = held.getKey();
+                var version = KeyspaceState.resolve(held.getValue(), key, point.bound(), removals);
+                MemorySegment value = null;
+                Object decoded = null;
+                if (version != null && version != Version.HIDDEN) {
+                    value = version.value;
+                    decoded = version.decoded;
+                } else if (version == null && order == 0 && !hiddenSinceTree(key, point, removals)) {
+                    value = tree.value();
+                }
+                if (order == 0) {
+                    inTree = tree.next();
+                }
+                held = memory.hasNext() ? memory.next() : null;
+                if (value != null) {
+                    visited++;
+                    if (!consumer.visit(key, value, decoded)) {
+                        break;
+                    }
+                }
+            } else {
+                var key = tree.key();
+                if (!hiddenSinceTree(key, point, removals)) {
+                    visited++;
+                    if (!consumer.visit(key, tree.value(), null)) {
+                        break;
+                    }
+                }
+                inTree = tree.next();
             }
         }
         return visited;
     }
 
-    /// Receives the entries of a scan, as encoded keys and their visible versions.
+    /// Receives the entries of a scan.
     @FunctionalInterface
     interface Visitor {
-        boolean visit(MemorySegment key, Version version);
+        /// Receives an entry.
+        ///
+        /// @param key the encoded key, read-only
+        /// @param value the encoded value, read-only
+        /// @param decoded the decoded value of a resident key space, or `null`
+        /// @return whether to go on
+        boolean visit(MemorySegment key, MemorySegment value, Object decoded);
     }
 }

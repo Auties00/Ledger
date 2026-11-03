@@ -2,10 +2,10 @@ package com.github.auties00.ledger;
 
 import com.github.auties00.ledger.engine.PlatformIoPool;
 
-/// The platform threads that write, force and checkpoint the files of one or more stores.
+/// The platform threads that write and force the logs of one or more stores.
 ///
-/// Stores do their I/O on platform threads so a force never holds the carrier of a virtual thread, and so an
-/// interrupted caller never interrupts an I/O call midway, which would close the file under every other caller.
+/// Stores write and force their logs on platform threads so a force never holds the carrier of a virtual thread, and
+/// so an interrupted caller never interrupts a write midway, which would close the log under every other caller.
 /// Several stores of one application can share a pool: a process holding many small stores needs a few threads,
 /// not a few per store.
 public sealed interface IoPool extends AutoCloseable permits PlatformIoPool {

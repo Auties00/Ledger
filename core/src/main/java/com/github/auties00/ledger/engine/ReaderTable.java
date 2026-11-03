@@ -91,6 +91,26 @@ final class ReaderTable {
         }
     }
 
+    /// {@return the lowest sequence a read or snapshot is reading at, or [Long#MAX_VALUE] if none is}
+    ///
+    /// Unlike [#active()], it counts reads at the latest sequence: they may have pinned the tree published before it.
+    /// Only the writer calls it, holding the writer lock.
+    long oldest() {
+        var oldest = Long.MAX_VALUE;
+        for (var slot = 0; slot <= mask; slot++) {
+            var value = slots.get(slot);
+            if (value != 0) {
+                oldest = Math.min(oldest, value - 1);
+            }
+        }
+        synchronized (registryLock) {
+            if (!registry.isEmpty()) {
+                oldest = Math.min(oldest, registry.firstKey());
+            }
+        }
+        return oldest;
+    }
+
     /// {@return every sequence a read or snapshot may be reading at, distinct, highest first; the first is the latest}
     ///
     /// Only the writer calls it, holding the writer lock, so the latest sequence does not change during the call.

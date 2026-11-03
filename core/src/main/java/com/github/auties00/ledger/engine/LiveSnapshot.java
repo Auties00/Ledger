@@ -16,13 +16,14 @@ import java.util.function.Function;
 final class LiveSnapshot implements Snapshot {
     private final LiveLedger ledger;
     private final long sequence;
-    private final long bound;
+    private final ReadPoint point;
     private final AtomicBoolean closed;
 
+    /// Creates the snapshot of a registration at `sequence`, made before this call so its tree stays pinned.
     LiveSnapshot(LiveLedger ledger, long sequence) {
         this.ledger = ledger;
         this.sequence = sequence;
-        this.bound = Reads.boundOf(sequence);
+        this.point = ledger.point(sequence);
         this.closed = new AtomicBoolean();
     }
 
@@ -41,33 +42,33 @@ final class LiveSnapshot implements Snapshot {
 
     @Override
     public <K, V> Optional<V> get(Keyspace<K, V> keyspace, K key) {
-        return Reads.get(state(keyspace), keyspace, key, bound);
+        return Reads.get(state(keyspace), keyspace, key, point);
     }
 
     @Override
     public <K, V> List<Entry<K, V>> range(Keyspace<K, V> keyspace, KeyRange<K> range, int limit) {
-        return Reads.range(state(keyspace), keyspace, range, limit, bound);
+        return Reads.range(state(keyspace), keyspace, range, limit, point);
     }
 
     @Override
     public <K, V> long forEach(Keyspace<K, V> keyspace, KeyRange<K> range, BiPredicate<? super K, ? super V> visitor) {
-        return Reads.forEach(state(keyspace), keyspace, range, bound, visitor);
+        return Reads.forEach(state(keyspace), keyspace, range, point, visitor);
     }
 
     @Override
     public <K, V> Optional<Entry<K, V>> first(Keyspace<K, V> keyspace, KeyRange<K> range) {
-        return Reads.first(state(keyspace), keyspace, range, bound);
+        return Reads.first(state(keyspace), keyspace, range, point);
     }
 
     @Override
     public <K, R> Optional<R> readEncoded(Keyspace<K, ?> keyspace, K key, Function<? super MemorySegment, ? extends R> reader) {
-        return Reads.readEncoded(state(keyspace), keyspace, key, bound, reader);
+        return Reads.readEncoded(state(keyspace), keyspace, key, point, reader);
     }
 
     @Override
     public <K> long forEachEncoded(Keyspace<K, ?> keyspace, KeyRange<K> range,
                                    BiPredicate<? super MemorySegment, ? super MemorySegment> visitor) {
-        return Reads.forEachEncoded(state(keyspace), keyspace, range, bound, visitor);
+        return Reads.forEachEncoded(state(keyspace), keyspace, range, point, visitor);
     }
 
     @Override

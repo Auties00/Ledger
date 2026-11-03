@@ -45,33 +45,33 @@ final class LiveTransaction implements Transaction {
 
     @Override
     public <K, V> Optional<V> get(Keyspace<K, V> keyspace, K key) {
-        return Reads.get(state(keyspace), keyspace, key, applier.bound());
+        return Reads.get(state(keyspace), keyspace, key, ledger.writerPoint(applier.bound()));
     }
 
     @Override
     public <K, V> List<Entry<K, V>> range(Keyspace<K, V> keyspace, KeyRange<K> range, int limit) {
-        return Reads.range(state(keyspace), keyspace, range, limit, applier.bound());
+        return Reads.range(state(keyspace), keyspace, range, limit, ledger.writerPoint(applier.bound()));
     }
 
     @Override
     public <K, V> long forEach(Keyspace<K, V> keyspace, KeyRange<K> range, BiPredicate<? super K, ? super V> visitor) {
-        return Reads.forEach(state(keyspace), keyspace, range, applier.bound(), visitor);
+        return Reads.forEach(state(keyspace), keyspace, range, ledger.writerPoint(applier.bound()), visitor);
     }
 
     @Override
     public <K, V> Optional<Entry<K, V>> first(Keyspace<K, V> keyspace, KeyRange<K> range) {
-        return Reads.first(state(keyspace), keyspace, range, applier.bound());
+        return Reads.first(state(keyspace), keyspace, range, ledger.writerPoint(applier.bound()));
     }
 
     @Override
     public <K, R> Optional<R> readEncoded(Keyspace<K, ?> keyspace, K key, Function<? super MemorySegment, ? extends R> reader) {
-        return Reads.readEncoded(state(keyspace), keyspace, key, applier.bound(), reader);
+        return Reads.readEncoded(state(keyspace), keyspace, key, ledger.writerPoint(applier.bound()), reader);
     }
 
     @Override
     public <K> long forEachEncoded(Keyspace<K, ?> keyspace, KeyRange<K> range,
                                    BiPredicate<? super MemorySegment, ? super MemorySegment> visitor) {
-        return Reads.forEachEncoded(state(keyspace), keyspace, range, applier.bound(), visitor);
+        return Reads.forEachEncoded(state(keyspace), keyspace, range, ledger.writerPoint(applier.bound()), visitor);
     }
 
     @Override

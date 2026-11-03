@@ -29,10 +29,17 @@ import java.util.zip.CRC32C;
 /// [#ALIGNMENT], so the pages of acknowledged frames are never written again.
 ///
 /// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames, written by one open of the store
-/// only, so the offset of a frame is a unique nonce under the segment's key:
+/// only. Its key derives from its number and a random salt of its own, so the offset of a frame is a unique nonce
+/// under that key, even if a damaged superblock ever made a later open reuse a segment number:
 ///
 /// ```text
-/// segment header  "LGSEGMNT", version, encryption, segment number, store id, CRC-32C of the header
+/// segment header   0  "LGSEGMNT"
+///                  8  version
+///                 12  encryption (1 if the frames are encrypted)
+///                 16  segment number
+///                 24  store id, 16 bytes
+///                 40  salt of the segment key, 16 random bytes
+///                 56  CRC-32C of bytes 0 to 55
 /// frame header     0  magic "LGF1"
 ///                  4  length of the sealed body
 ///                  8  commit sequence
@@ -52,6 +59,10 @@ final class LogWriter {
     static final long SEGMENT_MAGIC = 0x4C475345474D4E54L;
     static final int SEGMENT_VERSION = 1;
     static final int TAG_BYTES = 16;
+    static final int SALT_OFFSET = 40;
+    static final int SALT_BYTES = 16;
+    static final int HEADER_CRC_OFFSET = 56;
+    private static final java.security.SecureRandom SALTS = new java.security.SecureRandom();
 
     private final Path directory;
     private final StoreKeys keys;
@@ -65,12 +76,15 @@ final class LogWriter {
     private long segmentNumber;
     private long position;
     private SecretKeySpec segmentKey;
+    private byte[] segmentSalt;
     private final Cipher cipher;
     private final CRC32C crc;
     private byte[] output;
     private byte[] flushing;
     // Written by the flush task only
     private volatile long forces;
+    // The segment the flush task writes, for a checkpoint to read
+    private volatile long currentSegment;
 
     private final ReentrantLock queueLock;
     private byte[] queue;
@@ -79,6 +93,8 @@ final class LogWriter {
     // Frames queued since the writer opened; a catalog frame carries a sequence already durable, so close() waits on
     // frames rather than on sequences
     private long appended;
+    // The bytes of the frames queued since the writer opened, written under the queue lock
+    private volatile long appendedBytes;
     private final AtomicBoolean scheduled;
 
     private final ReentrantLock durabilityLock;
@@ -138,9 +154,13 @@ final class LogWriter {
             header.put(12, (byte) (keys.encrypted() ? 1 : 0));
             header.putLong(16, number);
             header.put(24, storeId);
+            var salt = new byte[SALT_BYTES];
+            SALTS.nextBytes(salt);
+            header.put(SALT_OFFSET, salt);
             crc.reset();
-            crc.update(header.array(), 0, 40);
-            header.putInt(40, (int) crc.getValue());
+            crc.update(header.array(), 0, HEADER_CRC_OFFSET);
+            header.putInt(HEADER_CRC_OFFSET, (int) crc.getValue());
+            segmentSalt = salt;
             while (header.hasRemaining()) {
                 created.write(header, header.position());
             }
@@ -152,8 +172,9 @@ final class LogWriter {
         }
         this.channel = created;
         this.segmentNumber = number;
+        this.currentSegment = number;
         this.position = SEGMENT_HEADER;
-        this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, number) : null;
+        this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, number, segmentSalt) : null;
     }
 
     /// Queues a frame holding the first `body.size()` bytes of `body`, copying them.
@@ -176,6 +197,7 @@ final class LogWriter {
             queued = needed;
             lastQueued = sequence;
             appended++;
+            appendedBytes += 13 + length;
         } finally {
             queueLock.unlock();
         }
@@ -375,6 +397,16 @@ final class LogWriter {
         } finally {
             durabilityLock.unlock();
         }
+    }
+
+    /// {@return the number of the segment frames are written to now; every later frame goes to it or a later one}
+    long currentSegment() {
+        return currentSegment;
+    }
+
+    /// {@return the bytes of the frames queued since the writer opened}
+    long appendedBytes() {
+        return appendedBytes;
     }
 
     /// {@return the forces made so far}

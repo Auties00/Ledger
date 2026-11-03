@@ -4,10 +4,15 @@ import com.github.auties00.ledger.Keyspace;
 
 import java.lang.foreign.MemorySegment;
 import java.util.NavigableMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentSkipListMap;
 
-/// The entries of one key space: a version chain per key, the range removals not applied yet, and the number of
-/// entries as of each recent commit.
+/// The entries of one key space in memory: a version chain per key, the range removals readers may still need, and
+/// the number of entries as of each recent commit.
+///
+/// In a store in a directory, the entries of a [Keyspace.Residency#PAGED] key space are only those written since the
+/// checkpoint every reader's tree holds; a key with no version in memory is read from the tree. A resident key space
+/// holds every entry.
 ///
 /// Readers use it concurrently with the writer; only the writer changes it.
 final class KeyspaceState {
@@ -20,6 +25,8 @@ final class KeyspaceState {
     volatile RangeRemoval[] removals;
     // The number of entries visible as of each commit sequence that changed it
     final ConcurrentSkipListMap<Long, Long> counts;
+    // The keys written since the last checkpoint was cut, guarded by the writer lock
+    TreeSet<MemorySegment> dirty;
 
     KeyspaceState(Keyspace<?, ?> keyspace) {
         this.keyspace = keyspace;
@@ -28,27 +35,41 @@ final class KeyspaceState {
         this.entries = new ConcurrentSkipListMap<>(Segments.UNSIGNED);
         this.removals = RangeRemoval.NONE;
         this.counts = new ConcurrentSkipListMap<>();
+        this.dirty = new TreeSet<>(Segments.UNSIGNED);
         counts.put(0L, 0L);
     }
 
-    /// {@return the version of `key` a reader with `bound` sees, or `null` if it sees none}
+    /// {@return the version of `key` a reader with `bound` sees, [Version#HIDDEN] if it sees the key removed, or `null`
+    /// if no version in memory is at or below its bound, so the key is read from the tree}
     ///
     /// @param head the newest version of `key`, or `null`
     /// @param removals the range removals the reader loaded
-    static Version visible(Version head, MemorySegment key, long bound, RangeRemoval[] removals) {
+    static Version resolve(Version head, MemorySegment key, long bound, RangeRemoval[] removals) {
         var version = head;
         while (version != null && version.stamp > bound) {
             version = version.older;
         }
-        if (version == null || version.removes()) {
+        if (version == null) {
             return null;
+        }
+        if (version.removes()) {
+            return Version.HIDDEN;
         }
         for (var removal : removals) {
             if (removal.stamp() > version.stamp && removal.stamp() <= bound && removal.covers(key)) {
-                return null;
+                return Version.HIDDEN;
             }
         }
         return version;
+    }
+
+    /// {@return the version of `key` a reader with `bound` sees in memory, or `null` if it sees none there}
+    ///
+    /// @param head the newest version of `key`, or `null`
+    /// @param removals the range removals the reader loaded
+    static Version visible(Version head, MemorySegment key, long bound, RangeRemoval[] removals) {
+        var version = resolve(head, key, bound, removals);
+        return version == Version.HIDDEN ? null : version;
     }
 
     /// {@return the entries between `from`, included, and `to`, excluded, either `null` for no bound}

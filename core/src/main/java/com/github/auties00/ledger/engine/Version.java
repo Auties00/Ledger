@@ -7,6 +7,9 @@ import java.lang.foreign.MemorySegment;
 /// A chain starts at the newest version. Its stamps decrease along the chain; a reader takes the first version whose
 /// stamp is at or below its bound. Only the writer creates versions and cuts chains, by clearing [#older].
 final class Version {
+    /// What [KeyspaceState#resolve] returns for a key a reader sees removed.
+    static final Version HIDDEN = new Version(Long.MIN_VALUE, null, null, null);
+
     /// The commit sequence in the high bits and the position of the write in its batch in the low bits.
     final long stamp;
     /// The encoded value, read-only, or `null` if this version removes the key.

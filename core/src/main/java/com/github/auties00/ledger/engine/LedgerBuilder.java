@@ -11,6 +11,7 @@ import com.github.auties00.ledger.LedgerIoException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.BitSet;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -123,42 +124,62 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         var encryption = (EncryptionSpec) this.encryption;
         DirectoryLock lock = null;
         PlatformIoPool ownedPool = null;
+        PageFile pages = null;
         try {
             Files.createDirectories(directory);
             lock = DirectoryLock.acquire(directory);
             var logDirectory = directory.resolve(LOG_DIRECTORY);
-            if (StoreHeader.read(directory) == null && hasFiles(logDirectory)) {
-                throw new LedgerCorruptedException(directory + " holds a log but no header", null);
+            if (StoreHeader.read(directory) == null && (hasFiles(logDirectory) || Files.exists(directory.resolve(PageFile.FILE)))) {
+                throw new LedgerCorruptedException(directory + " holds data but no header", null);
             }
             var opened = StoreHeader.openOrCreate(directory, encryption);
             Files.createDirectories(logDirectory);
-            var ledger = new LiveLedger(keyspaces.values(), new HeapPool(pageCache));
-            var recovered = LogRecovery.replay(logDirectory, opened.keys(), opened.header().storeId(), new LogRecovery.Sink() {
-                @Override
-                public void catalog(int keyspace, String name) {
-                    ledger.bind(keyspace, name);
-                }
+            var heap = new HeapPool(pageCache);
+            pages = PageFile.open(directory, new PageCipher(opened.keys().pageKey()), pageCache, heap);
+            var ledger = new LiveLedger(keyspaces.values(), heap);
+            var superblock = pages.superblock();
+            FreeSpace space;
+            if (superblock == null) {
+                space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+                ledger.useDataFile(pages, space);
+            } else {
+                var free = Catalog.decodeFreeList(pages.read(superblock.freeList(), PageFormat.FREE_LIST, false), superblock.pageCount());
+                space = new FreeSpace(superblock.pageCount(), free);
+                ledger.useDataFile(pages, space);
+                ledger.loadCheckpoint(superblock, Catalog.decode(pages.read(superblock.catalog(), PageFormat.CATALOG, false)));
+            }
+            var firstSegment = superblock == null ? 0 : superblock.logStart();
+            var recovered = LogRecovery.replay(logDirectory, opened.keys(), opened.header().storeId(), firstSegment,
+                    superblock == null ? 0 : superblock.sequence(), new LogRecovery.Sink() {
+                        @Override
+                        public void catalog(int keyspace, String name) {
+                            ledger.bind(keyspace, name);
+                        }
 
-                @Override
-                public void commit(long sequence, byte[] body) {
-                    ledger.replay(sequence, body);
-                }
-            });
+                        @Override
+                        public void commit(long sequence, byte[] body) {
+                            ledger.replay(sequence, body);
+                        }
+                    });
             var catalog = ledger.assignIds();
             var pool = ioPool != null ? (PlatformIoPool) ioPool : (ownedPool = new PlatformIoPool(1));
-            var log = new LogWriter(logDirectory, opened.keys(), opened.header().storeId(), recovered.lastSegment() + 1,
-                    recovered.lastSequence(), segmentSize, pool.executor(), commitWindow);
+            // Segment numbers never repeat: a checkpoint may have deleted every segment up to the one it names
+            var log = new LogWriter(logDirectory, opened.keys(), opened.header().storeId(),
+                    Math.max(recovered.lastSegment() + 1, Math.max(firstSegment, 1)), recovered.lastSequence(), segmentSize,
+                    pool.executor(), commitWindow);
+            var checkpointer = new Checkpointer(ledger, pages, space, log, logDirectory, checkpointEvery,
+                    superblock == null ? 0 : superblock.number());
             if (ownedPool != null) {
-                ledger.attach(log, catalog, lock, ownedPool);
+                ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
             } else {
-                ledger.attach(log, catalog, lock);
+                ledger.attach(log, catalog, checkpointer, pages, lock);
             }
             return ledger;
         } catch (IOException exception) {
-            release(lock, ownedPool);
+            release(pages, lock, ownedPool);
             throw new LedgerIoException("The store in " + directory + " could not be opened", exception);
         } catch (RuntimeException | Error throwable) {
-            release(lock, ownedPool);
+            release(pages, lock, ownedPool);
             throw throwable;
         }
     }
@@ -172,7 +193,10 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         }
     }
 
-    private static void release(DirectoryLock lock, PlatformIoPool pool) {
+    private static void release(PageFile pages, DirectoryLock lock, PlatformIoPool pool) {
+        if (pages != null) {
+            pages.close();
+        }
         if (pool != null) {
             pool.close();
         }
