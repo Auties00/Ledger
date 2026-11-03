@@ -5,6 +5,7 @@
 # Hosted runners share their hardware with other jobs, and their disks are virtual: compare engines within one run,
 # where they met the same conditions, rather than one run with another.
 name: Benchmark
+run-name: Benchmark on ${{ inputs.os }} ${{ inputs.jmh-args }}
 
 on:
   workflow_dispatch:
