@@ -21,7 +21,8 @@ import java.util.Objects;
 public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionStage, Ledger.Options {
     private static final long MIB = 1L << 20;
     private static final String LOG_DIRECTORY = "log";
-    private static final long SEGMENT_SIZE = 64 * MIB;
+    // A running store keeps one obsolete segment of this length as a spare; a closed one keeps no log
+    private static final long SEGMENT_SIZE = 16 * MIB;
 
     private Path directory;
     private Encryption encryption;
@@ -149,7 +150,9 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                 ledger.loadCheckpoint(superblock, Catalog.decode(pages.read(superblock.catalog(), PageFormat.CATALOG, false)));
             }
             var firstSegment = superblock == null ? 0 : superblock.logStart();
-            var recovered = LogRecovery.replay(logDirectory, opened.keys(), opened.header().storeId(), firstSegment,
+            var files = new LogFiles(logDirectory, opened.keys(), opened.header().storeId());
+            files.deleteStale();
+            var recovered = LogRecovery.replay(files, opened.keys(), opened.header().storeId(), firstSegment,
                     superblock == null ? 0 : superblock.sequence(), new LogRecovery.Sink() {
                         @Override
                         public void catalog(int keyspace, String name) {
@@ -163,11 +166,16 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                     });
             var catalog = ledger.assignIds();
             var pool = ioPool != null ? (PlatformIoPool) ioPool : (ownedPool = new PlatformIoPool(1));
-            // Segment numbers never repeat: a checkpoint may have deleted every segment up to the one it names
-            var log = new LogWriter(logDirectory, opened.keys(), opened.header().storeId(),
-                    Math.max(recovered.lastSegment() + 1, Math.max(firstSegment, 1)), recovered.lastSequence(), segmentSize,
-                    pool.executor(), commitWindow);
-            var checkpointer = new Checkpointer(ledger, pages, space, log, logDirectory, checkpointEvery,
+            // Numbers only grow, past every segment and the first one the checkpoint may need
+            var first = Math.max(recovered.lastSegment() + 1, Math.max(firstSegment, 1));
+            if (recovered.lastEmpty()) {
+                // Prepared by the last open and never written: prepared again, under a fresh salt
+                files.spare(recovered.lastSegment());
+                first = Math.max(recovered.lastSegment(), Math.max(firstSegment, 1));
+            }
+            var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
+                    segmentSize, pool.executor(), commitWindow);
+            var checkpointer = new Checkpointer(ledger, pages, space, log, files, checkpointEvery,
                     superblock == null ? 0 : superblock.number());
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);

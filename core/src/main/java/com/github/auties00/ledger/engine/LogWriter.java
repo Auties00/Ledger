@@ -8,12 +8,13 @@ import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.GeneralSecurityException;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.LockSupport;
@@ -25,12 +26,17 @@ import java.util.zip.CRC32C;
 /// Commits queue their frames in order, under the store's writer lock. One flush task at a time, on the store's
 /// [com.github.auties00.ledger.IoPool], takes everything queued, seals the frames, writes them with one call, forces
 /// the segment once and wakes the commits waiting for any of them: commits that arrive while a force runs make the
-/// next group, so concurrent commits share forces. After each force the next group starts at a multiple of
-/// [#ALIGNMENT], so the pages of acknowledged frames are never written again.
+/// next group, so concurrent commits share forces. Each group is padded with zeros to a multiple of [#ALIGNMENT], where
+/// the next one starts, so the pages of acknowledged frames are never written again.
+///
+/// Segments come from [LogFiles] prepared: once a segment is half written, the next one is prepared on the store's
+/// pool, so a rollover only forces the full segment and switches to the next, and no file is created or renamed on
+/// the way to a force. A prepared
+/// file may hold the frames of an earlier use, which every frame header tells apart by the tag of its segment's salt.
 ///
 /// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames, written by one open of the store
 /// only. Its key derives from its number and a random salt of its own, so the offset of a frame is a unique nonce
-/// under that key, even if a damaged superblock ever made a later open reuse a segment number:
+/// under that key, even if a segment number were ever used twice:
 ///
 /// ```text
 /// segment header   0  "LGSEGMNT"
@@ -44,6 +50,7 @@ import java.util.zip.CRC32C;
 ///                  4  length of the sealed body
 ///                  8  commit sequence
 ///                 16  frame type, flags (1: first frame after a force)
+///                 20  tag: the first 8 bytes of the segment's salt
 ///                 28  CRC-32C of bytes 0 to 27
 /// sealed body     AES-256-GCM of the body under the segment key, the frame's offset as nonce and the header as
 ///                 associated data; without encryption, the body and the CRC-32C of header and body
@@ -62,9 +69,7 @@ final class LogWriter {
     static final int SALT_OFFSET = 40;
     static final int SALT_BYTES = 16;
     static final int HEADER_CRC_OFFSET = 56;
-    private static final java.security.SecureRandom SALTS = new java.security.SecureRandom();
-
-    private final Path directory;
+    private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
     private final long segmentSize;
@@ -76,7 +81,11 @@ final class LogWriter {
     private long segmentNumber;
     private long position;
     private SecretKeySpec segmentKey;
-    private byte[] segmentSalt;
+    private long segmentTag;
+    // The end of the last group's frames, before its padding, for tests
+    private volatile long groupEnd;
+    // The preparation of the segment after the current one, run on the pool or by the flush task itself
+    private FutureTask<LogFiles.Prepared> next;
     private final Cipher cipher;
     private final CRC32C crc;
     private byte[] output;
@@ -103,20 +112,20 @@ final class LogWriter {
     private long written;
     private volatile LedgerIoException failure;
 
-    /// Opens a new segment to write frames to.
+    /// Prepares a segment to write frames to.
     ///
-    /// @param directory the directory of the segments
+    /// @param files the files of the log
     /// @param keys the store's keys
     /// @param storeId the store's id
-    /// @param firstSegment the number of the segment to create, above every existing one
+    /// @param firstSegment the number of the segment to prepare, above every existing one
     /// @param durable the sequence the log already holds durably
     /// @param segmentSize the size past which a new segment starts
     /// @param executor runs the flush task on platform threads
     /// @param commitWindow how long a flush waits for more commits before it starts
-    /// @throws IOException if the segment cannot be created
-    LogWriter(Path directory, StoreKeys keys, byte[] storeId, long firstSegment, long durable, long segmentSize,
+    /// @throws IOException if the segment cannot be prepared
+    LogWriter(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long durable, long segmentSize,
               Executor executor, Duration commitWindow) throws IOException {
-        this.directory = directory;
+        this.files = files;
         this.keys = keys;
         this.storeId = storeId;
         this.segmentSize = segmentSize;
@@ -137,44 +146,52 @@ final class LogWriter {
         this.durabilityChanged = durabilityLock.newCondition();
         this.durable = durable;
         this.lastQueued = durable;
-        createSegment(firstSegment);
+        open(files.prepare(firstSegment));
     }
 
     static String segmentName(long number) {
-        return "%016x.log".formatted(number);
+        return LogFiles.segmentName(number);
     }
 
-    private void createSegment(long number) throws IOException {
-        var path = directory.resolve(segmentName(number));
-        var created = FileChannel.open(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE);
-        try {
-            var header = ByteBuffer.allocate(SEGMENT_HEADER);
-            header.putLong(0, SEGMENT_MAGIC);
-            header.putInt(8, SEGMENT_VERSION);
-            header.put(12, (byte) (keys.encrypted() ? 1 : 0));
-            header.putLong(16, number);
-            header.put(24, storeId);
-            var salt = new byte[SALT_BYTES];
-            SALTS.nextBytes(salt);
-            header.put(SALT_OFFSET, salt);
-            crc.reset();
-            crc.update(header.array(), 0, HEADER_CRC_OFFSET);
-            header.putInt(HEADER_CRC_OFFSET, (int) crc.getValue());
-            segmentSalt = salt;
-            while (header.hasRemaining()) {
-                created.write(header, header.position());
-            }
-            created.force(true);
-            Durability.forceDirectory(directory);
-        } catch (IOException | RuntimeException exception) {
-            created.close();
-            throw exception;
-        }
-        this.channel = created;
-        this.segmentNumber = number;
-        this.currentSegment = number;
+    /// Starts writing `segment`.
+    private void open(LogFiles.Prepared segment) throws IOException {
+        this.channel = FileChannel.open(segment.path(), StandardOpenOption.READ, StandardOpenOption.WRITE);
+        this.segmentNumber = segment.number();
+        this.currentSegment = segment.number();
         this.position = SEGMENT_HEADER;
-        this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, number, segmentSalt) : null;
+        this.groupEnd = SEGMENT_HEADER;
+        this.segmentTag = ByteBuffer.wrap(segment.salt()).getLong();
+        this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt()) : null;
+        this.next = null;
+    }
+
+    /// Prepares the segment after the current one on the pool.
+    private void prepareNext() {
+        var number = segmentNumber + 1;
+        var preparation = new FutureTask<>(() -> files.prepare(number));
+        next = preparation;
+        executor.execute(preparation);
+    }
+
+    /// Switches to the prepared segment after the current one, preparing it here if the pool has not.
+    private void rollover() throws IOException {
+        if (next == null) {
+            prepareNext();
+        }
+        var preparation = next;
+        // Runs it on this thread unless it started elsewhere, so a pool of one thread never waits on itself
+        preparation.run();
+        LogFiles.Prepared prepared;
+        try {
+            prepared = preparation.get();
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while preparing a log segment", exception);
+        } catch (ExecutionException exception) {
+            throw exception.getCause() instanceof IOException failure ? failure
+                    : new IOException("A log segment could not be prepared", exception.getCause());
+        }
+        open(prepared);
     }
 
     /// Queues a frame holding the first `body.size()` bytes of `body`, copying them.
@@ -269,7 +286,7 @@ final class LogWriter {
                 channel.force(false);
                 forces++;
                 channel.close();
-                createSegment(segmentNumber + 1);
+                rollover();
                 used = 0;
                 groupStart = true;
             }
@@ -281,17 +298,27 @@ final class LogWriter {
             groupStart = false;
             offset = bodyOffset + bodyLength;
         }
-        writeFully(used);
+        // Zeros to the next block, where the next group starts: a reused file holds older bytes there
+        var end = position + used;
+        var padded = (int) ((end + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT - position);
+        if (padded > output.length) {
+            output = Arrays.copyOf(output, padded);
+        }
+        Arrays.fill(output, used, padded, (byte) 0);
+        writeFully(padded);
         channel.force(false);
         forces++;
-        position = (position + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT;
+        groupEnd = end;
+        if (next == null && position >= segmentSize / 2) {
+            prepareNext();
+        }
     }
 
     private void seal(byte type, long sequence, byte[] records, int bodyOffset, int bodyLength, int sealedLength,
                       long frameOffset, int at, boolean groupStart) throws IOException {
         var header = ByteBuffer.wrap(output, at, FRAME_HEADER);
         header.putInt(MAGIC).putInt(sealedLength).putLong(sequence).put(type).put(groupStart ? GROUP_START : 0)
-                .putShort((short) 0).putInt(0).putInt(0);
+                .putShort((short) 0).putLong(segmentTag);
         crc.reset();
         crc.update(output, at, FRAME_HEADER - Integer.BYTES);
         header.putInt((int) crc.getValue());
@@ -409,6 +436,11 @@ final class LogWriter {
         return appendedBytes;
     }
 
+    /// {@return the offset in the current segment where the frames of the last group end, before their padding}
+    long groupEnd() {
+        return groupEnd;
+    }
+
     /// {@return the forces made so far}
     long forces() {
         return forces;
@@ -438,6 +470,23 @@ final class LogWriter {
         } finally {
             // The flush task has nothing left to write, or has stopped
             closeChannel();
+            spareNext();
+        }
+    }
+
+    /// Turns the segment prepared after the current one, which nothing wrote, back into a spare.
+    private void spareNext() {
+        var preparation = next;
+        // A preparation that has not started never runs; one still running leaves an unused segment to the next open
+        if (preparation == null || preparation.cancel(false)) {
+            return;
+        }
+        try {
+            files.spare(preparation.get().number());
+        } catch (InterruptedException _) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException | IOException _) {
+            // An unused segment left behind holds no frame; the next open turns it into a spare
         }
     }
 
