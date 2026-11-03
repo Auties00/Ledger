@@ -14,114 +14,52 @@ public final class BuiltinCodecs {
     private static final ValueLayout.OfInt BIG_ENDIAN_INT = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
 
     /// Byte array keys, ordered as unsigned bytes.
-    public static final KeyCodec<byte[]> BYTES_KEY = new KeyCodec<>() {
-        @Override
-        public int sizeOf(byte[] key) {
-            return key.length;
-        }
-
-        @Override
-        public void encode(byte[] key, MemorySegment target) {
-            MemorySegment.copy(key, 0, target, ValueLayout.JAVA_BYTE, 0, key.length);
-        }
-
-        @Override
-        public byte[] decode(MemorySegment source) {
-            return source.toArray(ValueLayout.JAVA_BYTE);
-        }
-    };
+    public static final KeyCodec<byte[]> BYTES_KEY = new FunctionKeyCodec<>(
+            key -> key.length,
+            (key, target) -> MemorySegment.copy(key, 0, target, ValueLayout.JAVA_BYTE, 0, key.length),
+            source -> source.toArray(ValueLayout.JAVA_BYTE),
+            true);
 
     /// Byte array values.
-    public static final ValueCodec<byte[]> BYTES_VALUE = new ValueCodec<>() {
-        @Override
-        public long sizeOf(byte[] value) {
-            return value.length;
-        }
-
-        @Override
-        public void encode(byte[] value, MemorySegment target) {
-            MemorySegment.copy(value, 0, target, ValueLayout.JAVA_BYTE, 0, value.length);
-        }
-
-        @Override
-        public byte[] decode(MemorySegment source) {
-            return source.toArray(ValueLayout.JAVA_BYTE);
-        }
-    };
+    public static final ValueCodec<byte[]> BYTES_VALUE = new FunctionValueCodec<>(
+            value -> value.length,
+            (value, target) -> MemorySegment.copy(value, 0, target, ValueLayout.JAVA_BYTE, 0, value.length),
+            source -> source.toArray(ValueLayout.JAVA_BYTE),
+            true);
 
     /// String keys in UTF-8, ordered by code point.
-    public static final KeyCodec<String> UTF8_KEY = new KeyCodec<>() {
-        @Override
-        public int sizeOf(String key) {
-            return Math.toIntExact(utf8Length(key));
-        }
-
-        @Override
-        public void encode(String key, MemorySegment target) {
-            encodeUtf8(key, target);
-        }
-
-        @Override
-        public String decode(MemorySegment source) {
-            return new String(source.toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8);
-        }
-    };
+    public static final KeyCodec<String> UTF8_KEY = new FunctionKeyCodec<>(
+            key -> Math.toIntExact(utf8Length(key)),
+            BuiltinCodecs::encodeUtf8,
+            BuiltinCodecs::decodeUtf8,
+            true);
 
     /// String values in UTF-8.
-    public static final ValueCodec<String> UTF8_VALUE = new ValueCodec<>() {
-        @Override
-        public long sizeOf(String value) {
-            return utf8Length(value);
-        }
-
-        @Override
-        public void encode(String value, MemorySegment target) {
-            encodeUtf8(value, target);
-        }
-
-        @Override
-        public String decode(MemorySegment source) {
-            return new String(source.toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8);
-        }
-    };
+    public static final ValueCodec<String> UTF8_VALUE = new FunctionValueCodec<>(
+            BuiltinCodecs::utf8Length,
+            BuiltinCodecs::encodeUtf8,
+            BuiltinCodecs::decodeUtf8,
+            true);
 
     /// `long` keys, big-endian with the sign bit flipped so negative values sort first.
-    public static final KeyCodec<Long> INT64 = new KeyCodec<>() {
-        @Override
-        public int sizeOf(Long key) {
-            return Long.BYTES;
-        }
-
-        @Override
-        public void encode(Long key, MemorySegment target) {
-            target.set(BIG_ENDIAN_LONG, 0, key ^ Long.MIN_VALUE);
-        }
-
-        @Override
-        public Long decode(MemorySegment source) {
-            return source.get(BIG_ENDIAN_LONG, 0) ^ Long.MIN_VALUE;
-        }
-    };
+    public static final KeyCodec<Long> INT64 = new FunctionKeyCodec<>(
+            key -> Long.BYTES,
+            (key, target) -> target.set(BIG_ENDIAN_LONG, 0, key ^ Long.MIN_VALUE),
+            source -> source.get(BIG_ENDIAN_LONG, 0) ^ Long.MIN_VALUE,
+            true);
 
     /// `int` keys, big-endian with the sign bit flipped so negative values sort first.
-    public static final KeyCodec<Integer> INT32 = new KeyCodec<>() {
-        @Override
-        public int sizeOf(Integer key) {
-            return Integer.BYTES;
-        }
-
-        @Override
-        public void encode(Integer key, MemorySegment target) {
-            target.set(BIG_ENDIAN_INT, 0, key ^ Integer.MIN_VALUE);
-        }
-
-        @Override
-        public Integer decode(MemorySegment source) {
-            return source.get(BIG_ENDIAN_INT, 0) ^ Integer.MIN_VALUE;
-        }
-    };
+    public static final KeyCodec<Integer> INT32 = new FunctionKeyCodec<>(
+            key -> Integer.BYTES,
+            (key, target) -> target.set(BIG_ENDIAN_INT, 0, key ^ Integer.MIN_VALUE),
+            source -> source.get(BIG_ENDIAN_INT, 0) ^ Integer.MIN_VALUE,
+            true);
 
     private BuiltinCodecs() {
+    }
+
+    private static String decodeUtf8(MemorySegment source) {
+        return new String(source.toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8);
     }
 
     /// Writes `value` into `target` in UTF-8, without an intermediate array; an unpaired surrogate becomes `?`, as
