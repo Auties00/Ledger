@@ -61,6 +61,12 @@ Workloads Ledger is not built for, in `workload.limits`:
 | `LargeValueBenchmark` | Values of 1 and 16 MiB |
 | `PinnedReaderBenchmark` | File growth while a long reader pins an old version |
 
+Design measurements, in `workload.memory`:
+
+| Benchmark | What it decides |
+|---|---|
+| `MemoryPipelineBenchmark` | Whether Ledger keeps the bytes it encrypts and writes on the heap or in native memory: AES-GCM in the JDK is fastest on arrays, file I/O on native memory |
+
 ## Running
 
 ```
