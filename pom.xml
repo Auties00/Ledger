@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.github.auties00</groupId>
+    <artifactId>ledger-parent</artifactId>
+    <version>${revision}</version>
+    <packaging>pom</packaging>
+    <name>${project.groupId}:${project.artifactId}</name>
+    <description>Parent POM of Ledger, an embedded storage engine for single-writer applications that need durable, encrypted, ordered data</description>
+    <url>https://github.com/Auties00/Ledger</url>
+    <inceptionYear>2026</inceptionYear>
+
+    <modules>
+        <module>benchmark</module>
+    </modules>
+
+    <developers>
+        <developer>
+            <id>Auties00</id>
+            <name>Alessandro Autiero</name>
+            <email>alautiero@gmail.com</email>
+            <url>https://github.com/Auties00</url>
+        </developer>
+    </developers>
+
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://www.opensource.org/licenses/mit-license.php</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <properties>
+        <revision>0.1.0-SNAPSHOT</revision>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <java.version>26</java.version>
+        <maven.compiler.plugin.version>3.15.0</maven.compiler.plugin.version>
+        <maven.shade.plugin.version>3.6.0</maven.shade.plugin.version>
+        <!-- Engines the benchmark compares Ledger against. -->
+        <h2.mvstore.version>2.5.252</h2.mvstore.version>
+        <rocksdb.version>11.8.1</rocksdb.version>
+        <lmdbjava.version>0.9.3</lmdbjava.version>
+        <sqlite.jdbc.version>3.54.1.0</sqlite.jdbc.version>
+        <berkeley.je.version>18.3.12</berkeley.je.version>
+        <jmh.version>1.37</jmh.version>
+    </properties>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>${maven.compiler.plugin.version}</version>
+                    <configuration>
+                        <release>${java.version}</release>
+                        <compilerArgs>
+                            <arg>-Xlint:all,-processing,-serial</arg>
+                        </compilerArgs>
+                    </configuration>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-shade-plugin</artifactId>
+                    <version>${maven.shade.plugin.version}</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+</project>
