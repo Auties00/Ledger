@@ -13,6 +13,8 @@ import java.util.concurrent.ConcurrentSkipListMap;
 final class KeyspaceState {
     final Keyspace<?, ?> keyspace;
     final boolean resident;
+    // The id the log knows the key space by, set while the store opens
+    int id;
     final ConcurrentSkipListMap<MemorySegment, Version> entries;
     // Copy-on-write: the writer publishes a new array, readers keep the one they loaded
     volatile RangeRemoval[] removals;
@@ -22,6 +24,7 @@ final class KeyspaceState {
     KeyspaceState(Keyspace<?, ?> keyspace) {
         this.keyspace = keyspace;
         this.resident = keyspace.residency() == Keyspace.Residency.RESIDENT;
+        this.id = -1;
         this.entries = new ConcurrentSkipListMap<>(Segments.UNSIGNED);
         this.removals = RangeRemoval.NONE;
         this.counts = new ConcurrentSkipListMap<>();

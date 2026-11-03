@@ -13,6 +13,7 @@ import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -25,7 +26,8 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 
 /// A store whose entries live in memory: the engine of [Ledger.Builder#memory()], and the part of every store that
-/// holds the writes since its last checkpoint.
+/// holds the writes since its last checkpoint. A store in a directory also journals every commit to a [LogWriter],
+/// and replays the log into memory when it opens.
 ///
 /// One writer at a time applies a commit under [#writeLock], stamping its writes, then publishes it by advancing
 /// [#latest]; readers see a commit whole or not at all. After each commit the writer prunes the versions no reader can
@@ -45,6 +47,10 @@ public final class LiveLedger implements Ledger {
     private volatile boolean closed;
     private int sweepIndex;
     private MemorySegment sweepAfter;
+    private final Map<Integer, KeyspaceState> byId;
+    private int maxId;
+    private LogWriter log;
+    private AutoCloseable[] resources;
 
     /// Creates an empty store with `keyspaces`.
     ///
@@ -62,6 +68,78 @@ public final class LiveLedger implements Ledger {
         this.writeLock = new ReentrantLock();
         this.readers = new ReaderTable(READER_SLOTS, () -> latest);
         this.nextSequence = 1;
+        this.byId = new HashMap<>();
+        this.resources = new AutoCloseable[0];
+    }
+
+    /// Records that the log knows the key space `name` as `id`; key spaces the store was not opened with are ignored.
+    void bind(int id, String name) {
+        maxId = Math.max(maxId, id);
+        var state = states.get(name);
+        if (state != null) {
+            state.id = id;
+            byId.put(id, state);
+        }
+    }
+
+    /// Replays the commit `sequence` the log holds.
+    void replay(long sequence, byte[] body) {
+        var applier = new Applier(sequence, false);
+        FrameBody.readCommit(body, new FrameBody.Visitor() {
+            @Override
+            public void put(int keyspace, MemorySegment key, MemorySegment value) {
+                var state = byId.get(keyspace);
+                if (state != null) {
+                    applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null);
+                }
+            }
+
+            @Override
+            public void delete(int keyspace, MemorySegment key) {
+                var state = byId.get(keyspace);
+                if (state != null) {
+                    applier.delete(state, key);
+                }
+            }
+
+            @Override
+            public void deleteRange(int keyspace, MemorySegment from, MemorySegment to) {
+                var state = byId.get(keyspace);
+                if (state != null) {
+                    applier.deleteRange(state, from, to);
+                }
+            }
+        });
+        applier.publish();
+        nextSequence = sequence + 1;
+    }
+
+    /// Gives an id to every key space the log does not know yet.
+    ///
+    /// @return the body of the catalog frame naming them, or `null` if there is none
+    FrameBody assignIds() {
+        FrameBody catalog = null;
+        for (var state : states.values()) {
+            if (state.id == -1) {
+                state.id = ++maxId;
+                byId.put(state.id, state);
+                if (catalog == null) {
+                    catalog = new FrameBody();
+                }
+                catalog.catalog(state.id, state.keyspace.name());
+            }
+        }
+        return catalog;
+    }
+
+    /// Starts journaling to `log`, which holds every commit replayed so far, and makes the store close `resources`
+    /// after the log when it closes.
+    void attach(LogWriter log, FrameBody catalog, AutoCloseable... resources) {
+        this.log = log;
+        this.resources = resources;
+        if (catalog != null) {
+            log.append(FrameBody.CATALOG, latest, catalog);
+        }
     }
 
     KeyspaceState state(Keyspace<?, ?> keyspace) {
@@ -85,6 +163,11 @@ public final class LiveLedger implements Ledger {
 
     long latest() {
         return latest;
+    }
+
+    /// {@return the log the store journals to, or `null` for a store in memory}
+    LogWriter log() {
+        return log;
     }
 
     @Override
@@ -183,13 +266,14 @@ public final class LiveLedger implements Ledger {
             throw new IllegalArgumentException("A batch holds at most " + Reads.MAX_OPS + " writes: " + writes.size());
         }
         if (writes.isEmpty()) {
-            return new CompletedCommit(latest);
+            return ticket(latest);
         }
         checkNotInTransaction();
         writeLock.lock();
         try {
             ensureOpen();
-            var applier = new Applier(nextSequence);
+            checkHealthy();
+            var applier = new Applier(nextSequence, log != null);
             try {
                 for (var i = 0; i < writes.size(); i++) {
                     var state = states.get(writes.keyspace(i).name());
@@ -209,10 +293,11 @@ public final class LiveLedger implements Ledger {
                 applier.rollback();
                 throw throwable;
             }
-            nextSequence++;
             // The versions reference the batch's array, which the batch no longer writes
             writes.detach();
-            return new CompletedCommit(applier.publish());
+            var sequence = applier.publish();
+            nextSequence++;
+            return ticket(sequence);
         } finally {
             writeLock.unlock();
         }
@@ -230,7 +315,8 @@ public final class LiveLedger implements Ledger {
         writeLock.lock();
         try {
             ensureOpen();
-            var applier = new Applier(nextSequence);
+            checkHealthy();
+            var applier = new Applier(nextSequence, log != null);
             var view = new LiveTransaction(this, applier);
             try {
                 transaction.accept(view);
@@ -240,10 +326,21 @@ public final class LiveLedger implements Ledger {
             } finally {
                 view.invalidate();
             }
+            var sequence = applier.publish();
             nextSequence++;
-            return new CompletedCommit(applier.publish());
+            return ticket(sequence);
         } finally {
             writeLock.unlock();
+        }
+    }
+
+    private Commit ticket(long sequence) {
+        return log == null ? new CompletedCommit(sequence) : new LogCommit(sequence, log);
+    }
+
+    private void checkHealthy() {
+        if (log != null) {
+            log.checkHealthy();
         }
     }
 
@@ -254,8 +351,11 @@ public final class LiveLedger implements Ledger {
     }
 
     @Override
-    public void awaitDurable() {
+    public void awaitDurable() throws InterruptedException {
         ensureOpen();
+        if (log != null) {
+            log.awaitDurable(latest);
+        }
     }
 
     @Override
@@ -271,7 +371,28 @@ public final class LiveLedger implements Ledger {
 
     @Override
     public void close() {
-        closed = true;
+        writeLock.lock();
+        try {
+            if (closed) {
+                return;
+            }
+            closed = true;
+        } finally {
+            writeLock.unlock();
+        }
+        try {
+            if (log != null) {
+                log.close();
+            }
+        } finally {
+            for (var resource : resources) {
+                try {
+                    resource.close();
+                } catch (Exception exception) {
+                    // Everything is durable by now: a lock or pool that fails to close loses nothing
+                }
+            }
+        }
     }
 
     /// Unlinks the versions of `key` that no reader can see: it keeps, for each bound of `bounds`, the newest version
@@ -371,12 +492,15 @@ public final class LiveLedger implements Ledger {
         private final IdentityHashMap<KeyspaceState, Long> deltas;
         private final List<Touched> touched;
         private final IdentityHashMap<KeyspaceState, RangeRemoval[]> removalsBefore;
+        // The writes as the log records them, or null when nothing is journaled
+        private final FrameBody frame;
 
-        Applier(long sequence) {
+        Applier(long sequence, boolean journaled) {
             this.sequence = sequence;
             this.deltas = new IdentityHashMap<>();
             this.touched = new ArrayList<>();
             this.removalsBefore = new IdentityHashMap<>();
+            this.frame = journaled ? new FrameBody() : null;
         }
 
         /// {@return the bound of reads that see the latest commit and this one's writes so far}
@@ -405,6 +529,9 @@ public final class LiveLedger implements Ledger {
             if (!existed) {
                 deltas.merge(state, 1L, Long::sum);
             }
+            if (frame != null) {
+                frame.put(state.id, key, value);
+            }
         }
 
         void delete(KeyspaceState state, MemorySegment key) {
@@ -416,6 +543,9 @@ public final class LiveLedger implements Ledger {
             state.entries.put(key, new Version(stamp, null, null, head));
             touched.add(new Touched(state, key));
             deltas.merge(state, -1L, Long::sum);
+            if (frame != null) {
+                frame.delete(state.id, key);
+            }
         }
 
         void deleteRange(KeyspaceState state, MemorySegment from, MemorySegment to) {
@@ -434,12 +564,24 @@ public final class LiveLedger implements Ledger {
             if (removed != 0) {
                 deltas.merge(state, -removed, Long::sum);
             }
+            if (frame != null) {
+                frame.deleteRange(state.id, from, to);
+            }
         }
 
         /// Makes the commit visible to every read that starts afterward, then maintains the store.
         ///
         /// @return the sequence of the commit
         long publish() {
+            // Queued before it is visible, so the log holds every commit a reader can see, in order
+            if (frame != null) {
+                try {
+                    log.append(FrameBody.COMMIT, sequence, frame);
+                } catch (RuntimeException exception) {
+                    rollback();
+                    throw exception;
+                }
+            }
             for (var delta : deltas.entrySet()) {
                 var state = delta.getKey();
                 state.counts.put(sequence, state.counts.lastEntry().getValue() + delta.getValue());

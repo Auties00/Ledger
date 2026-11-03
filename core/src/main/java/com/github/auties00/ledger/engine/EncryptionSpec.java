@@ -49,6 +49,16 @@ public final class EncryptionSpec implements Encryption {
         return kind;
     }
 
+    /// {@return the raw master key, which [#destroy()] clears; `null` unless [#kind()] is [Kind#KEY]}
+    byte[] key() {
+        return key;
+    }
+
+    /// {@return the passphrase, which [#destroy()] clears; `null` unless [#kind()] is [Kind#PASSPHRASE]}
+    char[] passphrase() {
+        return passphrase;
+    }
+
     /// Clears the copy of the secret; the store calls it once it has derived its keys.
     public void destroy() {
         if (key != null) {
