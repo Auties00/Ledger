@@ -95,7 +95,10 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
 
     @Override
     public Ledger build() {
-        // TODO: open the engine; this commit only defines the API
-        throw new UnsupportedOperationException("The Ledger engine is not implemented yet");
+        if (directory == null) {
+            return new LiveLedger(keyspaces.values(), new HeapPool(pageCache));
+        }
+        // TODO: open a durable store: the write-ahead log is the next milestone of the engine
+        throw new UnsupportedOperationException("Ledger stores only in memory for now");
     }
 }
