@@ -11,6 +11,7 @@
     <inceptionYear>2026</inceptionYear>
 
     <modules>
+        <module>core</module>
         <module>benchmark</module>
     </modules>
 

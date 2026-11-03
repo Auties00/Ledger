@@ -18,7 +18,7 @@ on:
       group:
         description: Group of workloads to run
         type: choice
-        options: [all, commit, ingest, read, limits-write, limits-query]
+        options: [all, commit, ingest, read, limits-write, limits-query, memory]
         default: all
       jmh-args:
         description: 'Extra JMH arguments, for example: -p engine=rocksdb,sqlite -p messages=1000000'
@@ -48,7 +48,7 @@ jobs:
         os: ${{ fromJSON(inputs.os == 'all' && '["ubuntu-latest","windows-latest","macos-latest"]' || format('["{0}"]', inputs.os)) }}
         # The groups' patterns live in the run step: matrix include entries for groups a dispatch leaves out would
         # become jobs of their own, without an OS
-        group: ${{ fromJSON(inputs.group == 'all' && '["commit","ingest","read","limits-write","limits-query"]' || format('["{0}"]', inputs.group)) }}
+        group: ${{ fromJSON(inputs.group == 'all' && '["commit","ingest","read","limits-write","limits-query","memory"]' || format('["{0}"]', inputs.group)) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -98,6 +98,7 @@ jobs:
             read) PATTERN='cobalt\.(ChatPage|MessageLookup|Reopen)Benchmark' ;;
             limits-write) PATTERN='limits\.(RandomOverwrite|ParallelWriters|PinnedReader|LargeValue)Benchmark' ;;
             limits-query) PATTERN='limits\.(AdHocQuery|SqlIndexQuery|MultiProcessWriters)Benchmark' ;;
+            memory) PATTERN='memory\.MemoryPipelineBenchmark' ;;
             *) echo "::error::Unknown group $GROUP"; exit 1 ;;
           esac
           mkdir -p results
