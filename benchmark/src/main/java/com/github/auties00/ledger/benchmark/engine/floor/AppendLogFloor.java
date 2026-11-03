@@ -55,6 +55,12 @@ public final class AppendLogFloor implements Engine {
 
     @Override
     public void write(WriteBatch batch, Durability durability) throws IOException {
+        append(batch, true, durability);
+    }
+
+    /// Appends `batch` to the log, applies it to the index when `apply` is set, then forces the log if `durability`
+    /// asks for it.
+    private void append(WriteBatch batch, boolean apply, Durability durability) throws IOException {
         appendLock.lock();
         try {
             var size = 4;
@@ -82,7 +88,7 @@ public final class AppendLogFloor implements Engine {
             while (buffer.hasRemaining()) {
                 log.write(buffer);
             }
-            for (var i = 0; i < batch.size(); i++) {
+            for (var i = 0; apply && i < batch.size(); i++) {
                 var keyspace = index.get(batch.keyspace(i));
                 var value = batch.value(i);
                 if (value == null) {
@@ -123,10 +129,8 @@ public final class AppendLogFloor implements Engine {
 
     @Override
     public void deleteRange(Keyspace keyspace, byte[] from, byte[] to, Durability durability) throws IOException {
-        var batch = new WriteBatch();
-        batch.delete(keyspace, from);
-        batch.delete(keyspace, to);
-        write(batch, durability);
+        // The two bounds stand in for a range record, as large as an engine's range tombstone
+        append(new WriteBatch().delete(keyspace, from).delete(keyspace, to), false, durability);
         index.get(keyspace).subMap(from, true, to, false).clear();
     }
 
