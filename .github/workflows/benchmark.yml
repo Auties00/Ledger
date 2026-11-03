@@ -5,7 +5,7 @@
 # Hosted runners share their hardware with other jobs, and their disks are virtual: compare engines within one run,
 # where they met the same conditions, rather than one run with another.
 name: Benchmark
-run-name: Benchmark on ${{ inputs.os }} ${{ inputs.jmh-args }}
+run-name: Benchmark ${{ inputs.group }} on ${{ inputs.os }} ${{ inputs.jmh-args }}
 
 on:
   workflow_dispatch:
@@ -14,6 +14,11 @@ on:
         description: Runner to measure on
         type: choice
         options: [all, ubuntu-latest, windows-latest, macos-latest]
+        default: all
+      group:
+        description: Group of workloads to run
+        type: choice
+        options: [all, commit, ingest, read, limits-write, limits-query]
         default: all
       jmh-args:
         description: 'Extra JMH arguments, for example: -p engine=rocksdb,sqlite -p messages=1000000'
@@ -40,7 +45,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(inputs.os == 'all' && '["ubuntu-latest","windows-latest","macos-latest"]' || format('["{0}"]', inputs.os)) }}
-        group: [commit, ingest, read, limits-write, limits-query]
+        group: ${{ fromJSON(inputs.group == 'all' && '["commit","ingest","read","limits-write","limits-query"]' || format('["{0}"]', inputs.group)) }}
         include:
           - group: commit
             pattern: 'cobalt\.(DurableCommit|GroupCommit|OfflineDrain|WebhookInbox)Benchmark'

@@ -17,6 +17,7 @@ import org.openjdk.jmh.annotations.Fork;
 import org.openjdk.jmh.annotations.Level;
 import org.openjdk.jmh.annotations.Measurement;
 import org.openjdk.jmh.annotations.Mode;
+import org.openjdk.jmh.annotations.OperationsPerInvocation;
 import org.openjdk.jmh.annotations.OutputTimeUnit;
 import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Scope;
@@ -31,19 +32,23 @@ import java.util.concurrent.TimeUnit;
 
 /// Writing while a long reader holds an old version of the store open, as an export or a backup would.
 ///
-/// The store holds [#KEYS] 512-byte entries and each operation overwrites one durably. With `pinned` set, a read
-/// view opened before the first operation stays open throughout. A copy-on-write engine cannot reuse the pages that
-/// view still sees, so its files grow with every write; `sizeOnDisk` with and without the view shows by how much.
+/// The store holds [#KEYS] 512-byte entries and each iteration overwrites [#WRITES] of them durably, one at a time;
+/// the score is the time per write. With `pinned` set, a read view opened before the first write stays open
+/// throughout. A copy-on-write engine cannot reuse the pages that view still sees, so its files grow with every
+/// write; `sizeOnDisk` at the end of each iteration, with and without the view, shows by how much. The writes are
+/// counted rather than timed so the growth stays bounded: LMDB, whose map is sized up front, would otherwise fill it.
 ///
 /// Not a Cobalt workload: Cobalt holds no read open for long. Ledger pins versions the same way, so the cost applies
 /// to it as well.
 @State(Scope.Benchmark)
-@BenchmarkMode(Mode.Throughput)
-@OutputTimeUnit(TimeUnit.SECONDS)
-@Warmup(iterations = 1, time = 5)
-@Measurement(iterations = 3, time = 10)
+@BenchmarkMode(Mode.SingleShotTime)
+@OutputTimeUnit(TimeUnit.MICROSECONDS)
+@Warmup(iterations = 1)
+@Measurement(iterations = 3)
 @Fork(value = 1, jvmArgsAppend = {Jvm.NATIVE_ACCESS, Jvm.UNSAFE, Jvm.HEAP_MIN, Jvm.HEAP_MAX})
 public class PinnedReaderBenchmark {
+    /// The durable overwrites of one iteration.
+    public static final int WRITES = 5_000;
     private static final int KEYS = 20_000;
     private static final int VALUE_SIZE = 512;
 
@@ -60,7 +65,6 @@ public class PinnedReaderBenchmark {
     private Engine.ReadView view;
     private SplittableRandom random;
     private long writtenBefore;
-    private int invocations;
 
     /// Opens an empty store, fills it and opens the read view.
     ///
@@ -100,18 +104,19 @@ public class PinnedReaderBenchmark {
         store.close();
     }
 
-    /// Overwrites one entry durably.
+    /// Overwrites [#WRITES] entries durably, one at a time.
     ///
     /// @param counters receives what the writes cost on disk
     /// @throws IOException if the engine fails to write
     @Benchmark
+    @OperationsPerInvocation(WRITES)
     public void overwrite(IoCounters counters) throws IOException {
-        var key = random.nextInt(KEYS);
-        store.engine().write(new WriteBatch().put(Keyspace.GENERIC, Corpus.hashedKey(key, 16), corpus.slice(random.nextLong(), VALUE_SIZE)), Durability.DURABLE);
-        counters.payloadBytes += 16 + VALUE_SIZE;
-        counters.bytesWritten = ProcessProbe.bytesWritten() - writtenBefore;
-        if ((++invocations & 255) == 0) {
-            counters.sizeOnDisk = store.engine().sizeOnDisk();
+        for (var i = 0; i < WRITES; i++) {
+            var key = random.nextInt(KEYS);
+            store.engine().write(new WriteBatch().put(Keyspace.GENERIC, Corpus.hashedKey(key, 16), corpus.slice(random.nextLong(), VALUE_SIZE)), Durability.DURABLE);
         }
+        counters.payloadBytes = WRITES * (16L + VALUE_SIZE);
+        counters.bytesWritten = ProcessProbe.bytesWritten() - writtenBefore;
+        counters.sizeOnDisk = store.engine().sizeOnDisk();
     }
 }
