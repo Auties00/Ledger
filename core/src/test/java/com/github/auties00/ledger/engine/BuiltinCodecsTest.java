@@ -61,7 +61,7 @@ class BuiltinCodecsTest {
     void batch() {
         var opened = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.bytes());
         var other = Keyspace.paged("other", KeyCodec.utf8(), ValueCodec.bytes());
-        var batch = new ArrayWriteBatch(new HeapPool(1 << 20), Map.of(opened.name(), opened));
+        var batch = new ArrayWriteBatch(this, new HeapPool(1 << 20), Map.of(opened.name(), opened));
         assertThrows(IllegalArgumentException.class, () -> batch.put(other, "k", new byte[1]));
         assertThrows(IllegalArgumentException.class, () -> batch.put(opened, "", new byte[1]));
         batch.put(opened, "key", new byte[]{1, 2, 3})

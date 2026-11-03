@@ -28,6 +28,7 @@ public final class ArrayWriteBatch implements WriteBatch {
 
     private static final long ABSENT = -1;
 
+    private final Object owner;
     private final HeapPool pool;
     private final Map<String, Keyspace<?, ?>> keyspaces;
     private byte[] data;
@@ -43,9 +44,11 @@ public final class ArrayWriteBatch implements WriteBatch {
 
     /// Creates an empty batch for a store.
     ///
+    /// @param owner the store, which alone may apply the batch
     /// @param pool the store's pool, which the batch draws its memory from
     /// @param keyspaces the store's key spaces by name, which the batch may write
-    public ArrayWriteBatch(HeapPool pool, Map<String, Keyspace<?, ?>> keyspaces) {
+    public ArrayWriteBatch(Object owner, HeapPool pool, Map<String, Keyspace<?, ?>> keyspaces) {
+        this.owner = owner;
         this.pool = pool;
         this.keyspaces = keyspaces;
         this.data = pool.acquire(INITIAL_CAPACITY);
@@ -229,6 +232,11 @@ public final class ArrayWriteBatch implements WriteBatch {
         Objects.checkIndex(index, size);
         var offset = spans[index * 4 + field];
         return offset == ABSENT ? null : memory.asSlice(offset, spans[index * 4 + field + 1]).asReadOnly();
+    }
+
+    /// {@return the store that created the batch}
+    public Object owner() {
+        return owner;
     }
 
     /// {@return the bytes the encodings occupy}
