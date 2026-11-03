@@ -79,6 +79,32 @@ class BuiltinCodecsTest {
     }
 
     @Test
+    @DisplayName("an of codec decodes a copy it may keep; an ofTrusted codec reads the store's memory in place")
+    void trustModel() {
+        var kept = new MemorySegment[1];
+        var storeMemory = new byte[]{1, 2, 3};
+        var segment = MemorySegment.ofArray(storeMemory).asReadOnly();
+
+        var copying = ValueCodec.<String>of(value -> 0, (value, target) -> { }, source -> {
+            kept[0] = source;
+            return "";
+        });
+        copying.decode(segment);
+        storeMemory[0] = 9;
+        assertEquals(1, kept[0].get(ValueLayout.JAVA_BYTE, 0));
+        assertTrue(kept[0].isReadOnly());
+
+        var trusting = ValueCodec.<String>ofTrusted(value -> 0, (value, target) -> { }, source -> {
+            kept[0] = source;
+            return "";
+        });
+        trusting.decode(segment);
+        storeMemory[0] = 7;
+        assertEquals(7, kept[0].get(ValueLayout.JAVA_BYTE, 0));
+        assertTrue(ValueCodec.bytes().trusted() && KeyCodec.utf8().trusted());
+    }
+
+    @Test
     @DisplayName("the pool recycles arrays of its size classes and leaves others to the collector")
     void pool() {
         var pool = new HeapPool(1 << 20);
