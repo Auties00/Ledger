@@ -19,12 +19,17 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.Random;
+import java.util.TreeMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
@@ -56,10 +61,25 @@ class DurableLedgerTest {
         return options.build();
     }
 
+    /// {@return the segments of the store in `directory`, by number}
     private static List<Path> segments(Path directory) throws IOException {
         try (var files = Files.list(directory.resolve("log"))) {
-            return files.sorted(Comparator.comparing(Path::toString)).toList();
+            return files.filter(file -> LogFiles.segmentNumber(file.getFileName().toString()) >= 0)
+                    .sorted(Comparator.comparing(Path::toString))
+                    .toList();
         }
+    }
+
+    /// {@return every file of the log of the store in `directory`, segments, spares and preparations alike}
+    private static List<Path> logFiles(Path directory) throws IOException {
+        try (var files = Files.list(directory.resolve("log"))) {
+            return files.toList();
+        }
+    }
+
+    /// {@return the segment `ledger` writes now}
+    private static Path writing(Path directory, Ledger ledger) {
+        return directory.resolve("log").resolve(LogWriter.segmentName(((LiveLedger) ledger).log().currentSegment()));
     }
 
     @Nested
@@ -204,14 +224,14 @@ class DurableLedgerTest {
                     .build();
         }
 
-        /// Writes one commit with a value of `length` bytes into a segment of its own and returns the segment's size,
+        /// Writes one commit with a value of `length` bytes into a segment of its own and returns where its frames end,
         /// then, if `next`, commits once more into the same segment.
         private static long loneCommit(Path directory, int length, boolean next) throws Exception {
             open(directory, NAMES).close();
             var ledger = open(directory, NAMES);
             try {
                 ledger.commit(ledger.newBatch().put(NAMES, "lone", "x".repeat(length))).awaitDurable();
-                var size = Files.size(segments(directory).getLast());
+                var size = ((LiveLedger) ledger).log().groupEnd();
                 if (next) {
                     ledger.commit(ledger.newBatch().put(NAMES, "after", "next")).awaitDurable();
                 }
@@ -317,21 +337,22 @@ class DurableLedgerTest {
     class Recovery {
         @Test
         @DisplayName("a torn tail is dropped and the store goes on after it")
-        void tornTail(@TempDir Path directory) throws IOException {
+        void tornTail(@TempDir Path directory) throws Exception {
             var crashed = open(directory, NAMES);
+            Path segment;
+            long end;
             try {
-                crashed.commit(crashed.newBatch().put(NAMES, "a", "1"));
-                crashed.commit(crashed.newBatch().put(NAMES, "b", "2"));
+                crashed.commit(crashed.newBatch().put(NAMES, "a", "1")).awaitDurable();
+                crashed.commit(crashed.newBatch().put(NAMES, "b", "2")).awaitDurable();
+                segment = writing(directory, crashed);
+                end = ((LiveLedger) crashed).log().groupEnd();
             } finally {
                 crash(crashed);
             }
-            var segment = segments(directory).getLast();
-            // A crash in the middle of the last frame: cut it short, then leave garbage after it
-            var size = Files.size(segment);
-            try (var channel = Files.newByteChannel(segment, StandardOpenOption.WRITE)) {
-                channel.truncate(size - 5);
+            // A crash in the middle of the last frame: its last bytes, and what follows, are garbage
+            try (var channel = FileChannel.open(segment, StandardOpenOption.WRITE)) {
+                channel.write(ByteBuffer.wrap("garbage after the tear".getBytes(StandardCharsets.US_ASCII)), end - 5);
             }
-            Files.write(segment, "garbage after the tear".getBytes(StandardCharsets.US_ASCII), StandardOpenOption.APPEND);
             try (var ledger = open(directory, NAMES)) {
                 assertEquals(Optional.of("1"), ledger.get(NAMES, "a"));
                 assertEquals(Optional.empty(), ledger.get(NAMES, "b"));
@@ -346,13 +367,14 @@ class DurableLedgerTest {
         @DisplayName("damage before data written after a later force is refused, not dropped")
         void damageBeforeLaterGroup(@TempDir Path directory) throws Exception {
             var crashed = open(directory, NAMES);
+            Path segment;
             try {
                 crashed.commit(crashed.newBatch().put(NAMES, "a", "1")).awaitDurable();
                 crashed.commit(crashed.newBatch().put(NAMES, "b", "2")).awaitDurable();
+                segment = writing(directory, crashed);
             } finally {
                 crash(crashed);
             }
-            var segment = segments(directory).getLast();
             var bytes = Files.readAllBytes(segment);
             // The body of the first frame after the segment header
             bytes[LogWriter.SEGMENT_HEADER + LogWriter.FRAME_HEADER + 2] ^= 0x40;
@@ -378,7 +400,7 @@ class DurableLedgerTest {
                 crash(other);
             }
             // The second store's segment, renamed to the one the first store's next open would write
-            Files.copy(segments(second).getFirst(), first.resolve("log").resolve(LogWriter.segmentName(2)));
+            Files.copy(segments(second).getFirst(), first.resolve("log").resolve(LogWriter.segmentName(2)), StandardCopyOption.REPLACE_EXISTING);
             assertThrows(LedgerCorruptedException.class, () -> open(first, NAMES));
         }
 
@@ -406,17 +428,160 @@ class DurableLedgerTest {
         @DisplayName("a damaged header before written frames is refused, not deleted")
         void damagedHeader(@TempDir Path directory) throws IOException {
             var crashed = open(directory, NAMES);
+            Path segment;
             try {
                 crashed.commit(crashed.newBatch().put(NAMES, "a", "1"));
+                segment = writing(directory, crashed);
             } finally {
                 crash(crashed);
             }
-            var segment = segments(directory).getLast();
             var bytes = Files.readAllBytes(segment);
             bytes[3] ^= 1;
             Files.write(segment, bytes);
             assertThrows(LedgerCorruptedException.class, () -> open(directory, NAMES));
             assertTrue(Files.exists(segment));
+        }
+    }
+
+    @Nested
+    @DisplayName("reusing the log")
+    class Reuse {
+        @Test
+        @DisplayName("a clean close leaves no log behind, and the next open starts from the checkpoint")
+        void cleanClose(@TempDir Path directory) throws IOException {
+            for (var round = 0; round < 3; round++) {
+                try (var ledger = open(directory, NAMES)) {
+                    ledger.commit(ledger.newBatch().put(NAMES, "k" + round, "v" + round));
+                    assertEquals(round + 1, ledger.size(NAMES));
+                }
+                assertEquals(List.of(), logFiles(directory), "files left in the log");
+            }
+        }
+
+        @Test
+        @DisplayName("a reused segment keeps the length of its first use, so writing into it never grows it")
+        void reusedLength(@TempDir Path directory) throws Exception {
+            var segmentSize = 64 << 10;
+            try (var ledger = sized(directory, segmentSize)) {
+                var log = ((LiveLedger) ledger).log();
+                var commits = 0;
+                while (log.currentSegment() < 4) {
+                    ledger.commit(ledger.newBatch().put(NAMES, "k" + commits++, "v".repeat(1_000))).awaitDurable();
+                }
+                // Makes the full segments obsolete: one stays as a spare
+                ledger.checkpoint();
+                for (var attempt = 0; attempt < 200; attempt++) {
+                    ledger.commit(ledger.newBatch().put(NAMES, "k" + commits++, "v".repeat(1_000))).awaitDurable();
+                    var segment = writing(directory, ledger);
+                    if (Files.size(segment) >= segmentSize && log.groupEnd() < segmentSize / 4) {
+                        var size = Files.size(segment);
+                        for (var i = 0; i < 3; i++) {
+                            ledger.commit(ledger.newBatch().put(NAMES, "k" + commits++, "v".repeat(1_000))).awaitDurable();
+                        }
+                        assertEquals(segment, writing(directory, ledger));
+                        assertEquals(size, Files.size(segment));
+                        return;
+                    }
+                }
+                throw new AssertionError("no spare was reused");
+            }
+        }
+
+        @Test
+        @DisplayName("obsolete segments are reused, and recovery ignores the frames of their earlier use")
+        void recycled(@TempDir Path directory) throws Exception {
+            var model = new TreeMap<String, String>();
+            var random = new Random(9);
+            var ledger = sized(directory, 16_384);
+            try {
+                for (var round = 0; round < 30; round++) {
+                    for (var i = 0; i < 12; i++) {
+                        var key = "k" + random.nextInt(200);
+                        var value = "v".repeat(random.nextInt(2_000));
+                        ledger.commit(ledger.newBatch().put(NAMES, key, value)).awaitDurable();
+                        model.put(key, value);
+                    }
+                    ledger.checkpoint();
+                    var files = logFiles(directory).size();
+                    assertTrue(files <= 8, () -> files + " files in the log");
+                }
+                // Write into reused files, then stop without a checkpoint, so recovery reads them
+                for (var i = 0; i < 20; i++) {
+                    var key = "k" + random.nextInt(200);
+                    var value = "after " + i;
+                    ledger.commit(ledger.newBatch().put(NAMES, key, value)).awaitDurable();
+                    model.put(key, value);
+                }
+            } finally {
+                crash(ledger);
+            }
+            try (var reopened = sized(directory, 16_384)) {
+                var entries = new TreeMap<String, String>();
+                reopened.forEach(NAMES, KeyRange.all(), (key, value) -> {
+                    entries.put(key, value);
+                    return true;
+                });
+                assertEquals(model, entries);
+            }
+        }
+
+        @Test
+        @DisplayName("frames a reused file kept from its earlier use are never replayed, even when they authenticate")
+        void staleFrames(@TempDir Path base) throws Exception {
+            // Without encryption a stale frame passes its CRC, and these carry sequences the new commits reach
+            var old = base.resolve("old");
+            var previous = open(old, Encryption.none(), NAMES);
+            Path used;
+            try {
+                for (var i = 1; i <= 10; i++) {
+                    previous.commit(previous.newBatch().put(NAMES, "stale" + i, "x")).awaitDurable();
+                }
+                used = writing(old, previous);
+            } finally {
+                crash(previous);
+            }
+            var directory = base.resolve("store");
+            open(directory, Encryption.none(), NAMES).close();
+            Files.copy(used, directory.resolve("log").resolve("0000000000000099.spare"));
+            var crashed = open(directory, Encryption.none(), NAMES);
+            try {
+                crashed.commit(crashed.newBatch().put(NAMES, "own", "1")).awaitDurable();
+            } finally {
+                crash(crashed);
+            }
+            try (var ledger = open(directory, Encryption.none(), NAMES)) {
+                assertEquals(List.of("own"), ledger.range(NAMES, KeyRange.all(), 20).stream().map(com.github.auties00.ledger.Entry::key).toList());
+            }
+        }
+
+        @Test
+        @DisplayName("a segment a crash left prepared and unwritten is prepared again under its number")
+        void unwrittenSegment(@TempDir Path directory) throws Exception {
+            var crashed = open(directory, NAMES);
+            long number;
+            try {
+                crashed.commit(crashed.newBatch().put(NAMES, "a", "1")).awaitDurable();
+                number = ((LiveLedger) crashed).log().currentSegment();
+            } finally {
+                crash(crashed);
+            }
+            // What a crash right after preparing the next segment leaves
+            var opened = StoreHeader.openOrCreate(directory, EncryptionSpec.key(KEY));
+            new LogFiles(directory.resolve("log"), opened.keys(), opened.header().storeId()).prepare(number + 1);
+            try (var ledger = open(directory, NAMES)) {
+                assertEquals(number + 1, ((LiveLedger) ledger).log().currentSegment());
+                assertEquals(Optional.of("1"), ledger.get(NAMES, "a"));
+                ledger.commit(ledger.newBatch().put(NAMES, "b", "2"));
+            }
+            try (var ledger = open(directory, NAMES)) {
+                assertEquals(2, ledger.size(NAMES));
+            }
+        }
+
+        private static Ledger sized(Path directory, long segmentSize) {
+            return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(NAMES))
+                    .segmentSize(segmentSize)
+                    .build();
         }
     }
 

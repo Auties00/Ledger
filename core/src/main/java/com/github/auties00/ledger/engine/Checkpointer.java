@@ -3,7 +3,6 @@ package com.github.auties00.ledger.engine;
 import com.github.auties00.ledger.LedgerIoException;
 
 import java.io.IOException;
-import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.List;
@@ -15,8 +14,8 @@ import java.util.concurrent.locks.ReentrantLock;
 /// A checkpoint takes, under the writer lock, the keys written since the last one and the range removals since, as
 /// of the latest sequence ([LiveLedger#cutCheckpoint]); then, while commits go on, it applies them to the trees copy
 /// on write ([TreeUpdate]), writes the catalog and the free list, forces the file, writes the superblock the last one
-/// did not use and forces it. Only then are the new trees published, the log segments before the cut deleted and
-/// the versions the trees now hold dropped from memory. A crash at any point leaves the last durable superblock and
+/// did not use and forces it. Only then are the new trees published, the log segments before the cut retired and the
+/// versions the trees now hold dropped from memory. A crash at any point leaves the last durable superblock and
 /// everything it uses whole: a checkpoint writes only pages no durable state uses.
 ///
 /// The store starts one on a platform thread of its own whenever the log has grown by the checkpoint interval since
@@ -31,11 +30,14 @@ import java.util.concurrent.locks.ReentrantLock;
 /// no checkpoint runs again until the store reopens: overwriting either superblock could leave none that authenticates.
 /// The log still holds every commit.
 final class Checkpointer {
+    /// The obsolete segments kept for reuse while the store runs; a closed store keeps none.
+    private static final int SPARES = 1;
+
     private final LiveLedger ledger;
     private final PageFile pages;
     private final FreeSpace space;
     private final LogWriter log;
-    private final Path logDirectory;
+    private final LogFiles files;
     private final long every;
     private final ReentrantLock lock;
     private final AtomicBoolean scheduled;
@@ -52,12 +54,12 @@ final class Checkpointer {
     ///
     /// @param every the log growth that starts a checkpoint, in bytes
     /// @param number the number of the last durable checkpoint, or 0
-    Checkpointer(LiveLedger ledger, PageFile pages, FreeSpace space, LogWriter log, Path logDirectory, long every, long number) {
+    Checkpointer(LiveLedger ledger, PageFile pages, FreeSpace space, LogWriter log, LogFiles files, long every, long number) {
         this.ledger = ledger;
         this.pages = pages;
         this.space = space;
         this.log = log;
-        this.logDirectory = logDirectory;
+        this.files = files;
         this.every = every;
         this.number = number;
         this.lock = new ReentrantLock();
@@ -102,6 +104,10 @@ final class Checkpointer {
             }
             var cut = ledger.cutCheckpoint(() -> closing ? log.currentSegment() + 1 : log.currentSegment());
             if (cut == null) {
+                if (closing) {
+                    // The trees hold every commit, so the segments hold nothing a reopen needs
+                    retire(Long.MAX_VALUE, 0);
+                }
                 return;
             }
             cutBytes = cut.logBytes();
@@ -146,17 +152,26 @@ final class Checkpointer {
             }
             ledger.publish(cut, number, roots, catalog, freeList, freed);
             ledger.pruneCut(cut);
+            retire(cut.logStart(), closing ? 0 : SPARES);
             try {
-                LogRecovery.deleteSegmentsBefore(logDirectory, cut.logStart());
                 var end = space.trim();
                 if (end > 0) {
                     pages.truncate(end);
                 }
             } catch (IOException exception) {
-                // The checkpoint is durable; obsolete segments and trailing free pages wait for the next one
+                // The checkpoint is durable; trailing free pages wait for the next one
             }
         } finally {
             lock.unlock();
+        }
+    }
+
+    /// Retires the log segments before `first`, keeping `spares` of them to be prepared again.
+    private void retire(long first, int spares) {
+        try {
+            files.retireBefore(first, spares);
+        } catch (IOException exception) {
+            // Obsolete segments wait for the next checkpoint
         }
     }
 
