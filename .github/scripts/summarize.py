@@ -4,7 +4,8 @@
 usage: summarize.py [--by-os] FILE...
 
 By default each table lists every parameter combination with its score, the median and 99th
-percentile of sampled latencies, and the workload's secondary counters. With --by-os the files
+percentile of sampled latencies, and the workload's secondary counters. JMH adds the counters of a
+result up over its measurement iterations, so they are divided back to their value per iteration. With --by-os the files
 are named after the runner that produced them (ubuntu-latest.json, ...) and each runner gets a
 score column, so one table compares the operating systems.
 """
@@ -97,8 +98,11 @@ def by_result(results):
             if sampled:
                 percentiles = primary.get("scorePercentiles", {})
                 row += [number(percentiles.get("50.0")), number(percentiles.get("99.0"))]
+            iterations = result.get("measurementIterations", 1) * result.get("forks", 1)
             for name in secondary:
                 value = result.get("secondaryMetrics", {}).get(name, {}).get("score")
+                if isinstance(value, (int, float)):
+                    value /= max(1, iterations)
                 row.append(mebibytes(value) if name in BYTE_COUNTERS else number(value))
             rows.append(row)
         output.append(f"### {method_name(benchmark)}\n\n{table(rows)}\n")
