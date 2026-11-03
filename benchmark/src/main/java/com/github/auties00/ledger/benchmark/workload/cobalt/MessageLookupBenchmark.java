@@ -75,6 +75,10 @@ public class MessageLookupBenchmark {
         var index = ThreadLocalRandom.current().nextInt(corpus.messages());
         var chat = corpus.chat(index);
         var key = store.engine().get(Keyspace.MESSAGE_IDS, corpus.idKey(chat, corpus.sequence(index)));
-        return store.engine().get(Keyspace.MESSAGES, key);
+        var body = key == null ? null : store.engine().get(Keyspace.MESSAGES, key);
+        if (body == null) {
+            throw new IllegalStateException("Message " + index + " of the corpus is missing");
+        }
+        return body;
     }
 }

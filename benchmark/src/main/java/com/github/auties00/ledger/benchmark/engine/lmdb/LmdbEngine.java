@@ -17,6 +17,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -65,7 +66,9 @@ public final class LmdbEngine implements Engine {
                 .open(directory.toFile(), EnvFlags.MDB_NOTLS, EnvFlags.MDB_NOSYNC);
         var databases = new EnumMap<Keyspace, Dbi<byte[]>>(Keyspace.class);
         for (var keyspace : Keyspace.values()) {
-            databases.put(keyspace, environment.openDbi(keyspace.name(), DbiFlags.MDB_CREATE));
+            // LMDB orders keys by memcmp, but lmdbjava checks range bounds in Java with a signed comparator unless
+            // given one; false keeps LMDB's native order rather than calling back into Java
+            databases.put(keyspace, environment.openDbi(keyspace.name(), Arrays::compareUnsigned, false, DbiFlags.MDB_CREATE));
         }
         return new LmdbEngine(directory, environment, databases);
     }

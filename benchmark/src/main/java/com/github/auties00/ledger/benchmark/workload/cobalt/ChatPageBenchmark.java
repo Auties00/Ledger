@@ -125,10 +125,18 @@ public class ChatPageBenchmark {
     @Benchmark
     public void newestPage(Blackhole blackhole) throws IOException {
         var chat = corpus.chat(ThreadLocalRandom.current().nextInt(corpus.messages()));
-        store.engine().scan(Keyspace.MESSAGES, Corpus.chatStart(chat), Corpus.chatEnd(chat), true, PAGE, (key, value) -> {
+        var read = store.engine().scan(Keyspace.MESSAGES, Corpus.chatStart(chat), Corpus.chatEnd(chat), true, PAGE, (key, value) -> {
             blackhole.consume(value);
             return true;
         });
+        // Messages received in the background only add to a chat
+        expect(read >= Math.min(PAGE, corpus.chatSize(chat)), chat, read);
+    }
+
+    private static void expect(boolean condition, int chat, int read) {
+        if (!condition) {
+            throw new IllegalStateException("Chat " + chat + " returned " + read + " messages, not the ones it holds");
+        }
     }
 
     /// Reads the page before a random message of a chat.
@@ -139,10 +147,12 @@ public class ChatPageBenchmark {
     public void olderPage(Blackhole blackhole) throws IOException {
         var index = ThreadLocalRandom.current().nextInt(corpus.messages());
         var chat = corpus.chat(index);
-        var before = corpus.messageKey(chat, corpus.sequence(index));
-        store.engine().scan(Keyspace.MESSAGES, Corpus.chatStart(chat), before, true, PAGE, (key, value) -> {
+        var sequence = corpus.sequence(index);
+        var before = corpus.messageKey(chat, sequence);
+        var read = store.engine().scan(Keyspace.MESSAGES, Corpus.chatStart(chat), before, true, PAGE, (key, value) -> {
             blackhole.consume(value);
             return true;
         });
+        expect(read == Math.min(PAGE, sequence), chat, read);
     }
 }
