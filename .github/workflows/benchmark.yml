@@ -28,8 +28,9 @@ on:
 permissions:
   contents: read
 
+# Runs of different groups use different runners and go side by side; a second run of the same selection waits
 concurrency:
-  group: benchmark
+  group: benchmark-${{ inputs.group }}-${{ inputs.os }}
   cancel-in-progress: false
 
 defaults:
