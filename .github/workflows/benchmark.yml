@@ -45,18 +45,9 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(inputs.os == 'all' && '["ubuntu-latest","windows-latest","macos-latest"]' || format('["{0}"]', inputs.os)) }}
+        # The groups' patterns live in the run step: matrix include entries for groups a dispatch leaves out would
+        # become jobs of their own, without an OS
         group: ${{ fromJSON(inputs.group == 'all' && '["commit","ingest","read","limits-write","limits-query"]' || format('["{0}"]', inputs.group)) }}
-        include:
-          - group: commit
-            pattern: 'cobalt\.(DurableCommit|GroupCommit|OfflineDrain|WebhookInbox)Benchmark'
-          - group: ingest
-            pattern: 'cobalt\.(HistoryIngest|AppStateSync|ChatDelete)Benchmark'
-          - group: read
-            pattern: 'cobalt\.(ChatPage|MessageLookup|Reopen)Benchmark'
-          - group: limits-write
-            pattern: 'limits\.(RandomOverwrite|ParallelWriters|PinnedReader|LargeValue)Benchmark'
-          - group: limits-query
-            pattern: 'limits\.(AdHocQuery|SqlIndexQuery|MultiProcessWriters)Benchmark'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -95,11 +86,19 @@ jobs:
       - name: Run the workloads
         env:
           LEDGER_BENCH_DIR: ${{ runner.temp }}/bench
-          PATTERN: ${{ matrix.pattern }}
+          GROUP: ${{ matrix.group }}
           JMH_ARGS: ${{ inputs.jmh-args }}
           RESULTS: results/${{ matrix.os }}.json
           LOG: results/${{ matrix.os }}.log
         run: |
+          case "$GROUP" in
+            commit) PATTERN='cobalt\.(DurableCommit|GroupCommit|OfflineDrain|WebhookInbox)Benchmark' ;;
+            ingest) PATTERN='cobalt\.(HistoryIngest|AppStateSync|ChatDelete)Benchmark' ;;
+            read) PATTERN='cobalt\.(ChatPage|MessageLookup|Reopen)Benchmark' ;;
+            limits-write) PATTERN='limits\.(RandomOverwrite|ParallelWriters|PinnedReader|LargeValue)Benchmark' ;;
+            limits-query) PATTERN='limits\.(AdHocQuery|SqlIndexQuery|MultiProcessWriters)Benchmark' ;;
+            *) echo "::error::Unknown group $GROUP"; exit 1 ;;
+          esac
           mkdir -p results
           # JMH_ARGS is split into words on purpose
           java -jar benchmark/target/benchmarks.jar "$PATTERN" -foe false -rf json -rff "$RESULTS" $JMH_ARGS 2>&1 | tee "$LOG"
