@@ -256,7 +256,9 @@ class MemoryLedgerTest {
             var failures = new ConcurrentLinkedQueue<String>();
             var transfers = new AtomicLong();
             var checks = new AtomicLong();
-            try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            // Platform threads: the readers never block, and virtual ones would hold every carrier of a small machine,
+            // leaving the writers the lock wakes nowhere to run
+            try (var executor = Executors.newThreadPerTaskExecutor(Thread.ofPlatform().daemon().factory())) {
                 for (var writer = 0; writer < 8; writer++) {
                     executor.execute(() -> {
                         var random = ThreadLocalRandom.current();
