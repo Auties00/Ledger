@@ -1,0 +1,79 @@
+# Pushes and pull requests: builds the benchmark and runs every workload once on small data on each OS, so a broken
+# adapter or a native library missing on one platform shows up before a full run.
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  smoke:
+    name: smoke on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '26'
+          cache: maven
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Build
+        run: mvn -B -ntp package
+
+      # One short iteration of every workload; -foe stops at the first failure and fails the step.
+      - name: Run every workload once
+        env:
+          LEDGER_BENCH_DIR: ${{ runner.temp }}/bench
+        run: |
+          mkdir -p results
+          java -jar benchmark/target/benchmarks.jar -wi 0 -i 1 -r 1s -f 1 -foe true \
+            -p messages=20000 -p keys=100000 -p valueSize=1048576 -p committers=8 -p processes=2 \
+            -p backgroundWrites=100 -p batchSize=1000 \
+            -rf json -rff results/smoke.json 2>&1 | tee results/smoke.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Summarize
+        if: always() && hashFiles('results/smoke.json') != ''
+        run: |
+          {
+            echo "## Smoke run on ${{ matrix.os }}"
+            echo
+            echo "One one-second iteration on small data: it shows that every workload runs, not how fast."
+            echo
+            python .github/scripts/summarize.py results/smoke.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.os }}
+          path: results/
+          retention-days: 14
