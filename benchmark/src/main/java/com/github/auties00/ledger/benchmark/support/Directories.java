@@ -1,7 +1,6 @@
 package com.github.auties00.ledger.benchmark.support;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -23,20 +22,26 @@ public final class Directories {
         if (!Files.exists(directory)) {
             return 0;
         }
-        try (var files = Files.walk(directory)) {
-            return files.filter(Files::isRegularFile).mapToLong(file -> {
-                try {
-                    return Files.size(file);
-                } catch (NoSuchFileException _) {
-                    // Engines delete files while they compact
-                    return 0;
-                } catch (IOException exception) {
-                    throw new UncheckedIOException(exception);
+        var total = new long[1];
+        Files.walkFileTree(directory, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                if (attrs.isRegularFile()) {
+                    total[0] += attrs.size();
                 }
-            }).sum();
-        } catch (UncheckedIOException exception) {
-            throw exception.getCause();
-        }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path file, IOException exception) throws IOException {
+                // Engines delete files while they compact, between the listing and the visit
+                if (exception instanceof NoSuchFileException) {
+                    return FileVisitResult.CONTINUE;
+                }
+                throw exception;
+            }
+        });
+        return total[0];
     }
 
     /// Copies the tree under `source` to `target`, which must not exist.
