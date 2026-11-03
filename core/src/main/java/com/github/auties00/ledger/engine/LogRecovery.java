@@ -26,6 +26,9 @@ import java.util.zip.CRC32C;
 /// A segment's header is forced before its first frame is written, so a last segment no longer than its header is a
 /// crash during its creation, and is deleted. Any other segment whose header is damaged, or names another store,
 /// another number or another encryption, is refused.
+///
+/// A store with a checkpoint replays the log from the segment its superblock names, skipping the commits its trees
+/// hold; earlier segments hold nothing later, and are deleted.
 final class LogRecovery {
     private LogRecovery() {
     }
@@ -44,15 +47,17 @@ final class LogRecovery {
     record Result(long lastSequence, long lastSegment) {
     }
 
-    /// Replays every segment of `directory`.
+    /// Replays the segments of `directory` from `firstSegment`, deleting those before it.
     ///
+    /// @param checkpoint the sequence of the last commit the checkpoint holds, or 0; commits up to it are skipped
     /// @throws IOException if a segment cannot be read
     /// @throws LedgerCorruptedException if a segment belongs to another store, or acknowledged data is damaged
-    static Result replay(Path directory, StoreKeys keys, byte[] storeId, Sink sink) throws IOException {
+    static Result replay(Path directory, StoreKeys keys, byte[] storeId, long firstSegment, long checkpoint, Sink sink) throws IOException {
+        deleteSegmentsBefore(directory, firstSegment);
         var segments = segments(directory);
         var cipher = cipher(keys);
         var crc = new CRC32C();
-        var last = 0L;
+        var last = checkpoint;
         var lastSegment = 0L;
         for (var index = 0; index < segments.size(); index++) {
             var number = segments.get(index);
@@ -71,7 +76,9 @@ final class LogRecovery {
                 throw new LedgerCorruptedException(path + " is not a segment of this store", null);
             }
             lastSegment = number;
-            var segmentKey = keys.encrypted() ? keys.segmentKey(storeId, number) : null;
+            var segmentKey = keys.encrypted()
+                    ? keys.segmentKey(storeId, number, Arrays.copyOfRange(data, LogWriter.SALT_OFFSET, LogWriter.SALT_OFFSET + LogWriter.SALT_BYTES))
+                    : null;
             var position = LogWriter.SEGMENT_HEADER;
             var afterPadding = false;
             while (position + LogWriter.FRAME_HEADER <= data.length) {
@@ -107,6 +114,11 @@ final class LogRecovery {
                 }
                 switch (type) {
                     case FrameBody.COMMIT -> {
+                        if (sequence <= checkpoint) {
+                            // Held by the checkpoint's trees
+                            position = (int) end;
+                            continue;
+                        }
                         if (sequence != last + 1) {
                             throw new LedgerCorruptedException(path + " holds commit " + sequence + " after commit " + last, null);
                         }
@@ -114,7 +126,7 @@ final class LogRecovery {
                         last = sequence;
                     }
                     case FrameBody.CATALOG -> {
-                        if (sequence != last) {
+                        if (sequence > last) {
                             throw new LedgerCorruptedException(path + " holds a catalog at " + sequence + " after commit " + last, null);
                         }
                         FrameBody.readCatalog(body, sink::catalog);
@@ -125,6 +137,16 @@ final class LogRecovery {
             }
         }
         return new Result(last, lastSegment);
+    }
+
+    /// Deletes the segments of `directory` numbered below `first`, which a durable checkpoint made obsolete.
+    static void deleteSegmentsBefore(Path directory, long first) throws IOException {
+        for (var number : segments(directory)) {
+            if (number >= first) {
+                break;
+            }
+            Files.deleteIfExists(directory.resolve(LogWriter.segmentName(number)));
+        }
     }
 
     private static List<Long> segments(Path directory) throws IOException {
@@ -166,10 +188,10 @@ final class LogRecovery {
         }
         var header = ByteBuffer.wrap(data);
         crc.reset();
-        crc.update(data, 0, 40);
+        crc.update(data, 0, LogWriter.HEADER_CRC_OFFSET);
         return header.getLong(0) == LogWriter.SEGMENT_MAGIC
                 && header.getInt(8) == LogWriter.SEGMENT_VERSION
-                && header.getInt(40) == (int) crc.getValue();
+                && header.getInt(LogWriter.HEADER_CRC_OFFSET) == (int) crc.getValue();
     }
 
     /// {@return whether the intact segment header of `data` names this store, its encryption and `number`}

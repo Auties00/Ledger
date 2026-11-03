@@ -2,11 +2,13 @@ package com.github.auties00.ledger.engine;
 
 import com.github.auties00.ledger.Commit;
 import com.github.auties00.ledger.Entry;
+import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.Snapshot;
 import com.github.auties00.ledger.Transaction;
+import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.WriteBatch;
 
 import java.lang.foreign.MemorySegment;
@@ -20,24 +22,30 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.TreeSet;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
-/// A store whose entries live in memory: the engine of [Ledger.Builder#memory()], and the part of every store that
-/// holds the writes since its last checkpoint. A store in a directory also journals every commit to a [LogWriter],
-/// and replays the log into memory when it opens.
+/// A store: the engine of [Ledger.Builder#memory()], and of a store in a directory, which also journals every commit
+/// to a [LogWriter] and checkpoints it into the trees of a [PageFile].
 ///
 /// One writer at a time applies a commit under [#writeLock], stamping its writes, then publishes it by advancing
 /// [#latest]; readers see a commit whole or not at all. After each commit the writer prunes the versions no reader can
 /// need any more, applies the range removals every reader has passed, and sweeps a few keys of the whole store.
+///
+/// A store in a directory reads each key space's tree under the writes in memory ([ReadPoint]). Once every reader's
+/// tree holds a version, the writer drops it from memory, except in resident key spaces, which keep every entry; a
+/// range removal stays as a record while a reader's tree may hold keys it removed.
 public final class LiveLedger implements Ledger {
     private static final int READER_SLOTS = 256;
     private static final int SWEEP_BUDGET = 64;
+    private static final int PRUNE_CHUNK = 1_024;
 
     private final Map<String, KeyspaceState> states;
-    private final List<KeyspaceState> sweepOrder;
+    private List<KeyspaceState> sweepOrder;
     private final Map<String, Keyspace<?, ?>> keyspaces;
     private final HeapPool pool;
     private final ReentrantLock writeLock;
@@ -51,6 +59,11 @@ public final class LiveLedger implements Ledger {
     private int maxId;
     private LogWriter log;
     private AutoCloseable[] resources;
+    private PageFile pages;
+    private FreeSpace space;
+    private Checkpointer checkpointer;
+    // The trees of the latest published checkpoint, or null
+    private volatile TreeVersion tree;
 
     /// Creates an empty store with `keyspaces`.
     ///
@@ -72,13 +85,57 @@ public final class LiveLedger implements Ledger {
         this.resources = new AutoCloseable[0];
     }
 
-    /// Records that the log knows the key space `name` as `id`; key spaces the store was not opened with are ignored.
+    /// Makes this store one in a directory, whose checkpoints are in `pages`; called before anything is recovered.
+    void useDataFile(PageFile pages, FreeSpace space) {
+        this.pages = pages;
+        this.space = space;
+    }
+
+    /// Records that the store knows the key space `name` as `id`.
+    ///
+    /// A key space the store was not opened with is kept as a hidden one, so its entries survive the checkpoints of
+    /// this open.
     void bind(int id, String name) {
         maxId = Math.max(maxId, id);
         var state = states.get(name);
-        if (state != null) {
-            state.id = id;
-            byId.put(id, state);
+        if (state == null) {
+            if (pages == null) {
+                return;
+            }
+            state = new KeyspaceState(Keyspace.paged(name, KeyCodec.bytes(), ValueCodec.bytes()));
+            states.put(name, state);
+            sweepOrder = List.copyOf(states.values());
+        }
+        state.id = id;
+        byId.put(id, state);
+    }
+
+    /// Starts from the checkpoint `superblock` names, whose catalog is `catalog`: binds its key spaces, publishes its
+    /// trees and loads the entries of the resident key spaces.
+    void loadCheckpoint(Superblock superblock, Catalog.Contents catalog) {
+        maxId = Math.max(maxId, catalog.maxId());
+        var roots = new TreeRoot[catalog.maxId() + 1];
+        for (var entry : catalog.entries()) {
+            bind(entry.id(), entry.name());
+            roots[entry.id()] = entry.root();
+        }
+        var sequence = superblock.sequence();
+        tree = new TreeVersion(superblock.number(), sequence, sequence, roots, superblock.catalog(), superblock.freeList(), null);
+        latest = sequence;
+        nextSequence = sequence + 1;
+        var stamp = Reads.stamp(sequence, 0);
+        for (var entry : catalog.entries()) {
+            var state = byId.get(entry.id());
+            state.counts.clear();
+            state.counts.put(sequence, entry.root() == null ? 0 : entry.root().count());
+            if (!state.resident || entry.root() == null) {
+                continue;
+            }
+            var cursor = new TreeCursor(pages, entry.root(), null, null, false);
+            while (cursor.next()) {
+                var value = cursor.value();
+                state.entries.put(cursor.key(), new Version(stamp, value, state.keyspace.values().decode(value), null));
+            }
         }
     }
 
@@ -114,7 +171,7 @@ public final class LiveLedger implements Ledger {
         nextSequence = sequence + 1;
     }
 
-    /// Gives an id to every key space the log does not know yet.
+    /// Gives an id to every key space the store does not know yet.
     ///
     /// @return the body of the catalog frame naming them, or `null` if there is none
     FrameBody assignIds() {
@@ -132,10 +189,11 @@ public final class LiveLedger implements Ledger {
         return catalog;
     }
 
-    /// Starts journaling to `log`, which holds every commit replayed so far, and makes the store close `resources`
-    /// after the log when it closes.
-    void attach(LogWriter log, FrameBody catalog, AutoCloseable... resources) {
+    /// Starts journaling to `log`, which holds every commit replayed so far, checkpointing through `checkpointer`, and
+    /// makes the store close `resources` after the log when it closes.
+    void attach(LogWriter log, FrameBody catalog, Checkpointer checkpointer, AutoCloseable... resources) {
         this.log = log;
+        this.checkpointer = checkpointer;
         this.resources = resources;
         if (catalog != null) {
             log.append(FrameBody.CATALOG, latest, catalog);
@@ -170,13 +228,34 @@ public final class LiveLedger implements Ledger {
         return log;
     }
 
+    /// {@return the trees of the latest published checkpoint, or `null`}
+    TreeVersion tree() {
+        return tree;
+    }
+
+    /// {@return what a read registered at `sequence` sees}
+    ///
+    /// The read must be registered before the call, so the tree it takes stays pinned.
+    ReadPoint point(long sequence) {
+        var version = tree;
+        while (version != null && version.sequence > sequence) {
+            version = version.older;
+        }
+        return new ReadPoint(Reads.boundOf(sequence), version, pages);
+    }
+
+    /// {@return what the writer sees at `bound`, over the latest trees}
+    ReadPoint writerPoint(long bound) {
+        return new ReadPoint(bound, tree, pages);
+    }
+
     @Override
     public <K, V> Optional<V> get(Keyspace<K, V> keyspace, K key) {
         ensureOpen();
         var state = state(keyspace);
         var lease = readers.enter();
         try {
-            return Reads.get(state, keyspace, key, Reads.boundOf(lease.sequence()));
+            return Reads.get(state, keyspace, key, point(lease.sequence()));
         } finally {
             readers.exit(lease);
         }
@@ -188,7 +267,7 @@ public final class LiveLedger implements Ledger {
         var state = state(keyspace);
         var lease = readers.enter();
         try {
-            return Reads.range(state, keyspace, range, limit, Reads.boundOf(lease.sequence()));
+            return Reads.range(state, keyspace, range, limit, point(lease.sequence()));
         } finally {
             readers.exit(lease);
         }
@@ -200,7 +279,7 @@ public final class LiveLedger implements Ledger {
         var state = state(keyspace);
         var lease = readers.enter();
         try {
-            return Reads.forEach(state, keyspace, range, Reads.boundOf(lease.sequence()), visitor);
+            return Reads.forEach(state, keyspace, range, point(lease.sequence()), visitor);
         } finally {
             readers.exit(lease);
         }
@@ -212,7 +291,7 @@ public final class LiveLedger implements Ledger {
         var state = state(keyspace);
         var lease = readers.enter();
         try {
-            return Reads.first(state, keyspace, range, Reads.boundOf(lease.sequence()));
+            return Reads.first(state, keyspace, range, point(lease.sequence()));
         } finally {
             readers.exit(lease);
         }
@@ -224,7 +303,7 @@ public final class LiveLedger implements Ledger {
         var state = state(keyspace);
         var lease = readers.enter();
         try {
-            return Reads.readEncoded(state, keyspace, key, Reads.boundOf(lease.sequence()), reader);
+            return Reads.readEncoded(state, keyspace, key, point(lease.sequence()), reader);
         } finally {
             readers.exit(lease);
         }
@@ -237,7 +316,7 @@ public final class LiveLedger implements Ledger {
         var state = state(keyspace);
         var lease = readers.enter();
         try {
-            return Reads.forEachEncoded(state, keyspace, range, Reads.boundOf(lease.sequence()), visitor);
+            return Reads.forEachEncoded(state, keyspace, range, point(lease.sequence()), visitor);
         } finally {
             readers.exit(lease);
         }
@@ -269,6 +348,7 @@ public final class LiveLedger implements Ledger {
             return ticket(latest);
         }
         checkNotInTransaction();
+        Commit commit;
         writeLock.lock();
         try {
             ensureOpen();
@@ -289,7 +369,7 @@ public final class LiveLedger implements Ledger {
                     }
                 }
             } catch (RuntimeException | Error throwable) {
-                // A resident value whose decoder throws stops the batch: none of its writes apply
+                // A resident value whose decoder throws, or a tree that cannot be read, stops the batch
                 applier.rollback();
                 throw throwable;
             }
@@ -297,10 +377,12 @@ public final class LiveLedger implements Ledger {
             writes.detach();
             var sequence = applier.publish();
             nextSequence++;
-            return ticket(sequence);
+            commit = ticket(sequence);
         } finally {
             writeLock.unlock();
         }
+        afterCommit();
+        return commit;
     }
 
     private static Object residentValue(KeyspaceState state, Object decoded, MemorySegment value) {
@@ -312,6 +394,7 @@ public final class LiveLedger implements Ledger {
         Objects.requireNonNull(transaction, "transaction");
         ensureOpen();
         checkNotInTransaction();
+        Commit commit;
         writeLock.lock();
         try {
             ensureOpen();
@@ -328,9 +411,17 @@ public final class LiveLedger implements Ledger {
             }
             var sequence = applier.publish();
             nextSequence++;
-            return ticket(sequence);
+            commit = ticket(sequence);
         } finally {
             writeLock.unlock();
+        }
+        afterCommit();
+        return commit;
+    }
+
+    private void afterCommit() {
+        if (checkpointer != null) {
+            checkpointer.maybeStart();
         }
     }
 
@@ -367,10 +458,23 @@ public final class LiveLedger implements Ledger {
     @Override
     public void checkpoint() {
         ensureOpen();
+        if (checkpointer != null) {
+            checkpointer.run(false);
+        }
     }
 
     @Override
     public void close() {
+        close(true);
+    }
+
+    /// Closes the store as a process that stopped once its commits were durable would leave it: without a final
+    /// checkpoint, so the next open replays the log. For tests of recovery.
+    void closeWithoutCheckpoint() {
+        close(false);
+    }
+
+    private void close(boolean checkpoint) {
         writeLock.lock();
         try {
             if (closed) {
@@ -384,25 +488,177 @@ public final class LiveLedger implements Ledger {
             if (log != null) {
                 log.close();
             }
+            if (checkpoint && checkpointer != null) {
+                checkpointer.run(true);
+            }
         } finally {
             for (var resource : resources) {
                 try {
                     resource.close();
                 } catch (Exception exception) {
-                    // Everything is durable by now: a lock or pool that fails to close loses nothing
+                    // Everything is durable by now: a file, lock or pool that fails to close loses nothing
                 }
             }
         }
     }
 
+    /// The writes a checkpoint takes: everything up to its sequence, cut from the store under the writer lock.
+    ///
+    /// @param sequence the sequence of the last commit the checkpoint holds
+    /// @param logStart the first log segment a later commit may be in
+    /// @param logBytes the bytes the log had queued at the cut
+    /// @param base the trees the checkpoint updates, or `null`
+    /// @param maxId the highest key space id
+    /// @param keyspaces what changed in each key space
+    record Cut(long sequence, long logStart, long logBytes, TreeVersion base, int maxId, List<KeyspaceCut> keyspaces) {
+    }
+
+    /// What changed in one key space since the last checkpoint.
+    ///
+    /// @param state the key space
+    /// @param dirty the keys written
+    /// @param removals the range removals as of the cut
+    /// @param count the entries as of the cut
+    record KeyspaceCut(KeyspaceState state, TreeSet<MemorySegment> dirty, RangeRemoval[] removals, long count) {
+    }
+
+    /// Cuts the writes of a checkpoint and registers a read at its sequence, which keeps the versions it needs until
+    /// [ReaderTable#unregister(long)].
+    ///
+    /// @param logStart the first log segment a commit after the cut may be in
+    /// @return the cut, or `null` if no commit was made since the last checkpoint
+    Cut cutCheckpoint(LongSupplier logStart) {
+        writeLock.lock();
+        try {
+            var base = tree;
+            var sequence = latest;
+            if (sequence == (base == null ? 0 : base.sequence)) {
+                return null;
+            }
+            var registered = readers.register();
+            if (registered != sequence) {
+                throw new IllegalStateException("The latest sequence moved under the writer lock");
+            }
+            var cuts = new ArrayList<KeyspaceCut>(states.size());
+            for (var state : states.values()) {
+                cuts.add(new KeyspaceCut(state, state.dirty, state.removals, state.count(sequence)));
+                state.dirty = new TreeSet<>(Segments.UNSIGNED);
+            }
+            return new Cut(sequence, logStart.getAsLong(), log.appendedBytes(), base, maxId, cuts);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /// Gives a checkpoint that failed its keys back, so the next one writes them.
+    void restoreCut(Cut cut) {
+        writeLock.lock();
+        try {
+            for (var keyspace : cut.keyspaces()) {
+                keyspace.state().dirty.addAll(keyspace.dirty());
+            }
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /// {@return the key spaces as a checkpoint's catalog records them, with `roots` by id}
+    List<Catalog.Entry> catalog(Cut cut, TreeRoot[] roots) {
+        var entries = new ArrayList<Catalog.Entry>(cut.keyspaces().size());
+        for (var keyspace : cut.keyspaces()) {
+            var id = keyspace.state().id;
+            entries.add(new Catalog.Entry(id, keyspace.state().keyspace.name(), id < roots.length ? roots[id] : null));
+        }
+        return entries;
+    }
+
+    /// Publishes the trees of a checkpoint made durable: later reads use them, and the units it freed wait for the
+    /// reads of the trees before it.
+    void publish(Cut cut, long number, TreeRoot[] roots, PageRef catalog, PageRef freeList, List<PageRef> freed) {
+        writeLock.lock();
+        try {
+            tree = new TreeVersion(number, cut.sequence(), latest, roots, catalog, freeList, tree);
+            space.pend(latest, freed);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /// Drops from memory the versions of the keys a published checkpoint wrote that every reader's tree holds, a few
+    /// keys per hold of the writer lock.
+    void pruneCut(Cut cut) {
+        for (var keyspace : cut.keyspaces()) {
+            var state = keyspace.state();
+            if (state.resident) {
+                continue;
+            }
+            var keys = keyspace.dirty().iterator();
+            while (keys.hasNext()) {
+                writeLock.lock();
+                try {
+                    var bounds = bounds(readers.active());
+                    var floor = floor(readers.oldest());
+                    for (var i = 0; i < PRUNE_CHUNK && keys.hasNext(); i++) {
+                        prune(state, keys.next(), bounds, Reads.boundOf(floor));
+                    }
+                } finally {
+                    writeLock.unlock();
+                }
+            }
+        }
+    }
+
+    private static long[] bounds(long[] active) {
+        var bounds = new long[active.length];
+        for (var i = 0; i < active.length; i++) {
+            bounds[i] = Reads.boundOf(active[i]);
+        }
+        return bounds;
+    }
+
+    /// {@return the sequence of the checkpoint every reader's tree holds, present and future: the trees in memory
+    /// above it hold nothing older, or 0 if some reader may read no tree}
+    ///
+    /// A read at `s` uses at least the newest tree published before `s`; reads that start later use the latest tree.
+    private long floor(long oldestReader) {
+        var current = tree;
+        if (current == null) {
+            return 0;
+        }
+        if (oldestReader == Long.MAX_VALUE) {
+            return current.sequence;
+        }
+        for (var version = current; version != null; version = version.older) {
+            if (version.published < oldestReader) {
+                return version.sequence;
+            }
+        }
+        return 0;
+    }
+
+    /// Lets go of the trees, and the pages, no reader can use any more.
+    private void releaseTrees(long oldestReader) {
+        if (space == null) {
+            return;
+        }
+        space.releasePassed(oldestReader);
+        for (var version = tree; version != null; version = version.older) {
+            if (version.published < oldestReader) {
+                version.older = null;
+                break;
+            }
+        }
+    }
+
     /// Unlinks the versions of `key` that no reader can see: it keeps, for each bound of `bounds`, the newest version
-    /// at or below it, and removes the key once all it keeps is a removal.
+    /// at or below it, and removes the key once all it keeps is a removal. In a paged key space with a tree, it also
+    /// cuts the versions at or below `cutBound`, which every reader's tree holds.
     ///
     /// A reader walking the chain while it changes is not disturbed: an unlinked version keeps its own link to the
     /// versions after it, and no reader needs the versions that leaves out.
     ///
     /// @param bounds the bounds of every active reader, highest first; the first covers the newest version
-    private static void prune(KeyspaceState state, MemorySegment key, long[] bounds) {
+    private void prune(KeyspaceState state, MemorySegment key, long[] bounds, long cutBound) {
         var head = state.entries.get(key);
         if (head == null) {
             return;
@@ -427,13 +683,33 @@ public final class LiveLedger implements Ledger {
             return;
         }
         kept.older = null;
-        if (kept == head && head.removes()) {
-            state.entries.remove(key, head);
+        if (pages == null || state.resident) {
+            // Memory holds every entry: a key whose only version is a removal has none
+            if (kept == head && head.removes()) {
+                state.entries.remove(key, head);
+            }
+            return;
+        }
+        // A removal stays until the trees hold it, since it hides what they hold; then, like any version, it leaves
+        Version previous = null;
+        for (var cut = head; cut != null; cut = cut.older) {
+            if (cut.stamp <= cutBound) {
+                if (previous == null) {
+                    state.entries.remove(key, head);
+                } else {
+                    previous.older = null;
+                }
+                return;
+            }
+            previous = cut;
         }
     }
 
-    /// Applies to the entries the range removals every reader has passed, then drops them.
-    private static void applyRemovals(KeyspaceState state, long bound) {
+    /// Applies to the entries in memory the range removals every reader has passed, and drops the records of those
+    /// no reader's tree, nor the next checkpoint, needs.
+    ///
+    /// @param dropBound the stamps at or below which a record goes
+    private static void applyRemovals(KeyspaceState state, long bound, long dropBound) {
         var removals = state.removals;
         if (removals.length == 0) {
             return;
@@ -444,19 +720,25 @@ public final class LiveLedger implements Ledger {
                 kept.add(removal);
                 continue;
             }
-            for (var entry : state.slice(removal.from(), removal.to()).entrySet()) {
-                var head = entry.getValue();
-                Version newest = null;
-                var version = head;
-                while (version != null && version.stamp > removal.stamp()) {
-                    newest = version;
-                    version = version.older;
+            if (!removal.applied) {
+                for (var entry : state.slice(removal.from(), removal.to()).entrySet()) {
+                    var head = entry.getValue();
+                    Version newest = null;
+                    var version = head;
+                    while (version != null && version.stamp > removal.stamp()) {
+                        newest = version;
+                        version = version.older;
+                    }
+                    if (newest == null) {
+                        state.entries.remove(entry.getKey(), head);
+                    } else {
+                        newest.older = null;
+                    }
                 }
-                if (newest == null) {
-                    state.entries.remove(entry.getKey(), head);
-                } else {
-                    newest.older = null;
-                }
+                removal.applied = true;
+            }
+            if (removal.stamp() > dropBound) {
+                kept.add(removal);
             }
         }
         // Published after the entries changed, so a reader without the removal sees its effect instead
@@ -466,14 +748,14 @@ public final class LiveLedger implements Ledger {
     }
 
     /// Prunes up to `budget` keys, resuming where the last sweep stopped.
-    private void sweep(long[] bounds, int budget) {
+    private void sweep(long[] bounds, long cutBound, int budget) {
         var visitedKeyspaces = 0;
         while (budget > 0 && visitedKeyspaces <= sweepOrder.size() && !sweepOrder.isEmpty()) {
             var state = sweepOrder.get(sweepIndex % sweepOrder.size());
             var keys = (sweepAfter == null ? state.entries : state.entries.tailMap(sweepAfter, false)).keySet().iterator();
             while (budget > 0 && keys.hasNext()) {
                 var key = keys.next();
-                prune(state, key, bounds);
+                prune(state, key, bounds, cutBound);
                 sweepAfter = key;
                 budget--;
             }
@@ -522,12 +804,15 @@ public final class LiveLedger implements Ledger {
 
         void put(KeyspaceState state, MemorySegment key, MemorySegment value, Object decoded) {
             var stamp = nextStamp();
+            var existed = Reads.exists(state, key, writerPoint(stamp - 1));
             var head = state.entries.get(key);
-            var existed = KeyspaceState.visible(head, key, stamp - 1, state.removals) != null;
             state.entries.put(key, new Version(stamp, value, decoded, head));
             touched.add(new Touched(state, key));
             if (!existed) {
                 deltas.merge(state, 1L, Long::sum);
+            }
+            if (pages != null) {
+                state.dirty.add(key);
             }
             if (frame != null) {
                 frame.put(state.id, key, value);
@@ -536,13 +821,16 @@ public final class LiveLedger implements Ledger {
 
         void delete(KeyspaceState state, MemorySegment key) {
             var stamp = nextStamp();
-            var head = state.entries.get(key);
-            if (KeyspaceState.visible(head, key, stamp - 1, state.removals) == null) {
+            if (!Reads.exists(state, key, writerPoint(stamp - 1))) {
                 return;
             }
+            var head = state.entries.get(key);
             state.entries.put(key, new Version(stamp, null, null, head));
             touched.add(new Touched(state, key));
             deltas.merge(state, -1L, Long::sum);
+            if (pages != null) {
+                state.dirty.add(key);
+            }
             if (frame != null) {
                 frame.delete(state.id, key);
             }
@@ -550,13 +838,8 @@ public final class LiveLedger implements Ledger {
 
         void deleteRange(KeyspaceState state, MemorySegment from, MemorySegment to) {
             var stamp = nextStamp();
+            var removed = Reads.count(state, from, to, writerPoint(stamp - 1));
             var removals = state.removals;
-            var removed = 0L;
-            for (var entry : state.slice(from, to).entrySet()) {
-                if (KeyspaceState.visible(entry.getValue(), entry.getKey(), stamp - 1, removals) != null) {
-                    removed++;
-                }
-            }
             removalsBefore.putIfAbsent(state, removals);
             var grown = Arrays.copyOf(removals, removals.length + 1);
             grown[removals.length] = new RangeRemoval(from, to, stamp);
@@ -592,6 +875,8 @@ public final class LiveLedger implements Ledger {
         }
 
         /// Takes back every write this commit applied; no reader saw them, since the commit was never published.
+        ///
+        /// The keys it wrote stay marked for the next checkpoint, which writes their unchanged state.
         void rollback() {
             for (var write : touched) {
                 var head = write.state().entries.get(write.key());
@@ -612,22 +897,25 @@ public final class LiveLedger implements Ledger {
 
         private void maintain() {
             var active = readers.active();
-            var bounds = new long[active.length];
-            for (var i = 0; i < active.length; i++) {
-                bounds[i] = Reads.boundOf(active[i]);
-            }
+            var bounds = bounds(active);
+            var oldestReader = readers.oldest();
+            var floor = floor(oldestReader);
+            releaseTrees(oldestReader);
+            var cutBound = Reads.boundOf(floor);
+            // Without a data file a record goes once applied; with one, once every reader's tree holds it
+            var dropBound = pages == null ? Long.MAX_VALUE : cutBound;
             var oldest = active[active.length - 1];
             for (var write : touched) {
-                prune(write.state(), write.key(), bounds);
+                prune(write.state(), write.key(), bounds, cutBound);
             }
             for (var state : states.values()) {
-                applyRemovals(state, bounds[bounds.length - 1]);
-                var floor = state.counts.floorKey(oldest);
-                if (floor != null) {
-                    state.counts.headMap(floor, false).clear();
+                applyRemovals(state, bounds[bounds.length - 1], dropBound);
+                var countFloor = state.counts.floorKey(oldest);
+                if (countFloor != null) {
+                    state.counts.headMap(countFloor, false).clear();
                 }
             }
-            sweep(bounds, SWEEP_BUDGET);
+            sweep(bounds, cutBound, SWEEP_BUDGET);
         }
     }
 

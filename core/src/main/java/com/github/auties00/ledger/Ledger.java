@@ -52,8 +52,9 @@ import java.util.function.Consumer;
 ///
 /// # Threading
 /// Every method may be called from any thread, virtual threads included. Calls that wait (a commit while the
-/// writer is busy, a wait for durability) park the calling thread without holding a carrier; the store does its
-/// I/O on the platform threads of its [IoPool].
+/// writer is busy, a wait for durability) park the calling thread without holding a carrier. The store writes and
+/// forces its log on the platform threads of its [IoPool], and writes the checkpoints it starts on its own on a
+/// platform thread of their own; a read of a page the cache does not hold reads the file on the calling thread.
 ///
 /// # Lifecycle
 /// A store holds an exclusive lock on its directory from [Options#build()] until [#close()]: one process, and one
