@@ -52,14 +52,22 @@ public class AdHocQueryBenchmark {
     public int messages;
 
     private Stores.Store store;
+    private int expected;
 
-    /// Opens a copy of the loaded store.
+    /// Opens a copy of the loaded store and counts the answer it must give.
     ///
     /// @throws IOException if the store cannot be built or opened
     @Setup(Level.Trial)
     public void open() throws IOException {
         var corpus = new Corpus(messages);
         store = Stores.loaded(EngineKind.of(engine), Stores.settingsFor(corpus), sealed, corpus);
+        var starred = 0;
+        for (var index = 0; index < corpus.messages(); index++) {
+            if (Corpus.starred(corpus.body(corpus.chat(index), corpus.sequence(index)))) {
+                starred++;
+            }
+        }
+        expected = Math.min(RESULTS, starred);
     }
 
     /// Closes the store and deletes it.
@@ -88,6 +96,9 @@ public class AdHocQueryBenchmark {
                     }
                     return true;
                 });
+        if (newest.size() != expected) {
+            throw new IllegalStateException("Found " + newest.size() + " starred messages, expected " + expected);
+        }
         return newest;
     }
 }
