@@ -117,10 +117,17 @@ final class FreeSpace {
     ///
     /// @return the new page count, or -1 if the file ends with a page in use
     int trim() {
+        return trim(0);
+    }
+
+    /// Ends the file before its trailing free pages, if there are at least `slack` of them.
+    ///
+    /// @return the new page count, or -1 if the file keeps its length
+    int trim(int slack) {
         synchronized (lock) {
             var last = free.previousClearBit(pageCount - 1);
             var end = Math.max(PageFormat.FIRST_UNIT_PAGE, last + 1);
-            if (end >= pageCount) {
+            if (end >= pageCount || pageCount - end < slack) {
                 return -1;
             }
             free.clear(end, pageCount);

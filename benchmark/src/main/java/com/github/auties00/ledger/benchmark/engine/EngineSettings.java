@@ -11,7 +11,7 @@ package com.github.auties00.ledger.benchmark.engine;
 ///                    have no such choice and ignore it
 public record EngineSettings(long cacheBytes, long expectedBytes, long largeValues) {
     /// The settings of every workload that does not choose its own.
-    public static final EngineSettings DEFAULT = new EngineSettings(256L << 20, 256L << 20, 256L << 10);
+    public static final EngineSettings DEFAULT = new EngineSettings(256L << 20, 256L << 20, 1L << 20);
 
     /// {@return these settings, expecting `bytes` of data}
     ///

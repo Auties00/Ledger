@@ -32,7 +32,7 @@ import java.util.function.Consumer;
 /// share the forces that make them durable, so a thousand threads waiting for durability cost the device about as
 /// much as one.
 ///
-/// A value of a batch at least [Options#largeValues(long)] long, 256 KiB by default, is written once, to a file of
+/// A value of a batch at least [Options#largeValues(long)] long, 1 MiB by default, is written once, to a file of
 /// its own, before the commit applies; its log frame records where it is, and the next checkpoint takes it from
 /// there. Other values reach the device twice, in the log and in a checkpoint.
 ///
@@ -228,7 +228,7 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         ///
         /// A large value then reaches the device once, which halves what a commit of one costs a device whose
         /// bandwidth is the limit. Such a commit forces that file beside the log, in parallel; a commit without one
-        /// forces the log only. Transactions keep their values in the log. The default is 256 KiB;
+        /// forces the log only. Transactions keep their values in the log. The default is 1 MiB;
         /// [Long#MAX_VALUE] writes every value to the log.
         ///
         /// @param bytes the size from which a value goes to its own file, at least 4 KiB

@@ -47,7 +47,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         this.segmentSize = SEGMENT_SIZE;
         this.backgroundFailures = _ -> {
         };
-        this.largeValues = 256 * 1024;
+        this.largeValues = MIB;
         this.largeValuesByKeyspace = new LinkedHashMap<>();
     }
 

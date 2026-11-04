@@ -43,6 +43,8 @@ public final class LiveLedger implements Ledger {
     private static final int READER_SLOTS = 256;
     private static final int SWEEP_BUDGET = 64;
     private static final int PRUNE_CHUNK = 1_024;
+    /// The dropped chains a commit takes out of the ordered maps, more than the sweep and its own writes drop.
+    private static final int COMMIT_REMOVALS = 256;
     /// The most threads a commit reads tree pages with before it takes the writer lock, about the queue depth that
     /// keeps a solid-state drive busy.
     private static final int PREFETCH_THREADS = 32;
@@ -570,9 +572,12 @@ public final class LiveLedger implements Ledger {
     }
 
     /// Finishes a commit's maintenance outside the writer lock, and starts a checkpoint if one is due.
+    ///
+    /// A commit takes out of the ordered maps as many dropped chains as a commit drops, not those of a checkpoint,
+    /// which the checkpoint takes out itself: a commit never pays for a whole checkpoint's.
     private void afterCommit() {
         for (var state : sweepOrder) {
-            state.removeDropped();
+            state.removeDropped(COMMIT_REMOVALS);
         }
         if (checkpointer != null) {
             checkpointer.maybeStart();
@@ -808,8 +813,8 @@ public final class LiveLedger implements Ledger {
                 } finally {
                     writeLock.unlock();
                 }
-                state.removeDropped();
             }
+            state.removeDropped();
         }
     }
 

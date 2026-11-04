@@ -4,9 +4,12 @@ import com.github.auties00.ledger.engine.TreeNodes.Child;
 import com.github.auties00.ledger.engine.TreeNodes.LeafEntry;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ForkJoinTask;
+import java.util.concurrent.RecursiveTask;
 
 /// Applies the writes of one checkpoint to a key space's tree, copy on write.
 ///
@@ -17,8 +20,12 @@ import java.util.List;
 /// a neighbour when both fit in one node.
 ///
 /// The units of the old tree the update replaces go to [#freed()]; the pages it takes go to [#allocated()], so a
-/// checkpoint that fails gives them back.
+/// checkpoint that fails gives them back. A branch with many writes below it updates its children's subtrees in
+/// parallel, in the common fork-join pool.
 final class TreeUpdate {
+    /// The writes below a branch from which its children's subtrees are updated on every processor.
+    private static final int PARALLEL_OPS = 4_096;
+
     private final PageFile pages;
     private final PageFile.Writer writer;
     private final FreeSpace space;
@@ -155,8 +162,9 @@ final class TreeUpdate {
             return writeLeaves(merged);
         }
         var children = TreeNodes.children(unit);
-        var out = new ArrayList<Child>(children.size() + 4);
-        var changed = false;
+        // What each child takes: none of the writes, a removal of all of it, or a share of them
+        var plans = new Plan[children.size()];
+        var updates = 0;
         var op = opFrom;
         var rem = remFrom;
         for (var i = 0; i < children.size(); i++) {
@@ -181,21 +189,31 @@ final class TreeUpdate {
             // A range reaching past this child may reach the next one too
             rem = Math.max(remStart, remEnd - 1);
             if (op == opEnd && remStart == remEnd) {
-                out.add(child);
+                plans[i] = null;
             } else if (op == opEnd && remEnd - remStart == 1 && covers(removals.get(remStart), child.firstKey(), childHigh)) {
-                drop(child);
-                changed = true;
+                plans[i] = Plan.DROP;
             } else {
-                var childUnit = read(child.ref(), PageFile.NODE, true);
-                var replaced = update(child, childUnit, childLow, childHigh, ops, op, opEnd, removals, remStart, remEnd);
-                if (replaced == null) {
-                    out.add(child);
-                } else {
-                    out.addAll(replaced);
-                    changed = true;
-                }
+                plans[i] = new Plan(childLow, childHigh, op, opEnd, remStart, remEnd);
+                updates++;
             }
             op = opEnd;
+        }
+        var replacements = updates > 1 && opTo - opFrom >= PARALLEL_OPS
+                ? updateInParallel(children, plans, ops, removals)
+                : updateInTurn(children, plans, ops, removals);
+        var out = new ArrayList<Child>(children.size() + 4);
+        var changed = false;
+        for (var i = 0; i < children.size(); i++) {
+            var child = children.get(i);
+            if (plans[i] == Plan.DROP) {
+                drop(child);
+                changed = true;
+            } else if (replacements[i] == null) {
+                out.add(child);
+            } else {
+                out.addAll(replacements[i]);
+                changed = true;
+            }
         }
         if (!changed) {
             return null;
@@ -203,6 +221,97 @@ final class TreeUpdate {
         mergeUnderfull(out);
         freed.add(node.ref());
         return out.isEmpty() ? List.of() : writeBranches(out);
+    }
+
+    /// {@return what replaces each child that `plans` gives a share of the writes to, `null` where nothing does}
+    @SuppressWarnings("unchecked")
+    private List<Child>[] updateInTurn(List<Child> children, Plan[] plans, List<Op> ops, List<Range> removals) throws IOException {
+        var replacements = (List<Child>[]) new List<?>[children.size()];
+        for (var i = 0; i < children.size(); i++) {
+            var plan = plans[i];
+            if (plan != null && plan != Plan.DROP) {
+                replacements[i] = update(children.get(i), ops, removals, plan);
+            }
+        }
+        return replacements;
+    }
+
+    /// Updates, on every processor, each child that `plans` gives a share of the writes to.
+    ///
+    /// Each subtree is a task with an update of its own, whose freed and taken units join this one's; the writer and
+    /// the free space are shared, and safe for concurrent use. A checkpoint of a write rate that rewrites most leaves
+    /// would otherwise rewrite them on one processor.
+    ///
+    /// @return what replaces each child, `null` where nothing does
+    @SuppressWarnings("unchecked")
+    private List<Child>[] updateInParallel(List<Child> children, Plan[] plans, List<Op> ops, List<Range> removals) throws IOException {
+        var replacements = (List<Child>[]) new List<?>[children.size()];
+        var tasks = new ArrayList<Subtree>();
+        for (var i = 0; i < children.size(); i++) {
+            var plan = plans[i];
+            if (plan != null && plan != Plan.DROP) {
+                tasks.add(new Subtree(i, new TreeUpdate(pages, writer, space), children.get(i), ops, removals, plan));
+            }
+        }
+        try {
+            ForkJoinTask.invokeAll(tasks);
+        } catch (UncheckedIOException exception) {
+            throw exception.getCause();
+        } finally {
+            // Whatever the tasks took, even those of a failed update, goes back if the checkpoint fails
+            for (var task : tasks) {
+                allocated.addAll(task.update.allocated);
+            }
+        }
+        for (var task : tasks) {
+            freed.addAll(task.update.freed);
+            freedExternal.addAll(task.update.freedExternal);
+            replacements[task.index] = task.getRawResult();
+        }
+        return replacements;
+    }
+
+    /// {@return the nodes that replace `child`, or `null` if the writes `plan` gives it change nothing under it}
+    private List<Child> update(Child child, List<Op> ops, List<Range> removals, Plan plan) throws IOException {
+        var unit = read(child.ref(), PageFile.NODE, true);
+        return update(child, unit, plan.low(), plan.high(), ops, plan.opFrom(), plan.opTo(), removals, plan.remFrom(), plan.remTo());
+    }
+
+    /// The share of the writes of one child of a branch.
+    ///
+    /// @param low the lowest key the child may hold, or `null`
+    /// @param high the first key past the child, or `null`
+    private record Plan(MemorySegment low, MemorySegment high, int opFrom, int opTo, int remFrom, int remTo) {
+        /// A child a removed range covers whole.
+        static final Plan DROP = new Plan(null, null, 0, 0, 0, 0);
+    }
+
+    /// The update of one subtree, run on a processor of its own.
+    private static final class Subtree extends RecursiveTask<List<Child>> {
+        private final int index;
+        private final TreeUpdate update;
+        private final Child child;
+        private final List<Op> ops;
+        private final List<Range> removals;
+        private final Plan plan;
+
+        Subtree(int index, TreeUpdate update, Child child, List<Op> ops, List<Range> removals, Plan plan) {
+            this.index = index;
+            this.update = update;
+            this.child = child;
+            this.ops = ops;
+            this.removals = removals;
+            this.plan = plan;
+        }
+
+        @Override
+        protected List<Child> compute() {
+            try {
+                return update.update(child, ops, removals, plan);
+            } catch (IOException exception) {
+                throw new UncheckedIOException(exception);
+            }
+        }
     }
 
     /// {@return the plaintext of the unit `ref` names: queued by this checkpoint, cached or in the file}

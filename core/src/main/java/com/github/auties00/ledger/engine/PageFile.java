@@ -13,6 +13,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.TreeMap;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.stream.IntStream;
 
 /// The data file of a store: its units, read through the page cache and verified against the reference that named
 /// them, and the superblocks.
@@ -332,7 +333,14 @@ final class PageFile implements AutoCloseable {
     ///
     /// Each unit gets the next nonce of the checkpoint: the checkpoint's random first 8 bytes and a counter. A queued
     /// unit is read back through [#staged(PageRef)], since the file does not hold it yet.
+    ///
+    /// It is safe for concurrent use, as the tasks of a checkpoint that rewrites its trees in parallel use it; a flush
+    /// seals its units on every processor.
     final class Writer {
+        /// The queued units from which a flush seals them on every processor.
+        private static final int PARALLEL_SEALS = 16;
+
+        private final Object lock;
         private final long nonceHigh;
         private int nonceLow;
         private final TreeMap<Integer, Staged> staged;
@@ -340,6 +348,7 @@ final class PageFile implements AutoCloseable {
         private long written;
 
         private Writer(long nonceHigh) {
+            this.lock = new Object();
             this.nonceHigh = nonceHigh;
             this.staged = new TreeMap<>();
         }
@@ -350,30 +359,34 @@ final class PageFile implements AutoCloseable {
         ///
         /// @return the reference of the unit
         PageRef write(byte kind, int level, int page, int pages, byte[] unit, int length, boolean cached) throws IOException {
-            if (nonceLow == -1) {
-                throw new IllegalStateException("A checkpoint ran out of nonces");
+            synchronized (lock) {
+                if (nonceLow == -1) {
+                    throw new IllegalStateException("A checkpoint ran out of nonces");
+                }
+                var ref = new PageRef(page, pages, nonceHigh, nonceLow++);
+                header(unit, kind, level, page, pages, length, ref.nonceHigh(), ref.nonceLow());
+                if (staged.put(page, new Staged(ref, unit)) != null) {
+                    throw new IllegalStateException("A checkpoint wrote page " + page + " twice");
+                }
+                stagedBytes += (long) pages * PageFormat.SIZE;
+                if (cached) {
+                    cache.put(ref, unit, false);
+                } else {
+                    cache.remove(page);
+                }
+                if (stagedBytes >= STAGED_LIMIT) {
+                    flush();
+                }
+                return ref;
             }
-            var ref = new PageRef(page, pages, nonceHigh, nonceLow++);
-            header(unit, kind, level, page, pages, length, ref.nonceHigh(), ref.nonceLow());
-            if (staged.put(page, new Staged(ref, unit)) != null) {
-                throw new IllegalStateException("A checkpoint wrote page " + page + " twice");
-            }
-            stagedBytes += (long) pages * PageFormat.SIZE;
-            if (cached) {
-                cache.put(ref, unit, false);
-            } else {
-                cache.remove(page);
-            }
-            if (stagedBytes >= STAGED_LIMIT) {
-                flush();
-            }
-            return ref;
         }
 
         /// {@return the plaintext of the queued unit `ref` names, or `null` if it is not queued}
         byte[] staged(PageRef ref) {
-            var entry = staged.get(ref.page());
-            return entry != null && entry.ref().equals(ref) ? entry.unit() : null;
+            synchronized (lock) {
+                var entry = staged.get(ref.page());
+                return entry != null && entry.ref().equals(ref) ? entry.unit() : null;
+            }
         }
 
         /// {@return the first 8 bytes of every nonce of this writer}
@@ -383,22 +396,38 @@ final class PageFile implements AutoCloseable {
 
         /// {@return the next nonce, for a unit written outside this writer}
         int nextNonce() {
-            return nonceLow++;
+            synchronized (lock) {
+                return nonceLow++;
+            }
         }
 
         /// Seals and writes every queued unit.
+        ///
+        /// The units leave the queue once they are written, so a read of one meanwhile still finds it there.
         void flush() throws IOException {
+            synchronized (lock) {
+                flushQueued();
+            }
+        }
+
+        private void flushQueued() throws IOException {
             var run = new ArrayList<ByteBuffer>();
-            var sealedUnits = new ArrayList<byte[]>(staged.size());
+            var entries = new ArrayList<>(staged.values());
+            var sealedUnits = new byte[entries.size()][];
             var runStart = -1L;
             var runEnd = -1L;
             try {
-                for (var entry : staged.values()) {
-                    var pages = entry.ref().pages();
-                    var length = pages * PageFormat.SIZE;
-                    var sealed = pool.acquire(length);
-                    sealedUnits.add(sealed);
-                    cipher.seal(entry.unit(), pages, sealed, 0);
+                var indexes = IntStream.range(0, entries.size());
+                (entries.size() < PARALLEL_SEALS ? indexes : indexes.parallel()).forEach(index -> {
+                    var entry = entries.get(index);
+                    var sealed = pool.acquire(entry.ref().pages() * PageFormat.SIZE);
+                    cipher.seal(entry.unit(), entry.ref().pages(), sealed, 0);
+                    sealedUnits[index] = sealed;
+                });
+                for (var index = 0; index < entries.size(); index++) {
+                    var entry = entries.get(index);
+                    var length = entry.ref().pages() * PageFormat.SIZE;
+                    var sealed = sealedUnits[index];
                     var start = PageFormat.offset(entry.ref().page());
                     if (start != runEnd && !run.isEmpty()) {
                         writeRun(run, runStart);
@@ -415,7 +444,9 @@ final class PageFile implements AutoCloseable {
                 }
             } finally {
                 for (var sealed : sealedUnits) {
-                    pool.release(sealed);
+                    if (sealed != null) {
+                        pool.release(sealed);
+                    }
                 }
             }
             written += stagedBytes;
@@ -437,16 +468,20 @@ final class PageFile implements AutoCloseable {
 
         /// {@return the bytes written or queued so far}
         long written() {
-            return written + stagedBytes;
+            synchronized (lock) {
+                return written + stagedBytes;
+            }
         }
 
         /// Drops every queued unit, for a checkpoint that failed.
         void discard() {
-            for (var entry : staged.values()) {
-                cache.remove(entry.ref().page());
+            synchronized (lock) {
+                for (var entry : staged.values()) {
+                    cache.remove(entry.ref().page());
+                }
+                staged.clear();
+                stagedBytes = 0;
             }
-            staged.clear();
-            stagedBytes = 0;
         }
     }
 
