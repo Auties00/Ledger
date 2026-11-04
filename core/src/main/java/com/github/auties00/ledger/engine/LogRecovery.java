@@ -33,6 +33,10 @@ import java.util.zip.CRC32C;
 /// A store with a checkpoint replays the log from the segment its superblock names, skipping the commits its trees
 /// hold; earlier segments hold nothing later, and become spares.
 ///
+/// A commit whose units of [BlobFile] the file does not hold whole ends its segment like a frame that fails
+/// authentication: its group was forced beside that file, and acknowledged only once both forces completed, so without a
+/// later group it is a commit no one was told of.
+///
 /// Segments are read through a buffer, a part at a time.
 final class LogRecovery {
     private static final int BUFFER = 1 << 20;
@@ -44,7 +48,12 @@ final class LogRecovery {
     interface Sink {
         void catalog(int keyspace, String name);
 
-        void commit(long sequence, byte[] body);
+        /// Replays the commit `sequence`, unless the file of large values lacks one of its units.
+        ///
+        /// @return whether it replayed the commit; it changed nothing if not
+        boolean commit(long sequence, byte[] body);
+
+        void epoch(int epoch);
     }
 
     /// What recovery found.
@@ -133,14 +142,17 @@ final class LogRecovery {
                         checkNoLaterGroup(reader, position, last, tag, crc, path);
                         break;
                     }
+                    var replayed = true;
                     switch (type) {
                         case FrameBody.COMMIT -> {
                             if (sequence > checkpoint) {
                                 if (sequence != last + 1) {
                                     throw new LedgerCorruptedException(path + " holds commit " + sequence + " after commit " + last, null);
                                 }
-                                sink.commit(sequence, body);
-                                last = sequence;
+                                replayed = sink.commit(sequence, body);
+                                if (replayed) {
+                                    last = sequence;
+                                }
                             }
                             // Otherwise held by the checkpoint's trees
                         }
@@ -150,7 +162,17 @@ final class LogRecovery {
                             }
                             FrameBody.readCatalog(body, sink::catalog);
                         }
+                        case FrameBody.EPOCH -> {
+                            if (sequence > last) {
+                                throw new LedgerCorruptedException(path + " holds an epoch at " + sequence + " after commit " + last, null);
+                            }
+                            sink.epoch(FrameBody.readEpoch(body));
+                        }
                         default -> throw new LedgerCorruptedException(path + " holds a frame of unknown type " + type, null);
+                    }
+                    if (!replayed) {
+                        checkNoLaterGroup(reader, position, last, tag, crc, path);
+                        break;
                     }
                     position = end;
                 }

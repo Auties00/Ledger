@@ -37,6 +37,8 @@ final class PageFormat {
     static final byte VALUE = 4;
     static final byte CATALOG = 5;
     static final byte FREE_LIST = 6;
+    /// A value of the file of large values, `ledger.blobs`.
+    static final byte EXTERNAL = 7;
 
     /// The first page a unit may use; pages 0 and 1 are the superblocks.
     static final int FIRST_UNIT_PAGE = 2;

@@ -30,7 +30,8 @@ import static org.junit.jupiter.api.Assertions.fail;
 /// part of a batch, and a store that keeps working, even when a second failure strikes during recovery.
 ///
 /// A dry run of each workload counts its file system changes and forces, so the stop lands anywhere in it, half the
-/// time at a force: in a commit, a checkpoint, a rollover, a close or an open.
+/// time at a force: in a commit, a checkpoint, a rollover, a close or an open. Half the workloads write their values of
+/// more than 4 KiB to the file of large values, whose force runs beside the log's.
 class CrashRecoveryTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.utf8());
@@ -81,19 +82,20 @@ class CrashRecoveryTest {
     private static void check(int seed, Encryption encryption, CrashFileSystem disk, boolean processCrash, Random random) throws Exception {
         var workload = new Workload(seed, encryption);
         workload.run(disk.getPath("/store"));
+        var largeValues = largeValues(seed);
         var survivor = processCrash ? disk.afterProcessCrash() : disk.afterPowerLoss(new Random(random.nextLong()));
         // A second failure, during the recovery itself
         var recoveryStop = random.nextInt(4) == 0 ? random.nextLong(40) : -1;
         if (recoveryStop >= 0) {
             survivor.stopAfter(recoveryStop);
-            try (var ledger = open(survivor.getPath("/store"), encryption)) {
+            try (var ledger = open(survivor.getPath("/store"), encryption, largeValues)) {
                 ledger.checkpoint();
             } catch (RuntimeException _) {
                 // The recovery stopped where it was told to
             }
             survivor = survivor.afterPowerLoss(new Random(random.nextLong()));
         }
-        try (var ledger = open(survivor.getPath("/store"), encryption)) {
+        try (var ledger = open(survivor.getPath("/store"), encryption, largeValues)) {
             var recovered = contents(ledger);
             var match = -1;
             for (var commit = workload.durable; commit <= workload.visible; commit++) {
@@ -109,19 +111,29 @@ class CrashRecoveryTest {
             for (var keyspace : KEYSPACES) {
                 assertEquals(recovered.get(keyspace.name()).size(), ledger.size(keyspace), keyspace.name() + " count");
             }
-            // The recovered store takes commits and checkpoints
-            ledger.commit(ledger.newBatch().put(MESSAGES, "after", "recovery").put(CHATS, "after", "recovery")).awaitDurable();
+            // The recovered store takes commits and checkpoints, a large value included
+            var large = "v".repeat(10_000);
+            ledger.commit(ledger.newBatch().put(MESSAGES, "after", "recovery").put(CHATS, "after", "recovery")
+                    .put(MESSAGES, "large", large)).awaitDurable();
             ledger.checkpoint();
         }
-        try (var ledger = open(survivor.getPath("/store"), encryption)) {
+        try (var ledger = open(survivor.getPath("/store"), encryption, largeValues)) {
             assertEquals("recovery", ledger.get(MESSAGES, "after").orElseThrow());
+            assertEquals(10_000, ledger.get(MESSAGES, "large").orElseThrow().length());
         }
+        CheckpointTest.verifyPages(survivor.getPath("/store"), encryption != Encryption.none());
     }
 
-    private static Ledger open(Path directory, Encryption encryption) {
-        return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(encryption).keyspace(MESSAGES).keyspace(CHATS))
+    private static Ledger open(Path directory, Encryption encryption, long largeValues) {
+        return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(encryption).keyspace(MESSAGES).keyspace(CHATS)
+                .largeValues(largeValues))
                 .segmentSize(16_384)
                 .build();
+    }
+
+    /// {@return the size from which the workload of `seed` writes values to the file of large values}
+    private static long largeValues(int seed) {
+        return seed % 4 < 2 ? 4_096 : Long.MAX_VALUE;
     }
 
     private static Map<String, TreeMap<String, String>> contents(Ledger ledger) {
@@ -142,6 +154,7 @@ class CrashRecoveryTest {
     private static final class Workload {
         private final Random random;
         private final Encryption encryption;
+        private final long largeValues;
         // The state after each commit, from the empty store
         final List<Map<String, TreeMap<String, String>>> history;
         final Map<String, TreeMap<String, String>> state;
@@ -151,6 +164,7 @@ class CrashRecoveryTest {
         Workload(int seed, Encryption encryption) {
             this.random = new Random(seed);
             this.encryption = encryption;
+            this.largeValues = largeValues(seed);
             this.history = new ArrayList<>();
             this.state = new TreeMap<>();
             for (var keyspace : KEYSPACES) {
@@ -163,7 +177,7 @@ class CrashRecoveryTest {
         void run(Path directory) {
             Ledger ledger = null;
             try {
-                ledger = open(directory, encryption);
+                ledger = open(directory, encryption, largeValues);
                 for (var step = 0; step < 70; step++) {
                     var choice = random.nextInt(25);
                     if (choice == 0) {
@@ -172,7 +186,7 @@ class CrashRecoveryTest {
                     } else if (choice == 1) {
                         ledger.close();
                         durable = visible;
-                        ledger = open(directory, encryption);
+                        ledger = open(directory, encryption, largeValues);
                     } else if (choice < 6) {
                         transaction(ledger);
                     } else {

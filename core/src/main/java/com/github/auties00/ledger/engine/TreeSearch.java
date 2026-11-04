@@ -65,8 +65,12 @@ final class TreeSearch {
     ///
     /// @param cached whether a blob read from the file goes to the cache
     static MemorySegment value(PageFile pages, byte[] unit, int entry, boolean cached) {
-        if (!TreeNodes.isBlob(unit, entry)) {
+        if (TreeNodes.isInline(unit, entry)) {
             return TreeNodes.inlineValue(unit, entry);
+        }
+        if (TreeNodes.isExternal(unit, entry)) {
+            var external = pages.blobs().read(TreeNodes.blobRef(unit, entry), cached);
+            return MemorySegment.ofArray(external).asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry)).asReadOnly();
         }
         var blob = pages.read(TreeNodes.blobRef(unit, entry), PageFormat.VALUE, cached);
         return MemorySegment.ofArray(blob).asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry)).asReadOnly();

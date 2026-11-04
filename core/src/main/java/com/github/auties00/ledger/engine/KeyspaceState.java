@@ -41,6 +41,8 @@ final class KeyspaceState {
     ArrayList<Chain> dirty;
     // The number of the cut `dirty` collects for, guarded by the writer lock
     private long dirtyCut;
+    // The bytes from which a value a batch puts goes to the file of large values, set while the store opens
+    long largeValues = Long.MAX_VALUE;
 
     KeyspaceState(Keyspace<?, ?> keyspace) {
         this.keyspace = keyspace;

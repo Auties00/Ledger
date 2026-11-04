@@ -54,6 +54,28 @@ final class FreeSpace {
         }
     }
 
+    /// Takes the `pages` pages from `page`, growing the file to reach them, while the store opens.
+    ///
+    /// @return whether they were all free
+    boolean claim(int page, int pages) {
+        synchronized (lock) {
+            if (page < PageFormat.FIRST_UNIT_PAGE) {
+                return false;
+            }
+            if (page + pages > pageCount) {
+                // Pages past the file are free; those between its end and the claim stay so
+                free.set(pageCount, page + pages);
+                pageCount = page + pages;
+            }
+            var taken = free.get(page, page + pages);
+            if (taken.cardinality() != pages) {
+                return false;
+            }
+            free.clear(page, page + pages);
+            return true;
+        }
+    }
+
     /// Makes the `pages` pages from `page` free at once.
     void release(int page, int pages) {
         synchronized (lock) {
