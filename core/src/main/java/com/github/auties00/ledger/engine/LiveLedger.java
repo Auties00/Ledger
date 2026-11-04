@@ -528,12 +528,13 @@ public final class LiveLedger implements Ledger {
         }
         writes.compact();
         var units = writeUnits(writes);
-        var outcome = new Applier[1];
+        // Needed only to release the units of large values no log frame names
+        var outcome = units == null ? null : new Applier[1];
         Commit commit;
         try {
             commit = rangeRemoval(writes) ? commitAlone(writes, units, outcome) : commitPipelined(writes, units, outcome);
         } finally {
-            if (units != null && (outcome[0] == null || !outcome[0].logged())) {
+            if (outcome != null && (outcome[0] == null || !outcome[0].logged())) {
                 // No log frame names them
                 for (var unit : units) {
                     if (unit != null) {
@@ -559,7 +560,7 @@ public final class LiveLedger implements Ledger {
     /// Commits `writes`, which holds a range removal, as an exclusive operation: the removal counts the keys it
     /// removes, which needs every commit before it applied and none after it started.
     ///
-    /// @param outcome receives the writes as applied
+    /// @param outcome receives the writes as applied, or `null`
     private Commit commitAlone(ArrayWriteBatch writes, PageRef[] units, Applier[] outcome) {
         var hints = prefetch(writes, null, null);
         enterExclusive();
@@ -567,7 +568,9 @@ public final class LiveLedger implements Ledger {
             ensureOpen();
             checkHealthy();
             var applier = new Applier(sequenced.next, log != null);
-            outcome[0] = applier;
+            if (outcome != null) {
+                outcome[0] = applier;
+            }
             try {
                 for (var i = 0; i < writes.size(); i++) {
                     var state = states.get(writes.keyspace(i).name());
@@ -605,7 +608,7 @@ public final class LiveLedger implements Ledger {
     /// No lock is held at any point: commits on different keys apply at once, and a commit waits only for the
     /// commits before it on its own keys, then for its turn to become visible.
     ///
-    /// @param outcome receives the writes as applied
+    /// @param outcome receives the writes as applied, or `null`
     private Commit commitPipelined(ArrayWriteBatch writes, PageRef[] units, Applier[] outcome) {
         var size = writes.size();
         var chains = new Chain[size];
@@ -646,7 +649,9 @@ public final class LiveLedger implements Ledger {
             }
         }
         pending.predecessors = null;
-        outcome[0] = pending.applier;
+        if (outcome != null) {
+            outcome[0] = pending.applier;
+        }
         if (pending.failure != null) {
             throw rethrow(pending.failure);
         }
@@ -789,7 +794,7 @@ public final class LiveLedger implements Ledger {
     /// go on, and its committing thread throws the failure.
     private void apply(PendingCommit pending) {
         var writes = pending.writes;
-        var applier = new Applier(pending.sequence, log != null);
+        var applier = new Applier(pending.sequence, log != null, pending.writes.size());
         try {
             for (var i = 0; i < writes.size(); i++) {
                 var predecessor = pending.predecessors[i];
@@ -1708,9 +1713,19 @@ public final class LiveLedger implements Ledger {
         if (touched.isEmpty()) {
             return;
         }
-        var scan = readers.scanConcurrently();
-        var bounds = bounds(scan.active());
-        var cutBound = Reads.boundOf(floor(scan.oldest()));
+        long[] bounds;
+        long cutBound;
+        // Read before the reader table, as a scan reads it
+        var current = latest();
+        if (readers.idle()) {
+            // The usual case, without the scan's arrays: every read is at the latest sequence or later
+            bounds = new long[]{Reads.boundOf(current)};
+            cutBound = Reads.boundOf(floor(Long.MAX_VALUE));
+        } else {
+            var scan = readers.scanConcurrently();
+            bounds = bounds(scan.active());
+            cutBound = Reads.boundOf(floor(scan.oldest()));
+        }
         for (var i = 0; i < touched.size(); i++) {
             var write = touched.get(i);
             if (prune(write.state(), write.chain(), write.version(), bounds, cutBound)) {
@@ -1804,17 +1819,22 @@ public final class LiveLedger implements Ledger {
         private boolean logged;
         // The versions this commit added whose value a unit of the file of large values holds
         private int externals;
-        // The versions in flight this commit replaced, which a rollback marks current again
-        private final List<Version> replaced;
+        // The versions in flight this commit replaced, which a rollback marks current again, or null before any
+        private List<Version> replaced;
 
         Applier(long sequence, boolean journaled) {
+            this(sequence, journaled, 4);
+        }
+
+        /// Creates the applier of a commit of about `writes` writes.
+        Applier(long sequence, boolean journaled, int writes) {
             this.sequence = sequence;
             // Most commits write one or two key spaces
             this.deltaStates = new KeyspaceState[2];
             this.deltas = new long[2];
-            this.touched = new ArrayList<>();
+            this.touched = new ArrayList<>(writes);
             this.frame = journaled ? new FrameBody() : null;
-            this.replaced = new ArrayList<>();
+
         }
 
         /// {@return whether the commit's frame is queued in the log}
@@ -1852,6 +1872,9 @@ public final class LiveLedger implements Ledger {
         private void replace(Version version) {
             if (version != null && version.external != null && version.replacedAt == Long.MAX_VALUE) {
                 version.replacedAt = sequence;
+                if (replaced == null) {
+                    replaced = new ArrayList<>(2);
+                }
                 replaced.add(version);
             }
         }
@@ -2106,7 +2129,7 @@ public final class LiveLedger implements Ledger {
                     restored.getKey().removals = restored.getValue();
                 }
             }
-            for (var version : replaced) {
+            for (var version : replaced == null ? List.<Version>of() : replaced) {
                 version.replacedAt = Long.MAX_VALUE;
             }
         }

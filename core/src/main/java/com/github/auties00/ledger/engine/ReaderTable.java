@@ -212,6 +212,14 @@ final class ReaderTable {
         return new Scan(distinctDescending(sequences, count, current), oldest);
     }
 
+    /// {@return whether no read nor snapshot is registered, as one pass over the slots and the registry finds}
+    ///
+    /// Safe for concurrent use, under the rule of [#scanConcurrently()]: the caller reads the latest sequence first,
+    /// and if this returns `true`, every read is at that sequence or later.
+    boolean idle() {
+        return busy(0) < 0 && registrations == 0;
+    }
+
     /// {@return the first slot at or after `from` that a plain read finds busy, or -1}
     private int busy(int from) {
         var found = Arrays.mismatch(slots, from, slots.length, free, from, slots.length);
