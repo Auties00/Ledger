@@ -29,6 +29,22 @@ final class Segments {
         return Byte.compareUnsigned(left.get(ValueLayout.JAVA_BYTE, mismatch), right.get(ValueLayout.JAVA_BYTE, mismatch));
     }
 
+    /// {@return a hash of the bytes of `segment`}
+    ///
+    /// Keys often share long prefixes, a chat's id before a message's, so every byte counts.
+    static int hash(MemorySegment segment) {
+        var length = segment.byteSize();
+        var hash = length * 0x9E3779B97F4A7C15L;
+        var offset = 0L;
+        for (; offset + Long.BYTES <= length; offset += Long.BYTES) {
+            hash = Long.rotateLeft((hash ^ segment.get(ValueLayout.JAVA_LONG_UNALIGNED, offset)) * 0x9E3779B97F4A7C15L, 29);
+        }
+        for (; offset < length; offset++) {
+            hash = Long.rotateLeft((hash ^ segment.get(ValueLayout.JAVA_BYTE, offset)) * 0x9E3779B97F4A7C15L, 29);
+        }
+        return (int) (hash ^ (hash >>> 32));
+    }
+
     /// {@return a read-only copy of `segment` in an array of its own}
     ///
     /// For a key that outlives the batch it came in: a slice would keep the batch's whole array reachable.

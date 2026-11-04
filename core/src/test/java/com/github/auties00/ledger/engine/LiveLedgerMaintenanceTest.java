@@ -17,7 +17,7 @@ class LiveLedgerMaintenanceTest {
     private static final Keyspace<String, String> NAMES = Keyspace.paged("names", KeyCodec.utf8(), ValueCodec.utf8());
 
     private static int chainLength(LiveLedger ledger, String key) {
-        var version = ledger.state(NAMES).entries.get(Segments.encodeKey(KeyCodec.utf8(), key));
+        var version = ledger.state(NAMES).head(Segments.encodeKey(KeyCodec.utf8(), key));
         var length = 0;
         while (version != null) {
             length++;

@@ -78,7 +78,7 @@ final class Reads {
 
     /// {@return whether `point` sees `key`}
     static boolean exists(KeyspaceState state, MemorySegment key, ReadPoint point) {
-        return exists(state, state.entries.get(key), key, point, TreeSearch.UNKNOWN);
+        return exists(state, state.head(key), key, point, TreeSearch.UNKNOWN);
     }
 
     /// {@return whether `point` sees `key`, whose newest version in memory is `head`}
@@ -107,7 +107,7 @@ final class Reads {
         var root = point.root(state);
         var total = 0L;
         for (var entry : state.slice(from, to).entrySet()) {
-            var version = KeyspaceState.resolve(entry.getValue(), entry.getKey(), point.bound(), removals);
+            var version = KeyspaceState.resolve(entry.getValue().head, entry.getKey(), point.bound(), removals);
             if (version == null) {
                 // Counted with the tree
                 continue;
@@ -139,7 +139,7 @@ final class Reads {
     static <K, V> Optional<V> get(KeyspaceState state, Keyspace<K, V> keyspace, K key, ReadPoint point) {
         var encoded = Segments.encodeKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
         var removals = state.removals;
-        var version = KeyspaceState.resolve(state.entries.get(encoded), encoded, point.bound(), removals);
+        var version = KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals);
         if (version != null) {
             return version == Version.HIDDEN ? Optional.empty() : Optional.of(value(state, keyspace, version.value, version.decoded));
         }
@@ -176,7 +176,7 @@ final class Reads {
         Objects.requireNonNull(reader, "reader");
         var encoded = Segments.encodeKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
         var removals = state.removals;
-        var version = KeyspaceState.resolve(state.entries.get(encoded), encoded, point.bound(), removals);
+        var version = KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals);
         MemorySegment value;
         if (version != null) {
             if (version == Version.HIDDEN) {
@@ -218,7 +218,7 @@ final class Reads {
         var root = point.root(state);
         var tree = root == null ? null : new TreeCursor(point.pages(), root, from, to, descending);
         var inTree = tree != null && tree.next();
-        Map.Entry<MemorySegment, Version> held = memory.hasNext() ? memory.next() : null;
+        Map.Entry<MemorySegment, Chain> held = memory.hasNext() ? memory.next() : null;
         var visited = 0L;
         while (held != null || inTree) {
             int order;
@@ -235,7 +235,7 @@ final class Reads {
             }
             if (order <= 0) {
                 var key = held.getKey();
-                var version = KeyspaceState.resolve(held.getValue(), key, point.bound(), removals);
+                var version = KeyspaceState.resolve(held.getValue().head, key, point.bound(), removals);
                 MemorySegment value = null;
                 Object decoded = null;
                 if (version != null && version != Version.HIDDEN) {

@@ -4,8 +4,10 @@ import com.github.auties00.ledger.LedgerException;
 import com.github.auties00.ledger.LedgerIoException;
 
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
@@ -253,10 +255,25 @@ final class Checkpointer {
         var treeBound = cut.base() == null ? -1 : Reads.boundOf(cut.base().sequence);
         for (var keyspace : cut.keyspaces()) {
             var state = keyspace.state();
-            var ops = new ArrayList<TreeUpdate.Op>(keyspace.dirty().size());
-            for (var key : keyspace.dirty()) {
-                var version = KeyspaceState.visible(state.entries.get(key), key, bound, keyspace.removals());
-                ops.add(new TreeUpdate.Op(key, version == null ? null : version.value));
+            // Listed in the order of their writes, off the writer lock: sorted here, on every processor
+            var chains = keyspace.dirty().toArray(Chain[]::new);
+            Arrays.parallelSort(chains, Chain.BY_KEY);
+            var ops = new ArrayList<TreeUpdate.Op>(chains.length);
+            MemorySegment previous = null;
+            for (var chain : chains) {
+                var key = chain.key;
+                if (previous != null && Segments.compare(previous, key) == 0) {
+                    continue;
+                }
+                previous = key;
+                // The key's chain now, which is another one if the writer dropped this one
+                var version = KeyspaceState.resolve(state.head(key), key, bound, keyspace.removals());
+                if (version == null && !state.resident) {
+                    // No version at the cut in a paged key space: a commit that wrote the key rolled back, so the
+                    // tree is right. A resident one holds every entry, so there the key is gone
+                    continue;
+                }
+                ops.add(new TreeUpdate.Op(key, version == null || version == Version.HIDDEN ? null : version.value));
             }
             var ranges = new ArrayList<TreeUpdate.Range>();
             for (var removal : keyspace.removals()) {
