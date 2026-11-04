@@ -7,14 +7,23 @@ package com.github.auties00.ledger.benchmark.engine;
 ///                   through the OS page cache ignore it
 /// @param expectedBytes an estimate of the data the workload stores, which engines that must size their file up
 ///                      front (LMDB) use to reserve room
-public record EngineSettings(long cacheBytes, long expectedBytes) {
+/// @param largeValues the size from which Ledger writes a value once, to its file of large values; the other engines
+///                    have no such choice and ignore it
+public record EngineSettings(long cacheBytes, long expectedBytes, long largeValues) {
     /// The settings of every workload that does not choose its own.
-    public static final EngineSettings DEFAULT = new EngineSettings(256L << 20, 256L << 20);
+    public static final EngineSettings DEFAULT = new EngineSettings(256L << 20, 256L << 20, 256L << 10);
 
     /// {@return these settings, expecting `bytes` of data}
     ///
     /// @param bytes the expected data size
     public EngineSettings withExpectedBytes(long bytes) {
-        return new EngineSettings(cacheBytes, bytes);
+        return new EngineSettings(cacheBytes, bytes, largeValues);
+    }
+
+    /// {@return these settings, with Ledger writing values of `bytes` or more to its file of large values}
+    ///
+    /// @param bytes the threshold, at least 4 KiB
+    public EngineSettings withLargeValues(long bytes) {
+        return new EngineSettings(cacheBytes, expectedBytes, bytes);
     }
 }

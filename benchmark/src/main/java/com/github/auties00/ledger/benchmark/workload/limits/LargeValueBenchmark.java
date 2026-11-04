@@ -50,6 +50,12 @@ public class LargeValueBenchmark {
     @Param({"1048576", "16777216"})
     public int valueSize;
 
+    /// The size from which Ledger writes a value once, to its file of large values, rather than to its log and again
+    /// in a checkpoint; [Long#MAX_VALUE] keeps every value in the log. Sweeping it against [#valueSize] finds the size
+    /// from which writing once pays.
+    @Param({"262144"})
+    public long largeValues;
+
     private Corpus corpus;
     private Stores.Store store;
     private int next;
@@ -60,7 +66,7 @@ public class LargeValueBenchmark {
     @Setup(Level.Trial)
     public void open() throws IOException {
         corpus = new Corpus(1);
-        var settings = EngineSettings.DEFAULT.withExpectedBytes((long) SLOTS * valueSize * 4);
+        var settings = EngineSettings.DEFAULT.withExpectedBytes((long) SLOTS * valueSize * 4).withLargeValues(largeValues);
         store = Stores.empty(EngineKind.of(engine), settings, false);
         for (var slot = 0; slot < SLOTS; slot++) {
             store.engine().write(new WriteBatch().put(Keyspace.GENERIC, Corpus.longKey(slot), corpus.slice(slot, valueSize)), Durability.DURABLE);
