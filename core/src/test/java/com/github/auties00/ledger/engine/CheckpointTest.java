@@ -451,6 +451,33 @@ class CheckpointTest {
     }
 
     @Nested
+    @DisplayName("transactions that roll back")
+    class RolledBack {
+        @Test
+        @DisplayName("leave the trees with the keys they wrote, and the checkpoints after them consistent")
+        void treeKeys(@TempDir Path directory) {
+            try (var ledger = open(directory, MESSAGES)) {
+                ledger.commit(ledger.newBatch().put(MESSAGES, "kept", "1"));
+                // The checkpoint leaves the key in the tree only
+                ledger.checkpoint();
+                assertThrows(IllegalStateException.class, () -> ledger.update(transaction -> {
+                    transaction.put(MESSAGES, "kept", "2").put(MESSAGES, "new", "3");
+                    throw new IllegalStateException("abort");
+                }));
+                ledger.commit(ledger.newBatch().put(MESSAGES, "other", "4"));
+                ledger.checkpoint();
+                assertEquals(Optional.of("1"), ledger.get(MESSAGES, "kept"));
+                assertEquals(Optional.empty(), ledger.get(MESSAGES, "new"));
+                assertEquals(2, ledger.size(MESSAGES));
+            }
+            try (var ledger = open(directory, MESSAGES)) {
+                assertEquals(Optional.of("1"), ledger.get(MESSAGES, "kept"));
+                assertEquals(2, ledger.size(MESSAGES));
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("commits over trees the cache does not hold")
     class ColdTrees {
         @Test
@@ -556,6 +583,57 @@ class CheckpointTest {
     @Nested
     @DisplayName("concurrency")
     class Concurrency {
+        @Test
+        @DisplayName("writers that create keys at once see their commits in scans and counts, across checkpoints")
+        void concurrentNewKeys(@TempDir Path directory) throws Exception {
+            var values = Keyspace.paged("values", KeyCodec.int64(), LONGS);
+            var options = Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(values)
+                    .checkpointEvery(1 << 20);
+            var writers = 8;
+            var rounds = 400;
+            var keysPerRound = 16;
+            long size;
+            try (var ledger = options.build()) {
+                var failures = new ConcurrentLinkedQueue<String>();
+                try (var executor = Executors.newThreadPerTaskExecutor(Thread.ofPlatform().daemon().factory())) {
+                    for (var writer = 0; writer < writers; writer++) {
+                        var id = writer;
+                        executor.execute(() -> {
+                            var random = new Random(id);
+                            for (var round = 0; round < rounds; round++) {
+                                var batch = ledger.newBatch();
+                                // Keys of their own above 2^32, so each writer's are new
+                                var first = ((long) (id + 1) << 32) | ((long) round * keysPerRound);
+                                for (var i = 0; i < keysPerRound; i++) {
+                                    batch.put(values, first + i, (long) round);
+                                }
+                                // And a few hot keys every writer puts and deletes, so chains are dropped and opened again
+                                var hot = (long) random.nextInt(64);
+                                if (random.nextBoolean()) {
+                                    batch.put(values, hot, (long) id);
+                                } else {
+                                    batch.delete(values, hot);
+                                }
+                                ledger.commit(batch);
+                                var seen = ledger.range(values, KeyRange.between(first, first + keysPerRound), 100).size();
+                                if (seen != keysPerRound) {
+                                    failures.add("writer " + id + " round " + round + " saw " + seen + " of its keys");
+                                }
+                            }
+                        });
+                    }
+                }
+                assertTrue(failures.isEmpty(), () -> String.join(System.lineSeparator(), failures));
+                var hot =ledger.range(values, KeyRange.between(0L, 64L), 1_000).size();
+                size = (long) writers * rounds * keysPerRound + hot;
+                assertEquals(size, ledger.size(values));
+                assertEquals(size, ledger.range(values, KeyRange.all(), Integer.MAX_VALUE).size());
+            }
+            try (var ledger = options.build()) {
+                assertEquals(size, ledger.size(values));
+            }
+        }
+
         @Test
         @DisplayName("readers see consistent totals while checkpoints run under the writers")
         void transfersWithCheckpoints(@TempDir Path directory) throws Exception {

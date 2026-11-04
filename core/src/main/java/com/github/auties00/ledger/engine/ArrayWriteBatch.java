@@ -34,6 +34,8 @@ public final class ArrayWriteBatch implements WriteBatch {
     private byte[] data;
     private MemorySegment memory;
     private long used;
+    // The batch's own array while the encodings are in a compact copy for the store, or null
+    private byte[] spare;
 
     private byte[] kinds;
     private Keyspace<?, ?>[] targets;
@@ -244,8 +246,23 @@ public final class ArrayWriteBatch implements WriteBatch {
         return used;
     }
 
-    /// Hands the array holding the encodings over to the store and starts the batch again, empty, in a fresh array
-    /// from the pool.
+    /// Moves the encodings into an array of their size if they fill less than half of the batch's, before the store
+    /// reads the writes through the accessors.
+    ///
+    /// The store keeps the array it applies the writes from for as long as the versions slice it: until checkpoints
+    /// have written them and no read needs them. Without this, a commit of one small write would keep the whole
+    /// [#INITIAL_CAPACITY] of its batch. The batch keeps its own array for its next writes.
+    public void compact() {
+        if (spare != null || used > data.length / 2) {
+            return;
+        }
+        spare = data;
+        data = Arrays.copyOf(data, (int) used);
+        memory = MemorySegment.ofArray(data);
+    }
+
+    /// Hands the array holding the encodings over to the store and starts the batch again, empty, in the array it had
+    /// before [#compact()], or in a fresh one from the pool.
     ///
     /// The store reads the writes through the accessors, and [#encodedBytes()], first: the segments the accessors
     /// returned stay valid, since the batch never writes the detached array again. The array never goes back to the
@@ -255,7 +272,12 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// @return the array holding the encodings
     public byte[] detach() {
         var detached = data;
-        data = pool.acquire(INITIAL_CAPACITY);
+        if (spare != null) {
+            data = spare;
+            spare = null;
+        } else {
+            data = pool.acquire(INITIAL_CAPACITY);
+        }
         memory = MemorySegment.ofArray(data);
         clear();
         return detached;
