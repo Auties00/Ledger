@@ -53,7 +53,7 @@ public class LargeValueBenchmark {
     /// The size from which Ledger writes a value once, to its file of large values, rather than to its log and again
     /// in a checkpoint; [Long#MAX_VALUE] keeps every value in the log. Sweeping it against [#valueSize] finds the size
     /// from which writing once pays.
-    @Param({"262144"})
+    @Param({"1048576"})
     public long largeValues;
 
     private Corpus corpus;

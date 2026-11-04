@@ -36,6 +36,8 @@ final class BlobFile implements AutoCloseable {
     /// The name of the file in the store's directory.
     static final String FILE = "ledger.blobs";
     private static final int BUFFER = 1 << 20;
+    /// The trailing free pages, 64 MiB of them, below which [#trim()] keeps the file's length.
+    private static final int TRIM_SLACK = 16_384;
 
     private final Path path;
     private final FileChannel channel;
@@ -264,10 +266,14 @@ final class BlobFile implements AutoCloseable {
         return space.pageCount();
     }
 
-    /// Cuts the file before its trailing free pages, if any.
+    /// Cuts the file before its trailing free pages, once they are at least half of it and [#TRIM_SLACK].
+    ///
+    /// The commits write the file while it runs, so a file cut after every checkpoint would grow again with every
+    /// unit, and growing a file costs a force more than writing it: on NTFS, a unit past the end adds a metadata write
+    /// to the force that makes it durable. Kept long, the file takes new units into the pages old ones freed.
     void trim() throws IOException {
         synchronized (lock) {
-            var end = space.trim();
+            var end = space.trim(Math.max(TRIM_SLACK, space.pageCount() / 2));
             if (end > 0) {
                 channel.truncate(PageFormat.offset(end));
             }

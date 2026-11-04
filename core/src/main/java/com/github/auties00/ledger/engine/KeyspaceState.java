@@ -23,6 +23,9 @@ import java.util.concurrent.ConcurrentSkipListMap;
 /// Readers use it concurrently with the writer. Commits may create chains before they take the writer lock; everything
 /// else changes only under it.
 final class KeyspaceState {
+    /// The dropped chains from which [#removeDropped()] spreads the removals over the processors.
+    private static final int PARALLEL_REMOVALS = 4_096;
+
     final Keyspace<?, ?> keyspace;
     final boolean resident;
     // The id the log knows the key space by, set while the store opens
@@ -120,14 +123,27 @@ final class KeyspaceState {
         leaving.add(chain);
     }
 
-    /// Takes the chains the writer dropped out of the ordered map; safe without the writer lock.
+    /// Takes up to `limit` of the chains the writer dropped out of the ordered map; safe without the writer lock.
     ///
     /// A chain created since for the same key may have taken its place, and stays.
-    void removeDropped() {
+    void removeDropped(int limit) {
         Chain chain;
-        while ((chain = leaving.poll()) != null) {
+        for (var i = 0; i < limit && (chain = leaving.poll()) != null; i++) {
             entries.remove(chain.key, chain);
         }
+    }
+
+    /// Takes every chain the writer dropped out of the ordered map, on every processor when there are many, as there
+    /// are after a checkpoint; safe without the writer lock.
+    void removeDropped() {
+        var chains = new ArrayList<Chain>();
+        Chain chain;
+        while ((chain = leaving.poll()) != null) {
+            chains.add(chain);
+        }
+        // Each removal walks down the map, a few microseconds of cache misses at a million keys
+        var stream = chains.size() < PARALLEL_REMOVALS ? chains.stream() : chains.parallelStream();
+        stream.forEach(dropped -> entries.remove(dropped.key, dropped));
     }
 
     /// Lists `chain` among the keys the next checkpoint writes, under the writer lock.
