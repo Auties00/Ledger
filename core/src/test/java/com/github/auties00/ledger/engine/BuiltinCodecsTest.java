@@ -57,7 +57,7 @@ class BuiltinCodecsTest {
     }
 
     @Test
-    @DisplayName("a batch writes only its store's key spaces and reads its writes back in place")
+    @DisplayName("a batch writes only its store's key spaces, reads its writes in place and keeps a small batch small")
     void batch() {
         var opened = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.bytes());
         var other = Keyspace.paged("other", KeyCodec.utf8(), ValueCodec.bytes());
@@ -73,9 +73,12 @@ class BuiltinCodecsTest {
         assertEquals(ArrayWriteBatch.DELETE, batch.kind(1));
         assertEquals(null, batch.value(1));
         assertEquals("b", new String(batch.value(2).toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8));
+        var encoded = batch.encodedBytes();
         var detached = batch.detach();
         assertTrue(batch.isEmpty());
-        assertTrue(detached.length >= 4_096);
+        // Below the pool's smallest array, the batch grew an array of its own by doubling from its first write
+        assertTrue(detached.length >= encoded && detached.length < 2 * encoded,
+                () -> detached.length + " bytes for " + encoded);
     }
 
     @Test
