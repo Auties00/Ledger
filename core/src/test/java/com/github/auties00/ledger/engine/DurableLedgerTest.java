@@ -10,6 +10,8 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.LedgerKeyException;
 import com.github.auties00.ledger.LedgerLockedException;
 import com.github.auties00.ledger.ValueCodec;
+import com.github.auties00.ledger.testkit.ChangeInterceptor;
+import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -34,6 +36,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -307,6 +310,52 @@ class DurableLedgerTest {
             try (var recovered = open(copy, NAMES)) {
                 assertEquals(Optional.of("1"), recovered.get(NAMES, "a"));
                 assertEquals(Optional.of("2"), recovered.get(NAMES, "b"));
+            }
+        }
+
+        @Test
+        @DisplayName("a wait for durability times out, takes an interrupt, and returns once the force ends")
+        void waits() throws Exception {
+            var disk = CrashFileSystem.create();
+            var slow = new java.util.concurrent.atomic.AtomicBoolean();
+            var released = new java.util.concurrent.CountDownLatch(1);
+            disk.intercept((path, kind) -> {
+                if (slow.get() && kind == ChangeInterceptor.ChangeKind.FORCE) {
+                    try {
+                        released.await();
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+            try (var ledger = open(disk.getPath("/store"), NAMES)) {
+                slow.set(true);
+                var commit = ledger.commit(ledger.newBatch().put(NAMES, "a", "1"));
+                assertFalse(commit.awaitDurable(java.time.Duration.ofMillis(50)));
+                var waiter = Thread.ofVirtual().start(() -> {
+                    try {
+                        commit.awaitDurable();
+                    } catch (InterruptedException expected) {
+                        return;
+                    }
+                    throw new AssertionError("the wait ended without an interrupt");
+                });
+                waiter.interrupt();
+                waiter.join(5_000);
+                assertFalse(waiter.isAlive());
+                var durable = Thread.ofVirtual().start(() -> {
+                    try {
+                        commit.awaitDurable();
+                    } catch (InterruptedException exception) {
+                        throw new AssertionError(exception);
+                    }
+                });
+                slow.set(false);
+                released.countDown();
+                durable.join(5_000);
+                assertFalse(durable.isAlive());
+                assertTrue(commit.isDurable());
+                assertTrue(commit.awaitDurable(java.time.Duration.ZERO));
             }
         }
 

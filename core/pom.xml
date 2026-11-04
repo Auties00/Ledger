@@ -11,6 +11,11 @@
     <name>${project.groupId}:${project.artifactId}</name>
     <description>An embedded storage engine for single-writer Java applications that need durable, encrypted, ordered data</description>
 
+    <properties>
+        <!-- More arguments of the test JVM, for example -Dledger.test.jvm=-XX:StartFlightRecording -->
+        <ledger.test.jvm></ledger.test.jvm>
+    </properties>
+
     <dependencies>
         <dependency>
             <groupId>com.github.auties00</groupId>
@@ -33,7 +38,7 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
                     <!-- The tests run on the class path; native access lets them run the full syncs of macOS -->
-                    <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+                    <argLine>--enable-native-access=ALL-UNNAMED ${ledger.test.jvm}</argLine>
                 </configuration>
             </plugin>
         </plugins>

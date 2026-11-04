@@ -91,6 +91,65 @@ final class ReaderTable {
         }
     }
 
+    /// What one pass over the table found.
+    ///
+    /// @param active every sequence a read or snapshot may be reading at, distinct, highest first; the first is the
+    ///               latest
+    /// @param oldest the lowest sequence a read or snapshot is reading at, the latest included, or [Long#MAX_VALUE]
+    record Scan(long[] active, long oldest) {
+    }
+
+    /// {@return [#active()] and [#oldest()] from one pass over the slots and the registry}
+    ///
+    /// Only the writer calls it, holding the writer lock.
+    Scan scan() {
+        var current = latest.getAsLong();
+        var sequences = new long[slots.length() + 1];
+        var count = 0;
+        sequences[count++] = current;
+        var oldest = Long.MAX_VALUE;
+        for (var slot = 0; slot <= mask; slot++) {
+            var value = slots.get(slot);
+            if (value != 0) {
+                oldest = Math.min(oldest, value - 1);
+                if (value - 1 < current) {
+                    sequences[count++] = value - 1;
+                }
+            }
+        }
+        synchronized (registryLock) {
+            if (!registry.isEmpty()) {
+                oldest = Math.min(oldest, registry.firstKey());
+            }
+            for (var sequence : registry.keySet()) {
+                if (sequence >= current) {
+                    break;
+                }
+                if (count == sequences.length) {
+                    sequences = Arrays.copyOf(sequences, count * 2);
+                }
+                sequences[count++] = sequence;
+            }
+        }
+        return new Scan(distinctDescending(sequences, count, current), oldest);
+    }
+
+    private static long[] distinctDescending(long[] sequences, int count, long current) {
+        if (count == 1) {
+            return new long[]{current};
+        }
+        Arrays.sort(sequences, 1, count);
+        var result = new long[count];
+        result[0] = current;
+        var size = 1;
+        for (var i = count - 1; i >= 1; i--) {
+            if (sequences[i] != result[size - 1]) {
+                result[size++] = sequences[i];
+            }
+        }
+        return Arrays.copyOf(result, size);
+    }
+
     /// {@return the lowest sequence a read or snapshot is reading at, or [Long#MAX_VALUE] if none is}
     ///
     /// Unlike [#active()], it counts reads at the latest sequence: they may have pinned the tree published before it.

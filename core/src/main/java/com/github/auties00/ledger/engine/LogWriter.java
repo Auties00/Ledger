@@ -12,6 +12,7 @@ import java.nio.file.StandardOpenOption;
 import java.security.GeneralSecurityException;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.FutureTask;
@@ -29,9 +30,9 @@ import java.util.zip.CRC32C;
 /// next group, so concurrent commits share forces. Each group is padded with zeros to a multiple of [#ALIGNMENT], where
 /// the next one starts, so the pages of acknowledged frames are never written again.
 ///
-/// Segments come from [LogFiles] prepared: once a segment is half written, the next one is prepared on the store's
-/// pool, so a rollover only forces the full segment and switches to the next, and no file is created or renamed on
-/// the way to a force. A prepared
+/// Segments come from [LogFiles] prepared: once a segment is half written, the next one is prepared on a thread of
+/// its own, so a rollover only forces the full segment and switches to the next, and no file is created or renamed
+/// on the way to a force. A prepared
 /// file may hold the frames of an earlier use, which every frame header tells apart by the tag of its segment's salt.
 ///
 /// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames, written by one open of the store
@@ -109,6 +110,8 @@ final class LogWriter {
     // The bytes of the frames queued since the writer opened, written under the queue lock
     private volatile long appendedBytes;
     private final AtomicBoolean scheduled;
+    // The commits waiting for durability
+    private final ConcurrentLinkedQueue<Waiter> waiters;
 
     private final ReentrantLock durabilityLock;
     private final Condition durabilityChanged;
@@ -146,6 +149,7 @@ final class LogWriter {
         this.queueLock = new ReentrantLock();
         this.queue = new byte[64 * 1024];
         this.scheduled = new AtomicBoolean();
+        this.waiters = new ConcurrentLinkedQueue<>();
         this.durabilityLock = new ReentrantLock();
         this.durabilityChanged = durabilityLock.newCondition();
         this.durable = durable;
@@ -170,21 +174,24 @@ final class LogWriter {
         this.next = null;
     }
 
-    /// Prepares the segment after the current one on the pool.
+    /// Prepares the segment after the current one on a platform thread of its own.
+    ///
+    /// Not on the store's pool: creating and forcing a file costs tens of milliseconds on Windows, and a flush queued
+    /// behind it would make every commit waiting on that flush wait as long.
     private void prepareNext() {
         var number = segmentNumber + 1;
         var preparation = new FutureTask<>(() -> files.prepare(number));
         next = preparation;
-        executor.execute(preparation);
+        Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
     }
 
-    /// Switches to the prepared segment after the current one, preparing it here if the pool has not.
+    /// Switches to the prepared segment after the current one, preparing it here if its thread has not.
     private void rollover() throws IOException {
         if (next == null) {
             prepareNext();
         }
         var preparation = next;
-        // Runs it on this thread unless it started elsewhere, so a pool of one thread never waits on itself
+        // Runs it on this thread unless it started elsewhere, so a rollover never waits on a thread yet to start
         preparation.run();
         LogFiles.Prepared prepared;
         try {
@@ -359,24 +366,38 @@ final class LogWriter {
     }
 
     private void publish(long sequence, long frames) {
+        durable = sequence;
         durabilityLock.lock();
         try {
-            durable = sequence;
             written = frames;
             durabilityChanged.signalAll();
         } finally {
             durabilityLock.unlock();
         }
+        wake(sequence);
+    }
+
+    /// Wakes the commits waiting for a sequence at or below `sequence`.
+    private void wake(long sequence) {
+        for (var iterator = waiters.iterator(); iterator.hasNext(); ) {
+            var waiter = iterator.next();
+            if (waiter.sequence <= sequence) {
+                waiter.woken = true;
+                iterator.remove();
+                LockSupport.unpark(waiter.thread);
+            }
+        }
     }
 
     private void stop(IOException cause) {
+        failure = new LedgerIoException("The log could not be written: commits since the last force may be lost", cause);
         durabilityLock.lock();
         try {
-            failure = new LedgerIoException("The log could not be written: commits since the last force may be lost", cause);
             durabilityChanged.signalAll();
         } finally {
             durabilityLock.unlock();
         }
+        wake(Long.MAX_VALUE);
     }
 
     /// {@return whether the commit at `sequence` is durable}
@@ -395,18 +416,7 @@ final class LogWriter {
     /// @throws InterruptedException if interrupted while waiting
     /// @throws LedgerIoException if the writer stopped before it was
     void awaitDurable(long sequence) throws InterruptedException {
-        if (durable >= sequence) {
-            return;
-        }
-        durabilityLock.lockInterruptibly();
-        try {
-            while (durable < sequence) {
-                checkHealthy();
-                durabilityChanged.await();
-            }
-        } finally {
-            durabilityLock.unlock();
-        }
+        await(sequence, -1);
     }
 
     /// Waits until the commit at `sequence` is durable or `timeout` elapses.
@@ -415,22 +425,54 @@ final class LogWriter {
     /// @throws InterruptedException if interrupted while waiting
     /// @throws LedgerIoException if the writer stopped before it was
     boolean awaitDurable(long sequence, Duration timeout) throws InterruptedException {
+        return await(sequence, Math.max(0, timeout.toNanos()));
+    }
+
+    /// Parks the caller until the commit at `sequence` is durable, or `timeout` nanoseconds pass if it is not negative.
+    ///
+    /// A force wakes exactly the commits it made durable, each of which only reads [#durable]: no lock is handed from
+    /// one waiter to the next, which with hundreds of waiters would cost more than the force.
+    private boolean await(long sequence, long timeout) throws InterruptedException {
         if (durable >= sequence) {
             return true;
         }
-        var remaining = timeout.toNanos();
-        durabilityLock.lockInterruptibly();
+        checkHealthy();
+        var waiter = new Waiter(Thread.currentThread(), sequence);
+        waiters.add(waiter);
         try {
+            var deadline = timeout < 0 ? 0 : System.nanoTime() + timeout;
             while (durable < sequence) {
                 checkHealthy();
-                if (remaining <= 0) {
-                    return false;
+                if (Thread.interrupted()) {
+                    throw new InterruptedException();
                 }
-                remaining = durabilityChanged.awaitNanos(remaining);
+                if (timeout < 0) {
+                    LockSupport.park(this);
+                } else {
+                    var remaining = deadline - System.nanoTime();
+                    if (remaining <= 0) {
+                        return false;
+                    }
+                    LockSupport.parkNanos(this, remaining);
+                }
             }
             return true;
         } finally {
-            durabilityLock.unlock();
+            if (!waiter.woken) {
+                waiters.remove(waiter);
+            }
+        }
+    }
+
+    /// A commit waiting for durability.
+    private static final class Waiter {
+        final Thread thread;
+        final long sequence;
+        volatile boolean woken;
+
+        Waiter(Thread thread, long sequence) {
+            this.thread = thread;
+            this.sequence = sequence;
         }
     }
 

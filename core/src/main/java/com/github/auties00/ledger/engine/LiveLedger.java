@@ -55,6 +55,10 @@ public final class LiveLedger implements Ledger {
     private volatile boolean closed;
     private int sweepIndex;
     private MemorySegment sweepAfter;
+    // Whether a prune left a chain that a later one may shorten, so the sweep has work; guarded by the writer lock
+    private boolean sweepPending;
+    // Whether the sweep's current pass over the store found such a chain
+    private boolean sweepFound;
     private final Map<Integer, KeyspaceState> byId;
     private int maxId;
     private LogWriter log;
@@ -607,10 +611,11 @@ public final class LiveLedger implements Ledger {
             while (keys.hasNext()) {
                 writeLock.lock();
                 try {
-                    var bounds = bounds(readers.active());
-                    var floor = floor(readers.oldest());
+                    var scan = readers.scan();
+                    var bounds = bounds(scan.active());
+                    var floor = floor(scan.oldest());
                     for (var i = 0; i < PRUNE_CHUNK && keys.hasNext(); i++) {
-                        prune(state, keys.next(), bounds, Reads.boundOf(floor));
+                        sweepPending |= prune(state, keys.next(), bounds, Reads.boundOf(floor));
                     }
                 } finally {
                     writeLock.unlock();
@@ -669,10 +674,11 @@ public final class LiveLedger implements Ledger {
     /// versions after it, and no reader needs the versions that leaves out.
     ///
     /// @param bounds the bounds of every active reader, highest first; the first covers the newest version
-    private void prune(KeyspaceState state, MemorySegment key, long[] bounds, long cutBound) {
+    /// @return whether the key keeps a version a later prune may drop, once the readers that need it are gone
+    private boolean prune(KeyspaceState state, MemorySegment key, long[] bounds, long cutBound) {
         var head = state.entries.get(key);
         if (head == null) {
-            return;
+            return false;
         }
         Version kept = null;
         var version = head;
@@ -691,15 +697,16 @@ public final class LiveLedger implements Ledger {
             }
         }
         if (kept == null) {
-            return;
+            return false;
         }
         kept.older = null;
         if (pages == null || state.resident) {
             // Memory holds every entry: a key whose only version is a removal has none
             if (kept == head && head.removes()) {
                 state.entries.remove(key, head);
+                return false;
             }
-            return;
+            return head.older != null;
         }
         // A removal stays until the trees hold it, since it hides what they hold; then, like any version, it leaves
         Version previous = null;
@@ -707,13 +714,16 @@ public final class LiveLedger implements Ledger {
             if (cut.stamp <= cutBound) {
                 if (previous == null) {
                     state.entries.remove(key, head);
-                } else {
-                    previous.older = null;
+                    return false;
                 }
-                return;
+                previous.older = null;
+                break;
             }
             previous = cut;
         }
+        // A version the latest tree holds leaves once no reader reads an older tree
+        var current = tree;
+        return head.older != null || (current != null && head.stamp <= Reads.boundOf(current.sequence));
     }
 
     /// Applies to the entries in memory the range removals every reader has passed, and drops the records of those
@@ -758,15 +768,22 @@ public final class LiveLedger implements Ledger {
         }
     }
 
-    /// Prunes up to `budget` keys, resuming where the last sweep stopped.
+    /// Prunes up to `budget` keys, resuming where the last sweep stopped, while some prune left a chain a later one may
+    /// shorten; a whole pass over the store that finds none ends the sweeping.
     private void sweep(long[] bounds, long cutBound, int budget) {
+        if (!sweepPending || sweepOrder.isEmpty()) {
+            return;
+        }
         var visitedKeyspaces = 0;
-        while (budget > 0 && visitedKeyspaces <= sweepOrder.size() && !sweepOrder.isEmpty()) {
+        while (budget > 0 && visitedKeyspaces <= sweepOrder.size()) {
+            if (sweepIndex == 0 && sweepAfter == null) {
+                sweepFound = false;
+            }
             var state = sweepOrder.get(sweepIndex % sweepOrder.size());
             var keys = (sweepAfter == null ? state.entries : state.entries.tailMap(sweepAfter, false)).keySet().iterator();
             while (budget > 0 && keys.hasNext()) {
                 var key = keys.next();
-                prune(state, key, bounds, cutBound);
+                sweepFound |= prune(state, key, bounds, cutBound);
                 sweepAfter = key;
                 budget--;
             }
@@ -774,6 +791,10 @@ public final class LiveLedger implements Ledger {
                 sweepIndex = (sweepIndex + 1) % sweepOrder.size();
                 sweepAfter = null;
                 visitedKeyspaces++;
+                if (sweepIndex == 0 && !sweepFound) {
+                    sweepPending = false;
+                    return;
+                }
             }
         }
     }
@@ -907,9 +928,10 @@ public final class LiveLedger implements Ledger {
         }
 
         private void maintain() {
-            var active = readers.active();
+            var scan = readers.scan();
+            var active = scan.active();
             var bounds = bounds(active);
-            var oldestReader = readers.oldest();
+            var oldestReader = scan.oldest();
             var floor = floor(oldestReader);
             releaseTrees(oldestReader);
             var cutBound = Reads.boundOf(floor);
@@ -917,7 +939,7 @@ public final class LiveLedger implements Ledger {
             var dropBound = pages == null ? Long.MAX_VALUE : cutBound;
             var oldest = active[active.length - 1];
             for (var write : touched) {
-                prune(write.state(), write.key(), bounds, cutBound);
+                sweepPending |= prune(write.state(), write.key(), bounds, cutBound);
             }
             for (var state : states.values()) {
                 applyRemovals(state, bounds[bounds.length - 1], dropBound);
