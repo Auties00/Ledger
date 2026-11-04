@@ -670,7 +670,8 @@ public final class LiveLedger implements Ledger {
         drainArrivals();
         // The wait gives up, so this thread helps, while the role is free or held by a commit sequencing itself; a
         // park that ends early (a spurious wake-up, or the guard's timeout) helps again too
-        while (pending.state < PendingCommit.SEQUENCED && !pending.await(PendingCommit.SEQUENCED, sequencing)) {
+        while (pending.state < PendingCommit.SEQUENCED
+                && !pending.await(PendingCommit.SEQUENCED, sequencing, sequencingWanted)) {
             if (sequencing.heldBriefly()) {
                 Thread.onSpinWait();
             }
@@ -685,7 +686,7 @@ public final class LiveLedger implements Ledger {
         publishApplied();
         // The wait helps every few spins while the role is free: a commit is then published by the first thread that
         // notices it applied, not by the next pass of a holder
-        pending.awaitHelping(PendingCommit.DONE, publishing, publishHelper);
+        pending.awaitHelping(PendingCommit.DONE, publishing, publishingWanted, publishHelper);
     }
 
     /// Adds `pending` to the commits waiting for a sequence.

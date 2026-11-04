@@ -154,17 +154,26 @@ final class PendingCommit {
     ///
     /// @return whether it did; `false` after a park that ended before, so the caller may help and wait again
     boolean await(int wanted) {
-        return await(wanted, null);
+        return await(wanted, null, null);
     }
 
     /// Waits as [#await(int)] does, and returns `false` instead of parking while `role` is free or held briefly:
     /// a thread that takes it briefly lets it go without looking for this commit, so this thread must help.
-    boolean await(int wanted, Padded.Role role) {
+    ///
+    /// While `roleWanted` is raised it parks instead, the role free or not: the thread that raised it takes the role
+    /// next, and gives the waiting commits their turn when it lets it go. Helping is then forbidden, and a thread that
+    /// kept spinning and yielding would only take the processor, or the carrier, from the one thread that can move on.
+    ///
+    /// @param roleWanted the flag raised for an operation that wants `role` for itself, or `null`
+    boolean await(int wanted, Padded.Role role, Padded.Role roleWanted) {
         var virtual = Thread.currentThread().isVirtual();
         var spins = virtual ? VIRTUAL_SPINS : PLATFORM_SPINS;
         var yields = spins + (virtual ? VIRTUAL_YIELDS : PLATFORM_YIELDS);
         for (var spin = 0; state < wanted; spin++) {
-            if (role != null && (spin & 63) == 63 && !role.held()) {
+            if (roleWanted != null && roleWanted.held()) {
+                // Skips the spinning: the operation that wants the role runs for a while
+                spin = Math.max(spin, yields);
+            } else if (role != null && (spin & 63) == 63 && !role.held()) {
                 return false;
             }
             if (spin < spins) {
@@ -174,7 +183,8 @@ final class PendingCommit {
             } else {
                 // Announced with a volatile store, a full fence, before the state and the role are read again
                 parking = true;
-                if (state < wanted && (role == null || (role.held() && !role.heldBriefly()))) {
+                if (state < wanted && (role == null || (roleWanted != null && roleWanted.held())
+                        || (role.held() && !role.heldBriefly()))) {
                     park(this);
                 }
                 parking = false;
@@ -189,12 +199,16 @@ final class PendingCommit {
     ///
     /// Unlike [#await(int, Padded.Role)], it keeps its count of spins across the help, so it still parks once it has
     /// spun and yielded its budget: helping finds nothing to do while an earlier commit has not applied, and its
-    /// thread wakes this one when it is published.
-    void awaitHelping(int wanted, Padded.Role role, Runnable help) {
+    /// thread wakes this one when it is published. While `roleWanted` is raised it parks at once, as
+    /// [#await(int, Padded.Role, Padded.Role)] does.
+    void awaitHelping(int wanted, Padded.Role role, Padded.Role roleWanted, Runnable help) {
         var virtual = Thread.currentThread().isVirtual();
         var spins = virtual ? VIRTUAL_SPINS : PLATFORM_SPINS;
         var yields = spins + (virtual ? VIRTUAL_YIELDS : PLATFORM_YIELDS);
         for (var spin = 0; state < wanted; spin++) {
+            if (roleWanted.held()) {
+                spin = Math.max(spin, yields);
+            }
             if (spin < spins) {
                 if ((spin & 63) == 63 && !role.held()) {
                     help.run();
