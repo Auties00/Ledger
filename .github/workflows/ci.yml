@@ -44,8 +44,30 @@ jobs:
         with:
           python-version: '3.x'
 
+      # A build that runs past 25 minutes (it takes about 7) has a hung test: the watchdog prints the threads of every
+      # JVM into results/ before it stops the build, and the log step uploads them.
       - name: Build
-        run: mvn -B -ntp package
+        run: |
+          mkdir -p results
+          (
+            for _ in $(seq 1 1500); do
+              sleep 1
+              [ -f results/.built ] && exit 0
+            done
+            for pid in $(jps -q); do
+              echo "=== $(jps -l | grep "^$pid ")"
+              jcmd "$pid" Thread.print
+            done > results/threads.txt 2>&1
+            if command -v taskkill > /dev/null; then taskkill //F //IM java.exe; else pkill java; fi
+          ) > results/watchdog.log 2>&1 &
+          set +e
+          mvn -B -ntp package 2>&1 | tee results/build.log
+          status=${PIPESTATUS[0]}
+          touch results/.built
+          if [ -f results/threads.txt ]; then
+            echo "The build ran past 25 minutes; thread dumps are in the uploaded results/threads.txt" >&2
+          fi
+          exit "$status"
 
       # One short iteration of every workload; -foe stops at the first failure and fails the step.
       - name: Run every workload once
