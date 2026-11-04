@@ -89,6 +89,40 @@ final class Padded {
         long q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14, q15, q16;
     }
 
+    abstract static class CommitFields extends Before {
+        volatile PendingCommit commit;
+    }
+
+    /// A reference to a commit that one side of the arrival list writes at every commit.
+    @SuppressWarnings("unused")
+    static final class CommitReference extends CommitFields {
+        private static final VarHandle COMMIT;
+
+        static {
+            try {
+                COMMIT = MethodHandles.lookup().findVarHandle(CommitFields.class, "commit", PendingCommit.class);
+            } catch (ReflectiveOperationException exception) {
+                throw new ExceptionInInitializerError(exception);
+            }
+        }
+
+        long q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14, q15, q16;
+
+        CommitReference(PendingCommit commit) {
+            this.commit = commit;
+        }
+
+        /// Makes `commit` the reference and {@return the commit it held}, with a full fence.
+        PendingCommit getAndSet(PendingCommit commit) {
+            return (PendingCommit) COMMIT.getAndSet(this, commit);
+        }
+
+        /// Makes `commit` the reference with a release store.
+        void setLazily(PendingCommit commit) {
+            COMMIT.setRelease(this, commit);
+        }
+    }
+
     abstract static class SequencedFields extends Before {
         /// The last commit given a sequence.
         PendingCommit last;
