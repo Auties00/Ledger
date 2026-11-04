@@ -78,12 +78,24 @@ final class Reads {
 
     /// {@return whether `point` sees `key`}
     static boolean exists(KeyspaceState state, MemorySegment key, ReadPoint point) {
+        return exists(state, state.entries.get(key), key, point, TreeSearch.UNKNOWN);
+    }
+
+    /// {@return whether `point` sees `key`, whose newest version in memory is `head`}
+    ///
+    /// @param head the newest version of `key` in memory, or `null` if there is none
+    /// @param inTree whether the tree `point` reads holds `key`, as a lookup of that same tree found it, or
+    ///               [TreeSearch#UNKNOWN] to look it up
+    static boolean exists(KeyspaceState state, Version head, MemorySegment key, ReadPoint point, byte inTree) {
         var removals = state.removals;
-        var version = KeyspaceState.resolve(state.entries.get(key), key, point.bound(), removals);
+        var version = KeyspaceState.resolve(head, key, point.bound(), removals);
         if (version != null) {
             return version != Version.HIDDEN;
         }
-        return inTree(state, key, point, removals);
+        if (inTree == TreeSearch.UNKNOWN) {
+            return inTree(state, key, point, removals);
+        }
+        return inTree == TreeSearch.FOUND && !hiddenSinceTree(key, point, removals);
     }
 
     /// {@return the entries `point` sees from `from`, included, to `to`, excluded, either `null` for no bound}

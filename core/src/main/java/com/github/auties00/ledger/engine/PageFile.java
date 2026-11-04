@@ -155,6 +155,14 @@ final class PageFile implements AutoCloseable {
         }
     }
 
+    /// {@return the plaintext of the unit `ref` names if the cache holds it, or `null`}
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    byte[] cached(PageRef ref, byte kind) {
+        var hit = cache.get(ref);
+        return hit != null && kindMatches(hit[PageFormat.KIND], kind) ? hit : null;
+    }
+
     private static boolean kindMatches(byte actual, byte expected) {
         return expected == NODE ? actual == PageFormat.LEAF || actual == PageFormat.BRANCH : actual == expected;
     }

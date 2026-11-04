@@ -451,6 +451,57 @@ class CheckpointTest {
     }
 
     @Nested
+    @DisplayName("commits over trees the cache does not hold")
+    class ColdTrees {
+        @Test
+        @DisplayName("read the pages their lookups need before the writer lock and keep exact counts")
+        void coldBatches(@TempDir Path directory) {
+            var values = Keyspace.paged("values", KeyCodec.int64(), LONGS);
+            var random = new Random(31);
+            var model = new TreeMap<Long, Long>();
+            var options = Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(values).pageCache(1 << 20);
+            try (var ledger = options.build()) {
+                // Far more leaves than the 256 pages the cache holds
+                for (var first = 0L; first < 60_000; first += 5_000) {
+                    var batch = ledger.newBatch();
+                    for (var key = first; key < first + 5_000; key++) {
+                        batch.put(values, key * 2, key);
+                        model.put(key * 2, key);
+                    }
+                    ledger.commit(batch);
+                }
+                ledger.checkpoint();
+                for (var round = 0; round < 6; round++) {
+                    ((LiveLedger) ledger).clearPageCacheForTests();
+                    var batch = ledger.newBatch();
+                    for (var i = 0; i < 400; i++) {
+                        // Even keys exist, odd ones do not
+                        var key = (long) random.nextInt(130_000);
+                        if (random.nextInt(3) == 0) {
+                            batch.delete(values, key);
+                            model.remove(key);
+                        } else {
+                            batch.put(values, key, (long) round);
+                            model.put(key, (long) round);
+                        }
+                    }
+                    ledger.commit(batch);
+                    assertEquals(model.size(), ledger.size(values), "round " + round);
+                    if (round % 2 == 1) {
+                        ledger.checkpoint();
+                    }
+                }
+                for (var key = 0L; key < 130_000; key += 97) {
+                    assertEquals(Optional.ofNullable(model.get(key)), ledger.get(values, key), "key " + key);
+                }
+            }
+            try (var ledger = options.build()) {
+                assertEquals(model.size(), ledger.size(values));
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("damage")
     class Damage {
         @Test

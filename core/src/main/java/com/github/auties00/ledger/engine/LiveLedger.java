@@ -43,6 +43,9 @@ public final class LiveLedger implements Ledger {
     private static final int READER_SLOTS = 256;
     private static final int SWEEP_BUDGET = 64;
     private static final int PRUNE_CHUNK = 1_024;
+    /// The most threads a commit reads tree pages with before it takes the writer lock, about the queue depth that
+    /// keeps a solid-state drive busy.
+    private static final int PREFETCH_THREADS = 32;
 
     private final Map<String, KeyspaceState> states;
     private List<KeyspaceState> sweepOrder;
@@ -59,6 +62,12 @@ public final class LiveLedger implements Ledger {
     private boolean sweepPending;
     // Whether the sweep's current pass over the store found such a chain
     private boolean sweepFound;
+    // The reader bounds and floor the current pass started under
+    private long[] passBounds;
+    private long passCutBound;
+    // The bounds and floor of the last complete pass that left chains, or null: under the same ones a pass frees nothing
+    private long[] sweptBounds;
+    private long sweptCutBound;
     private final Map<Integer, KeyspaceState> byId;
     private int maxId;
     private LogWriter log;
@@ -360,6 +369,7 @@ public final class LiveLedger implements Ledger {
         if (checkpointer != null) {
             checkpointer.throttle();
         }
+        var hints = prefetch(writes);
         Commit commit;
         writeLock.lock();
         try {
@@ -373,9 +383,9 @@ public final class LiveLedger implements Ledger {
                         case ArrayWriteBatch.PUT -> {
                             var value = writes.value(i);
                             var decoded = state.resident ? residentValue(state, writes.decodedValue(i), value) : null;
-                            applier.put(state, writes.key(i), value, decoded);
+                            applier.put(state, writes.key(i), value, decoded, hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree));
                         }
-                        case ArrayWriteBatch.DELETE -> applier.delete(state, writes.key(i));
+                        case ArrayWriteBatch.DELETE -> applier.delete(state, writes.key(i), hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree));
                         case ArrayWriteBatch.DELETE_RANGE -> applier.deleteRange(state, writes.key(i), writes.value(i));
                         default -> throw new IllegalStateException("Unknown write kind " + writes.kind(i));
                     }
@@ -487,6 +497,13 @@ public final class LiveLedger implements Ledger {
     /// checkpoint, so the next open replays the log. For tests of recovery.
     void closeWithoutCheckpoint() {
         close(false);
+    }
+
+    /// Drops every unit the page cache holds, so the next reads go to the file. For tests of reads that miss it.
+    void clearPageCacheForTests() {
+        if (pages != null) {
+            pages.cache().clearForTests();
+        }
     }
 
     private void close(boolean checkpoint) {
@@ -624,6 +641,102 @@ public final class LiveLedger implements Ledger {
         }
     }
 
+    /// Looks up in the trees, before the commit takes the writer lock, the keys of the writes of `writes` that have no
+    /// version in memory.
+    ///
+    /// Under the lock, such a write looks its key up in its tree, so the counts stay exact. With a tree larger than the
+    /// page cache, that lookup reads the file, and every other commit would wait for the read; even from the cache, it
+    /// would be work every other commit waits behind. Here the lookups run outside the lock, those that reach the file
+    /// on up to [#PREFETCH_THREADS] threads at once, and what they found serves the writes under the lock as long as
+    /// the trees are still the ones they read.
+    ///
+    /// The lookups do not register as a read: a lease per commit would hold versions back and change the readers the
+    /// sweep waits for at every commit. Without one, a checkpoint may reuse a page of the trees they read once newer
+    /// trees replace them; the page then fails authentication, since its nonce is not the one its parent records, and
+    /// the lookup leaves its write to the writer. A lookup that succeeds read the trees as they were, and its answer
+    /// is used only while they are still the latest.
+    ///
+    /// @return what the lookups found, or `null` if the store has no trees
+    private Hints prefetch(ArrayWriteBatch writes) {
+        var trees = tree;
+        if (pages == null || trees == null) {
+            return null;
+        }
+        try {
+            var point = new ReadPoint(Reads.boundOf(latest), trees, pages);
+            var found = new byte[writes.size()];
+            var missing = new int[16];
+            var misses = 0;
+            for (var i = 0; i < writes.size(); i++) {
+                var kind = writes.kind(i);
+                if (kind != ArrayWriteBatch.PUT && kind != ArrayWriteBatch.DELETE) {
+                    continue;
+                }
+                var state = states.get(writes.keyspace(i).name());
+                var root = point.root(state);
+                var key = writes.key(i);
+                if (root == null || state.entries.containsKey(key)) {
+                    continue;
+                }
+                found[i] = TreeSearch.lookupCached(pages, root, key);
+                if (found[i] == TreeSearch.UNKNOWN) {
+                    if (misses == missing.length) {
+                        missing = Arrays.copyOf(missing, misses * 2);
+                    }
+                    missing[misses++] = i;
+                }
+            }
+            if (misses == 1) {
+                lookUp(writes, point, found, missing, 1, 0, 1);
+            } else if (misses > 1) {
+                var threads = Math.min(PREFETCH_THREADS, misses);
+                var started = new Thread[threads];
+                var indexes = missing;
+                var count = misses;
+                for (var thread = 0; thread < threads; thread++) {
+                    var first = thread;
+                    started[thread] = Thread.ofVirtual().start(() -> lookUp(writes, point, found, indexes, count, first, threads));
+                }
+                for (var thread : started) {
+                    thread.join();
+                }
+            }
+            return new Hints(trees, found);
+        } catch (InterruptedException _) {
+            // The commit goes on without the hints, and its lookups read the trees under the lock
+            Thread.currentThread().interrupt();
+            return null;
+        }
+    }
+
+    /// Looks up the keys of every `step`-th write of `missing` from `first` in the trees of `point`, reading the file,
+    /// and records in `found` what each lookup found.
+    private void lookUp(ArrayWriteBatch writes, ReadPoint point, byte[] found, int[] missing, int count, int first, int step) {
+        for (var i = first; i < count; i += step) {
+            var write = missing[i];
+            try {
+                var root = point.root(states.get(writes.keyspace(write).name()));
+                found[write] = TreeSearch.find(pages, root, writes.key(write)) != null ? TreeSearch.FOUND : TreeSearch.ABSENT;
+            } catch (RuntimeException _) {
+                // Left unknown: the lookup under the writer lock reads the page again and reports the failure
+            }
+        }
+    }
+
+    /// Whether the trees held the keys of a batch's writes, as a commit found before it took the writer lock.
+    ///
+    /// @param tree the trees the lookups read
+    /// @param found per write, [TreeSearch#FOUND], [TreeSearch#ABSENT], or [TreeSearch#UNKNOWN] for one not looked up
+    private record Hints(TreeVersion tree, byte[] found) {
+        /// {@return what the lookups found for write `write`, or [TreeSearch#UNKNOWN] if the writer reads trees
+        /// other than theirs}
+        ///
+        /// @param current the trees the writer reads
+        byte of(int write, TreeVersion current) {
+            return tree == current ? found[write] : TreeSearch.UNKNOWN;
+        }
+    }
+
     private static long[] bounds(long[] active) {
         var bounds = new long[active.length];
         for (var i = 0; i < active.length; i++) {
@@ -676,7 +789,13 @@ public final class LiveLedger implements Ledger {
     /// @param bounds the bounds of every active reader, highest first; the first covers the newest version
     /// @return whether the key keeps a version a later prune may drop, once the readers that need it are gone
     private boolean prune(KeyspaceState state, MemorySegment key, long[] bounds, long cutBound) {
-        var head = state.entries.get(key);
+        return prune(state, key, state.entries.get(key), bounds, cutBound);
+    }
+
+    /// Prunes the chain of `key` from `head`, its newest version or one a later version of the same commit replaced.
+    ///
+    /// @return whether the chain keeps versions a later prune may drop
+    private boolean prune(KeyspaceState state, MemorySegment key, Version head, long[] bounds, long cutBound) {
         if (head == null) {
             return false;
         }
@@ -774,29 +893,54 @@ public final class LiveLedger implements Ledger {
         if (!sweepPending || sweepOrder.isEmpty()) {
             return;
         }
+        // A chain a pass left is left again under the same readers and floor, such as while a checkpoint's own read
+        // holds the floor back
+        if (sweptBounds != null && sameReaders(bounds, cutBound, sweptBounds, sweptCutBound)) {
+            return;
+        }
         var visitedKeyspaces = 0;
         while (budget > 0 && visitedKeyspaces <= sweepOrder.size()) {
             if (sweepIndex == 0 && sweepAfter == null) {
                 sweepFound = false;
+                passBounds = bounds;
+                passCutBound = cutBound;
             }
             var state = sweepOrder.get(sweepIndex % sweepOrder.size());
-            var keys = (sweepAfter == null ? state.entries : state.entries.tailMap(sweepAfter, false)).keySet().iterator();
-            while (budget > 0 && keys.hasNext()) {
-                var key = keys.next();
-                sweepFound |= prune(state, key, bounds, cutBound);
-                sweepAfter = key;
+            // Under the writer lock, so each entry's value is the key's newest version
+            var entries = (sweepAfter == null ? state.entries : state.entries.tailMap(sweepAfter, false)).entrySet().iterator();
+            while (budget > 0 && entries.hasNext()) {
+                var entry = entries.next();
+                sweepFound |= prune(state, entry.getKey(), entry.getValue(), bounds, cutBound);
+                sweepAfter = entry.getKey();
                 budget--;
             }
-            if (!keys.hasNext()) {
+            if (!entries.hasNext()) {
                 sweepIndex = (sweepIndex + 1) % sweepOrder.size();
                 sweepAfter = null;
                 visitedKeyspaces++;
-                if (sweepIndex == 0 && !sweepFound) {
-                    sweepPending = false;
-                    return;
+                if (sweepIndex == 0) {
+                    if (!sweepFound) {
+                        sweepPending = false;
+                        sweptBounds = null;
+                        return;
+                    }
+                    sweptBounds = passBounds;
+                    sweptCutBound = passCutBound;
+                    if (sameReaders(bounds, cutBound, sweptBounds, sweptCutBound)) {
+                        return;
+                    }
                 }
             }
         }
+    }
+
+    /// {@return whether a prune under `bounds` and `cutBound` keeps what one under `otherBounds` and `otherCutBound`
+    /// keeps, for a chain no commit has touched since}
+    ///
+    /// The first bound is the latest commit's: a commit prunes the keys it writes, so it changes nothing for the
+    /// others.
+    private static boolean sameReaders(long[] bounds, long cutBound, long[] otherBounds, long otherCutBound) {
+        return cutBound == otherCutBound && Arrays.equals(bounds, 1, bounds.length, otherBounds, 1, otherBounds.length);
     }
 
     /// The writes of one commit or transaction, applied as they come and published together.
@@ -835,16 +979,25 @@ public final class LiveLedger implements Ledger {
         }
 
         void put(KeyspaceState state, MemorySegment key, MemorySegment value, Object decoded) {
+            put(state, key, value, decoded, TreeSearch.UNKNOWN);
+        }
+
+        /// Applies a put of `key`.
+        ///
+        /// @param inTree whether the latest tree holds `key`, as [Hints] give it, or [TreeSearch#UNKNOWN]
+        void put(KeyspaceState state, MemorySegment key, MemorySegment value, Object decoded, byte inTree) {
             var stamp = nextStamp();
-            var existed = Reads.exists(state, key, writerPoint(stamp - 1));
             var head = state.entries.get(key);
-            state.entries.put(head == null ? Segments.copy(key) : key, new Version(stamp, value, decoded, head));
-            touched.add(new Touched(state, key));
+            var existed = Reads.exists(state, head, key, writerPoint(stamp - 1), inTree);
+            var version = new Version(stamp, value, decoded, head);
+            var stored = head == null ? Segments.copy(key) : key;
+            state.entries.put(stored, version);
+            touched.add(new Touched(state, key, version));
             if (!existed) {
                 deltas.merge(state, 1L, Long::sum);
             }
             if (pages != null) {
-                state.dirty.add(key);
+                state.dirty.add(stored);
             }
             if (frame != null) {
                 frame.put(state.id, key, value);
@@ -852,16 +1005,25 @@ public final class LiveLedger implements Ledger {
         }
 
         void delete(KeyspaceState state, MemorySegment key) {
+            delete(state, key, TreeSearch.UNKNOWN);
+        }
+
+        /// Applies a removal of `key`.
+        ///
+        /// @param inTree whether the latest tree holds `key`, as [Hints] give it, or [TreeSearch#UNKNOWN]
+        void delete(KeyspaceState state, MemorySegment key, byte inTree) {
             var stamp = nextStamp();
-            if (!Reads.exists(state, key, writerPoint(stamp - 1))) {
+            var head = state.entries.get(key);
+            if (!Reads.exists(state, head, key, writerPoint(stamp - 1), inTree)) {
                 return;
             }
-            var head = state.entries.get(key);
-            state.entries.put(head == null ? Segments.copy(key) : key, new Version(stamp, null, null, head));
-            touched.add(new Touched(state, key));
+            var version = new Version(stamp, null, null, head);
+            var stored = head == null ? Segments.copy(key) : key;
+            state.entries.put(stored, version);
+            touched.add(new Touched(state, key, version));
             deltas.merge(state, -1L, Long::sum);
             if (pages != null) {
-                state.dirty.add(key);
+                state.dirty.add(stored);
             }
             if (frame != null) {
                 frame.delete(state.id, key);
@@ -939,7 +1101,7 @@ public final class LiveLedger implements Ledger {
             var dropBound = pages == null ? Long.MAX_VALUE : cutBound;
             var oldest = active[active.length - 1];
             for (var write : touched) {
-                sweepPending |= prune(write.state(), write.key(), bounds, cutBound);
+                sweepPending |= prune(write.state(), write.key(), write.version(), bounds, cutBound);
             }
             for (var state : states.values()) {
                 applyRemovals(state, bounds[bounds.length - 1], dropBound);
@@ -953,6 +1115,8 @@ public final class LiveLedger implements Ledger {
     }
 
     /// A key a commit wrote.
-    private record Touched(KeyspaceState state, MemorySegment key) {
+    ///
+    /// @param version the version the write added
+    private record Touched(KeyspaceState state, MemorySegment key, Version version) {
     }
 }

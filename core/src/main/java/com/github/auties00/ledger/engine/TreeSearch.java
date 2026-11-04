@@ -4,6 +4,13 @@ import java.lang.foreign.MemorySegment;
 
 /// Point lookups and range counts in a key space's tree.
 final class TreeSearch {
+    /// A lookup through the page cache met a node the cache does not hold.
+    static final byte UNKNOWN = 0;
+    /// The tree holds the key.
+    static final byte FOUND = 1;
+    /// The tree does not hold the key.
+    static final byte ABSENT = 2;
+
     private TreeSearch() {
     }
 
@@ -14,20 +21,39 @@ final class TreeSearch {
     record Hit(byte[] unit, int entry) {
     }
 
+    /// {@return whether the tree under `root` holds `key`, as [#FOUND] or [#ABSENT], looked up through the page cache
+    /// alone, or [#UNKNOWN] if the cache does not hold a node on the way}
+    static byte lookupCached(PageFile pages, TreeRoot root, MemorySegment key) {
+        var unit = pages.cached(root.ref(), PageFile.NODE);
+        while (unit != null && !TreeNodes.isLeaf(unit)) {
+            unit = pages.cached(TreeNodes.childRef(unit, TreeNodes.childFor(unit, key)), PageFile.NODE);
+        }
+        if (unit == null) {
+            return UNKNOWN;
+        }
+        return entryOf(unit, key) != -1 ? FOUND : ABSENT;
+    }
+
     /// {@return where the tree under `root` holds `key`, or `null` if it does not}
     static Hit find(PageFile pages, TreeRoot root, MemorySegment key) {
         var unit = pages.read(root.ref(), PageFile.NODE, true);
         while (!TreeNodes.isLeaf(unit)) {
             unit = pages.read(TreeNodes.childRef(unit, TreeNodes.childFor(unit, key)), PageFile.NODE, true);
         }
+        var entry = entryOf(unit, key);
+        return entry == -1 ? null : new Hit(unit, entry);
+    }
+
+    /// {@return the offset of the entry of leaf `unit` holding `key`, or -1 if it holds none}
+    private static int entryOf(byte[] unit, MemorySegment key) {
         var index = TreeNodes.lowerBound(unit, key);
         if (index == TreeNodes.count(unit)) {
-            return null;
+            return -1;
         }
         var entry = TreeNodes.entry(unit, index);
         return TreeNodes.compare(unit, TreeNodes.leafKeyOffset(entry), TreeNodes.leafKeyLength(unit, entry), key) == 0
-                ? new Hit(unit, entry)
-                : null;
+                ? entry
+                : -1;
     }
 
     /// {@return the read-only value of leaf entry `entry` of `unit`, read from its blob if it has one}
