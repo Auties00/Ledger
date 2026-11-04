@@ -43,6 +43,7 @@ final class PendingCommit {
     private static final VarHandle STATE;
     private static final VarHandle NEXT;
     private static final VarHandle WAITERS;
+    private static final VarHandle ARRIVAL;
 
     static {
         try {
@@ -50,6 +51,7 @@ final class PendingCommit {
             STATE = lookup.findVarHandle(PendingCommit.class, "state", int.class);
             NEXT = lookup.findVarHandle(PendingCommit.class, "next", PendingCommit.class);
             WAITERS = lookup.findVarHandle(PendingCommit.class, "waiters", Waiter.class);
+            ARRIVAL = lookup.findVarHandle(PendingCommit.class, "arrival", PendingCommit.class);
         } catch (ReflectiveOperationException exception) {
             throw new ExceptionInInitializerError(exception);
         }
@@ -83,6 +85,9 @@ final class PendingCommit {
     Throwable failure;
     /// Whether publishing the commit only moves the latest sequence; set by the committing thread before [#APPLIED].
     boolean light;
+    /// The commit that arrived after this one, waiting for a sequence, or `null` before it links itself here and once
+    /// the sequencer moved past this one.
+    volatile PendingCommit arrival;
     /// The next commit the same pass of the sequencer gave a sequence, which that thread alone reads and writes.
     PendingCommit sequencedNext;
     /// The next commit the same pass of the publisher published, which that thread alone reads and writes.
@@ -249,6 +254,17 @@ final class PendingCommit {
                 LockSupport.unpark(waiter.thread);
             }
         }
+    }
+
+    /// Makes `commit`, which arrived after this one, the next in the arrival list, with a release store.
+    void linkArrival(PendingCommit commit) {
+        ARRIVAL.setRelease(this, commit);
+    }
+
+    /// Forgets the commit that arrived after this one, once the sequencer moved past this one: as with [#unlink()],
+    /// a consumed commit the collector promoted would otherwise keep every later arrival reachable.
+    void unlinkArrival() {
+        ARRIVAL.set(this, null);
     }
 
     /// Makes `commit` the commit given the sequence after this one's.

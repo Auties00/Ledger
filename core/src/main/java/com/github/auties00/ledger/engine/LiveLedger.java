@@ -25,7 +25,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
@@ -78,8 +77,12 @@ public final class LiveLedger implements Ledger {
     private List<KeyspaceState> sweepOrder;
     private final Map<String, Keyspace<?, ?>> keyspaces;
     private final HeapPool pool;
-    // Commits waiting for a sequence, in the order they arrived
-    private final ConcurrentLinkedQueue<PendingCommit> arrivals;
+    // The last commit to arrive for a sequence: an arrival swaps itself in, then links the commit it replaced to
+    // itself through PendingCommit.arrival, so the arrivals form a list in the order of the swaps
+    private final Padded.CommitReference arrivalTail;
+    // The last arrival the sequencer took off the list, from which it follows the links; written holding the
+    // sequencing role
+    private final Padded.CommitReference arrivalCursor;
     // Held by the thread giving sequences to the arrived commits, or by an exclusive operation
     private final Padded.Role sequencing;
     // Held by the thread publishing applied commits in order, by maintenance, or by an exclusive operation
@@ -158,7 +161,9 @@ public final class LiveLedger implements Ledger {
         }
         this.sweepOrder = List.copyOf(states.values());
         this.pool = pool;
-        this.arrivals = new ConcurrentLinkedQueue<>();
+        var arrivalStart = new PendingCommit(0);
+        this.arrivalTail = new Padded.CommitReference(arrivalStart);
+        this.arrivalCursor = new Padded.CommitReference(arrivalStart);
         this.sequencing = new Padded.Role();
         this.publishing = new Padded.Role();
         this.sequenced = new Padded.Sequenced();
@@ -617,7 +622,7 @@ public final class LiveLedger implements Ledger {
             }
         }
         var pending = new PendingCommit(writes, chains, keyspaceStates, decoded, units, hints);
-        if (arrivals.isEmpty() && !sequencingWanted.held() && sequencing.tryAcquireBriefly()) {
+        if (arrivalTail.commit == arrivalCursor.commit && !sequencingWanted.held() && sequencing.tryAcquireBriefly()) {
             // No commit arrived before this one: it takes its sequence without the queue, and lets the role go with
             // a release store, looking for no arrival: one that finds the role held briefly sequences itself
             try {
@@ -626,7 +631,7 @@ public final class LiveLedger implements Ledger {
                 sequencing.releaseLazily();
             }
         } else {
-            arrivals.add(pending);
+            arrive(pending);
         }
         awaitSequenced(pending);
         if (pending.failure != null) {
@@ -678,15 +683,32 @@ public final class LiveLedger implements Ledger {
         pending.awaitHelping(PendingCommit.DONE, publishing, publishHelper);
     }
 
+    /// Adds `pending` to the commits waiting for a sequence.
+    ///
+    /// Between the swap and the link, the sequencer cannot reach the commit, and stops before it; the commit's own
+    /// thread then takes the role and sequences it, since it announces a park with a full fence and parks only while
+    /// another thread holds the role, which re-reads the link after letting the role go.
+    private void arrive(PendingCommit pending) {
+        arrivalTail.getAndSet(pending).linkArrival(pending);
+    }
+
+    /// {@return whether a commit is linked after the last one the sequencer took off the arrival list}
+    private boolean arrivalLinked() {
+        return arrivalCursor.commit.arrival != null;
+    }
+
     /// Gives a sequence to every arrived commit, in the order they arrived, unless another thread or an exclusive
     /// operation holds the role.
     private void drainArrivals() {
-        while (!arrivals.isEmpty() && !sequencingWanted.held() && sequencing.tryAcquire()) {
+        while (arrivalLinked() && !sequencingWanted.held() && sequencing.tryAcquire()) {
             PendingCommit first = null;
             PendingCommit last = null;
+            var cursor = arrivalCursor.commit;
             try {
                 PendingCommit pending;
-                while ((pending = arrivals.poll()) != null) {
+                while ((pending = cursor.arrival) != null) {
+                    cursor.unlinkArrival();
+                    cursor = pending;
                     if (sequence(pending)) {
                         // A list of this thread's own, which outlives the role
                         if (last == null) {
@@ -698,6 +720,7 @@ public final class LiveLedger implements Ledger {
                     }
                 }
             } finally {
+                arrivalCursor.setLazily(cursor);
                 sequencing.releaseLazily();
                 // One fence after every move of the pass and the release: each committing thread that parks is seen
                 // parking, and the queue is read again after the role went
