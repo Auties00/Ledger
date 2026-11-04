@@ -44,28 +44,38 @@ jobs:
         with:
           python-version: '3.x'
 
-      # A build that runs past 25 minutes (it takes about 7) has a hung test: the watchdog prints the threads of every
-      # JVM into results/ before it stops the build, and the log step uploads them.
+      # A build that runs past 20 minutes (it takes a few) has a hung test. The watchdog then records the threads of
+      # every JVM into results/, each dump cut off after a minute since a JVM that cannot reach a safepoint never
+      # answers one (macOS adds native stacks, which need no safepoint), and kills the JVMs so the build fails and the
+      # log step uploads results/. A safepoint that takes longer than 30 seconds aborts its JVM, whose crash report
+      # names the thread that does not stop.
       - name: Build
         run: |
           mkdir -p results
           (
-            for _ in $(seq 1 1500); do
+            for _ in $(seq 1 1200); do
               sleep 1
               [ -f results/.built ] && exit 0
             done
+            echo "The build ran past 20 minutes"
             for pid in $(jps -q); do
-              echo "=== $(jps -l | grep "^$pid ")"
-              jcmd "$pid" Thread.print
-            done > results/threads.txt 2>&1
-            if command -v taskkill > /dev/null; then taskkill //F //IM java.exe; else pkill java; fi
+              name=$(jps -l | grep "^$pid " || true)
+              if command -v sample > /dev/null; then
+                sample "$pid" 3 -file "results/native-$pid.txt" > /dev/null 2>&1 &
+              fi
+              { echo "=== $name"; jcmd "$pid" Thread.print; } > "results/threads-$pid.txt" 2>&1 &
+            done
+            sleep 60
+            if command -v taskkill > /dev/null; then taskkill //F //IM java.exe; else pkill -9 java; fi
           ) > results/watchdog.log 2>&1 &
           set +e
-          mvn -B -ntp package 2>&1 | tee results/build.log
+          mvn -B -ntp package \
+            "-Dledger.test.jvm=-XX:+IgnoreUnrecognizedVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+SafepointTimeout -XX:SafepointTimeoutDelay=30000 -XX:+AbortVMOnSafepointTimeout" \
+            2>&1 | tee results/build.log
           status=${PIPESTATUS[0]}
           touch results/.built
-          if [ -f results/threads.txt ]; then
-            echo "The build ran past 25 minutes; thread dumps are in the uploaded results/threads.txt" >&2
+          if [ -s results/watchdog.log ]; then
+            echo "The build ran past 20 minutes; thread dumps are in the uploaded results/" >&2
           fi
           exit "$status"
 
@@ -93,9 +103,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the log
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: smoke-${{ matrix.os }}
-          path: results/
+          path: |
+            results/
+            **/hs_err_pid*.log
+            **/target/surefire-reports/*.dumpstream
           retention-days: 14

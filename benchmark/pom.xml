@@ -18,6 +18,8 @@
     <properties>
         <maven.deploy.skip>true</maven.deploy.skip>
         <maven.install.skip>true</maven.install.skip>
+        <!-- More arguments of the test JVM, as in the core module -->
+        <ledger.test.jvm></ledger.test.jvm>
     </properties>
 
     <dependencies>
@@ -83,7 +85,7 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
-                    <argLine>--enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow</argLine>
+                    <argLine>--enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow ${ledger.test.jvm}</argLine>
                 </configuration>
             </plugin>
             <plugin>
