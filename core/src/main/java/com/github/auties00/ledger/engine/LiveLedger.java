@@ -12,6 +12,8 @@ import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.WriteBatch;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -23,6 +25,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
@@ -32,9 +36,16 @@ import java.util.function.LongSupplier;
 /// A store: the engine of [Ledger.Builder#memory()], and of a store in a directory, which also journals every commit
 /// to a [LogWriter] and checkpoints it into the trees of a [PageFile].
 ///
-/// One writer at a time applies a commit under [#writeLock], stamping its writes, then publishes it by advancing
-/// [#latest]; readers see a commit whole or not at all. After each commit the writer prunes the versions no reader can
-/// need any more, applies the range removals every reader has passed, and sweeps a few keys of the whole store.
+/// A batch commits through a pipeline that holds no lock ([PendingCommit]): the committing thread prepares it, the
+/// thread holding the sequencing role gives it the next sequence in the order commits arrive, the committing thread
+/// applies its writes once the commits before it on the same keys have applied theirs, and the thread holding the
+/// publishing role publishes the applied commits in the order of their sequences by advancing [#latest]. Readers see
+/// a commit whole or not at all. Transactions and batches with a range removal run alone instead: they hold both roles
+/// once every commit given a sequence has published.
+///
+/// After publishing, the publisher prunes the versions no reader can need any more, applies the range removals every
+/// reader has passed, and sweeps a few keys of the whole store; prunes and drops of chains happen only while holding
+/// the publishing role, so a chain is dropped only once its last writer has published.
 ///
 /// A store in a directory reads each key space's tree under the writes in memory ([ReadPoint]). Once every reader's
 /// tree holds a version, the writer drops it from memory, except in resident key spaces, which keep every entry; a
@@ -45,7 +56,21 @@ public final class LiveLedger implements Ledger {
     private static final int PRUNE_CHUNK = 1_024;
     /// The dropped chains a commit takes out of the ordered maps, more than the sweep and its own writes drop.
     private static final int COMMIT_REMOVALS = 256;
-    /// The most threads a commit reads tree pages with before it takes the writer lock, about the queue depth that
+    /// The passes of the publisher between two maintenances when nothing asks for one sooner: the counts and trees
+    /// readers no longer need wait that long to go.
+    private static final int MAINTAIN_EVERY = 16;
+    private static final VarHandle LAST_PUBLISHED;
+    private static final VarHandle LATEST;
+
+    static {
+        try {
+            LAST_PUBLISHED = MethodHandles.lookup().findVarHandle(Padded.PublishedFields.class, "last", PendingCommit.class);
+            LATEST = MethodHandles.lookup().findVarHandle(Padded.PublishedFields.class, "latest", long.class);
+        } catch (ReflectiveOperationException exception) {
+            throw new ExceptionInInitializerError(exception);
+        }
+    }
+    /// The most threads a commit reads tree pages with before it is given a sequence, about the queue depth that
     /// keeps a solid-state drive busy.
     private static final int PREFETCH_THREADS = 32;
 
@@ -53,14 +78,47 @@ public final class LiveLedger implements Ledger {
     private List<KeyspaceState> sweepOrder;
     private final Map<String, Keyspace<?, ?>> keyspaces;
     private final HeapPool pool;
-    private final ReentrantLock writeLock;
+    // Commits waiting for a sequence, in the order they arrived
+    private final ConcurrentLinkedQueue<PendingCommit> arrivals;
+    // Held by the thread giving sequences to the arrived commits, or by an exclusive operation
+    private final Padded.Role sequencing;
+    // Held by the thread publishing applied commits in order, by maintenance, or by an exclusive operation
+    private final Padded.Role publishing;
+    // The last commit given a sequence and the next sequence; guarded by sequencing
+    private final Padded.Sequenced sequenced;
+    // The latest sequence and the last commit published, which an exclusive operation waits to reach the last
+    // sequenced; written under publishing
+    private final Padded.Published published;
+    // Raised by the thread that waits for the sequencing role, or holds it, for an exclusive operation: the commits
+    // then leave the role to it, so it is not starved by threads that take the role again and again
+    private final Padded.Role sequencingWanted;
+    // Raised by the thread that waits for the publishing role, or holds it, for an exclusive operation or the work of
+    // a checkpoint
+    private final Padded.Role publishingWanted;
+    // Taken by the threads that want the roles for exclusive operations and checkpoints; barging, so transactions
+    // that follow each other hand it on without parking, except while a checkpoint waits for it
+    private final ReentrantLock requests;
+    // Raised while the work of a checkpoint waits for the requests lock: transactions then stop barging
+    private final Padded.Role checkpointWaiting;
+    // publishApplied, which waiting commits run to help, made once
+    private final Runnable publishHelper;
+    // The frames of a pass of the publisher, queued in the log together; guarded by the publishing role
+    private final LogWriter.Batch passFrames;
+    // The passes of the publisher since the last maintenance; guarded by the publishing role
+    private int passesSinceMaintenance;
+    // The thread running an exclusive operation, or null
+    private volatile Thread exclusiveOwner;
+    // The failure of the log that stopped publication, after which no commit publishes, or null
+    private volatile RuntimeException broken;
     private final ReaderTable readers;
-    private volatile long latest;
-    private long nextSequence;
+    // The latest sequence, for the drops of chains
+    private final LongSupplier latestSequence;
+    // Raised by a prune that left a chain a later one may shorten, so the sweep starts a pass; lowered when it does
+    private final Padded.Role sweepWanted;
     private volatile boolean closed;
     private int sweepIndex;
     private MemorySegment sweepAfter;
-    // Whether a prune left a chain that a later one may shorten, so the sweep has work; guarded by the writer lock
+    // Whether a prune left a chain that a later one may shorten, so the sweep has work; guarded by the publishing role
     private boolean sweepPending;
     // Whether the sweep's current pass over the store found such a chain
     private boolean sweepFound;
@@ -83,7 +141,8 @@ public final class LiveLedger implements Ledger {
     private BlobFile blobs;
     // The threshold of the key spaces the store finds in its catalog without being opened with them
     private long largeValues = Long.MAX_VALUE;
-    // The versions whose units of the file of large values no published checkpoint has taken, guarded by the writer lock
+    // The versions whose units of the file of large values no published checkpoint has taken; guarded by the
+    // publishing role
     private final ArrayList<InFlight> inFlight;
 
     /// Creates an empty store with `keyspaces`.
@@ -99,9 +158,23 @@ public final class LiveLedger implements Ledger {
         }
         this.sweepOrder = List.copyOf(states.values());
         this.pool = pool;
-        this.writeLock = new ReentrantLock();
-        this.readers = new ReaderTable(READER_SLOTS, () -> latest);
-        this.nextSequence = 1;
+        this.arrivals = new ConcurrentLinkedQueue<>();
+        this.sequencing = new Padded.Role();
+        this.publishing = new Padded.Role();
+        this.sequenced = new Padded.Sequenced();
+        this.published = new Padded.Published();
+        sequenced.last = new PendingCommit(0);
+        published.last = sequenced.last;
+        this.latestSequence = this::latest;
+        this.readers = new ReaderTable(READER_SLOTS, latestSequence);
+        this.sweepWanted = new Padded.Role();
+        this.sequencingWanted = new Padded.Role();
+        this.publishingWanted = new Padded.Role();
+        this.requests = new ReentrantLock();
+        this.checkpointWaiting = new Padded.Role();
+        this.publishHelper = this::publishApplied;
+        this.passFrames = new LogWriter.Batch();
+        sequenced.next = 1;
         this.byId = new HashMap<>();
         this.resources = new AutoCloseable[0];
         this.inFlight = new ArrayList<>();
@@ -155,8 +228,8 @@ public final class LiveLedger implements Ledger {
         var sequence = superblock.sequence();
         tree = new TreeVersion(superblock.number(), sequence, sequence, roots, superblock.catalog(), superblock.freeList(),
                 superblock.blobFreeList(), null);
-        latest = sequence;
-        nextSequence = sequence + 1;
+        published.latest = sequence;
+        sequenced.next = sequence + 1;
         var stamp = Reads.stamp(sequence, 0);
         for (var entry : catalog.entries()) {
             var state = byId.get(entry.id());
@@ -246,7 +319,7 @@ public final class LiveLedger implements Ledger {
             }
         });
         applier.publish();
-        nextSequence = sequence + 1;
+        sequenced.next = sequence + 1;
         return true;
     }
 
@@ -275,11 +348,11 @@ public final class LiveLedger implements Ledger {
         this.checkpointer = checkpointer;
         this.resources = resources;
         if (catalog != null) {
-            log.append(FrameBody.CATALOG, latest, catalog);
+            log.append(FrameBody.CATALOG, latest(), catalog);
         }
         if (blobs != null) {
             // Durable before this open's first unit, so no later open reuses its nonces
-            var frames = log.append(FrameBody.EPOCH, latest, FrameBody.epoch(blobs.epoch()), 0);
+            var frames = log.append(FrameBody.EPOCH, latest(), FrameBody.epoch(blobs.epoch()), 0);
             blobs.epochGate(() -> log.awaitFrames(frames));
             log.useBlobs(blobs);
         }
@@ -305,7 +378,7 @@ public final class LiveLedger implements Ledger {
     }
 
     long latest() {
-        return latest;
+        return published.latest;
     }
 
     /// {@return the log the store journals to, or `null` for a store in memory}
@@ -415,7 +488,14 @@ public final class LiveLedger implements Ledger {
     @Override
     public long size(Keyspace<?, ?> keyspace) {
         ensureOpen();
-        return state(keyspace).count(latest);
+        var state = state(keyspace);
+        // Registered as a read: the publisher drops the counts below the oldest read, and the latest may move on
+        var lease = readers.enter();
+        try {
+            return state.count(lease.sequence());
+        } finally {
+            readers.exit(lease);
+        }
     }
 
     @Override
@@ -435,7 +515,7 @@ public final class LiveLedger implements Ledger {
             throw new IllegalArgumentException("A batch holds at most " + Reads.MAX_OPS + " writes: " + writes.size());
         }
         if (writes.isEmpty()) {
-            return ticket(latest);
+            return ticket(latest());
         }
         checkNotInTransaction();
         if (checkpointer != null) {
@@ -443,46 +523,12 @@ public final class LiveLedger implements Ledger {
         }
         writes.compact();
         var units = writeUnits(writes);
-        Applier applier = null;
+        var outcome = new Applier[1];
         Commit commit;
         try {
-            var hints = prefetch(writes);
-            writeLock.lock();
-            try {
-                ensureOpen();
-                checkHealthy();
-                applier = new Applier(nextSequence, log != null);
-                try {
-                    for (var i = 0; i < writes.size(); i++) {
-                        var state = states.get(writes.keyspace(i).name());
-                        switch (writes.kind(i)) {
-                            case ArrayWriteBatch.PUT -> {
-                                var value = writes.value(i);
-                                var decoded = state.resident ? residentValue(state, writes.decodedValue(i), value) : null;
-                                applier.put(state, writes.key(i), value, decoded,
-                                        hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree), units == null ? null : units[i]);
-                            }
-                            case ArrayWriteBatch.DELETE ->
-                                    applier.delete(state, writes.key(i), hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree));
-                            case ArrayWriteBatch.DELETE_RANGE -> applier.deleteRange(state, writes.key(i), writes.value(i));
-                            default -> throw new IllegalStateException("Unknown write kind " + writes.kind(i));
-                        }
-                    }
-                } catch (RuntimeException | Error throwable) {
-                    // A resident value whose decoder throws, or a tree that cannot be read, stops the batch
-                    applier.rollback();
-                    throw throwable;
-                }
-                // The versions reference the batch's array, which the batch no longer writes
-                writes.detach();
-                var sequence = applier.publish();
-                nextSequence++;
-                commit = ticket(sequence);
-            } finally {
-                writeLock.unlock();
-            }
+            commit = rangeRemoval(writes) ? commitAlone(writes, units, outcome) : commitPipelined(writes, units, outcome);
         } finally {
-            if (units != null && (applier == null || !applier.logged())) {
+            if (units != null && (outcome[0] == null || !outcome[0].logged())) {
                 // No log frame names them
                 for (var unit : units) {
                     if (unit != null) {
@@ -495,7 +541,506 @@ public final class LiveLedger implements Ledger {
         return commit;
     }
 
-    /// Writes to the file of large values, before the commit takes the writer lock, each value `writes` puts that is
+    /// {@return whether `writes` holds a range removal}
+    private static boolean rangeRemoval(ArrayWriteBatch writes) {
+        for (var i = 0; i < writes.size(); i++) {
+            if (writes.kind(i) == ArrayWriteBatch.DELETE_RANGE) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Commits `writes`, which holds a range removal, as an exclusive operation: the removal counts the keys it
+    /// removes, which needs every commit before it applied and none after it started.
+    ///
+    /// @param outcome receives the writes as applied
+    private Commit commitAlone(ArrayWriteBatch writes, PageRef[] units, Applier[] outcome) {
+        var hints = prefetch(writes, null, null);
+        enterExclusive();
+        try {
+            ensureOpen();
+            checkHealthy();
+            var applier = new Applier(sequenced.next, log != null);
+            outcome[0] = applier;
+            try {
+                for (var i = 0; i < writes.size(); i++) {
+                    var state = states.get(writes.keyspace(i).name());
+                    switch (writes.kind(i)) {
+                        case ArrayWriteBatch.PUT -> {
+                            var value = writes.value(i);
+                            var decoded = state.resident ? residentValue(state, writes.decodedValue(i), value) : null;
+                            applier.put(state, writes.key(i), value, decoded,
+                                    hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree), units == null ? null : units[i]);
+                        }
+                        case ArrayWriteBatch.DELETE ->
+                                applier.delete(state, writes.key(i), hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree));
+                        case ArrayWriteBatch.DELETE_RANGE -> applier.deleteRange(state, writes.key(i), writes.value(i));
+                        default -> throw new IllegalStateException("Unknown write kind " + writes.kind(i));
+                    }
+                }
+            } catch (RuntimeException | Error throwable) {
+                // A resident value whose decoder throws, or a tree that cannot be read, stops the batch
+                applier.rollback();
+                throw throwable;
+            }
+            // The versions reference the batch's array, which the batch no longer writes
+            writes.detach();
+            var sequence = applier.publish();
+            sequenced.next++;
+            return ticket(sequence);
+        } finally {
+            exitExclusive();
+        }
+    }
+
+    /// Commits `writes` through the pipeline: prepared here, given a sequence in the order commits arrive, applied
+    /// here once the commits before it that write the same keys have, and published in the order of the sequences.
+    ///
+    /// No lock is held at any point: commits on different keys apply at once, and a commit waits only for the
+    /// commits before it on its own keys, then for its turn to become visible.
+    ///
+    /// @param outcome receives the writes as applied
+    private Commit commitPipelined(ArrayWriteBatch writes, PageRef[] units, Applier[] outcome) {
+        var size = writes.size();
+        var chains = new Chain[size];
+        var keyspaceStates = new KeyspaceState[size];
+        var hints = prefetch(writes, chains, keyspaceStates);
+        Object[] decoded = null;
+        for (var i = 0; i < size; i++) {
+            if (writes.kind(i) == ArrayWriteBatch.PUT && keyspaceStates[i].resident) {
+                if (decoded == null) {
+                    decoded = new Object[size];
+                }
+                // A decoder that throws stops the batch before it has a sequence
+                decoded[i] = residentValue(keyspaceStates[i], writes.decodedValue(i), writes.value(i));
+            }
+        }
+        var pending = new PendingCommit(writes, chains, keyspaceStates, decoded, units, hints);
+        if (arrivals.isEmpty() && !sequencingWanted.held() && sequencing.tryAcquireBriefly()) {
+            // No commit arrived before this one: it takes its sequence without the queue, and lets the role go with
+            // a release store, looking for no arrival: one that finds the role held briefly sequences itself
+            try {
+                sequence(pending);
+            } finally {
+                sequencing.releaseLazily();
+            }
+        } else {
+            arrivals.add(pending);
+        }
+        awaitSequenced(pending);
+        if (pending.failure != null) {
+            throw rethrow(pending.failure);
+        }
+        apply(pending);
+        awaitPublished(pending);
+        // Forgotten here rather than by the publisher, whose cache would have to fetch each chain's line
+        for (var chain : pending.chains) {
+            if (chain != null) {
+                chain.forget(pending);
+            }
+        }
+        pending.predecessors = null;
+        outcome[0] = pending.applier;
+        if (pending.failure != null) {
+            throw rethrow(pending.failure);
+        }
+        pruneWritten(pending.applier.touched);
+        // The versions reference the batch's array, which the batch no longer writes
+        writes.detach();
+        return ticket(pending.sequence);
+    }
+
+    /// Waits until `pending` has a sequence, giving the arrived commits their sequences whenever no other thread does.
+    ///
+    /// A thread lets a role go with a release store, which does not wait for the reads after it: it may miss a commit
+    /// that arrived as it let go, whose own thread then takes the role here.
+    private void awaitSequenced(PendingCommit pending) {
+        // One try: a thread that holds the role, or leaves it with a volatile store, sees the commit after
+        drainArrivals();
+        // The wait gives up, so this thread helps, while the role is free or held by a commit sequencing itself; a
+        // park that ends early (a spurious wake-up, or the guard's timeout) helps again too
+        while (pending.state < PendingCommit.SEQUENCED && !pending.await(PendingCommit.SEQUENCED, sequencing)) {
+            if (sequencing.heldBriefly()) {
+                Thread.onSpinWait();
+            }
+            drainArrivals();
+        }
+    }
+
+    /// Waits until `pending` is published, publishing the applied commits whenever no other thread does.
+    private void awaitPublished(PendingCommit pending) {
+        // One try, after the volatile store of APPLIED: a thread that holds the role, or leaves it with a volatile
+        // store, sees the commit after
+        publishApplied();
+        // The wait helps every few spins while the role is free: a commit is then published by the first thread that
+        // notices it applied, not by the next pass of a holder
+        pending.awaitHelping(PendingCommit.DONE, publishing, publishHelper);
+    }
+
+    /// Gives a sequence to every arrived commit, in the order they arrived, unless another thread or an exclusive
+    /// operation holds the role.
+    private void drainArrivals() {
+        while (!arrivals.isEmpty() && !sequencingWanted.held() && sequencing.tryAcquire()) {
+            PendingCommit first = null;
+            PendingCommit last = null;
+            try {
+                PendingCommit pending;
+                while ((pending = arrivals.poll()) != null) {
+                    if (sequence(pending)) {
+                        // A list of this thread's own, which outlives the role
+                        if (last == null) {
+                            first = pending;
+                        } else {
+                            last.sequencedNext = pending;
+                        }
+                        last = pending;
+                    }
+                }
+            } finally {
+                sequencing.releaseLazily();
+                // One fence after every move of the pass and the release: each committing thread that parks is seen
+                // parking, and the queue is read again after the role went
+                VarHandle.fullFence();
+                for (var commit = first; commit != null; ) {
+                    var next = commit.sequencedNext;
+                    commit.sequencedNext = null;
+                    commit.wake();
+                    commit = next;
+                }
+            }
+        }
+    }
+
+    /// Gives `pending` the next sequence and, for each of its keys, the commit given a write of it just before.
+    ///
+    /// @return whether it did, with a release store the caller follows by a full fence and [PendingCommit#wake()];
+    ///         `false` if the commit failed instead, which woke its thread
+    private boolean sequence(PendingCommit pending) {
+        if (closed) {
+            pending.fail(new IllegalStateException("The store is closed"));
+            return false;
+        }
+        var stopped = broken;
+        if (stopped != null) {
+            pending.fail(stopped);
+            return false;
+        }
+        try {
+            checkHealthy();
+        } catch (RuntimeException failure) {
+            pending.fail(failure);
+            return false;
+        }
+        var sequence = sequenced.next;
+        var chains = pending.chains;
+        var predecessors = new PendingCommit[chains.length];
+        for (var i = 0; i < chains.length; i++) {
+            var chain = chains[i];
+            if (chain == null) {
+                continue;
+            }
+            while (true) {
+                var previous = chain.claim(pending, sequence);
+                if (previous != Chain.DROPPED_WRITER) {
+                    predecessors[i] = previous instanceof PendingCommit commit && commit != pending ? commit : null;
+                    break;
+                }
+                // Dropped since the commit opened it: the key gets a chain of its own
+                chain = pending.states[i].open(pending.writes.key(i));
+                chains[i] = chain;
+            }
+        }
+        pending.predecessors = predecessors;
+        pending.sequence = sequence;
+        sequenced.next = sequence + 1;
+        sequenced.last.follow(pending);
+        sequenced.last = pending;
+        pending.advanceLazily(PendingCommit.SEQUENCED);
+        return true;
+    }
+
+    /// Applies the writes of `pending` to their chains, each once the commit before it on the same key has.
+    ///
+    /// A write whose tree cannot be read takes back the commit's writes: it publishes empty, so the commits after it
+    /// go on, and its committing thread throws the failure.
+    private void apply(PendingCommit pending) {
+        var writes = pending.writes;
+        var applier = new Applier(pending.sequence, log != null);
+        try {
+            for (var i = 0; i < writes.size(); i++) {
+                var predecessor = pending.predecessors[i];
+                if (predecessor != null) {
+                    predecessor.awaitApplied();
+                }
+                var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(i, tree);
+                if (writes.kind(i) == ArrayWriteBatch.PUT) {
+                    applier.put(pending.states[i], pending.chains[i], writes.key(i), writes.value(i),
+                            pending.decoded == null ? null : pending.decoded[i], inTree, pending.units == null ? null : pending.units[i]);
+                } else {
+                    applier.delete(pending.states[i], pending.chains[i], writes.key(i), inTree);
+                }
+            }
+        } catch (Throwable failure) {
+            applier.rollback();
+            pending.failure = failure;
+        }
+        pending.applier = applier;
+        // Read by the publisher on the commit's own line, so it reads the applier only when there is work in it
+        pending.light = pending.failure == null && applier.light();
+        pending.advanceApplied();
+    }
+
+    /// Publishes the applied commits after the last published one, in order, unless another thread holds the role.
+    private void publishApplied() {
+        while (true) {
+            var next = published.last.next;
+            if (next == null || next.state != PendingCommit.APPLIED || publishingWanted.held() || !publishing.tryAcquire()) {
+                return;
+            }
+            PendingCommit first = null;
+            try {
+                first = publishInOrder();
+            } finally {
+                publishing.releaseLazily();
+                // One fence after every move of the pass and the release: each committing thread that parks is seen
+                // parking, and the next commit is read again after the role went
+                VarHandle.fullFence();
+                wakePublished(first);
+            }
+        }
+    }
+
+    /// Wakes the committing threads parked for the commits of a pass of the publisher, after a full fence.
+    private static void wakePublished(PendingCommit first) {
+        for (var commit = first; commit != null; ) {
+            var next = commit.publishedNext;
+            commit.publishedNext = null;
+            commit.wake();
+            commit = next;
+        }
+    }
+
+    /// Publishes, holding the publishing role, every applied commit after the last published one, up to the first
+    /// that has not applied, then maintains the store for their writes when [#maintenanceDue()].
+    ///
+    /// Once the log fails, no commit publishes: each fails with the log's failure, its versions above the latest
+    /// sequence, where no read sees them. Each commit moves to [PendingCommit#DONE] right after the latest sequence
+    /// covers it, with release stores; the caller wakes the parked ones after a full fence.
+    ///
+    /// @return the first of the commits it published, linked through [PendingCommit#publishedNext], or `null`
+    private PendingCommit publishInOrder() {
+        // The pass ends at the last applied commit found now: a commit that applies later waits for the next pass,
+        // since its frame is not in this pass's batch
+        PendingCommit end = null;
+        var commit = published.last.next;
+        while (commit != null && commit.state == PendingCommit.APPLIED) {
+            end = commit;
+            commit = commit.next;
+        }
+        if (end == null) {
+            return null;
+        }
+        var wrote = false;
+        PendingCommit first = null;
+        PendingCommit last = null;
+        // The frames of the pass go to the log in one batch, before the latest sequence covers any of its commits
+        var logged = log != null && broken == null && queueFrames(end);
+        PendingCommit next;
+        do {
+            next = published.last.next;
+            if (broken == null) {
+                if (next.failure != null) {
+                    LATEST.setRelease(published, next.sequence);
+                } else {
+                    // A light commit is published from its own line: the applier is not read
+                    if (next.light) {
+                        LATEST.setRelease(published, next.sequence);
+                    } else {
+                        next.applier.publishQueued(logged);
+                    }
+                    wrote = true;
+                }
+            }
+            if (broken != null && next.failure == null) {
+                next.failure = broken;
+            }
+            var previous = published.last;
+            LAST_PUBLISHED.setRelease(published, next);
+            previous.unlink();
+            next.advanceLazily(PendingCommit.DONE);
+            if (last == null) {
+                first = next;
+            } else {
+                last.publishedNext = next;
+            }
+            last = next;
+        } while (next != end);
+        if (wrote && maintenanceDue()) {
+            // The committing threads prune the chains their commits wrote; maintain fences before it scans
+            maintain(List.of());
+        }
+        return first;
+    }
+
+    /// Queues in the log, in one batch, the frames of the commits after the last published one, up to `end`, all
+    /// applied: the commits [#publishInOrder()] then publishes.
+    ///
+    /// A commit whose writes were taken back gets an empty frame, which keeps the sequences of the log consecutive. If
+    /// the log has stopped, no frame is queued, the commits with writes take them back, and the store stops
+    /// publishing.
+    ///
+    /// @return whether the frames are queued
+    private boolean queueFrames(PendingCommit end) {
+        var batch = passFrames;
+        var commit = published.last;
+        do {
+            commit = commit.next;
+            if (commit.failure != null) {
+                batch.add(FrameBody.COMMIT, commit.sequence, new FrameBody(), 0);
+            } else {
+                commit.applier.queueFrame(batch);
+            }
+        } while (commit != end);
+        try {
+            log.appendAll(batch);
+            return true;
+        } catch (RuntimeException failure) {
+            broken = failure;
+            // Newest first, so each rollback finds its own versions at the head of their chains
+            var applied = new ArrayList<PendingCommit>();
+            commit = published.last;
+            do {
+                commit = commit.next;
+                applied.add(commit);
+            } while (commit != end);
+            for (var i = applied.size() - 1; i >= 0; i--) {
+                if (applied.get(i).failure == null) {
+                    applied.get(i).applier.rollback();
+                }
+            }
+            return false;
+        }
+    }
+
+    /// {@return whether the publisher maintains the store after this pass}: every [#MAINTAIN_EVERY] passes, or at
+    /// once while a range removal waits to be applied, the sweep has work, or older trees wait to be released.
+    private boolean maintenanceDue() {
+        // A checkpoint published since the last one leaves older trees, whose pages the next checkpoints reuse once
+        // no reader needs them
+        var trees = tree;
+        var due = ++passesSinceMaintenance >= MAINTAIN_EVERY || sweepPending || sweepWanted.held()
+                || (trees != null && trees.older != null);
+        if (!due) {
+            for (var i = 0; i < sweepOrder.size() && !due; i++) {
+                due = sweepOrder.get(i).removals.length != 0;
+            }
+        }
+        if (due) {
+            passesSinceMaintenance = 0;
+        }
+        return due;
+    }
+
+    /// Starts an operation that runs alone: no commit is given a sequence until [#exitExclusive()], and every commit
+    /// given one has published.
+    private void enterExclusive() {
+        lockRequests();
+        sequencingWanted.raise();
+        acquire(sequencing);
+        publishingWanted.raise();
+        acquire(publishing);
+        // The commits leave the publishing role to this thread, which publishes them as they apply
+        for (var spin = 0; published.last != sequenced.last; spin++) {
+            var first = publishInOrder();
+            VarHandle.fullFence();
+            wakePublished(first);
+            if (published.last != sequenced.last) {
+                pause(spin);
+            }
+        }
+        exclusiveOwner = Thread.currentThread();
+    }
+
+    /// Ends an operation [#enterExclusive()] started, and gives sequences to the commits that arrived meanwhile.
+    private void exitExclusive() {
+        exclusiveOwner = null;
+        publishingWanted.release();
+        publishing.release();
+        sequencingWanted.release();
+        sequencing.release();
+        requests.unlock();
+        // Volatile stores before: a commit that arrived and found the roles wanted relies on this thread to see it
+        drainArrivals();
+    }
+
+    /// Takes the publishing role, for work on the published state that applies may run beside: the cut of a
+    /// checkpoint, the publication of its trees and the pruning after it.
+    private void enterPublishing() {
+        // A checkpoint goes before the transactions that keep taking the lock one after another
+        checkpointWaiting.raise();
+        try {
+            requests.lock();
+        } finally {
+            checkpointWaiting.release();
+        }
+        publishingWanted.raise();
+        acquire(publishing);
+    }
+
+    /// Lets the publishing role go, and publishes what applied meanwhile.
+    private void exitPublishing() {
+        publishingWanted.release();
+        publishing.release();
+        requests.unlock();
+        publishApplied();
+    }
+
+    private static void acquire(Padded.Role role) {
+        for (var spin = 0; !role.tryAcquire(); spin++) {
+            pause(spin);
+        }
+    }
+
+    /// Takes the requests lock for an exclusive operation, spinning for it first: the operation before usually lets it
+    /// go within microseconds, and a parked waiter would cost every release a wake-up.
+    private void lockRequests() {
+        var virtual = Thread.currentThread().isVirtual();
+        var spins = virtual ? 32 : 1_024;
+        var yields = spins + (virtual ? 8 : 1_024);
+        for (var spin = 0; spin < yields; spin++) {
+            if (!checkpointWaiting.held() && requests.tryLock()) {
+                return;
+            }
+            if (spin < spins) {
+                Thread.onSpinWait();
+            } else {
+                Thread.yield();
+            }
+        }
+        requests.lock();
+    }
+
+    /// Waits a while for a role whose holder lets it go soon: the commits leave a wanted role to the waiting thread.
+    private static void pause(int spin) {
+        if (spin < 256) {
+            Thread.onSpinWait();
+        } else if (spin < 1_024) {
+            Thread.yield();
+        } else {
+            LockSupport.parkNanos(100_000);
+        }
+    }
+
+    /// {@return `failure`, to throw, after throwing it if it is an error}
+    private static RuntimeException rethrow(Throwable failure) {
+        if (failure instanceof Error error) {
+            throw error;
+        }
+        return (RuntimeException) failure;
+    }
+
+    /// Writes to the file of large values, before the commit is given a sequence, each value `writes` puts that is
     /// at least its key space's threshold.
     ///
     /// The commit's frame then records where each unit is instead of the value, which no checkpoint copies again: a
@@ -547,11 +1092,11 @@ public final class LiveLedger implements Ledger {
             checkpointer.throttle();
         }
         Commit commit;
-        writeLock.lock();
+        enterExclusive();
         try {
             ensureOpen();
             checkHealthy();
-            var applier = new Applier(nextSequence, log != null);
+            var applier = new Applier(sequenced.next, log != null);
             var view = new LiveTransaction(this, applier);
             try {
                 transaction.accept(view);
@@ -562,16 +1107,16 @@ public final class LiveLedger implements Ledger {
                 view.invalidate();
             }
             var sequence = applier.publish();
-            nextSequence++;
+            sequenced.next++;
             commit = ticket(sequence);
         } finally {
-            writeLock.unlock();
+            exitExclusive();
         }
         afterCommit();
         return commit;
     }
 
-    /// Finishes a commit's maintenance outside the writer lock, and starts a checkpoint if one is due.
+    /// Finishes a commit's maintenance after it published, and starts a checkpoint if one is due.
     ///
     /// A commit takes out of the ordered maps as many dropped chains as a commit drops, not those of a checkpoint,
     /// which the checkpoint takes out itself: a commit never pays for a whole checkpoint's.
@@ -595,7 +1140,7 @@ public final class LiveLedger implements Ledger {
     }
 
     private void checkNotInTransaction() {
-        if (writeLock.isHeldByCurrentThread()) {
+        if (exclusiveOwner == Thread.currentThread()) {
             throw new IllegalStateException("A transaction cannot commit or start another transaction");
         }
     }
@@ -604,7 +1149,7 @@ public final class LiveLedger implements Ledger {
     public void awaitDurable() throws InterruptedException {
         ensureOpen();
         if (log != null) {
-            log.awaitDurable(latest);
+            log.awaitDurable(latest());
         }
     }
 
@@ -646,14 +1191,14 @@ public final class LiveLedger implements Ledger {
     }
 
     private void close(boolean checkpoint) {
-        writeLock.lock();
+        enterExclusive();
         try {
             if (closed) {
                 return;
             }
             closed = true;
         } finally {
-            writeLock.unlock();
+            exitExclusive();
         }
         try {
             if (log != null) {
@@ -673,7 +1218,7 @@ public final class LiveLedger implements Ledger {
         }
     }
 
-    /// The writes a checkpoint takes: everything up to its sequence, cut from the store under the writer lock.
+    /// The writes a checkpoint takes: everything up to its sequence, cut from the store holding the publishing role.
     ///
     /// @param sequence the sequence of the last commit the checkpoint holds
     /// @param logStart the first log segment a later commit may be in
@@ -703,16 +1248,16 @@ public final class LiveLedger implements Ledger {
     /// @param logStart the first log segment a commit after the cut may be in
     /// @return the cut, or `null` if no commit was made since the last checkpoint
     Cut cutCheckpoint(LongSupplier logStart) {
-        writeLock.lock();
+        enterPublishing();
         try {
             var base = tree;
-            var sequence = latest;
+            var sequence = latest();
             if (sequence == (base == null ? 0 : base.sequence)) {
                 return null;
             }
             var registered = readers.register();
             if (registered != sequence) {
-                throw new IllegalStateException("The latest sequence moved under the writer lock");
+                throw new IllegalStateException("The latest sequence moved while the checkpoint held the publishing role");
             }
             var cuts = new ArrayList<KeyspaceCut>(states.size());
             for (var state : states.values()) {
@@ -727,13 +1272,13 @@ public final class LiveLedger implements Ledger {
             }
             return new Cut(sequence, logStart.getAsLong(), log.appendedBytes(), base, maxId, cuts, superseded);
         } finally {
-            writeLock.unlock();
+            exitPublishing();
         }
     }
 
     /// Gives a checkpoint that failed its keys back, so the next one writes them.
     void restoreCut(Cut cut) {
-        writeLock.lock();
+        enterPublishing();
         try {
             for (var keyspace : cut.keyspaces()) {
                 for (var chain : keyspace.dirty()) {
@@ -741,7 +1286,7 @@ public final class LiveLedger implements Ledger {
                 }
             }
         } finally {
-            writeLock.unlock();
+            exitPublishing();
         }
     }
 
@@ -766,12 +1311,12 @@ public final class LiveLedger implements Ledger {
     /// @param adopted the units of the file of large values these trees took
     void publish(Cut cut, long number, TreeRoot[] roots, PageRef catalog, PageRef freeList, PageRef blobFreeList,
                  List<PageRef> freed, List<PageRef> freedExternal, Set<PageRef> adopted) {
-        writeLock.lock();
+        enterPublishing();
         try {
-            tree = new TreeVersion(number, cut.sequence(), latest, roots, catalog, freeList, blobFreeList, tree);
-            space.pend(latest, freed);
+            tree = new TreeVersion(number, cut.sequence(), latest(), roots, catalog, freeList, blobFreeList, tree);
+            space.pend(latest(), freed);
             if (blobs != null) {
-                blobs.pend(latest, freedExternal);
+                blobs.pend(latest(), freedExternal);
                 for (var unit : cut.superseded()) {
                     blobs.release(unit);
                 }
@@ -783,12 +1328,12 @@ public final class LiveLedger implements Ledger {
                         && (adopted.contains(unit.version().external) || unit.version().replacedAt <= cut.sequence()));
             }
         } finally {
-            writeLock.unlock();
+            exitPublishing();
         }
     }
 
     /// Drops from memory the versions of the keys a published checkpoint wrote that every reader's tree holds, a few
-    /// keys per hold of the writer lock.
+    /// keys per hold of the publishing role.
     void pruneCut(Cut cut) {
         for (var keyspace : cut.keyspaces()) {
             var state = keyspace.state();
@@ -797,7 +1342,7 @@ public final class LiveLedger implements Ledger {
             }
             var chains = keyspace.dirty().iterator();
             while (chains.hasNext()) {
-                writeLock.lock();
+                enterPublishing();
                 try {
                     var scan = readers.scan();
                     var bounds = bounds(scan.active());
@@ -807,25 +1352,26 @@ public final class LiveLedger implements Ledger {
                         // A chain dropped since the cut may have been followed by another for the same key
                         var current = chain.dropped ? state.chain(chain.key) : chain;
                         if (current != null) {
-                            sweepPending |= prune(state, current, current.head, bounds, Reads.boundOf(floor));
+                            if (prune(state, current, current.head, bounds, Reads.boundOf(floor))) {
+                                requestSweep();
+                            }
                         }
                     }
                 } finally {
-                    writeLock.unlock();
+                    exitPublishing();
                 }
             }
             state.removeDropped();
         }
     }
 
-    /// Looks up in the trees, before the commit takes the writer lock, the keys of the writes of `writes` that have no
+    /// Looks up in the trees, before the commit is given a sequence, the keys of the writes of `writes` that have no
     /// version in memory.
     ///
-    /// Under the lock, such a write looks its key up in its tree, so the counts stay exact. With a tree larger than the
-    /// page cache, that lookup reads the file, and every other commit would wait for the read; even from the cache, it
-    /// would be work every other commit waits behind. Here the lookups run outside the lock, those that reach the file
-    /// on up to [#PREFETCH_THREADS] threads at once, and what they found serves the writes under the lock as long as
-    /// the trees are still the ones they read.
+    /// Applying such a write looks its key up in its tree, so the counts stay exact. With a tree larger than the page
+    /// cache, that lookup reads the file, and every later commit on the key would wait for the read. Here the lookups
+    /// run before the commit's turn, those that reach the file on up to [#PREFETCH_THREADS] threads at once, and what
+    /// they found serves the writes as long as the trees are still the ones they read.
     ///
     /// The lookups do not register as a read: a lease per commit would hold versions back and change the readers the
     /// sweep waits for at every commit. Without one, a checkpoint may reuse a page of the trees they read once newer
@@ -837,10 +1383,13 @@ public final class LiveLedger implements Ledger {
     /// a walk down, grows outside the lock; commits that run at once insert their keys at once.
     ///
     /// @return what the lookups found, or `null` if the store has no trees
-    private Hints prefetch(ArrayWriteBatch writes) {
+    ///
+    /// @param chains receives the chain of each put and removal, opened for the pipeline, or `null`
+    /// @param keyspaceStates receives the key space of each write when `chains` does, or `null`
+    private Hints prefetch(ArrayWriteBatch writes, Chain[] chains, KeyspaceState[] keyspaceStates) {
         var trees = pages == null ? null : tree;
         try {
-            var point = trees == null ? null : new ReadPoint(Reads.boundOf(latest), trees, pages);
+            var point = trees == null ? null : new ReadPoint(Reads.boundOf(latest()), trees, pages);
             var found = trees == null ? null : new byte[writes.size()];
             var missing = new int[16];
             var misses = 0;
@@ -851,7 +1400,11 @@ public final class LiveLedger implements Ledger {
                 }
                 var state = states.get(writes.keyspace(i).name());
                 var key = writes.key(i);
-                var chain = kind == ArrayWriteBatch.PUT ? state.open(key) : state.chain(key);
+                var chain = chains != null || kind == ArrayWriteBatch.PUT ? state.open(key) : state.chain(key);
+                if (chains != null) {
+                    chains[i] = chain;
+                    keyspaceStates[i] = state;
+                }
                 if (found == null || (chain != null && chain.head != null)) {
                     continue;
                 }
@@ -884,7 +1437,7 @@ public final class LiveLedger implements Ledger {
             }
             return found == null ? null : new Hints(trees, found);
         } catch (InterruptedException _) {
-            // The commit goes on without the hints, and its lookups read the trees under the lock
+            // The commit goes on without the hints, and its lookups read the trees as it applies
             Thread.currentThread().interrupt();
             return null;
         }
@@ -899,16 +1452,16 @@ public final class LiveLedger implements Ledger {
                 var root = point.root(states.get(writes.keyspace(write).name()));
                 found[write] = TreeSearch.find(pages, root, writes.key(write)) != null ? TreeSearch.FOUND : TreeSearch.ABSENT;
             } catch (RuntimeException _) {
-                // Left unknown: the lookup under the writer lock reads the page again and reports the failure
+                // Left unknown: the lookup as the write applies reads the page again and reports the failure
             }
         }
     }
 
-    /// Whether the trees held the keys of a batch's writes, as a commit found before it took the writer lock.
+    /// Whether the trees held the keys of a batch's writes, as a commit found before it was given a sequence.
     ///
     /// @param tree the trees the lookups read
     /// @param found per write, [TreeSearch#FOUND], [TreeSearch#ABSENT], or [TreeSearch#UNKNOWN] for one not looked up
-    private record Hints(TreeVersion tree, byte[] found) {
+    record Hints(TreeVersion tree, byte[] found) {
         /// {@return what the lookups found for write `write`, or [TreeSearch#UNKNOWN] if the writer reads trees
         /// other than theirs}
         ///
@@ -978,10 +1531,9 @@ public final class LiveLedger implements Ledger {
     /// @return whether the chain keeps versions a later prune may drop
     private boolean prune(KeyspaceState state, Chain chain, Version head, long[] bounds, long cutBound) {
         if (head == null) {
-            // Left empty, by a commit that rolled back or that created it and has not taken the lock yet
-            if (chain.head == null) {
-                state.drop(chain);
-            }
+            // Left empty, by a commit that rolled back, that removed a key it did not find, or that opened it and has
+            // not applied it yet, which keeps it
+            state.drop(chain, null, latestSequence);
             return false;
         }
         Version kept = null;
@@ -995,7 +1547,7 @@ public final class LiveLedger implements Ledger {
             }
             if (version != kept) {
                 if (kept != null) {
-                    kept.older = version;
+                    kept.link(version);
                 }
                 kept = version;
             }
@@ -1003,13 +1555,11 @@ public final class LiveLedger implements Ledger {
         if (kept == null) {
             return false;
         }
-        kept.older = null;
+        kept.link(null);
         if (pages == null || state.resident) {
             // Memory holds every entry: a key whose only version is a removal has none
             if (kept == head && head.removes()) {
-                if (chain.head == head) {
-                    state.drop(chain);
-                }
+                state.drop(chain, head, latestSequence);
                 return false;
             }
             return head.older != null;
@@ -1019,12 +1569,10 @@ public final class LiveLedger implements Ledger {
         for (var cut = head; cut != null; cut = cut.older) {
             if (cut.stamp <= cutBound) {
                 if (previous == null) {
-                    if (chain.head == head) {
-                        state.drop(chain);
-                    }
+                    state.drop(chain, head, latestSequence);
                     return false;
                 }
-                previous.older = null;
+                previous.link(null);
                 break;
             }
             previous = cut;
@@ -1038,7 +1586,7 @@ public final class LiveLedger implements Ledger {
     /// no reader's tree, nor the next checkpoint, needs.
     ///
     /// @param dropBound the stamps at or below which a record goes
-    private static void applyRemovals(KeyspaceState state, long bound, long dropBound) {
+    private static void applyRemovals(KeyspaceState state, long bound, long dropBound, LongSupplier latest) {
         var removals = state.removals;
         if (removals.length == 0) {
             return;
@@ -1050,6 +1598,7 @@ public final class LiveLedger implements Ledger {
                 continue;
             }
             if (!removal.applied) {
+                var complete = true;
                 for (var chain : state.slice(removal.from(), removal.to()).values()) {
                     var head = chain.head;
                     Version newest = null;
@@ -1059,10 +1608,18 @@ public final class LiveLedger implements Ledger {
                         version = version.older;
                     }
                     if (newest == null) {
-                        state.drop(chain);
+                        // A chain a commit has a write of, not published yet, stays: the record must hide its
+                        // versions until a later pass drops them
+                        if (!state.drop(chain, head, latest) && head != null) {
+                            complete = false;
+                        }
                     } else {
-                        newest.older = null;
+                        newest.link(null);
                     }
+                }
+                if (!complete) {
+                    kept.add(removal);
+                    continue;
                 }
                 removal.applied = true;
             }
@@ -1076,11 +1633,83 @@ public final class LiveLedger implements Ledger {
         }
     }
 
+/// Prunes the chains `touched` wrote, applies the range removals every reader has passed, drops the counts no
+/// reader needs and sweeps a few chains; holding the publishing role.
+    private void maintain(List<Touched> touched) {
+        // The latest sequence was stored with a release store: the scan must not miss a read that saw the one before
+        VarHandle.fullFence();
+        var scan = readers.scan();
+        var active = scan.active();
+        var bounds = bounds(active);
+        var oldestReader = scan.oldest();
+        var floor = floor(oldestReader);
+        releaseTrees(oldestReader);
+        var cutBound = Reads.boundOf(floor);
+        // Without a data file a record goes once applied; with one, once every reader's tree holds it
+        var dropBound = pages == null ? Long.MAX_VALUE : cutBound;
+        var oldest = active[active.length - 1];
+        for (var write : touched) {
+            if (prune(write.state(), write.chain(), write.version(), bounds, cutBound)) {
+                requestSweep();
+            }
+        }
+        var order = sweepOrder;
+        for (var i = 0; i < order.size(); i++) {
+            var state = order.get(i);
+            applyRemovals(state, bounds[bounds.length - 1], dropBound, latestSequence);
+            var countFloor = state.counts.floorKey(oldest);
+            // Most commits find nothing to drop; a view of the map would cost more than the check
+            if (countFloor != null && state.counts.firstKey() < countFloor) {
+                state.counts.headMap(countFloor, false).clear();
+            }
+        }
+        sweep(bounds, cutBound, SWEEP_BUDGET);
+    }
+
+    /// Asks the sweep for a pass over the store, for a chain a prune left that a later one may shorten.
+    private void requestSweep() {
+        // Read first: written only when it changes, so commits that keep finding such chains share its line
+        if (!sweepWanted.held()) {
+            sweepWanted.raise();
+        }
+    }
+
+    /// Prunes the chains a published commit wrote, on its committing thread, beside the other commits and the
+    /// publisher.
+    ///
+    /// Prunes of one chain may run at once: each keeps, below the newest version it finds at or below the latest
+    /// sequence it scanned, every version a reader of its scan or a later one needs, and only bypasses or cuts the
+    /// versions below; a chain is dropped only through [KeyspaceState#drop], whose claim check orders it after the
+    /// commits given its writes.
+    private void pruneWritten(List<Touched> touched) {
+        if (touched.isEmpty()) {
+            return;
+        }
+        var scan = readers.scanConcurrently();
+        var bounds = bounds(scan.active());
+        var cutBound = Reads.boundOf(floor(scan.oldest()));
+        for (var i = 0; i < touched.size(); i++) {
+            var write = touched.get(i);
+            if (prune(write.state(), write.chain(), write.version(), bounds, cutBound)) {
+                requestSweep();
+            }
+        }
+    }
+
     /// Prunes up to `budget` keys, resuming where the last sweep stopped, while some prune left a chain a later one may
     /// shorten; a whole pass over the store that finds none ends the sweeping.
     private void sweep(long[] bounds, long cutBound, int budget) {
-        if (!sweepPending || sweepOrder.isEmpty()) {
+        if (sweepOrder.isEmpty()) {
             return;
+        }
+        if (!sweepPending) {
+            if (!sweepWanted.held()) {
+                return;
+            }
+            // Lowered before the pass: a prune that raises it after has its chain visited by this pass or the next
+            sweepWanted.release();
+            sweepPending = true;
+            sweptBounds = null;
         }
         // A chain a pass left is left again under the same readers and floor, such as while a checkpoint's own read
         // holds the floor back
@@ -1095,7 +1724,7 @@ public final class LiveLedger implements Ledger {
                 passCutBound = cutBound;
             }
             var state = sweepOrder.get(sweepIndex % sweepOrder.size());
-            // Under the writer lock, so each entry's value is the key's newest version
+            // An apply may have put a newer version above the entry's value: the prune leaves it, and drops nothing
             var entries = (sweepAfter == null ? state.entries : state.entries.tailMap(sweepAfter, false)).entrySet().iterator();
             while (budget > 0 && entries.hasNext()) {
                 var entry = entries.next();
@@ -1150,6 +1779,8 @@ public final class LiveLedger implements Ledger {
         private long unitBytes;
         // Whether the commit's frame is queued in the log, which then names its units
         private boolean logged;
+        // The versions this commit added whose value a unit of the file of large values holds
+        private int externals;
         // The versions in flight this commit replaced, which a rollback marks current again
         private final List<Version> replaced;
 
@@ -1228,20 +1859,37 @@ public final class LiveLedger implements Ledger {
         /// @param inTree whether the latest tree holds `key`, as [Hints] give it, or [TreeSearch#UNKNOWN]
         /// @param external the unit of the file of large values that holds `value` too, or `null`
         void put(KeyspaceState state, MemorySegment key, MemorySegment value, Object decoded, byte inTree, PageRef external) {
+            // Usually opened already by the commit's prefetch
+            put(state, claim(state, key), key, value, decoded, inTree, external);
+        }
+
+        /// {@return the chain of `key`, claimed for a write of an operation that runs alone}
+        ///
+        /// The claim keeps a prune that runs beside it, of a commit published before, from dropping the chain.
+        private Chain claim(KeyspaceState state, MemorySegment key) {
+            while (true) {
+                var chain = state.open(key);
+                if (chain.claimAlone(sequence)) {
+                    return chain;
+                }
+            }
+        }
+
+        /// Applies a put of `key`, whose chain is `chain`, in the order and without the race the caller ensures.
+        void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, Object decoded, byte inTree,
+                 PageRef external) {
             var stamp = nextStamp();
-            // Usually opened already by the commit's prefetch, outside the lock
-            var chain = state.open(key);
             var head = chain.head;
             var existed = Reads.exists(state, head, key, writerPoint(stamp - 1), inTree);
             var version = new Version(stamp, value, decoded, head, external);
-            chain.head = version;
+            chain.attach(version);
+            if (external != null) {
+                externals++;
+            }
             touched.add(new Touched(state, chain, version));
             replace(head);
             if (!existed) {
                 addDelta(state, 1);
-            }
-            if (pages != null) {
-                state.markDirty(chain);
             }
             if (frame != null) {
                 if (external != null) {
@@ -1261,23 +1909,37 @@ public final class LiveLedger implements Ledger {
         ///
         /// @param inTree whether the latest tree holds `key`, as [Hints] give it, or [TreeSearch#UNKNOWN]
         void delete(KeyspaceState state, MemorySegment key, byte inTree) {
-            var stamp = nextStamp();
             var chain = state.chain(key);
-            var head = chain == null ? null : chain.head;
-            if (!Reads.exists(state, head, key, writerPoint(stamp - 1), inTree)) {
-                return;
-            }
             if (chain == null || !chain.ordered) {
+                var head = chain == null ? null : chain.head;
+                if (!Reads.exists(state, head, key, writerPoint(Reads.stamp(sequence, op) - 1), inTree)) {
+                    nextStamp();
+                    return;
+                }
                 chain = state.open(key);
             }
+            if (!chain.claimAlone(sequence)) {
+                chain = claim(state, key);
+            }
+            delete(state, chain, key, inTree);
+        }
+
+        /// Applies a removal of `key`, whose chain is `chain`, in the order and without the race the caller ensures.
+        void delete(KeyspaceState state, Chain chain, MemorySegment key, byte inTree) {
+            var stamp = nextStamp();
+            var head = chain.head;
+            if (!Reads.exists(state, head, key, writerPoint(stamp - 1), inTree)) {
+                if (head == null) {
+                    // Opened for this removal: the prune after the commit publishes drops it, if it stays empty
+                    touched.add(new Touched(state, chain, null));
+                }
+                return;
+            }
             var version = new Version(stamp, null, null, head);
-            chain.head = version;
+            chain.attach(version);
             touched.add(new Touched(state, chain, version));
             replace(head);
             addDelta(state, -1);
-            if (pages != null) {
-                state.markDirty(chain);
-            }
             if (frame != null) {
                 frame.delete(state.id, key);
             }
@@ -1317,6 +1979,32 @@ public final class LiveLedger implements Ledger {
         ///
         /// @return the sequence of the commit
         long publish() {
+            publishWrites();
+            maintain(touched);
+            return sequence;
+        }
+
+        /// Makes the commit visible to every read that starts afterward: queues its frame, then publishes its writes,
+        /// its counts and its sequence; the caller maintains the store.
+        ///
+        /// Called in the order of the sequences, holding the publishing role.
+        ///
+        /// @throws com.github.auties00.ledger.LedgerIoException if the log has stopped; the writes are taken back
+        void publishWrites() {
+            publishOrdered();
+            // A release store; the thread then fences before it reads the reader table, or wakes a commit
+            LATEST.setRelease(published, sequence);
+        }
+
+        /// {@return whether publishing the commit is only moving the latest sequence: nothing to log, to count, to
+        /// list for a checkpoint or as a unit in flight}
+        boolean light() {
+            return frame == null && externals == 0 && deltaCount == 0 && pages == null;
+        }
+
+        /// Does what [#publishWrites()] does but move the latest sequence, which the caller moves, after, for a whole
+        /// pass of commits.
+        void publishOrdered() {
             // Queued before it is visible, so the log holds every commit a reader can see, in order
             if (frame != null) {
                 try {
@@ -1327,18 +2015,45 @@ public final class LiveLedger implements Ledger {
                     throw exception;
                 }
             }
-            for (var write : touched) {
-                if (write.version().external != null) {
-                    inFlight.add(new InFlight(write.state(), write.chain(), write.version()));
+            publishCounted();
+        }
+
+        /// Adds the commit's frame, if it is journaled, to `batch`.
+        void queueFrame(LogWriter.Batch batch) {
+            if (frame != null) {
+                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes);
+            }
+        }
+
+        /// Publishes the commit as [#publishWrites()] does, once [#queueFrame(LogWriter.Batch)] queued its frame in a
+        /// batch.
+        ///
+        /// @param queued whether the batch is queued; `false` for a store with no log
+        void publishQueued(boolean queued) {
+            logged = queued && frame != null;
+            publishCounted();
+            LATEST.setRelease(published, sequence);
+        }
+
+        /// Publishes what the commit adds to the units in flight, the keys the next checkpoint writes and the counts.
+        private void publishCounted() {
+            if (externals != 0 || pages != null) {
+                for (var write : touched) {
+                    if (write.version() == null) {
+                        continue;
+                    }
+                    if (write.version().external != null) {
+                        inFlight.add(new InFlight(write.state(), write.chain(), write.version()));
+                    }
+                    if (pages != null) {
+                        write.state().markDirty(write.chain());
+                    }
                 }
             }
             for (var i = 0; i < deltaCount; i++) {
                 var state = deltaStates[i];
                 state.counts.put(sequence, state.counts.lastEntry().getValue() + deltas[i]);
             }
-            latest = sequence;
-            maintain();
-            return sequence;
         }
 
         /// Takes back every write this commit applied; no reader saw them, since the commit was never published.
@@ -1353,9 +2068,12 @@ public final class LiveLedger implements Ledger {
                     version = version.older;
                 }
                 if (version == null) {
-                    if (!chain.dropped) {
-                        write.state().drop(chain);
+                    // Emptied whether or not it can be dropped: once the commit publishes empty, its sequence is
+                    // visible, and so would be a version left at the head
+                    if (head != null) {
+                        chain.attach(null);
                     }
+                    write.state().dropRolledBack(chain, sequence);
                 } else if (version != head) {
                     chain.head = version;
                 }
@@ -1370,32 +2088,6 @@ public final class LiveLedger implements Ledger {
             }
         }
 
-        private void maintain() {
-            var scan = readers.scan();
-            var active = scan.active();
-            var bounds = bounds(active);
-            var oldestReader = scan.oldest();
-            var floor = floor(oldestReader);
-            releaseTrees(oldestReader);
-            var cutBound = Reads.boundOf(floor);
-            // Without a data file a record goes once applied; with one, once every reader's tree holds it
-            var dropBound = pages == null ? Long.MAX_VALUE : cutBound;
-            var oldest = active[active.length - 1];
-            for (var write : touched) {
-                sweepPending |= prune(write.state(), write.chain(), write.version(), bounds, cutBound);
-            }
-            var order = sweepOrder;
-            for (var i = 0; i < order.size(); i++) {
-                var state = order.get(i);
-                applyRemovals(state, bounds[bounds.length - 1], dropBound);
-                var countFloor = state.counts.floorKey(oldest);
-                // Most commits find nothing to drop; a view of the map would cost more than the check
-                if (countFloor != null && state.counts.firstKey() < countFloor) {
-                    state.counts.headMap(countFloor, false).clear();
-                }
-            }
-            sweep(bounds, cutBound, SWEEP_BUDGET);
-        }
     }
 
     /// A version whose value a unit of the file of large values holds, which no published checkpoint has taken.

@@ -1,12 +1,29 @@
 package com.github.auties00.ledger.engine;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 
 /// One version of the value under a key, linked to the version it replaced.
 ///
 /// A chain starts at the newest version. Its stamps decrease along the chain; a reader takes the first version whose
-/// stamp is at or below its bound. Only the writer creates versions and cuts chains, by clearing [#older].
+/// stamp is at or below its bound. Only the writer creates versions and cuts chains, through [#link(Version)].
+///
+/// A version reaches readers through the release store that makes it the head of its chain, which publishes the
+/// plain store of [#older] the constructor makes; a volatile store there would wait, on most processors, for every
+/// store before it to reach the cache.
 final class Version {
+    // Before HIDDEN, whose constructor uses it
+    private static final VarHandle OLDER;
+
+    static {
+        try {
+            OLDER = MethodHandles.lookup().findVarHandle(Version.class, "older", Version.class);
+        } catch (ReflectiveOperationException exception) {
+            throw new ExceptionInInitializerError(exception);
+        }
+    }
+
     /// What [KeyspaceState#resolve] returns for a key a reader sees removed.
     static final Version HIDDEN = new Version(Long.MIN_VALUE, null, null, null);
 
@@ -21,7 +38,8 @@ final class Version {
     /// The unit of [BlobFile] that also holds [#value], or `null` if the value is in memory and the log only.
     final PageRef external;
     /// The sequence of the commit that replaced or removed this version, while no checkpoint has taken its unit, or
-    /// [Long#MAX_VALUE]; guarded by the writer lock.
+    /// [Long#MAX_VALUE]; written by that commit, which applies after the commits before it on the key, and read
+    /// holding the publishing role.
     long replacedAt;
 
     Version(long stamp, MemorySegment value, Object decoded, Version older) {
@@ -32,9 +50,17 @@ final class Version {
         this.stamp = stamp;
         this.value = value;
         this.decoded = decoded;
-        this.older = older;
+        OLDER.set(this, older);
         this.external = external;
         this.replacedAt = Long.MAX_VALUE;
+    }
+
+    /// Makes `older` the version after this one, or cuts the chain here if `null`.
+    ///
+    /// A release store: a reader that follows the old link still finds versions whose fields it can read, and one
+    /// that follows the new link finds the versions it needs, since only those no reader needs leave.
+    void link(Version older) {
+        OLDER.setRelease(this, older);
     }
 
     /// {@return whether this version removes the key}

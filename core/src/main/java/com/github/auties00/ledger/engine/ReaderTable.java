@@ -1,8 +1,9 @@
 package com.github.auties00.ledger.engine;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.Arrays;
 import java.util.TreeMap;
-import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.LongSupplier;
 
 /// The sequences that reads in progress and open snapshots read at, so the writer prunes no version one of them can
@@ -15,14 +16,25 @@ import java.util.function.LongSupplier;
 /// read publishes its sequence, then checks the latest sequence is still that one, retrying if not. Either the
 /// writer's scan sees the published sequence, or the read's check came after the scan, so the read's sequence is at
 /// or past the latest sequence the writer read: no read ever reads at a sequence below the bound.
+///
+/// The writer finds the busy slots by comparing the table with one of zeros, which the processor does several slots at
+/// a time, then reads each busy slot again. Those comparisons are plain reads, made after the volatile read of the
+/// latest sequence, which the writer stored with a volatile store: they cannot see the table as it was before either.
 final class ReaderTable {
-    private final AtomicLongArray slots;
+    private static final VarHandle SLOTS = MethodHandles.arrayElementVarHandle(long[].class);
+
+    private final long[] slots;
+    // As long as slots, and all zeros
+    private final long[] free;
     private final int mask;
     private final LongSupplier latest;
     private final Object registryLock;
     // Sequence to the number of registrations at it
     private final TreeMap<Long, Integer> registry;
-    // What scan() collects into: only the writer scans, holding the writer lock
+    // The registrations in the registry, or about to be: raised before a registration reads the latest sequence, so a
+    // writer that reads it zero after reading the latest sequence skips the registry, as it would skip a free slot
+    private volatile int registrations;
+    // What scan() collects into: only the holder of the store's publishing role scans
     private long[] scanned;
 
     /// Creates a table of `slots` slots.
@@ -33,7 +45,8 @@ final class ReaderTable {
         if (Integer.bitCount(slots) != 1) {
             throw new IllegalArgumentException("slots must be a power of two: " + slots);
         }
-        this.slots = new AtomicLongArray(slots);
+        this.slots = new long[slots];
+        this.free = new long[slots];
         this.mask = slots - 1;
         this.latest = latest;
         this.registryLock = new Object();
@@ -48,19 +61,19 @@ final class ReaderTable {
         var start = (int) Thread.currentThread().threadId() & mask;
         for (var probe = 0; probe <= mask; probe++) {
             var slot = (start + probe) & mask;
-            if (slots.get(slot) != 0) {
+            if ((long) SLOTS.getOpaque(slots, slot) != 0) {
                 continue;
             }
             var sequence = latest.getAsLong();
             // Slots hold the sequence plus one, so zero means free
-            if (slots.compareAndSet(slot, 0, sequence + 1)) {
+            if (SLOTS.compareAndSet(slots, slot, 0L, sequence + 1)) {
                 while (true) {
                     var now = latest.getAsLong();
                     if (now == sequence) {
                         return new Lease(slot, sequence);
                     }
                     sequence = now;
-                    slots.set(slot, sequence + 1);
+                    SLOTS.setVolatile(slots, slot, sequence + 1);
                 }
             }
         }
@@ -70,7 +83,8 @@ final class ReaderTable {
     /// Releases a read.
     void exit(Lease lease) {
         if (lease.slot >= 0) {
-            slots.set(lease.slot, 0);
+            // A writer that still sees the slot busy keeps a version longer, nothing worse
+            SLOTS.setRelease(slots, lease.slot, 0L);
         } else {
             unregister(lease.sequence);
         }
@@ -81,6 +95,7 @@ final class ReaderTable {
     /// @return the sequence of the snapshot
     long register() {
         synchronized (registryLock) {
+            registrations++;
             var sequence = latest.getAsLong();
             registry.merge(sequence, 1, Integer::sum);
             return sequence;
@@ -90,7 +105,15 @@ final class ReaderTable {
     /// Releases a registration [#register()] made at `sequence`.
     void unregister(long sequence) {
         synchronized (registryLock) {
-            registry.computeIfPresent(sequence, (_, count) -> count == 1 ? null : count - 1);
+            var count = registry.get(sequence);
+            if (count != null) {
+                if (count == 1) {
+                    registry.remove(sequence);
+                } else {
+                    registry.put(sequence, count - 1);
+                }
+                registrations--;
+            }
         }
     }
 
@@ -104,15 +127,15 @@ final class ReaderTable {
 
     /// {@return [#active()] and [#oldest()] from one pass over the slots and the registry}
     ///
-    /// Only the writer calls it, holding the writer lock.
+    /// Only the holder of the store's publishing role calls it.
     Scan scan() {
         var current = latest.getAsLong();
         var sequences = scanned;
         var count = 0;
         sequences[count++] = current;
         var oldest = Long.MAX_VALUE;
-        for (var slot = 0; slot <= mask; slot++) {
-            var value = slots.get(slot);
+        for (var slot = busy(0); slot >= 0; slot = busy(slot + 1)) {
+            var value = (long) SLOTS.getVolatile(slots, slot);
             if (value != 0) {
                 oldest = Math.min(oldest, value - 1);
                 if (value - 1 < current) {
@@ -120,22 +143,79 @@ final class ReaderTable {
                 }
             }
         }
-        synchronized (registryLock) {
-            if (!registry.isEmpty()) {
-                oldest = Math.min(oldest, registry.firstKey());
-            }
-            for (var sequence : registry.keySet()) {
-                if (sequence >= current) {
-                    break;
+        if (registrations != 0) {
+            synchronized (registryLock) {
+                if (!registry.isEmpty()) {
+                    oldest = Math.min(oldest, registry.firstKey());
                 }
-                if (count == sequences.length) {
-                    sequences = Arrays.copyOf(sequences, count * 2);
-                    scanned = sequences;
+                for (var sequence : registry.keySet()) {
+                    if (sequence >= current) {
+                        break;
+                    }
+                    if (count == sequences.length) {
+                        sequences = Arrays.copyOf(sequences, count * 2);
+                        scanned = sequences;
+                    }
+                    sequences[count++] = sequence;
                 }
-                sequences[count++] = sequence;
             }
         }
         return new Scan(distinctDescending(sequences, count, current), oldest);
+    }
+
+    /// {@return [#active()] and [#oldest()] from one pass over the slots and the registry, safe for concurrent use}
+    ///
+    /// Unlike [#scan()], it collects into memory of its own, which it allocates only for the busy slots. A thread
+    /// that stored the latest sequence itself must have stored it with a volatile store, as the publisher does.
+    Scan scanConcurrently() {
+        var current = latest.getAsLong();
+        var oldest = Long.MAX_VALUE;
+        long[] sequences = null;
+        var count = 1;
+        for (var slot = busy(0); slot >= 0; slot = busy(slot + 1)) {
+            var value = (long) SLOTS.getVolatile(slots, slot);
+            if (value != 0) {
+                oldest = Math.min(oldest, value - 1);
+                if (value - 1 < current) {
+                    if (sequences == null) {
+                        sequences = new long[8];
+                        sequences[0] = current;
+                    } else if (count == sequences.length) {
+                        sequences = Arrays.copyOf(sequences, count * 2);
+                    }
+                    sequences[count++] = value - 1;
+                }
+            }
+        }
+        if (registrations != 0) {
+            synchronized (registryLock) {
+                if (!registry.isEmpty()) {
+                    oldest = Math.min(oldest, registry.firstKey());
+                }
+                for (var sequence : registry.keySet()) {
+                    if (sequence >= current) {
+                        break;
+                    }
+                    if (sequences == null) {
+                        sequences = new long[8];
+                        sequences[0] = current;
+                    } else if (count == sequences.length) {
+                        sequences = Arrays.copyOf(sequences, count * 2);
+                    }
+                    sequences[count++] = sequence;
+                }
+            }
+        }
+        if (sequences == null) {
+            return new Scan(new long[]{current}, oldest);
+        }
+        return new Scan(distinctDescending(sequences, count, current), oldest);
+    }
+
+    /// {@return the first slot at or after `from` that a plain read finds busy, or -1}
+    private int busy(int from) {
+        var found = Arrays.mismatch(slots, from, slots.length, free, from, slots.length);
+        return found < 0 ? -1 : from + found;
     }
 
     private static long[] distinctDescending(long[] sequences, int count, long current) {
@@ -157,11 +237,11 @@ final class ReaderTable {
     /// {@return the lowest sequence a read or snapshot is reading at, or [Long#MAX_VALUE] if none is}
     ///
     /// Unlike [#active()], it counts reads at the latest sequence: they may have pinned the tree published before it.
-    /// Only the writer calls it, holding the writer lock.
+    /// Only the holder of the store's publishing role calls it.
     long oldest() {
         var oldest = Long.MAX_VALUE;
-        for (var slot = 0; slot <= mask; slot++) {
-            var value = slots.get(slot);
+        for (var slot = busy(0); slot >= 0; slot = busy(slot + 1)) {
+            var value = (long) SLOTS.getVolatile(slots, slot);
             if (value != 0) {
                 oldest = Math.min(oldest, value - 1);
             }
@@ -176,14 +256,14 @@ final class ReaderTable {
 
     /// {@return every sequence a read or snapshot may be reading at, distinct, highest first; the first is the latest}
     ///
-    /// Only the writer calls it, holding the writer lock, so the latest sequence does not change during the call.
+    /// Only the holder of the store's publishing role calls it, so the latest sequence does not change during the call.
     long[] active() {
         var current = latest.getAsLong();
-        var sequences = new long[slots.length() + 1];
+        var sequences = new long[slots.length + 1];
         var count = 0;
         sequences[count++] = current;
-        for (var slot = 0; slot <= mask; slot++) {
-            var value = slots.get(slot);
+        for (var slot = busy(0); slot >= 0; slot = busy(slot + 1)) {
+            var value = (long) SLOTS.getVolatile(slots, slot);
             if (value != 0 && value - 1 < current) {
                 sequences[count++] = value - 1;
             }

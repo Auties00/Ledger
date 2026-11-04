@@ -8,6 +8,7 @@ import java.util.NavigableMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.function.LongSupplier;
 
 /// The entries of one key space in memory: a version chain per key, the range removals readers may still need, and
 /// the number of entries as of each recent commit.
@@ -20,7 +21,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
 /// at a million keys costs a fraction of a walk down the ordered one. A chain enters the index first, then the ordered
 /// map, and leaves them in the same order.
 ///
-/// Readers use it concurrently with the writer. Commits may create chains before they take the writer lock; everything
+/// Readers use it concurrently with the commits. Commits create chains before they are given a sequence; everything
 /// else changes only under it.
 final class KeyspaceState {
     /// The dropped chains from which [#removeDropped()] spreads the removals over the processors.
@@ -40,9 +41,9 @@ final class KeyspaceState {
     volatile RangeRemoval[] removals;
     // The number of entries visible as of each commit sequence that changed it
     final ConcurrentSkipListMap<Long, Long> counts;
-    // The chains written since the last checkpoint was cut, each listed once per cut; guarded by the writer lock
+    // The chains written since the last checkpoint was cut, each listed once per cut; guarded by the publishing role
     ArrayList<Chain> dirty;
-    // The number of the cut `dirty` collects for, guarded by the writer lock
+    // The number of the cut `dirty` collects for, guarded by the publishing role
     private long dirtyCut;
     // The bytes from which a value a batch puts goes to the file of large values, set while the store opens
     long largeValues = Long.MAX_VALUE;
@@ -73,12 +74,17 @@ final class KeyspaceState {
 
     /// {@return the chain of `key`, created if memory holds none, and in the ordered map}
     ///
-    /// Safe without the writer lock: commits call it for the keys they are about to write, so the ordered map, the
-    /// costly one, grows outside the lock. A chain the writer drops meanwhile is returned dropped; the writer, which
-    /// calls it again under the lock, never gets one.
+    /// Safe for concurrent use: commits call it for the keys they are about to write, so the ordered map, the costly
+    /// one, grows before their turn. A chain dropped meanwhile is returned dropped; the sequencer, which finds it so
+    /// when it gives the commit its writes, opens the key again.
     Chain open(MemorySegment key) {
         var hash = Segments.hash(key);
         var chain = index.get(new IndexKey(key, hash));
+        if (chain != null && chain.released()) {
+            // Dropped, and maybe not out of the index yet: the key gets a chain of its own
+            index.remove(new IndexKey(chain.key, chain.hash), chain);
+            chain = null;
+        }
         if (chain == null) {
             var created = new Chain(Segments.copy(key), hash);
             chain = index.putIfAbsent(new IndexKey(created.key, hash), created);
@@ -94,13 +100,20 @@ final class KeyspaceState {
 
     /// Inserts `chain` into the ordered map, in place of a dropped chain of the same key, unless it is dropped.
     private void order(Chain chain) {
-        while (!chain.dropped) {
+        // Released counts as dropped on both sides: another thread may have used the chain, and a prune dropped it,
+        // while this one was still inserting it; a later chain of the key then holds the place
+        while (!chain.dropped && !chain.released()) {
             var previous = entries.putIfAbsent(chain.key, chain);
             if (previous == null || previous == chain) {
                 chain.ordered = true;
                 return;
             }
-            if (!previous.dropped) {
+            // A chain being dropped is released before it is marked dropped
+            if (!previous.dropped && !previous.released()) {
+                if (chain.released()) {
+                    // Dropped since the check above, and replaced: the later chain is the key's
+                    return;
+                }
                 throw new IllegalStateException("Two chains hold one key of " + keyspace.name());
             }
             if (entries.replace(chain.key, previous, chain)) {
@@ -110,20 +123,44 @@ final class KeyspaceState {
         }
     }
 
-    /// Takes `chain` out of the index and empties it, under the writer lock; [#removeDropped()] takes it out of the
-    /// ordered map.
+    /// Takes `chain` out of the index and empties it, unless a commit given a write of the key has yet to apply it;
+    /// [#removeDropped()] takes it out of the ordered map.
     ///
-    /// The writer drops a chain when the trees every reader reads hold what it had, or when it is empty; a reader that
+    /// The store drops a chain when the trees every reader reads hold what it had, or when it is empty; a reader that
     /// found the chain before then reads the tree, as a scan does for an empty chain still in the ordered map. A walk
-    /// down that map would cost the writer lock more than the rest of a small commit.
-    void drop(Chain chain) {
+    /// down that map would cost the publication of a small commit more than the rest of it.
+    ///
+    /// @return whether it dropped the chain
+    boolean drop(Chain chain, Version head, LongSupplier latest) {
+        // Read in this order: the claim, then the latest sequence, then the head
+        var claimed = chain.claimed();
+        if (claimed == Chain.DROPPED) {
+            return true;
+        }
+        if (claimed > latest.getAsLong() || chain.head != head || !chain.release(claimed)) {
+            return false;
+        }
+        empty(chain);
+        return true;
+    }
+
+    /// Drops `chain`, which a rolled-back write at `sequence` left empty, unless a later write was claimed since.
+    boolean dropRolledBack(Chain chain, long sequence) {
+        if (chain.head != null || !chain.release(sequence)) {
+            return false;
+        }
+        empty(chain);
+        return true;
+    }
+
+    private void empty(Chain chain) {
         chain.dropped = true;
         chain.head = null;
         index.remove(new IndexKey(chain.key, chain.hash), chain);
         leaving.add(chain);
     }
 
-    /// Takes up to `limit` of the chains the writer dropped out of the ordered map; safe without the writer lock.
+    /// Takes up to `limit` of the dropped chains out of the ordered map; safe for concurrent use.
     ///
     /// A chain created since for the same key may have taken its place, and stays.
     void removeDropped(int limit) {
@@ -134,7 +171,7 @@ final class KeyspaceState {
     }
 
     /// Takes every chain the writer dropped out of the ordered map, on every processor when there are many, as there
-    /// are after a checkpoint; safe without the writer lock.
+    /// are after a checkpoint; safe for concurrent use.
     void removeDropped() {
         var chains = new ArrayList<Chain>();
         Chain chain;
@@ -146,7 +183,7 @@ final class KeyspaceState {
         stream.forEach(dropped -> entries.remove(dropped.key, dropped));
     }
 
-    /// Lists `chain` among the keys the next checkpoint writes, under the writer lock.
+    /// Lists `chain` among the keys the next checkpoint writes, holding the publishing role.
     void markDirty(Chain chain) {
         if (chain.dirtyCut != dirtyCut) {
             chain.dirtyCut = dirtyCut;
@@ -156,7 +193,7 @@ final class KeyspaceState {
 
     /// {@return the chains written since the last cut, and starts listing those of the next one}
     ///
-    /// Called under the writer lock. A key may appear in two chains, an old one the writer dropped and the one it
+    /// Called holding the publishing role. A key may appear in two chains, an old one dropped and the one
     /// created since.
     ArrayList<Chain> cutDirty() {
         var cut = dirty;
