@@ -23,6 +23,7 @@ final class TreeUpdate {
     private final PageFile.Writer writer;
     private final FreeSpace space;
     private final List<PageRef> freed;
+    private final List<PageRef> freedExternal;
     private final List<PageRef> allocated;
 
     TreeUpdate(PageFile pages, PageFile.Writer writer, FreeSpace space) {
@@ -30,6 +31,7 @@ final class TreeUpdate {
         this.writer = writer;
         this.space = space;
         this.freed = new ArrayList<>();
+        this.freedExternal = new ArrayList<>();
         this.allocated = new ArrayList<>();
     }
 
@@ -37,7 +39,11 @@ final class TreeUpdate {
     ///
     /// @param key the key
     /// @param value its value, or `null` if the key has none
-    record Op(MemorySegment key, MemorySegment value) {
+    /// @param external the unit of [BlobFile] a commit wrote the value to, which the tree takes, or `null`
+    record Op(MemorySegment key, MemorySegment value, PageRef external) {
+        Op(MemorySegment key, MemorySegment value) {
+            this(key, value, null);
+        }
     }
 
     /// A range of keys removed.
@@ -77,9 +83,14 @@ final class TreeUpdate {
         return merged;
     }
 
-    /// {@return the units the update replaced}
+    /// {@return the units of the data file the update replaced}
     List<PageRef> freed() {
         return freed;
+    }
+
+    /// {@return the units of [BlobFile] the old tree pointed to and the new one does not}
+    List<PageRef> freedExternal() {
+        return freedExternal;
     }
 
     /// {@return the pages the update took}
@@ -214,6 +225,8 @@ final class TreeUpdate {
                     var entry = TreeNodes.entry(unit, i);
                     if (TreeNodes.isBlob(unit, entry)) {
                         freed.add(TreeNodes.blobRef(unit, entry));
+                    } else if (TreeNodes.isExternal(unit, entry)) {
+                        freedExternal.add(TreeNodes.blobRef(unit, entry));
                     }
                 }
             }
@@ -244,7 +257,10 @@ final class TreeUpdate {
             if (op < opTo && Segments.compare(ops.get(op).key(), entry.key()) == 0) {
                 // The key's state as of the checkpoint, which already takes the removals into account
                 var state = ops.get(op++);
-                release(entry);
+                // A version the tree took already, back after a commit that replaced it rolled back, keeps its unit
+                if (!(entry.external() && entry.blob().equals(state.external()))) {
+                    release(entry);
+                }
                 changed = true;
                 if (state.value() != null) {
                     out.add(entry(state));
@@ -273,12 +289,15 @@ final class TreeUpdate {
 
     private void release(LeafEntry entry) {
         if (entry.blob() != null) {
-            freed.add(entry.blob());
+            (entry.external() ? freedExternal : freed).add(entry.blob());
         }
     }
 
     private LeafEntry entry(Op op) throws IOException {
         var length = op.value().byteSize();
+        if (op.external() != null) {
+            return new LeafEntry(op.key(), null, op.external(), (int) length, true);
+        }
         if (LeafEntry.fitsInline(op.key().byteSize(), length)) {
             return new LeafEntry(op.key(), op.value(), null, (int) length);
         }

@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
@@ -76,6 +77,12 @@ public final class LiveLedger implements Ledger {
     private Checkpointer checkpointer;
     // The trees of the latest published checkpoint, or null
     private volatile TreeVersion tree;
+    // The file of large values, or null for a store in memory
+    private BlobFile blobs;
+    // The threshold of the key spaces the store finds in its catalog without being opened with them
+    private long largeValues = Long.MAX_VALUE;
+    // The versions whose units of the file of large values no published checkpoint has taken, guarded by the writer lock
+    private final ArrayList<InFlight> inFlight;
 
     /// Creates an empty store with `keyspaces`.
     ///
@@ -95,12 +102,23 @@ public final class LiveLedger implements Ledger {
         this.nextSequence = 1;
         this.byId = new HashMap<>();
         this.resources = new AutoCloseable[0];
+        this.inFlight = new ArrayList<>();
     }
 
     /// Makes this store one in a directory, whose checkpoints are in `pages`; called before anything is recovered.
     void useDataFile(PageFile pages, FreeSpace space) {
         this.pages = pages;
         this.space = space;
+    }
+
+    /// Makes `blobs` the file of large values: a batch writes there each value of at least `threshold` bytes, or of
+    /// the bytes `overrides` gives for its key space by name; called before anything is recovered.
+    void useBlobs(BlobFile blobs, long threshold, Map<String, Long> overrides) {
+        this.blobs = blobs;
+        this.largeValues = threshold;
+        for (var state : states.values()) {
+            state.largeValues = overrides.getOrDefault(state.keyspace.name(), threshold);
+        }
     }
 
     /// Records that the store knows the key space `name` as `id`.
@@ -115,6 +133,7 @@ public final class LiveLedger implements Ledger {
                 return;
             }
             state = new KeyspaceState(Keyspace.paged(name, KeyCodec.bytes(), ValueCodec.bytes()));
+            state.largeValues = largeValues;
             states.put(name, state);
             sweepOrder = List.copyOf(states.values());
         }
@@ -132,7 +151,8 @@ public final class LiveLedger implements Ledger {
             roots[entry.id()] = entry.root();
         }
         var sequence = superblock.sequence();
-        tree = new TreeVersion(superblock.number(), sequence, sequence, roots, superblock.catalog(), superblock.freeList(), null);
+        tree = new TreeVersion(superblock.number(), sequence, sequence, roots, superblock.catalog(), superblock.freeList(),
+                superblock.blobFreeList(), null);
         latest = sequence;
         nextSequence = sequence + 1;
         var stamp = Reads.stamp(sequence, 0);
@@ -151,10 +171,54 @@ public final class LiveLedger implements Ledger {
         }
     }
 
-    /// Replays the commit `sequence` the log holds.
-    void replay(long sequence, byte[] body) {
+    /// Replays the commit `sequence` the log holds, unless the file of large values lacks one of its units.
+    ///
+    /// The units are read before anything applies, and taken again from the free pages once the commit applies.
+    ///
+    /// @return whether it replayed the commit
+    boolean replay(long sequence, byte[] body) {
+        var units = new ArrayList<byte[]>();
+        var missing = new boolean[1];
+        FrameBody.readCommit(body, new FrameBody.Visitor() {
+            @Override
+            public void put(int keyspace, MemorySegment key, MemorySegment value) {
+            }
+
+            @Override
+            public void delete(int keyspace, MemorySegment key) {
+            }
+
+            @Override
+            public void deleteRange(int keyspace, MemorySegment from, MemorySegment to) {
+            }
+
+            @Override
+            public void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
+                var unit = blobs == null || missing[0] ? null : blobs.readUnit(ref);
+                if (unit == null || Bytes.i32(unit, PageFormat.LENGTH) != length) {
+                    missing[0] = true;
+                } else {
+                    units.add(unit);
+                }
+            }
+        });
+        if (missing[0]) {
+            return false;
+        }
+        var next = new int[1];
         var applier = new Applier(sequence, false);
         FrameBody.readCommit(body, new FrameBody.Visitor() {
+            @Override
+            public void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
+                var unit = units.get(next[0]++);
+                var state = byId.get(keyspace);
+                if (state != null) {
+                    var value = MemorySegment.ofArray(unit).asSlice(PageFormat.HEADER, length).asReadOnly();
+                    applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null, TreeSearch.UNKNOWN, ref);
+                    blobs.claim(ref);
+                }
+            }
+
             @Override
             public void put(int keyspace, MemorySegment key, MemorySegment value) {
                 var state = byId.get(keyspace);
@@ -181,6 +245,7 @@ public final class LiveLedger implements Ledger {
         });
         applier.publish();
         nextSequence = sequence + 1;
+        return true;
     }
 
     /// Gives an id to every key space the store does not know yet.
@@ -209,6 +274,12 @@ public final class LiveLedger implements Ledger {
         this.resources = resources;
         if (catalog != null) {
             log.append(FrameBody.CATALOG, latest, catalog);
+        }
+        if (blobs != null) {
+            // Durable before this open's first unit, so no later open reuses its nonces
+            var frames = log.append(FrameBody.EPOCH, latest, FrameBody.epoch(blobs.epoch()), 0);
+            blobs.epochGate(() -> log.awaitFrames(frames));
+            log.useBlobs(blobs);
         }
     }
 
@@ -369,42 +440,96 @@ public final class LiveLedger implements Ledger {
             checkpointer.throttle();
         }
         writes.compact();
-        var hints = prefetch(writes);
+        var units = writeUnits(writes);
+        Applier applier = null;
         Commit commit;
-        writeLock.lock();
         try {
-            ensureOpen();
-            checkHealthy();
-            var applier = new Applier(nextSequence, log != null);
+            var hints = prefetch(writes);
+            writeLock.lock();
             try {
-                for (var i = 0; i < writes.size(); i++) {
-                    var state = states.get(writes.keyspace(i).name());
-                    switch (writes.kind(i)) {
-                        case ArrayWriteBatch.PUT -> {
-                            var value = writes.value(i);
-                            var decoded = state.resident ? residentValue(state, writes.decodedValue(i), value) : null;
-                            applier.put(state, writes.key(i), value, decoded, hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree));
+                ensureOpen();
+                checkHealthy();
+                applier = new Applier(nextSequence, log != null);
+                try {
+                    for (var i = 0; i < writes.size(); i++) {
+                        var state = states.get(writes.keyspace(i).name());
+                        switch (writes.kind(i)) {
+                            case ArrayWriteBatch.PUT -> {
+                                var value = writes.value(i);
+                                var decoded = state.resident ? residentValue(state, writes.decodedValue(i), value) : null;
+                                applier.put(state, writes.key(i), value, decoded,
+                                        hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree), units == null ? null : units[i]);
+                            }
+                            case ArrayWriteBatch.DELETE ->
+                                    applier.delete(state, writes.key(i), hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree));
+                            case ArrayWriteBatch.DELETE_RANGE -> applier.deleteRange(state, writes.key(i), writes.value(i));
+                            default -> throw new IllegalStateException("Unknown write kind " + writes.kind(i));
                         }
-                        case ArrayWriteBatch.DELETE -> applier.delete(state, writes.key(i), hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree));
-                        case ArrayWriteBatch.DELETE_RANGE -> applier.deleteRange(state, writes.key(i), writes.value(i));
-                        default -> throw new IllegalStateException("Unknown write kind " + writes.kind(i));
+                    }
+                } catch (RuntimeException | Error throwable) {
+                    // A resident value whose decoder throws, or a tree that cannot be read, stops the batch
+                    applier.rollback();
+                    throw throwable;
+                }
+                // The versions reference the batch's array, which the batch no longer writes
+                writes.detach();
+                var sequence = applier.publish();
+                nextSequence++;
+                commit = ticket(sequence);
+            } finally {
+                writeLock.unlock();
+            }
+        } finally {
+            if (units != null && (applier == null || !applier.logged())) {
+                // No log frame names them
+                for (var unit : units) {
+                    if (unit != null) {
+                        blobs.release(unit);
                     }
                 }
-            } catch (RuntimeException | Error throwable) {
-                // A resident value whose decoder throws, or a tree that cannot be read, stops the batch
-                applier.rollback();
-                throw throwable;
             }
-            // The versions reference the batch's array, which the batch no longer writes
-            writes.detach();
-            var sequence = applier.publish();
-            nextSequence++;
-            commit = ticket(sequence);
-        } finally {
-            writeLock.unlock();
         }
         afterCommit();
         return commit;
+    }
+
+    /// Writes to the file of large values, before the commit takes the writer lock, each value `writes` puts that is
+    /// at least its key space's threshold.
+    ///
+    /// The commit's frame then records where each unit is instead of the value, which no checkpoint copies again: a
+    /// large value reaches the device once, where the log and a checkpoint would write it twice.
+    ///
+    /// @return the unit of each write, `null` for one without; or `null` if no write has one
+    private PageRef[] writeUnits(ArrayWriteBatch writes) {
+        if (blobs == null) {
+            return null;
+        }
+        PageRef[] units = null;
+        try {
+            for (var i = 0; i < writes.size(); i++) {
+                if (writes.kind(i) != ArrayWriteBatch.PUT) {
+                    continue;
+                }
+                var value = writes.value(i);
+                if (value.byteSize() < states.get(writes.keyspace(i).name()).largeValues) {
+                    continue;
+                }
+                if (units == null) {
+                    units = new PageRef[writes.size()];
+                }
+                units[i] = blobs.write(value);
+            }
+            return units;
+        } catch (RuntimeException | Error throwable) {
+            if (units != null) {
+                for (var unit : units) {
+                    if (unit != null) {
+                        blobs.release(unit);
+                    }
+                }
+            }
+            throw throwable;
+        }
     }
 
     private static Object residentValue(KeyspaceState state, Object decoded, MemorySegment value) {
@@ -503,6 +628,11 @@ public final class LiveLedger implements Ledger {
         close(false);
     }
 
+    /// {@return the file of large values, or `null` for a store in memory; for tests}
+    BlobFile blobsForTests() {
+        return blobs;
+    }
+
     /// Drops every unit the page cache holds, so the next reads go to the file. For tests of reads that miss it.
     void clearPageCacheForTests() {
         if (pages != null) {
@@ -546,7 +676,11 @@ public final class LiveLedger implements Ledger {
     /// @param base the trees the checkpoint updates, or `null`
     /// @param maxId the highest key space id
     /// @param keyspaces what changed in each key space
-    record Cut(long sequence, long logStart, long logBytes, TreeVersion base, int maxId, List<KeyspaceCut> keyspaces) {
+    /// @param superseded the units of the file of large values whose versions commits at or below the cut replaced
+    ///                   before any checkpoint took them: no tree points to them, and no recovery from this checkpoint
+    ///                   on replays their commits
+    record Cut(long sequence, long logStart, long logBytes, TreeVersion base, int maxId, List<KeyspaceCut> keyspaces,
+               List<PageRef> superseded) {
     }
 
     /// What changed in one key space since the last checkpoint.
@@ -579,7 +713,14 @@ public final class LiveLedger implements Ledger {
             for (var state : states.values()) {
                 cuts.add(new KeyspaceCut(state, state.cutDirty(), state.removals, state.count(sequence)));
             }
-            return new Cut(sequence, logStart.getAsLong(), log.appendedBytes(), base, maxId, cuts);
+            var bound = Reads.boundOf(sequence);
+            var superseded = new ArrayList<PageRef>();
+            for (var unit : inFlight) {
+                if (unit.version().stamp <= bound && unit.version().replacedAt <= sequence) {
+                    superseded.add(unit.version().external);
+                }
+            }
+            return new Cut(sequence, logStart.getAsLong(), log.appendedBytes(), base, maxId, cuts, superseded);
         } finally {
             writeLock.unlock();
         }
@@ -611,11 +752,31 @@ public final class LiveLedger implements Ledger {
 
     /// Publishes the trees of a checkpoint made durable: later reads use them, and the units it freed wait for the
     /// reads of the trees before it.
-    void publish(Cut cut, long number, TreeRoot[] roots, PageRef catalog, PageRef freeList, List<PageRef> freed) {
+    ///
+    /// The units of the file of large values its trees took leave the units in flight; those the commits it holds
+    /// replaced before a checkpoint took them are free at once, since only memory reads them; those its trees no longer
+    /// point to wait for the reads of the trees before it.
+    ///
+    /// @param freedExternal the units of the file of large values the trees before pointed to and these do not
+    /// @param adopted the units of the file of large values these trees took
+    void publish(Cut cut, long number, TreeRoot[] roots, PageRef catalog, PageRef freeList, PageRef blobFreeList,
+                 List<PageRef> freed, List<PageRef> freedExternal, Set<PageRef> adopted) {
         writeLock.lock();
         try {
-            tree = new TreeVersion(number, cut.sequence(), latest, roots, catalog, freeList, tree);
+            tree = new TreeVersion(number, cut.sequence(), latest, roots, catalog, freeList, blobFreeList, tree);
             space.pend(latest, freed);
+            if (blobs != null) {
+                blobs.pend(latest, freedExternal);
+                for (var unit : cut.superseded()) {
+                    blobs.release(unit);
+                }
+                for (var unit : adopted) {
+                    blobs.adopt(unit);
+                }
+                var bound = Reads.boundOf(cut.sequence());
+                inFlight.removeIf(unit -> unit.version().stamp <= bound
+                        && (adopted.contains(unit.version().external) || unit.version().replacedAt <= cut.sequence()));
+            }
         } finally {
             writeLock.unlock();
         }
@@ -786,6 +947,9 @@ public final class LiveLedger implements Ledger {
             return;
         }
         space.releasePassed(oldestReader);
+        if (blobs != null) {
+            blobs.releasePassed(oldestReader);
+        }
         for (var version = tree; version != null; version = version.older) {
             if (version.published < oldestReader) {
                 version.older = null;
@@ -973,6 +1137,12 @@ public final class LiveLedger implements Ledger {
         private final IdentityHashMap<KeyspaceState, RangeRemoval[]> removalsBefore;
         // The writes as the log records them, or null when nothing is journaled
         private final FrameBody frame;
+        // The bytes of the units of the file of large values this commit's values are in
+        private long unitBytes;
+        // Whether the commit's frame is queued in the log, which then names its units
+        private boolean logged;
+        // The versions in flight this commit replaced, which a rollback marks current again
+        private final List<Version> replaced;
 
         Applier(long sequence, boolean journaled) {
             this.sequence = sequence;
@@ -980,6 +1150,20 @@ public final class LiveLedger implements Ledger {
             this.touched = new ArrayList<>();
             this.removalsBefore = new IdentityHashMap<>();
             this.frame = journaled ? new FrameBody() : null;
+            this.replaced = new ArrayList<>();
+        }
+
+        /// {@return whether the commit's frame is queued in the log}
+        boolean logged() {
+            return logged;
+        }
+
+        /// Records that this commit replaces `version`, if a unit no checkpoint has taken holds its value.
+        private void replace(Version version) {
+            if (version != null && version.external != null && version.replacedAt == Long.MAX_VALUE) {
+                version.replacedAt = sequence;
+                replaced.add(version);
+            }
         }
 
         /// {@return the bound of reads that see the latest commit and this one's writes so far}
@@ -1000,21 +1184,23 @@ public final class LiveLedger implements Ledger {
         }
 
         void put(KeyspaceState state, MemorySegment key, MemorySegment value, Object decoded) {
-            put(state, key, value, decoded, TreeSearch.UNKNOWN);
+            put(state, key, value, decoded, TreeSearch.UNKNOWN, null);
         }
 
         /// Applies a put of `key`.
         ///
         /// @param inTree whether the latest tree holds `key`, as [Hints] give it, or [TreeSearch#UNKNOWN]
-        void put(KeyspaceState state, MemorySegment key, MemorySegment value, Object decoded, byte inTree) {
+        /// @param external the unit of the file of large values that holds `value` too, or `null`
+        void put(KeyspaceState state, MemorySegment key, MemorySegment value, Object decoded, byte inTree, PageRef external) {
             var stamp = nextStamp();
             // Usually opened already by the commit's prefetch, outside the lock
             var chain = state.open(key);
             var head = chain.head;
             var existed = Reads.exists(state, head, key, writerPoint(stamp - 1), inTree);
-            var version = new Version(stamp, value, decoded, head);
+            var version = new Version(stamp, value, decoded, head, external);
             chain.head = version;
             touched.add(new Touched(state, chain, version));
+            replace(head);
             if (!existed) {
                 deltas.merge(state, 1L, Long::sum);
             }
@@ -1022,7 +1208,12 @@ public final class LiveLedger implements Ledger {
                 state.markDirty(chain);
             }
             if (frame != null) {
-                frame.put(state.id, key, value);
+                if (external != null) {
+                    frame.putExternal(state.id, key, value.byteSize(), external);
+                    unitBytes += value.byteSize();
+                } else {
+                    frame.put(state.id, key, value);
+                }
             }
         }
 
@@ -1046,6 +1237,7 @@ public final class LiveLedger implements Ledger {
             var version = new Version(stamp, null, null, head);
             chain.head = version;
             touched.add(new Touched(state, chain, version));
+            replace(head);
             deltas.merge(state, -1L, Long::sum);
             if (pages != null) {
                 state.markDirty(chain);
@@ -1061,8 +1253,19 @@ public final class LiveLedger implements Ledger {
             var removals = state.removals;
             removalsBefore.putIfAbsent(state, removals);
             var grown = Arrays.copyOf(removals, removals.length + 1);
-            grown[removals.length] = new RangeRemoval(from, to, stamp);
+            var removal = new RangeRemoval(from, to, stamp);
+            grown[removals.length] = removal;
             state.removals = grown;
+            for (var unit : inFlight) {
+                if (unit.state() == state && removal.covers(unit.chain().key)) {
+                    replace(unit.version());
+                }
+            }
+            for (var write : touched) {
+                if (write.state() == state && removal.covers(write.chain().key)) {
+                    replace(write.version());
+                }
+            }
             if (removed != 0) {
                 deltas.merge(state, -removed, Long::sum);
             }
@@ -1078,10 +1281,16 @@ public final class LiveLedger implements Ledger {
             // Queued before it is visible, so the log holds every commit a reader can see, in order
             if (frame != null) {
                 try {
-                    log.append(FrameBody.COMMIT, sequence, frame);
+                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes);
+                    logged = true;
                 } catch (RuntimeException exception) {
                     rollback();
                     throw exception;
+                }
+            }
+            for (var write : touched) {
+                if (write.version().external != null) {
+                    inFlight.add(new InFlight(write.state(), write.chain(), write.version()));
                 }
             }
             for (var delta : deltas.entrySet()) {
@@ -1115,6 +1324,9 @@ public final class LiveLedger implements Ledger {
             for (var restored : removalsBefore.entrySet()) {
                 restored.getKey().removals = restored.getValue();
             }
+            for (var version : replaced) {
+                version.replacedAt = Long.MAX_VALUE;
+            }
         }
 
         private void maintain() {
@@ -1140,6 +1352,12 @@ public final class LiveLedger implements Ledger {
             }
             sweep(bounds, cutBound, SWEEP_BUDGET);
         }
+    }
+
+    /// A version whose value a unit of the file of large values holds, which no published checkpoint has taken.
+    ///
+    /// @param chain the chain of its key
+    private record InFlight(KeyspaceState state, Chain chain, Version version) {
     }
 
     /// A key a commit wrote.

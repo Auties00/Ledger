@@ -16,14 +16,16 @@ import java.util.Arrays;
 ///
 /// The master key is the caller's raw key, or the output of PBKDF2-HMAC-SHA256 over a passphrase. HKDF extracts a
 /// pseudorandom key from it with the store's salt, and expands one key per use: the check the header keeps to tell a
-/// wrong key from a damaged file, one AES-256 key per log segment (from its number and a random salt of its own), and the AES-256 key of the data file's units. A store
-/// without encryption has no keys.
+/// wrong key from a damaged file, one AES-256 key per log segment (from its number and a random salt of its own), the
+/// AES-256 key of the data file's units, and that of the units of the file of large values. A store without encryption
+/// has no keys.
 final class StoreKeys {
     /// The PBKDF2 iterations of a passphrase.
     static final int PASSPHRASE_ITERATIONS = 600_000;
     private static final byte[] CHECK_INFO = "ledger key check".getBytes(StandardCharsets.US_ASCII);
     private static final byte[] SEGMENT_INFO = "ledger log segment".getBytes(StandardCharsets.US_ASCII);
     private static final byte[] PAGE_INFO = "ledger data file".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] BLOB_INFO = "ledger blob file".getBytes(StandardCharsets.US_ASCII);
 
     private final byte[] pseudorandomKey;
 
@@ -105,6 +107,11 @@ final class StoreKeys {
     /// {@return the AES-256 key of the units of the data file, or `null` without encryption}
     SecretKeySpec pageKey() {
         return encrypted() ? new SecretKeySpec(expand(PAGE_INFO), "AES") : null;
+    }
+
+    /// {@return the AES-256 key of the units of the file of large values, or `null` without encryption}
+    SecretKeySpec blobKey() {
+        return encrypted() ? new SecretKeySpec(expand(BLOB_INFO), "AES") : null;
     }
 
     /// {@return the AES-256 key of log segment `number` of the store `storeId`, whose header holds `salt`}

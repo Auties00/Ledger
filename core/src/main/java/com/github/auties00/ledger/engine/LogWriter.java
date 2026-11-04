@@ -122,8 +122,13 @@ final class LogWriter {
     // Frames queued since the writer opened; a catalog frame carries a sequence already durable, so close() waits on
     // frames rather than on sequences
     private long appended;
-    // The bytes of the frames queued since the writer opened, written under the queue lock
+    // The bytes of the frames queued since the writer opened, and of the units of BlobFile their commits wrote, written
+    // under the queue lock
     private volatile long appendedBytes;
+    // Whether a queued frame's commit wrote a unit of BlobFile, which the next group forces; guarded by the queue lock
+    private boolean queuedUnits;
+    // The file of large values the commits write to, or null
+    private volatile BlobFile blobs;
     private final AtomicBoolean scheduled;
     // The commits waiting for durability
     private final ConcurrentLinkedQueue<Waiter> waiters;
@@ -231,8 +236,21 @@ final class LogWriter {
     ///
     /// @throws LedgerIoException if the writer has stopped
     void append(byte type, long sequence, FrameBody body) {
+        append(type, sequence, body, 0);
+    }
+
+    /// Queues a frame as [#append(byte, long, FrameBody)] does, for a commit that wrote `unitBytes` of units of the
+    /// file of large values.
+    ///
+    /// The group that holds the frame forces that file beside the segment. The units count toward the growth that
+    /// starts a checkpoint, as if their values were in the frame: memory holds them until a checkpoint takes them.
+    ///
+    /// @return the frames queued since the writer opened, the new one included
+    /// @throws LedgerIoException if the writer has stopped
+    long append(byte type, long sequence, FrameBody body, long unitBytes) {
         checkHealthy();
         var length = body.size();
+        long frames;
         queueLock.lock();
         try {
             while (pendingBytes > 0 && pendingBytes + length > QUEUE_LIMIT && failure == null) {
@@ -242,13 +260,35 @@ final class LogWriter {
             queue.add(new Queued(type, sequence, body));
             pendingBytes += length;
             lastQueued = sequence;
-            appended++;
-            appendedBytes += 13 + length;
+            frames = ++appended;
+            appendedBytes += 13 + length + unitBytes;
+            queuedUnits |= unitBytes > 0;
         } finally {
             queueLock.unlock();
         }
         if (scheduled.compareAndSet(false, true)) {
             executor.execute(this::flush);
+        }
+        return frames;
+    }
+
+    /// Makes `blobs` the file of large values the commits write units to, which the groups force.
+    void useBlobs(BlobFile blobs) {
+        this.blobs = blobs;
+    }
+
+    /// Waits until the first `frames` frames queued since the writer opened are durable.
+    ///
+    /// @throws LedgerIoException if the writer stops first
+    void awaitFrames(long frames) {
+        durabilityLock.lock();
+        try {
+            while (written < frames) {
+                checkHealthy();
+                durabilityChanged.awaitUninterruptibly();
+            }
+        } finally {
+            durabilityLock.unlock();
         }
     }
 
@@ -271,6 +311,7 @@ final class LogWriter {
                 ArrayList<Queued> group;
                 long sequence;
                 long frames;
+                boolean units;
                 queueLock.lock();
                 try {
                     if (queue.isEmpty()) {
@@ -280,11 +321,13 @@ final class LogWriter {
                     group = queue;
                     sequence = lastQueued;
                     frames = appended;
+                    units = queuedUnits;
+                    queuedUnits = false;
                     queue = flushing;
                 } finally {
                     queueLock.unlock();
                 }
-                var bodies = write(group);
+                var bodies = write(group, units);
                 group.clear();
                 flushing = group;
                 queueLock.lock();
@@ -303,10 +346,15 @@ final class LogWriter {
         }
     }
 
-    /// Seals and writes `group`, then forces it.
+    /// Seals and writes `group`, then forces it, and the file of large values if `units`.
+    ///
+    /// The commits of the group wrote their units before they queued their frames, so one force of that file, run
+    /// beside the segment's, makes them all durable. A rollover waits for it before it forces the segment: the first
+    /// frame of a group in the next segment then means, as it always does, that everything before it is durable.
     ///
     /// @return the bytes of the frame bodies written
-    private long write(List<Queued> group) throws IOException {
+    private long write(List<Queued> group, boolean units) throws IOException {
+        var unitForce = units ? forceUnits() : null;
         var start = position;
         var groupStart = true;
         var bodies = 0L;
@@ -316,6 +364,10 @@ final class LogWriter {
             var sealedLength = bodyLength + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
             if (position + used + FRAME_HEADER + sealedLength > segmentSize && position + used > SEGMENT_HEADER) {
                 drain();
+                if (unitForce != null) {
+                    await(unitForce);
+                    unitForce = null;
+                }
                 force();
                 forces++;
                 closeSegment();
@@ -335,6 +387,9 @@ final class LogWriter {
         drain();
         force();
         forces++;
+        if (unitForce != null) {
+            await(unitForce);
+        }
         this.groupStart = start;
         groupEnd = end;
         if (next == null && position >= segmentSize / 2) {
@@ -392,6 +447,29 @@ final class LogWriter {
         room(Integer.BYTES);
         ByteBuffer.wrap(output, used, Integer.BYTES).putInt((int) crc.getValue());
         used += Integer.BYTES;
+    }
+
+    /// {@return the force of the file of large values, started on a thread of its own}
+    private FutureTask<Void> forceUnits() {
+        var file = blobs;
+        var task = new FutureTask<Void>(() -> {
+            file.force();
+            return null;
+        });
+        Thread.ofVirtual().name("ledger-blob-force").start(task);
+        return task;
+    }
+
+    private static void await(FutureTask<Void> task) throws IOException {
+        try {
+            task.get();
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while forcing the file of large values", exception);
+        } catch (ExecutionException exception) {
+            throw exception.getCause() instanceof IOException failure ? failure
+                    : new IOException("The file of large values could not be forced", exception.getCause());
+        }
     }
 
     /// Writes the output out if `bytes` more would not fit in it.

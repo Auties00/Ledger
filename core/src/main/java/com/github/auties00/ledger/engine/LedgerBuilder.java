@@ -35,6 +35,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private Duration commitWindow;
     private long segmentSize;
     private Consumer<? super LedgerException> backgroundFailures;
+    private long largeValues;
+    private final Map<String, Long> largeValuesByKeyspace;
 
     /// Creates a builder with the default options.
     public LedgerBuilder() {
@@ -45,6 +47,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         this.segmentSize = SEGMENT_SIZE;
         this.backgroundFailures = _ -> {
         };
+        this.largeValues = 256 * 1024;
+        this.largeValuesByKeyspace = new LinkedHashMap<>();
     }
 
     /// Sets the size past which the log starts a new segment, so tests can roll segments over without writing
@@ -123,6 +127,26 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     }
 
     @Override
+    public Ledger.Options largeValues(long bytes) {
+        this.largeValues = checkLargeValues(bytes);
+        return this;
+    }
+
+    @Override
+    public Ledger.Options largeValues(Keyspace<?, ?> keyspace, long bytes) {
+        Objects.requireNonNull(keyspace, "keyspace");
+        largeValuesByKeyspace.put(keyspace.name(), checkLargeValues(bytes));
+        return this;
+    }
+
+    private static long checkLargeValues(long bytes) {
+        if (bytes < PageFormat.SIZE) {
+            throw new IllegalArgumentException("Large values are at least 4 KiB: " + bytes);
+        }
+        return bytes;
+    }
+
+    @Override
     public Ledger build() {
         if (directory == null) {
             var ledger = new LiveLedger(keyspaces.values(), new HeapPool(pageCache));
@@ -150,6 +174,17 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             pages = PageFile.open(directory, new PageCipher(opened.keys().pageKey()), pageCache, heap);
             var ledger = new LiveLedger(keyspaces.values(), heap);
             var superblock = pages.superblock();
+            var blobPages = 0;
+            var blobFree = new BitSet();
+            if (superblock != null && superblock.blobFreeList() != null) {
+                blobPages = superblock.blobPageCount();
+                blobFree = Catalog.decodeFreeList(pages.read(superblock.blobFreeList(), PageFormat.FREE_LIST, false), blobPages);
+            }
+            // The epoch is fixed once recovery has read those of the opens since the checkpoint
+            var blobs = BlobFile.open(directory, new PageCipher(opened.keys().blobKey()), pages.cache(), heap, blobPages, blobFree);
+            pages.useBlobs(blobs);
+            ledger.useBlobs(blobs, largeValues, largeValuesByKeyspace);
+            var epochs = new int[]{superblock == null ? 0 : superblock.epoch()};
             FreeSpace space;
             if (superblock == null) {
                 space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
@@ -171,10 +206,16 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                         }
 
                         @Override
-                        public void commit(long sequence, byte[] body) {
-                            ledger.replay(sequence, body);
+                        public boolean commit(long sequence, byte[] body) {
+                            return ledger.replay(sequence, body);
+                        }
+
+                        @Override
+                        public void epoch(int epoch) {
+                            epochs[0] = Integer.compareUnsigned(epoch, epochs[0]) > 0 ? epoch : epochs[0];
                         }
                     });
+            blobs.begin(epochs[0] + 1);
             var catalog = ledger.assignIds();
             var pool = ioPool != null ? (PlatformIoPool) ioPool : (ownedPool = new PlatformIoPool(1));
             // Numbers only grow, past every segment and the first one the checkpoint may need
@@ -186,7 +227,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             }
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
                     segmentSize, pool.executor(), commitWindow);
-            var checkpointer = new Checkpointer(ledger, pages, space, log, files, checkpointEvery,
+            var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
                     superblock == null ? 0 : superblock.number(), backgroundFailures);
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);

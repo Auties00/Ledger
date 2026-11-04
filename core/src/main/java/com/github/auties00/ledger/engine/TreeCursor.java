@@ -144,7 +144,7 @@ final class TreeCursor {
 
     /// {@return the value of the current entry, read-only, read from its blob if it has one}
     MemorySegment value() {
-        return TreeSearch.value(pages, leaf, entry, TreeNodes.isBlob(leaf, entry) && admit());
+        return TreeSearch.value(pages, leaf, entry, !TreeNodes.isInline(leaf, entry) && admit());
     }
 
     /// {@return whether to cache the child of branch `parent` the cursor reads}

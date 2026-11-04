@@ -18,12 +18,23 @@ final class Version {
     final Object decoded;
     /// The version this one replaced, or `null` once no reader can need it.
     volatile Version older;
+    /// The unit of [BlobFile] that also holds [#value], or `null` if the value is in memory and the log only.
+    final PageRef external;
+    /// The sequence of the commit that replaced or removed this version, while no checkpoint has taken its unit, or
+    /// [Long#MAX_VALUE]; guarded by the writer lock.
+    long replacedAt;
 
     Version(long stamp, MemorySegment value, Object decoded, Version older) {
+        this(stamp, value, decoded, older, null);
+    }
+
+    Version(long stamp, MemorySegment value, Object decoded, Version older, PageRef external) {
         this.stamp = stamp;
         this.value = value;
         this.decoded = decoded;
         this.older = older;
+        this.external = external;
+        this.replacedAt = Long.MAX_VALUE;
     }
 
     /// {@return whether this version removes the key}

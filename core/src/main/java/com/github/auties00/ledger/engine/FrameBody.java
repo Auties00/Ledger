@@ -7,27 +7,31 @@ import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
-/// The body of a log frame: the writes of one commit, or entries of the key space catalog.
+/// The body of a log frame: the writes of one commit, entries of the key space catalog, or the epoch of an open.
 ///
 /// A commit body is its writes, in order, each a kind byte, the key space id and the encoded bytes:
 ///
 /// ```text
-/// put     0, id, key length, key, value length, value
-/// delete  1, id, key length, key
-/// range   2, id, lower bound length, lower bound, upper bound length, upper bound   (0: no bound)
+/// put       0, id, key length, key, value length, value
+/// delete    1, id, key length, key
+/// range     2, id, lower bound length, lower bound, upper bound length, upper bound   (0: no bound)
+/// external  3, id, key length, key, value length, reference of the value's unit in ledger.blobs (20)
 /// ```
 ///
-/// A catalog body is entries of an id and a name. Numbers are unsigned LEB128 varints; keys are never empty, so a
-/// bound of length 0 is an absent bound.
+/// A catalog body is entries of an id and a name; an epoch body is the epoch. Numbers are unsigned LEB128 varints;
+/// keys are never empty, so a bound of length 0 is an absent bound.
 final class FrameBody {
     /// A frame holding a commit.
     static final byte COMMIT = 1;
     /// A frame naming key spaces.
     static final byte CATALOG = 2;
+    /// A frame holding the epoch of an open, durable before the open writes a unit of [BlobFile].
+    static final byte EPOCH = 3;
 
     private static final byte PUT = 0;
     private static final byte DELETE = 1;
     private static final byte RANGE = 2;
+    private static final byte EXTERNAL = 3;
 
     private byte[] data;
     private int size;
@@ -51,6 +55,36 @@ final class FrameBody {
         writeVarInt(keyspace);
         writeSegment(key);
         writeSegment(value);
+    }
+
+    /// Records a put whose value is the unit `ref` of [BlobFile], holding `length` bytes.
+    void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
+        writeByte(EXTERNAL);
+        writeVarInt(keyspace);
+        writeSegment(key);
+        writeVarInt(length);
+        ensure(PageRef.BYTES);
+        ref.write(data, size);
+        size += PageRef.BYTES;
+    }
+
+    /// {@return the body of an epoch frame for `epoch`}
+    static FrameBody epoch(int epoch) {
+        var body = new FrameBody();
+        body.writeVarInt(Integer.toUnsignedLong(epoch));
+        return body;
+    }
+
+    /// {@return the epoch an epoch body holds}
+    ///
+    /// @throws LedgerCorruptedException if the body is malformed
+    static int readEpoch(byte[] body) {
+        var reader = new Reader(body);
+        var epoch = reader.readVarInt();
+        if (reader.position != body.length || epoch > 0xFFFF_FFFFL) {
+            throw new LedgerCorruptedException("A log frame holds a malformed epoch", null);
+        }
+        return (int) epoch;
     }
 
     void delete(int keyspace, MemorySegment key) {
@@ -125,6 +159,7 @@ final class FrameBody {
                 case PUT -> visitor.put(keyspace, reader.readSegment(), reader.readSegment());
                 case DELETE -> visitor.delete(keyspace, reader.readSegment());
                 case RANGE -> visitor.deleteRange(keyspace, reader.readOptional(), reader.readOptional());
+                case EXTERNAL -> visitor.putExternal(keyspace, reader.readSegment(), reader.readVarInt(), reader.readRef());
                 default -> throw new LedgerCorruptedException("A log frame holds an unknown write kind " + kind, null);
             }
         }
@@ -151,6 +186,8 @@ final class FrameBody {
         void delete(int keyspace, MemorySegment key);
 
         void deleteRange(int keyspace, MemorySegment from, MemorySegment to);
+
+        void putExternal(int keyspace, MemorySegment key, long length, PageRef ref);
     }
 
     /// Receives the entries of a catalog body.
@@ -199,6 +236,13 @@ final class FrameBody {
             var segment = memory.asSlice(position, length);
             position += (int) length;
             return segment;
+        }
+
+        PageRef readRef() {
+            check(PageRef.BYTES);
+            var ref = PageRef.read(body, position);
+            position += PageRef.BYTES;
+            return ref;
         }
 
         MemorySegment readOptional() {

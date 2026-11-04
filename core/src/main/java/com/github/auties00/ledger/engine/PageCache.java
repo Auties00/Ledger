@@ -5,7 +5,8 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
-/// The opened units of the data file, by first page, within a limit of bytes; it evicts with the CLOCK algorithm.
+/// The opened units of the store's files, by file and first page, within one limit of bytes; it evicts with the CLOCK
+/// algorithm.
 ///
 /// An entry holds the plaintext of the unit and is never written again, so a reader keeps using an array the cache has
 /// evicted: the array goes to the collector, not back to a pool, and no read pins anything. An entry is found only
@@ -15,8 +16,12 @@ import java.util.concurrent.atomic.AtomicLong;
 final class PageCache {
     /// The dropped entries the clock may hold beyond the current ones before a sweep takes them out.
     private static final int SLACK = 64;
+    /// The file of the trees, `ledger.data`.
+    static final int DATA = 0;
+    /// The file of the values written at commit, `ledger.blobs`.
+    static final int BLOBS = 1;
 
-    private final ConcurrentHashMap<Integer, Entry> entries;
+    private final ConcurrentHashMap<Long, Entry> entries;
     // The entries in eviction order, current or dropped
     private final ConcurrentLinkedQueue<Entry> clock;
     // The entries in the clock, which may briefly differ from its length while threads race
@@ -33,9 +38,19 @@ final class PageCache {
         this.limit = limit;
     }
 
-    /// {@return the plaintext of the unit `ref` names, or `null` if the cache does not hold it}
+    /// {@return the key of page `page` of `file`, [#DATA] or [#BLOBS]}
+    static long key(int file, int page) {
+        return (long) file << 32 | (page & 0xFFFF_FFFFL);
+    }
+
+    /// {@return the plaintext of the unit `ref` of the data file names, or `null` if the cache does not hold it}
     byte[] get(PageRef ref) {
-        var entry = entries.get(ref.page());
+        return get(key(DATA, ref.page()), ref);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, at `key`, or `null` if the cache does not hold it}
+    byte[] get(long key, PageRef ref) {
+        var entry = entries.get(key);
         if (entry == null || entry.nonceHigh != ref.nonceHigh() || entry.nonceLow != ref.nonceLow()) {
             return null;
         }
@@ -47,19 +62,27 @@ final class PageCache {
         return unit;
     }
 
-    /// Caches `unit`, the plaintext of the unit `ref` names, replacing whatever the cache held for its page.
+    /// Caches `unit`, the plaintext of the unit `ref` of the data file names, replacing whatever the cache held for its
+    /// page.
     ///
     /// @param referenced whether the unit counts as read, rather than written and maybe never read
     void put(PageRef ref, byte[] unit, boolean referenced) {
+        put(key(DATA, ref.page()), ref, unit, referenced);
+    }
+
+    /// Caches `unit`, the plaintext of the unit `ref` names, at `key`, replacing whatever the cache held there.
+    ///
+    /// @param referenced whether the unit counts as read, rather than written and maybe never read
+    void put(long key, PageRef ref, byte[] unit, boolean referenced) {
         if (unit.length > limit / 4) {
             // A unit this large would evict most of the cache for one read; what the page held is out of date
-            remove(ref.page());
+            remove(key);
             return;
         }
-        var entry = new Entry(ref.page(), ref.nonceHigh(), ref.nonceLow(), unit);
+        var entry = new Entry(key, ref.nonceHigh(), ref.nonceLow(), unit);
         entry.referenced = referenced;
         bytes.addAndGet(unit.length);
-        var previous = entries.put(ref.page(), entry);
+        var previous = entries.put(key, entry);
         if (previous != null) {
             drop(previous);
         }
@@ -68,9 +91,14 @@ final class PageCache {
         evict();
     }
 
-    /// Drops whatever the cache holds for page `page`.
+    /// Drops whatever the cache holds for page `page` of the data file.
     void remove(int page) {
-        var previous = entries.remove(page);
+        remove(key(DATA, page));
+    }
+
+    /// Drops whatever the cache holds at `key`.
+    void remove(long key) {
+        var previous = entries.remove(key);
         if (previous != null) {
             drop(previous);
         }
@@ -117,12 +145,12 @@ final class PageCache {
                 return;
             }
             clockSize.decrementAndGet();
-            if (entries.get(entry.page) != entry) {
+            if (entries.get(entry.key) != entry) {
                 // Replaced or removed already
                 continue;
             }
             if (over && !entry.referenced) {
-                if (entries.remove(entry.page, entry)) {
+                if (entries.remove(entry.key, entry)) {
                     drop(entry);
                 }
                 continue;
@@ -136,7 +164,7 @@ final class PageCache {
     }
 
     private static final class Entry {
-        final int page;
+        final long key;
         final long nonceHigh;
         final int nonceLow;
         final int length;
@@ -144,8 +172,8 @@ final class PageCache {
         volatile byte[] unit;
         volatile boolean referenced;
 
-        Entry(int page, long nonceHigh, int nonceLow, byte[] unit) {
-            this.page = page;
+        Entry(long key, long nonceHigh, int nonceLow, byte[] unit) {
+            this.key = key;
             this.nonceHigh = nonceHigh;
             this.nonceLow = nonceLow;
             this.length = unit.length;

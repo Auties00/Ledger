@@ -32,6 +32,10 @@ import java.util.function.Consumer;
 /// share the forces that make them durable, so a thousand threads waiting for durability cost the device about as
 /// much as one.
 ///
+/// A value of a batch at least [Options#largeValues(long)] long, 256 KiB by default, is written once, to a file of
+/// its own, before the commit applies; its log frame records where it is, and the next checkpoint takes it from
+/// there. Other values reach the device twice, in the log and in a checkpoint.
+///
 /// The writes since the last checkpoint stay in memory until the next one. When commits come faster than
 /// checkpoints can write them, and the log holds three checkpoint intervals ([Options#checkpointEvery(long)]) the
 /// files do not, a commit waits for the running checkpoint before it applies: memory stays bounded, at the cost of
@@ -64,7 +68,9 @@ import java.util.function.Consumer;
 /// Every method may be called from any thread, virtual threads included. Calls that wait (a commit while the
 /// writer is busy, a wait for durability) park the calling thread without holding a carrier. The store writes and
 /// forces its log on the platform threads of its [IoPool], and writes the checkpoints it starts on its own on a
-/// platform thread of their own; a read of a page the cache does not hold reads the file on the calling thread.
+/// platform thread of their own; a read of a page the cache does not hold reads the file on the calling thread. A
+/// commit writes its large values on the calling thread, and reads the pages of the trees its writes need, which
+/// the cache does not hold, on virtual threads of its own, before it waits for the writer.
 ///
 /// # Lifecycle
 /// A store holds an exclusive lock on its directory from [Options#build()] until [#close()]: one process, and one
@@ -216,6 +222,28 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// @param listener receives each failure on the thread that met it, and must not block for long
         /// @return these options
         Options onBackgroundFailure(Consumer<? super LedgerException> listener);
+
+        /// Writes each value of at least `bytes` bytes that a batch puts to a file of its own, once, instead of into the
+        /// log and again at the next checkpoint.
+        ///
+        /// A large value then reaches the device once, which halves what a commit of one costs a device whose
+        /// bandwidth is the limit. Such a commit forces that file beside the log, in parallel; a commit without one
+        /// forces the log only. Transactions keep their values in the log. The default is 256 KiB;
+        /// [Long#MAX_VALUE] writes every value to the log.
+        ///
+        /// @param bytes the size from which a value goes to its own file, at least 4 KiB
+        /// @return these options
+        /// @throws IllegalArgumentException if `bytes` is below 4 KiB
+        Options largeValues(long bytes);
+
+        /// Sets the size from which a value of `keyspace` goes to a file of its own, in place of the one
+        /// [#largeValues(long)] sets for every key space.
+        ///
+        /// @param keyspace a key space of the store
+        /// @param bytes the size from which a value goes to its own file, at least 4 KiB
+        /// @return these options
+        /// @throws IllegalArgumentException if `bytes` is below 4 KiB
+        Options largeValues(Keyspace<?, ?> keyspace, long bytes);
 
         /// Lets a commit wait up to `window` for other commits to join the force it starts.
         ///

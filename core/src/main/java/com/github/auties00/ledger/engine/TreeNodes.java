@@ -15,15 +15,16 @@ import java.util.List;
 ///    the entries
 /// ```
 ///
-/// A leaf entry is a key and its value, inline or in a blob of its own:
+/// A leaf entry is a key and its value, inline, in a blob of its own, or in a unit of [BlobFile] a commit wrote:
 ///
 /// ```text
 /// key length (2), key, 0, value length (2), value
 /// key length (2), key, 1, value length (4), reference of the value blob (20)
+/// key length (2), key, 2, value length (4), reference of the value's unit in ledger.blobs (20)
 /// ```
 ///
 /// A branch entry is a child: its reference (page and nonce, its pages being 1), the entries of its subtree, whether
-/// the subtree has value blobs, and its first key, which is also the separator before it.
+/// the subtree has values in blobs or units, and its first key, which is also the separator before it.
 ///
 /// ```text
 /// page (4), nonce (12), entries (8), flags (1), key length (2), key
@@ -41,6 +42,7 @@ final class TreeNodes {
     private static final int BRANCH_FIXED = 4 + 8 + 4 + 8 + 1 + 2;
     private static final byte INLINE = 0;
     private static final byte BLOB = 1;
+    private static final byte EXTERNAL = 2;
     private static final byte HAS_BLOBS = 1;
 
     private TreeNodes() {
@@ -111,8 +113,19 @@ final class TreeNodes {
         return leafKeyOffset(entry) + leafKeyLength(unit, entry);
     }
 
+    /// {@return whether the value of leaf entry `entry` is in a blob of the data file}
     static boolean isBlob(byte[] unit, int entry) {
         return unit[valueField(unit, entry)] == BLOB;
+    }
+
+    /// {@return whether the value of leaf entry `entry` is in a unit of [BlobFile]}
+    static boolean isExternal(byte[] unit, int entry) {
+        return unit[valueField(unit, entry)] == EXTERNAL;
+    }
+
+    /// {@return whether the value of leaf entry `entry` is in the leaf}
+    static boolean isInline(byte[] unit, int entry) {
+        return unit[valueField(unit, entry)] == INLINE;
     }
 
     /// {@return the read-only inline value of leaf entry `entry`}
@@ -183,8 +196,8 @@ final class TreeNodes {
         for (var i = 0; i < count; i++) {
             var entry = entry(unit, i);
             var key = leafKey(unit, entry);
-            if (isBlob(unit, entry)) {
-                entries.add(new LeafEntry(key, null, blobRef(unit, entry), blobLength(unit, entry)));
+            if (isBlob(unit, entry) || isExternal(unit, entry)) {
+                entries.add(new LeafEntry(key, null, blobRef(unit, entry), blobLength(unit, entry), isExternal(unit, entry)));
             } else {
                 var value = inlineValue(unit, entry);
                 entries.add(new LeafEntry(key, value, null, (int) value.byteSize()));
@@ -227,7 +240,7 @@ final class TreeNodes {
                 MemorySegment.copy(entry.value(), 0, target, position + 3, entry.length());
                 position += 3 + entry.length();
             } else {
-                unit[position] = BLOB;
+                unit[position] = entry.external() ? EXTERNAL : BLOB;
                 Bytes.i32(unit, position + 1, entry.length());
                 entry.blob().write(unit, position + 5);
                 position += 5 + PageRef.BYTES;
@@ -285,13 +298,18 @@ final class TreeNodes {
         return runs;
     }
 
-    /// An entry of a leaf: a key and its value, inline or in a blob.
+    /// An entry of a leaf: a key and its value, inline, in a blob, or in a unit of [BlobFile].
     ///
     /// @param key the key
-    /// @param value the inline value, or `null` if it is in a blob
-    /// @param blob the blob of the value, or `null` if it is inline
+    /// @param value the inline value, or `null` if it is in a blob or a unit
+    /// @param blob the blob or unit of the value, or `null` if it is inline
     /// @param length the bytes of the value
-    record LeafEntry(MemorySegment key, MemorySegment value, PageRef blob, int length) {
+    /// @param external whether `blob` is a unit of [BlobFile] rather than a blob of the data file
+    record LeafEntry(MemorySegment key, MemorySegment value, PageRef blob, int length, boolean external) {
+        LeafEntry(MemorySegment key, MemorySegment value, PageRef blob, int length) {
+            this(key, value, blob, length, false);
+        }
+
         /// {@return the bytes the entry takes in a leaf, offset included}
         int size() {
             return 2 + 2 + (int) key.byteSize() + 1 + (blob == null ? 2 + length : 4 + PageRef.BYTES);

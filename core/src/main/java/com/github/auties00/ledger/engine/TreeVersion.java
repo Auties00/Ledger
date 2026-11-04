@@ -18,16 +18,20 @@ final class TreeVersion {
     final PageRef catalog;
     /// The free list blob of the checkpoint.
     final PageRef freeList;
+    /// The blob holding the free list of [BlobFile], or `null` if the checkpoint wrote none.
+    final PageRef blobFreeList;
     /// The version before this one, or `null` once no read can use it.
     volatile TreeVersion older;
 
-    TreeVersion(long number, long sequence, long published, TreeRoot[] roots, PageRef catalog, PageRef freeList, TreeVersion older) {
+    TreeVersion(long number, long sequence, long published, TreeRoot[] roots, PageRef catalog, PageRef freeList,
+                PageRef blobFreeList, TreeVersion older) {
         this.number = number;
         this.sequence = sequence;
         this.published = published;
         this.roots = roots;
         this.catalog = catalog;
         this.freeList = freeList;
+        this.blobFreeList = blobFreeList;
         this.older = older;
     }
 

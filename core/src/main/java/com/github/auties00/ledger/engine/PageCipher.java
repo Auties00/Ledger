@@ -4,16 +4,22 @@ import javax.crypto.AEADBadTagException;
 import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
+import java.io.IOException;
+import java.lang.foreign.MemorySegment;
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.zip.CRC32C;
 
-/// Seals and opens the units of the data file, as [PageFormat] lays them out: AES-256-GCM under the store's page key,
-/// or a CRC-32C for a store without encryption.
+/// Seals and opens the units of the store's files, as [PageFormat] lays them out: AES-256-GCM under the key of the
+/// file, or a CRC-32C for a store without encryption.
 ///
 /// It is safe for concurrent use: each call takes a cipher from a pool, since a cipher is not.
 final class PageCipher {
+    /// The content a streamed unit passes to the cipher in one call: small enough to stay out of the way of the
+    /// cipher's intrinsic, which a cold JVM reaches only through calls that are not too large.
+    private static final int SLICE = 64 << 10;
+
     private final SecretKeySpec key;
     private final ConcurrentLinkedQueue<Cipher> ciphers;
 
@@ -41,6 +47,90 @@ final class PageCipher {
             cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, plain, PageFormat.NONCE, 12));
             cipher.updateAAD(plain, 0, PageFormat.HEADER);
             Sealing.encrypt(cipher, plain, PageFormat.HEADER, tag - PageFormat.HEADER, out, offset + PageFormat.HEADER);
+        } catch (GeneralSecurityException exception) {
+            throw new IllegalStateException("A unit could not be sealed", exception);
+        } finally {
+            ciphers.offer(cipher);
+        }
+    }
+
+    /// Receives the bytes of a unit sealed a part at a time.
+    @FunctionalInterface
+    interface Output {
+        /// Takes the first `length` bytes of `bytes`, which the cipher fills again once it returns.
+        void write(byte[] bytes, int length) throws IOException;
+    }
+
+    /// Seals the unit of `pages` pages whose header is `header` and whose content is `content`, passing it to `out` a
+    /// part at a time through `buffer`.
+    ///
+    /// The unit is the one [#seal(byte\[\], int, byte\[\], int)] makes of the same header and content, but neither is
+    /// whole in memory: a value of megabytes is sealed through a buffer of its own size.
+    ///
+    /// @param header the unit's header, filled in, of [PageFormat#HEADER] bytes
+    /// @param buffer the buffer the sealed bytes pass through, of at least 64 KiB
+    /// @throws IOException if `out` fails
+    void seal(byte[] header, MemorySegment content, int pages, byte[] buffer, Output out) throws IOException {
+        var tag = pages * PageFormat.SIZE - PageFormat.TAG;
+        var padding = tag - PageFormat.HEADER - content.byteSize();
+        if (padding < 0) {
+            throw new IllegalArgumentException("A unit of " + pages + " pages holds at most " + PageFormat.capacity(pages) + " bytes");
+        }
+        System.arraycopy(header, 0, buffer, 0, PageFormat.HEADER);
+        var used = PageFormat.HEADER;
+        var slice = new byte[Math.min(SLICE, buffer.length / 2)];
+        if (key == null) {
+            var crc = new CRC32C();
+            crc.update(header, 0, PageFormat.HEADER);
+            for (var offset = 0L; offset < content.byteSize() + padding; ) {
+                if (used == buffer.length) {
+                    out.write(buffer, used);
+                    used = 0;
+                }
+                var count = (int) Math.min(buffer.length - used, content.byteSize() + padding - offset);
+                var fromContent = (int) Math.max(0, Math.min(count, content.byteSize() - offset));
+                if (fromContent > 0) {
+                    MemorySegment.copy(content, offset, MemorySegment.ofArray(buffer), used, fromContent);
+                }
+                Arrays.fill(buffer, used + fromContent, used + count, (byte) 0);
+                crc.update(buffer, used, count);
+                used += count;
+                offset += count;
+            }
+            if (buffer.length - used < PageFormat.TAG) {
+                out.write(buffer, used);
+                used = 0;
+            }
+            Bytes.i32(buffer, used, (int) crc.getValue());
+            Arrays.fill(buffer, used + Integer.BYTES, used + PageFormat.TAG, (byte) 0);
+            out.write(buffer, used + PageFormat.TAG);
+            return;
+        }
+        var cipher = take();
+        try {
+            cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, header, PageFormat.NONCE, 12));
+            cipher.updateAAD(header, 0, PageFormat.HEADER);
+            for (var offset = 0L; offset < content.byteSize() + padding; ) {
+                var count = (int) Math.min(slice.length, content.byteSize() + padding - offset);
+                var fromContent = (int) Math.max(0, Math.min(count, content.byteSize() - offset));
+                if (fromContent > 0) {
+                    MemorySegment.copy(content, offset, MemorySegment.ofArray(slice), 0, fromContent);
+                }
+                Arrays.fill(slice, fromContent, count, (byte) 0);
+                // The cipher may hold back a partial block, and gives it out with the next call
+                if (buffer.length - used < count + PageFormat.TAG) {
+                    out.write(buffer, used);
+                    used = 0;
+                }
+                used += cipher.update(slice, 0, count, buffer, used);
+                offset += count;
+            }
+            if (buffer.length - used < 2 * PageFormat.TAG) {
+                out.write(buffer, used);
+                used = 0;
+            }
+            used += cipher.doFinal(buffer, used);
+            out.write(buffer, used);
         } catch (GeneralSecurityException exception) {
             throw new IllegalStateException("A unit could not be sealed", exception);
         } finally {

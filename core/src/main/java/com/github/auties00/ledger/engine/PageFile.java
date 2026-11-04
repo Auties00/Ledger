@@ -33,6 +33,8 @@ final class PageFile implements AutoCloseable {
     private final HeapPool pool;
     private final ArrayBlockingQueue<FileChannel> readers;
     private final FileChannel writer;
+    // The file of large values, which leaves point into
+    private volatile BlobFile blobs;
     // Empties the drive's cache for the file on macOS, or null
     private final FullSync.Handle fullSync;
     private volatile boolean closed;
@@ -286,6 +288,16 @@ final class PageFile implements AutoCloseable {
         return cache;
     }
 
+    /// Makes `blobs` the file of large values the trees point into; this file closes it.
+    void useBlobs(BlobFile blobs) {
+        this.blobs = blobs;
+    }
+
+    /// {@return the file of large values the trees point into}
+    BlobFile blobs() {
+        return blobs;
+    }
+
     /// {@return a writer of the units of one checkpoint, sealed under nonces that start with `nonceHigh`}
     Writer writer(long nonceHigh) {
         return new Writer(nonceHigh);
@@ -294,6 +306,10 @@ final class PageFile implements AutoCloseable {
     @Override
     public void close() {
         closed = true;
+        var external = blobs;
+        if (external != null) {
+            external.close();
+        }
         for (var channel : readers) {
             try {
                 channel.close();

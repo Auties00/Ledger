@@ -716,7 +716,7 @@ class CheckpointTest {
     }
 
     /// Walks the data file from its newest superblock and checks that every page is used once or free.
-    private static void verifyPages(Path directory, boolean encrypted) throws IOException {
+    static void verifyPages(Path directory, boolean encrypted) throws IOException {
         var header = StoreHeader.read(directory);
         var keys = header.open(encrypted ? EncryptionSpec.key(KEY) : EncryptionSpec.NONE);
         try (var pages = PageFile.open(directory, new PageCipher(keys.pageKey()), 1 << 20, new HeapPool(1 << 20))) {
@@ -725,12 +725,16 @@ class CheckpointTest {
                 return;
             }
             var used = new BitSet();
+            var usedBlobs = new BitSet();
             mark(used, superblock.catalog());
             mark(used, superblock.freeList());
+            if (superblock.blobFreeList() != null) {
+                mark(used, superblock.blobFreeList());
+            }
             var catalog = Catalog.decode(pages.read(superblock.catalog(), PageFormat.CATALOG, false));
             for (var entry : catalog.entries()) {
                 if (entry.root() != null) {
-                    walk(pages, entry.root().ref(), used);
+                    walk(pages, entry.root().ref(), used, usedBlobs);
                 }
             }
             var free = Catalog.decodeFreeList(pages.read(superblock.freeList(), PageFormat.FREE_LIST, false), superblock.pageCount());
@@ -738,6 +742,14 @@ class CheckpointTest {
                 assertTrue(used.get(page) != free.get(page), "page " + page + (used.get(page) ? " is used and free" : " is neither used nor free"));
             }
             assertFalse(used.get(superblock.pageCount()), "a unit is past the end of the file");
+            // A store closed cleanly has no unit in flight: every page of the file of large values is a tree's or free
+            var blobFree = superblock.blobFreeList() == null ? new BitSet()
+                    : Catalog.decodeFreeList(pages.read(superblock.blobFreeList(), PageFormat.FREE_LIST, false), superblock.blobPageCount());
+            for (var page = PageFormat.FIRST_UNIT_PAGE; page < superblock.blobPageCount(); page++) {
+                assertTrue(usedBlobs.get(page) != blobFree.get(page),
+                        "page " + page + " of the large values" + (usedBlobs.get(page) ? " is used and free" : " is neither used nor free"));
+            }
+            assertTrue(usedBlobs.isEmpty() || usedBlobs.length() <= superblock.blobPageCount(), "a value is past the end of its file");
         }
     }
 
@@ -748,7 +760,7 @@ class CheckpointTest {
         }
     }
 
-    private static void walk(PageFile pages, PageRef ref, BitSet used) {
+    private static void walk(PageFile pages, PageRef ref, BitSet used, BitSet usedBlobs) {
         mark(used, ref);
         var unit = pages.read(ref, PageFile.NODE, false);
         for (var i = 0; i < TreeNodes.count(unit); i++) {
@@ -756,9 +768,11 @@ class CheckpointTest {
                 var entry = TreeNodes.entry(unit, i);
                 if (TreeNodes.isBlob(unit, entry)) {
                     mark(used, TreeNodes.blobRef(unit, entry));
+                } else if (TreeNodes.isExternal(unit, entry)) {
+                    mark(usedBlobs, TreeNodes.blobRef(unit, entry));
                 }
             } else {
-                walk(pages, TreeNodes.childRef(unit, i), used);
+                walk(pages, TreeNodes.childRef(unit, i), used, usedBlobs);
             }
         }
     }

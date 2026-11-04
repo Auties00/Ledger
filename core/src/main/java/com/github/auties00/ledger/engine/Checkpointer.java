@@ -8,7 +8,9 @@ import java.lang.foreign.MemorySegment;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.function.Consumer;
@@ -43,6 +45,8 @@ final class Checkpointer {
     private final LiveLedger ledger;
     private final PageFile pages;
     private final FreeSpace space;
+    // The file of large values, or null
+    private final BlobFile blobs;
     private final LogWriter log;
     private final LogFiles files;
     private final long every;
@@ -68,11 +72,12 @@ final class Checkpointer {
     /// @param every the log growth that starts a checkpoint, in bytes
     /// @param number the number of the last durable checkpoint, or 0
     /// @param failures receives the failures of the checkpoints started on their own threads
-    Checkpointer(LiveLedger ledger, PageFile pages, FreeSpace space, LogWriter log, LogFiles files, long every, long number,
-                 Consumer<? super LedgerException> failures) {
+    Checkpointer(LiveLedger ledger, PageFile pages, FreeSpace space, BlobFile blobs, LogWriter log, LogFiles files, long every,
+                 long number, Consumer<? super LedgerException> failures) {
         this.ledger = ledger;
         this.pages = pages;
         this.space = space;
+        this.blobs = blobs;
         this.log = log;
         this.files = files;
         this.every = every;
@@ -179,21 +184,38 @@ final class Checkpointer {
             TreeRoot[] roots;
             PageRef catalog;
             PageRef freeList;
+            PageRef blobFreeList = null;
             var freed = new ArrayList<PageRef>();
+            var adopted = new HashSet<PageRef>();
             var superblockWritten = false;
             try {
-                roots = build(cut, update);
+                roots = build(cut, update, adopted);
                 freed.addAll(update.freed());
                 if (cut.base() != null) {
                     freed.add(cut.base().catalog);
                     freed.add(cut.base().freeList);
+                    if (cut.base().blobFreeList != null) {
+                        freed.add(cut.base().blobFreeList);
+                    }
                 }
                 catalog = writeCatalog(cut, roots, writer, update);
+                BlobFile.Runs blobRuns = null;
+                if (blobs != null) {
+                    var alsoFree = new ArrayList<>(update.freedExternal());
+                    alsoFree.addAll(cut.superseded());
+                    blobRuns = blobs.durableRuns(adopted, alsoFree);
+                    blobFreeList = writeBlobFreeList(writer, update, blobRuns);
+                }
                 freeList = writeFreeList(writer, update, freed);
                 writer.flush();
+                if (blobs != null) {
+                    // The units the trees take were written by commits the log may not have forced yet
+                    blobs.force();
+                }
                 pages.force();
                 superblockWritten = true;
-                pages.writeSuperblock(new Superblock(number + 1, cut.sequence(), cut.logStart(), space.pageCount(), catalog, freeList),
+                pages.writeSuperblock(new Superblock(number + 1, cut.sequence(), cut.logStart(), space.pageCount(), catalog, freeList,
+                                blobRuns == null ? 0 : blobRuns.pageCount(), blobFreeList, blobs == null ? 0 : blobs.epoch()),
                         writer.nonceHigh(), writer.nextNonce());
                 number++;
             } catch (IOException exception) {
@@ -213,7 +235,7 @@ final class Checkpointer {
             } finally {
                 ledger.readers().unregister(cut.sequence());
             }
-            ledger.publish(cut, number, roots, catalog, freeList, freed);
+            ledger.publish(cut, number, roots, catalog, freeList, blobFreeList, freed, update.freedExternal(), adopted);
             publishedBytes = cut.logBytes();
             signalProgress();
             ledger.pruneCut(cut);
@@ -222,6 +244,9 @@ final class Checkpointer {
                 var end = space.trim();
                 if (end > 0) {
                     pages.truncate(end);
+                }
+                if (blobs != null) {
+                    blobs.trim();
                 }
             } catch (IOException exception) {
                 // The checkpoint is durable; trailing free pages wait for the next one
@@ -249,7 +274,9 @@ final class Checkpointer {
     }
 
     /// {@return the roots of every key space's tree after the cut, by id}
-    private TreeRoot[] build(LiveLedger.Cut cut, TreeUpdate update) throws IOException {
+    ///
+    /// @param adopted receives the units of the file of large values the trees take
+    private TreeRoot[] build(LiveLedger.Cut cut, TreeUpdate update, Set<PageRef> adopted) throws IOException {
         var roots = cut.base() == null ? new TreeRoot[cut.maxId() + 1] : cut.base().roots(cut.maxId() + 1);
         var bound = Reads.boundOf(cut.sequence());
         var treeBound = cut.base() == null ? -1 : Reads.boundOf(cut.base().sequence);
@@ -273,7 +300,14 @@ final class Checkpointer {
                     // tree is right. A resident one holds every entry, so there the key is gone
                     continue;
                 }
-                ops.add(new TreeUpdate.Op(key, version == null || version == Version.HIDDEN ? null : version.value));
+                if (version == null || version == Version.HIDDEN) {
+                    ops.add(new TreeUpdate.Op(key, null));
+                } else {
+                    ops.add(new TreeUpdate.Op(key, version.value, version.external));
+                    if (version.external != null) {
+                        adopted.add(version.external);
+                    }
+                }
             }
             var ranges = new ArrayList<TreeUpdate.Range>();
             for (var removal : keyspace.removals()) {
@@ -297,6 +331,14 @@ final class Checkpointer {
         var unitPages = unit.length / PageFormat.SIZE;
         var page = allocate(unitPages, update);
         return writer.write(PageFormat.CATALOG, 0, page, unitPages, unit, Bytes.i32(unit, PageFormat.LENGTH), false);
+    }
+
+    /// Writes the free list of the file of large values the checkpoint makes durable, in pages of the data file.
+    private PageRef writeBlobFreeList(PageFile.Writer writer, TreeUpdate update, BlobFile.Runs runs) throws IOException {
+        var unitPages = PageFormat.pagesFor(Catalog.freeListLength(runs.runs().size()));
+        var page = allocate(unitPages, update);
+        var unit = Catalog.encodeFreeList(runs.runs(), unitPages);
+        return writer.write(PageFormat.FREE_LIST, 0, page, unitPages, unit, Bytes.i32(unit, PageFormat.LENGTH), false);
     }
 
     /// Writes the free list of the state the checkpoint makes durable, in pages taken from that list.
