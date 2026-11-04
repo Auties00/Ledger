@@ -22,6 +22,8 @@ final class ReaderTable {
     private final Object registryLock;
     // Sequence to the number of registrations at it
     private final TreeMap<Long, Integer> registry;
+    // What scan() collects into: only the writer scans, holding the writer lock
+    private long[] scanned;
 
     /// Creates a table of `slots` slots.
     ///
@@ -36,6 +38,7 @@ final class ReaderTable {
         this.latest = latest;
         this.registryLock = new Object();
         this.registry = new TreeMap<>();
+        this.scanned = new long[slots + 1];
     }
 
     /// Registers a read at the latest sequence.
@@ -104,7 +107,7 @@ final class ReaderTable {
     /// Only the writer calls it, holding the writer lock.
     Scan scan() {
         var current = latest.getAsLong();
-        var sequences = new long[slots.length() + 1];
+        var sequences = scanned;
         var count = 0;
         sequences[count++] = current;
         var oldest = Long.MAX_VALUE;
@@ -127,6 +130,7 @@ final class ReaderTable {
                 }
                 if (count == sequences.length) {
                     sequences = Arrays.copyOf(sequences, count * 2);
+                    scanned = sequences;
                 }
                 sequences[count++] = sequence;
             }

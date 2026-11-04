@@ -1137,9 +1137,13 @@ public final class LiveLedger implements Ledger {
     final class Applier {
         private final long sequence;
         private int op;
-        private final IdentityHashMap<KeyspaceState, Long> deltas;
+        // The key spaces whose counts the commit changes, and by how much, in the first deltaCount slots
+        private KeyspaceState[] deltaStates;
+        private long[] deltas;
+        private int deltaCount;
         private final List<Touched> touched;
-        private final IdentityHashMap<KeyspaceState, RangeRemoval[]> removalsBefore;
+        // The removals of each key space before this commit's first range removal there, or null before any
+        private IdentityHashMap<KeyspaceState, RangeRemoval[]> removalsBefore;
         // The writes as the log records them, or null when nothing is journaled
         private final FrameBody frame;
         // The bytes of the units of the file of large values this commit's values are in
@@ -1151,9 +1155,10 @@ public final class LiveLedger implements Ledger {
 
         Applier(long sequence, boolean journaled) {
             this.sequence = sequence;
-            this.deltas = new IdentityHashMap<>();
+            // Most commits write one or two key spaces
+            this.deltaStates = new KeyspaceState[2];
+            this.deltas = new long[2];
             this.touched = new ArrayList<>();
-            this.removalsBefore = new IdentityHashMap<>();
             this.frame = journaled ? new FrameBody() : null;
             this.replaced = new ArrayList<>();
         }
@@ -1161,6 +1166,32 @@ public final class LiveLedger implements Ledger {
         /// {@return whether the commit's frame is queued in the log}
         boolean logged() {
             return logged;
+        }
+
+        /// {@return the change this commit makes to the count of `state`}
+        private long delta(KeyspaceState state) {
+            for (var i = 0; i < deltaCount; i++) {
+                if (deltaStates[i] == state) {
+                    return deltas[i];
+                }
+            }
+            return 0;
+        }
+
+        /// Adds `delta` to the change this commit makes to the count of `state`.
+        private void addDelta(KeyspaceState state, long delta) {
+            for (var i = 0; i < deltaCount; i++) {
+                if (deltaStates[i] == state) {
+                    deltas[i] += delta;
+                    return;
+                }
+            }
+            if (deltaCount == deltaStates.length) {
+                deltaStates = Arrays.copyOf(deltaStates, deltaCount * 2);
+                deltas = Arrays.copyOf(deltas, deltaCount * 2);
+            }
+            deltaStates[deltaCount] = state;
+            deltas[deltaCount++] = delta;
         }
 
         /// Records that this commit replaces `version`, if a unit no checkpoint has taken holds its value.
@@ -1178,7 +1209,7 @@ public final class LiveLedger implements Ledger {
 
         /// {@return the number of entries of `state` once this commit applies}
         long count(KeyspaceState state) {
-            return state.counts.lastEntry().getValue() + deltas.getOrDefault(state, 0L);
+            return state.counts.lastEntry().getValue() + delta(state);
         }
 
         private long nextStamp() {
@@ -1207,7 +1238,7 @@ public final class LiveLedger implements Ledger {
             touched.add(new Touched(state, chain, version));
             replace(head);
             if (!existed) {
-                deltas.merge(state, 1L, Long::sum);
+                addDelta(state, 1);
             }
             if (pages != null) {
                 state.markDirty(chain);
@@ -1243,7 +1274,7 @@ public final class LiveLedger implements Ledger {
             chain.head = version;
             touched.add(new Touched(state, chain, version));
             replace(head);
-            deltas.merge(state, -1L, Long::sum);
+            addDelta(state, -1);
             if (pages != null) {
                 state.markDirty(chain);
             }
@@ -1256,6 +1287,9 @@ public final class LiveLedger implements Ledger {
             var stamp = nextStamp();
             var removed = Reads.count(state, from, to, writerPoint(stamp - 1));
             var removals = state.removals;
+            if (removalsBefore == null) {
+                removalsBefore = new IdentityHashMap<>(2);
+            }
             removalsBefore.putIfAbsent(state, removals);
             var grown = Arrays.copyOf(removals, removals.length + 1);
             var removal = new RangeRemoval(from, to, stamp);
@@ -1272,7 +1306,7 @@ public final class LiveLedger implements Ledger {
                 }
             }
             if (removed != 0) {
-                deltas.merge(state, -removed, Long::sum);
+                addDelta(state, -removed);
             }
             if (frame != null) {
                 frame.deleteRange(state.id, from, to);
@@ -1298,9 +1332,9 @@ public final class LiveLedger implements Ledger {
                     inFlight.add(new InFlight(write.state(), write.chain(), write.version()));
                 }
             }
-            for (var delta : deltas.entrySet()) {
-                var state = delta.getKey();
-                state.counts.put(sequence, state.counts.lastEntry().getValue() + delta.getValue());
+            for (var i = 0; i < deltaCount; i++) {
+                var state = deltaStates[i];
+                state.counts.put(sequence, state.counts.lastEntry().getValue() + deltas[i]);
             }
             latest = sequence;
             maintain();
@@ -1326,8 +1360,10 @@ public final class LiveLedger implements Ledger {
                     chain.head = version;
                 }
             }
-            for (var restored : removalsBefore.entrySet()) {
-                restored.getKey().removals = restored.getValue();
+            if (removalsBefore != null) {
+                for (var restored : removalsBefore.entrySet()) {
+                    restored.getKey().removals = restored.getValue();
+                }
             }
             for (var version : replaced) {
                 version.replacedAt = Long.MAX_VALUE;
@@ -1348,10 +1384,13 @@ public final class LiveLedger implements Ledger {
             for (var write : touched) {
                 sweepPending |= prune(write.state(), write.chain(), write.version(), bounds, cutBound);
             }
-            for (var state : states.values()) {
+            var order = sweepOrder;
+            for (var i = 0; i < order.size(); i++) {
+                var state = order.get(i);
                 applyRemovals(state, bounds[bounds.length - 1], dropBound);
                 var countFloor = state.counts.floorKey(oldest);
-                if (countFloor != null) {
+                // Most commits find nothing to drop; a view of the map would cost more than the check
+                if (countFloor != null && state.counts.firstKey() < countFloor) {
                     state.counts.headMap(countFloor, false).clear();
                 }
             }

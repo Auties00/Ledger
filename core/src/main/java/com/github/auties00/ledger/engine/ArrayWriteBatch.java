@@ -18,6 +18,10 @@ import java.util.Objects;
 /// this class when it applies the batch, then takes the array over with [#detach()].
 public final class ArrayWriteBatch implements WriteBatch {
     private static final int INITIAL_CAPACITY = 4_096;
+    private static final byte[] EMPTY = new byte[0];
+    private static final MemorySegment EMPTY_MEMORY = MemorySegment.ofArray(EMPTY);
+    /// The writes a new batch has room for: most batches hold one or two.
+    private static final int INITIAL_WRITES = 2;
 
     /// A write of a value under a key.
     public static final byte PUT = 0;
@@ -53,12 +57,13 @@ public final class ArrayWriteBatch implements WriteBatch {
         this.owner = owner;
         this.pool = pool;
         this.keyspaces = keyspaces;
-        this.data = pool.acquire(INITIAL_CAPACITY);
-        this.memory = MemorySegment.ofArray(data);
-        this.kinds = new byte[8];
-        this.targets = new Keyspace<?, ?>[8];
-        this.values = new Object[8];
-        this.spans = new long[8 * 4];
+        // Taken from the pool with the first write, and given back at the commit
+        this.data = EMPTY;
+        this.memory = EMPTY_MEMORY;
+        this.kinds = new byte[INITIAL_WRITES];
+        this.targets = new Keyspace<?, ?>[INITIAL_WRITES];
+        this.values = new Object[INITIAL_WRITES];
+        this.spans = new long[INITIAL_WRITES * 4];
     }
 
     @Override
@@ -142,7 +147,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     private long reserve(long length) {
         var needed = used + length;
         if (needed > data.length) {
-            var capacity = Math.max(needed, (long) data.length * 2);
+            var capacity = Math.max(Math.max(needed, (long) data.length * 2), INITIAL_CAPACITY);
             if (capacity > Integer.MAX_VALUE - 8) {
                 throw new IllegalArgumentException("A batch holds at most 2 GiB");
             }
@@ -261,24 +266,24 @@ public final class ArrayWriteBatch implements WriteBatch {
         memory = MemorySegment.ofArray(data);
     }
 
-    /// Hands the array holding the encodings over to the store and starts the batch again, empty, in the array it had
-    /// before [#compact()], or in a fresh one from the pool.
+    /// Hands the array holding the encodings over to the store and starts the batch again, empty.
     ///
     /// The store reads the writes through the accessors, and [#encodedBytes()], first: the segments the accessors
-    /// returned stay valid, since the batch never writes the detached array again. The array never goes back to the
+    /// returned stay valid, since the batch never writes the detached array again. That array never goes back to the
     /// pool: the versions slicing it keep it until checkpoints have written them and no read needs them, and the
-    /// collector takes it then.
+    /// collector takes it then. The array the batch had before [#compact()] goes back to the pool at once, so a store
+    /// committing small batches takes their memory from the pool rather than from the collector; the batch takes an
+    /// array again with its next write.
     ///
     /// @return the array holding the encodings
     public byte[] detach() {
         var detached = data;
         if (spare != null) {
-            data = spare;
+            pool.release(spare);
             spare = null;
-        } else {
-            data = pool.acquire(INITIAL_CAPACITY);
         }
-        memory = MemorySegment.ofArray(data);
+        data = EMPTY;
+        memory = EMPTY_MEMORY;
         clear();
         return detached;
     }
