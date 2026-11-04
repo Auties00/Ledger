@@ -40,7 +40,7 @@ public class AdHocQueryBenchmark {
     private static final int RESULTS = 50;
 
     /// The engine, by [EngineKind#id()].
-    @Param({"mvstore", "mvstore-encrypted", "rocksdb", "lmdb", "sqlite", "berkeley-je"})
+    @Param({"ledger", "ledger-plain", "mvstore", "mvstore-encrypted", "rocksdb", "lmdb", "sqlite", "berkeley-je"})
     public String engine;
 
     /// Whether values are sealed with AES-GCM before they reach the engine.

@@ -45,7 +45,7 @@ public class WebhookInboxBenchmark {
     public static final int IN_FLIGHT = 64;
 
     /// The engine, by [EngineKind#id()].
-    @Param({"mvstore", "mvstore-encrypted", "rocksdb", "lmdb", "sqlite", "berkeley-je", "floor"})
+    @Param({"ledger", "ledger-plain", "mvstore", "mvstore-encrypted", "rocksdb", "lmdb", "sqlite", "berkeley-je", "floor"})
     public String engine;
 
     /// Whether values are sealed with AES-GCM before they reach the engine.

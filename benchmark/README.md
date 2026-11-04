@@ -6,6 +6,8 @@ JMH workloads that compare Ledger with other embedded storage engines. Some work
 
 | `engine` | What it is | Pure Java |
 |---|---|---|
+| `ledger` | Ledger, encrypting its files with AES-256-GCM: a group-committed log checkpointed into copy-on-write B+trees; sessions and chats resident, the rest paged | yes |
+| `ledger-plain` | The same without encryption | yes |
 | `mvstore` | H2 MVStore 2.5.252, configured as Cobalt's current store configures it | yes |
 | `mvstore-encrypted` | The same, with MVStore's XTS-AES file encryption (not authenticated) | yes |
 | `rocksdb` | RocksDB 11.8.1 through JNI: an LSM tree with a write-ahead log and group commit | no |
@@ -13,8 +15,6 @@ JMH workloads that compare Ledger with other embedded storage engines. Some work
 | `sqlite` | SQLite 3.54 through the xerial driver, WAL mode, one `WITHOUT ROWID` table per key space | no |
 | `berkeley-je` | Berkeley DB Java Edition 18.3.12: a B+tree inside an append-only log, with group commit | yes |
 | `floor` | Not an engine: an append-only file with the index in memory. It bounds what the device charges for the same bytes and forces | yes |
-
-Ledger joins as `ledger` once it exists: one more adapter of `engine.Engine` and one more `EngineKind`.
 
 Every engine gets the same contract (`engine.Engine`):
 - byte-ordered key spaces;
@@ -30,7 +30,7 @@ Durability means the same thing everywhere:
 - **`DEFERRED`**: atomic and visible, and it survives a crash of the process, but not necessarily a power loss.
 - **`DURABLE`**: on stable storage when the call returns.
 
-How each engine implements both levels is documented on its adapter. Cobalt seals everything it stores. Ledger will too, so the Cobalt workloads seal values with AES-GCM (`sealed=true`) before they reach engines that cannot; `-p sealed=false` measures the engines bare.
+How each engine implements both levels is documented on its adapter. Cobalt seals everything it stores, so the Cobalt workloads seal values with AES-GCM (`sealed=true`) before they reach engines that cannot; `ledger` authenticates every frame and page itself and is not sealed again, while `ledger-plain` is. `-p sealed=false` measures the engines bare.
 
 ## Workloads
 
@@ -92,7 +92,8 @@ On GitHub, the Benchmark workflow runs the full suite on Linux, Windows and macO
 
 ## Reading the numbers
 
-- **Results move with the device and the OS.** A force on a consumer NVMe drive costs about a millisecond on Windows and less on Linux, and macOS issues `F_FULLFSYNC`. Compare engines within one machine.
+- **Results move with the device and the OS.** A force on a consumer NVMe drive costs about a millisecond on Windows and less on Linux. Compare engines within one machine.
+- **On macOS, durable writes do not mean the same thing for every engine.** LMDB and RocksDB call `fcntl(F_FULLFSYNC)`, which empties the drive's cache; the Java engines (Ledger, MVStore, Berkeley DB, the floor) force through `FileChannel.force`, which the JDK implements with `fsync` there, leaving the data in the drive's cache. Their durable writes are cheaper on macOS and do not survive every loss of power.
 - **JMH adds the secondary counters up over the measurement iterations.** In JMH's own output and JSON, `bytesWritten`, `payloadBytes`, `sizeOnDisk`, `heapBytes` and `residentBytes` are the sum of the iterations; the workflow summaries divide them back to their value per iteration.
 - **`bytesWritten` is not measured the same way on each OS.** On Windows and Linux it counts the bytes passed to write calls; on macOS, the bytes written to disk. See `support.ProcessProbe`.
 - **`ReopenBenchmark` measures a warm start.** The files it opens were just copied, so they are in the OS page cache.

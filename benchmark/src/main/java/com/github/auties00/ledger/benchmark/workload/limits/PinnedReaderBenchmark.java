@@ -53,7 +53,7 @@ public class PinnedReaderBenchmark {
     private static final int VALUE_SIZE = 512;
 
     /// The engine, by [EngineKind#id()]; Berkeley DB and the floor have no read views.
-    @Param({"mvstore", "rocksdb", "lmdb", "sqlite"})
+    @Param({"ledger", "ledger-plain", "mvstore", "rocksdb", "lmdb", "sqlite"})
     public String engine;
 
     /// Whether a read view stays open while the writes run.

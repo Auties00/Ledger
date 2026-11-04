@@ -50,7 +50,7 @@ public class RandomOverwriteBenchmark {
     private static final int VALUE_SIZE = 256;
 
     /// The engine, by [EngineKind#id()].
-    @Param({"mvstore", "rocksdb", "lmdb", "sqlite", "berkeley-je"})
+    @Param({"ledger", "ledger-plain", "mvstore", "rocksdb", "lmdb", "sqlite", "berkeley-je"})
     public String engine;
 
     /// The entries the store holds.

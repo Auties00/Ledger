@@ -45,7 +45,7 @@ public class ParallelWritersBenchmark {
     private static final int KEYS = 1 << 20;
 
     /// The engine, by [EngineKind#id()].
-    @Param({"mvstore", "rocksdb", "lmdb", "sqlite", "berkeley-je", "floor"})
+    @Param({"ledger", "ledger-plain", "mvstore", "rocksdb", "lmdb", "sqlite", "berkeley-je", "floor"})
     public String engine;
 
     private Corpus corpus;
