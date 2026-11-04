@@ -29,6 +29,15 @@ final class Segments {
         return Byte.compareUnsigned(left.get(ValueLayout.JAVA_BYTE, mismatch), right.get(ValueLayout.JAVA_BYTE, mismatch));
     }
 
+    /// {@return a read-only copy of `segment` in an array of its own}
+    ///
+    /// For a key that outlives the batch it came in: a slice would keep the batch's whole array reachable.
+    static MemorySegment copy(MemorySegment segment) {
+        var array = new byte[(int) segment.byteSize()];
+        MemorySegment.copy(segment, 0, MemorySegment.ofArray(array), 0, array.length);
+        return MemorySegment.ofArray(array).asReadOnly();
+    }
+
     /// {@return `key` encoded into a read-only segment of its own}
     ///
     /// @throws IllegalArgumentException if the key encodes to no bytes or more than [KeyCodec#MAX_LENGTH]

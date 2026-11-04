@@ -838,7 +838,7 @@ public final class LiveLedger implements Ledger {
             var stamp = nextStamp();
             var existed = Reads.exists(state, key, writerPoint(stamp - 1));
             var head = state.entries.get(key);
-            state.entries.put(key, new Version(stamp, value, decoded, head));
+            state.entries.put(head == null ? Segments.copy(key) : key, new Version(stamp, value, decoded, head));
             touched.add(new Touched(state, key));
             if (!existed) {
                 deltas.merge(state, 1L, Long::sum);
@@ -857,7 +857,7 @@ public final class LiveLedger implements Ledger {
                 return;
             }
             var head = state.entries.get(key);
-            state.entries.put(key, new Version(stamp, null, null, head));
+            state.entries.put(head == null ? Segments.copy(key) : key, new Version(stamp, null, null, head));
             touched.add(new Touched(state, key));
             deltas.merge(state, -1L, Long::sum);
             if (pages != null) {

@@ -248,8 +248,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// from the pool.
     ///
     /// The store reads the writes through the accessors, and [#encodedBytes()], first: the segments the accessors
-    /// returned stay valid, since the batch never writes the detached array again. The store returns the array to the
-    /// pool once a checkpoint has written its contents.
+    /// returned stay valid, since the batch never writes the detached array again. The array never goes back to the
+    /// pool: the versions slicing it keep it until checkpoints have written them and no read needs them, and the
+    /// collector takes it then.
     ///
     /// @return the array holding the encodings
     public byte[] detach() {
