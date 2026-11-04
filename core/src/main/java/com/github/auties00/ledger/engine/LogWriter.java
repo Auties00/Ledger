@@ -11,7 +11,9 @@ import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 import java.security.GeneralSecurityException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
@@ -70,6 +72,12 @@ final class LogWriter {
     static final int SALT_OFFSET = 40;
     static final int SALT_BYTES = 16;
     static final int HEADER_CRC_OFFSET = 56;
+    /// The size of the buffer frames are sealed into and written from.
+    private static final int OUTPUT = 1 << 20;
+    /// The bytes of a frame body sealed in one call, a multiple of the AES block.
+    private static final int SLICE = 64 << 10;
+    /// The bytes of frame bodies the queue holds before commits wait for the device.
+    private static final long QUEUE_LIMIT = 64L << 20;
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
@@ -93,16 +101,23 @@ final class LogWriter {
     private FutureTask<LogFiles.Prepared> next;
     private final Cipher cipher;
     private final CRC32C crc;
-    private byte[] output;
-    private byte[] flushing;
+    // The buffer frames are sealed into and written from, a slice at a time whatever their size
+    private final byte[] output;
+    // The bytes of output not written yet
+    private int used;
+    // The emptied queue, which the next swap reuses
+    private ArrayList<Queued> flushing;
     // Written by the flush task only
     private volatile long forces;
     // The segment the flush task writes, for a checkpoint to read
     private volatile long currentSegment;
 
     private final ReentrantLock queueLock;
-    private byte[] queue;
-    private int queued;
+    // Signalled when a group is durable, for the commits waiting on a full queue
+    private final Condition queueDrained;
+    private ArrayList<Queued> queue;
+    // The bytes of the frame bodies queued and not durable yet
+    private long pendingBytes;
     private long lastQueued;
     // Frames queued since the writer opened; a catalog frame carries a sequence already durable, so close() waits on
     // frames rather than on sequences
@@ -144,10 +159,11 @@ final class LogWriter {
             throw new IllegalStateException("AES-GCM is unavailable", exception);
         }
         this.crc = new CRC32C();
-        this.output = new byte[64 * 1024];
-        this.flushing = new byte[64 * 1024];
+        this.output = new byte[OUTPUT];
+        this.flushing = new ArrayList<>();
         this.queueLock = new ReentrantLock();
-        this.queue = new byte[64 * 1024];
+        this.queueDrained = queueLock.newCondition();
+        this.queue = new ArrayList<>();
         this.scheduled = new AtomicBoolean();
         this.waiters = new ConcurrentLinkedQueue<>();
         this.durabilityLock = new ReentrantLock();
@@ -206,9 +222,12 @@ final class LogWriter {
         open(prepared);
     }
 
-    /// Queues a frame holding the first `body.size()` bytes of `body`, copying them.
+    /// Queues a frame holding the first `body.size()` bytes of `body`, which the writer owns from now on.
     ///
-    /// Called with the store's writer lock held, so frames queue in the order of their sequences.
+    /// Called with the store's writer lock held, so frames queue in the order of their sequences. While the queue holds
+    /// more than [#QUEUE_LIMIT] bytes not durable yet, it waits for the device, which holds back every commit behind
+    /// it: memory stays bounded when commits come faster than the device takes them. A frame larger than the limit
+    /// waits for the queue to empty.
     ///
     /// @throws LedgerIoException if the writer has stopped
     void append(byte type, long sequence, FrameBody body) {
@@ -216,14 +235,12 @@ final class LogWriter {
         var length = body.size();
         queueLock.lock();
         try {
-            var needed = queued + 13 + length;
-            if (needed > queue.length) {
-                queue = Arrays.copyOf(queue, Math.max(needed, queue.length * 2));
+            while (pendingBytes > 0 && pendingBytes + length > QUEUE_LIMIT && failure == null) {
+                queueDrained.awaitUninterruptibly();
             }
-            queue[queued] = type;
-            ByteBuffer.wrap(queue, queued + 1, 12).putLong(sequence).putInt(length);
-            System.arraycopy(body.array(), 0, queue, queued + 13, length);
-            queued = needed;
+            checkHealthy();
+            queue.add(new Queued(type, sequence, body));
+            pendingBytes += length;
             lastQueued = sequence;
             appended++;
             appendedBytes += 13 + length;
@@ -251,27 +268,32 @@ final class LogWriter {
                 if (commitWindowNanos > 0) {
                     LockSupport.parkNanos(commitWindowNanos);
                 }
-                byte[] records;
-                int length;
+                ArrayList<Queued> group;
                 long sequence;
                 long frames;
                 queueLock.lock();
                 try {
-                    if (queued == 0) {
+                    if (queue.isEmpty()) {
                         scheduled.set(false);
                         return;
                     }
-                    records = queue;
-                    length = queued;
+                    group = queue;
                     sequence = lastQueued;
                     frames = appended;
                     queue = flushing;
-                    queued = 0;
                 } finally {
                     queueLock.unlock();
                 }
-                write(records, length);
-                flushing = records;
+                var bodies = write(group);
+                group.clear();
+                flushing = group;
+                queueLock.lock();
+                try {
+                    pendingBytes -= bodies;
+                    queueDrained.signalAll();
+                } finally {
+                    queueLock.unlock();
+                }
                 publish(sequence, frames);
             }
         } catch (IOException exception) {
@@ -281,45 +303,36 @@ final class LogWriter {
         }
     }
 
-    private void write(byte[] records, int length) throws IOException {
+    /// Seals and writes `group`, then forces it.
+    ///
+    /// @return the bytes of the frame bodies written
+    private long write(List<Queued> group) throws IOException {
         var start = position;
-        var used = 0;
         var groupStart = true;
-        var offset = 0;
-        while (offset < length) {
-            var type = records[offset];
-            var fields = ByteBuffer.wrap(records, offset + 1, 12);
-            var sequence = fields.getLong();
-            var bodyLength = fields.getInt();
-            var bodyOffset = offset + 13;
+        var bodies = 0L;
+        for (var frame : group) {
+            var bodyLength = frame.body().size();
+            bodies += bodyLength;
             var sealedLength = bodyLength + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
-            var frameLength = FRAME_HEADER + sealedLength;
-            if (position + used + frameLength > segmentSize && position + used > SEGMENT_HEADER) {
-                writeFully(used);
+            if (position + used + FRAME_HEADER + sealedLength > segmentSize && position + used > SEGMENT_HEADER) {
+                drain();
                 force();
                 forces++;
                 closeSegment();
                 rollover();
                 start = position;
-                used = 0;
                 groupStart = true;
             }
-            if (used + frameLength > output.length) {
-                output = Arrays.copyOf(output, Math.max(used + frameLength, output.length * 2));
-            }
-            seal(type, sequence, records, bodyOffset, bodyLength, sealedLength, position + used, used, groupStart);
-            used += frameLength;
+            seal(frame, sealedLength, groupStart);
             groupStart = false;
-            offset = bodyOffset + bodyLength;
         }
         // Zeros to the next block, where the next group starts: a reused file holds older bytes there
         var end = position + used;
-        var padded = (int) ((end + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT - position);
-        if (padded > output.length) {
-            output = Arrays.copyOf(output, padded);
-        }
-        Arrays.fill(output, used, padded, (byte) 0);
-        writeFully(padded);
+        var padding = (int) ((end + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT - end);
+        room(padding);
+        Arrays.fill(output, used, used + padding, (byte) 0);
+        used += padding;
+        drain();
         force();
         forces++;
         this.groupStart = start;
@@ -327,42 +340,87 @@ final class LogWriter {
         if (next == null && position >= segmentSize / 2) {
             prepareNext();
         }
+        return bodies;
     }
 
-    private void seal(byte type, long sequence, byte[] records, int bodyOffset, int bodyLength, int sealedLength,
-                      long frameOffset, int at, boolean groupStart) throws IOException {
+    /// Seals `frame` into the output, writing the output out whenever it fills.
+    ///
+    /// The body goes to the cipher a slice at a time: the frame is the one GCM message a single call would make, and
+    /// the output stays [#OUTPUT] bytes whatever the frame's size.
+    private void seal(Queued frame, int sealedLength, boolean groupStart) throws IOException {
+        room(FRAME_HEADER);
+        var at = used;
+        var frameOffset = position + used;
         var header = ByteBuffer.wrap(output, at, FRAME_HEADER);
-        header.putInt(MAGIC).putInt(sealedLength).putLong(sequence).put(type).put(groupStart ? GROUP_START : 0)
+        header.putInt(MAGIC).putInt(sealedLength).putLong(frame.sequence()).put(frame.type()).put(groupStart ? GROUP_START : 0)
                 .putShort((short) 0).putLong(segmentTag);
         crc.reset();
         crc.update(output, at, FRAME_HEADER - Integer.BYTES);
         header.putInt((int) crc.getValue());
+        used += FRAME_HEADER;
+        var body = frame.body().array();
+        var length = frame.body().size();
         if (cipher != null) {
             try {
                 cipher.init(Cipher.ENCRYPT_MODE, segmentKey, new GCMParameterSpec(TAG_BYTES * 8, nonce(frameOffset)));
+                // The cipher keeps the additional data, so the header may leave the output before the body is sealed
                 cipher.updateAAD(output, at, FRAME_HEADER);
-                Sealing.encrypt(cipher, records, bodyOffset, bodyLength, output, at + FRAME_HEADER);
+                for (var offset = 0; offset < length; ) {
+                    var slice = Math.min(SLICE, length - offset);
+                    room(slice + TAG_BYTES);
+                    used += cipher.update(body, offset, slice, output, used);
+                    offset += slice;
+                }
+                room(2 * TAG_BYTES);
+                used += cipher.doFinal(output, used);
             } catch (GeneralSecurityException exception) {
                 throw new IOException("A log frame could not be sealed", exception);
             }
-        } else {
-            System.arraycopy(records, bodyOffset, output, at + FRAME_HEADER, bodyLength);
-            crc.reset();
-            crc.update(output, at, FRAME_HEADER + bodyLength);
-            ByteBuffer.wrap(output, at + FRAME_HEADER + bodyLength, Integer.BYTES).putInt((int) crc.getValue());
+            return;
         }
+        // Without encryption the CRC covers the header and the body
+        crc.reset();
+        crc.update(output, at, FRAME_HEADER);
+        for (var offset = 0; offset < length; ) {
+            var slice = Math.min(SLICE, length - offset);
+            room(slice);
+            System.arraycopy(body, offset, output, used, slice);
+            crc.update(body, offset, slice);
+            used += slice;
+            offset += slice;
+        }
+        room(Integer.BYTES);
+        ByteBuffer.wrap(output, used, Integer.BYTES).putInt((int) crc.getValue());
+        used += Integer.BYTES;
+    }
+
+    /// Writes the output out if `bytes` more would not fit in it.
+    private void room(int bytes) throws IOException {
+        if (used + bytes > output.length) {
+            drain();
+        }
+    }
+
+    /// Writes the bytes of the output.
+    private void drain() throws IOException {
+        var buffer = ByteBuffer.wrap(output, 0, used);
+        while (buffer.hasRemaining()) {
+            position += channel.write(buffer, position);
+        }
+        used = 0;
+    }
+
+    /// A frame waiting in the queue.
+    ///
+    /// @param type the frame type
+    /// @param sequence the sequence it carries
+    /// @param body its body, which the writer owns
+    private record Queued(byte type, long sequence, FrameBody body) {
     }
 
     /// {@return the GCM nonce of the frame at `offset` of its segment}
     static byte[] nonce(long offset) {
         return ByteBuffer.allocate(12).putInt(0).putLong(offset).array();
-    }
-
-    private void writeFully(int length) throws IOException {
-        var buffer = ByteBuffer.wrap(output, 0, length);
-        while (buffer.hasRemaining()) {
-            position += channel.write(buffer, position);
-        }
     }
 
     private void publish(long sequence, long frames) {
@@ -398,6 +456,12 @@ final class LogWriter {
             durabilityLock.unlock();
         }
         wake(Long.MAX_VALUE);
+        queueLock.lock();
+        try {
+            queueDrained.signalAll();
+        } finally {
+            queueLock.unlock();
+        }
     }
 
     /// {@return whether the commit at `sequence` is durable}
