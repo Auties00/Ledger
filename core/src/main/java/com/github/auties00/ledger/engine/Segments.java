@@ -33,9 +33,17 @@ final class Segments {
     ///
     /// For a key that outlives the batch it came in: a slice would keep the batch's whole array reachable.
     static MemorySegment copy(MemorySegment segment) {
-        var array = new byte[(int) segment.byteSize()];
+        return MemorySegment.ofArray(toBytes(segment)).asReadOnly();
+    }
+
+    /// {@return the bytes of `segment`, in a new array}
+    ///
+    /// `MemorySegment.toArray` does the same, but builds the name of the array class for its size check on every
+    /// call, which costs more than copying a short value.
+    static byte[] toBytes(MemorySegment segment) {
+        var array = new byte[Math.toIntExact(segment.byteSize())];
         MemorySegment.copy(segment, 0, MemorySegment.ofArray(array), 0, array.length);
-        return MemorySegment.ofArray(array).asReadOnly();
+        return array;
     }
 
     /// {@return `key` encoded into a read-only segment of its own}

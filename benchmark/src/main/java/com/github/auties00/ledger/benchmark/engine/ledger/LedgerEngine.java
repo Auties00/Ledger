@@ -15,7 +15,7 @@ import com.github.auties00.ledger.benchmark.support.Directories;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
-import java.lang.foreign.ValueLayout;
+import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
 import java.util.EnumMap;
 import java.util.Locale;
@@ -100,7 +100,7 @@ public final class LedgerEngine implements Engine {
         var visited = new int[1];
         ledger.forEachEncoded(keyspaces.get(keyspace), descending ? range.reversed() : range, (key, value) -> {
             visited[0]++;
-            return visitor.visit(key.toArray(ValueLayout.JAVA_BYTE), value.toArray(ValueLayout.JAVA_BYTE)) && visited[0] < limit;
+            return visitor.visit(bytes(key), bytes(value)) && visited[0] < limit;
         });
         return visited[0];
     }
@@ -127,6 +127,16 @@ public final class LedgerEngine implements Engine {
     @Override
     public void close() {
         ledger.close();
+    }
+
+    /// {@return the bytes of `segment`, in a new array}
+    ///
+    /// `MemorySegment.toArray` would build the name of the array class on every call, a cost the other engines do not
+    /// pay for their arrays.
+    private static byte[] bytes(MemorySegment segment) {
+        var array = new byte[Math.toIntExact(segment.byteSize())];
+        MemorySegment.copy(segment, 0, MemorySegment.ofArray(array), 0, array.length);
+        return array;
     }
 
     /// A read view over a [Snapshot].

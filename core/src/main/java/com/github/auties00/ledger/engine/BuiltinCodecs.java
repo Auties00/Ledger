@@ -17,14 +17,14 @@ public final class BuiltinCodecs {
     public static final KeyCodec<byte[]> BYTES_KEY = new FunctionKeyCodec<>(
             key -> key.length,
             (key, target) -> MemorySegment.copy(key, 0, target, ValueLayout.JAVA_BYTE, 0, key.length),
-            source -> source.toArray(ValueLayout.JAVA_BYTE),
+            Segments::toBytes,
             true);
 
     /// Byte array values.
     public static final ValueCodec<byte[]> BYTES_VALUE = new FunctionValueCodec<>(
             value -> value.length,
             (value, target) -> MemorySegment.copy(value, 0, target, ValueLayout.JAVA_BYTE, 0, value.length),
-            source -> source.toArray(ValueLayout.JAVA_BYTE),
+            Segments::toBytes,
             true);
 
     /// String keys in UTF-8, ordered by code point.
@@ -59,7 +59,7 @@ public final class BuiltinCodecs {
     }
 
     private static String decodeUtf8(MemorySegment source) {
-        return new String(source.toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8);
+        return new String(Segments.toBytes(source), StandardCharsets.UTF_8);
     }
 
     /// Writes `value` into `target` in UTF-8, without an intermediate array; an unpaired surrogate becomes `?`, as

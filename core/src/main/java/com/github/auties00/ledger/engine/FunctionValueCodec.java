@@ -3,7 +3,6 @@ package com.github.auties00.ledger.engine;
 import com.github.auties00.ledger.ValueCodec;
 
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.util.Objects;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
@@ -46,6 +45,6 @@ public record FunctionValueCodec<V>(ToLongFunction<? super V> sizeOf, BiConsumer
 
     /// {@return a read-only copy of `source` on the heap, which nothing else references}
     static MemorySegment copy(MemorySegment source) {
-        return MemorySegment.ofArray(source.toArray(ValueLayout.JAVA_BYTE)).asReadOnly();
+        return Segments.copy(source);
     }
 }
