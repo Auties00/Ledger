@@ -26,8 +26,10 @@ import java.util.function.Consumer;
 /// }
 ///
 /// # Writes
-/// Writes are atomic batches, applied one at a time in the order they are committed; any number of threads may
-/// commit concurrently. A commit is visible to every read that starts after it returns, and durable later:
+/// Writes are atomic batches, ordered by the sequence each commit receives as it arrives; any number of threads may
+/// commit concurrently, holding no lock: batches on different keys apply at the same time, and a batch waits only for
+/// the earlier ones that write its keys, then for its turn to become visible. Transactions and batches with a range
+/// removal run alone, after the commits before them. A commit is visible to every read that starts after it returns, and durable later:
 /// [Commit#awaitDurable()] waits for one commit, [#awaitDurable()] for every commit made so far. Concurrent commits
 /// share the forces that make them durable, so a thousand threads waiting for durability cost the device about as
 /// much as one.
@@ -65,8 +67,9 @@ import java.util.function.Consumer;
 /// write that memory in place, through [java.lang.foreign.MemorySegment] views.
 ///
 /// # Threading
-/// Every method may be called from any thread, virtual threads included. Calls that wait (a commit while the
-/// writer is busy, a wait for durability) park the calling thread without holding a carrier. The store writes and
+/// Every method may be called from any thread, virtual threads included. Calls that wait (a commit behind an earlier
+/// one on its keys or behind a transaction, a wait for durability) spin briefly, then park the calling thread without
+/// holding a carrier. The store writes and
 /// forces its log on the platform threads of its [IoPool], and writes the checkpoints it starts on its own on a
 /// platform thread of their own; a read of a page the cache does not hold reads the file on the calling thread. A
 /// commit writes its large values on the calling thread, and reads the pages of the trees its writes need, which

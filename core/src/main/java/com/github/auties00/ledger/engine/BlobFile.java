@@ -21,7 +21,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /// The file of large values, `ledger.blobs`: values a commit writes once, in units of their own, instead of into its
 /// log frame and again at the next checkpoint.
 ///
-/// A commit seals each of its large values into free pages before it takes the writer lock, and its log frame records
+/// A commit seals each of its large values into free pages before it is given a sequence, and its log frame records
 /// where the unit is; the log forces this file with the segment, in parallel, so a durable commit has durable values.
 /// The checkpoint that holds the commit points its leaf at the unit, with no copy. The file holds no superblock: the
 /// data file's records its free pages, which list as free every unit no checkpoint has taken, since recovery claims

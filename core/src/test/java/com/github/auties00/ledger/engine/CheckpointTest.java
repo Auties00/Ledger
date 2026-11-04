@@ -584,6 +584,55 @@ class CheckpointTest {
     @DisplayName("concurrency")
     class Concurrency {
         @Test
+        @DisplayName("writers racing on the same keys leave every snapshot's count equal to what it reads")
+        void racingCounts(@TempDir Path directory) throws Exception {
+            var values = Keyspace.paged("values", KeyCodec.int64(), LONGS);
+            var options = Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(values)
+                    .checkpointEvery(1 << 20);
+            long size;
+            try (var ledger = options.build()) {
+                var failures = new ConcurrentLinkedQueue<String>();
+                try (var executor = Executors.newThreadPerTaskExecutor(Thread.ofPlatform().daemon().factory())) {
+                    for (var writer = 0; writer < 8; writer++) {
+                        var id = writer;
+                        executor.execute(() -> {
+                            var random = new Random(id);
+                            for (var round = 0; round < 1_500; round++) {
+                                var batch = ledger.newBatch();
+                                // Few keys, so most commits wait on another's write of the same key
+                                for (var i = 0; i < 1 + random.nextInt(4); i++) {
+                                    var key = (long) random.nextInt(24);
+                                    if (random.nextInt(3) == 0) {
+                                        batch.delete(values, key);
+                                    } else {
+                                        batch.put(values, key, (long) round);
+                                    }
+                                }
+                                ledger.commit(batch);
+                                if (round % 50 == 0) {
+                                    try (var snapshot = ledger.snapshot()) {
+                                        var seen = snapshot.range(values, KeyRange.all(), 1_000).size();
+                                        if (seen != snapshot.size(values)) {
+                                            failures.add("writer " + id + " round " + round + " read " + seen + " entries where the count is "
+                                                    + snapshot.size(values));
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+                assertTrue(failures.isEmpty(), () -> String.join(System.lineSeparator(), failures));
+                size = ledger.size(values);
+                assertEquals(size, ledger.range(values, KeyRange.all(), 1_000).size());
+            }
+            try (var ledger = options.build()) {
+                assertEquals(size, ledger.size(values));
+                assertEquals(size, ledger.range(values, KeyRange.all(), 1_000).size());
+            }
+        }
+
+        @Test
         @DisplayName("writers that create keys at once see their commits in scans and counts, across checkpoints")
         void concurrentNewKeys(@TempDir Path directory) throws Exception {
             var values = Keyspace.paged("values", KeyCodec.int64(), LONGS);
