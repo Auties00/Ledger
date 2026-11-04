@@ -40,7 +40,7 @@ final class PageCipher {
         try {
             cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, plain, PageFormat.NONCE, 12));
             cipher.updateAAD(plain, 0, PageFormat.HEADER);
-            cipher.doFinal(plain, PageFormat.HEADER, tag - PageFormat.HEADER, out, offset + PageFormat.HEADER);
+            Sealing.encrypt(cipher, plain, PageFormat.HEADER, tag - PageFormat.HEADER, out, offset + PageFormat.HEADER);
         } catch (GeneralSecurityException exception) {
             throw new IllegalStateException("A unit could not be sealed", exception);
         } finally {

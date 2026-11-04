@@ -1,5 +1,6 @@
 package com.github.auties00.ledger.engine;
 
+import com.github.auties00.ledger.LedgerException;
 import com.github.auties00.ledger.LedgerIoException;
 
 import java.io.IOException;
@@ -7,6 +8,8 @@ import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.Condition;
+import java.util.function.Consumer;
 import java.util.concurrent.locks.ReentrantLock;
 
 /// Writes the checkpoints of a store in a directory.
@@ -32,6 +35,8 @@ import java.util.concurrent.locks.ReentrantLock;
 final class Checkpointer {
     /// The obsolete segments kept for reuse while the store runs; a closed store keeps none.
     private static final int SPARES = 1;
+    /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint.
+    private static final int BACKLOG = 3;
 
     private final LiveLedger ledger;
     private final PageFile pages;
@@ -47,6 +52,12 @@ final class Checkpointer {
     // The log's queued bytes at the last cut
     private volatile long cutBytes;
     private volatile RuntimeException lastFailure;
+    private final Consumer<? super LedgerException> failures;
+    // The log's queued bytes at the cut of the last published checkpoint
+    private volatile long publishedBytes;
+    // Signalled whenever a checkpoint ends, for the commits that wait on one
+    private final ReentrantLock progressLock;
+    private final Condition progress;
     // Set when a superblock write failed: no checkpoint runs again in this open
     private volatile LedgerIoException stopped;
 
@@ -54,7 +65,9 @@ final class Checkpointer {
     ///
     /// @param every the log growth that starts a checkpoint, in bytes
     /// @param number the number of the last durable checkpoint, or 0
-    Checkpointer(LiveLedger ledger, PageFile pages, FreeSpace space, LogWriter log, LogFiles files, long every, long number) {
+    /// @param failures receives the failures of the checkpoints started on their own threads
+    Checkpointer(LiveLedger ledger, PageFile pages, FreeSpace space, LogWriter log, LogFiles files, long every, long number,
+                 Consumer<? super LedgerException> failures) {
         this.ledger = ledger;
         this.pages = pages;
         this.space = space;
@@ -65,6 +78,9 @@ final class Checkpointer {
         this.lock = new ReentrantLock();
         this.scheduled = new AtomicBoolean();
         this.random = new SecureRandom();
+        this.failures = failures;
+        this.progressLock = new ReentrantLock();
+        this.progress = progressLock.newCondition();
     }
 
     /// Starts a checkpoint on a thread of its own if the log has grown enough since the last, and none is running.
@@ -81,10 +97,55 @@ final class Checkpointer {
             } catch (RuntimeException failure) {
                 // The log still holds every commit; the next checkpoint retries
                 lastFailure = failure;
+                report(failure);
             } finally {
                 scheduled.set(false);
+                signalProgress();
             }
         });
+    }
+
+    private void report(RuntimeException failure) {
+        var reported = failure instanceof LedgerException known ? known
+                : new com.github.auties00.ledger.LedgerCorruptedException("A checkpoint found the store inconsistent", failure);
+        try {
+            failures.accept(reported);
+        } catch (RuntimeException _) {
+            // A listener that throws loses its report, not the store
+        }
+    }
+
+    private void signalProgress() {
+        progressLock.lock();
+        try {
+            progress.signalAll();
+        } finally {
+            progressLock.unlock();
+        }
+    }
+
+    /// Makes the caller wait while the log holds more than [#BACKLOG] checkpoint intervals the trees do not, and a
+    /// checkpoint is running to take them in.
+    ///
+    /// It never waits while checkpoints fail: the commits go on, and the log grows until one succeeds.
+    void throttle() {
+        if (log.appendedBytes() - publishedBytes <= BACKLOG * every || lastFailure != null || stopped != null) {
+            return;
+        }
+        maybeStart();
+        progressLock.lock();
+        try {
+            while (log.appendedBytes() - publishedBytes > BACKLOG * every && scheduled.get() && lastFailure == null) {
+                progress.awaitUninterruptibly();
+            }
+        } finally {
+            progressLock.unlock();
+        }
+    }
+
+    /// {@return the bytes of log queued since the cut of the last published checkpoint, which the trees lack}
+    long backlog() {
+        return log.appendedBytes() - publishedBytes;
     }
 
     /// {@return the failure of the last checkpoint started on its own thread, or `null` if it succeeded}
@@ -151,6 +212,8 @@ final class Checkpointer {
                 ledger.readers().unregister(cut.sequence());
             }
             ledger.publish(cut, number, roots, catalog, freeList, freed);
+            publishedBytes = cut.logBytes();
+            signalProgress();
             ledger.pruneCut(cut);
             retire(cut.logStart(), closing ? 0 : SPARES);
             try {

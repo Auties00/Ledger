@@ -161,7 +161,7 @@ record StoreHeader(EncryptionSpec.Kind encryption, int iterations, byte[] storeI
             while (buffer.hasRemaining()) {
                 channel.write(buffer);
             }
-            channel.force(true);
+            FullSync.force(channel, temporary, true);
         }
         Files.move(temporary, directory.resolve(FILE), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         Durability.forceDirectory(directory);

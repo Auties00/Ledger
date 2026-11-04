@@ -32,6 +32,11 @@ import java.util.function.Consumer;
 /// share the forces that make them durable, so a thousand threads waiting for durability cost the device about as
 /// much as one.
 ///
+/// The writes since the last checkpoint stay in memory until the next one. When commits come faster than
+/// checkpoints can write them, and the log holds three checkpoint intervals ([Options#checkpointEvery(long)]) the
+/// files do not, a commit waits for the running checkpoint before it applies: memory stays bounded, at the cost of
+/// throughput.
+///
 /// # Reads
 /// Reads never wait for writes and never see part of a batch. The read methods of this interface read the latest
 /// state, each on its own; a [Snapshot] reads one state for as long as it stays open.
@@ -43,6 +48,11 @@ import java.util.function.Consumer;
 ///
 /// A failed force leaves the store unable to tell which commits reached stable storage, so it stops: every later
 /// commit, and every wait for durability, throws [LedgerIoException]. Reopen the store to recover.
+///
+/// On macOS a force reaches stable storage only when the application grants the store's module native access,
+/// with `--enable-native-access=com.github.auties00.ledger`: the store then empties the drive's cache with
+/// `fcntl(F_FULLFSYNC)`, as the JDK does not. Without it, a durable commit survives a crash of the system, but a loss
+/// of power may take it from the drive's cache.
 ///
 /// # Memory
 /// The store keeps the bytes it encrypts, decrypts and writes on the Java heap, in arrays it recycles: the JDK's
@@ -195,6 +205,17 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// @return these options
         /// @throws IllegalArgumentException if `logBytes` is below 1 MiB
         Options checkpointEvery(long logBytes);
+
+        /// Sends the failures of the work the store does on its own threads to `listener`: a checkpoint it started
+        /// that could not be written.
+        ///
+        /// The store goes on after such a failure, since its log still holds every commit, and its next checkpoint
+        /// retries; until one succeeds the log grows and opening replays more of it. A failure of the log itself stops
+        /// the store instead, and every later commit throws it. Without a listener, these failures are not reported.
+        ///
+        /// @param listener receives each failure on the thread that met it, and must not block for long
+        /// @return these options
+        Options onBackgroundFailure(Consumer<? super LedgerException> listener);
 
         /// Lets a commit wait up to `window` for other commits to join the force it starts.
         ///

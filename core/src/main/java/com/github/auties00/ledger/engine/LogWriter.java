@@ -78,12 +78,16 @@ final class LogWriter {
 
     // Owned by the flush task
     private FileChannel channel;
+    // Empties the drive's cache for the segment on macOS, or null
+    private FullSync.Handle fullSync;
     private long segmentNumber;
     private long position;
     private SecretKeySpec segmentKey;
     private long segmentTag;
     // The end of the last group's frames, before its padding, for tests
     private volatile long groupEnd;
+    // Where the frames of the last group start, for tests
+    private volatile long groupStart;
     // The preparation of the segment after the current one, run on the pool or by the flush task itself
     private FutureTask<LogFiles.Prepared> next;
     private final Cipher cipher;
@@ -156,6 +160,7 @@ final class LogWriter {
     /// Starts writing `segment`.
     private void open(LogFiles.Prepared segment) throws IOException {
         this.channel = FileChannel.open(segment.path(), StandardOpenOption.READ, StandardOpenOption.WRITE);
+        this.fullSync = FullSync.open(segment.path());
         this.segmentNumber = segment.number();
         this.currentSegment = segment.number();
         this.position = SEGMENT_HEADER;
@@ -270,6 +275,7 @@ final class LogWriter {
     }
 
     private void write(byte[] records, int length) throws IOException {
+        var start = position;
         var used = 0;
         var groupStart = true;
         var offset = 0;
@@ -283,10 +289,11 @@ final class LogWriter {
             var frameLength = FRAME_HEADER + sealedLength;
             if (position + used + frameLength > segmentSize && position + used > SEGMENT_HEADER) {
                 writeFully(used);
-                channel.force(false);
+                force();
                 forces++;
-                channel.close();
+                closeSegment();
                 rollover();
+                start = position;
                 used = 0;
                 groupStart = true;
             }
@@ -306,8 +313,9 @@ final class LogWriter {
         }
         Arrays.fill(output, used, padded, (byte) 0);
         writeFully(padded);
-        channel.force(false);
+        force();
         forces++;
+        this.groupStart = start;
         groupEnd = end;
         if (next == null && position >= segmentSize / 2) {
             prepareNext();
@@ -326,7 +334,7 @@ final class LogWriter {
             try {
                 cipher.init(Cipher.ENCRYPT_MODE, segmentKey, new GCMParameterSpec(TAG_BYTES * 8, nonce(frameOffset)));
                 cipher.updateAAD(output, at, FRAME_HEADER);
-                cipher.doFinal(records, bodyOffset, bodyLength, output, at + FRAME_HEADER);
+                Sealing.encrypt(cipher, records, bodyOffset, bodyLength, output, at + FRAME_HEADER);
             } catch (GeneralSecurityException exception) {
                 throw new IOException("A log frame could not be sealed", exception);
             }
@@ -441,6 +449,11 @@ final class LogWriter {
         return groupEnd;
     }
 
+    /// {@return the offset in the current segment where the frames of the last group start, a block boundary}
+    long groupStart() {
+        return groupStart;
+    }
+
     /// {@return the forces made so far}
     long forces() {
         return forces;
@@ -490,10 +503,27 @@ final class LogWriter {
         }
     }
 
+    /// Forces the segment to stable storage, emptying the drive's cache on macOS when it can.
+    private void force() throws IOException {
+        if (fullSync != null) {
+            fullSync.force(channel, false);
+        } else {
+            channel.force(false);
+        }
+    }
+
+    private void closeSegment() throws IOException {
+        if (fullSync != null) {
+            fullSync.close();
+            fullSync = null;
+        }
+        channel.close();
+    }
+
     private void closeChannel() {
         // No flush runs: everything queued is durable, or the writer stopped
         try {
-            channel.close();
+            closeSegment();
         } catch (IOException _) {
             // The data is durable already; nothing to recover from a failed close
         }
