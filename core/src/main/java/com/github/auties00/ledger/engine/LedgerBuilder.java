@@ -6,12 +6,14 @@ import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
 
 import com.github.auties00.ledger.LedgerCorruptedException;
+import com.github.auties00.ledger.LedgerException;
 import com.github.auties00.ledger.LedgerIoException;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.BitSet;
+import java.util.function.Consumer;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -32,6 +34,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private long checkpointEvery;
     private Duration commitWindow;
     private long segmentSize;
+    private Consumer<? super LedgerException> backgroundFailures;
 
     /// Creates a builder with the default options.
     public LedgerBuilder() {
@@ -40,6 +43,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         this.checkpointEvery = 64 * MIB;
         this.commitWindow = Duration.ZERO;
         this.segmentSize = SEGMENT_SIZE;
+        this.backgroundFailures = _ -> {
+        };
     }
 
     /// Sets the size past which the log starts a new segment, so tests can roll segments over without writing
@@ -80,6 +85,12 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     @Override
     public Ledger.Options ioPool(IoPool pool) {
         this.ioPool = Objects.requireNonNull(pool, "pool");
+        return this;
+    }
+
+    @Override
+    public Ledger.Options onBackgroundFailure(Consumer<? super LedgerException> listener) {
+        this.backgroundFailures = Objects.requireNonNull(listener, "listener");
         return this;
     }
 
@@ -176,7 +187,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
                     segmentSize, pool.executor(), commitWindow);
             var checkpointer = new Checkpointer(ledger, pages, space, log, files, checkpointEvery,
-                    superblock == null ? 0 : superblock.number());
+                    superblock == null ? 0 : superblock.number(), backgroundFailures);
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
             } else {

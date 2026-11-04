@@ -138,7 +138,7 @@ final class LogFiles {
                 while (start.hasRemaining()) {
                     channel.write(start, start.position());
                 }
-                channel.force(true);
+                FullSync.force(channel, source, true);
             }
             Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
             Durability.forceDirectory(directory);

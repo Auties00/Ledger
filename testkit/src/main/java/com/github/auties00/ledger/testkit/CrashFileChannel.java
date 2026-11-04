@@ -14,6 +14,7 @@ import java.nio.channels.WritableByteChannel;
 /// A channel on a file or a directory of a [CrashFileSystem]; a channel on a directory reads nothing, and its
 /// [#force(boolean)] makes the namespace changes that touched the directory durable.
 final class CrashFileChannel extends FileChannel {
+    private final CrashFileSystem fileSystem;
     private final Disk disk;
     private final String path;
     private final Disk.FileNode file;
@@ -23,8 +24,9 @@ final class CrashFileChannel extends FileChannel {
     private long position;
 
     /// Creates a channel on `file`, or on the directory at `path` if `file` is `null`.
-    CrashFileChannel(Disk disk, String path, Disk.FileNode file, boolean readable, boolean writable, boolean append) {
-        this.disk = disk;
+    CrashFileChannel(CrashFileSystem fileSystem, String path, Disk.FileNode file, boolean readable, boolean writable, boolean append) {
+        this.fileSystem = fileSystem;
+        this.disk = fileSystem.disk();
         this.path = path;
         this.file = file;
         this.readable = readable;
@@ -74,11 +76,12 @@ final class CrashFileChannel extends FileChannel {
 
     @Override
     public int write(ByteBuffer src) throws IOException {
+        fileSystem.beforeChange(path, ChangeInterceptor.ChangeKind.WRITE);
         synchronized (disk.lock) {
             if (append) {
                 position = file().size;
             }
-            var written = write(src, position);
+            var written = writeAt(src, position);
             position += written;
             return written;
         }
@@ -120,6 +123,7 @@ final class CrashFileChannel extends FileChannel {
 
     @Override
     public FileChannel truncate(long size) throws IOException {
+        fileSystem.beforeChange(path, ChangeInterceptor.ChangeKind.TRUNCATE);
         synchronized (disk.lock) {
             checkOpen();
             if (!writable) {
@@ -133,6 +137,7 @@ final class CrashFileChannel extends FileChannel {
 
     @Override
     public void force(boolean metaData) throws IOException {
+        fileSystem.beforeChange(path, ChangeInterceptor.ChangeKind.FORCE);
         synchronized (disk.lock) {
             checkOpen();
             if (file == null) {
@@ -173,6 +178,13 @@ final class CrashFileChannel extends FileChannel {
 
     @Override
     public int write(ByteBuffer src, long position) throws IOException {
+        fileSystem.beforeChange(path, ChangeInterceptor.ChangeKind.WRITE);
+        synchronized (disk.lock) {
+            return writeAt(src, position);
+        }
+    }
+
+    private int writeAt(ByteBuffer src, long position) throws IOException {
         synchronized (disk.lock) {
             checkOpen();
             if (!writable) {

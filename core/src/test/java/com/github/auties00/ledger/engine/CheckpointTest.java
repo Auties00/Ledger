@@ -9,6 +9,10 @@ import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.Snapshot;
 import com.github.auties00.ledger.ValueCodec;
+import com.github.auties00.ledger.LedgerException;
+import com.github.auties00.ledger.LedgerIoException;
+import com.github.auties00.ledger.testkit.ChangeInterceptor;
+import com.github.auties00.ledger.testkit.CrashFileSystem;
 import com.github.auties00.ledger.View;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -343,6 +347,80 @@ class CheckpointTest {
             try (var ledger = open(directory, MESSAGES)) {
                 assertEquals(4_000, ledger.size(MESSAGES));
                 assertEquals(Optional.of(value + 3999), ledger.get(MESSAGES, "m03999"));
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("work on the store's own threads")
+    class BackgroundWork {
+        private static boolean dataFile(Path path) {
+            return path.getFileName() != null && path.getFileName().toString().equals(PageFile.FILE);
+        }
+
+        @Test
+        @DisplayName("a checkpoint that fails on its own thread is reported, and the store goes on")
+        void reportsFailures() throws Exception {
+            var disk = CrashFileSystem.create();
+            var failing = new AtomicBoolean(true);
+            disk.intercept((path, kind) -> {
+                if (failing.get() && kind == ChangeInterceptor.ChangeKind.WRITE && dataFile(path)) {
+                    throw new IOException("No space left on device");
+                }
+            });
+            var failures = new ConcurrentLinkedQueue<LedgerException>();
+            var directory = disk.getPath("/store");
+            var value = "v".repeat(10_000);
+            try (var ledger = Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(MESSAGES)
+                    .checkpointEvery(1 << 20).onBackgroundFailure(failures::add).build()) {
+                var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+                var written = 0;
+                while (failures.isEmpty() && System.nanoTime() < deadline) {
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "m%05d".formatted(written++), value));
+                    if (written > 300) {
+                        Thread.sleep(10);
+                    }
+                }
+                assertTrue(failures.peek() instanceof LedgerIoException, () -> "reported: " + failures);
+                ledger.commit(ledger.newBatch().put(MESSAGES, "after", "failure")).awaitDurable();
+                failing.set(false);
+                ledger.checkpoint();
+                assertEquals(written + 1, ledger.size(MESSAGES));
+            }
+            try (var ledger = open(directory, MESSAGES)) {
+                assertEquals(Optional.of("failure"), ledger.get(MESSAGES, "after"));
+                assertEquals(Optional.of(value), ledger.get(MESSAGES, "m00000"));
+            }
+        }
+
+        @Test
+        @DisplayName("commits wait for checkpoints slower than they are, so the log the trees lack stays bounded")
+        void backpressure() throws Exception {
+            var disk = CrashFileSystem.create();
+            disk.intercept((path, kind) -> {
+                if (kind == ChangeInterceptor.ChangeKind.WRITE && dataFile(path)) {
+                    try {
+                        Thread.sleep(1);
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+            var every = 1 << 20;
+            var value = "v".repeat(64 << 10);
+            try (var ledger = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY))
+                    .keyspace(MESSAGES).checkpointEvery(every).build()) {
+                var checkpointer = ((LiveLedger) ledger).checkpointer();
+                var largest = 0L;
+                for (var i = 0; i < 200; i++) {
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "m%05d".formatted(i), value));
+                    largest = Math.max(largest, checkpointer.backlog());
+                }
+                // Three intervals, and the commit that found the log just under them
+                var bound = 3L * every + 2L * value.length();
+                var observed = largest;
+                assertTrue(observed <= bound, () -> observed + " bytes of log the trees lacked, past " + bound);
+                assertEquals(200, ledger.size(MESSAGES));
             }
         }
     }

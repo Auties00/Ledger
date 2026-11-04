@@ -51,11 +51,14 @@ public final class CrashFileSystem extends FileSystem {
     private final Disk disk;
     private final CrashFileSystemProvider provider;
     private volatile boolean open;
+    private volatile ChangeInterceptor interceptor;
 
     private CrashFileSystem(Disk disk) {
         this.disk = disk;
         this.provider = new CrashFileSystemProvider(this);
         this.open = true;
+        this.interceptor = (_, _) -> {
+        };
     }
 
     /// {@return a new, empty file system}
@@ -97,6 +100,18 @@ public final class CrashFileSystem extends FileSystem {
         synchronized (disk.lock) {
             disk.stopAtForce(forces);
         }
+    }
+
+    /// Shows every later change to `interceptor` before it is made, replacing the interceptor set before.
+    ///
+    /// @param interceptor sees each change, and may fail or delay it
+    public void intercept(ChangeInterceptor interceptor) {
+        this.interceptor = Objects.requireNonNull(interceptor, "interceptor");
+    }
+
+    /// Runs the interceptor before a change of the entry at `key`.
+    void beforeChange(String key, ChangeInterceptor.ChangeKind kind) throws java.io.IOException {
+        interceptor.beforeChange(CrashPath.parse(this, key), kind);
     }
 
     /// {@return the forces made so far, of files and of directories}

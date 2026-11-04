@@ -183,14 +183,15 @@ class DurableLedgerTest {
         @Test
         @DisplayName("a group that ends just short of a block boundary is followed by the next one")
         void shortPadding(@TempDir Path base) throws Exception {
-            // The size of a segment holding one commit, which grows by one byte per byte of value
+            // The length of a group holding one commit, which grows by one byte per byte of value; groups start on
+            // a block boundary, so the length alone places the group's end
             var probe = base.resolve("probe");
-            var probeSize = loneCommit(probe, 300, false);
-            var boundary = (probeSize / LogWriter.ALIGNMENT + 1) * LogWriter.ALIGNMENT;
-            var length = 300 + (int) (boundary - 10 - probeSize);
+            var probeLength = loneCommit(probe, 300, false);
+            var length = 300 + (int) (LogWriter.ALIGNMENT - 10 - probeLength % LogWriter.ALIGNMENT);
             var directory = base.resolve("store");
-            var size = loneCommit(directory, length, true);
-            assertTrue(size > boundary - LogWriter.FRAME_HEADER && size < boundary, () -> "the group ends at " + size);
+            var groupLength = loneCommit(directory, length, true);
+            var tail = groupLength % LogWriter.ALIGNMENT;
+            assertTrue(tail > LogWriter.ALIGNMENT - LogWriter.FRAME_HEADER, () -> "the group ends " + tail + " bytes into a block");
             try (var ledger = open(directory, NAMES)) {
                 assertEquals(Optional.of("x".repeat(length)), ledger.get(NAMES, "lone"));
                 assertEquals(Optional.of("next"), ledger.get(NAMES, "after"));
@@ -224,14 +225,17 @@ class DurableLedgerTest {
                     .build();
         }
 
-        /// Writes one commit with a value of `length` bytes into a segment of its own and returns where its frames end,
+        /// Writes one commit with a value of `length` bytes in a group of its own and returns the length of its frames,
         /// then, if `next`, commits once more into the same segment.
         private static long loneCommit(Path directory, int length, boolean next) throws Exception {
             open(directory, NAMES).close();
             var ledger = open(directory, NAMES);
             try {
+                // Flushes the catalog frame the open queued, which would otherwise join the group or not by timing
+                ledger.commit(ledger.newBatch().put(NAMES, "warm", "x")).awaitDurable();
                 ledger.commit(ledger.newBatch().put(NAMES, "lone", "x".repeat(length))).awaitDurable();
-                var size = ((LiveLedger) ledger).log().groupEnd();
+                var log = ((LiveLedger) ledger).log();
+                var size = log.groupEnd() - log.groupStart();
                 if (next) {
                     ledger.commit(ledger.newBatch().put(NAMES, "after", "next")).awaitDurable();
                 }

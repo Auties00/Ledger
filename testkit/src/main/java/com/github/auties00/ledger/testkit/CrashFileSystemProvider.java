@@ -79,6 +79,14 @@ final class CrashFileSystemProvider extends FileSystemProvider {
         var write = options.contains(StandardOpenOption.WRITE) || options.contains(StandardOpenOption.APPEND);
         var read = options.contains(StandardOpenOption.READ) || !write;
         var disk = disk();
+        boolean creates;
+        synchronized (disk.lock) {
+            creates = write && disk.node(key) == null
+                    && (options.contains(StandardOpenOption.CREATE) || options.contains(StandardOpenOption.CREATE_NEW));
+        }
+        if (creates) {
+            fileSystem.beforeChange(key, ChangeInterceptor.ChangeKind.CREATE);
+        }
         synchronized (disk.lock) {
             disk.alive();
             var node = disk.node(key);
@@ -86,7 +94,7 @@ final class CrashFileSystemProvider extends FileSystemProvider {
                 if (write) {
                     throw new IOException(key + " is a directory");
                 }
-                return new CrashFileChannel(disk, key, null, true, false, false);
+                return new CrashFileChannel(fileSystem, key, null, true, false, false);
             }
             if (node == null) {
                 if (!write || !(options.contains(StandardOpenOption.CREATE) || options.contains(StandardOpenOption.CREATE_NEW))) {
@@ -102,7 +110,7 @@ final class CrashFileSystemProvider extends FileSystemProvider {
             if (write && options.contains(StandardOpenOption.TRUNCATE_EXISTING) && file.size > 0) {
                 disk.truncate(file, 0);
             }
-            return new CrashFileChannel(disk, key, file, read, write, options.contains(StandardOpenOption.APPEND));
+            return new CrashFileChannel(fileSystem, key, file, read, write, options.contains(StandardOpenOption.APPEND));
         }
     }
 
@@ -134,6 +142,7 @@ final class CrashFileSystemProvider extends FileSystemProvider {
 
     @Override
     public void createDirectory(Path dir, FileAttribute<?>... attrs) throws IOException {
+        fileSystem.beforeChange(cast(dir).key(), ChangeInterceptor.ChangeKind.CREATE);
         var disk = disk();
         synchronized (disk.lock) {
             disk.create(cast(dir).key(), new Disk.DirectoryNode());
@@ -142,6 +151,7 @@ final class CrashFileSystemProvider extends FileSystemProvider {
 
     @Override
     public void delete(Path path) throws IOException {
+        fileSystem.beforeChange(cast(path).key(), ChangeInterceptor.ChangeKind.DELETE);
         var disk = disk();
         synchronized (disk.lock) {
             disk.delete(cast(path).key());
@@ -153,6 +163,7 @@ final class CrashFileSystemProvider extends FileSystemProvider {
         var from = cast(source).key();
         var to = cast(target).key();
         var replace = Arrays.asList(options).contains(StandardCopyOption.REPLACE_EXISTING);
+        fileSystem.beforeChange(from, ChangeInterceptor.ChangeKind.RENAME);
         var disk = disk();
         synchronized (disk.lock) {
             if (!(disk.node(from) instanceof Disk.FileNode file)) {
@@ -176,6 +187,7 @@ final class CrashFileSystemProvider extends FileSystemProvider {
         var to = cast(target).key();
         var replace = Arrays.asList(options).contains(StandardCopyOption.REPLACE_EXISTING)
                 || Arrays.asList(options).contains(StandardCopyOption.ATOMIC_MOVE);
+        fileSystem.beforeChange(from, ChangeInterceptor.ChangeKind.RENAME);
         var disk = disk();
         synchronized (disk.lock) {
             if (!replace && disk.node(to) != null) {

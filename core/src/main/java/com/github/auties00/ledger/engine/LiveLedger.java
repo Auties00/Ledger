@@ -228,6 +228,11 @@ public final class LiveLedger implements Ledger {
         return log;
     }
 
+    /// {@return the checkpointer of a store in a directory, or `null` for a store in memory}
+    Checkpointer checkpointer() {
+        return checkpointer;
+    }
+
     /// {@return the trees of the latest published checkpoint, or `null`}
     TreeVersion tree() {
         return tree;
@@ -348,6 +353,9 @@ public final class LiveLedger implements Ledger {
             return ticket(latest);
         }
         checkNotInTransaction();
+        if (checkpointer != null) {
+            checkpointer.throttle();
+        }
         Commit commit;
         writeLock.lock();
         try {
@@ -394,6 +402,9 @@ public final class LiveLedger implements Ledger {
         Objects.requireNonNull(transaction, "transaction");
         ensureOpen();
         checkNotInTransaction();
+        if (checkpointer != null) {
+            checkpointer.throttle();
+        }
         Commit commit;
         writeLock.lock();
         try {
