@@ -77,7 +77,7 @@ public class AppStateSyncBenchmark {
     @State(Scope.Benchmark)
     public static class SnapshotState {
         /// The engine, by [EngineKind#id()].
-        @Param({"mvstore", "mvstore-encrypted", "rocksdb", "lmdb", "sqlite", "berkeley-je", "floor"})
+        @Param({"ledger", "ledger-plain", "mvstore", "mvstore-encrypted", "rocksdb", "lmdb", "sqlite", "berkeley-je", "floor"})
         public String engine;
 
         /// Whether values are sealed with AES-GCM before they reach the engine.
@@ -114,7 +114,7 @@ public class AppStateSyncBenchmark {
     @State(Scope.Benchmark)
     public static class PatchState {
         /// The engine, by [EngineKind#id()].
-        @Param({"mvstore", "mvstore-encrypted", "rocksdb", "lmdb", "sqlite", "berkeley-je", "floor"})
+        @Param({"ledger", "ledger-plain", "mvstore", "mvstore-encrypted", "rocksdb", "lmdb", "sqlite", "berkeley-je", "floor"})
         public String engine;
 
         /// Whether values are sealed with AES-GCM before they reach the engine.

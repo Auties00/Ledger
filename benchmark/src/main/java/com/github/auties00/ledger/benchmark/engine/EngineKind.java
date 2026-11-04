@@ -2,6 +2,7 @@ package com.github.auties00.ledger.benchmark.engine;
 
 import com.github.auties00.ledger.benchmark.engine.floor.AppendLogFloor;
 import com.github.auties00.ledger.benchmark.engine.je.BerkeleyJeEngine;
+import com.github.auties00.ledger.benchmark.engine.ledger.LedgerEngine;
 import com.github.auties00.ledger.benchmark.engine.lmdb.LmdbEngine;
 import com.github.auties00.ledger.benchmark.engine.mvstore.MvStoreEngine;
 import com.github.auties00.ledger.benchmark.engine.rocksdb.RocksDbEngine;
@@ -15,6 +16,21 @@ import java.util.stream.Collectors;
 
 /// The engines a workload can run against, by the name its `engine` parameter takes.
 public enum EngineKind {
+    /// Ledger, encrypting its files with AES-256-GCM: a log of commits checkpointed into copy-on-write B+trees. It
+    /// authenticates every frame and page itself, so the workloads do not seal its values again.
+    LEDGER("ledger", false, true) {
+        @Override
+        public Engine open(Path directory, EngineSettings settings) {
+            return LedgerEngine.open(directory, settings, true);
+        }
+    },
+    /// Ledger without encryption, which the workloads seal like the other engines when they seal values.
+    LEDGER_PLAIN("ledger-plain", false) {
+        @Override
+        public Engine open(Path directory, EngineSettings settings) {
+            return LedgerEngine.open(directory, settings, false);
+        }
+    },
     /// H2 MVStore, the engine under Cobalt's current store: a copy-on-write B-tree written as append-only chunks.
     MVSTORE("mvstore", false) {
         @Override
@@ -68,10 +84,22 @@ public enum EngineKind {
 
     private final String id;
     private final boolean nativeCode;
+    private final boolean sealsItself;
 
     EngineKind(String id, boolean nativeCode) {
+        this(id, nativeCode, false);
+    }
+
+    EngineKind(String id, boolean nativeCode, boolean sealsItself) {
         this.id = id;
         this.nativeCode = nativeCode;
+        this.sealsItself = sealsItself;
+    }
+
+    /// {@return whether the engine encrypts and authenticates what it stores, so sealing its values again would only
+    /// add the cost of a second seal}
+    public boolean sealsItself() {
+        return sealsItself;
     }
 
     /// Opens the engine over `directory`, creating its files when the directory is empty.

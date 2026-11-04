@@ -211,7 +211,7 @@ public final class Stores {
     /// @throws IOException if the engine fails to open
     public static Engine openAt(EngineKind kind, Path directory, EngineSettings settings, boolean sealed) throws IOException {
         var engine = kind.open(directory, settings);
-        return sealed ? new SealedEngine(engine) : engine;
+        return sealed && !kind.sealsItself() ? new SealedEngine(engine) : engine;
     }
 
     /// An open engine and the directory it owns.

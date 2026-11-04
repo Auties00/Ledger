@@ -45,7 +45,7 @@ class EngineConformanceTest {
 
     private static Engine open(EngineKind kind, boolean sealed, Path directory) throws IOException {
         var engine = kind.open(directory, EngineSettings.DEFAULT);
-        return sealed ? new SealedEngine(engine) : engine;
+        return sealed && !kind.sealsItself() ? new SealedEngine(engine) : engine;
     }
 
     private static List<String> scan(Engine engine, byte[] from, byte[] to, boolean descending, int limit) throws IOException {

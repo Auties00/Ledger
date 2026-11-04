@@ -43,7 +43,7 @@ public class LargeValueBenchmark {
     public static final int SLOTS = 8;
 
     /// The engine, by [EngineKind#id()].
-    @Param({"mvstore", "rocksdb", "lmdb", "sqlite", "berkeley-je", "floor"})
+    @Param({"ledger", "ledger-plain", "mvstore", "rocksdb", "lmdb", "sqlite", "berkeley-je", "floor"})
     public String engine;
 
     /// The size of each value.
