@@ -11,8 +11,10 @@ import java.util.Arrays;
 import java.util.Map;
 import java.util.Objects;
 
-/// A [WriteBatch] that encodes into one growing array from its store's [HeapPool] and records each write as offsets
-/// into it.
+/// A [WriteBatch] that encodes into one growing array and records each write as offsets into it.
+///
+/// A batch's first array has the size of its first write, which a batch of one write, the usual one, keeps as is; the
+/// array grows by doubling, and from [#INITIAL_CAPACITY] it comes from the store's [HeapPool].
 ///
 /// A range removal stores its bounds, each encoded or absent; the store reads them back through the accessors of
 /// this class when it applies the batch, then takes the array over with [#detach()].
@@ -37,6 +39,8 @@ public final class ArrayWriteBatch implements WriteBatch {
     private final Map<String, Keyspace<?, ?>> keyspaces;
     private byte[] data;
     private MemorySegment memory;
+    // A read-only view of memory, which the accessors slice: one object per slice, not two
+    private MemorySegment view;
     private long used;
     // The batch's own array while the encodings are in a compact copy for the store, or null
     private byte[] spare;
@@ -60,6 +64,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         // Taken from the pool with the first write, and given back at the commit
         this.data = EMPTY;
         this.memory = EMPTY_MEMORY;
+        this.view = EMPTY_MEMORY;
         this.kinds = new byte[INITIAL_WRITES];
         this.targets = new Keyspace<?, ?>[INITIAL_WRITES];
         this.values = new Object[INITIAL_WRITES];
@@ -72,9 +77,10 @@ public final class ArrayWriteBatch implements WriteBatch {
         Objects.requireNonNull(value, "value");
         var keyLength = checkKeyLength(keyspace.keys().sizeOf(Objects.requireNonNull(key, "key")));
         var valueLength = checkValueLength(keyspace.values().sizeOf(value));
-        var keyOffset = reserve(keyLength);
+        // One reservation for both, so a batch of one write grows its array once
+        var keyOffset = reserve(keyLength + valueLength);
+        var valueOffset = keyOffset + keyLength;
         keyspace.keys().encode(key, memory.asSlice(keyOffset, keyLength));
-        var valueOffset = reserve(valueLength);
         keyspace.values().encode(value, memory.asSlice(valueOffset, valueLength));
         add(PUT, keyspace, keyspace.residency() == Keyspace.Residency.RESIDENT ? value : null,
                 keyOffset, keyLength, valueOffset, valueLength);
@@ -86,9 +92,9 @@ public final class ArrayWriteBatch implements WriteBatch {
         checkOpened(keyspace);
         var keyLength = checkKeyLength(key.byteSize());
         var valueLength = checkValueLength(value.byteSize());
-        var keyOffset = reserve(keyLength);
+        var keyOffset = reserve(keyLength + valueLength);
+        var valueOffset = keyOffset + keyLength;
         MemorySegment.copy(key, 0, memory, keyOffset, keyLength);
-        var valueOffset = reserve(valueLength);
         MemorySegment.copy(value, 0, memory, valueOffset, valueLength);
         add(PUT, keyspace, null, keyOffset, keyLength, valueOffset, valueLength);
         return this;
@@ -147,15 +153,18 @@ public final class ArrayWriteBatch implements WriteBatch {
     private long reserve(long length) {
         var needed = used + length;
         if (needed > data.length) {
-            var capacity = Math.max(Math.max(needed, (long) data.length * 2), INITIAL_CAPACITY);
+            var capacity = Math.max(needed, (long) data.length * 2);
             if (capacity > Integer.MAX_VALUE - 8) {
                 throw new IllegalArgumentException("A batch holds at most 2 GiB");
             }
-            var grown = pool.acquire((int) capacity);
+            // Below the pool's smallest array, an array of the size the batch needs: the store keeps it without the
+            // copy compact() would make. The pool takes back only its own sizes, so it ignores these arrays
+            var grown = capacity < INITIAL_CAPACITY ? new byte[(int) capacity] : pool.acquire((int) capacity);
             System.arraycopy(data, 0, grown, 0, (int) used);
             pool.release(data);
             data = grown;
             memory = MemorySegment.ofArray(data);
+            view = memory.asReadOnly();
         }
         var offset = used;
         used = needed;
@@ -238,7 +247,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     private MemorySegment span(int index, int field) {
         Objects.checkIndex(index, size);
         var offset = spans[index * 4 + field];
-        return offset == ABSENT ? null : memory.asSlice(offset, spans[index * 4 + field + 1]).asReadOnly();
+        return offset == ABSENT ? null : view.asSlice(offset, spans[index * 4 + field + 1]);
     }
 
     /// {@return the store that created the batch}
@@ -264,6 +273,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         spare = data;
         data = Arrays.copyOf(data, (int) used);
         memory = MemorySegment.ofArray(data);
+        view = memory.asReadOnly();
     }
 
     /// Hands the array holding the encodings over to the store and starts the batch again, empty.
@@ -284,6 +294,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         }
         data = EMPTY;
         memory = EMPTY_MEMORY;
+        view = EMPTY_MEMORY;
         clear();
         return detached;
     }
