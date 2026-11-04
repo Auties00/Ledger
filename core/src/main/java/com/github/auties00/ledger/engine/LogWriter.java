@@ -26,7 +26,7 @@ import java.util.zip.CRC32C;
 
 /// Appends frames to the log and makes them durable in groups.
 ///
-/// Commits queue their frames in order, under the store's writer lock. One flush task at a time, on the store's
+/// Commits queue their frames in order, holding the store's publishing role. One flush task at a time, on the store's
 /// [com.github.auties00.ledger.IoPool], takes everything queued, seals the frames, writes them with one call, forces
 /// the segment once and wakes the commits waiting for any of them: commits that arrive while a force runs make the
 /// next group, so concurrent commits share forces. Each group is padded with zeros to a multiple of [#ALIGNMENT], where
@@ -229,7 +229,7 @@ final class LogWriter {
 
     /// Queues a frame holding the first `body.size()` bytes of `body`, which the writer owns from now on.
     ///
-    /// Called with the store's writer lock held, so frames queue in the order of their sequences. While the queue holds
+    /// Called holding the store's publishing role, so frames queue in the order of their sequences. While the queue holds
     /// more than [#QUEUE_LIMIT] bytes not durable yet, it waits for the device, which holds back every commit behind
     /// it: memory stays bounded when commits come faster than the device takes them. A frame larger than the limit
     /// waits for the queue to empty.
@@ -270,6 +270,39 @@ final class LogWriter {
             executor.execute(this::flush);
         }
         return frames;
+    }
+
+    /// Queues the frames of `batch`, in its order, as [#append(byte, long, FrameBody, long)] queues each, and empties
+    /// it: one hold of the queue lock for a whole pass of the store's publisher.
+    ///
+    /// The batch waits on a full queue as one frame of its total size would. Either every frame is queued or, if the
+    /// writer has stopped, none is.
+    ///
+    /// @throws LedgerIoException if the writer has stopped
+    void appendAll(Batch batch) {
+        if (batch.frames.isEmpty()) {
+            return;
+        }
+        checkHealthy();
+        queueLock.lock();
+        try {
+            while (pendingBytes > 0 && pendingBytes + batch.bodyBytes > QUEUE_LIMIT && failure == null) {
+                queueDrained.awaitUninterruptibly();
+            }
+            checkHealthy();
+            queue.addAll(batch.frames);
+            pendingBytes += batch.bodyBytes;
+            lastQueued = batch.frames.getLast().sequence();
+            appended += batch.frames.size();
+            appendedBytes += batch.appendedBytes;
+            queuedUnits |= batch.units;
+        } finally {
+            queueLock.unlock();
+            batch.clear();
+        }
+        if (scheduled.compareAndSet(false, true)) {
+            executor.execute(this::flush);
+        }
     }
 
     /// Makes `blobs` the file of large values the commits write units to, which the groups force.
@@ -494,6 +527,38 @@ final class LogWriter {
     /// @param sequence the sequence it carries
     /// @param body its body, which the writer owns
     private record Queued(byte type, long sequence, FrameBody body) {
+    }
+
+    /// The frames of consecutive commits, which [#appendAll(Batch)] queues together; the publisher of a store reuses
+    /// one across its passes.
+    static final class Batch {
+        private final ArrayList<Queued> frames;
+        // The bytes of the bodies, which count toward the queue's limit
+        private long bodyBytes;
+        // The bytes that count toward appendedBytes: headers, bodies and units
+        private long appendedBytes;
+        // Whether a commit of the batch wrote a unit of the file of large values
+        private boolean units;
+
+        Batch() {
+            this.frames = new ArrayList<>();
+        }
+
+        /// Adds a frame, which the writer owns once queued, for a commit that wrote `unitBytes` of units.
+        void add(byte type, long sequence, FrameBody body, long unitBytes) {
+            frames.add(new Queued(type, sequence, body));
+            bodyBytes += body.size();
+            appendedBytes += 13 + body.size() + unitBytes;
+            units |= unitBytes > 0;
+        }
+
+        /// Forgets every frame.
+        void clear() {
+            frames.clear();
+            bodyBytes = 0;
+            appendedBytes = 0;
+            units = false;
+        }
     }
 
     /// {@return the GCM nonce of the frame at `offset` of its segment}

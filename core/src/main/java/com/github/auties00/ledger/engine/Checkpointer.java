@@ -18,7 +18,7 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /// Writes the checkpoints of a store in a directory.
 ///
-/// A checkpoint takes, under the writer lock, the keys written since the last one and the range removals since, as
+/// A checkpoint takes, holding the publishing role, the keys written since the last one and the range removals since, as
 /// of the latest sequence ([LiveLedger#cutCheckpoint]); then, while commits go on, it applies them to the trees copy
 /// on write ([TreeUpdate]), writes the catalog and the free list, forces the file, writes the superblock the last one
 /// did not use and forces it. Only then are the new trees published, the log segments before the cut retired and the
@@ -282,7 +282,7 @@ final class Checkpointer {
         var treeBound = cut.base() == null ? -1 : Reads.boundOf(cut.base().sequence);
         for (var keyspace : cut.keyspaces()) {
             var state = keyspace.state();
-            // Listed in the order of their writes, off the writer lock: sorted here, on every processor
+            // Listed in the order of their writes, off the publishing role: sorted here, on every processor
             var chains = keyspace.dirty().toArray(Chain[]::new);
             Arrays.parallelSort(chains, Chain.BY_KEY);
             var ops = new ArrayList<TreeUpdate.Op>(chains.length);

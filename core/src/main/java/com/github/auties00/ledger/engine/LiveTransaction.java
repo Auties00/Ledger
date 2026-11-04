@@ -15,7 +15,8 @@ import java.util.function.Function;
 
 /// A [Transaction] of a [LiveLedger].
 ///
-/// It runs holding the writer lock and applies each write at once under a sequence no reader sees yet; its own reads
+/// It runs alone, holding the sequencing and publishing roles once every commit given a sequence has published, and
+/// applies each write at once under a sequence no reader sees yet; its own reads
 /// use that sequence's bound, so they see the latest commit and the transaction's writes so far. Every key and value
 /// is encoded into memory of its own, which stays valid once the transaction publishes.
 final class LiveTransaction implements Transaction {
