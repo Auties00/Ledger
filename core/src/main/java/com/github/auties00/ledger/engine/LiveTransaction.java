@@ -7,7 +7,6 @@ import com.github.auties00.ledger.Transaction;
 import com.github.auties00.ledger.ValueCodec;
 
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -104,8 +103,8 @@ final class LiveTransaction implements Transaction {
         if (value.byteSize() > ValueCodec.MAX_LENGTH) {
             throw new IllegalArgumentException("Values are at most " + ValueCodec.MAX_LENGTH + " bytes: " + value.byteSize());
         }
-        var ownKey = MemorySegment.ofArray(key.toArray(ValueLayout.JAVA_BYTE)).asReadOnly();
-        var ownValue = MemorySegment.ofArray(value.toArray(ValueLayout.JAVA_BYTE)).asReadOnly();
+        var ownKey = Segments.copy(key);
+        var ownValue = Segments.copy(value);
         applier.put(state, ownKey, ownValue, state.resident ? keyspace.values().decode(ownValue) : null);
         return this;
     }

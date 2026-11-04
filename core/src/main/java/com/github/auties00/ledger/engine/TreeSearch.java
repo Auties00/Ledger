@@ -32,10 +32,17 @@ final class TreeSearch {
 
     /// {@return the read-only value of leaf entry `entry` of `unit`, read from its blob if it has one}
     static MemorySegment value(PageFile pages, byte[] unit, int entry) {
+        return value(pages, unit, entry, true);
+    }
+
+    /// {@return the read-only value of leaf entry `entry` of `unit`, read from its blob if it has one}
+    ///
+    /// @param cached whether a blob read from the file goes to the cache
+    static MemorySegment value(PageFile pages, byte[] unit, int entry, boolean cached) {
         if (!TreeNodes.isBlob(unit, entry)) {
             return TreeNodes.inlineValue(unit, entry);
         }
-        var blob = pages.read(TreeNodes.blobRef(unit, entry), PageFormat.VALUE, true);
+        var blob = pages.read(TreeNodes.blobRef(unit, entry), PageFormat.VALUE, cached);
         return MemorySegment.ofArray(blob).asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry)).asReadOnly();
     }
 
