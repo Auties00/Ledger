@@ -3,11 +3,14 @@ package com.github.auties00.ledger.engine;
 import com.github.auties00.ledger.Keyspace;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.NavigableMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 
 /// The entries of one key space in memory: a version chain per key, the range removals readers may still need, and
@@ -20,6 +23,11 @@ import java.util.function.LongSupplier;
 /// The chains of the keys are in two maps: an ordered one for scans, and a hash index for lookups of one key, which
 /// at a million keys costs a fraction of a walk down the ordered one. A chain enters the index first, then the ordered
 /// map, and leaves them in the same order.
+///
+/// A paged key space of a store in a directory orders its chains lazily: a new chain is only listed, and the reads of
+/// a range order the listed ones before they walk the map ([#slice]). Its chains leave memory once a checkpoint takes
+/// them, so with no read of a range in between, as when a store takes writes it does not scan, the walk down the map
+/// to insert each new key, and the one to remove it, are never paid; a commit that wrote a new key paid both.
 ///
 /// Readers use it concurrently with the commits. Commits create chains before they are given a sequence; everything
 /// else changes only under it.
@@ -49,6 +57,24 @@ final class KeyspaceState {
     private long dirtyCut;
     // The bytes from which a value a batch puts goes to the file of large values, set while the store opens
     long largeValues = Long.MAX_VALUE;
+    // Whether the key space orders its chains lazily, set while the store opens, before any chain is opened
+    boolean lazy;
+    // The chains opened and not yet ordered, newest first, linked through Chain.nextUnordered
+    @SuppressWarnings("unused")
+    private volatile Chain unordered;
+    // Held while the listed chains are ordered or pruned, so a read of a range that finds the list empty waits for
+    // the chains another thread took from it
+    private final ReentrantLock ordering;
+
+    private static final VarHandle UNORDERED;
+
+    static {
+        try {
+            UNORDERED = MethodHandles.lookup().findVarHandle(KeyspaceState.class, "unordered", Chain.class);
+        } catch (ReflectiveOperationException exception) {
+            throw new ExceptionInInitializerError(exception);
+        }
+    }
 
     KeyspaceState(Keyspace<?, ?> keyspace) {
         this.keyspace = keyspace;
@@ -61,12 +87,18 @@ final class KeyspaceState {
         this.counts = new ConcurrentSkipListMap<>();
         this.blind = new BlindWrites();
         this.dirty = new ArrayList<>();
+        this.ordering = new ReentrantLock();
         counts.put(0L, 0L);
     }
 
     /// {@return the chain of `key`, or `null` if memory holds none}
     Chain chain(MemorySegment key) {
         return index.get(new IndexKey(key, Segments.hash(key)));
+    }
+
+    /// {@return the chains memory holds, ordered or not}
+    int chains() {
+        return index.size();
     }
 
     /// {@return the newest version of `key` in memory, or `null`}
@@ -93,12 +125,94 @@ final class KeyspaceState {
             chain = index.putIfAbsent(new IndexKey(created.key, hash), created);
             if (chain == null) {
                 chain = created;
+                if (lazy) {
+                    list(created);
+                    return created;
+                }
             }
         }
-        if (!chain.ordered) {
+        if (!lazy && !chain.ordered) {
             order(chain);
         }
         return chain;
+    }
+
+    /// Lists `chain` among those a read of a range orders first.
+    private void list(Chain chain) {
+        while (true) {
+            var head = unordered;
+            chain.nextUnordered = head;
+            if (UNORDERED.compareAndSet(this, head, chain)) {
+                return;
+            }
+        }
+    }
+
+    /// Orders every listed chain that is not dropped, so the ordered map holds every chain a read of a range may need;
+    /// safe for concurrent use.
+    private void orderListed() {
+        // Both read in this order: a thread that takes the list holds the lock until it ordered what it took
+        if (unordered == null && !ordering.isLocked()) {
+            return;
+        }
+        ordering.lock();
+        try {
+            var chain = (Chain) UNORDERED.getAndSet(this, null);
+            while (chain != null) {
+                var next = chain.nextUnordered;
+                chain.nextUnordered = null;
+                order(chain);
+                chain = next;
+            }
+        } finally {
+            ordering.unlock();
+        }
+    }
+
+    /// Takes the dropped chains off the list, once a checkpoint dropped most of those it holds, and orders the chains
+    /// a prune left that no commit wrote since `cut`, so the sweep, which walks the ordered map, shortens them; safe
+    /// for concurrent use.
+    ///
+    /// @param cut the number of the cut whose keys the prune went through, as [#markDirty] gave it to the chains
+    void pruneListed(long cut) {
+        if (unordered == null) {
+            return;
+        }
+        ordering.lock();
+        try {
+            var chain = (Chain) UNORDERED.getAndSet(this, null);
+            Chain first = null;
+            Chain last = null;
+            while (chain != null) {
+                var next = chain.nextUnordered;
+                chain.nextUnordered = null;
+                if (!chain.dropped && !chain.released()) {
+                    // A plain read off the publishing role: a chain marked meanwhile is only ordered early
+                    if (chain.dirtyCut <= cut) {
+                        order(chain);
+                    } else {
+                        if (first == null) {
+                            first = chain;
+                        } else {
+                            last.nextUnordered = chain;
+                        }
+                        last = chain;
+                    }
+                }
+                chain = next;
+            }
+            if (first != null) {
+                while (true) {
+                    var head = unordered;
+                    last.nextUnordered = head;
+                    if (UNORDERED.compareAndSet(this, head, first)) {
+                        break;
+                    }
+                }
+            }
+        } finally {
+            ordering.unlock();
+        }
     }
 
     /// Inserts `chain` into the ordered map, in place of a dropped chain of the same key, unless it is dropped.
@@ -108,7 +222,7 @@ final class KeyspaceState {
         while (!chain.dropped && !chain.released()) {
             var previous = entries.putIfAbsent(chain.key, chain);
             if (previous == null || previous == chain) {
-                chain.ordered = true;
+                inserted(chain);
                 return;
             }
             // A chain being dropped is released before it is marked dropped
@@ -120,7 +234,7 @@ final class KeyspaceState {
                 throw new IllegalStateException("Two chains hold one key of " + keyspace.name());
             }
             if (entries.replace(chain.key, previous, chain)) {
-                chain.ordered = true;
+                inserted(chain);
                 return;
             }
         }
@@ -160,7 +274,19 @@ final class KeyspaceState {
         chain.dropped = true;
         chain.head = null;
         index.remove(new IndexKey(chain.key, chain.hash), chain);
-        leaving.add(chain);
+        // Read after the store above, as [#inserted] reads the flag after its own store: one of them takes it out
+        if (chain.ordered) {
+            leaving.add(chain);
+        }
+    }
+
+    /// Records that the ordered map holds `chain`, and takes it out again if it was dropped meanwhile, unseen by
+    /// [#empty], which lists for removal only the chains it finds ordered.
+    private void inserted(Chain chain) {
+        chain.ordered = true;
+        if (chain.dropped) {
+            entries.remove(chain.key, chain);
+        }
     }
 
     /// Takes up to `limit` of the dropped chains out of the ordered map; safe for concurrent use.
@@ -192,6 +318,13 @@ final class KeyspaceState {
             chain.dirtyCut = dirtyCut;
             dirty.add(chain);
         }
+    }
+
+    /// {@return the number [#markDirty] gives the chains it lists, the cut's that [#cutDirty()] takes next}
+    ///
+    /// Called holding the publishing role.
+    long dirtyNumber() {
+        return dirtyCut;
     }
 
     /// {@return the chains written since the last cut, and starts listing those of the next one}
@@ -255,7 +388,10 @@ final class KeyspaceState {
     }
 
     /// {@return the chains between `from`, included, and `to`, excluded, either `null` for no bound}
+    ///
+    /// It orders the listed chains first, so the map holds every chain a read of the range may need.
     NavigableMap<MemorySegment, Chain> slice(MemorySegment from, MemorySegment to) {
+        orderListed();
         if (from != null && to != null) {
             return Segments.compare(from, to) >= 0 ? entries.subMap(from, true, from, false) : entries.subMap(from, true, to, false);
         }
