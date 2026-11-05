@@ -170,12 +170,12 @@ final class PageFile implements AutoCloseable {
             return hit;
         }
         if (ref.isRecord()) {
-            var leaf = DeltaLeaves.materialize(ref, (unit, unitKind) -> read(unit, unitKind, cached));
+            var leaf = DeltaLeaves.materialize(ref, (unit, unitKind) -> read(unit, unitKind, cached, referenced));
             if (!kindMatches(leaf[PageFormat.KIND], kind)) {
                 throw new LedgerCorruptedException(path + " holds a delta record where a branch belongs, at page " + ref.page(), null);
             }
             if (cached) {
-                cache.put(ref, leaf, true);
+                cache.put(ref, leaf, referenced);
             }
             return leaf;
         }

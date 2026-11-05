@@ -9,10 +9,10 @@ import java.util.Arrays;
 /// climbs it to reach the next leaf.
 ///
 /// The first [#ADMITTED] leaves and blobs a cursor reads go to the page cache; past them it reads through the cache,
-/// using the units the cache holds and adding the leaves only while the cache has room for them, as entries the cache
+/// using the units the cache holds and adding the others only while the cache has room for them, as entries the cache
 /// evicts before any other. A long scan reads each unit once, so caching what it reads would only evict the units
 /// other reads use: the PostgreSQL buffer manager holds a large sequential scan to a small ring for the same reason. A
-/// cache with room evicts nothing to take the leaves, and keeps a key space small enough to fit for the next scan.
+/// cache with room evicts nothing to take them, and keeps a key space small enough to fit for the next scan.
 final class TreeCursor {
     /// The leaves and blobs a cursor adds to the page cache, enough for the pages of a chat a reader scrolls through.
     static final int ADMITTED = 64;
@@ -145,7 +145,14 @@ final class TreeCursor {
 
     /// {@return the value of the current entry, read-only, read from its blob if it has one}
     MemorySegment value() {
-        return TreeSearch.value(pages, leaf, entry, !TreeNodes.isInline(leaf, entry) && admit());
+        if (TreeNodes.isInline(leaf, entry)) {
+            return TreeNodes.inlineValue(leaf, entry);
+        }
+        if (admit()) {
+            return TreeSearch.value(pages, leaf, entry, true);
+        }
+        var bytes = (long) PageFormat.pagesFor(TreeNodes.blobLength(leaf, entry)) * PageFormat.SIZE;
+        return TreeSearch.value(pages, leaf, entry, pages.cache().hasRoom(bytes), false);
     }
 
     /// {@return child `index` of the branch `parent`, read through the cache}
