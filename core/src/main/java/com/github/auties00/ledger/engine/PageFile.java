@@ -208,7 +208,7 @@ final class PageFile implements AutoCloseable {
         var next = -1;
         for (var index : order) {
             var ref = refs.get(index);
-            var alone = cache.get(ref) != null;
+            var alone = ref.isRecord() || cache.get(ref) != null;
             if (!run.isEmpty() && (alone || ref.page() != next || runPages + ref.pages() > RUN_PAGES)) {
                 runs.add(run.stream().mapToInt(Integer::intValue).toArray());
                 run.clear();
