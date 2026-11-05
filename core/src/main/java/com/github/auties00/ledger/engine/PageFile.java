@@ -11,10 +11,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.TreeMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 
 /// The data file of a store: its units, read through the page cache and verified against the reference that named
@@ -25,8 +29,9 @@ import java.util.stream.IntStream;
 /// on the one thread that writes a checkpoint, through a [Writer].
 final class PageFile implements AutoCloseable {
     static final String FILE = "ledger.data";
-    /// The reads of the file that run at once, each on a channel of its own.
-    static final int READ_CHANNELS = 8;
+    private static final int READ_CHANNELS = 8;
+    /// The most pages [#readAll(List, byte)] reads with one call.
+    private static final int RUN_PAGES = 64;
     private static final int STAGED_LIMIT = 8 << 20;
     // The bytes a checkpoint writes from which it forces them beside its work, as the device takes them, instead of
     // all at once before its superblock: forced at the end, the writes of a checkpoint that rewrites hundreds of
@@ -163,6 +168,112 @@ final class PageFile implements AutoCloseable {
                 cache.put(ref, plain, true);
             }
             return plain;
+        } finally {
+            pool.release(sealed);
+        }
+    }
+
+    /// {@return the plaintext of the units `refs` name, in their order, none of them cached}
+    ///
+    /// Units in consecutive pages are read with one call, up to [#RUN_PAGES] pages, and the calls run on as many
+    /// virtual threads as there are read channels: reading many units one after another out of the OS cache made the
+    /// caller wait for each read in turn.
+    ///
+    /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
+    /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[][] readAll(List<PageRef> refs, byte kind) {
+        var units = new byte[refs.size()][];
+        var order = new Integer[refs.size()];
+        for (var i = 0; i < order.length; i++) {
+            order[i] = i;
+        }
+        Arrays.sort(order, (left, right) -> Integer.compare(refs.get(left).page(), refs.get(right).page()));
+        // Runs of indexes into refs, by page
+        var runs = new ArrayList<int[]>();
+        var run = new ArrayList<Integer>();
+        var runPages = 0;
+        var next = -1;
+        for (var index : order) {
+            var ref = refs.get(index);
+            var alone = cache.get(ref) != null;
+            if (!run.isEmpty() && (alone || ref.page() != next || runPages + ref.pages() > RUN_PAGES)) {
+                runs.add(run.stream().mapToInt(Integer::intValue).toArray());
+                run.clear();
+                runPages = 0;
+            }
+            if (alone) {
+                runs.add(new int[]{index});
+                continue;
+            }
+            run.add(index);
+            runPages += ref.pages();
+            next = ref.page() + ref.pages();
+        }
+        if (!run.isEmpty()) {
+            runs.add(run.stream().mapToInt(Integer::intValue).toArray());
+        }
+        var claimed = new AtomicInteger();
+        var failure = new AtomicReference<RuntimeException>();
+        Runnable reader = () -> {
+            for (var i = claimed.getAndIncrement(); i < runs.size() && failure.get() == null; i = claimed.getAndIncrement()) {
+                try {
+                    readRun(refs, runs.get(i), kind, units);
+                } catch (RuntimeException exception) {
+                    failure.compareAndSet(null, exception);
+                }
+            }
+        };
+        var threads = Math.min(READ_CHANNELS, runs.size());
+        if (threads <= 1) {
+            reader.run();
+        } else {
+            var started = new Thread[threads];
+            for (var i = 0; i < threads; i++) {
+                started[i] = Thread.ofVirtual().name("ledger-read").start(reader);
+            }
+            var interrupted = false;
+            for (var thread : started) {
+                while (true) {
+                    try {
+                        thread.join();
+                        break;
+                    } catch (InterruptedException _) {
+                        interrupted = true;
+                    }
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        if (failure.get() != null) {
+            throw failure.get();
+        }
+        return units;
+    }
+
+    /// Reads the units at `indexes` of `refs`, in consecutive pages, with one call, into `units`.
+    private void readRun(List<PageRef> refs, int[] indexes, byte kind, byte[][] units) {
+        if (indexes.length == 1) {
+            units[indexes[0]] = read(refs.get(indexes[0]), kind, false);
+            return;
+        }
+        var first = refs.get(indexes[0]).page();
+        var last = refs.get(indexes[indexes.length - 1]);
+        var length = (last.page() + last.pages() - first) * PageFormat.SIZE;
+        var sealed = pool.acquire(length);
+        try {
+            readFully(sealed, length, PageFormat.offset(first));
+            for (var index : indexes) {
+                var ref = refs.get(index);
+                var plain = new byte[ref.pages() * PageFormat.SIZE];
+                if (!cipher.open(sealed, (ref.page() - first) * PageFormat.SIZE, ref.pages(), plain) || !ref.describes(plain)
+                        || !kindMatches(plain[PageFormat.KIND], kind)) {
+                    throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+                }
+                units[index] = plain;
+            }
         } finally {
             pool.release(sealed);
         }
