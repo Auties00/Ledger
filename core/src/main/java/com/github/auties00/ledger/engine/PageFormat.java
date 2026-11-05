@@ -3,9 +3,9 @@ package com.github.auties00.ledger.engine;
 /// The layout of the data file, `ledger.data`, which holds the state of a store as of its last checkpoint.
 ///
 /// The file is a sequence of 4 KiB pages. Pages 0 and 1 hold the two superblocks, written alternately; the other
-/// pages hold units a checkpoint writes into pages no durable state uses: one page for a node of a key space's tree, a
-/// run of consecutive pages for a blob (a value too large for a leaf, the catalog, the free list). Every unit is
-/// sealed on its own:
+/// pages hold units a checkpoint writes into pages no durable state uses: one page for a node of a key space's tree or
+/// for the delta records of several leaves ([DeltaLeaves]), a run of consecutive pages for a blob (a value too large
+/// for a leaf, the catalog, the free list, the table of delta pages). Every unit is sealed on its own:
 ///
 /// ```text
 ///  0  kind, 1 byte
@@ -39,6 +39,10 @@ final class PageFormat {
     static final byte FREE_LIST = 6;
     /// A value of the file of large values, `ledger.blobs`.
     static final byte EXTERNAL = 7;
+    /// The delta records of several leaves ([DeltaLeaves]).
+    static final byte DELTA = 8;
+    /// The table of the delta pages in use, with the records each holds ([DeltaTable]).
+    static final byte DELTA_TABLE = 9;
 
     /// The first page a unit may use; pages 0 and 1 are the superblocks.
     static final int FIRST_UNIT_PAGE = 2;

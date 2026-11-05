@@ -227,8 +227,11 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             }
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
                     segmentSize, pool.executor(), commitWindow);
+            var deltaTable = superblock == null ? null : superblock.deltaTable();
+            var deltas = deltaTable == null ? DeltaTable.EMPTY
+                    : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));
             var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
-                    superblock == null ? 0 : superblock.number(), backgroundFailures);
+                    superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures);
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
             } else {

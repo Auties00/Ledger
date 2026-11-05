@@ -23,11 +23,14 @@ import java.util.List;
 /// key length (2), key, 2, value length (4), reference of the value's unit in ledger.blobs (20)
 /// ```
 ///
-/// A branch entry is a child: its reference (page and nonce, its pages being 1), the entries of its subtree, whether
-/// the subtree has values in blobs or units, and its first key, which is also the separator before it.
+/// A branch entry is a child: its reference (page and nonce, its pages being 1), the entries of its subtree, flags,
+/// and its first key, which is also the separator before it. The flags tell whether the subtree has values in blobs
+/// or units, and whether the child is a leaf made of a base leaf and a delta record ([DeltaLeaves]), whose slot in the
+/// delta page the reference names follows the key.
 ///
 /// ```text
 /// page (4), nonce (12), entries (8), flags (1), key length (2), key
+/// page (4), nonce (12), entries (8), flags (1), key length (2), key, slot of the delta record (2)
 /// ```
 ///
 /// Every child's first key is the lowest key of its subtree, so a key below the first key of a branch's first child
@@ -43,7 +46,13 @@ final class TreeNodes {
     private static final byte INLINE = 0;
     private static final byte BLOB = 1;
     private static final byte EXTERNAL = 2;
+    /// The form of an entry of a delta record that removes the key from the base leaf.
+    private static final byte REMOVED = 3;
     private static final byte HAS_BLOBS = 1;
+    private static final byte IS_DELTA = 2;
+    /// The header byte that marks a leaf made of a base leaf and a delta record, whose header names the base.
+    private static final int ORIGIN = 3;
+    private static final byte FROM_DELTA = 1;
 
     private TreeNodes() {
     }
@@ -128,6 +137,34 @@ final class TreeNodes {
         return unit[valueField(unit, entry)] == INLINE;
     }
 
+    /// {@return whether entry `entry` of a delta record removes its key}
+    static boolean isRemoved(byte[] unit, int entry) {
+        return unit[valueField(unit, entry)] == REMOVED;
+    }
+
+    /// {@return the bytes entry `entry` takes, without its offset}
+    static int entryLength(byte[] unit, int entry) {
+        var field = valueField(unit, entry);
+        return field - entry + switch (unit[field]) {
+            case INLINE -> 3 + Bytes.u16(unit, field + 1);
+            case REMOVED -> 1;
+            default -> 5 + PageRef.BYTES;
+        };
+    }
+
+    /// {@return entry `entry` of `unit`, a view of it}
+    static LeafEntry entryAt(byte[] unit, int entry) {
+        var key = leafKey(unit, entry);
+        if (isRemoved(unit, entry)) {
+            return LeafEntry.removed(key);
+        }
+        if (isBlob(unit, entry) || isExternal(unit, entry)) {
+            return new LeafEntry(key, null, blobRef(unit, entry), blobLength(unit, entry), isExternal(unit, entry));
+        }
+        var value = inlineValue(unit, entry);
+        return new LeafEntry(key, value, null, (int) value.byteSize());
+    }
+
     /// {@return the read-only inline value of leaf entry `entry`}
     static MemorySegment inlineValue(byte[] unit, int entry) {
         var field = valueField(unit, entry);
@@ -177,7 +214,9 @@ final class TreeNodes {
 
     static PageRef childRef(byte[] unit, int index) {
         var entry = entry(unit, index);
-        return new PageRef(Bytes.i32(unit, entry), 1, Bytes.i64(unit, entry + 4), Bytes.i32(unit, entry + 12));
+        var slot = (unit[entry + 24] & IS_DELTA) == 0 ? -1
+                : Bytes.u16(unit, entry + BRANCH_FIXED + Bytes.u16(unit, entry + BRANCH_FIXED - 2));
+        return new PageRef(Bytes.i32(unit, entry), 1, Bytes.i64(unit, entry + 4), Bytes.i32(unit, entry + 12), slot);
     }
 
     static long childCount(byte[] unit, int index) {
@@ -194,16 +233,25 @@ final class TreeNodes {
         var count = count(unit);
         var entries = new ArrayList<LeafEntry>(count + 8);
         for (var i = 0; i < count; i++) {
-            var entry = entry(unit, i);
-            var key = leafKey(unit, entry);
-            if (isBlob(unit, entry) || isExternal(unit, entry)) {
-                entries.add(new LeafEntry(key, null, blobRef(unit, entry), blobLength(unit, entry), isExternal(unit, entry)));
-            } else {
-                var value = inlineValue(unit, entry);
-                entries.add(new LeafEntry(key, value, null, (int) value.byteSize()));
-            }
+            entries.add(entryAt(unit, entry(unit, i)));
         }
         return entries;
+    }
+
+    /// {@return the leaf the leaf `unit` named by `ref` is made from: `ref` itself, or the base leaf of a delta}
+    static PageRef base(byte[] unit, PageRef ref) {
+        if (unit[ORIGIN] != FROM_DELTA) {
+            return ref;
+        }
+        return new PageRef(Bytes.i32(unit, PageFormat.PAGE), 1, Bytes.i64(unit, PageFormat.NONCE),
+                Bytes.i32(unit, PageFormat.NONCE + 8));
+    }
+
+    /// Fills the header of `unit`, a leaf made of the base leaf `base` and a delta record, with `length` bytes of
+    /// content; [#base(byte\[\], PageRef)] reads `base` back from it.
+    static void deltaHeader(byte[] unit, PageRef base, int length) {
+        PageFile.header(unit, PageFormat.LEAF, 0, base.page(), 1, length, base.nonceHigh(), base.nonceLow());
+        unit[ORIGIN] = FROM_DELTA;
     }
 
     /// {@return the children of the branch `unit`, as views of it}
@@ -226,27 +274,36 @@ final class TreeNodes {
         var count = to - from;
         Bytes.u16(unit, PageFormat.HEADER, count);
         var position = PageFormat.HEADER + 2 + 2 * count;
-        var target = MemorySegment.ofArray(unit);
         for (var i = 0; i < count; i++) {
-            var entry = entries.get(from + i);
             Bytes.u16(unit, PageFormat.HEADER + 2 + 2 * i, position);
-            var keyLength = (int) entry.key().byteSize();
-            Bytes.u16(unit, position, keyLength);
-            MemorySegment.copy(entry.key(), 0, target, position + 2, keyLength);
-            position += 2 + keyLength;
-            if (entry.blob() == null) {
-                unit[position] = INLINE;
-                Bytes.u16(unit, position + 1, entry.length());
-                MemorySegment.copy(entry.value(), 0, target, position + 3, entry.length());
-                position += 3 + entry.length();
-            } else {
-                unit[position] = entry.external() ? EXTERNAL : BLOB;
-                Bytes.i32(unit, position + 1, entry.length());
-                entry.blob().write(unit, position + 5);
-                position += 5 + PageRef.BYTES;
-            }
+            position = writeEntry(unit, position, entries.get(from + i));
         }
         return position - PageFormat.HEADER;
+    }
+
+    /// Writes `entry` at `position` of `unit`, in the form a leaf or a delta record holds it.
+    ///
+    /// @return the position past it
+    static int writeEntry(byte[] unit, int position, LeafEntry entry) {
+        var target = MemorySegment.ofArray(unit);
+        var keyLength = (int) entry.key().byteSize();
+        Bytes.u16(unit, position, keyLength);
+        MemorySegment.copy(entry.key(), 0, target, position + 2, keyLength);
+        position += 2 + keyLength;
+        if (entry.isRemoved()) {
+            unit[position] = REMOVED;
+            return position + 1;
+        }
+        if (entry.blob() == null) {
+            unit[position] = INLINE;
+            Bytes.u16(unit, position + 1, entry.length());
+            MemorySegment.copy(entry.value(), 0, target, position + 3, entry.length());
+            return position + 3 + entry.length();
+        }
+        unit[position] = entry.external() ? EXTERNAL : BLOB;
+        Bytes.i32(unit, position + 1, entry.length());
+        entry.blob().write(unit, position + 5);
+        return position + 5 + PageRef.BYTES;
     }
 
     /// Writes `children` from `from` to `to` into `unit` as a branch's content.
@@ -264,11 +321,15 @@ final class TreeNodes {
             Bytes.i64(unit, position + 4, child.ref().nonceHigh());
             Bytes.i32(unit, position + 12, child.ref().nonceLow());
             Bytes.i64(unit, position + 16, child.count());
-            unit[position + 24] = child.blobs() ? HAS_BLOBS : 0;
+            unit[position + 24] = (byte) ((child.blobs() ? HAS_BLOBS : 0) | (child.ref().isRecord() ? IS_DELTA : 0));
             var keyLength = (int) child.firstKey().byteSize();
             Bytes.u16(unit, position + 25, keyLength);
             MemorySegment.copy(child.firstKey(), 0, target, position + BRANCH_FIXED, keyLength);
             position += BRANCH_FIXED + keyLength;
+            if (child.ref().isRecord()) {
+                Bytes.u16(unit, position, child.ref().slot());
+                position += 2;
+            }
         }
         return position - PageFormat.HEADER;
     }
@@ -298,20 +359,45 @@ final class TreeNodes {
         return runs;
     }
 
-    /// An entry of a leaf: a key and its value, inline, in a blob, or in a unit of [BlobFile].
+    /// An entry of a leaf: a key and its value, inline, in a blob, or in a unit of [BlobFile]; in a delta record, also
+    /// the removal of a key.
     ///
     /// @param key the key
-    /// @param value the inline value, or `null` if it is in a blob or a unit
-    /// @param blob the blob or unit of the value, or `null` if it is inline
-    /// @param length the bytes of the value
+    /// @param value the inline value, or `null` if it is in a blob or a unit, or the entry is a removal
+    /// @param blob the blob or unit of the value, or `null` if it is inline, or the entry is a removal
+    /// @param length the bytes of the value, or -1 for a removal
     /// @param external whether `blob` is a unit of [BlobFile] rather than a blob of the data file
     record LeafEntry(MemorySegment key, MemorySegment value, PageRef blob, int length, boolean external) {
         LeafEntry(MemorySegment key, MemorySegment value, PageRef blob, int length) {
             this(key, value, blob, length, false);
         }
 
+        /// {@return the removal of `key`, as a delta record holds it}
+        static LeafEntry removed(MemorySegment key) {
+            return new LeafEntry(key, null, null, -1, false);
+        }
+
+        /// {@return whether the entry removes its key}
+        boolean isRemoved() {
+            return length < 0;
+        }
+
+        /// {@return whether the entry and `other` hold the same key and the same value, in the same form}
+        boolean sameAs(LeafEntry other) {
+            if (length != other.length || external != other.external || Segments.compare(key, other.key) != 0) {
+                return false;
+            }
+            if (blob != null || other.blob != null) {
+                return blob != null && blob.equals(other.blob);
+            }
+            return value == null || MemorySegment.mismatch(value, 0, length, other.value, 0, length) == -1;
+        }
+
         /// {@return the bytes the entry takes in a leaf, offset included}
         int size() {
+            if (isRemoved()) {
+                return 2 + 2 + (int) key.byteSize() + 1;
+            }
             return 2 + 2 + (int) key.byteSize() + 1 + (blob == null ? 2 + length : 4 + PageRef.BYTES);
         }
 
@@ -332,7 +418,7 @@ final class TreeNodes {
     record Child(MemorySegment firstKey, PageRef ref, long count, boolean blobs, int level, int fill) {
         /// {@return the bytes the child takes in a branch, offset included}
         int size() {
-            return 2 + BRANCH_FIXED + (int) firstKey.byteSize();
+            return 2 + BRANCH_FIXED + (int) firstKey.byteSize() + (ref.isRecord() ? 2 : 0);
         }
     }
 }
