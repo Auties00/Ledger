@@ -9,9 +9,10 @@ import java.util.Arrays;
 /// climbs it to reach the next leaf.
 ///
 /// The first [#ADMITTED] leaves and blobs a cursor reads go to the page cache; past them it reads through the cache,
-/// using the units the cache holds without adding the others. A long scan reads each unit once, so caching what it
-/// reads would only evict the units other reads use: the PostgreSQL buffer manager holds a large sequential scan to a
-/// small ring for the same reason.
+/// using the units the cache holds and adding the others only while the cache has room for them, as entries the cache
+/// evicts before any other. A long scan reads each unit once, so caching what it reads would only evict the units
+/// other reads use: the PostgreSQL buffer manager holds a large sequential scan to a small ring for the same reason. A
+/// cache with room evicts nothing to take them, and keeps a key space small enough to fit for the next scan.
 final class TreeCursor {
     /// The leaves and blobs a cursor adds to the page cache, enough for the pages of a chat a reader scrolls through.
     static final int ADMITTED = 64;
@@ -62,7 +63,7 @@ final class TreeCursor {
                 child = from == null ? 0 : TreeNodes.childFor(unit, from);
             }
             push(unit, child);
-            unit = pages.read(TreeNodes.childRef(unit, child), PageFile.NODE, caches(unit));
+            unit = child(unit, child);
         }
         leaf = unit;
         if (descending) {
@@ -116,11 +117,11 @@ final class TreeCursor {
             var child = indexes[depth - 1] + (descending ? -1 : 1);
             if (child >= 0 && child < TreeNodes.count(unit)) {
                 indexes[depth - 1] = child;
-                var node = pages.read(TreeNodes.childRef(unit, child), PageFile.NODE, caches(unit));
+                var node = child(unit, child);
                 while (!TreeNodes.isLeaf(node)) {
                     var edge = descending ? TreeNodes.count(node) - 1 : 0;
                     push(node, edge);
-                    node = pages.read(TreeNodes.childRef(node, edge), PageFile.NODE, caches(node));
+                    node = child(node, edge);
                 }
                 leaf = node;
                 index = descending ? TreeNodes.count(node) - 1 : 0;
@@ -144,14 +145,25 @@ final class TreeCursor {
 
     /// {@return the value of the current entry, read-only, read from its blob if it has one}
     MemorySegment value() {
-        return TreeSearch.value(pages, leaf, entry, !TreeNodes.isInline(leaf, entry) && admit());
+        if (TreeNodes.isInline(leaf, entry)) {
+            return TreeNodes.inlineValue(leaf, entry);
+        }
+        if (admit()) {
+            return TreeSearch.value(pages, leaf, entry, true);
+        }
+        var bytes = (long) PageFormat.pagesFor(TreeNodes.blobLength(leaf, entry)) * PageFormat.SIZE;
+        return TreeSearch.value(pages, leaf, entry, pages.cache().hasRoom(bytes), false);
     }
 
-    /// {@return whether to cache the child of branch `parent` the cursor reads}
+    /// {@return child `index` of the branch `parent`, read through the cache}
     ///
     /// Branches are always cached: a scan reads one for every few hundred leaves, and every read starts from them.
-    private boolean caches(byte[] parent) {
-        return TreeNodes.level(parent) > 1 || admit();
+    private byte[] child(byte[] parent, int index) {
+        var ref = TreeNodes.childRef(parent, index);
+        if (TreeNodes.level(parent) > 1 || admit()) {
+            return pages.read(ref, PageFile.NODE, true);
+        }
+        return pages.read(ref, PageFile.NODE, pages.cache().hasRoom(PageFormat.SIZE), false);
     }
 
     /// {@return whether the leaf or blob the cursor reads next goes to the cache}
