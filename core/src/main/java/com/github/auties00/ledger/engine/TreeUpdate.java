@@ -368,6 +368,11 @@ final class TreeUpdate {
         if (touched.isEmpty()) {
             return List.of();
         }
+        if (appends(entries, touched)) {
+            // The end of a range that grows, as a chat's newest messages: the leaf most reads start from, which a
+            // record would make two reads, and whose writes a checkpoint takes few of
+            return null;
+        }
         var changes = ref.isRecord() ? DeltaLeaves.combine(DeltaLeaves.record(read(ref.unit(), PageFormat.DELTA, true), ref.slot()), touched)
                 : touched;
         var size = DeltaLeaves.recordSize(changes);
@@ -382,6 +387,15 @@ final class TreeUpdate {
         TreeNodes.deltaHeader(leaf, base, TreeNodes.writeLeaf(leaf, merged, 0, merged.size()));
         pages.cache().put(record, leaf, false);
         return List.of(new Child(merged.getFirst().key(), record, merged.size(), blobs, 0, fill));
+    }
+
+    /// {@return whether every one of `changes` puts a key past the last of `entries`}
+    private static boolean appends(List<LeafEntry> entries, List<LeafEntry> changes) {
+        if (entries.isEmpty()) {
+            return true;
+        }
+        var last = entries.getLast().key();
+        return !changes.getFirst().isRemoved() && Segments.compare(changes.getFirst().key(), last) > 0;
     }
 
     /// Gives up the leaf `ref`, made from the leaf `base`: frees a unit, or drops a delta record and frees its base.
