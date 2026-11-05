@@ -175,7 +175,7 @@ final class LogWriter {
         this.durabilityChanged = durabilityLock.newCondition();
         this.durable = durable;
         this.lastQueued = durable;
-        open(files.prepare(firstSegment));
+        open(files.prepare(firstSegment, segmentSize));
     }
 
     static String segmentName(long number) {
@@ -201,7 +201,7 @@ final class LogWriter {
     /// behind it would make every commit waiting on that flush wait as long.
     private void prepareNext() {
         var number = segmentNumber + 1;
-        var preparation = new FutureTask<>(() -> files.prepare(number));
+        var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize));
         next = preparation;
         Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
     }

@@ -500,14 +500,16 @@ class DurableLedgerTest {
     @DisplayName("reusing the log")
     class Reuse {
         @Test
-        @DisplayName("a clean close leaves no log behind, and the next open starts from the checkpoint")
+        @DisplayName("a clean close leaves one spare and no segment, and the next open starts from the checkpoint")
         void cleanClose(@TempDir Path directory) throws IOException {
             for (var round = 0; round < 3; round++) {
                 try (var ledger = open(directory, NAMES)) {
                     ledger.commit(ledger.newBatch().put(NAMES, "k" + round, "v" + round));
                     assertEquals(round + 1, ledger.size(NAMES));
                 }
-                assertEquals(List.of(), logFiles(directory), "files left in the log");
+                var left = logFiles(directory);
+                assertEquals(1, left.size(), () -> "files left in the log: " + left);
+                assertTrue(left.getFirst().getFileName().toString().endsWith(".spare"), () -> "files left in the log: " + left);
             }
         }
 
@@ -620,7 +622,7 @@ class DurableLedgerTest {
             }
             // What a crash right after preparing the next segment leaves
             var opened = StoreHeader.openOrCreate(directory, EncryptionSpec.key(KEY));
-            new LogFiles(directory.resolve("log"), opened.keys(), opened.header().storeId()).prepare(number + 1);
+            new LogFiles(directory.resolve("log"), opened.keys(), opened.header().storeId()).prepare(number + 1, 16 << 20);
             try (var ledger = open(directory, NAMES)) {
                 assertEquals(number + 1, ((LiveLedger) ledger).log().currentSegment());
                 assertEquals(Optional.of("1"), ledger.get(NAMES, "a"));
