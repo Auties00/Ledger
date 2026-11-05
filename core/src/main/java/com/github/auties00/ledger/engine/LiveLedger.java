@@ -247,10 +247,12 @@ public final class LiveLedger implements Ledger {
             if (!state.resident || entry.root() == null) {
                 continue;
             }
-            var cursor = new TreeCursor(pages, entry.root(), null, null, false);
-            while (cursor.next()) {
-                var value = cursor.value();
-                state.open(cursor.key()).head = new Version(stamp, value, state.keyspace.values().decode(value), null);
+            for (var leaf : TreeSearch.leaves(pages, entry.root(), PageFile.READ_CHANNELS)) {
+                for (var i = 0; i < TreeNodes.count(leaf); i++) {
+                    var offset = TreeNodes.entry(leaf, i);
+                    var value = TreeSearch.value(pages, leaf, offset, false);
+                    state.open(TreeNodes.leafKey(leaf, offset)).head = new Version(stamp, value, state.keyspace.values().decode(value), null);
+                }
             }
         }
     }

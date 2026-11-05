@@ -34,7 +34,8 @@ import java.util.zip.CRC32C;
 ///
 /// Segments come from [LogFiles] prepared: once a segment is half written, the next one is prepared on a thread of
 /// its own, so a rollover only forces the full segment and switches to the next, and no file is created or renamed
-/// on the way to a force. A prepared
+/// on the way to a force. The first one is prepared the same way while the store opens, and the first group waits for
+/// it: forcing a new file and its directory took most of an open on Windows and macOS. A prepared
 /// file may hold the frames of an earlier use, which every frame header tells apart by the tag of its segment's salt.
 ///
 /// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames, written by one open of the store
@@ -85,7 +86,7 @@ final class LogWriter {
     private final Executor executor;
     private final long commitWindowNanos;
 
-    // Owned by the flush task
+    // Owned by the flush task; null until the first group opens the first segment
     private FileChannel channel;
     // Empties the drive's cache for the segment on macOS, or null
     private FullSync.Handle fullSync;
@@ -175,7 +176,10 @@ final class LogWriter {
         this.durabilityChanged = durabilityLock.newCondition();
         this.durable = durable;
         this.lastQueued = durable;
-        open(files.prepare(firstSegment));
+        // The first group switches to it, as a rollover does
+        this.segmentNumber = firstSegment - 1;
+        this.currentSegment = firstSegment;
+        prepareNext();
     }
 
     static String segmentName(long number) {
@@ -387,6 +391,9 @@ final class LogWriter {
     ///
     /// @return the bytes of the frame bodies written
     private long write(List<Queued> group, boolean units) throws IOException {
+        if (channel == null) {
+            rollover();
+        }
         var unitForce = units ? forceUnits() : null;
         var start = position;
         var groupStart = true;
@@ -766,7 +773,9 @@ final class LogWriter {
             fullSync.close();
             fullSync = null;
         }
-        channel.close();
+        if (channel != null) {
+            channel.close();
+        }
     }
 
     private void closeChannel() {

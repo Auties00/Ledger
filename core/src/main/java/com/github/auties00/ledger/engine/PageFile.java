@@ -25,7 +25,8 @@ import java.util.stream.IntStream;
 /// on the one thread that writes a checkpoint, through a [Writer].
 final class PageFile implements AutoCloseable {
     static final String FILE = "ledger.data";
-    private static final int READ_CHANNELS = 8;
+    /// The reads of the file that run at once, each on a channel of its own.
+    static final int READ_CHANNELS = 8;
     private static final int STAGED_LIMIT = 8 << 20;
     // The bytes a checkpoint writes from which it forces them beside its work, as the device takes them, instead of
     // all at once before its superblock: forced at the end, the writes of a checkpoint that rewrites hundreds of
