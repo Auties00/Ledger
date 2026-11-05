@@ -56,7 +56,9 @@ public final class BerkeleyJeEngine implements Engine {
         Files.createDirectories(directory);
         var config = new EnvironmentConfig()
                 .setAllowCreate(true)
-                .setTransactional(true);
+                .setTransactional(true)
+                // A scan reads behind the writer's record locks: past JE's 500 ms default it failed rather than waited
+                .setLockTimeout(60, java.util.concurrent.TimeUnit.SECONDS);
         config.setCacheSize(settings.cacheBytes());
         var environment = new Environment(directory.toFile(), config);
         var databases = new EnumMap<Keyspace, Database>(Keyspace.class);

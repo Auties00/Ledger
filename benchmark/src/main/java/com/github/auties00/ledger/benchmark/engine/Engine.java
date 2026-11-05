@@ -18,7 +18,10 @@ public interface Engine extends AutoCloseable {
     /// @throws IOException if the engine fails to write
     void write(WriteBatch batch, Durability durability) throws IOException;
 
-    /// {@return the value stored under `key`, or `null` if there is none}
+    /// {@return the value stored under `key`, in an array the caller owns, or `null` if there is none}
+    ///
+    /// An engine that keeps the arrays it stores hands out copies: a caller may change what it gets, and handing out
+    /// the engine's own would skip the copy every other engine makes.
     ///
     /// @param keyspace the key space to read
     /// @param key the key to look up
@@ -78,7 +81,8 @@ public interface Engine extends AutoCloseable {
 
     /// A consistent view of the store at the moment it was opened.
     interface ReadView extends AutoCloseable {
-        /// {@return the value stored under `key` when the view was opened, or `null` if there was none}
+        /// {@return the value stored under `key` when the view was opened, in an array the caller owns, or `null` if
+        /// there was none}
         ///
         /// @param keyspace the key space to read
         /// @param key the key to look up
@@ -92,7 +96,7 @@ public interface Engine extends AutoCloseable {
     /// Receives the entries of a scan.
     @FunctionalInterface
     interface EntryVisitor {
-        /// Receives one entry.
+        /// Receives one entry, in arrays the visitor owns.
         ///
         /// @param key the entry's key
         /// @param value the entry's value

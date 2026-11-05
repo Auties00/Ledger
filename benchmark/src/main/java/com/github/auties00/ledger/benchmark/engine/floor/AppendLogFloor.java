@@ -107,7 +107,8 @@ public final class AppendLogFloor implements Engine {
 
     @Override
     public byte[] get(Keyspace keyspace, byte[] key) {
-        return index.get(keyspace).get(key);
+        var value = index.get(keyspace).get(key);
+        return value == null ? null : value.clone();
     }
 
     @Override
@@ -120,7 +121,7 @@ public final class AppendLogFloor implements Engine {
                 break;
             }
             visited++;
-            if (!visitor.visit(entry.getKey(), entry.getValue())) {
+            if (!visitor.visit(entry.getKey().clone(), entry.getValue().clone())) {
                 break;
             }
         }
