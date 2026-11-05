@@ -50,7 +50,8 @@ public final class LedgerEngine implements Engine {
                 .directory(directory)
                 .encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
                 .pageCache(Math.max(1L << 20, settings.cacheBytes()))
-                .largeValues(settings.largeValues());
+                .largeValues(settings.largeValues())
+                .checkpointEvery(256L << 20);
         for (var keyspace : Keyspace.values()) {
             var name = keyspace.name().toLowerCase(Locale.ROOT).replace('_', '-');
             var resident = keyspace == Keyspace.SESSIONS || keyspace == Keyspace.CHATS;
