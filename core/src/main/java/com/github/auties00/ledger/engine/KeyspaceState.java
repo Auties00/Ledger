@@ -51,6 +51,8 @@ final class KeyspaceState {
     final ConcurrentSkipListMap<Long, Long> counts;
     // The writes whose effect on the count the trees settle
     final BlindWrites blind;
+    // The copies of the keys the chains hold
+    private final KeySlab keys;
     // The chains written since the last checkpoint was cut, each listed once per cut; guarded by the publishing role
     ArrayList<Chain> dirty;
     // The number of the cut `dirty` collects for, guarded by the publishing role
@@ -87,6 +89,7 @@ final class KeyspaceState {
         this.counts = new ConcurrentSkipListMap<>();
         this.blind = new BlindWrites();
         this.dirty = new ArrayList<>();
+        this.keys = new KeySlab();
         this.ordering = new ReentrantLock();
         counts.put(0L, 0L);
     }
@@ -121,7 +124,7 @@ final class KeyspaceState {
             chain = null;
         }
         if (chain == null) {
-            var created = new Chain(Segments.copy(key), hash);
+            var created = new Chain(keys.copy(key), hash);
             chain = index.putIfAbsent(new IndexKey(created.key, hash), created);
             if (chain == null) {
                 chain = created;
