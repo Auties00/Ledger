@@ -294,16 +294,20 @@ final class Checkpointer {
                 }
                 previous = key;
                 // The key's chain now, which is another one if the writer dropped this one
-                var version = KeyspaceState.resolve(state.head(key), key, bound, keyspace.removals());
+                var current = state.chain(key);
+                var version = KeyspaceState.resolve(current == null ? null : current.head, key, bound, keyspace.removals());
                 if (version == null && !state.resident) {
                     // No version at the cut in a paged key space: a commit that wrote the key rolled back, so the
                     // tree is right. A resident one holds every entry, so there the key is gone
                     continue;
                 }
+                // A blind write the cut takes: the leaf the update merges tells whether the tree held the key
+                var blind = current != null && current.blindSequence != 0 && current.blindSequence <= cut.sequence()
+                        && current.blindState == TreeSearch.UNKNOWN ? current : null;
                 if (version == null || version == Version.HIDDEN) {
-                    ops.add(new TreeUpdate.Op(key, null));
+                    ops.add(new TreeUpdate.Op(key, null, null, blind));
                 } else {
-                    ops.add(new TreeUpdate.Op(key, version.value, version.external));
+                    ops.add(new TreeUpdate.Op(key, version.value, version.external, blind));
                     if (version.external != null) {
                         adopted.add(version.external);
                     }
@@ -315,11 +319,14 @@ final class Checkpointer {
                     ranges.add(new TreeUpdate.Range(removal.from(), removal.to()));
                 }
             }
-            var root = update.apply(roots[state.id], ops, TreeUpdate.merge(ranges));
+            var base = roots[state.id];
+            var root = update.apply(base, ops, TreeUpdate.merge(ranges));
+            // The update settled the blind writes up to the cut but those of keys it skipped, looked up here
+            var blind = state.blind.correction(cut.sequence(), key -> base != null && TreeSearch.find(pages, base, key) != null);
             var count = root == null ? 0 : root.count();
-            if (count != keyspace.count()) {
+            if (count != keyspace.count() + blind) {
                 throw new IllegalStateException("The checkpoint of " + state.keyspace.name() + " holds " + count
-                        + " entries where the store counts " + keyspace.count());
+                        + " entries where the store counts " + (keyspace.count() + blind));
             }
             roots[state.id] = root;
         }

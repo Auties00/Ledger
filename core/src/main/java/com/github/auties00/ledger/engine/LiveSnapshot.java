@@ -73,7 +73,7 @@ final class LiveSnapshot implements Snapshot {
 
     @Override
     public long size(Keyspace<?, ?> keyspace) {
-        return state(keyspace).count(sequence);
+        return state(keyspace).count(point);
     }
 
     @Override

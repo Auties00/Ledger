@@ -182,7 +182,7 @@ class PipelineBugsTest {
     }
 
     @Test
-    @DisplayName("a commit whose tree read fails takes back the new keys it wrote before")
+    @DisplayName("a commit that runs alone, whose tree read fails, takes back the new keys it wrote before")
     void rolledBackNewKey(@TempDir Path directory) throws Exception {
         var options = Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(VALUES);
         try (var ledger = options.build()) {
@@ -222,7 +222,10 @@ class PipelineBugsTest {
                 if (damaged == null) {
                     continue;
                 }
-                var failing = ledger.newBatch().put(VALUES, "a", "new").put(VALUES, damaged, "x");
+                // The range removal makes the commit run alone, which looks its keys up as it applies; a commit of
+                // the pipeline writes them blind and reads no tree
+                var failing = ledger.newBatch().put(VALUES, "a", "new").put(VALUES, damaged, "x")
+                        .deleteRange(VALUES, KeyRange.between("b", "c"));
                 assertThrows(LedgerCorruptedException.class, () -> ledger.commit(failing));
                 // The commit failed whole: its first write is not visible
                 assertEquals(Optional.empty(), ledger.get(VALUES, "a"));

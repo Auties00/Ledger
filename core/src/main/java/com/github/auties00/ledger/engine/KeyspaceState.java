@@ -39,8 +39,10 @@ final class KeyspaceState {
     private final ConcurrentLinkedQueue<Chain> leaving;
     // Copy-on-write: the writer publishes a new array, readers keep the one they loaded
     volatile RangeRemoval[] removals;
-    // The number of entries visible as of each commit sequence that changed it
+    // The number of entries visible as of each commit sequence that changed it, leaving out the blind writes
     final ConcurrentSkipListMap<Long, Long> counts;
+    // The writes whose effect on the count the trees settle
+    final BlindWrites blind;
     // The chains written since the last checkpoint was cut, each listed once per cut; guarded by the publishing role
     ArrayList<Chain> dirty;
     // The number of the cut `dirty` collects for, guarded by the publishing role
@@ -57,6 +59,7 @@ final class KeyspaceState {
         this.leaving = new ConcurrentLinkedQueue<>();
         this.removals = RangeRemoval.NONE;
         this.counts = new ConcurrentSkipListMap<>();
+        this.blind = new BlindWrites();
         this.dirty = new ArrayList<>();
         counts.put(0L, 0L);
     }
@@ -265,9 +268,18 @@ final class KeyspaceState {
         return entries;
     }
 
-    /// {@return the number of entries a reader at `sequence` sees}
-    long count(long sequence) {
+    /// {@return the number of entries a reader at `sequence` sees, leaving out the blind writes}
+    long known(long sequence) {
         var entry = counts.floorEntry(sequence);
         return entry == null ? 0 : entry.getValue();
+    }
+
+    /// {@return the number of entries `point` sees}
+    ///
+    /// It looks up in the trees of `point` the keys of the blind writes up to its sequence whose effect is not known
+    /// yet, which reads the file for those of a tree larger than the page cache.
+    long count(ReadPoint point) {
+        var sequence = point.bound() >>> Reads.OP_BITS;
+        return known(sequence) + blind.correction(sequence, key -> Reads.inTreeOnly(this, key, point));
     }
 }

@@ -47,9 +47,18 @@ final class TreeUpdate {
     /// @param key the key
     /// @param value its value, or `null` if the key has none
     /// @param external the unit of [BlobFile] a commit wrote the value to, which the tree takes, or `null`
-    record Op(MemorySegment key, MemorySegment value, PageRef external) {
+    /// @param blind the chain of the key, if a blind write the checkpoint takes needs to know whether the tree held
+    ///              the key ([BlindWrites]), which the update records on it; or `null`
+    record Op(MemorySegment key, MemorySegment value, PageRef external, Chain blind) {
         Op(MemorySegment key, MemorySegment value) {
-            this(key, value, null);
+            this(key, value, null, null);
+        }
+
+        /// Records on the chain of a blind write whether the tree held the key.
+        void settle(boolean inTree) {
+            if (blind != null) {
+                blind.blindState = inTree ? TreeSearch.FOUND : TreeSearch.ABSENT;
+            }
         }
     }
 
@@ -358,6 +367,7 @@ final class TreeUpdate {
         for (var entry : entries) {
             while (op < opTo && Segments.compare(ops.get(op).key(), entry.key()) < 0) {
                 var put = ops.get(op++);
+                put.settle(false);
                 if (put.value() != null) {
                     out.add(entry(put));
                     changed = true;
@@ -366,6 +376,7 @@ final class TreeUpdate {
             if (op < opTo && Segments.compare(ops.get(op).key(), entry.key()) == 0) {
                 // The key's state as of the checkpoint, which already takes the removals into account
                 var state = ops.get(op++);
+                state.settle(true);
                 // A version the tree took already, back after a commit that replaced it rolled back, keeps its unit
                 if (!(entry.external() && entry.blob().equals(state.external()))) {
                     release(entry);
@@ -388,6 +399,7 @@ final class TreeUpdate {
         }
         while (op < opTo) {
             var put = ops.get(op++);
+            put.settle(false);
             if (put.value() != null) {
                 out.add(entry(put));
                 changed = true;

@@ -497,7 +497,7 @@ public final class LiveLedger implements Ledger {
         // Registered as a read: the publisher drops the counts below the oldest read, and the latest may move on
         var lease = readers.enter();
         try {
-            return state.count(lease.sequence());
+            return state.count(point(lease.sequence()));
         } finally {
             readers.exit(lease);
         }
@@ -1267,7 +1267,7 @@ public final class LiveLedger implements Ledger {
     /// @param state the key space
     /// @param dirty the keys written
     /// @param removals the range removals as of the cut
-    /// @param count the entries as of the cut
+    /// @param count the entries as of the cut, leaving out the blind writes ([BlindWrites])
     record KeyspaceCut(KeyspaceState state, List<Chain> dirty, RangeRemoval[] removals, long count) {
     }
 
@@ -1290,7 +1290,7 @@ public final class LiveLedger implements Ledger {
             }
             var cuts = new ArrayList<KeyspaceCut>(states.size());
             for (var state : states.values()) {
-                cuts.add(new KeyspaceCut(state, state.cutDirty(), state.removals, state.count(sequence)));
+                cuts.add(new KeyspaceCut(state, state.cutDirty(), state.removals, state.known(sequence)));
             }
             var bound = Reads.boundOf(sequence);
             var superseded = new ArrayList<PageRef>();
@@ -1394,33 +1394,35 @@ public final class LiveLedger implements Ledger {
         }
     }
 
-    /// Looks up in the trees, before the commit is given a sequence, the keys of the writes of `writes` that have no
-    /// version in memory.
+    /// Prepares the writes of `writes` before the commit is given a sequence: opens the chain of every key the batch
+    /// puts, and says how each write learns whether its key existed.
     ///
-    /// Applying such a write looks its key up in its tree, so the counts stay exact. With a tree larger than the page
-    /// cache, that lookup reads the file, and every later commit on the key would wait for the read. Here the lookups
-    /// run before the commit's turn, those that reach the file on up to [#PREFETCH_THREADS] threads at once, and what
-    /// they found serves the writes as long as the trees are still the ones they read.
+    /// A commit of the pipeline (`chains` given) writes blind: a write of a paged key space whose key memory holds no
+    /// version does not look the key up, and the checkpoint that takes it settles what it does to the count
+    /// ([BlindWrites]). With a tree larger than the page cache the lookup would read the file, and every later commit
+    /// on the key would wait for the read.
     ///
-    /// The lookups do not register as a read: a lease per commit would hold versions back and change the readers the
-    /// sweep waits for at every commit. Without one, a checkpoint may reuse a page of the trees they read once newer
-    /// trees replace them; the page then fails authentication, since its nonce is not the one its parent records, and
-    /// the lookup leaves its write to the writer. A lookup that succeeds read the trees as they were, and its answer
-    /// is used only while they are still the latest.
+    /// An operation that runs alone counts exactly as it applies, so here its lookups run before its turn, those that
+    /// reach the file on up to [#PREFETCH_THREADS] threads at once, and what they found serves the writes as long as
+    /// the trees are still the ones they read. The lookups do not register as a read: a lease per commit would hold
+    /// versions back and change the readers the sweep waits for at every commit. Without one, a checkpoint may reuse a
+    /// page of the trees they read once newer trees replace them; the page then fails authentication, since its nonce
+    /// is not the one its parent records, and the lookup leaves its write to the writer. A lookup that succeeds read
+    /// the trees as they were, and its answer is used only while they are still the latest.
     ///
-    /// It also opens the chain of every key the batch puts, so the ordered map of the key space, which a new key costs
-    /// a walk down, grows outside the lock; commits that run at once insert their keys at once.
+    /// Opening the chains here grows the ordered map of the key space, which a new key costs a walk down, outside the
+    /// lock; commits that run at once insert their keys at once.
     ///
-    /// @return what the lookups found, or `null` if the store has no trees
+    /// @return how each write learns whether its key existed, or `null` if the store has no trees
     ///
     /// @param chains receives the chain of each put and removal, opened for the pipeline, or `null`
     /// @param keyspaceStates receives the key space of each write when `chains` does, or `null`
     private Hints prefetch(ArrayWriteBatch writes, Chain[] chains, KeyspaceState[] keyspaceStates) {
         var trees = pages == null ? null : tree;
         try {
-            var point = trees == null ? null : new ReadPoint(Reads.boundOf(latest()), trees, pages);
+            var point = trees == null || chains != null ? null : new ReadPoint(Reads.boundOf(latest()), trees, pages);
             var found = trees == null ? null : new byte[writes.size()];
-            var missing = new int[16];
+            int[] missing = null;
             var misses = 0;
             for (var i = 0; i < writes.size(); i++) {
                 var kind = writes.kind(i);
@@ -1434,7 +1436,16 @@ public final class LiveLedger implements Ledger {
                     chains[i] = chain;
                     keyspaceStates[i] = state;
                 }
-                if (found == null || (chain != null && chain.head != null)) {
+                if (found == null) {
+                    continue;
+                }
+                if (chains != null) {
+                    if (!state.resident) {
+                        found[i] = TreeSearch.BLIND;
+                    }
+                    continue;
+                }
+                if (chain != null && chain.head != null) {
                     continue;
                 }
                 var root = point.root(state);
@@ -1443,7 +1454,9 @@ public final class LiveLedger implements Ledger {
                 }
                 found[i] = TreeSearch.lookupCached(pages, root, key);
                 if (found[i] == TreeSearch.UNKNOWN) {
-                    if (misses == missing.length) {
+                    if (missing == null) {
+                        missing = new int[16];
+                    } else if (misses == missing.length) {
                         missing = Arrays.copyOf(missing, misses * 2);
                     }
                     missing[misses++] = i;
@@ -1496,7 +1509,8 @@ public final class LiveLedger implements Ledger {
         ///
         /// @param current the trees the writer reads
         byte of(int write, TreeVersion current) {
-            return tree == current ? found[write] : TreeSearch.UNKNOWN;
+            var hint = found[write];
+            return hint == TreeSearch.BLIND || tree == current ? hint : TreeSearch.UNKNOWN;
         }
     }
 
@@ -1691,6 +1705,7 @@ public final class LiveLedger implements Ledger {
             if (countFloor != null && state.counts.firstKey() < countFloor) {
                 state.counts.headMap(countFloor, false).clear();
             }
+            state.blind.fold(oldest);
         }
         sweep(bounds, cutBound, SWEEP_BUDGET);
     }
@@ -1869,6 +1884,12 @@ public final class LiveLedger implements Ledger {
             deltas[deltaCount++] = delta;
         }
 
+        /// Records on `chain` that this commit writes its key blind: the tree settles what the write does to the count.
+        private void markBlind(Chain chain) {
+            chain.blindSequence = sequence;
+            chain.blindState = TreeSearch.UNKNOWN;
+        }
+
         /// Records that this commit replaces `version`, if a unit no checkpoint has taken holds its value.
         private void replace(Version version) {
             if (version != null && version.external != null && version.replacedAt == Long.MAX_VALUE) {
@@ -1886,8 +1907,13 @@ public final class LiveLedger implements Ledger {
         }
 
         /// {@return the number of entries of `state` once this commit applies}
+        ///
+        /// It looks up the keys of the blind writes whose effect is not known yet, in the latest trees: the commits
+        /// before this one have published, as this one runs alone.
         long count(KeyspaceState state) {
-            return state.counts.lastEntry().getValue() + delta(state);
+            var point = writerPoint(Reads.stamp(sequence, op) - 1);
+            var blind = state.blind.correction(sequence - 1, key -> Reads.inTreeOnly(state, key, point));
+            return state.counts.lastEntry().getValue() + blind + delta(state);
         }
 
         private long nextStamp() {
@@ -1927,15 +1953,19 @@ public final class LiveLedger implements Ledger {
                  PageRef external) {
             var stamp = nextStamp();
             var head = chain.head;
-            var existed = Reads.exists(state, head, key, writerPoint(stamp - 1), inTree);
+            var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
             var version = new Version(stamp, value, decoded, head, external);
+            var blind = existed == TreeSearch.UNKNOWN;
+            if (blind) {
+                markBlind(chain);
+            }
             chain.attach(version);
             if (external != null) {
                 externals++;
             }
-            touched.add(new Touched(state, chain, version));
+            touched.add(new Touched(state, chain, version, blind));
             replace(head);
-            if (!existed) {
+            if (existed == TreeSearch.ABSENT) {
                 addDelta(state, 1);
             }
             if (frame != null) {
@@ -1975,18 +2005,25 @@ public final class LiveLedger implements Ledger {
         void delete(KeyspaceState state, Chain chain, MemorySegment key, byte inTree) {
             var stamp = nextStamp();
             var head = chain.head;
-            if (!Reads.exists(state, head, key, writerPoint(stamp - 1), inTree)) {
+            var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
+            if (existed == TreeSearch.ABSENT) {
                 if (head == null) {
                     // Opened for this removal: the prune after the commit publishes drops it, if it stays empty
-                    touched.add(new Touched(state, chain, null));
+                    touched.add(new Touched(state, chain, null, false));
                 }
                 return;
             }
             var version = new Version(stamp, null, null, head);
+            var blind = existed == TreeSearch.UNKNOWN;
+            if (blind) {
+                markBlind(chain);
+            }
             chain.attach(version);
-            touched.add(new Touched(state, chain, version));
+            touched.add(new Touched(state, chain, version, blind));
             replace(head);
-            addDelta(state, -1);
+            if (!blind) {
+                addDelta(state, -1);
+            }
             if (frame != null) {
                 frame.delete(state.id, key);
             }
@@ -2095,6 +2132,9 @@ public final class LiveLedger implements Ledger {
                     if (pages != null) {
                         write.state().markDirty(write.chain());
                     }
+                    if (write.blind()) {
+                        write.state().blind.add(write.chain(), sequence, write.version().removes());
+                    }
                 }
             }
             for (var i = 0; i < deltaCount; i++) {
@@ -2147,6 +2187,7 @@ public final class LiveLedger implements Ledger {
     ///
     /// @param chain the key's chain
     /// @param version the version the write added
-    private record Touched(KeyspaceState state, Chain chain, Version version) {
+    /// @param blind whether the write is blind: the tree settles what it does to the count ([BlindWrites])
+    private record Touched(KeyspaceState state, Chain chain, Version version, boolean blind) {
     }
 }

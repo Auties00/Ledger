@@ -52,6 +52,12 @@ final class Chain {
     /// The cut whose dirty keys list the chain, so a chain is listed once per checkpoint; guarded by the publishing
     /// role.
     long dirtyCut;
+    /// The sequence of the commit that wrote the key without knowing whether the tree held it ([BlindWrites]), or 0;
+    /// a chain has at most one such write, its first, since every later one finds a version in memory.
+    long blindSequence;
+    /// Whether the tree the blind write would have read held the key, as [TreeSearch#FOUND] or [TreeSearch#ABSENT],
+    /// or [TreeSearch#UNKNOWN] until the checkpoint that takes the write, or a count, finds out.
+    volatile byte blindState;
 
     private static final VarHandle CLAIMED;
     private static final VarHandle LAST_WRITER;

@@ -76,6 +76,40 @@ final class Reads {
         return root != null && TreeSearch.find(point.pages(), root, key) != null && !hiddenSinceTree(key, point, removals);
     }
 
+    /// {@return whether the tree of `point` holds `key`, whatever range removal since hides it}
+    static boolean inTreeOnly(KeyspaceState state, MemorySegment key, ReadPoint point) {
+        var root = point.root(state);
+        return root != null && TreeSearch.find(point.pages(), root, key) != null;
+    }
+
+    /// {@return whether `point` sees `key`, whose newest version in memory is `head`, as [TreeSearch#FOUND] or
+    /// [TreeSearch#ABSENT] when memory or a range removal since the tree tells, or [TreeSearch#UNKNOWN] when only the
+    /// tree does}
+    static byte existsInMemory(KeyspaceState state, Version head, MemorySegment key, ReadPoint point) {
+        var removals = state.removals;
+        var version = KeyspaceState.resolve(head, key, point.bound(), removals);
+        if (version != null) {
+            return version != Version.HIDDEN ? TreeSearch.FOUND : TreeSearch.ABSENT;
+        }
+        if (point.root(state) == null || hiddenSinceTree(key, point, removals)) {
+            return TreeSearch.ABSENT;
+        }
+        return TreeSearch.UNKNOWN;
+    }
+
+    /// {@return whether `point` sees `key`, whose newest version in memory is `head`, as [TreeSearch#FOUND] or
+    /// [TreeSearch#ABSENT], or [TreeSearch#UNKNOWN] for a blind write: one hinted [TreeSearch#BLIND] that only the tree
+    /// could answer}
+    ///
+    /// @param inTree whether the tree of `point` holds `key`, as a lookup of that same tree found it,
+    ///               [TreeSearch#UNKNOWN] to look it up, or [TreeSearch#BLIND] not to
+    static byte existence(KeyspaceState state, Version head, MemorySegment key, ReadPoint point, byte inTree) {
+        if (inTree == TreeSearch.BLIND) {
+            return existsInMemory(state, head, key, point);
+        }
+        return exists(state, head, key, point, inTree) ? TreeSearch.FOUND : TreeSearch.ABSENT;
+    }
+
     /// {@return whether `point` sees `key`}
     static boolean exists(KeyspaceState state, MemorySegment key, ReadPoint point) {
         return exists(state, state.head(key), key, point, TreeSearch.UNKNOWN);
