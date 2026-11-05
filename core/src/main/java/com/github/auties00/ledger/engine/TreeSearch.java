@@ -10,6 +10,8 @@ final class TreeSearch {
     static final byte FOUND = 1;
     /// The tree does not hold the key.
     static final byte ABSENT = 2;
+    /// A hint that the write does not look the key up: unless memory tells, it is a blind write ([BlindWrites]).
+    static final byte BLIND = 3;
 
     private TreeSearch() {
     }

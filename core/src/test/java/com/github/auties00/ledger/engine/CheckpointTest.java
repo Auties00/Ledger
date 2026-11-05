@@ -73,6 +73,92 @@ class CheckpointTest {
     }
 
     @Nested
+    @DisplayName("blind writes")
+    class BlindWrites {
+        @Test
+        @DisplayName("keep counts exact before the checkpoint that settles them, in snapshots, after it and after a reopen")
+        void exactCounts(@TempDir Path directory) {
+            try (var ledger = open(directory, MESSAGES)) {
+                var live = (LiveLedger) ledger;
+                var seed = ledger.newBatch();
+                for (var i = 0; i < 100; i++) {
+                    seed.put(MESSAGES, "k" + i, "v");
+                }
+                ledger.commit(seed);
+                ledger.checkpoint();
+                assertEquals(100, ledger.size(MESSAGES));
+                try (var before = ledger.snapshot()) {
+                    var writes = ledger.newBatch();
+                    for (var i = 0; i < 50; i++) {
+                        writes.put(MESSAGES, "k" + i, "w");
+                    }
+                    for (var i = 100; i < 130; i++) {
+                        writes.put(MESSAGES, "k" + i, "w");
+                    }
+                    for (var i = 50; i < 70; i++) {
+                        writes.delete(MESSAGES, "k" + i);
+                    }
+                    for (var i = 200; i < 210; i++) {
+                        writes.delete(MESSAGES, "k" + i);
+                    }
+                    ledger.commit(writes);
+                    // Every write found its key only in the tree, or nowhere
+                    assertEquals(110, live.state(MESSAGES).blind.listed());
+                    assertEquals(100, before.size(MESSAGES));
+                    try (var after = ledger.snapshot()) {
+                        // Once a write settles, the next write of its key knows: the overwrite of a new key adds nothing
+                        ledger.commit(ledger.newBatch().put(MESSAGES, "k100", "x").delete(MESSAGES, "k0"));
+                        assertEquals(110, after.size(MESSAGES));
+                        assertEquals(109, ledger.size(MESSAGES));
+                        ledger.checkpoint();
+                        assertEquals(100, before.size(MESSAGES));
+                        assertEquals(110, after.size(MESSAGES));
+                    }
+                }
+                assertEquals(109, ledger.size(MESSAGES));
+            }
+            try (var reopened = open(directory, MESSAGES)) {
+                assertEquals(109, reopened.size(MESSAGES));
+                assertEquals(Optional.of("w"), reopened.get(MESSAGES, "k1"));
+                assertEquals(Optional.empty(), reopened.get(MESSAGES, "k0"));
+                assertEquals(Optional.empty(), reopened.get(MESSAGES, "k55"));
+                assertEquals(Optional.of("x"), reopened.get(MESSAGES, "k100"));
+            }
+        }
+
+        @Test
+        @DisplayName("count exactly in a transaction and in a range removal after them, and settle at the checkpoint")
+        void transactionsAndRanges(@TempDir Path directory) {
+            try (var ledger = open(directory, MESSAGES)) {
+                var live = (LiveLedger) ledger;
+                var seed = ledger.newBatch();
+                for (var i = 0; i < 10; i++) {
+                    seed.put(MESSAGES, "a" + i, "v");
+                }
+                ledger.commit(seed);
+                ledger.checkpoint();
+                ledger.commit(ledger.newBatch().put(MESSAGES, "a1", "w").put(MESSAGES, "b1", "w").delete(MESSAGES, "a2"));
+                var counted = new long[1];
+                ledger.update(transaction -> {
+                    counted[0] = transaction.size(MESSAGES);
+                    transaction.put(MESSAGES, "b2", "w");
+                });
+                assertEquals(10, counted[0]);
+                assertEquals(11, ledger.size(MESSAGES));
+                // The removal counts the keys it removes on its own, blind writes among them
+                ledger.commit(ledger.newBatch().deleteRange(MESSAGES, KeyRange.between("a0", "a5")));
+                assertEquals(11 - 4, ledger.size(MESSAGES));
+                ledger.checkpoint();
+                assertEquals(7, ledger.size(MESSAGES));
+                var listed = live.state(MESSAGES).blind.listed();
+                ledger.commit(ledger.newBatch().put(MESSAGES, "a9", "z"));
+                assertEquals(listed + 1, live.state(MESSAGES).blind.listed());
+                assertEquals(7, ledger.size(MESSAGES));
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("random histories")
     class RandomHistories {
         @ParameterizedTest(name = "encrypted: {0}, seed {1}")

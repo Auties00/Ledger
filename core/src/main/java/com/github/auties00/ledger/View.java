@@ -102,7 +102,10 @@ public sealed interface View permits Ledger, Snapshot, Transaction {
 
     /// {@return the number of entries in `keyspace`}
     ///
-    /// The store keeps the count as it writes, so this does not read the entries.
+    /// The count is exact. The store keeps it as it writes, except for a write of a key it holds no version of in
+    /// memory, which does not read the file to learn whether the key existed: the next checkpoint learns it. Until
+    /// then this looks up each such key, which may read the file after many of them; once a checkpoint has taken them,
+    /// it reads nothing.
     ///
     /// @param keyspace the key space to count
     /// @throws IllegalArgumentException if this store was not opened with `keyspace`
