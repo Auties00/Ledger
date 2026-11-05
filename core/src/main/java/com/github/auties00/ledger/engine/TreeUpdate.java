@@ -51,7 +51,21 @@ final class TreeUpdate {
         this.freedExternal = new ArrayList<>();
         this.allocated = new ArrayList<>();
         this.records = new HashMap<>();
-        this.packer = new DeltaLeaves.Packer(writer, this::allocate, (page, written) -> records.merge(page, written, Integer::sum));
+        this.packer = new DeltaLeaves.Packer(writer, new DeltaLeaves.Packer.Space() {
+            @Override
+            public long take(int least, int most) {
+                var run = space.allocateRun(least, most);
+                // The whole run, though the packer gives some back: a page given back and taken again by another unit
+                // of the checkpoint goes back with it, if the checkpoint fails
+                allocated.add(new PageRef((int) (run >>> 32), (int) run, 0, 0));
+                return run;
+            }
+
+            @Override
+            public void giveBack(int page, int pages) {
+                space.release(page, pages);
+            }
+        }, (page, written) -> records.merge(page, written, Integer::sum));
     }
 
     /// The state of a key as of a checkpoint.
@@ -131,7 +145,7 @@ final class TreeUpdate {
     ///
     /// @return the table of delta pages after the update
     DeltaTable finishDeltas(DeltaTable table) throws IOException {
-        packer.finish();
+        packer.close();
         var next = table.apply(records, freed);
         records.clear();
         return next;
@@ -409,7 +423,7 @@ final class TreeUpdate {
             try {
                 var replacement = update.update(child, ops, removals, plan);
                 // The records of the subtree end its own pages, so the branch above reads them back from the writer
-                update.packer.finish();
+                update.packer.close();
                 return replacement;
             } catch (IOException exception) {
                 throw new UncheckedIOException(exception);

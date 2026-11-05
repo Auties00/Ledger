@@ -6,7 +6,6 @@ import com.github.auties00.ledger.engine.TreeNodes.LeafEntry;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.IntUnaryOperator;
 
 /// Leaves a checkpoint writes as the entries that changed since a base leaf, in a record that shares a page with the
 /// records of other leaves.
@@ -146,10 +145,17 @@ final class DeltaLeaves {
     }
 
     /// Fills delta pages with records, one page at a time, for one thread of a checkpoint.
+    ///
+    /// It takes its pages in runs, so the delta pages of a checkpoint reach the file as long writes rather than one
+    /// page in each hole the last checkpoints left.
     static final class Packer {
+        /// The fewest free pages a run of delta pages takes, and the most.
+        private static final int LEAST_RUN = 8;
+        private static final int MOST_RUN = 64;
+
         private final PageFile.Writer writer;
-        // Takes a free page for the next delta page
-        private final IntUnaryOperator allocate;
+        // Takes and gives back runs of free pages
+        private final Space space;
         // Receives each page written and the records it holds
         private final Written written;
         private byte[] unit;
@@ -158,6 +164,18 @@ final class DeltaLeaves {
         private int records;
         // The lowest byte the records take; the offsets grow up to it
         private int low;
+        // The pages of the current run not used yet
+        private int next;
+        private int end;
+
+        /// Takes and gives back the runs of free pages delta pages are written to.
+        interface Space {
+            /// {@return a run of free pages, as [FreeSpace#allocateRun(int, int)] gives it}
+            long take(int least, int most);
+
+            /// Gives back the `pages` pages from `page`, which the packer did not use.
+            void giveBack(int page, int pages);
+        }
 
         /// Receives a delta page once it is queued.
         @FunctionalInterface
@@ -166,9 +184,9 @@ final class DeltaLeaves {
             void accept(int page, int records);
         }
 
-        Packer(PageFile.Writer writer, IntUnaryOperator allocate, Written written) {
+        Packer(PageFile.Writer writer, Space space, Written written) {
             this.writer = writer;
-            this.allocate = allocate;
+            this.space = space;
             this.written = written;
         }
 
@@ -179,7 +197,7 @@ final class DeltaLeaves {
             if (unit == null || COUNT + 2 + 2 * (records + 1) > low - size) {
                 finish();
                 unit = new byte[PageFormat.SIZE];
-                page = allocate.applyAsInt(1);
+                page = nextPage();
                 nonce = writer.nextNonce();
                 records = 0;
                 low = PageFormat.SIZE - PageFormat.TAG;
@@ -206,8 +224,26 @@ final class DeltaLeaves {
                     : null;
         }
 
+        private int nextPage() {
+            if (next == end) {
+                var run = space.take(LEAST_RUN, MOST_RUN);
+                next = (int) (run >>> 32);
+                end = next + (int) run;
+            }
+            return next++;
+        }
+
+        /// Queues the delta page being filled, if any, and gives back the pages of the run it did not use.
+        void close() throws IOException {
+            finish();
+            if (next < end) {
+                space.giveBack(next, end - next);
+                next = end;
+            }
+        }
+
         /// Queues the delta page being filled, if any.
-        void finish() throws IOException {
+        private void finish() throws IOException {
             if (unit == null) {
                 return;
             }
