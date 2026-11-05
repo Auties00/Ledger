@@ -121,7 +121,9 @@ final class DeltaLeaves {
                 changes.add(LeafEntry.removed(base.get(at++).key()));
             }
             if (at < base.size() && Segments.compare(base.get(at).key(), entry.key()) == 0) {
-                if (!base.get(at++).sameAs(entry)) {
+                // A leaf's entries the writes left alone are the very entries of its base, when the base is the leaf
+                var same = base.get(at++);
+                if (same != entry && !same.sameAs(entry)) {
                     changes.add(entry);
                 }
             } else {
