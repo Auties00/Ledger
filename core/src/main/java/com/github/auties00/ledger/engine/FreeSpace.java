@@ -17,6 +17,9 @@ import java.util.List;
 final class FreeSpace {
     private final Object lock;
     private final BitSet free;
+    // No page below it is free: a checkpoint takes hundreds of thousands of pages one at a time, and each search from
+    // the first page of the file walked every word of the pages in use before the first free one
+    private int lowestFree;
     private int pageCount;
     private final ArrayDeque<Pending> pending;
 
@@ -24,6 +27,7 @@ final class FreeSpace {
     FreeSpace(int pageCount, BitSet free) {
         this.lock = new Object();
         this.free = free;
+        this.lowestFree = PageFormat.FIRST_UNIT_PAGE;
         this.pageCount = pageCount;
         this.pending = new ArrayDeque<>();
     }
@@ -33,7 +37,8 @@ final class FreeSpace {
     /// It takes the first run that fits, or the pages past the end of the file.
     int allocate(int pages) {
         synchronized (lock) {
-            var start = free.nextSetBit(PageFormat.FIRST_UNIT_PAGE);
+            var start = free.nextSetBit(lowestFree);
+            lowestFree = start < 0 ? Math.max(lowestFree, pageCount) : start;
             while (start >= 0 && start < pageCount) {
                 var end = Math.min(free.nextClearBit(start), pageCount);
                 if (end - start >= pages) {
@@ -65,6 +70,7 @@ final class FreeSpace {
             if (page + pages > pageCount) {
                 // Pages past the file are free; those between its end and the claim stay so
                 free.set(pageCount, page + pages);
+                lowestFree = Math.min(lowestFree, pageCount);
                 pageCount = page + pages;
             }
             var taken = free.get(page, page + pages);
@@ -80,6 +86,7 @@ final class FreeSpace {
     void release(int page, int pages) {
         synchronized (lock) {
             free.set(page, page + pages);
+            lowestFree = Math.min(lowestFree, page);
         }
     }
 
@@ -101,6 +108,7 @@ final class FreeSpace {
             while (!pending.isEmpty() && pending.peekFirst().published() < oldestReader) {
                 for (var unit : pending.pollFirst().units()) {
                     free.set(unit.page(), unit.page() + unit.pages());
+                    lowestFree = Math.min(lowestFree, unit.page());
                 }
             }
         }
