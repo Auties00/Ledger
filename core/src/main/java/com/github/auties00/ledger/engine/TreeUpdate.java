@@ -215,7 +215,7 @@ final class TreeUpdate {
             }
             var base = TreeNodes.base(unit, node.ref());
             if (!root) {
-                var delta = writeDelta(node.ref(), base, base == node.ref() ? entries : null, merged);
+                var delta = writeDelta(node.ref(), base, entries, merged);
                 if (delta != null) {
                     return delta.isEmpty() ? null : delta;
                 }
@@ -343,10 +343,15 @@ final class TreeUpdate {
     /// Writes the leaf `ref`, made from the leaf `base`, as a delta record if what changed since `base` makes a small
     /// one and `merged`, the entries after the writes, fill one leaf at least a quarter.
     ///
-    /// @param baseEntries the entries of `base`, or `null` to read them
+    /// The record is the one `ref` names, if it is a record, with what the writes changed: the base is not read. It
+    /// may remove a key the base lacks, or put one the base holds as it is, which reads the same. The leaf the record
+    /// makes goes to the page cache, as a leaf written whole does: the next checkpoint and the readers find it there
+    /// rather than reading the record and its base.
+    ///
+    /// @param entries the entries of the leaf `ref` names, before the writes
     /// @return the record, alone; an empty list if `merged` is what `ref` holds already; or `null` if the leaf is to
     ///         be written whole
-    private List<Child> writeDelta(PageRef ref, PageRef base, List<LeafEntry> baseEntries, List<LeafEntry> merged) throws IOException {
+    private List<Child> writeDelta(PageRef ref, PageRef base, List<LeafEntry> entries, List<LeafEntry> merged) throws IOException {
         if (merged.isEmpty()) {
             return null;
         }
@@ -359,15 +364,12 @@ final class TreeUpdate {
         if (fill - 2 > TreeNodes.CAPACITY || fill < TreeNodes.MIN_FILL) {
             return null;
         }
-        var changes = DeltaLeaves.diff(baseEntries != null ? baseEntries : TreeNodes.leafEntries(read(base, PageFormat.LEAF, true)), merged);
-        if (changes.isEmpty()) {
-            if (!ref.isRecord()) {
-                return List.of();
-            }
-            // Back to what the base holds
-            dropRecord(ref);
-            return List.of(new Child(merged.getFirst().key(), base, merged.size(), blobs, 0, fill));
+        var touched = DeltaLeaves.diff(entries, merged);
+        if (touched.isEmpty()) {
+            return List.of();
         }
+        var changes = ref.isRecord() ? DeltaLeaves.combine(DeltaLeaves.record(read(ref.unit(), PageFormat.DELTA, true), ref.slot()), touched)
+                : touched;
         var size = DeltaLeaves.recordSize(changes);
         if (size > DeltaLeaves.MAX_RECORD) {
             return null;
@@ -376,6 +378,9 @@ final class TreeUpdate {
             dropRecord(ref);
         }
         var record = packer.append(base, changes, size);
+        var leaf = new byte[PageFormat.SIZE];
+        TreeNodes.deltaHeader(leaf, base, TreeNodes.writeLeaf(leaf, merged, 0, merged.size()));
+        pages.cache().put(record, leaf, false);
         return List.of(new Child(merged.getFirst().key(), record, merged.size(), blobs, 0, fill));
     }
 
