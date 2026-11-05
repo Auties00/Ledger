@@ -4,18 +4,29 @@ import com.github.auties00.ledger.KeyCodec;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.util.Comparator;
 
 /// Operations on the memory segments that hold encoded keys and values.
 final class Segments {
     /// Orders segments as unsigned bytes, a prefix before every longer segment it starts.
     static final Comparator<MemorySegment> UNSIGNED = Segments::compare;
+    private static final ValueLayout.OfLong BIG_ENDIAN_LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
 
     private Segments() {
     }
 
     /// {@return a negative number, zero or a positive number as `left` sorts before, with or after `right`}
     static int compare(MemorySegment left, MemorySegment right) {
+        // The first 8 bytes decide most comparisons of keys that do not share a prefix, without the set-up of a
+        // mismatch, which a walk down the ordered map of a large key space pays twenty times
+        if (left.byteSize() >= Long.BYTES && right.byteSize() >= Long.BYTES) {
+            var leftPrefix = left.get(BIG_ENDIAN_LONG, 0);
+            var rightPrefix = right.get(BIG_ENDIAN_LONG, 0);
+            if (leftPrefix != rightPrefix) {
+                return Long.compareUnsigned(leftPrefix, rightPrefix);
+            }
+        }
         var mismatch = left.mismatch(right);
         if (mismatch == -1) {
             return 0;
