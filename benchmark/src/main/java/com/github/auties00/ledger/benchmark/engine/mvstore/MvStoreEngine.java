@@ -92,12 +92,17 @@ public final class MvStoreEngine implements Engine {
 
     @Override
     public byte[] get(Keyspace keyspace, byte[] key) {
-        return maps.get(keyspace).get(key);
+        return copy(maps.get(keyspace).get(key));
     }
 
     @Override
     public int scan(Keyspace keyspace, byte[] from, byte[] to, boolean descending, int limit, EntryVisitor visitor) {
         return scan(maps.get(keyspace), from, to, descending, limit, visitor);
+    }
+
+    /// {@return a copy of `value`, or `null`: MVStore hands out the arrays its maps hold}
+    private static byte[] copy(byte[] value) {
+        return value == null ? null : value.clone();
     }
 
     private static int scan(MVMap<byte[], byte[]> map, byte[] from, byte[] to, boolean descending, int limit, EntryVisitor visitor) {
@@ -111,7 +116,7 @@ public final class MvStoreEngine implements Engine {
             while (visited < limit && cursor.hasNext()) {
                 var key = cursor.next();
                 visited++;
-                if (!visitor.visit(key, cursor.getValue())) {
+                if (!visitor.visit(key.clone(), cursor.getValue().clone())) {
                     break;
                 }
             }
@@ -123,7 +128,7 @@ public final class MvStoreEngine implements Engine {
                     break;
                 }
                 visited++;
-                if (!visitor.visit(key, cursor.getValue())) {
+                if (!visitor.visit(key.clone(), cursor.getValue().clone())) {
                     break;
                 }
             }
@@ -143,7 +148,7 @@ public final class MvStoreEngine implements Engine {
         return new ReadView() {
             @Override
             public byte[] get(Keyspace keyspace, byte[] key) {
-                return views.get(keyspace).get(key);
+                return copy(views.get(keyspace).get(key));
             }
 
             @Override

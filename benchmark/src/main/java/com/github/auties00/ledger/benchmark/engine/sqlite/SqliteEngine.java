@@ -27,8 +27,9 @@ import java.util.concurrent.locks.ReentrantLock;
 ///
 /// Writes go through one connection, since SQLite allows one writer; reads go through a pool of connections, which
 /// WAL mode lets run alongside the writer. A deferred write commits with `synchronous=NORMAL`, which in WAL mode
-/// writes the log without forcing it; a durable write commits with `synchronous=FULL`, which forces the log. SQLite
-/// has no group commit, so durable writers queue behind each other's forces.
+/// writes the log without forcing it; a durable write commits with `synchronous=FULL`, which forces the log, emptying
+/// the drive's cache on macOS as the other engines' forces do there. SQLite has no group commit, so durable writers
+/// queue behind each other's forces.
 public final class SqliteEngine implements Engine {
     private static final int READERS = Math.max(4, Runtime.getRuntime().availableProcessors());
 
@@ -75,6 +76,10 @@ public final class SqliteEngine implements Engine {
             try (var statement = writer.createStatement()) {
                 statement.execute("PRAGMA journal_mode = WAL");
                 statement.execute("PRAGMA synchronous = NORMAL");
+                // On macOS a durable commit empties the drive's cache, as LMDB, RocksDB and Ledger make theirs do;
+                // elsewhere SQLite ignores both
+                statement.execute("PRAGMA fullfsync = 1");
+                statement.execute("PRAGMA checkpoint_fullfsync = 1");
                 // Another process may hold the write lock; wait for it rather than fail
                 statement.execute("PRAGMA busy_timeout = 60000");
                 statement.execute(cachePragma);
