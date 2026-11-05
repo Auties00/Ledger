@@ -1,6 +1,9 @@
 package com.github.auties00.ledger.engine;
 
 import java.lang.foreign.MemorySegment;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 /// Point lookups and range counts in a key space's tree.
 final class TreeSearch {
@@ -56,6 +59,25 @@ final class TreeSearch {
         return TreeNodes.compare(unit, TreeNodes.leafKeyOffset(entry), TreeNodes.leafKeyLength(unit, entry), key) == 0
                 ? entry
                 : -1;
+    }
+
+    /// {@return the leaves of the tree under `root`, in key order, without caching them}
+    ///
+    /// It reads the tree a level at a time, with [PageFile#readAll(List, byte)]: a store that just opened finds its
+    /// file out of the OS cache as often as not, and reading the leaves of its resident key spaces one after another
+    /// made the open wait for each read in turn.
+    static List<byte[]> leaves(PageFile pages, TreeRoot root) {
+        var level = List.of(pages.read(root.ref(), PageFile.NODE, false));
+        while (!TreeNodes.isLeaf(level.getFirst())) {
+            var refs = new ArrayList<PageRef>();
+            for (var unit : level) {
+                for (var i = 0; i < TreeNodes.count(unit); i++) {
+                    refs.add(TreeNodes.childRef(unit, i));
+                }
+            }
+            level = Arrays.asList(pages.readAll(refs, PageFile.NODE));
+        }
+        return level;
     }
 
     /// {@return the read-only value of leaf entry `entry` of `unit`, read from its blob if it has one}
