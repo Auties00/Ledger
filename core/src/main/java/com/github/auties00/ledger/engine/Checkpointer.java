@@ -208,6 +208,7 @@ final class Checkpointer {
                 }
                 freeList = writeFreeList(writer, update, freed);
                 writer.flush();
+                writer.awaitForce();
                 if (blobs != null) {
                     // The units the trees take were written by commits the log may not have forced yet
                     blobs.force();
