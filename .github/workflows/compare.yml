@@ -1,0 +1,131 @@
+# Measures two refs on the same runner, in alternating rounds (base, head, base, head, ...). Hosted runners' hardware
+# and disks differ enough between runs to move every engine's score several times over, so two runs of the benchmark
+# workflow cannot tell a change apart from the runner; within one job, both refs meet the same machine. The summary
+# gives each workload's median on both refs, the range of their rounds, and the ratio.
+name: Compare
+run-name: Compare ${{ inputs.base }} and ${{ inputs.head || github.ref_name }} on ${{ inputs.os }} ${{ inputs.pattern }} ${{ inputs.jmh-args }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Ref to compare against
+        type: string
+        default: master
+      head:
+        description: Ref to measure; empty for the ref the workflow runs on
+        type: string
+        default: ''
+      os:
+        description: Runner to measure on
+        type: choice
+        options: [all, ubuntu-latest, windows-latest, macos-latest]
+        default: all
+      pattern:
+        description: 'JMH pattern of the workloads, for example: limits\.ParallelWritersBenchmark'
+        type: string
+        default: 'limits\.ParallelWritersBenchmark'
+      rounds:
+        description: Rounds of each ref
+        type: string
+        default: '3'
+      jmh-args:
+        description: 'Extra JMH arguments, for example: -p engine=ledger,ledger-plain'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compare-${{ inputs.os }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  compare:
+    name: compare on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.os == 'all' && '["ubuntu-latest","windows-latest","macos-latest"]' || format('["{0}"]', inputs.os)) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base }}
+          path: base
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head || github.sha }}
+          path: head
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '26'
+          cache: maven
+          cache-dependency-path: '*/pom.xml'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # The templates of the larger workloads take several GB, twice here
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Build both refs
+        run: |
+          (cd base && mvn -B -ntp package -DskipTests)
+          (cd head && mvn -B -ntp package -DskipTests)
+
+      - name: Describe the runner
+        run: |
+          {
+            echo "## ${{ inputs.base }} against ${{ inputs.head || github.ref_name }} on ${{ matrix.os }}"
+            echo
+            echo "- Base: $(git -C base rev-parse --short HEAD), head: $(git -C head rev-parse --short HEAD)"
+            echo "- CPUs: $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")"
+            echo "- Java: $(java -version 2>&1 | head -1)"
+            echo "- Rounds: ${{ inputs.rounds }} of each ref, alternating"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Each ref keeps its own store templates, which the two builds might lay out differently
+      - name: Run the workloads
+        env:
+          PATTERN: ${{ inputs.pattern }}
+          ROUNDS: ${{ inputs.rounds }}
+          JMH_ARGS: ${{ inputs.jmh-args }}
+        run: |
+          mkdir -p results
+          for round in $(seq 1 "$ROUNDS"); do
+            for side in base head; do
+              echo "::group::$side, round $round"
+              # JMH_ARGS is split into words on purpose
+              LEDGER_BENCH_DIR="$RUNNER_TEMP/bench-$side" java -jar "$side/benchmark/target/benchmarks.jar" "$PATTERN" \
+                -foe false -rf json -rff "results/$side-$round.json" $JMH_ARGS 2>&1 | tee -a "results/$side.log"
+              echo "::endgroup::"
+            done
+          done
+
+      - name: Summarize
+        if: always() && hashFiles('results/*.json') != ''
+        run: python head/.github/scripts/compare.py results >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compare-${{ matrix.os }}
+          path: results/
+          retention-days: 90
