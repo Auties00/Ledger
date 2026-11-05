@@ -20,6 +20,9 @@ final class FreeSpace {
     // No page below it is free: a checkpoint takes hundreds of thousands of pages one at a time, and each search from
     // the first page of the file walked every word of the pages in use before the first free one
     private int lowestFree;
+    // Where the next search for a run of free pages starts: the runs before it were too short when a search of this
+    // pass went past them, and searching them again for every run cost more than the writes the runs saved
+    private int runCursor;
     private int pageCount;
     private final ArrayDeque<Pending> pending;
 
@@ -59,32 +62,41 @@ final class FreeSpace {
         }
     }
 
-    /// Takes a run of free pages for units written one after another: the first run of at least `least` pages, up to
-    /// `most` of them, or `most` pages past the end of the file.
+    /// Takes a run of free pages for units written one after another: the next run of at least `least` pages since
+    /// the last [#rewindRuns()], up to `most` of them, or `most` pages past the end of the file.
     ///
     /// @return the first page of the run in the high 32 bits, and its pages in the low ones
     long allocateRun(int least, int most) {
         synchronized (lock) {
-            var start = free.nextSetBit(lowestFree);
-            lowestFree = start < 0 ? Math.max(lowestFree, pageCount) : start;
+            var start = free.nextSetBit(Math.max(lowestFree, runCursor));
             while (start >= 0 && start < pageCount) {
                 var end = Math.min(free.nextClearBit(start), pageCount);
                 if (end == pageCount && end - start < most) {
                     // The last run reaches the end of the file: grow it
                     free.clear(start, end);
                     pageCount = start + most;
+                    runCursor = pageCount;
                     return (long) start << 32 | most;
                 }
                 if (end - start >= least) {
                     var pages = Math.min(end - start, most);
                     free.clear(start, start + pages);
+                    runCursor = start + pages;
                     return (long) start << 32 | pages;
                 }
                 start = free.nextSetBit(end);
             }
             var first = pageCount;
             pageCount += most;
+            runCursor = pageCount;
             return (long) first << 32 | most;
+        }
+    }
+
+    /// Makes the next [#allocateRun(int, int)] search from the first free page again, once per checkpoint.
+    void rewindRuns() {
+        synchronized (lock) {
+            runCursor = 0;
         }
     }
 
