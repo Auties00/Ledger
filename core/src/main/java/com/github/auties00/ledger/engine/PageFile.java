@@ -13,6 +13,8 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.TreeMap;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.stream.IntStream;
 
 /// The data file of a store: its units, read through the page cache and verified against the reference that named
@@ -25,6 +27,10 @@ final class PageFile implements AutoCloseable {
     static final String FILE = "ledger.data";
     private static final int READ_CHANNELS = 8;
     private static final int STAGED_LIMIT = 8 << 20;
+    // The bytes a checkpoint writes from which it forces them beside its work, as the device takes them, instead of
+    // all at once before its superblock: forced at the end, the writes of a checkpoint that rewrites hundreds of
+    // megabytes kept the device idle while it built them, then made it wait seconds for them
+    private static final long FORCE_EVERY = 32L << 20;
     /// Marks a read that accepts a leaf or a branch.
     static final byte NODE = -1;
 
@@ -346,6 +352,10 @@ final class PageFile implements AutoCloseable {
         private final TreeMap<Integer, Staged> staged;
         private long stagedBytes;
         private long written;
+        // The bytes written when the last force beside the checkpoint started
+        private long forcedUpTo;
+        // The force beside the checkpoint, running or done, or null
+        private FutureTask<Void> forcing;
 
         private Writer(long nonceHigh) {
             this.lock = new Object();
@@ -452,6 +462,57 @@ final class PageFile implements AutoCloseable {
             written += stagedBytes;
             staged.clear();
             stagedBytes = 0;
+            forceBeside();
+        }
+
+        /// Starts forcing what the checkpoint wrote so far, beside its work, once it wrote [#FORCE_EVERY] bytes since
+        /// the last force started and that one is done; throws the failure of that one.
+        private void forceBeside() throws IOException {
+            if (forcing != null) {
+                if (!forcing.isDone()) {
+                    return;
+                }
+                await(forcing);
+                forcing = null;
+            }
+            if (written - forcedUpTo < FORCE_EVERY) {
+                return;
+            }
+            forcedUpTo = written;
+            // The data only: the length of the file and the device's cache wait for the force before the superblock
+            var task = new FutureTask<Void>(() -> {
+                PageFile.this.writer.force(false);
+                return null;
+            });
+            Thread.ofVirtual().name("ledger-page-force").start(task);
+            forcing = task;
+        }
+
+        /// Waits for the force running beside the checkpoint, if any.
+        ///
+        /// @throws IOException if it failed: a write it did not make durable may be lost even if a later force
+        ///                     succeeds, so the checkpoint fails
+        void awaitForce() throws IOException {
+            FutureTask<Void> running;
+            synchronized (lock) {
+                running = forcing;
+                forcing = null;
+            }
+            if (running != null) {
+                await(running);
+            }
+        }
+
+        private static void await(FutureTask<Void> task) throws IOException {
+            try {
+                task.get();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while forcing the data file", exception);
+            } catch (ExecutionException exception) {
+                throw exception.getCause() instanceof IOException failure ? failure
+                        : new IOException("The data file could not be forced", exception.getCause());
+            }
         }
 
         private void writeRun(ArrayList<ByteBuffer> run, long position) throws IOException {
@@ -475,6 +536,11 @@ final class PageFile implements AutoCloseable {
 
         /// Drops every queued unit, for a checkpoint that failed.
         void discard() {
+            try {
+                awaitForce();
+            } catch (IOException _) {
+                // The checkpoint failed already; its pages go back
+            }
             synchronized (lock) {
                 for (var entry : staged.values()) {
                     cache.remove(entry.ref().page());
