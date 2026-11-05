@@ -32,10 +32,10 @@ import java.util.zip.CRC32C;
 /// next group, so concurrent commits share forces. Each group is padded with zeros to a multiple of [#ALIGNMENT], where
 /// the next one starts, so the pages of acknowledged frames are never written again.
 ///
-/// Segments come from [LogFiles] prepared: once a segment is half written, the next one is prepared on a thread of
-/// its own, so a rollover only forces the full segment and switches to the next, and no file is created or renamed
-/// on the way to a force. A prepared
-/// file may hold the frames of an earlier use, which every frame header tells apart by the tag of its segment's salt.
+/// Segments come from [LogFiles] prepared: once a segment takes its first group, the next one is prepared on a thread
+/// of its own, which a new file's zeros give the whole segment's time, so a rollover only forces the full segment and
+/// switches to the next, and no file is created or renamed on the way to a force. A prepared file may hold the frames
+/// of an earlier use, which every frame header tells apart by the tag of its segment's salt.
 ///
 /// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames, written by one open of the store
 /// only. Its key derives from its number and a random salt of its own, so the offset of a frame is a unique nonce
@@ -99,6 +99,8 @@ final class LogWriter {
     private volatile long groupStart;
     // The preparation of the segment after the current one, run on the pool or by the flush task itself
     private FutureTask<LogFiles.Prepared> next;
+    // Set by the preparation in next when it starts, or by a close first, which it then leaves undone
+    private AtomicBoolean nextClaimed;
     private final Cipher cipher;
     private final CRC32C crc;
     // The buffer frames are sealed into and written from, a slice at a time whatever their size
@@ -201,8 +203,10 @@ final class LogWriter {
     /// behind it would make every commit waiting on that flush wait as long.
     private void prepareNext() {
         var number = segmentNumber + 1;
-        var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize));
+        var claimed = new AtomicBoolean();
+        var preparation = new FutureTask<>(() -> claimed.compareAndSet(false, true) ? files.prepare(number, segmentSize) : null);
         next = preparation;
+        nextClaimed = claimed;
         Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
     }
 
@@ -425,7 +429,7 @@ final class LogWriter {
         }
         this.groupStart = start;
         groupEnd = end;
-        if (next == null && position >= segmentSize / 2) {
+        if (next == null) {
             prepareNext();
         }
         return bodies;
@@ -739,8 +743,9 @@ final class LogWriter {
     /// Turns the segment prepared after the current one, which nothing wrote, back into a spare.
     private void spareNext() {
         var preparation = next;
-        // A preparation that has not started never runs; one still running leaves an unused segment to the next open
-        if (preparation == null || preparation.cancel(false)) {
+        // A preparation that has not started never runs; one that has is waited for, so no file of the store changes
+        // once it is closed
+        if (preparation == null || nextClaimed.compareAndSet(false, true)) {
             return;
         }
         try {
