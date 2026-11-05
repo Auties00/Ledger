@@ -189,6 +189,9 @@ public final class LiveLedger implements Ledger {
     void useDataFile(PageFile pages, FreeSpace space) {
         this.pages = pages;
         this.space = space;
+        for (var state : states.values()) {
+            state.lazy = !state.resident;
+        }
     }
 
     /// Makes `blobs` the file of large values: a batch writes there each value of at least `threshold` bytes, or of
@@ -214,6 +217,7 @@ public final class LiveLedger implements Ledger {
             }
             state = new KeyspaceState(Keyspace.paged(name, KeyCodec.bytes(), ValueCodec.bytes()));
             state.largeValues = largeValues;
+            state.lazy = true;
             states.put(name, state);
             sweepOrder = List.copyOf(states.values());
         }
@@ -1268,7 +1272,8 @@ public final class LiveLedger implements Ledger {
     /// @param dirty the keys written
     /// @param removals the range removals as of the cut
     /// @param count the entries as of the cut, leaving out the blind writes ([BlindWrites])
-    record KeyspaceCut(KeyspaceState state, List<Chain> dirty, RangeRemoval[] removals, long count) {
+    /// @param number the number of the cut in the key space, which [KeyspaceState#markDirty] gave the chains of `dirty`
+    record KeyspaceCut(KeyspaceState state, List<Chain> dirty, RangeRemoval[] removals, long count, long number) {
     }
 
     /// Cuts the writes of a checkpoint and registers a read at its sequence, which keeps the versions it needs until
@@ -1290,7 +1295,8 @@ public final class LiveLedger implements Ledger {
             }
             var cuts = new ArrayList<KeyspaceCut>(states.size());
             for (var state : states.values()) {
-                cuts.add(new KeyspaceCut(state, state.cutDirty(), state.removals, state.known(sequence)));
+                var number = state.dirtyNumber();
+                cuts.add(new KeyspaceCut(state, state.cutDirty(), state.removals, state.known(sequence), number));
             }
             var bound = Reads.boundOf(sequence);
             var superseded = new ArrayList<PageRef>();
@@ -1391,6 +1397,7 @@ public final class LiveLedger implements Ledger {
                 }
             }
             state.removeDropped();
+            state.pruneListed(keyspace.number());
         }
     }
 

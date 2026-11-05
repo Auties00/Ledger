@@ -37,9 +37,13 @@ final class Chain {
     final long prefix;
     /// The newest version, or `null` before the writer attaches the first one and once it drops the chain.
     volatile Version head;
-    /// Whether the ordered map holds the chain: the writer attaches no version before it does, so every committed
-    /// version a scan may see is in the map the scan walks.
+    /// Whether the ordered map holds the chain. In a key space that orders its chains eagerly, the writer attaches no
+    /// version before it does; in one that orders them lazily, the chain is listed among those a read of a range
+    /// orders first ([KeyspaceState#slice]). Either way every committed version a scan may see is in the map it walks.
     volatile boolean ordered;
+    /// The next of the chains a key space lists for a read of a range to order, or `null`; written before the chain
+    /// is listed, and by the thread that takes the list.
+    Chain nextUnordered;
     /// Whether the writer took the chain out of the maps; no version is attached to it again.
     volatile boolean dropped;
     /// The sequence of the last write claimed, 0 before any, or [#DROPPED]; only grows.

@@ -73,6 +73,43 @@ class CheckpointTest {
     }
 
     @Nested
+    @DisplayName("lazily ordered chains")
+    class LazilyOrdered {
+        @Test
+        @DisplayName("reads of a range see the keys written since the last checkpoint, which only they order")
+        void rangesSeeUnorderedKeys(@TempDir Path directory) {
+            try (var ledger = open(directory, MESSAGES)) {
+                var live = (LiveLedger) ledger;
+                var seed = ledger.newBatch();
+                for (var i = 0; i < 1_000; i += 2) {
+                    seed.put(MESSAGES, "m%04d".formatted(i), "even");
+                }
+                ledger.commit(seed);
+                ledger.checkpoint();
+                for (var i = 999; i > 0; i -= 2) {
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "m%04d".formatted(i), "odd"));
+                }
+                assertEquals(0, live.state(MESSAGES).entries.size());
+                var page = ledger.range(MESSAGES, KeyRange.between("m0100", "m0110"), 100);
+                assertEquals(List.of("m0100", "m0101", "m0102", "m0103", "m0104", "m0105", "m0106", "m0107", "m0108", "m0109"),
+                        page.stream().map(Entry::key).toList());
+                assertEquals(1_000, ledger.size(MESSAGES));
+                try (var snapshot = ledger.snapshot()) {
+                    // The removal counts the unordered keys of its range too
+                    ledger.commit(ledger.newBatch().deleteRange(MESSAGES, KeyRange.between("m0500", "m0600"))
+                            .put(MESSAGES, "z", "new"));
+                    assertEquals(901, ledger.size(MESSAGES));
+                    ledger.checkpoint();
+                    assertEquals(1_000, snapshot.size(MESSAGES));
+                    assertEquals(100, snapshot.range(MESSAGES, KeyRange.between("m0500", "m0600"), 1_000).size());
+                }
+                ledger.commit(ledger.newBatch().put(MESSAGES, "after", "x"));
+                assertEquals(902, ledger.range(MESSAGES, KeyRange.all(), 2_000).size());
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("blind writes")
     class BlindWrites {
         @Test
@@ -342,11 +379,13 @@ class CheckpointTest {
                 }
                 ledger.commit(batch);
                 var live = (LiveLedger) ledger;
-                assertEquals(5_000, live.state(MESSAGES).entries.size());
+                assertEquals(5_000, live.state(MESSAGES).chains());
                 ledger.checkpoint();
                 // The next commit's maintenance and the checkpoint's pruning drop what the tree holds
                 ledger.commit(ledger.newBatch().put(MESSAGES, "after", "x"));
-                assertTrue(live.state(MESSAGES).entries.size() <= 1, () -> live.state(MESSAGES).entries.size() + " entries in memory");
+                assertTrue(live.state(MESSAGES).chains() <= 1, () -> live.state(MESSAGES).chains() + " chains in memory");
+                // A paged key space orders its chains only for a read of a range, which none made
+                assertTrue(live.state(MESSAGES).entries.size() <= 1, () -> live.state(MESSAGES).entries.size() + " ordered");
                 assertEquals(5_000, live.state(CHATS).entries.size());
                 assertEquals(Optional.of("message 4321"), ledger.get(MESSAGES, "m04321"));
                 assertEquals(5_001, ledger.size(MESSAGES));
