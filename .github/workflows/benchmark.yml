@@ -3,9 +3,11 @@
 # results of all of them into one summary.
 #
 # Hosted runners share their hardware with other jobs, and their disks are virtual: compare engines within one run,
-# where they met the same conditions, rather than one run with another.
+# where they met the same conditions, rather than one run with another. With more than one round, each round runs every
+# engine of a workload in turn and the summary takes each result's median round, so a runner that slows down during
+# the job weighs on every engine rather than on those that happened to run last.
 name: Benchmark
-run-name: Benchmark ${{ inputs.group }} on ${{ inputs.os }} ${{ inputs.jmh-args }}
+run-name: Benchmark ${{ inputs.group }} on ${{ inputs.os }} ${{ inputs.jmh-args }} (${{ inputs.rounds }} rounds)
 
 on:
   workflow_dispatch:
@@ -24,6 +26,10 @@ on:
         description: 'Extra JMH arguments, for example: -p engine=rocksdb,sqlite -p messages=1000000'
         type: string
         default: ''
+      rounds:
+        description: Rounds of every workload, interleaving the engines; the summary takes each result's median round
+        type: string
+        default: '1'
 
 permissions:
   contents: read
@@ -89,6 +95,8 @@ jobs:
           LEDGER_BENCH_DIR: ${{ runner.temp }}/bench
           GROUP: ${{ matrix.group }}
           JMH_ARGS: ${{ inputs.jmh-args }}
+          ROUNDS: ${{ inputs.rounds }}
+          OS: ${{ matrix.os }}
           RESULTS: results/${{ matrix.os }}.json
           LOG: results/${{ matrix.os }}.log
         run: |
@@ -104,8 +112,18 @@ jobs:
             *) echo "::error::Unknown group $GROUP"; exit 1 ;;
           esac
           mkdir -p results
-          # JMH_ARGS is split into words on purpose
-          java -jar benchmark/target/benchmarks.jar "$PATTERN" -foe false -rf json -rff "$RESULTS" $JMH_ARGS 2>&1 | tee "$LOG"
+          if [ "${ROUNDS:-1}" -le 1 ]; then
+            # JMH_ARGS is split into words on purpose
+            java -jar benchmark/target/benchmarks.jar "$PATTERN" -foe false -rf json -rff "$RESULTS" $JMH_ARGS 2>&1 | tee "$LOG"
+          else
+            mkdir -p results/rounds
+            for round in $(seq 1 "$ROUNDS"); do
+              echo "::group::Round $round"
+              java -jar benchmark/target/benchmarks.jar "$PATTERN" -foe false -rf json -rff "results/rounds/$OS-$round.json" $JMH_ARGS 2>&1 | tee -a "$LOG"
+              echo "::endgroup::"
+            done
+            python .github/scripts/merge_rounds.py "$RESULTS" results/rounds/"$OS"-*.json
+          fi
 
       - name: Summarize
         if: always() && hashFiles('results/*.json') != ''
@@ -153,5 +171,6 @@ jobs:
             echo
             echo "Scores only; each job's summary has the percentiles and the disk and memory counters."
             echo
-            find all -name '*.json' -print0 | xargs -0 python .github/scripts/summarize.py --by-os
+            # The merged result of each runner, not its rounds
+            find all -name '*.json' -not -path '*/rounds/*' -print0 | xargs -0 python .github/scripts/summarize.py --by-os
           } >> "$GITHUB_STEP_SUMMARY"
