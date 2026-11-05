@@ -31,6 +31,9 @@ final class PageFile implements AutoCloseable {
     // all at once before its superblock: forced at the end, the writes of a checkpoint that rewrites hundreds of
     // megabytes kept the device idle while it built them, then made it wait seconds for them
     private static final long FORCE_EVERY = 32L << 20;
+    // Not on Windows, where the forces beside the work made the checkpoints of the random overwrite benchmark slower
+    // (14% fewer overwrites a second on the same runner) where they made them faster on Linux (19% more)
+    private static final boolean FORCE_BESIDE = !System.getProperty("os.name", "").startsWith("Windows");
     /// Marks a read that accepts a leaf or a branch.
     static final byte NODE = -1;
 
@@ -475,7 +478,7 @@ final class PageFile implements AutoCloseable {
                 await(forcing);
                 forcing = null;
             }
-            if (written - forcedUpTo < FORCE_EVERY) {
+            if (!FORCE_BESIDE || written - forcedUpTo < FORCE_EVERY) {
                 return;
             }
             forcedUpTo = written;
