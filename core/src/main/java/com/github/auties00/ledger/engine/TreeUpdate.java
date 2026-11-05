@@ -7,7 +7,9 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.RecursiveTask;
 
@@ -19,9 +21,13 @@ import java.util.concurrent.RecursiveTask;
 /// removed range covers is dropped without being rewritten. A rewritten node left less than a quarter full merges with
 /// a neighbour when both fit in one node.
 ///
+/// A leaf below the root that the writes change by a little is written as a delta record of what changed since its
+/// base leaf ([DeltaLeaves]); one that changes more, splits, or falls under a quarter full is written whole.
+///
 /// The units of the old tree the update replaces go to [#freed()]; the pages it takes go to [#allocated()], so a
-/// checkpoint that fails gives them back. A branch with many writes below it updates its children's subtrees in
-/// parallel, in the common fork-join pool.
+/// checkpoint that fails gives them back. The delta records it writes and those it drops are counted by page, which
+/// [#finishDeltas(DeltaTable)] applies to the table of delta pages once every tree is updated. A branch with many
+/// writes below it updates its children's subtrees in parallel, in the common fork-join pool.
 final class TreeUpdate {
     /// The writes below a branch from which its children's subtrees are updated on every processor.
     private static final int PARALLEL_OPS = 4_096;
@@ -32,6 +38,10 @@ final class TreeUpdate {
     private final List<PageRef> freed;
     private final List<PageRef> freedExternal;
     private final List<PageRef> allocated;
+    // The records each delta page gained or lost, by page
+    private final Map<Integer, Integer> records;
+    // Fills the delta pages of this update's thread
+    private final DeltaLeaves.Packer packer;
 
     TreeUpdate(PageFile pages, PageFile.Writer writer, FreeSpace space) {
         this.pages = pages;
@@ -40,6 +50,8 @@ final class TreeUpdate {
         this.freed = new ArrayList<>();
         this.freedExternal = new ArrayList<>();
         this.allocated = new ArrayList<>();
+        this.records = new HashMap<>();
+        this.packer = new DeltaLeaves.Packer(writer, this::allocate, (page, written) -> records.merge(page, written, Integer::sum));
     }
 
     /// The state of a key as of a checkpoint.
@@ -114,6 +126,17 @@ final class TreeUpdate {
         return allocated;
     }
 
+    /// Queues the delta page being filled and applies the records written and dropped to `table`, once every tree is
+    /// updated; the delta pages left with no record go to [#freed()].
+    ///
+    /// @return the table of delta pages after the update
+    DeltaTable finishDeltas(DeltaTable table) throws IOException {
+        packer.finish();
+        var next = table.apply(records, freed);
+        records.clear();
+        return next;
+    }
+
     /// {@return the root of the tree after `ops` and `removals`, or `null` if it is empty}
     ///
     /// @param root the root before, or `null` for an empty tree
@@ -133,7 +156,7 @@ final class TreeUpdate {
         } else {
             var unit = read(root.ref(), PageFile.NODE, true);
             var node = new Child(null, root.ref(), root.count(), root.blobs(), TreeNodes.level(unit), -1);
-            var replaced = update(node, unit, null, null, ops, 0, ops.size(), removals, 0, removals.size());
+            var replaced = update(node, unit, null, null, ops, 0, ops.size(), removals, 0, removals.size(), true);
             if (replaced == null) {
                 return root;
             }
@@ -156,18 +179,34 @@ final class TreeUpdate {
             freed.add(top.ref());
             top = TreeNodes.children(unit).getFirst();
         }
+        if (top.ref().isRecord()) {
+            // A root is a unit of its own: a leaf left alone at the top is written whole
+            var unit = read(top.ref(), PageFormat.LEAF, true);
+            retire(top.ref(), TreeNodes.base(unit, top.ref()));
+            top = writeLeaves(TreeNodes.leafEntries(unit)).getFirst();
+        }
         return new TreeRoot(top.ref(), top.count(), top.blobs());
     }
 
     /// {@return the nodes that replace `node`, or `null` if the writes change nothing under it}
+    ///
+    /// @param root whether `node` is the root, which is never a delta record
     private List<Child> update(Child node, byte[] unit, MemorySegment low, MemorySegment high, List<Op> ops,
-                               int opFrom, int opTo, List<Range> removals, int remFrom, int remTo) throws IOException {
+                               int opFrom, int opTo, List<Range> removals, int remFrom, int remTo, boolean root) throws IOException {
         if (TreeNodes.isLeaf(unit)) {
-            var merged = merge(TreeNodes.leafEntries(unit), ops, opFrom, opTo, removals, remFrom, remTo);
+            var entries = TreeNodes.leafEntries(unit);
+            var merged = merge(entries, ops, opFrom, opTo, removals, remFrom, remTo);
             if (merged == null) {
                 return null;
             }
-            freed.add(node.ref());
+            var base = TreeNodes.base(unit, node.ref());
+            if (!root) {
+                var delta = writeDelta(node.ref(), base, base == node.ref() ? entries : null, merged);
+                if (delta != null) {
+                    return delta.isEmpty() ? null : delta;
+                }
+            }
+            retire(node.ref(), base);
             return writeLeaves(merged);
         }
         var children = TreeNodes.children(unit);
@@ -275,6 +314,7 @@ final class TreeUpdate {
         for (var task : tasks) {
             freed.addAll(task.update.freed);
             freedExternal.addAll(task.update.freedExternal);
+            task.update.records.forEach((page, change) -> records.merge(page, change, Integer::sum));
             replacements[task.index] = task.getRawResult();
         }
         return replacements;
@@ -283,7 +323,58 @@ final class TreeUpdate {
     /// {@return the nodes that replace `child`, or `null` if the writes `plan` gives it change nothing under it}
     private List<Child> update(Child child, List<Op> ops, List<Range> removals, Plan plan) throws IOException {
         var unit = read(child.ref(), PageFile.NODE, true);
-        return update(child, unit, plan.low(), plan.high(), ops, plan.opFrom(), plan.opTo(), removals, plan.remFrom(), plan.remTo());
+        return update(child, unit, plan.low(), plan.high(), ops, plan.opFrom(), plan.opTo(), removals, plan.remFrom(), plan.remTo(), false);
+    }
+
+    /// Writes the leaf `ref`, made from the leaf `base`, as a delta record if what changed since `base` makes a small
+    /// one and `merged`, the entries after the writes, fill one leaf at least a quarter.
+    ///
+    /// @param baseEntries the entries of `base`, or `null` to read them
+    /// @return the record, alone; an empty list if `merged` is what `ref` holds already; or `null` if the leaf is to
+    ///         be written whole
+    private List<Child> writeDelta(PageRef ref, PageRef base, List<LeafEntry> baseEntries, List<LeafEntry> merged) throws IOException {
+        if (merged.isEmpty()) {
+            return null;
+        }
+        var fill = 2;
+        var blobs = false;
+        for (var entry : merged) {
+            fill += entry.size();
+            blobs |= entry.blob() != null;
+        }
+        if (fill - 2 > TreeNodes.CAPACITY || fill < TreeNodes.MIN_FILL) {
+            return null;
+        }
+        var changes = DeltaLeaves.diff(baseEntries != null ? baseEntries : TreeNodes.leafEntries(read(base, PageFormat.LEAF, true)), merged);
+        if (changes.isEmpty()) {
+            if (!ref.isRecord()) {
+                return List.of();
+            }
+            // Back to what the base holds
+            dropRecord(ref);
+            return List.of(new Child(merged.getFirst().key(), base, merged.size(), blobs, 0, fill));
+        }
+        var size = DeltaLeaves.recordSize(changes);
+        if (size > DeltaLeaves.MAX_RECORD) {
+            return null;
+        }
+        if (ref.isRecord()) {
+            dropRecord(ref);
+        }
+        var record = packer.append(base, changes, size);
+        return List.of(new Child(merged.getFirst().key(), record, merged.size(), blobs, 0, fill));
+    }
+
+    /// Gives up the leaf `ref`, made from the leaf `base`: frees a unit, or drops a delta record and frees its base.
+    private void retire(PageRef ref, PageRef base) {
+        if (ref.isRecord()) {
+            dropRecord(ref);
+        }
+        freed.add(base);
+    }
+
+    private void dropRecord(PageRef ref) {
+        records.merge(ref.page(), -1, Integer::sum);
     }
 
     /// The share of the writes of one child of a branch.
@@ -316,17 +407,35 @@ final class TreeUpdate {
         @Override
         protected List<Child> compute() {
             try {
-                return update.update(child, ops, removals, plan);
+                var replacement = update.update(child, ops, removals, plan);
+                // The records of the subtree end its own pages, so the branch above reads them back from the writer
+                update.packer.finish();
+                return replacement;
             } catch (IOException exception) {
                 throw new UncheckedIOException(exception);
             }
         }
     }
 
-    /// {@return the plaintext of the unit `ref` names: queued by this checkpoint, cached or in the file}
+    /// {@return the plaintext of the unit `ref` names: queued by this checkpoint, cached or in the file; for a delta
+    /// record, the leaf it makes, from a delta page this update may still be filling}
     private byte[] read(PageRef ref, byte kind, boolean cached) {
-        var unit = writer.staged(ref);
-        return unit != null ? unit : pages.read(ref, kind, cached);
+        if (!ref.isRecord()) {
+            var unit = writer.staged(ref);
+            return unit != null ? unit : pages.read(ref, kind, cached);
+        }
+        var hit = pages.cached(ref, kind);
+        if (hit != null) {
+            return hit;
+        }
+        return DeltaLeaves.materialize(ref, (unit, unitKind) -> {
+            var filling = packer.filling(unit);
+            if (filling != null) {
+                return filling;
+            }
+            var staged = writer.staged(unit);
+            return staged != null ? staged : pages.read(unit, unitKind, cached);
+        });
     }
 
     private static boolean covers(Range range, MemorySegment from, MemorySegment to) {
@@ -337,8 +446,8 @@ final class TreeUpdate {
     /// Frees every unit of the subtree under `node`.
     private void drop(Child node) {
         if (node.level() == 0) {
+            var unit = node.blobs() || node.ref().isRecord() ? read(node.ref(), PageFormat.LEAF, false) : null;
             if (node.blobs()) {
-                var unit = read(node.ref(), PageFormat.LEAF, false);
                 for (var i = 0; i < TreeNodes.count(unit); i++) {
                     var entry = TreeNodes.entry(unit, i);
                     if (TreeNodes.isBlob(unit, entry)) {
@@ -348,13 +457,14 @@ final class TreeUpdate {
                     }
                 }
             }
+            retire(node.ref(), unit == null ? node.ref() : TreeNodes.base(unit, node.ref()));
         } else {
             var unit = read(node.ref(), PageFormat.BRANCH, false);
             for (var child : TreeNodes.children(unit)) {
                 drop(child);
             }
+            freed.add(node.ref());
         }
-        freed.add(node.ref());
     }
 
     /// {@return the entries of a leaf after the writes that reach it, or `null` if they change none}
@@ -430,6 +540,7 @@ final class TreeUpdate {
         return new LeafEntry(op.key(), null, ref, (int) length);
     }
 
+    /// {@return the first of `unitPages` free pages, which the update took}
     private int allocate(int unitPages) {
         var page = space.allocate(unitPages);
         allocated.add(new PageRef(page, unitPages, 0, 0));
@@ -513,8 +624,8 @@ final class TreeUpdate {
                     children.addAll(TreeNodes.children(unitB));
                     replacement = writeBranches(children);
                 }
-                freed.add(a.ref());
-                freed.add(b.ref());
+                retire(a.ref(), TreeNodes.base(unitA, a.ref()));
+                retire(b.ref(), TreeNodes.base(unitB, b.ref()));
                 nodes.remove(left + 1);
                 nodes.remove(left);
                 nodes.addAll(left, replacement);

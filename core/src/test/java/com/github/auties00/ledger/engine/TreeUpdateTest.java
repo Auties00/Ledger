@@ -45,7 +45,9 @@ class TreeUpdateTest {
                 keys.add(key);
             }
             TreeRoot root = null;
+            var deltas = DeltaTable.EMPTY;
             var deepest = 0;
+            var records = 0;
             for (var round = 0; round < 40; round++) {
                 var states = new TreeMap<byte[], byte[]>(UNSIGNED);
                 var writes = round < 3 ? 12_000 : random.nextInt(600);
@@ -83,6 +85,7 @@ class TreeUpdateTest {
                 var writer = pages.writer(random.nextLong());
                 var update = new TreeUpdate(pages, writer, space);
                 root = update.apply(root, ops, ranges);
+                deltas = update.finishDeltas(deltas);
                 writer.flush();
                 for (var unit : update.freed()) {
                     space.release(unit.page(), unit.pages());
@@ -92,12 +95,13 @@ class TreeUpdateTest {
                     pages.cache().clearForTests();
                 }
                 verify(pages, root, model, random, keys);
-                verifyPages(pages, space, root);
+                records = Math.max(records, verifyPages(pages, space, root, deltas));
                 if (root != null) {
                     deepest = Math.max(deepest, TreeNodes.level(pages.read(root.ref(), PageFile.NODE, true)));
                 }
             }
             assertTrue(deepest >= 2, () -> "the tree never grew past level " + 1);
+            assertTrue(records > 0, "no leaf was ever written as a delta record");
         }
     }
 
@@ -164,36 +168,19 @@ class TreeUpdateTest {
         }
     }
 
-    private static void verifyPages(PageFile pages, FreeSpace space, TreeRoot root) {
+    /// {@return the delta records the tree refers to}
+    private static int verifyPages(PageFile pages, FreeSpace space, TreeRoot root, DeltaTable deltas) {
         var used = new BitSet();
+        var records = new TreeMap<Integer, Integer>();
         if (root != null) {
-            walk(pages, root.ref(), used);
+            assertFalse(root.ref().isRecord(), "the root is a delta record");
+            CheckpointTest.walk(pages, root.ref(), used, new BitSet(), records);
         }
+        CheckpointTest.verifyDeltas(used, records, deltas);
         for (var page = PageFormat.FIRST_UNIT_PAGE; page < space.pageCount(); page++) {
             var free = space.isUnused(page);
             assertTrue(free != used.get(page), "page " + page + (free ? " is free and in use" : " is neither free nor in use"));
         }
-    }
-
-    private static void walk(PageFile pages, PageRef ref, BitSet used) {
-        assertFalse(used.get(ref.page()), "page " + ref.page() + " is used twice");
-        used.set(ref.page());
-        var unit = pages.read(ref, PageFile.NODE, true);
-        if (TreeNodes.isLeaf(unit)) {
-            for (var i = 0; i < TreeNodes.count(unit); i++) {
-                var entry = TreeNodes.entry(unit, i);
-                if (TreeNodes.isBlob(unit, entry)) {
-                    var blob = TreeNodes.blobRef(unit, entry);
-                    for (var page = blob.page(); page < blob.page() + blob.pages(); page++) {
-                        assertFalse(used.get(page), "page " + page + " is used twice");
-                        used.set(page);
-                    }
-                }
-            }
-            return;
-        }
-        for (var i = 0; i < TreeNodes.count(unit); i++) {
-            walk(pages, TreeNodes.childRef(unit, i), used);
-        }
+        return records.values().stream().mapToInt(Integer::intValue).sum();
     }
 }

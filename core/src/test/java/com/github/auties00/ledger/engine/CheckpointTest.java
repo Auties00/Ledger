@@ -73,6 +73,87 @@ class CheckpointTest {
     }
 
     @Nested
+    @DisplayName("delta records")
+    class DeltaRecords {
+        @Test
+        @DisplayName("hold the scattered writes of each checkpoint, read back in snapshots, after a reopen and with pages accounted")
+        void scatteredWrites(@TempDir Path directory) throws IOException {
+            var random = new Random(5);
+            var model = new TreeMap<String, String>();
+            try (var ledger = open(directory, MESSAGES)) {
+                var seed = ledger.newBatch();
+                for (var i = 0; i < 6_000; i++) {
+                    var key = "m%05d".formatted(i * 2);
+                    var value = value(random);
+                    seed.put(MESSAGES, key, value);
+                    model.put(key, value);
+                }
+                ledger.commit(seed);
+                ledger.checkpoint();
+                for (var round = 0; round < 6; round++) {
+                    try (var before = ledger.snapshot()) {
+                        var expected = new TreeMap<>(model);
+                        scatter(ledger, model, random);
+                        ledger.checkpoint();
+                        assertMatches(before, expected, random);
+                    }
+                    assertMatches(ledger, model, random);
+                }
+            }
+            assertTrue(verifyPages(directory, true) > 0, "no leaf was written as a delta record");
+            try (var ledger = open(directory, MESSAGES)) {
+                assertMatches(ledger, model, random);
+                for (var round = 0; round < 4; round++) {
+                    scatter(ledger, model, random);
+                    ledger.checkpoint();
+                    assertMatches(ledger, model, random);
+                }
+                // Removing most keys writes the leaves whole again, or drops them
+                ledger.commit(ledger.newBatch().deleteRange(MESSAGES, KeyRange.between("m02000", "m10000")));
+                model.subMap("m02000", "m10000").clear();
+                ledger.checkpoint();
+                assertMatches(ledger, model, random);
+            }
+            verifyPages(directory, true);
+            try (var ledger = open(directory, MESSAGES)) {
+                assertMatches(ledger, model, random);
+            }
+        }
+
+        private static String value(Random random) {
+            return "v".repeat(150 + random.nextInt(100)) + random.nextInt();
+        }
+
+        /// Overwrites, removes and adds a few hundred keys spread over the whole key space.
+        private static void scatter(Ledger ledger, TreeMap<String, String> model, Random random) {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < 300; i++) {
+                var key = "m%05d".formatted(random.nextInt(12_000));
+                if (random.nextInt(8) == 0) {
+                    batch.delete(MESSAGES, key);
+                    model.remove(key);
+                } else {
+                    var value = value(random);
+                    batch.put(MESSAGES, key, value);
+                    model.put(key, value);
+                }
+            }
+            ledger.commit(batch);
+        }
+
+        private static void assertMatches(View view, TreeMap<String, String> model, Random random) {
+            assertEquals(model.size(), view.size(MESSAGES));
+            var all = view.range(MESSAGES, KeyRange.all(), 20_000);
+            assertEquals(new ArrayList<>(model.keySet()), all.stream().map(Entry::key).toList());
+            assertEquals(new ArrayList<>(model.values()), all.stream().map(Entry::value).toList());
+            for (var i = 0; i < 200; i++) {
+                var key = "m%05d".formatted(random.nextInt(12_000));
+                assertEquals(Optional.ofNullable(model.get(key)), view.get(MESSAGES, key));
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("lazily ordered chains")
     class LazilyOrdered {
         @Test
@@ -890,13 +971,15 @@ class CheckpointTest {
     }
 
     /// Walks the data file from its newest superblock and checks that every page is used once or free.
-    static void verifyPages(Path directory, boolean encrypted) throws IOException {
+    ///
+    /// @return the delta records the trees refer to
+    static int verifyPages(Path directory, boolean encrypted) throws IOException {
         var header = StoreHeader.read(directory);
         var keys = header.open(encrypted ? EncryptionSpec.key(KEY) : EncryptionSpec.NONE);
         try (var pages = PageFile.open(directory, new PageCipher(keys.pageKey()), 1 << 20, new HeapPool(1 << 20))) {
             var superblock = pages.superblock();
             if (superblock == null) {
-                return;
+                return 0;
             }
             var used = new BitSet();
             var usedBlobs = new BitSet();
@@ -905,12 +988,20 @@ class CheckpointTest {
             if (superblock.blobFreeList() != null) {
                 mark(used, superblock.blobFreeList());
             }
+            var deltas = DeltaTable.EMPTY;
+            if (superblock.deltaTable() != null) {
+                mark(used, superblock.deltaTable());
+                deltas = DeltaTable.decode(pages.read(superblock.deltaTable(), PageFormat.DELTA_TABLE, false));
+            }
             var catalog = Catalog.decode(pages.read(superblock.catalog(), PageFormat.CATALOG, false));
+            var records = new java.util.TreeMap<Integer, Integer>();
             for (var entry : catalog.entries()) {
                 if (entry.root() != null) {
-                    walk(pages, entry.root().ref(), used, usedBlobs);
+                    assertFalse(entry.root().ref().isRecord(), "a root is a delta record");
+                    walk(pages, entry.root().ref(), used, usedBlobs, records);
                 }
             }
+            verifyDeltas(used, records, deltas);
             var free = Catalog.decodeFreeList(pages.read(superblock.freeList(), PageFormat.FREE_LIST, false), superblock.pageCount());
             for (var page = PageFormat.FIRST_UNIT_PAGE; page < superblock.pageCount(); page++) {
                 assertTrue(used.get(page) != free.get(page), "page " + page + (used.get(page) ? " is used and free" : " is neither used nor free"));
@@ -924,6 +1015,7 @@ class CheckpointTest {
                         "page " + page + " of the large values" + (usedBlobs.get(page) ? " is used and free" : " is neither used nor free"));
             }
             assertTrue(usedBlobs.isEmpty() || usedBlobs.length() <= superblock.blobPageCount(), "a value is past the end of its file");
+            return records.values().stream().mapToInt(Integer::intValue).sum();
         }
     }
 
@@ -934,9 +1026,23 @@ class CheckpointTest {
         }
     }
 
-    private static void walk(PageFile pages, PageRef ref, BitSet used, BitSet usedBlobs) {
-        mark(used, ref);
+    /// Marks the delta pages the trees refer to, each once, and checks their table counts the records walked.
+    static void verifyDeltas(BitSet used, java.util.Map<Integer, Integer> records, DeltaTable deltas) {
+        for (var entry : records.entrySet()) {
+            mark(used, new PageRef(entry.getKey(), 1, 0, 0));
+            assertEquals(entry.getValue(), deltas.records(entry.getKey()), "delta page " + entry.getKey() + " counts wrong");
+        }
+        assertEquals(records.size(), deltas.size(), "the table lists delta pages no tree refers to");
+    }
+
+    static void walk(PageFile pages, PageRef ref, BitSet used, BitSet usedBlobs, java.util.Map<Integer, Integer> records) {
         var unit = pages.read(ref, PageFile.NODE, false);
+        if (ref.isRecord()) {
+            records.merge(ref.page(), 1, Integer::sum);
+            mark(used, TreeNodes.base(unit, ref));
+        } else {
+            mark(used, ref);
+        }
         for (var i = 0; i < TreeNodes.count(unit); i++) {
             if (TreeNodes.isLeaf(unit)) {
                 var entry = TreeNodes.entry(unit, i);
@@ -946,7 +1052,7 @@ class CheckpointTest {
                     mark(usedBlobs, TreeNodes.blobRef(unit, entry));
                 }
             } else {
-                walk(pages, TreeNodes.childRef(unit, i), used, usedBlobs);
+                walk(pages, TreeNodes.childRef(unit, i), used, usedBlobs, records);
             }
         }
     }

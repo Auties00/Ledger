@@ -141,14 +141,26 @@ final class PageFile implements AutoCloseable {
 
     /// {@return the plaintext of the unit `ref` names, from the cache or the file}
     ///
+    /// A delta record reads as the leaf it makes of its base ([DeltaLeaves]).
+    ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
-    /// @param cached whether to keep the unit in the cache
+    /// @param cached whether to keep the unit in the cache, and the units a delta record's leaf is made of
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
     byte[] read(PageRef ref, byte kind, boolean cached) {
         var hit = cache.get(ref);
         if (hit != null && kindMatches(hit[PageFormat.KIND], kind)) {
             return hit;
+        }
+        if (ref.isRecord()) {
+            var leaf = DeltaLeaves.materialize(ref, (unit, unitKind) -> read(unit, unitKind, cached));
+            if (!kindMatches(leaf[PageFormat.KIND], kind)) {
+                throw new LedgerCorruptedException(path + " holds a delta record where a branch belongs, at page " + ref.page(), null);
+            }
+            if (cached) {
+                cache.put(ref, leaf, true);
+            }
+            return leaf;
         }
         var length = ref.pages() * PageFormat.SIZE;
         var sealed = pool.acquire(length);
@@ -373,10 +385,17 @@ final class PageFile implements AutoCloseable {
         /// @return the reference of the unit
         PageRef write(byte kind, int level, int page, int pages, byte[] unit, int length, boolean cached) throws IOException {
             synchronized (lock) {
-                if (nonceLow == -1) {
-                    throw new IllegalStateException("A checkpoint ran out of nonces");
-                }
-                var ref = new PageRef(page, pages, nonceHigh, nonceLow++);
+                return write(kind, level, page, pages, unit, length, cached, nextNonce());
+            }
+        }
+
+        /// Queues `unit` as [#write(byte, int, int, int, byte\[\], int, boolean)] does, sealed under `nonce`, which
+        /// [#nextNonce()] gave.
+        ///
+        /// @return the reference of the unit
+        PageRef write(byte kind, int level, int page, int pages, byte[] unit, int length, boolean cached, int nonce) throws IOException {
+            synchronized (lock) {
+                var ref = new PageRef(page, pages, nonceHigh, nonce);
                 header(unit, kind, level, page, pages, length, ref.nonceHigh(), ref.nonceLow());
                 if (staged.put(page, new Staged(ref, unit)) != null) {
                     throw new IllegalStateException("A checkpoint wrote page " + page + " twice");
@@ -407,9 +426,13 @@ final class PageFile implements AutoCloseable {
             return nonceHigh;
         }
 
-        /// {@return the next nonce, for a unit written outside this writer}
+        /// {@return the next nonce, for a unit written outside this writer or whose reference is needed before it is
+        /// queued}
         int nextNonce() {
             synchronized (lock) {
+                if (nonceLow == -1) {
+                    throw new IllegalStateException("A checkpoint ran out of nonces");
+                }
                 return nonceLow++;
             }
         }

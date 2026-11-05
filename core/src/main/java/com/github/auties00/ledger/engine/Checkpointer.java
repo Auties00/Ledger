@@ -66,14 +66,19 @@ final class Checkpointer {
     private final Condition progress;
     // Set when a superblock write failed: no checkpoint runs again in this open
     private volatile LedgerIoException stopped;
+    // The delta pages of the last durable checkpoint, and the blob that holds their table, or null; guarded by the lock
+    private DeltaTable deltas;
+    private PageRef deltaTable;
 
     /// Creates the checkpointer of `ledger`.
     ///
     /// @param every the log growth that starts a checkpoint, in bytes
     /// @param number the number of the last durable checkpoint, or 0
+    /// @param deltas the delta pages of the last durable checkpoint
+    /// @param deltaTable the blob holding their table, or `null` if there is none
     /// @param failures receives the failures of the checkpoints started on their own threads
     Checkpointer(LiveLedger ledger, PageFile pages, FreeSpace space, BlobFile blobs, LogWriter log, LogFiles files, long every,
-                 long number, Consumer<? super LedgerException> failures) {
+                 long number, DeltaTable deltas, PageRef deltaTable, Consumer<? super LedgerException> failures) {
         this.ledger = ledger;
         this.pages = pages;
         this.space = space;
@@ -82,6 +87,8 @@ final class Checkpointer {
         this.files = files;
         this.every = every;
         this.number = number;
+        this.deltas = deltas;
+        this.deltaTable = deltaTable;
         this.lock = new ReentrantLock();
         this.scheduled = new AtomicBoolean();
         this.random = new SecureRandom();
@@ -185,12 +192,21 @@ final class Checkpointer {
             PageRef catalog;
             PageRef freeList;
             PageRef blobFreeList = null;
+            DeltaTable nextDeltas;
+            PageRef nextDeltaTable = null;
             var freed = new ArrayList<PageRef>();
             var adopted = new HashSet<PageRef>();
             var superblockWritten = false;
             try {
                 roots = build(cut, update, adopted);
+                nextDeltas = update.finishDeltas(deltas);
                 freed.addAll(update.freed());
+                if (deltaTable != null) {
+                    freed.add(deltaTable);
+                }
+                if (!nextDeltas.isEmpty()) {
+                    nextDeltaTable = writeDeltaTable(writer, update, nextDeltas);
+                }
                 if (cut.base() != null) {
                     freed.add(cut.base().catalog);
                     freed.add(cut.base().freeList);
@@ -216,9 +232,12 @@ final class Checkpointer {
                 pages.force();
                 superblockWritten = true;
                 pages.writeSuperblock(new Superblock(number + 1, cut.sequence(), cut.logStart(), space.pageCount(), catalog, freeList,
-                                blobRuns == null ? 0 : blobRuns.pageCount(), blobFreeList, blobs == null ? 0 : blobs.epoch()),
+                                blobRuns == null ? 0 : blobRuns.pageCount(), blobFreeList, blobs == null ? 0 : blobs.epoch(),
+                                nextDeltaTable),
                         writer.nonceHigh(), writer.nextNonce());
                 number++;
+                deltas = nextDeltas;
+                deltaTable = nextDeltaTable;
             } catch (IOException exception) {
                 var failure = new LedgerIoException("The checkpoint could not be written", exception);
                 if (superblockWritten) {
@@ -347,6 +366,14 @@ final class Checkpointer {
         var page = allocate(unitPages, update);
         var unit = Catalog.encodeFreeList(runs.runs(), unitPages);
         return writer.write(PageFormat.FREE_LIST, 0, page, unitPages, unit, Bytes.i32(unit, PageFormat.LENGTH), false);
+    }
+
+    /// Writes the table of the delta pages the checkpoint makes durable.
+    private PageRef writeDeltaTable(PageFile.Writer writer, TreeUpdate update, DeltaTable table) throws IOException {
+        var unitPages = PageFormat.pagesFor(table.length());
+        var page = allocate(unitPages, update);
+        var unit = table.encode(unitPages);
+        return writer.write(PageFormat.DELTA_TABLE, 0, page, unitPages, unit, table.length(), false);
     }
 
     /// Writes the free list of the state the checkpoint makes durable, in pages taken from that list.

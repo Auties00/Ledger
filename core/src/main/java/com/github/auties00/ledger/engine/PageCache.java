@@ -20,6 +20,8 @@ final class PageCache {
     static final int DATA = 0;
     /// The file of the values written at commit, `ledger.blobs`.
     static final int BLOBS = 1;
+    /// The first of the keys of the leaves delta records make, one per slot of a delta page of `ledger.data`.
+    private static final int RECORDS = 2;
 
     private final ConcurrentHashMap<Long, Entry> entries;
     // The entries in eviction order, current or dropped
@@ -43,9 +45,15 @@ final class PageCache {
         return (long) file << 32 | (page & 0xFFFF_FFFFL);
     }
 
-    /// {@return the plaintext of the unit `ref` of the data file names, or `null` if the cache does not hold it}
+    /// {@return the plaintext of the unit `ref` of the data file names, or of the leaf its delta record makes, or
+    /// `null` if the cache does not hold it}
     byte[] get(PageRef ref) {
-        return get(key(DATA, ref.page()), ref);
+        return get(key(ref), ref);
+    }
+
+    /// {@return the key of the unit `ref` of the data file names, or of the leaf its delta record makes}
+    private static long key(PageRef ref) {
+        return key(ref.isRecord() ? RECORDS + ref.slot() : DATA, ref.page());
     }
 
     /// {@return the plaintext of the unit `ref` names, at `key`, or `null` if the cache does not hold it}
@@ -67,7 +75,7 @@ final class PageCache {
     ///
     /// @param referenced whether the unit counts as read, rather than written and maybe never read
     void put(PageRef ref, byte[] unit, boolean referenced) {
-        put(key(DATA, ref.page()), ref, unit, referenced);
+        put(key(ref), ref, unit, referenced);
     }
 
     /// Caches `unit`, the plaintext of the unit `ref` names, at `key`, replacing whatever the cache held there.
