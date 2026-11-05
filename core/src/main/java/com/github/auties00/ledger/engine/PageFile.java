@@ -54,7 +54,10 @@ final class PageFile implements AutoCloseable {
         this.cipher = cipher;
         this.cache = cache;
         this.pool = pool;
-        this.writer = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        // On Windows the pages reach the drive as a checkpoint writes them: a force of everything at the end held the
+        // drive for seconds, and every durable commit's force of the log waited behind it
+        this.writer = FORCE_BESIDE ? FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)
+                : FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.DSYNC);
         this.fullSync = FullSync.open(path);
         this.readers = new ArrayBlockingQueue<>(READ_CHANNELS);
         try {
