@@ -123,6 +123,11 @@ final class PageCache {
         return bytes.get();
     }
 
+    /// {@return whether the cache holds `bytes` fewer bytes than its limit, so caching them would evict nothing}
+    boolean hasRoom(long bytes) {
+        return this.bytes.get() + bytes <= limit;
+    }
+
     /// {@return the entries the clock holds, current or dropped, for tests that bound it}
     int clockLengthForTests() {
         return clock.size();
