@@ -78,6 +78,14 @@ final class DeltaLeaves {
         return unit;
     }
 
+    /// {@return the entries of record `slot` of the delta page `page`, as views of it}
+    static List<LeafEntry> record(byte[] page, int slot) {
+        if (slot >= Bytes.u16(page, COUNT)) {
+            throw new LedgerCorruptedException("A delta page holds no record " + slot, null);
+        }
+        return changes(page, Bytes.u16(page, COUNT + 2 + 2 * slot));
+    }
+
     /// {@return the entries of the record at `record` of the delta page `page`, as views of it}
     private static List<LeafEntry> changes(byte[] page, int record) {
         var count = Bytes.u16(page, record + 16);
@@ -134,6 +142,25 @@ final class DeltaLeaves {
             changes.add(LeafEntry.removed(base.get(at++).key()));
         }
         return changes;
+    }
+
+    /// {@return the changes of `older` followed by those of `newer`, both in key order: `newer` wins a key both hold}
+    static List<LeafEntry> combine(List<LeafEntry> older, List<LeafEntry> newer) {
+        var out = new ArrayList<LeafEntry>(older.size() + newer.size());
+        var at = 0;
+        for (var change : newer) {
+            while (at < older.size() && Segments.compare(older.get(at).key(), change.key()) < 0) {
+                out.add(older.get(at++));
+            }
+            if (at < older.size() && Segments.compare(older.get(at).key(), change.key()) == 0) {
+                at++;
+            }
+            out.add(change);
+        }
+        while (at < older.size()) {
+            out.add(older.get(at++));
+        }
+        return out;
     }
 
     /// {@return the bytes the record of `changes` takes}
