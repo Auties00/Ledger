@@ -187,6 +187,7 @@ final class Checkpointer {
             }
             cutBytes = cut.logBytes();
             var writer = pages.writer(random.nextLong());
+            space.rewindRuns();
             var update = new TreeUpdate(pages, writer, space);
             TreeRoot[] roots;
             PageRef catalog;
