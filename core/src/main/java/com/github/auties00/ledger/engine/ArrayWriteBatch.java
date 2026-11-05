@@ -260,14 +260,15 @@ public final class ArrayWriteBatch implements WriteBatch {
         return used;
     }
 
-    /// Moves the encodings into an array of their size if they fill less than half of the batch's, before the store
-    /// reads the writes through the accessors.
+    /// Moves the encodings into an array of their size if they leave a sixteenth of the batch's unused, before the
+    /// store reads the writes through the accessors.
     ///
     /// The store keeps the array it applies the writes from for as long as the versions slice it: until checkpoints
     /// have written them and no read needs them. Without this, a commit of one small write would keep the whole
-    /// [#INITIAL_CAPACITY] of its batch. The batch keeps its own array for its next writes.
+    /// [#INITIAL_CAPACITY] of its batch, and a batch that grew by doubling a quarter of its array on average, every
+    /// byte of which the store held for each write. The batch keeps its own array for its next writes.
     public void compact() {
-        if (spare != null || used > data.length / 2) {
+        if (spare != null || used > data.length - data.length / 16) {
             return;
         }
         spare = data;
