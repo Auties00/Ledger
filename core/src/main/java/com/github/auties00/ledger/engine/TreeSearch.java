@@ -4,8 +4,6 @@ import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 /// Point lookups and range counts in a key space's tree.
 final class TreeSearch {
@@ -65,10 +63,10 @@ final class TreeSearch {
 
     /// {@return the leaves of the tree under `root`, in key order, without caching them}
     ///
-    /// It reads the tree a level at a time, `parallelism` nodes at once: a store that just opened finds its file out
-    /// of the OS cache as often as not, and reading the leaves of its resident key spaces one after another made the
-    /// open wait for each read in turn.
-    static List<byte[]> leaves(PageFile pages, TreeRoot root, int parallelism) {
+    /// It reads the tree a level at a time, with [PageFile#readAll(List, byte)]: a store that just opened finds its
+    /// file out of the OS cache as often as not, and reading the leaves of its resident key spaces one after another
+    /// made the open wait for each read in turn.
+    static List<byte[]> leaves(PageFile pages, TreeRoot root) {
         var level = List.of(pages.read(root.ref(), PageFile.NODE, false));
         while (!TreeNodes.isLeaf(level.getFirst())) {
             var refs = new ArrayList<PageRef>();
@@ -77,54 +75,9 @@ final class TreeSearch {
                     refs.add(TreeNodes.childRef(unit, i));
                 }
             }
-            level = readAll(pages, refs, parallelism);
+            level = Arrays.asList(pages.readAll(refs, PageFile.NODE));
         }
         return level;
-    }
-
-    /// {@return the nodes `refs` name, in their order, read `parallelism` at once on virtual threads}
-    private static List<byte[]> readAll(PageFile pages, List<PageRef> refs, int parallelism) {
-        var units = new byte[refs.size()][];
-        var threads = Math.min(parallelism, refs.size());
-        if (threads <= 1) {
-            for (var i = 0; i < units.length; i++) {
-                units[i] = pages.read(refs.get(i), PageFile.NODE, false);
-            }
-            return Arrays.asList(units);
-        }
-        var next = new AtomicInteger();
-        var failure = new AtomicReference<RuntimeException>();
-        Runnable reader = () -> {
-            for (var i = next.getAndIncrement(); i < units.length && failure.get() == null; i = next.getAndIncrement()) {
-                try {
-                    units[i] = pages.read(refs.get(i), PageFile.NODE, false);
-                } catch (RuntimeException exception) {
-                    failure.compareAndSet(null, exception);
-                }
-            }
-        };
-        var started = new Thread[threads];
-        for (var i = 0; i < threads; i++) {
-            started[i] = Thread.ofVirtual().name("ledger-load").start(reader);
-        }
-        var interrupted = false;
-        for (var thread : started) {
-            while (true) {
-                try {
-                    thread.join();
-                    break;
-                } catch (InterruptedException _) {
-                    interrupted = true;
-                }
-            }
-        }
-        if (interrupted) {
-            Thread.currentThread().interrupt();
-        }
-        if (failure.get() != null) {
-            throw failure.get();
-        }
-        return Arrays.asList(units);
     }
 
     /// {@return the read-only value of leaf entry `entry` of `unit`, read from its blob if it has one}

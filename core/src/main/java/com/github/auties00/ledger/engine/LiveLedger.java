@@ -247,7 +247,7 @@ public final class LiveLedger implements Ledger {
             if (!state.resident || entry.root() == null) {
                 continue;
             }
-            for (var leaf : TreeSearch.leaves(pages, entry.root(), PageFile.READ_CHANNELS)) {
+            for (var leaf : TreeSearch.leaves(pages, entry.root())) {
                 for (var i = 0; i < TreeNodes.count(leaf); i++) {
                     var offset = TreeNodes.entry(leaf, i);
                     var value = TreeSearch.value(pages, leaf, offset, false);
