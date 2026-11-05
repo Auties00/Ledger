@@ -101,6 +101,37 @@ class TreeUpdateTest {
         }
     }
 
+    @ParameterizedTest(name = "cache of {0} bytes")
+    @ValueSource(ints = {1 << 20, 64 << 20})
+    @DisplayName("a long scan keeps the leaves it reads while the cache has room for them, and evicts no other")
+    void scansFillRoomOnly(int cacheBytes, @TempDir Path directory) throws Exception {
+        var cipher = new PageCipher(new SecretKeySpec(new byte[32], "AES"));
+        try (var pages = PageFile.open(directory, cipher, cacheBytes, new HeapPool(1 << 20))) {
+            var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+            var ops = new ArrayList<TreeUpdate.Op>();
+            for (var i = 0; i < 20_000; i++) {
+                ops.add(new TreeUpdate.Op(segment("k%06d".formatted(i).getBytes()), segment(new byte[150])));
+            }
+            var writer = pages.writer(1);
+            var root = new TreeUpdate(pages, writer, space).apply(null, ops, List.of());
+            writer.flush();
+            pages.cache().clearForTests();
+            // A hot leaf, read before the scan
+            var hot = segment("k000010".getBytes());
+            assertTrue(TreeSearch.find(pages, root, hot) != null);
+            var cursor = new TreeCursor(pages, root, null, null, false);
+            var scanned = 0;
+            while (cursor.next()) {
+                cursor.value();
+                scanned++;
+            }
+            assertEquals(20_000, scanned);
+            assertEquals(TreeSearch.FOUND, TreeSearch.lookupCached(pages, root, hot), "the scan evicted the hot leaf");
+            var late = TreeSearch.lookupCached(pages, root, segment("k019990".getBytes()));
+            assertEquals(cacheBytes > 16 << 20 ? TreeSearch.FOUND : TreeSearch.UNKNOWN, late);
+        }
+    }
+
     private static byte[] value(Random random) {
         var size = switch (random.nextInt(20)) {
             case 0 -> 2_500 + random.nextInt(20_000);

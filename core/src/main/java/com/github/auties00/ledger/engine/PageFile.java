@@ -146,6 +146,17 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
     byte[] read(PageRef ref, byte kind, boolean cached) {
+        return read(ref, kind, cached, true);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, from the cache or the file}
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    /// @param cached whether to keep the unit in the cache
+    /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
+    /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[] read(PageRef ref, byte kind, boolean cached, boolean referenced) {
         var hit = cache.get(ref);
         if (hit != null && kindMatches(hit[PageFormat.KIND], kind)) {
             return hit;
@@ -159,7 +170,7 @@ final class PageFile implements AutoCloseable {
                 throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
             }
             if (cached) {
-                cache.put(ref, plain, true);
+                cache.put(ref, plain, referenced);
             }
             return plain;
         } finally {
