@@ -540,7 +540,9 @@ final class LogWriter {
     private void flushGroups(long until) {
         leading = until != Long.MAX_VALUE;
         try {
-            while (durable < until) {
+            // A stopped writer writes nothing more: a group after one whose force failed would pass for durable while
+            // the failed one, maybe partly on disk, stands before it
+            while (durable < until && failure == null) {
                 if (commitWindowNanos > 0) {
                     LockSupport.parkNanos(commitWindowNanos);
                 }
