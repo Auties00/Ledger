@@ -42,7 +42,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     public LedgerBuilder() {
         this.keyspaces = new LinkedHashMap<>();
         this.pageCache = 64 * MIB;
-        this.checkpointEvery = 64 * MIB;
+        this.checkpointEvery = defaultCheckpointEvery();
         this.commitWindow = Duration.ZERO;
         this.segmentSize = SEGMENT_SIZE;
         this.backgroundFailures = _ -> {
@@ -105,6 +105,16 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         }
         this.pageCache = bytes;
         return this;
+    }
+
+    /// {@return the checkpoint interval of a store whose options do not choose one: a sixteenth of the heap's maximum
+    /// size, between 64 MiB and 512 MiB}
+    ///
+    /// A checkpoint of writes spread over a store larger than the interval rewrites a page for each write or two, so
+    /// the interval sets the throughput of such writes: 256 MiB rather than 64 MiB made them three to four times
+    /// faster. The writes it holds cost the heap about twice their bytes in the log.
+    static long defaultCheckpointEvery() {
+        return Math.clamp(Runtime.getRuntime().maxMemory() / 16, 64 * MIB, 512 * MIB);
     }
 
     @Override
