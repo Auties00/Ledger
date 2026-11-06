@@ -7,6 +7,7 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 import java.security.GeneralSecurityException;
@@ -18,6 +19,7 @@ import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
@@ -111,6 +113,16 @@ final class LogWriter {
 
     // Owned by the flush task; null until the first group opens the first segment
     private FileChannel channel;
+    // The file of the current segment, which an interrupted write reopens
+    private java.nio.file.Path segmentPath;
+    // Whether an interrupt closed the channel or cut a wait short during the flush, which then gives the interrupt
+    // back to its thread
+    private boolean interruptedWrite;
+    // Whether the flush running is a commit's, for its own group, which one drain writes whole
+    private boolean leading;
+    // Where the last drain wrote, and how many bytes, which the output still holds until the next group is sealed
+    private long lastDrainStart;
+    private int lastDrainLength;
     private long segmentNumber;
     private long position;
     private SecretKeySpec segmentKey;
@@ -151,7 +163,7 @@ final class LogWriter {
     private ArrayList<Queued> queue;
     // The bytes of the frame bodies queued and not durable yet
     private long pendingBytes;
-    private long lastQueued;
+    private volatile long lastQueued;
     // Frames queued since the writer opened; a catalog frame carries a sequence already durable, so close() waits on
     // frames rather than on sequences
     private long appended;
@@ -171,6 +183,8 @@ final class LogWriter {
     // The file of large values the commits write to, or null
     private volatile BlobFile blobs;
     private final AtomicBoolean scheduled;
+    // Held by the one flush that writes groups, on the pool or on the thread of a commit waiting for its group
+    private final AtomicBoolean running;
     // The commits waiting for durability
     private final ConcurrentLinkedQueue<Waiter> waiters;
 
@@ -214,6 +228,7 @@ final class LogWriter {
         this.queueDrained = queueLock.newCondition();
         this.queue = new ArrayList<>();
         this.scheduled = new AtomicBoolean();
+        this.running = new AtomicBoolean();
         this.waiters = new ConcurrentLinkedQueue<>();
         this.durabilityLock = new ReentrantLock();
         this.durabilityChanged = durabilityLock.newCondition();
@@ -245,6 +260,7 @@ final class LogWriter {
         waitedBefore = waited;
         waited = false;
         this.channel = FileChannel.open(segment.path(), StandardOpenOption.READ, StandardOpenOption.WRITE);
+        this.segmentPath = segment.path();
         this.segmentNumber = segment.number();
         this.currentSegment = segment.number();
         this.position = SEGMENT_HEADER;
@@ -449,8 +465,82 @@ final class LogWriter {
     }
 
     private void flush() {
+        flush(Long.MAX_VALUE);
+    }
+
+    /// Writes the queued groups until the queue is empty, or until the commit at `until` is durable, for a commit that
+    /// waits for its group on its own thread rather than for a thread of the pool to wake, then for its own to be woken.
+    ///
+    /// One flush writes at a time: another returns at once, and the one that writes looks at the queue again once it
+    /// stops, so the frames of a commit whose flush returned are never left behind. A flush for a commit hands what is
+    /// queued after its group to the pool.
+    private void flush(long until) {
+        while (running.compareAndSet(false, true)) {
+            try {
+                flushGroups(until);
+            } finally {
+                running.set(false);
+            }
+            boolean empty;
+            queueLock.lock();
+            try {
+                empty = queue.isEmpty();
+                if (empty) {
+                    scheduled.set(false);
+                }
+            } finally {
+                queueLock.unlock();
+            }
+            if (empty || failure != null) {
+                return;
+            }
+            if (until != Long.MAX_VALUE) {
+                try {
+                    executor.execute(this::flush);
+                } catch (RejectedExecutionException exception) {
+                    stop(new IOException("The log's pool refused a flush: it was closed with the store open", exception));
+                }
+                return;
+            }
+        }
+    }
+
+    /// {@return whether the frame of the commit at `sequence` is queued, no later commit's is, and no other commit
+    /// waits for its durability}
+    ///
+    /// Only such a commit writes its group itself. With other commits under way, the pool's flush goes on to their
+    /// group at once, where a commit that wrote its own would hand that group to the pool and wait for a thread of it
+    /// to wake; and the wake of the pool's thread lets more commits join a group than a commit forcing its own at once
+    /// would, which at eight committers made fewer forces than leading did.
+    ///
+    /// Only a platform thread does, so a force never holds the carrier of a virtual thread, and only without a commit
+    /// window, which the pool's flush waits out for the commits that join the group.
+    private boolean alone(long sequence) {
+        return commitWindowNanos == 0 && !Thread.currentThread().isVirtual() && waiters.isEmpty()
+                && lastQueued == sequence && durable < sequence;
+    }
+
+    /// {@return whether `frames` seal into the output and the current segment, so the group is written with one call
+    /// that a write cut off by an interrupt repeats, with no rollover to prepare a segment on the caller's thread}
+    private boolean fitsOneWrite(List<Queued> frames) {
+        if (channel == null) {
+            return false;
+        }
+        var bytes = 0L;
+        for (var frame : frames) {
+            bytes += FRAME_HEADER + frame.body().size() + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
+            if (bytes > OUTPUT - ALIGNMENT) {
+                return false;
+            }
+        }
+        return position + bytes + ALIGNMENT <= segmentSize;
+    }
+
+    /// Writes the queued groups until the queue is empty or the commit at `until` is durable, holding [#running].
+    private void flushGroups(long until) {
+        leading = until != Long.MAX_VALUE;
         try {
-            while (true) {
+            while (durable < until) {
                 if (commitWindowNanos > 0) {
                     LockSupport.parkNanos(commitWindowNanos);
                 }
@@ -460,8 +550,7 @@ final class LogWriter {
                 boolean units;
                 queueLock.lock();
                 try {
-                    if (queue.isEmpty()) {
-                        scheduled.set(false);
+                    if (queue.isEmpty() || (until != Long.MAX_VALUE && (lastQueued > until || !fitsOneWrite(queue)))) {
                         return;
                     }
                     group = queue;
@@ -489,7 +578,23 @@ final class LogWriter {
             stop(exception);
         } catch (RuntimeException | Error throwable) {
             stop(new IOException("The log writer failed", throwable));
+        } finally {
+            leading = false;
+            // A commit's thread gets its interrupt back; a thread of the pool, which nothing should interrupt, not
+            if (interruptedWrite) {
+                interruptedWrite = false;
+                if (until != Long.MAX_VALUE) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
+    }
+
+    /// Opens the segment again after an interrupt of the thread writing it closed its channel, with the interrupt
+    /// cleared until the flush ends, so a commit that writes its own group survives an interrupt.
+    private void reopen() throws IOException {
+        interruptedWrite |= Thread.interrupted();
+        channel = FileChannel.open(segmentPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
     }
 
     /// Seals and writes `group`, then forces it, and the file of large values if `units`.
@@ -609,15 +714,23 @@ final class LogWriter {
         return task;
     }
 
-    private static void await(FutureTask<Void> task) throws IOException {
-        try {
-            task.get();
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while forcing the file of large values", exception);
-        } catch (ExecutionException exception) {
-            throw exception.getCause() instanceof IOException failure ? failure
-                    : new IOException("The file of large values could not be forced", exception.getCause());
+    ///
+    /// An interrupt of a commit that writes its own group waits on, and is given back to the commit when the flush ends.
+    private void await(FutureTask<Void> task) throws IOException {
+        while (true) {
+            try {
+                task.get();
+                return;
+            } catch (InterruptedException exception) {
+                if (!leading) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while forcing the file of large values", exception);
+                }
+                interruptedWrite = true;
+            } catch (ExecutionException exception) {
+                throw exception.getCause() instanceof IOException failure ? failure
+                        : new IOException("The file of large values could not be forced", exception.getCause());
+            }
         }
     }
 
@@ -629,12 +742,25 @@ final class LogWriter {
     }
 
     /// Writes the bytes of the output.
+    ///
+    /// An interrupt that closes the channel meanwhile has the bytes written again, the same bytes at the same offsets.
     private void drain() throws IOException {
-        var buffer = ByteBuffer.wrap(output, 0, used);
-        while (buffer.hasRemaining()) {
-            position += channel.write(buffer, position);
+        var start = position;
+        lastDrainStart = start;
+        lastDrainLength = used;
+        while (true) {
+            try {
+                var buffer = ByteBuffer.wrap(output, 0, used);
+                while (buffer.hasRemaining()) {
+                    position += channel.write(buffer, position);
+                }
+                used = 0;
+                return;
+            } catch (ClosedByInterruptException _) {
+                position = start;
+                reopen();
+            }
         }
-        used = 0;
     }
 
     /// A frame waiting in the queue.
@@ -761,6 +887,14 @@ final class LogWriter {
         }
         checkHealthy();
         waited = true;
+        if (timeout < 0 && !Thread.currentThread().isInterrupted() && alone(sequence)) {
+            // Writes the group itself if no flush is writing: a wait with a timeout, which a slow force would outlast,
+            // leaves it to the pool
+            flush(sequence);
+            if (durable >= sequence) {
+                return true;
+            }
+        }
         var waiter = new Waiter(Thread.currentThread(), sequence);
         waiters.add(waiter);
         try {
@@ -908,8 +1042,40 @@ final class LogWriter {
     }
 
     /// Forces the segment to stable storage; on macOS the JDK empties the drive's cache with `fcntl(F_FULLFSYNC)`.
+    ///
+    /// An interrupt of a commit writing its own group that closes the channel meanwhile has the group written again
+    /// through a new one, then forced: the interrupt may hide a failure of the force, after which the file system may
+    /// report the next force a success with the group not on disk, so the pages are made dirty again first. A group of
+    /// the pool's flush, which one write may not hold, fails as any failed force does.
     private void force() throws IOException {
-        channel.force(false);
+        while (true) {
+            try {
+                channel.force(false);
+                return;
+            } catch (ClosedByInterruptException exception) {
+                if (!leading) {
+                    throw exception;
+                }
+                reopen();
+                rewriteLastDrain();
+            }
+        }
+    }
+
+    /// Writes the bytes of the last drain again, where it wrote them; they are still in the output.
+    private void rewriteLastDrain() throws IOException {
+        while (true) {
+            try {
+                var buffer = ByteBuffer.wrap(output, 0, lastDrainLength);
+                var at = lastDrainStart;
+                while (buffer.hasRemaining()) {
+                    at += channel.write(buffer, at);
+                }
+                return;
+            } catch (ClosedByInterruptException _) {
+                reopen();
+            }
+        }
     }
 
     private void closeSegment() throws IOException {
