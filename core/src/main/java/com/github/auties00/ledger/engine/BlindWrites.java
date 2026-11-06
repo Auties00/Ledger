@@ -19,6 +19,11 @@ import java.util.function.Predicate;
 /// is known; any thread reads them.
 final class BlindWrites {
     private static final int INITIAL_CAPACITY = 64;
+    // Take the place of the chains of folded writes, whose effect they give the same: a folded slot stays in arrays a
+    // reader of an older run may walk, and kept the chain, its key and its key's chunk reachable after the checkpoint
+    // that took the key dropped it
+    private static final Chain FOUND = settled(TreeSearch.FOUND);
+    private static final Chain ABSENT = settled(TreeSearch.ABSENT);
 
     // The run the publisher appends to; a reader keeps the one it loaded, whose writes up to its end stay valid
     private volatile Run run;
@@ -61,6 +66,7 @@ final class BlindWrites {
                 break;
             }
             folded += effect(state, current.writes[next]);
+            current.chains[next] = state == TreeSearch.FOUND ? FOUND : ABSENT;
             next++;
         }
         if (next == start) {
@@ -99,6 +105,13 @@ final class BlindWrites {
             total += effect(state, write);
         }
         return total;
+    }
+
+    /// {@return a chain of no key whose blind write's effect is known to be `state`}
+    private static Chain settled(byte state) {
+        var chain = new Chain(java.lang.foreign.MemorySegment.ofArray(new byte[0]), 0);
+        chain.blindState = state;
+        return chain;
     }
 
     /// {@return the blind writes listed and not folded yet}
