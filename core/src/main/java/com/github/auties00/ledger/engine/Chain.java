@@ -163,14 +163,6 @@ final class Chain {
         this.dirtyCut = -1;
     }
 
-    /// {@return a chain of no version that the ordered map orders as `key`, a bound of a range}
-    ///
-    /// A bound longer than any key is cut to one byte more than the longest: no key sorts between the two.
-    static Chain probe(MemorySegment key) {
-        var longest = KeyCodec.MAX_LENGTH + 1L;
-        return new Chain(key.byteSize() > longest ? key.asSlice(0, longest) : key, 0);
-    }
-
     /// {@return the key, a read-only segment made for the call}
     MemorySegment key() {
         return keyChunk.asSlice(keyOffset(), keyLength());

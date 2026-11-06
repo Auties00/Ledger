@@ -7,6 +7,7 @@ import com.github.auties00.ledger.Keyspace;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.BiPredicate;
@@ -139,14 +140,13 @@ final class Reads {
         var removals = state.removals;
         var root = point.root(state);
         var total = 0L;
-        for (var chain : state.slice(from, to).values()) {
-            var key = chain.key();
-            var version = KeyspaceState.resolve(chain.head, key, point.bound(), removals);
+        for (var entry : state.slice(from, to).entrySet()) {
+            var version = KeyspaceState.resolve(entry.getValue().head, entry.getKey(), point.bound(), removals);
             if (version == null) {
                 // Counted with the tree
                 continue;
             }
-            var counted = root != null && inTree(state, key, point, removals);
+            var counted = root != null && inTree(state, entry.getKey(), point, removals);
             total += (version == Version.HIDDEN ? 0 : 1) - (counted ? 1 : 0);
         }
         if (root == null) {
@@ -254,13 +254,11 @@ final class Reads {
         var descending = range.descending();
         var removals = state.removals;
         var slice = state.slice(from, to);
-        var memory = (descending ? slice.descendingMap() : slice).values().iterator();
+        var memory = (descending ? slice.descendingMap() : slice).entrySet().iterator();
         var root = point.root(state);
         var tree = root == null ? null : new TreeCursor(point.pages(), root, from, to, descending);
         var inTree = tree != null && tree.next();
-        var held = memory.hasNext() ? memory.next() : null;
-        // The key of the chain held, a segment made once for the comparisons and the visit
-        var heldKey = held == null ? null : held.key();
+        Map.Entry<MemorySegment, Chain> held = memory.hasNext() ? memory.next() : null;
         var visited = 0L;
         while (held != null || inTree) {
             int order;
@@ -270,14 +268,14 @@ final class Reads {
                 order = -1;
             } else {
                 // Where the key in memory sorts against the tree's, in the order of the scan
-                order = -tree.compareKey(heldKey);
+                order = -tree.compareKey(held.getKey());
                 if (descending) {
                     order = -order;
                 }
             }
             if (order <= 0) {
-                var key = heldKey;
-                var version = KeyspaceState.resolve(held.head, key, point.bound(), removals);
+                var key = held.getKey();
+                var version = KeyspaceState.resolve(held.getValue().head, key, point.bound(), removals);
                 MemorySegment value = null;
                 Object decoded = null;
                 if (version != null && version != Version.HIDDEN) {
@@ -290,7 +288,6 @@ final class Reads {
                     inTree = tree.next();
                 }
                 held = memory.hasNext() ? memory.next() : null;
-                heldKey = held == null ? null : held.key();
                 if (value != null) {
                     visited++;
                     if (!consumer.visit(key, value, decoded)) {

@@ -5,6 +5,7 @@ import com.github.auties00.ledger.KeyCodec;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
+import java.util.Comparator;
 
 /// Operations on the memory segments that hold encoded keys and values.
 final class Segments {
@@ -18,8 +19,8 @@ final class Segments {
         // Odd, so its products keep every bit of the other factor
         HASH_KEY = random.nextLong() | 1;
     }
-
-    /// Reads 8 bytes as a number whose order is that of the bytes, as the order of keys reads them.
+    /// Orders segments as unsigned bytes, a prefix before every longer segment it starts.
+    static final Comparator<MemorySegment> UNSIGNED = Segments::compare;
     static final ValueLayout.OfLong BIG_ENDIAN_LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
 
     private Segments() {

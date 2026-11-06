@@ -122,7 +122,7 @@ public final class LiveLedger implements Ledger {
     private final Padded.Role sweepWanted;
     private volatile boolean closed;
     private int sweepIndex;
-    private Chain sweepAfter;
+    private MemorySegment sweepAfter;
     // The log bytes, and the heap by the log's estimate, of the commits the open replayed, which the trees lack
     private long replayedBytes;
     private long replayedHeap;
