@@ -28,13 +28,14 @@ sealed class Version permits Version.External {
     }
 
     /// What [KeyspaceState#resolve] returns for a key a reader sees removed.
-    static final Version HIDDEN = new Version(Long.MIN_VALUE, null, null, null);
+    static final Version HIDDEN = new Version(Long.MIN_VALUE, (MemorySegment) null, null, null);
 
     /// The commit sequence in the high bits and the position of the write in its batch in the low bits.
     final long stamp;
-    // The read-only segment the encoded value is part of, the array of its batch, or `null` if this version removes the
-    // key: a slice of its own per version was 40 of the bytes a buffered write took on the heap
-    private final MemorySegment source;
+    // The read-only segment the encoded value is part of, the array of its batch; or the array that is the value, which
+    // a resident version keeps, and whose segment and session, 72 bytes, a read of its encoding makes; or `null` if
+    // this version removes the key. A slice of its own per version was 40 of the bytes a buffered write took
+    private final Object source;
     // Where the value starts in source, and its length
     private final int offset;
     private final int length;
@@ -49,12 +50,28 @@ sealed class Version permits Version.External {
 
     /// Makes a version of the `length` bytes at `offset` of `source`, a read-only segment.
     Version(long stamp, MemorySegment source, int offset, int length, Object decoded, Version older) {
+        this(stamp, (Object) source, offset, length, decoded, older);
+    }
+
+    /// Makes a version whose value is `value`, an array of its own that no one writes.
+    Version(long stamp, byte[] value, Object decoded, Version older) {
+        this(stamp, value, 0, value.length, decoded, older);
+    }
+
+    private Version(long stamp, Object source, int offset, int length, Object decoded, Version older) {
         this.stamp = stamp;
         this.source = source;
         this.offset = offset;
         this.length = length;
         this.decoded = decoded;
         OLDER.set(this, older);
+    }
+
+    /// {@return a version whose value is `value`, an array of its own that no one writes, which the unit `external` of
+    /// [BlobFile] also holds if it is not `null`}
+    static Version ofOwn(long stamp, byte[] value, Object decoded, Version older, PageRef external) {
+        return external == null ? new Version(stamp, value, decoded, older)
+                : new External(stamp, value, 0, value.length, decoded, older, external);
     }
 
     /// {@return a version of the `length` bytes at `offset` of `source`, a read-only segment, or of no value if
@@ -66,10 +83,14 @@ sealed class Version permits Version.External {
 
     /// {@return the encoded value, read-only, or `null` if this version removes the key}
     MemorySegment value() {
-        var whole = source;
-        if (whole == null) {
+        var held = source;
+        if (held == null) {
             return null;
         }
+        if (held instanceof byte[] array) {
+            return MemorySegment.ofArray(array).asReadOnly();
+        }
+        var whole = (MemorySegment) held;
         return offset == 0 && length == whole.byteSize() ? whole : whole.asSlice(offset, length);
     }
 
@@ -87,7 +108,7 @@ sealed class Version permits Version.External {
         /// holding the publishing role.
         long replacedAt;
 
-        External(long stamp, MemorySegment source, int offset, int length, Object decoded, Version older, PageRef unit) {
+        External(long stamp, Object source, int offset, int length, Object decoded, Version older, PageRef unit) {
             super(stamp, source, offset, length, decoded, older);
             this.unit = unit;
             this.replacedAt = Long.MAX_VALUE;
@@ -109,7 +130,12 @@ sealed class Version permits Version.External {
 
     /// {@return the bytes of the segment the value is part of, 0 for a removal; for tests of what memory keeps}
     long sourceBytesForTests() {
-        return source == null ? 0 : source.byteSize();
+        return switch (source) {
+            case null -> 0;
+            case byte[] array -> array.length;
+            case MemorySegment segment -> segment.byteSize();
+            default -> throw new IllegalStateException();
+        };
     }
 
     /// {@return whether this version removes the key}
