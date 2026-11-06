@@ -103,6 +103,12 @@ final class ChainIndex {
                 if (held == chain) {
                     SLOTS.setRelease(table, slot, TOMBSTONE);
                     segment.size--;
+                    // Tombstones end no probe: once they outnumber the chains, and fill a quarter of the table, they
+                    // go, and with them the length a churn of insertions and removals left the table at
+                    var tombstones = segment.taken - segment.size;
+                    if (tombstones > segment.size && tombstones * 4 > table.length) {
+                        segment.rebuild();
+                    }
                     return;
                 }
             }
@@ -122,7 +128,8 @@ final class ChainIndex {
         return segments[(hash >>> 26) & (SEGMENTS - 1)];
     }
 
-    // Spreads the hash over the slots, whose index uses its low bits, apart from the segment's high ones
+    // Orders the slots by the hash's low bits, apart from the high ones that pick the segment; it separates no keys the
+    // hash does not, which the seed of the hash keeps others from choosing
     private static int slot(int hash) {
         return hash * 0x9E3779B9;
     }
