@@ -40,6 +40,19 @@ final class Segments {
         return Byte.compareUnsigned(left.get(ValueLayout.JAVA_BYTE, mismatch), right.get(ValueLayout.JAVA_BYTE, mismatch));
     }
 
+    /// {@return whether `left` and `right` hold the same bytes}
+    static boolean equal(MemorySegment left, MemorySegment right) {
+        var length = left.byteSize();
+        if (length != right.byteSize()) {
+            return false;
+        }
+        // The first 8 bytes tell most keys apart without the set-up of a mismatch
+        if (length >= Long.BYTES && left.get(ValueLayout.JAVA_LONG_UNALIGNED, 0) != right.get(ValueLayout.JAVA_LONG_UNALIGNED, 0)) {
+            return false;
+        }
+        return left.mismatch(right) == -1;
+    }
+
     /// {@return a hash of the bytes of `segment`}
     ///
     /// Keys often share long prefixes, a chat's id before a message's, so every byte counts.
