@@ -12,7 +12,6 @@ import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.WriteBatch;
 
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
@@ -665,9 +664,10 @@ public final class LiveLedger implements Ledger {
         if (pending.failure != null) {
             throw rethrow(pending.failure);
         }
-        pruneWritten(pending.applier.touched);
-        // The versions reference the batch's array, which the batch no longer writes
+        // The versions reference the batch's array, which the batch no longer writes: before anything else can throw,
+        // so a caller that reuses the batch after a failure never writes over values readers see
         writes.detach();
+        pruneWritten(pending.applier.touched);
         return ticket(pending.sequence);
     }
 
@@ -1986,10 +1986,10 @@ public final class LiveLedger implements Ledger {
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
             var length = Math.toIntExact(value.byteSize());
-            if (state.resident && external == null && (source == null || source.byteSize() > 2L * length + RESIDENT_SLACK)) {
+            if (state.resident && (source == null || source.byteSize() > 2L * length + RESIDENT_SLACK)) {
                 // A resident version lives as long as its key does: on a value of its own, not on the array of the
                 // batch or the log frame it came in, which a session written beside ten messages held 12 times over
-                value = MemorySegment.ofArray(value.toArray(ValueLayout.JAVA_BYTE)).asReadOnly();
+                value = Segments.copy(value);
                 source = null;
             }
             var version = source == null ? Version.of(stamp, value, 0, length, decoded, head, external)

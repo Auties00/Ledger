@@ -107,6 +107,11 @@ sealed class Version permits Version.External {
         OLDER.setRelease(this, older);
     }
 
+    /// {@return the bytes of the segment the value is part of, 0 for a removal; for tests of what memory keeps}
+    long sourceBytesForTests() {
+        return source == null ? 0 : source.byteSize();
+    }
+
     /// {@return whether this version removes the key}
     boolean removes() {
         return source == null;

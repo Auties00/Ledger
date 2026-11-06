@@ -55,7 +55,7 @@ final class KeyspaceState {
     // The chains written since the last checkpoint was cut, each listed once per cut; guarded by the publishing role
     ArrayList<Chain> dirty;
     // The number of the cut `dirty` collects for, guarded by the publishing role
-    private long dirtyCut;
+    private int dirtyCut;
     // The bytes from which a value a batch puts goes to the file of large values, set while the store opens
     long largeValues = Long.MAX_VALUE;
     // Whether the key space orders its chains lazily, set while the store opens, before any chain is opened
@@ -317,7 +317,7 @@ final class KeyspaceState {
     /// Lists `chain` among the keys the next checkpoint writes, holding the publishing role.
     void markDirty(Chain chain) {
         if (chain.dirtyCut != dirtyCut) {
-            chain.dirtyCut = (int) dirtyCut;
+            chain.dirtyCut = dirtyCut;
             dirty.add(chain);
         }
     }
