@@ -22,10 +22,10 @@ import java.util.zip.CRC32C;
 ///
 /// A segment is prepared before the log needs it ([#prepare(long, long)]): a spare, or a new file, gets the segment's
 /// header with a fresh salt and a zeroed first frame block, is forced, and only then takes its name, so recovery never
-/// meets a segment half prepared, and finds one never written empty at once. A new file is written with zeros to its
-/// full length first, except on Windows, and a spare has its blocks already: writing into a segment leaves a force no file size and no
-/// block allocation to record, which on ext4 made one force in a thousand wait for a journal commit, tens of
-/// milliseconds. Once a checkpoint makes segments obsolete, they become spares ([#retireBefore(long, int)]) instead of
+/// meets a segment half prepared, and finds one never written empty at once. A spare has its blocks already, and a new
+/// file can be written with zeros to its full length first, except on Windows: writing into either leaves a force no
+/// file size and no block allocation to record, which on ext4 halved the time of a durable commit and spared one force
+/// in a thousand a wait of tens of milliseconds for a journal commit. Once a checkpoint makes segments obsolete, they become spares ([#retireBefore(long, int)]) instead of
 /// being deleted.
 ///
 /// It is safe for concurrent use: the log writer prepares while a checkpoint retires.
@@ -111,8 +111,9 @@ final class LogFiles {
 
     /// Prepares segment `number`, which must not exist, from a spare or a new file of `length` bytes.
     ///
+    /// @param zeros whether a new file is first written with zeros to its full length
     /// @return the segment, durable under its name
-    Prepared prepare(long number, long length) throws IOException {
+    Prepared prepare(long number, long length, boolean zeros) throws IOException {
         synchronized (lock) {
             var target = segment(number);
             var spares = spares();
@@ -140,7 +141,7 @@ final class LogFiles {
             crc.update(start.array(), 0, LogWriter.HEADER_CRC_OFFSET);
             start.putInt(LogWriter.HEADER_CRC_OFFSET, (int) crc.getValue());
             try (var channel = FileChannel.open(source, StandardOpenOption.WRITE)) {
-                if (fresh && ZERO_FILL) {
+                if (fresh && zeros && ZERO_FILL) {
                     fill(channel, start.capacity(), length);
                 }
                 // The header, and a first frame block of zeros that marks the segment as never written

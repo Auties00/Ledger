@@ -622,7 +622,7 @@ class DurableLedgerTest {
             }
             // What a crash right after preparing the next segment leaves
             var opened = StoreHeader.openOrCreate(directory, EncryptionSpec.key(KEY));
-            new LogFiles(directory.resolve("log"), opened.keys(), opened.header().storeId()).prepare(number + 1, 16 << 20);
+            new LogFiles(directory.resolve("log"), opened.keys(), opened.header().storeId()).prepare(number + 1, 16 << 20, true);
             try (var ledger = open(directory, NAMES)) {
                 assertEquals(number + 1, ((LiveLedger) ledger).log().currentSegment());
                 assertEquals(Optional.of("1"), ledger.get(NAMES, "a"));

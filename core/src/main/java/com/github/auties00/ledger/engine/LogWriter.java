@@ -33,9 +33,13 @@ import java.util.zip.CRC32C;
 /// the next one starts, so the pages of acknowledged frames are never written again.
 ///
 /// Segments come from [LogFiles] prepared: once a segment takes its first group, the next one is prepared on a thread
-/// of its own, which a new file's zeros give the whole segment's time, so a rollover only forces the full segment and
-/// switches to the next, and no file is created or renamed on the way to a force. A prepared file may hold the frames
-/// of an earlier use, which every frame header tells apart by the tag of its segment's salt.
+/// of its own, so a rollover only forces the full segment and switches to the next, and no file is created or renamed
+/// on the way to a force. A prepared file may hold the frames of an earlier use, which every frame header tells apart
+/// by the tag of its segment's salt.
+///
+/// A new file is written with zeros first only while the commits wait for the forces and the log fills slower than
+/// [#ZEROED_RATE]: the zeros halve the time of a force on Linux, but double the bytes the device takes, which slowed an
+/// ingest of a history, whose commits do not wait, and 256 committers writing 100 MB a second, by a fifth.
 ///
 /// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames, written by one open of the store
 /// only. Its key derives from its number and a random salt of its own, so the offset of a frame is a unique nonce
@@ -78,6 +82,8 @@ final class LogWriter {
     private static final int SLICE = 64 << 10;
     /// The bytes of frame bodies the queue holds before commits wait for the device.
     private static final long QUEUE_LIMIT = 64L << 20;
+    /// The bytes a second of log below which a new segment is written with zeros first, if the commits wait for it.
+    private static final long ZEROED_RATE = 64L << 20;
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
@@ -101,6 +107,12 @@ final class LogWriter {
     private FutureTask<LogFiles.Prepared> next;
     // Set by the preparation in next when it starts, or by a close first, which it then leaves undone
     private AtomicBoolean nextClaimed;
+    // When the current segment opened, and how long the one before it took to fill, or -1; owned by the flush task
+    private long segmentOpened;
+    private long lastFill = -1;
+    // Whether a commit waited for a force since the segment before the current one opened
+    private volatile boolean waited;
+    private boolean waitedBefore;
     private final Cipher cipher;
     private final CRC32C crc;
     // The buffer frames are sealed into and written from, a slice at a time whatever their size
@@ -177,7 +189,7 @@ final class LogWriter {
         this.durabilityChanged = durabilityLock.newCondition();
         this.durable = durable;
         this.lastQueued = durable;
-        open(files.prepare(firstSegment, segmentSize));
+        open(files.prepare(firstSegment, segmentSize, false));
     }
 
     static String segmentName(long number) {
@@ -186,6 +198,13 @@ final class LogWriter {
 
     /// Starts writing `segment`.
     private void open(LogFiles.Prepared segment) throws IOException {
+        var now = System.nanoTime();
+        if (channel != null) {
+            lastFill = now - segmentOpened;
+        }
+        segmentOpened = now;
+        waitedBefore = waited;
+        waited = false;
         this.channel = FileChannel.open(segment.path(), StandardOpenOption.READ, StandardOpenOption.WRITE);
         this.fullSync = FullSync.open(segment.path());
         this.segmentNumber = segment.number();
@@ -204,7 +223,9 @@ final class LogWriter {
     private void prepareNext() {
         var number = segmentNumber + 1;
         var claimed = new AtomicBoolean();
-        var preparation = new FutureTask<>(() -> claimed.compareAndSet(false, true) ? files.prepare(number, segmentSize) : null);
+        // Filled slower than the rate, by commits that waited for its forces
+        var zeros = (waited || waitedBefore) && lastFill >= 0 && lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE;
+        var preparation = new FutureTask<>(() -> claimed.compareAndSet(false, true) ? files.prepare(number, segmentSize, zeros) : null);
         next = preparation;
         nextClaimed = claimed;
         Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
@@ -648,6 +669,7 @@ final class LogWriter {
             return true;
         }
         checkHealthy();
+        waited = true;
         var waiter = new Waiter(Thread.currentThread(), sequence);
         waiters.add(waiter);
         try {
@@ -685,6 +707,11 @@ final class LogWriter {
             this.thread = thread;
             this.sequence = sequence;
         }
+    }
+
+    /// {@return the bytes of a segment}
+    long segmentSize() {
+        return segmentSize;
     }
 
     /// {@return the number of the segment frames are written to now; every later frame goes to it or a later one}
