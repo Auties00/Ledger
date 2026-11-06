@@ -10,6 +10,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 import java.security.GeneralSecurityException;
+import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -38,13 +39,21 @@ import java.util.zip.CRC32C;
 /// it: forcing a new file and its directory took most of an open on Windows and macOS. A prepared file may hold the
 /// frames of an earlier use, which every frame header tells apart by the tag of its segment's salt.
 ///
+/// A close keeps the segment prepared after the current one, cut to its first two blocks, and the next open writes
+/// into it, as it does into any segment recovery finds prepared and never written: the first durable commit after an
+/// open then waits for one force, where preparing a segment cost two more before it.
+///
 /// A new file is written with zeros first only while the commits wait for the forces and the log fills slower than
 /// [#ZEROED_RATE]: the zeros halve the time of a force on Linux, but double the bytes the device takes, which slowed an
 /// ingest of a history, whose commits do not wait, and 256 committers writing 100 MB a second, by a fifth.
 ///
-/// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames, written by one open of the store
-/// only. Its key derives from its number and a random salt of its own, so the offset of a frame is a unique nonce
-/// under that key, even if a segment number were ever used twice:
+/// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames. Each use of it, the writing of one
+/// open, draws a random tag, and the key of the use derives from the segment's number, a random salt of its own and
+/// that tag: the offset of a frame is a unique nonce under its key, even where an open writes into a segment that an
+/// earlier one began to write and crashed before any of it was durable, whose bytes a copy-on-write file system may
+/// keep, and even if a segment number were ever used twice. A use writes past its first group only once a force made
+/// that group durable, after which no open writes into the segment again, so at most one use of a segment has frames
+/// past its first group:
 ///
 /// ```text
 /// segment header   0  "LGSEGMNT"
@@ -58,9 +67,10 @@ import java.util.zip.CRC32C;
 ///                  4  length of the sealed body
 ///                  8  commit sequence
 ///                 16  frame type, flags (1: first frame after a force)
-///                 20  tag: the first 8 bytes of the segment's salt
-///                 28  CRC-32C of bytes 0 to 27
-/// sealed body     AES-256-GCM of the body under the segment key, the frame's offset as nonce and the header as
+///                 20  tag of the segment: the first 8 bytes of its salt
+///                 28  tag of the use: 8 random bytes the writer drew when it began writing the segment
+///                 36  CRC-32C of bytes 0 to 35
+/// sealed body     AES-256-GCM of the body under the key of the use, the frame's offset as nonce and the header as
 ///                 associated data; without encryption, the body and the CRC-32C of header and body
 /// ```
 ///
@@ -68,15 +78,22 @@ import java.util.zip.CRC32C;
 final class LogWriter {
     static final int SEGMENT_HEADER = 4_096;
     static final int ALIGNMENT = 4_096;
-    static final int FRAME_HEADER = 32;
+    static final int FRAME_HEADER = 40;
     static final int MAGIC = 0x4C474631;
     static final byte GROUP_START = 1;
     static final long SEGMENT_MAGIC = 0x4C475345474D4E54L;
-    static final int SEGMENT_VERSION = 1;
+    static final int SEGMENT_VERSION = 2;
     static final int TAG_BYTES = 16;
     static final int SALT_OFFSET = 40;
     static final int SALT_BYTES = 16;
     static final int HEADER_CRC_OFFSET = 56;
+    /// Where a frame header holds the tag of its segment.
+    static final int SEGMENT_TAG_OFFSET = 20;
+    /// Where a frame header holds the tag of the use of the segment that wrote it.
+    static final int USE_TAG_OFFSET = 28;
+    /// The length of a segment a close keeps for the next open: its header and a first frame block of zeros.
+    static final long KEPT_LENGTH = SEGMENT_HEADER + ALIGNMENT;
+    private static final SecureRandom TAGS = new SecureRandom();
     /// The size of the buffer frames are sealed into and written from.
     private static final int OUTPUT = 1 << 20;
     /// The bytes of a frame body sealed in one call, a multiple of the AES block.
@@ -98,14 +115,17 @@ final class LogWriter {
     private long position;
     private SecretKeySpec segmentKey;
     private long segmentTag;
+    // The tag of this writer's use of the segment
+    private long useTag;
+    // The segment close kept for the next open, or -1
+    private volatile long kept = -1;
     // The end of the last group's frames, before its padding, for tests
     private volatile long groupEnd;
     // Where the frames of the last group start, for tests
     private volatile long groupStart;
-    // The preparation of the segment after the current one, run on the pool or by the flush task itself
+    // The preparation of the segment after the current one, run on a thread of its own, or by whichever of the flush
+    // task and a close needs it first
     private FutureTask<LogFiles.Prepared> next;
-    // Set by the preparation in next when it starts, or by a close first, which it then leaves undone
-    private AtomicBoolean nextClaimed;
     // When the current segment opened, and how long the one before it took to fill, or -1; owned by the flush task
     private long segmentOpened;
     private long lastFill = -1;
@@ -140,6 +160,14 @@ final class LogWriter {
     private volatile long appendedBytes;
     // Whether a queued frame's commit wrote a unit of BlobFile, which the next group forces; guarded by the queue lock
     private boolean queuedUnits;
+    // A frame that waits to be queued before the next one, or until a thread needs it durable; guarded by the queue lock
+    private Queued deferred;
+    // The number the deferred frame took among the frames queued, once queued; guarded by the queue lock
+    private long deferredFrame;
+    // Whether close began, after which nothing is queued; guarded by the queue lock
+    private boolean closed;
+    // Whether close began, so a segment prepared now is not written with zeros it would cut off
+    private volatile boolean closing;
     // The file of large values the commits write to, or null
     private volatile BlobFile blobs;
     private final AtomicBoolean scheduled;
@@ -157,14 +185,17 @@ final class LogWriter {
     /// @param files the files of the log
     /// @param keys the store's keys
     /// @param storeId the store's id
-    /// @param firstSegment the number of the segment to prepare, above every existing one
+    /// @param firstSegment the number of the segment to write first: the one to prepare, above every existing one, or
+    ///                     the number of `empty`
     /// @param durable the sequence the log already holds durably
     /// @param segmentSize the size past which a new segment starts
     /// @param executor runs the flush task on platform threads
     /// @param commitWindow how long a flush waits for more commits before it starts
+    /// @param empty the segment numbered `firstSegment`, which recovery found prepared and never written, to write
+    ///              first; or `null`, to prepare one
     /// @throws IOException if the segment cannot be prepared
     LogWriter(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long durable, long segmentSize,
-              Executor executor, Duration commitWindow) throws IOException {
+              Executor executor, Duration commitWindow, LogFiles.Prepared empty) throws IOException {
         this.files = files;
         this.keys = keys;
         this.storeId = storeId;
@@ -191,7 +222,13 @@ final class LogWriter {
         // The first group switches to it, as a rollover does
         this.segmentNumber = firstSegment - 1;
         this.currentSegment = firstSegment;
-        prepareNext();
+        if (empty != null) {
+            var ready = new FutureTask<>(() -> empty);
+            ready.run();
+            this.next = ready;
+        } else {
+            prepareNext();
+        }
     }
 
     static String segmentName(long number) {
@@ -213,7 +250,8 @@ final class LogWriter {
         this.position = SEGMENT_HEADER;
         this.groupEnd = SEGMENT_HEADER;
         this.segmentTag = ByteBuffer.wrap(segment.salt()).getLong();
-        this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt()) : null;
+        this.useTag = TAGS.nextLong();
+        this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt(), useTag) : null;
         this.next = null;
     }
 
@@ -223,12 +261,10 @@ final class LogWriter {
     /// behind it would make every commit waiting on that flush wait as long.
     private void prepareNext() {
         var number = segmentNumber + 1;
-        var claimed = new AtomicBoolean();
         // Filled slower than the rate, by commits that waited for its forces
         var zeros = (waited || waitedBefore) && lastFill >= 0 && lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE;
-        var preparation = new FutureTask<>(() -> claimed.compareAndSet(false, true) ? files.prepare(number, segmentSize, zeros) : null);
+        var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize, zeros && !closing));
         next = preparation;
-        nextClaimed = claimed;
         Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
     }
 
@@ -283,6 +319,7 @@ final class LogWriter {
                 queueDrained.awaitUninterruptibly();
             }
             checkHealthy();
+            queueDeferred();
             queue.add(new Queued(type, sequence, body));
             pendingBytes += length;
             lastQueued = sequence;
@@ -316,6 +353,7 @@ final class LogWriter {
                 queueDrained.awaitUninterruptibly();
             }
             checkHealthy();
+            queueDeferred();
             queue.addAll(batch.frames);
             pendingBytes += batch.bodyBytes;
             lastQueued = batch.frames.getLast().sequence();
@@ -329,6 +367,55 @@ final class LogWriter {
         if (scheduled.compareAndSet(false, true)) {
             executor.execute(this::flush);
         }
+    }
+
+    /// Holds a frame of `body` back until the next frame is queued, which follows it into the same group, or until
+    /// [#queueDeferred()]: a frame that matters only to the commits after it, so a close with none drops it.
+    ///
+    /// @param sequence the sequence it carries, which every frame queued after it carries or exceeds
+    void defer(byte type, long sequence, FrameBody body) {
+        queueLock.lock();
+        try {
+            deferred = new Queued(type, sequence, body);
+        } finally {
+            queueLock.unlock();
+        }
+    }
+
+    /// Queues the frame [#defer] holds back, unless a frame queued since took it along, and starts a flush.
+    ///
+    /// @return the number of the frame among those queued since the writer opened, for [#awaitFrames(long)]
+    /// @throws IllegalStateException if the writer is closed, which dropped the frame
+    long flushDeferred() {
+        long frames;
+        queueLock.lock();
+        try {
+            if (closed) {
+                throw new IllegalStateException("The store is closed");
+            }
+            queueDeferred();
+            frames = deferredFrame;
+        } finally {
+            queueLock.unlock();
+        }
+        if (scheduled.compareAndSet(false, true)) {
+            executor.execute(this::flush);
+        }
+        return frames;
+    }
+
+    /// Queues the deferred frame, if any; holding the queue lock.
+    private void queueDeferred() {
+        var frame = deferred;
+        if (frame == null) {
+            return;
+        }
+        deferred = null;
+        queue.add(frame);
+        pendingBytes += frame.body().size();
+        lastQueued = frame.sequence();
+        deferredFrame = ++appended;
+        appendedBytes += 13 + frame.body().size();
     }
 
     /// Makes `blobs` the file of large values the commits write units to, which the groups force.
@@ -470,7 +557,7 @@ final class LogWriter {
         var frameOffset = position + used;
         var header = ByteBuffer.wrap(output, at, FRAME_HEADER);
         header.putInt(MAGIC).putInt(sealedLength).putLong(frame.sequence()).put(frame.type()).put(groupStart ? GROUP_START : 0)
-                .putShort((short) 0).putLong(segmentTag);
+                .putShort((short) 0).putLong(segmentTag).putLong(useTag);
         crc.reset();
         crc.update(output, at, FRAME_HEADER - Integer.BYTES);
         header.putInt((int) crc.getValue());
@@ -747,9 +834,13 @@ final class LogWriter {
     ///
     /// @throws LedgerIoException if the queued frames cannot be made durable
     void close() {
+        closing = true;
         long frames;
         queueLock.lock();
         try {
+            // No frame followed it, so no commit needs it
+            deferred = null;
+            closed = true;
             frames = appended;
         } finally {
             queueLock.unlock();
@@ -767,24 +858,52 @@ final class LogWriter {
         } finally {
             // The flush task has nothing left to write, or has stopped
             closeChannel();
-            spareNext();
+            keepNext();
         }
     }
 
-    /// Turns the segment prepared after the current one, which nothing wrote, back into a spare.
-    private void spareNext() {
+    /// {@return the first segment a later open may write: the one [#close()] kept for it, or the one after the current}
+    long nextOpenSegment() {
+        var segment = kept;
+        return segment >= 0 ? segment : currentSegment + 1;
+    }
+
+    /// Keeps the segment prepared after the current one, which nothing wrote, for the next open, cut to
+    /// [#KEPT_LENGTH] bytes: a spare's frames of an earlier use, or a new file's zeros, are not left on the disk of a
+    /// closed store, nor in the cache of a copy of it.
+    ///
+    /// A preparation its thread has not started runs here, as a rollover runs it; one that has is waited for, by an
+    /// interrupted thread too, so no file of the store changes once it is closed.
+    private void keepNext() {
         var preparation = next;
-        // A preparation that has not started never runs; one that has is waited for, so no file of the store changes
-        // once it is closed
-        if (preparation == null || nextClaimed.compareAndSet(false, true)) {
+        if (preparation == null) {
             return;
         }
+        // A file operation would close its channel on an interrupted thread
+        var interrupted = Thread.interrupted();
+        preparation.run();
         try {
-            files.spare(preparation.get().number());
-        } catch (InterruptedException _) {
-            Thread.currentThread().interrupt();
+            while (true) {
+                try {
+                    var prepared = preparation.get();
+                    // Not forced: recovery reads the segment the same at either length
+                    try (var channel = FileChannel.open(prepared.path(), StandardOpenOption.WRITE)) {
+                        if (channel.size() > KEPT_LENGTH) {
+                            channel.truncate(KEPT_LENGTH);
+                        }
+                    }
+                    kept = prepared.number();
+                    return;
+                } catch (InterruptedException _) {
+                    interrupted = true;
+                }
+            }
         } catch (ExecutionException | IOException _) {
-            // An unused segment left behind holds no frame; the next open turns it into a spare
+            // An unused segment left behind holds no frame; the next open writes into it or into a new one
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 

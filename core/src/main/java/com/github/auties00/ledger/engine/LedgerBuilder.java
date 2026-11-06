@@ -10,8 +10,10 @@ import com.github.auties00.ledger.LedgerException;
 import com.github.auties00.ledger.LedgerIoException;
 
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.BitSet;
 import java.util.function.Consumer;
 import java.time.Duration;
@@ -208,6 +210,12 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var firstSegment = superblock == null ? 0 : superblock.logStart();
             var files = new LogFiles(logDirectory, opened.keys(), opened.header().storeId());
             files.deleteStale();
+            // Segments before the superblock's first one: the process that wrote it stopped before its checkpoint
+            // retired them, maybe before the superblock left the OS cache, which recovery is about to trust
+            var crashed = !files.segments().isEmpty() && files.segments().getFirst() < firstSegment;
+            if (crashed) {
+                pages.force();
+            }
             var recovered = LogRecovery.replay(files, opened.keys(), opened.header().storeId(), firstSegment,
                     superblock == null ? 0 : superblock.sequence(), new LogRecovery.Sink() {
                         @Override
@@ -230,18 +238,31 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var pool = ioPool != null ? (PlatformIoPool) ioPool : (ownedPool = new PlatformIoPool(1));
             // Numbers only grow, past every segment and the first one the checkpoint may need
             var first = Math.max(recovered.lastSegment() + 1, Math.max(firstSegment, 1));
-            if (recovered.lastEmpty()) {
-                // Prepared by the last open and never written: prepared again, under a fresh salt
-                files.spare(recovered.lastSegment());
-                first = Math.max(recovered.lastSegment(), Math.max(firstSegment, 1));
+            var empty = recovered.empty();
+            if (empty != null) {
+                // Kept by the last close, or prepared by a crashed open and never written: the writer writes into it
+                first = empty.number();
+            }
+            if (recovered.lastWritten() != null || crashed) {
+                // What a process that stopped left in the cache, durable before a commit follows it: the commits it
+                // replayed, their units, and the name of a segment it prepared, which this open may write into
+                if (recovered.lastWritten() != null) {
+                    try (var channel = FileChannel.open(recovered.lastWritten(), StandardOpenOption.WRITE)) {
+                        FullSync.force(channel, recovered.lastWritten(), false);
+                    }
+                }
+                blobs.force();
+                pages.force();
+                Durability.forceDirectory(logDirectory);
             }
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
-                    segmentSize, pool.executor(), commitWindow);
+                    segmentSize, pool.executor(), commitWindow, empty);
             var deltaTable = superblock == null ? null : superblock.deltaTable();
             var deltas = deltaTable == null ? DeltaTable.EMPTY
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));
             var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
-                    superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures);
+                    superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures,
+                    superblock == null ? 0 : superblock.epoch(), epochs[0]);
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
             } else {

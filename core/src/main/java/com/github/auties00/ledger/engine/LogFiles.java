@@ -168,16 +168,6 @@ final class LogFiles {
         }
     }
 
-    /// Turns segment `number`, which holds no frame, into a spare.
-    void spare(long number) throws IOException {
-        synchronized (lock) {
-            var path = segment(number);
-            if (Files.exists(path)) {
-                Files.move(path, directory.resolve("%016x".formatted(number) + SPARE), StandardCopyOption.ATOMIC_MOVE);
-            }
-        }
-    }
-
     /// Turns the segments numbered below `first`, which a durable checkpoint made obsolete, into spares until there
     /// are `keep`, and deletes the others and any spare past `keep`.
     void retireBefore(long first, int keep) throws IOException {

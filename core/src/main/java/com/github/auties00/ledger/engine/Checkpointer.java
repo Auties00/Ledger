@@ -36,12 +36,16 @@ import java.util.concurrent.locks.ReentrantLock;
 /// no checkpoint runs again until the store reopens: overwriting either superblock could leave none that authenticates.
 /// The log still holds every commit.
 final class Checkpointer {
-    /// The obsolete segments a closed store keeps for reuse: none. An open prepares its first segment beside its work,
-    /// so a spare saves it nothing, and forcing a spare that a copy of the store left in the OS cache held the first
-    /// durable commit after the open for tens of milliseconds.
+    /// The obsolete segments a closed store keeps for reuse: none. The next open writes into the segment the log kept
+    /// for it ([LogWriter#nextOpenSegment()]), so a spare saves it nothing, and forcing a spare that a copy of the store
+    /// left in the OS cache held the first durable commit after the open for tens of milliseconds.
     private static final int SPARES = 0;
     /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint.
     private static final int BACKLOG = 3;
+    // The epoch of the file of large values the last durable superblock records; guarded by the lock
+    private int durableEpoch;
+    // The highest epoch an earlier open used that only its log segments record, if above durableEpoch
+    private final int loggedEpoch;
 
     private final LiveLedger ledger;
     private final PageFile pages;
@@ -78,8 +82,11 @@ final class Checkpointer {
     /// @param deltas the delta pages of the last durable checkpoint
     /// @param deltaTable the blob holding their table, or `null` if there is none
     /// @param failures receives the failures of the checkpoints started on their own threads
+    /// @param durableEpoch the epoch of the file of large values the last superblock records
+    /// @param loggedEpoch the highest epoch recovery found, in the superblock or in the log, which units may take
     Checkpointer(LiveLedger ledger, PageFile pages, FreeSpace space, BlobFile blobs, LogWriter log, LogFiles files, long every,
-                 long number, DeltaTable deltas, PageRef deltaTable, Consumer<? super LedgerException> failures) {
+                 long number, DeltaTable deltas, PageRef deltaTable, Consumer<? super LedgerException> failures,
+                 int durableEpoch, int loggedEpoch) {
         this.ledger = ledger;
         this.pages = pages;
         this.space = space;
@@ -94,6 +101,8 @@ final class Checkpointer {
         this.scheduled = new AtomicBoolean();
         this.random = new SecureRandom();
         this.failures = failures;
+        this.durableEpoch = durableEpoch;
+        this.loggedEpoch = loggedEpoch;
         this.progressLock = new ReentrantLock();
         this.progress = progressLock.newCondition();
     }
@@ -178,11 +187,11 @@ final class Checkpointer {
             if (stopped != null) {
                 throw stopped;
             }
-            var cut = ledger.cutCheckpoint(() -> closing ? log.currentSegment() + 1 : log.currentSegment());
+            var cut = ledger.cutCheckpoint(() -> closing ? log.nextOpenSegment() : log.currentSegment());
             if (cut == null) {
-                if (closing) {
-                    // The trees hold every commit, so the segments hold nothing a reopen needs
-                    retire(Long.MAX_VALUE, SPARES);
+                if (closing && !epochOnlyInLog()) {
+                    // The trees hold every commit, so the segments hold nothing a reopen needs but the one kept for it
+                    retire(log.nextOpenSegment(), SPARES);
                 }
                 return;
             }
@@ -239,6 +248,9 @@ final class Checkpointer {
                                 nextDeltaTable),
                         writer.nonceHigh(), writer.nextNonce());
                 number++;
+                if (blobs != null) {
+                    durableEpoch = blobs.epoch();
+                }
                 deltas = nextDeltas;
                 deltaTable = nextDeltaTable;
             } catch (IOException exception) {
@@ -278,6 +290,19 @@ final class Checkpointer {
         } finally {
             lock.unlock();
         }
+    }
+
+    /// {@return whether an epoch of the file of large values that units may have taken is recorded only by the log}
+    ///
+    /// Units are sealed under their epoch and a counter, so an open that reused an epoch would reuse their nonces: a
+    /// unit written by a commit that failed, or by one a crash cut off, took its open's epoch without a checkpoint
+    /// recording it, and the segments that hold its epoch frame stay until one does.
+    private boolean epochOnlyInLog() {
+        if (blobs == null) {
+            return false;
+        }
+        return Integer.compareUnsigned(loggedEpoch, durableEpoch) > 0
+                || (blobs.epochTaken() && Integer.compareUnsigned(blobs.epoch(), durableEpoch) > 0);
     }
 
     /// Retires the log segments before `first`, keeping `spares` of them to be prepared again.

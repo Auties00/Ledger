@@ -54,6 +54,8 @@ final class BlobFile implements AutoCloseable {
     private final HashSet<PageRef> unadopted;
     // Makes the epoch durable before the first unit of this open, or null once it is
     private volatile Runnable epochGate;
+    // Whether a unit was sealed under this open's epoch, which a later open must then not reuse
+    private volatile boolean epochTaken;
 
     private BlobFile(Path path, FileChannel channel, PageCipher cipher, PageCache cache, HeapPool pool, FreeSpace space) throws IOException {
         this.path = path;
@@ -102,6 +104,11 @@ final class BlobFile implements AutoCloseable {
         return epoch;
     }
 
+    /// {@return whether a unit was sealed under this open's epoch, even one written by a commit that failed}
+    boolean epochTaken() {
+        return epochTaken;
+    }
+
     /// Seals `value` into free pages and writes it, without forcing it.
     ///
     /// The unit is in flight until a checkpoint takes it or [#release(PageRef)] frees it.
@@ -114,6 +121,7 @@ final class BlobFile implements AutoCloseable {
             gate.run();
             epochGate = null;
         }
+        epochTaken = true;
         var pages = PageFormat.pagesFor(value.byteSize());
         PageRef ref;
         synchronized (lock) {
