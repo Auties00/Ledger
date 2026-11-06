@@ -23,7 +23,7 @@ import java.util.zip.CRC32C;
 /// A segment is prepared before the log needs it ([#prepare(long, long)]): a spare, or a new file, gets the segment's
 /// header with a fresh salt and a zeroed first frame block, is forced, and only then takes its name, so recovery never
 /// meets a segment half prepared, and finds one never written empty at once. A new file is written with zeros to its
-/// full length first, and a spare has its blocks already: writing into a segment leaves a force no file size and no
+/// full length first, except on Windows, and a spare has its blocks already: writing into a segment leaves a force no file size and no
 /// block allocation to record, which on ext4 made one force in a thousand wait for a journal commit, tens of
 /// milliseconds. Once a checkpoint makes segments obsolete, they become spares ([#retireBefore(long, int)]) instead of
 /// being deleted.
@@ -34,6 +34,9 @@ final class LogFiles {
     private static final String SPARE = ".spare";
     private static final String PREPARING = ".prep";
     private static final SecureRandom SALTS = new SecureRandom();
+    // Not on Windows, where forcing a growing file cost a durable commit no more than forcing one written with zeros
+    // first, and the zeros made an ingest of a history a fifth slower
+    private static final boolean ZERO_FILL = !System.getProperty("os.name", "").startsWith("Windows");
 
     private final Path directory;
     private final StoreKeys keys;
@@ -137,7 +140,7 @@ final class LogFiles {
             crc.update(start.array(), 0, LogWriter.HEADER_CRC_OFFSET);
             start.putInt(LogWriter.HEADER_CRC_OFFSET, (int) crc.getValue());
             try (var channel = FileChannel.open(source, StandardOpenOption.WRITE)) {
-                if (fresh) {
+                if (fresh && ZERO_FILL) {
                     fill(channel, start.capacity(), length);
                 }
                 // The header, and a first frame block of zeros that marks the segment as never written
