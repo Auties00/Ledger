@@ -17,6 +17,9 @@ public final class HeapPool {
     private final ConcurrentLinkedQueue<byte[]>[] free;
     private final AtomicLong pooledBytes;
     private final long maxPooledBytes;
+    // The bytes each size holds free, which may not take more than half of maxPooledBytes: a checkpoint's flush
+    // releases its many small arrays at once, and would otherwise leave no room for the large ones
+    private final AtomicLong[] pooledBySize;
 
     /// Creates a pool that keeps at most `maxPooledBytes` of free arrays.
     ///
@@ -30,6 +33,10 @@ public final class HeapPool {
         }
         this.pooledBytes = new AtomicLong();
         this.maxPooledBytes = maxPooledBytes;
+        this.pooledBySize = new AtomicLong[free.length];
+        for (var i = 0; i < free.length; i++) {
+            pooledBySize[i] = new AtomicLong();
+        }
     }
 
     /// {@return an array of at least `capacity` bytes}
@@ -45,6 +52,7 @@ public final class HeapPool {
             return new byte[1 << shift];
         }
         pooledBytes.addAndGet(-array.length);
+        pooledBySize[shift - MIN_SHIFT].addAndGet(-array.length);
         return array;
     }
 
@@ -56,10 +64,16 @@ public final class HeapPool {
         if (Integer.bitCount(length) != 1 || length < 1 << MIN_SHIFT || length > 1 << MAX_SHIFT) {
             return;
         }
-        if (pooledBytes.addAndGet(length) > maxPooledBytes) {
-            pooledBytes.addAndGet(-length);
+        var size = Integer.numberOfTrailingZeros(length) - MIN_SHIFT;
+        if (pooledBySize[size].addAndGet(length) > maxPooledBytes / 2) {
+            pooledBySize[size].addAndGet(-length);
             return;
         }
-        free[Integer.numberOfTrailingZeros(length) - MIN_SHIFT].offer(array);
+        if (pooledBytes.addAndGet(length) > maxPooledBytes) {
+            pooledBytes.addAndGet(-length);
+            pooledBySize[size].addAndGet(-length);
+            return;
+        }
+        free[size].offer(array);
     }
 }

@@ -10,7 +10,15 @@ import java.util.Comparator;
 /// Operations on the memory segments that hold encoded keys and values.
 final class Segments {
     // Mixed into every hash; drawn once per process
-    private static final long HASH_SEED = new java.security.SecureRandom().nextLong();
+    private static final long HASH_SEED;
+    private static final long HASH_KEY;
+
+    static {
+        var random = new java.security.SecureRandom();
+        HASH_SEED = random.nextLong();
+        // Odd, so its products keep every bit of the other factor
+        HASH_KEY = random.nextLong() | 1;
+    }
     /// Orders segments as unsigned bytes, a prefix before every longer segment it starts.
     static final Comparator<MemorySegment> UNSIGNED = Segments::compare;
     private static final ValueLayout.OfLong BIG_ENDIAN_LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
@@ -65,12 +73,23 @@ final class Segments {
         var hash = HASH_SEED ^ length * 0x9E3779B97F4A7C15L;
         var offset = 0L;
         for (; offset + Long.BYTES <= length; offset += Long.BYTES) {
-            hash = Long.rotateLeft((hash ^ segment.get(ValueLayout.JAVA_LONG_UNALIGNED, offset)) * 0x9E3779B97F4A7C15L, 29);
+            hash = fold(hash ^ segment.get(ValueLayout.JAVA_LONG_UNALIGNED, offset), HASH_KEY);
         }
-        for (; offset < length; offset++) {
-            hash = Long.rotateLeft((hash ^ segment.get(ValueLayout.JAVA_BYTE, offset)) * 0x9E3779B97F4A7C15L, 29);
+        if (offset < length) {
+            var tail = 0L;
+            for (var shift = 0; offset < length; offset++, shift += 8) {
+                tail |= (segment.get(ValueLayout.JAVA_BYTE, offset) & 0xFFL) << shift;
+            }
+            hash = fold(hash ^ tail, HASH_KEY);
         }
+        hash = fold(hash, HASH_KEY ^ 0x9E3779B97F4A7C15L);
         return (int) (hash ^ (hash >>> 32));
+    }
+
+    // The 128-bit product of left and right, its halves folded into each other: every bit of the result depends on
+    // every bit of both, so a difference in the bytes cannot be steered to cancel without the key
+    private static long fold(long left, long right) {
+        return Math.multiplyHigh(left, right) ^ (left * right);
     }
 
     /// {@return a read-only copy of `segment` in an array of its own}

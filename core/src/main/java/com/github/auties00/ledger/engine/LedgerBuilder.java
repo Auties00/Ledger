@@ -100,13 +100,14 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         return this;
     }
 
-    /// {@return the most memory the free arrays of the store's pool may hold: an eighth of the page cache, at least 4
+    /// {@return the most memory the free arrays of the store's pool may hold: a quarter of the page cache, at least 16
     /// MiB}
     ///
-    /// The pool recycles the arrays a store fills and empties over and over, batches, log buffers and pages, whose
-    /// working set is small; as large as the page cache, it held up to as much again in arrays no one used.
+    /// The pool recycles the arrays a store fills and empties over and over, batches, sealed pages and the buffers of
+    /// large values, whose working set is a checkpoint's flush and a few buffers; as large as the page cache, it held
+    /// up to as much again in arrays no one used.
     private long pooledBytes() {
-        return Math.max(4 * MIB, pageCache / 8);
+        return Math.max(16 * MIB, pageCache / 4);
     }
 
     @Override

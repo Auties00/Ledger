@@ -175,7 +175,13 @@ final class Reads {
         var removals = state.removals;
         var version = KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals);
         if (version != null) {
-            return version == Version.HIDDEN ? Optional.empty() : Optional.of(value(state, keyspace, version.value(), version.decoded));
+            if (version == Version.HIDDEN) {
+                return Optional.empty();
+            }
+            // A resident key space reads the decoded value: no slice of the encoded one
+            @SuppressWarnings("unchecked")
+            var found = state.resident ? (V) version.decoded : keyspace.values().decode(version.value());
+            return Optional.of(found);
         }
         var value = treeValue(state, encoded, point, removals);
         return value == null ? Optional.empty() : Optional.of(keyspace.values().decode(value));
