@@ -54,8 +54,9 @@ final class Chain {
     @SuppressWarnings("unused")
     private volatile PendingCommit lastWriter;
     /// The cut whose dirty keys list the chain, so a chain is listed once per checkpoint; guarded by the publishing
-    /// role.
-    long dirtyCut;
+    /// role. An `int`, which a key space's cuts do not outgrow in a lifetime of checkpoints, makes the chain 64 bytes
+    /// rather than 72.
+    int dirtyCut;
     /// The sequence of the commit that wrote the key without knowing whether the tree held it ([BlindWrites]), or 0;
     /// a chain has at most one such write, its first, since every later one finds a version in memory.
     long blindSequence;
