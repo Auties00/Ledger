@@ -22,31 +22,37 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class MemoryRetentionTest {
     private static final Keyspace<byte[], byte[]> SESSIONS = Keyspace.resident("sessions", KeyCodec.bytes(), ValueCodec.bytes());
     private static final Keyspace<byte[], byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.bytes(), ValueCodec.bytes());
+    private static final Keyspace<byte[], String> NAMES = Keyspace.resident("names", KeyCodec.bytes(), ValueCodec.utf8());
 
     @Test
-    @DisplayName("a resident value written beside large paged values takes an array of its own; one written alone shares its batch's")
+    @DisplayName("a resident byte array is held once; another resident value takes an array of its own beside large values, and shares its batch's alone")
     void residentValueOwnsItsBytes(@TempDir Path directory) throws Exception {
         try (var ledger = (LiveLedger) Ledger.builder().directory(directory).encryption(Encryption.key(new byte[32]))
-                .keyspace(SESSIONS).keyspace(MESSAGES).build()) {
+                .keyspace(SESSIONS).keyspace(MESSAGES).keyspace(NAMES).build()) {
             var session = new byte[1_500];
             session[7] = 7;
-            var batch = ledger.newBatch().put(SESSIONS, new byte[]{1}, session);
+            var name = "n".repeat(1_500);
+            var batch = ledger.newBatch().put(SESSIONS, new byte[]{1}, session).put(NAMES, new byte[]{1}, name);
             for (var i = 0; i < 10; i++) {
                 batch.put(MESSAGES, new byte[]{2, (byte) i}, new byte[4_096]);
             }
             ledger.commit(batch).awaitDurable();
-            ledger.commit(ledger.newBatch().put(SESSIONS, new byte[]{9}, session)).awaitDurable();
-            // The first session's version would keep the 40 KiB of messages reachable on the batch's array
-            assertEquals(1_500, head(ledger, new byte[]{1}).sourceBytesForTests());
-            // Alone in its batch, the value shares the batch's array, which holds little else
-            var alone = head(ledger, new byte[]{9}).sourceBytesForTests();
-            assertTrue(alone > 1_500 && alone <= 2 * 1_500 + 64, "a session alone in its batch keeps " + alone + " bytes");
+            ledger.commit(ledger.newBatch().put(NAMES, new byte[]{9}, name)).awaitDurable();
+            // A byte array is its own encoding: the store keeps one copy, which reads return and checkpoints write
+            var held = head(ledger, SESSIONS, new byte[]{1});
+            assertEquals(1_500, held.sourceBytesForTests());
+            assertTrue(held.decoded != session, "the store holds the caller's array");
             assertEquals(7, ledger.get(SESSIONS, new byte[]{1}).orElseThrow()[7]);
+            // Another value would keep the 40 KiB of messages reachable on the batch's array
+            assertEquals(1_500, head(ledger, NAMES, new byte[]{1}).sourceBytesForTests());
+            // Alone in its batch, it shares the batch's array, which holds little else
+            var alone = head(ledger, NAMES, new byte[]{9}).sourceBytesForTests();
+            assertTrue(alone > 1_500 && alone <= 2 * 1_500 + 64, "a value alone in its batch keeps " + alone + " bytes");
         }
     }
 
-    private static Version head(LiveLedger ledger, byte[] key) {
-        return ledger.state(SESSIONS).chain(MemorySegment.ofArray(key)).head;
+    private static Version head(LiveLedger ledger, Keyspace<?, ?> keyspace, byte[] key) {
+        return ledger.state(keyspace).chain(MemorySegment.ofArray(key)).head;
     }
 
     @Test

@@ -253,7 +253,12 @@ public final class LiveLedger implements Ledger {
                 for (var i = 0; i < TreeNodes.count(leaf); i++) {
                     var offset = TreeNodes.entry(leaf, i);
                     var value = TreeSearch.value(pages, leaf, offset, false);
-                    state.open(TreeNodes.leafKey(leaf, offset)).head = new Version(stamp, value, state.keyspace.values().decode(value), null);
+                    var decoded = state.keyspace.values().decode(value);
+                    if (decoded instanceof byte[] bytes && state.keyspace.values() == BuiltinCodecs.BYTES_VALUE) {
+                        // The decoded array is the encoding: the version keeps one copy, not that and its leaf too
+                        value = MemorySegment.ofArray(bytes).asReadOnly();
+                    }
+                    state.open(TreeNodes.leafKey(leaf, offset)).head = new Version(stamp, value, decoded, null);
                 }
             }
         }
@@ -1987,7 +1992,14 @@ public final class LiveLedger implements Ledger {
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
             var length = Math.toIntExact(value.byteSize());
-            if (state.resident && (source == null || source.byteSize() > 2L * length + RESIDENT_SLACK)) {
+            if (state.resident && state.keyspace.values() == BuiltinCodecs.BYTES_VALUE) {
+                // A byte array is its own encoding: one copy of the store's serves the reads, which return the instance
+                // the store holds, and the checkpoints, where the caller's array and a copy of it served them apart
+                var own = Segments.toBytes(value);
+                decoded = own;
+                value = MemorySegment.ofArray(own).asReadOnly();
+                source = null;
+            } else if (state.resident && (source == null || source.byteSize() > 2L * length + RESIDENT_SLACK)) {
                 // A resident version lives as long as its key does: on a value of its own, not on the array of the
                 // batch or the log frame it came in, which a session written beside ten messages held 12 times over
                 value = Segments.copy(value);
