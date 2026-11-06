@@ -1199,7 +1199,15 @@ public final class LiveLedger implements Ledger {
     public void checkpoint() {
         ensureOpen();
         if (checkpointer != null) {
-            checkpointer.run(false);
+            // It forces the files on this thread: an interrupt would close their channels under the store's own threads
+            var interrupted = Thread.interrupted();
+            try {
+                checkpointer.run(false);
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
     }
 

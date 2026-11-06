@@ -167,21 +167,31 @@ final class CrashFileChannel extends FileChannel {
         throw new UnsupportedOperationException("Transfers are not simulated");
     }
 
+    /// Reads at `position`, interruptibly as [#force(boolean)] forces.
     @Override
     public int read(ByteBuffer dst, long position) throws IOException {
-        synchronized (disk.lock) {
-            checkOpen();
-            if (!readable) {
-                throw new NonReadableChannelException();
+        var completed = false;
+        begin();
+        try {
+            int count;
+            synchronized (disk.lock) {
+                checkOpen();
+                if (!readable) {
+                    throw new NonReadableChannelException();
+                }
+                disk.alive();
+                var source = file();
+                if (position >= source.size) {
+                    count = -1;
+                } else {
+                    count = (int) Math.min(dst.remaining(), source.size - position);
+                    dst.put(source.data, (int) position, count);
+                }
             }
-            disk.alive();
-            var source = file();
-            if (position >= source.size) {
-                return -1;
-            }
-            var count = (int) Math.min(dst.remaining(), source.size - position);
-            dst.put(source.data, (int) position, count);
+            completed = true;
             return count;
+        } finally {
+            end(completed);
         }
     }
 
