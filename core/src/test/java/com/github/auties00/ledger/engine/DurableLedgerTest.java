@@ -456,6 +456,26 @@ class DurableLedgerTest {
     @DisplayName("recovery")
     class Recovery {
         @Test
+        @DisplayName("an open counts the commits it replayed as log the trees lack, so the first checkpoint takes them before commits pile up behind it")
+        void replayedBacklog(@TempDir Path directory) throws Exception {
+            var value = "v".repeat(10_000);
+            var crashed = open(directory, NAMES);
+            try {
+                for (var i = 0; i < 100; i++) {
+                    crashed.commit(crashed.newBatch().put(NAMES, "k" + i, value));
+                }
+                crashed.awaitDurable();
+            } finally {
+                crash(crashed);
+            }
+            try (var reopened = open(directory, NAMES)) {
+                var backlog = ((LiveLedger) reopened).checkpointer().backlog();
+                assertTrue(backlog >= 100L * value.length(), () -> backlog + " bytes of log counted after the replay");
+                assertEquals(Optional.of(value), reopened.get(NAMES, "k99"));
+            }
+        }
+
+        @Test
         @DisplayName("a torn tail is dropped and the store goes on after it")
         void tornTail(@TempDir Path directory) throws Exception {
             var crashed = open(directory, NAMES);

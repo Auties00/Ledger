@@ -283,6 +283,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
                     superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures,
                     superblock == null ? 0 : superblock.epoch(), epochs[0], checkpointHeap);
+            checkpointer.replayed(ledger.replayedBytes(), ledger.replayedHeap());
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
             } else {
