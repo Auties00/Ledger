@@ -68,17 +68,27 @@ final class TreeUpdate {
 
     /// The state of a key as of a checkpoint.
     ///
-    /// It keeps the version rather than a slice of its value, which it makes when it writes the key: a checkpoint holds
-    /// one state per key it takes, through the whole update.
+    /// It keeps a chain of the key and the version rather than segments of the key and the value, which it makes when
+    /// it writes the key: a checkpoint holds one state per key it takes, through the whole update.
     ///
-    /// @param key the key
+    /// @param keyed a chain of the key, whose bytes the state compares and writes
     /// @param version its version as of the checkpoint, or `null` if the key has none
     /// @param blind the chain of the key, if a blind write the checkpoint takes needs to know whether the tree held
     ///              the key ([BlindWrites]), which the update records on it; or `null`
-    record Op(MemorySegment key, Version version, Chain blind) {
+    record Op(Chain keyed, Version version, Chain blind) {
         /// Makes the state of `key` with `value`, or with none if `null`.
         Op(MemorySegment key, MemorySegment value) {
-            this(key, value == null ? null : new Version(0, value, null, null), null);
+            this(new Chain(key, 0), value == null ? null : new Version(0, value, null, null), null);
+        }
+
+        /// {@return the key, a segment made for the call}
+        MemorySegment key() {
+            return keyed.key();
+        }
+
+        /// {@return the order of the key and `other`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
+        int compareKey(MemorySegment other) {
+            return keyed.compareKey(other);
         }
 
         /// {@return the value, or `null` if the key has none}
@@ -250,7 +260,7 @@ final class TreeUpdate {
             var childLow = i == 0 ? low : child.firstKey();
             var childHigh = i == children.size() - 1 ? high : children.get(i + 1).firstKey();
             var opEnd = op;
-            while (opEnd < opTo && (childHigh == null || Segments.compare(ops.get(opEnd).key(), childHigh) < 0)) {
+            while (opEnd < opTo && (childHigh == null || ops.get(opEnd).compareKey(childHigh) < 0)) {
                 opEnd++;
             }
             // The removed ranges that meet the keys the child holds, from its first key
@@ -524,7 +534,7 @@ final class TreeUpdate {
         var op = opFrom;
         var rem = remFrom;
         for (var entry : entries) {
-            while (op < opTo && Segments.compare(ops.get(op).key(), entry.key()) < 0) {
+            while (op < opTo && ops.get(op).compareKey(entry.key()) < 0) {
                 var put = ops.get(op++);
                 put.settle(false);
                 if (!put.removes()) {
@@ -532,7 +542,7 @@ final class TreeUpdate {
                     changed = true;
                 }
             }
-            if (op < opTo && Segments.compare(ops.get(op).key(), entry.key()) == 0) {
+            if (op < opTo && ops.get(op).compareKey(entry.key()) == 0) {
                 // The key's state as of the checkpoint, which already takes the removals into account
                 var state = ops.get(op++);
                 state.settle(true);
@@ -574,21 +584,22 @@ final class TreeUpdate {
     }
 
     private LeafEntry entry(Op op) throws IOException {
+        var key = op.key();
         var value = op.value();
         var length = value.byteSize();
         var external = op.external();
         if (external != null) {
-            return new LeafEntry(op.key(), null, external, (int) length, true);
+            return new LeafEntry(key, null, external, (int) length, true);
         }
-        if (LeafEntry.fitsInline(op.key().byteSize(), length)) {
-            return new LeafEntry(op.key(), value, null, (int) length);
+        if (LeafEntry.fitsInline(key.byteSize(), length)) {
+            return new LeafEntry(key, value, null, (int) length);
         }
         var unitPages = PageFormat.pagesFor(length);
         var page = allocate(unitPages);
         var unit = new byte[unitPages * PageFormat.SIZE];
         MemorySegment.copy(value, 0, MemorySegment.ofArray(unit), PageFormat.HEADER, length);
         var ref = writer.write(PageFormat.VALUE, 0, page, unitPages, unit, (int) length, true);
-        return new LeafEntry(op.key(), null, ref, (int) length);
+        return new LeafEntry(key, null, ref, (int) length);
     }
 
     /// {@return the first of `unitPages` free pages, which the update took}

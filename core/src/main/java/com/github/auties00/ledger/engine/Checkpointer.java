@@ -335,29 +335,31 @@ final class Checkpointer {
             var chains = keyspace.dirty().toArray(Chain[]::new);
             ChainSort.sort(chains);
             var ops = new ArrayList<TreeUpdate.Op>(chains.length);
+            var removals = keyspace.removals();
             Chain previous = null;
             for (var chain : chains) {
                 if (previous != null && Chain.sameKey(previous, chain)) {
                     continue;
                 }
                 previous = chain;
-                var key = chain.key();
                 // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
                 // otherwise another one, or none
-                var current = chain.released() ? state.chain(key) : chain;
-                var version = KeyspaceState.resolve(current == null ? null : current.head, key, bound, keyspace.removals());
+                var current = chain.released() ? state.chain(chain.key()) : chain;
+                // The key, a segment of its own, only for the range removals to cover
+                var key = removals.length == 0 ? null : chain.key();
+                var version = KeyspaceState.resolve(current == null ? null : current.head, key, bound, removals);
                 if (version == null && !state.resident) {
                     // No version at the cut in a paged key space: a commit that wrote the key rolled back, so the
                     // tree is right. A resident one holds every entry, so there the key is gone
                     continue;
                 }
-                // A blind write the cut takes: the leaf the update merges tells whether the tree held the key
-                // A blind write the cut takes: the chain's first, so at or below the cut, as the cut sees a version of it
+                // A blind write the cut takes, the chain's first and so at or below the cut, which sees a version of it:
+                // the leaf the update merges tells whether the tree held the key
                 var blind = current != null && current.blindState() == TreeSearch.UNKNOWN ? current : null;
                 if (version == null || version == Version.HIDDEN) {
-                    ops.add(new TreeUpdate.Op(key, null, blind));
+                    ops.add(new TreeUpdate.Op(chain, null, blind));
                 } else {
-                    ops.add(new TreeUpdate.Op(key, version, blind));
+                    ops.add(new TreeUpdate.Op(chain, version, blind));
                     var external = version.external();
                     if (external != null) {
                         adopted.add(external);

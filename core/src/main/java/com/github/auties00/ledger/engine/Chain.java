@@ -243,6 +243,11 @@ final class Chain {
         return Segments.compare(left.keyChunk, left.keyOffset(), left.keyLength(), right.keyChunk, right.keyOffset(), right.keyLength());
     }
 
+    /// {@return the order of the key and `other`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
+    int compareKey(MemorySegment other) {
+        return Segments.compare(keyChunk, keyOffset(), keyLength(), other, 0, other.byteSize());
+    }
+
     /// {@return the 8 bytes of the key at `at`, big-endian, zero past its end}
     long word(long at) {
         var length = keyLength();
