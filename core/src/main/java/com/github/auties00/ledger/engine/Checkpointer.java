@@ -352,8 +352,8 @@ final class Checkpointer {
                     continue;
                 }
                 // A blind write the cut takes: the leaf the update merges tells whether the tree held the key
-                var blind = current != null && current.blindSequence != 0 && current.blindSequence <= cut.sequence()
-                        && current.blindState == TreeSearch.UNKNOWN ? current : null;
+                // A blind write the cut takes: the chain's first, so at or below the cut, as the cut sees a version of it
+                var blind = current != null && current.blindState() == TreeSearch.UNKNOWN ? current : null;
                 if (version == null || version == Version.HIDDEN) {
                     ops.add(new TreeUpdate.Op(key, null, blind));
                 } else {

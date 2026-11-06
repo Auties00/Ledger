@@ -65,7 +65,7 @@ final class BlindWrites {
         var folded = current.folded;
         var next = start;
         while (next < end && (current.writes[next] >>> 1) <= oldest) {
-            var state = current.chains[next].blindState;
+            var state = current.chains[next].blindState();
             if (state == TreeSearch.UNKNOWN) {
                 break;
             }
@@ -101,11 +101,12 @@ final class BlindWrites {
                 break;
             }
             var chain = current.chains[i];
-            var state = chain.blindState;
+            var state = chain.blindState();
             if (state == TreeSearch.UNKNOWN) {
                 // Every thread that resolves the write finds the same answer
-                state = inTree.test(chain.key()) ? TreeSearch.FOUND : TreeSearch.ABSENT;
-                chain.blindState = state;
+                var found = inTree.test(chain.key());
+                chain.settle(found);
+                state = found ? TreeSearch.FOUND : TreeSearch.ABSENT;
             }
             total += effect(state, write);
         }
@@ -115,7 +116,7 @@ final class BlindWrites {
     /// {@return a chain of no key whose blind write's effect is known to be `state`}
     private static Chain settled(byte state) {
         var chain = new Chain(java.lang.foreign.MemorySegment.ofArray(new byte[0]), 0);
-        chain.blindState = state;
+        chain.settle(state == TreeSearch.FOUND);
         return chain;
     }
 
