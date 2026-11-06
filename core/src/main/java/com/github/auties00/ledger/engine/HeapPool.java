@@ -1,5 +1,8 @@
 package com.github.auties00.ledger.engine;
 
+import java.util.Collections;
+import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -10,9 +13,15 @@ import java.util.concurrent.atomic.AtomicLong;
 /// native memory through small arrays of its own; recycling the arrays keeps that memory from becoming garbage. A
 /// request above 1 MiB gets an array of its own, which is not recycled. Arrays come back with the contents of their
 /// last use: callers write before they read.
+///
+/// A pool no array was taken from for between [#IDLE_MILLIS] and twice that gives its free arrays to the collector:
+/// a store whose last checkpoint left a megabyte of sealed arrays in its pool kept them as long as it stayed idle,
+/// which a process of many stores, most of them idle, paid for each.
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
+    /// How long a pool goes without an acquire, at least, before it frees its arrays.
+    static final long IDLE_MILLIS = 30_000;
 
     private final ConcurrentLinkedQueue<byte[]>[] free;
     private final AtomicLong pooledBytes;
@@ -20,6 +29,11 @@ public final class HeapPool {
     // The bytes each size holds free, which may not take more than half of maxPooledBytes: a checkpoint's flush
     // releases its many small arrays at once, and would otherwise leave no room for the large ones
     private final AtomicLong[] pooledBySize;
+    // The acquires so far, a plain count: a stale read only delays a trim, or trims a pool just used, whose next
+    // acquire then allocates
+    private int acquires;
+    // The count of acquires the trimmer saw last; the trimmer's alone
+    private int acquiresSeen;
 
     /// Creates a pool that keeps at most `maxPooledBytes` of free arrays.
     ///
@@ -37,6 +51,7 @@ public final class HeapPool {
         for (var i = 0; i < free.length; i++) {
             pooledBySize[i] = new AtomicLong();
         }
+        Trimmer.watch(this);
     }
 
     /// {@return an array of at least `capacity` bytes}
@@ -47,6 +62,7 @@ public final class HeapPool {
             return new byte[capacity];
         }
         var shift = Math.max(MIN_SHIFT, 32 - Integer.numberOfLeadingZeros(Math.max(1, capacity) - 1));
+        acquires++;
         var array = free[shift - MIN_SHIFT].poll();
         if (array == null) {
             return new byte[1 << shift];
@@ -75,5 +91,55 @@ public final class HeapPool {
             return;
         }
         free[size].offer(array);
+    }
+
+    /// Gives the free arrays to the collector if no array was acquired since the last call.
+    void trimIfIdle() {
+        var seen = acquires;
+        if (seen == acquiresSeen) {
+            for (var i = 0; i < free.length; i++) {
+                byte[] array;
+                while ((array = free[i].poll()) != null) {
+                    pooledBytes.addAndGet(-array.length);
+                    pooledBySize[i].addAndGet(-array.length);
+                }
+            }
+        }
+        acquiresSeen = seen;
+    }
+
+    /// {@return the bytes of the free arrays; for tests}
+    long pooledBytesForTests() {
+        return pooledBytes.get();
+    }
+
+    /// The thread of the process that trims idle pools, started with the first pool.
+    private static final class Trimmer {
+        // The pools of the process, weakly: a store's pool goes when the store does
+        private static final Set<HeapPool> POOLS = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+
+        static {
+            Thread.ofVirtual().name("ledger-pool-trimmer").start(Trimmer::run);
+        }
+
+        private Trimmer() {
+        }
+
+        static void watch(HeapPool pool) {
+            POOLS.add(pool);
+        }
+
+        private static void run() {
+            while (true) {
+                try {
+                    Thread.sleep(IDLE_MILLIS);
+                } catch (InterruptedException _) {
+                    return;
+                }
+                for (var pool : POOLS.toArray(HeapPool[]::new)) {
+                    pool.trimIfIdle();
+                }
+            }
+        }
     }
 }
