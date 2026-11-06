@@ -55,10 +55,8 @@ import java.util.function.Consumer;
 /// A failed force leaves the store unable to tell which commits reached stable storage, so it stops: every later
 /// commit, and every wait for durability, throws [LedgerIoException]. Reopen the store to recover.
 ///
-/// On macOS a force reaches stable storage only when the application grants the store's module native access,
-/// with `--enable-native-access=com.github.auties00.ledger`: the store then empties the drive's cache with
-/// `fcntl(F_FULLFSYNC)`, as the JDK does not. Without it, a durable commit survives a crash of the system, but a loss
-/// of power may take it from the drive's cache.
+/// On macOS a force empties the drive's cache too, so a durable commit survives a loss of power: the JDK forces a file
+/// with `fcntl(F_FULLFSYNC)` there.
 ///
 /// # Memory
 /// The store keeps the bytes it encrypts, decrypts and writes on the Java heap, in arrays it recycles: the JDK's

@@ -52,8 +52,6 @@ final class PageFile implements AutoCloseable {
     private final FileChannel writer;
     // The file of large values, which leaves point into
     private volatile BlobFile blobs;
-    // Empties the drive's cache for the file on macOS, or null
-    private final FullSync.Handle fullSync;
     private volatile boolean closed;
 
     private PageFile(Path path, PageCipher cipher, PageCache cache, HeapPool pool) throws IOException {
@@ -62,7 +60,6 @@ final class PageFile implements AutoCloseable {
         this.cache = cache;
         this.pool = pool;
         this.writer = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
-        this.fullSync = FullSync.open(path);
         this.readers = new ArrayBlockingQueue<>(READ_CHANNELS);
         try {
             for (var i = 0; i < READ_CHANNELS; i++) {
@@ -87,7 +84,7 @@ final class PageFile implements AutoCloseable {
                 while (empty.hasRemaining()) {
                     channel.write(empty, empty.position());
                 }
-                FullSync.force(channel, temporary, true);
+                channel.force(true);
             }
             Files.move(temporary, path, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
             Durability.forceDirectory(directory);
@@ -419,11 +416,7 @@ final class PageFile implements AutoCloseable {
     }
 
     private void force(boolean metadata) throws IOException {
-        if (fullSync != null) {
-            fullSync.force(writer, metadata);
-        } else {
-            writer.force(metadata);
-        }
+        writer.force(metadata);
     }
 
     /// Cuts the file to `pages` pages, every one past them being free.
@@ -470,9 +463,6 @@ final class PageFile implements AutoCloseable {
             } catch (IOException _) {
                 // Nothing was written through a read channel
             }
-        }
-        if (fullSync != null) {
-            fullSync.close();
         }
         try {
             writer.close();

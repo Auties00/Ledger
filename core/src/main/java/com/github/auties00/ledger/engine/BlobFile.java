@@ -41,8 +41,6 @@ final class BlobFile implements AutoCloseable {
 
     private final Path path;
     private final FileChannel channel;
-    // Empties the drive's cache for the file on macOS, or null
-    private final FullSync.Handle fullSync;
     private final PageCipher cipher;
     private final PageCache cache;
     private final HeapPool pool;
@@ -60,7 +58,6 @@ final class BlobFile implements AutoCloseable {
     private BlobFile(Path path, FileChannel channel, PageCipher cipher, PageCache cache, HeapPool pool, FreeSpace space) throws IOException {
         this.path = path;
         this.channel = channel;
-        this.fullSync = FullSync.open(path);
         this.cipher = cipher;
         this.cache = cache;
         this.pool = pool;
@@ -80,7 +77,7 @@ final class BlobFile implements AutoCloseable {
             var temporary = directory.resolve(FILE + ".tmp");
             try (var created = FileChannel.open(temporary, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
                     StandardOpenOption.WRITE)) {
-                FullSync.force(created, temporary, true);
+                created.force(true);
             }
             Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE);
             Durability.forceDirectory(directory);
@@ -201,11 +198,7 @@ final class BlobFile implements AutoCloseable {
 
     /// Forces every unit written so far, and the length of the file.
     void force() throws IOException {
-        if (fullSync != null) {
-            fullSync.force(channel, true);
-        } else {
-            channel.force(true);
-        }
+        channel.force(true);
     }
 
     /// Frees the pages of `ref` at once: a unit no commit made durable, or one a checkpoint superseded.
@@ -298,9 +291,6 @@ final class BlobFile implements AutoCloseable {
 
     @Override
     public void close() {
-        if (fullSync != null) {
-            fullSync.close();
-        }
         try {
             channel.close();
         } catch (IOException _) {
