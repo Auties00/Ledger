@@ -16,10 +16,12 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
@@ -102,6 +104,11 @@ final class LogWriter {
     private static final int SLICE = 64 << 10;
     /// The bytes of frame bodies the queue holds before commits wait for the device.
     private static final long QUEUE_LIMIT = 64L << 20;
+    /// How long a flush waits for a commit that waits for its durability, while none does and the queue holds less
+    /// than [#HOLD_BYTES]: a group no one waits for joins the next one, which saves a force.
+    private static final long HOLD_NANOS = 5_000_000;
+    /// The bytes of frame bodies queued from which a flush no one waits for starts at once.
+    private static final long HOLD_BYTES = 256L << 10;
     /// The bytes a second of log below which a new segment is written with zeros first, if the commits wait for it.
     private static final long ZEROED_RATE = 64L << 20;
     private final LogFiles files;
@@ -183,6 +190,8 @@ final class LogWriter {
     // The file of large values the commits write to, or null
     private volatile BlobFile blobs;
     private final AtomicBoolean scheduled;
+    // Whether the flush scheduled waits for a commit to wait for its durability, or for its time to pass
+    private final AtomicBoolean held;
     // Held by the one flush that writes groups, on the pool or on the thread of a commit waiting for its group
     private final AtomicBoolean running;
     // The commits waiting for durability
@@ -228,6 +237,7 @@ final class LogWriter {
         this.queueDrained = queueLock.newCondition();
         this.queue = new ArrayList<>();
         this.scheduled = new AtomicBoolean();
+        this.held = new AtomicBoolean();
         this.running = new AtomicBoolean();
         this.waiters = new ConcurrentLinkedQueue<>();
         this.durabilityLock = new ReentrantLock();
@@ -329,6 +339,7 @@ final class LogWriter {
         checkHealthy();
         var length = body.size();
         long frames;
+        long pending;
         queueLock.lock();
         try {
             while (pendingBytes > 0 && pendingBytes + length > QUEUE_LIMIT && failure == null) {
@@ -338,6 +349,7 @@ final class LogWriter {
             queueDeferred();
             queue.add(new Queued(type, sequence, body));
             pendingBytes += length;
+            pending = pendingBytes;
             lastQueued = sequence;
             frames = ++appended;
             appendedBytes += 13 + length + unitBytes;
@@ -345,9 +357,7 @@ final class LogWriter {
         } finally {
             queueLock.unlock();
         }
-        if (scheduled.compareAndSet(false, true)) {
-            executor.execute(this::flush);
-        }
+        schedule(pending);
         return frames;
     }
 
@@ -363,6 +373,7 @@ final class LogWriter {
             return;
         }
         checkHealthy();
+        long pending;
         queueLock.lock();
         try {
             while (pendingBytes > 0 && pendingBytes + batch.bodyBytes > QUEUE_LIMIT && failure == null) {
@@ -372,6 +383,7 @@ final class LogWriter {
             queueDeferred();
             queue.addAll(batch.frames);
             pendingBytes += batch.bodyBytes;
+            pending = pendingBytes;
             lastQueued = batch.frames.getLast().sequence();
             appended += batch.frames.size();
             appendedBytes += batch.appendedBytes;
@@ -380,8 +392,34 @@ final class LogWriter {
             queueLock.unlock();
             batch.clear();
         }
+        schedule(pending);
+    }
+
+    /// Starts a flush of what was queued, unless one is under way: at once if the queue holds [#HOLD_BYTES] or a
+    /// commit window waits out the commits instead, else once a commit waits for its durability or [#HOLD_NANOS] pass.
+    ///
+    /// @param pending the bytes of frame bodies queued and not durable, as the frames were queued
+    private void schedule(long pending) {
         if (scheduled.compareAndSet(false, true)) {
-            executor.execute(this::flush);
+            if (commitWindowNanos > 0 || pending >= HOLD_BYTES) {
+                executor.execute(this::flush);
+            } else {
+                held.set(true);
+                CompletableFuture.delayedExecutor(HOLD_NANOS, TimeUnit.NANOSECONDS, executor).execute(this::release);
+            }
+        } else if (pending >= HOLD_BYTES) {
+            release();
+        }
+    }
+
+    /// Runs the flush held back, if one is: its time passed, or something needs the queue written.
+    private void release() {
+        if (held.compareAndSet(true, false)) {
+            try {
+                executor.execute(this::flush);
+            } catch (RejectedExecutionException exception) {
+                stop(new IOException("The log's pool refused a flush: it was closed with the store open", exception));
+            }
         }
     }
 
@@ -416,6 +454,8 @@ final class LogWriter {
         }
         if (scheduled.compareAndSet(false, true)) {
             executor.execute(this::flush);
+        } else {
+            release();
         }
         return frames;
     }
@@ -443,6 +483,7 @@ final class LogWriter {
     ///
     /// @throws LedgerIoException if the writer stops first
     void awaitFrames(long frames) {
+        release();
         durabilityLock.lock();
         try {
             while (written < frames) {
@@ -888,13 +929,15 @@ final class LogWriter {
         checkHealthy();
         waited = true;
         if (timeout < 0 && !Thread.currentThread().isInterrupted() && alone(sequence)) {
-            // Writes the group itself if no flush is writing: a wait with a timeout, which a slow force would outlast,
-            // leaves it to the pool
+            // Writes the group itself if no flush is writing, the frames held back included: a wait with a timeout,
+            // which a slow force would outlast, leaves it to the pool
+            held.set(false);
             flush(sequence);
             if (durable >= sequence) {
                 return true;
             }
         }
+        release();
         var waiter = new Waiter(Thread.currentThread(), sequence);
         waiters.add(waiter);
         try {
@@ -979,6 +1022,7 @@ final class LogWriter {
         } finally {
             queueLock.unlock();
         }
+        release();
         try {
             durabilityLock.lock();
             try {
