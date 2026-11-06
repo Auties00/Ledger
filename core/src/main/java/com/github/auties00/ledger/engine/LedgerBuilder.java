@@ -248,7 +248,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                 // replayed, their units, and the name of a segment it prepared, which this open may write into
                 if (recovered.lastWritten() != null) {
                     try (var channel = FileChannel.open(recovered.lastWritten(), StandardOpenOption.WRITE)) {
-                        FullSync.force(channel, recovered.lastWritten(), false);
+                        channel.force(false);
                     }
                 }
                 blobs.force();
