@@ -1318,7 +1318,7 @@ public final class LiveLedger implements Ledger {
             var superseded = new ArrayList<PageRef>();
             for (var unit : inFlight) {
                 if (unit.version().stamp <= bound && unit.version().replacedAt <= sequence) {
-                    superseded.add(unit.version().external);
+                    superseded.add(unit.version().unit);
                 }
             }
             return new Cut(sequence, logStart.getAsLong(), log.appendedBytes(), base, maxId, cuts, superseded);
@@ -1376,7 +1376,7 @@ public final class LiveLedger implements Ledger {
                 }
                 var bound = Reads.boundOf(cut.sequence());
                 inFlight.removeIf(unit -> unit.version().stamp <= bound
-                        && (adopted.contains(unit.version().external) || unit.version().replacedAt <= cut.sequence()));
+                        && (adopted.contains(unit.version().unit) || unit.version().replacedAt <= cut.sequence()));
             }
         } finally {
             exitPublishing();
@@ -1859,7 +1859,7 @@ public final class LiveLedger implements Ledger {
         // The versions this commit added whose value a unit of the file of large values holds
         private int externals;
         // The versions in flight this commit replaced, which a rollback marks current again, or null before any
-        private List<Version> replaced;
+        private List<Version.External> replaced;
 
         Applier(long sequence, boolean journaled) {
             this(sequence, journaled, 4);
@@ -1915,12 +1915,12 @@ public final class LiveLedger implements Ledger {
 
         /// Records that this commit replaces `version`, if a unit no checkpoint has taken holds its value.
         private void replace(Version version) {
-            if (version != null && version.external != null && version.replacedAt == Long.MAX_VALUE) {
-                version.replacedAt = sequence;
+            if (version instanceof Version.External external && external.replacedAt == Long.MAX_VALUE) {
+                external.replacedAt = sequence;
                 if (replaced == null) {
                     replaced = new ArrayList<>(2);
                 }
-                replaced.add(version);
+                replaced.add(external);
             }
         }
 
@@ -1977,7 +1977,7 @@ public final class LiveLedger implements Ledger {
             var stamp = nextStamp();
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
-            var version = new Version(stamp, value, decoded, head, external);
+            var version = Version.of(stamp, value, decoded, head, external);
             var blind = existed == TreeSearch.UNKNOWN;
             if (blind) {
                 markBlind(chain);
@@ -2149,8 +2149,8 @@ public final class LiveLedger implements Ledger {
                     if (write.version() == null) {
                         continue;
                     }
-                    if (write.version().external != null) {
-                        inFlight.add(new InFlight(write.state(), write.chain(), write.version()));
+                    if (write.version() instanceof Version.External external) {
+                        inFlight.add(new InFlight(write.state(), write.chain(), external));
                     }
                     if (pages != null) {
                         write.state().markDirty(write.chain());
@@ -2193,7 +2193,7 @@ public final class LiveLedger implements Ledger {
                     restored.getKey().removals = restored.getValue();
                 }
             }
-            for (var version : replaced == null ? List.<Version>of() : replaced) {
+            for (var version : replaced == null ? List.<Version.External>of() : replaced) {
                 version.replacedAt = Long.MAX_VALUE;
             }
         }
@@ -2203,7 +2203,7 @@ public final class LiveLedger implements Ledger {
     /// A version whose value a unit of the file of large values holds, which no published checkpoint has taken.
     ///
     /// @param chain the chain of its key
-    private record InFlight(KeyspaceState state, Chain chain, Version version) {
+    private record InFlight(KeyspaceState state, Chain chain, Version.External version) {
     }
 
     /// A key a commit wrote.
