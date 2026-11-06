@@ -316,14 +316,16 @@ class DurableLedgerTest {
         }
 
         @ParameterizedTest(name = "{0}")
-        @ValueSource(strings = {"the force of its group", "the force of the file of large values"})
+        @ValueSource(strings = {"the force of its group", "the force of the file of large values", "the force of a group larger than the starting output"})
         @DisplayName("a commit that writes its own group and is interrupted by another thread is durable, and the log goes on")
         void interruptedLeader(String cutOff) throws Exception {
             var disk = CrashFileSystem.create();
             var committer = Thread.currentThread();
             var armed = new java.util.concurrent.atomic.AtomicBoolean();
             var interrupts = new java.util.concurrent.atomic.AtomicInteger();
-            var large = cutOff.contains("large");
+            var large = cutOff.contains("large values");
+            // A group of 80 values of 4,000 bytes, 320 KB, more than the log writer's output starts with
+            var wide = cutOff.contains("larger");
             disk.intercept((path, kind) -> {
                 var target = large ? path.toString().endsWith(BlobFile.FILE) : path.toString().endsWith(".log");
                 // Only while the committing thread forces its own group, or waits for the file of large values
@@ -347,7 +349,11 @@ class DurableLedgerTest {
                 for (var i = 0; i < 40; i++) {
                     armed.set(true);
                     var value = large ? "v".repeat(5_000) + i : "v" + i;
-                    var commit = ledger.commit(ledger.newBatch().put(NAMES, "k" + i, value));
+                    var batch = ledger.newBatch().put(NAMES, "k" + i, value);
+                    for (var j = 0; wide && j < 80; j++) {
+                        batch.put(NAMES, "k" + i + "-" + j, "w".repeat(4_000) + j);
+                    }
+                    var commit = ledger.commit(batch);
                     try {
                         commit.awaitDurable();
                     } catch (InterruptedException _) {
@@ -367,6 +373,9 @@ class DurableLedgerTest {
             try (var ledger = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(NAMES).largeValues(4_096).build()) {
                 for (var i = 0; i < 40; i++) {
                     assertEquals(Optional.of(large ? "v".repeat(5_000) + i : "v" + i), ledger.get(NAMES, "k" + i));
+                    for (var j = 0; wide && j < 80; j++) {
+                        assertEquals(Optional.of("w".repeat(4_000) + j), ledger.get(NAMES, "k" + i + "-" + j));
+                    }
                 }
             }
         }

@@ -37,6 +37,9 @@ final class LogFiles {
     // Not on Windows, where forcing a growing file cost a durable commit no more than forcing one written with zeros
     // first, and the zeros made an ingest of a history a fifth slower
     private static final boolean ZERO_FILL = !System.getProperty("os.name", "").startsWith("Windows");
+    // The zeros a fill writes, a megabyte at a time: one buffer for the process rather than one per segment, which on
+    // the heap took a region of its own each time; direct, so the channel writes them without copying them first
+    private static final ByteBuffer ZEROS = ByteBuffer.allocateDirect(1 << 20).asReadOnlyBuffer();
 
     private final Path directory;
     private final StoreKeys keys;
@@ -158,7 +161,8 @@ final class LogFiles {
 
     /// Writes zeros to `channel` from `from` to `to`, so the file has the blocks of its full length.
     private static void fill(FileChannel channel, long from, long to) throws IOException {
-        var zeros = ByteBuffer.allocate(1 << 20);
+        // A view of its own of the shared zeros, whose bytes no one writes
+        var zeros = ZEROS.duplicate();
         var position = from;
         while (position < to) {
             zeros.clear().limit((int) Math.min(zeros.capacity(), to - position));
