@@ -41,7 +41,7 @@ final class Checkpointer {
     /// left in the OS cache held the first durable commit after the open for tens of milliseconds.
     private static final int SPARES = 0;
     /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint.
-    private static final int BACKLOG = 3;
+    private static final int BACKLOG = Integer.getInteger("ledger.backlog", 3);
     // The epoch of the file of large values the last durable superblock records; guarded by the lock
     private int durableEpoch;
     // The highest epoch an earlier open used that only its log segments record, if above durableEpoch
