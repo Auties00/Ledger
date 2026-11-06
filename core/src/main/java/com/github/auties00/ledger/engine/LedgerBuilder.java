@@ -210,6 +210,12 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var firstSegment = superblock == null ? 0 : superblock.logStart();
             var files = new LogFiles(logDirectory, opened.keys(), opened.header().storeId());
             files.deleteStale();
+            // Segments before the superblock's first one: the process that wrote it stopped before its checkpoint
+            // retired them, maybe before the superblock left the OS cache, which recovery is about to trust
+            var crashed = !files.segments().isEmpty() && files.segments().getFirst() < firstSegment;
+            if (crashed) {
+                pages.force();
+            }
             var recovered = LogRecovery.replay(files, opened.keys(), opened.header().storeId(), firstSegment,
                     superblock == null ? 0 : superblock.sequence(), new LogRecovery.Sink() {
                         @Override
@@ -237,12 +243,17 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                 // Kept by the last close, or prepared by a crashed open and never written: the writer writes into it
                 first = empty.number();
             }
-            if (recovered.lastWritten() != null) {
-                // What a process that stopped left in the cache, durable before a commit follows it
-                try (var channel = FileChannel.open(recovered.lastWritten(), StandardOpenOption.WRITE)) {
-                    FullSync.force(channel, recovered.lastWritten(), false);
+            if (recovered.lastWritten() != null || crashed) {
+                // What a process that stopped left in the cache, durable before a commit follows it: the commits it
+                // replayed, their units, and the name of a segment it prepared, which this open may write into
+                if (recovered.lastWritten() != null) {
+                    try (var channel = FileChannel.open(recovered.lastWritten(), StandardOpenOption.WRITE)) {
+                        FullSync.force(channel, recovered.lastWritten(), false);
+                    }
                 }
                 blobs.force();
+                pages.force();
+                Durability.forceDirectory(logDirectory);
             }
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
                     segmentSize, pool.executor(), commitWindow, empty);
@@ -250,7 +261,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var deltas = deltaTable == null ? DeltaTable.EMPTY
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));
             var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
-                    superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures);
+                    superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures,
+                    superblock == null ? 0 : superblock.epoch(), epochs[0]);
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
             } else {

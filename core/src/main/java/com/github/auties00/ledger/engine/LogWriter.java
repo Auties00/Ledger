@@ -166,6 +166,10 @@ final class LogWriter {
     private Queued deferred;
     // The number the deferred frame took among the frames queued, once queued; guarded by the queue lock
     private long deferredFrame;
+    // Whether close began, after which nothing is queued; guarded by the queue lock
+    private boolean closed;
+    // Whether close began, so a segment prepared now is not written with zeros it would cut off
+    private volatile boolean closing;
     // The file of large values the commits write to, or null
     private volatile BlobFile blobs;
     private final AtomicBoolean scheduled;
@@ -183,7 +187,8 @@ final class LogWriter {
     /// @param files the files of the log
     /// @param keys the store's keys
     /// @param storeId the store's id
-    /// @param firstSegment the number of the segment to prepare, above every existing one
+    /// @param firstSegment the number of the segment to write first: the one to prepare, above every existing one, or
+    ///                     the number of `empty`
     /// @param durable the sequence the log already holds durably
     /// @param segmentSize the size past which a new segment starts
     /// @param executor runs the flush task on platform threads
@@ -261,7 +266,7 @@ final class LogWriter {
         var number = segmentNumber + 1;
         // Filled slower than the rate, by commits that waited for its forces
         var zeros = (waited || waitedBefore) && lastFill >= 0 && lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE;
-        var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize, zeros));
+        var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize, zeros && !closing));
         next = preparation;
         Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
     }
@@ -383,10 +388,14 @@ final class LogWriter {
     /// Queues the frame [#defer] holds back, unless a frame queued since took it along, and starts a flush.
     ///
     /// @return the number of the frame among those queued since the writer opened, for [#awaitFrames(long)]
+    /// @throws IllegalStateException if the writer is closed, which dropped the frame
     long flushDeferred() {
         long frames;
         queueLock.lock();
         try {
+            if (closed) {
+                throw new IllegalStateException("The store is closed");
+            }
             queueDeferred();
             frames = deferredFrame;
         } finally {
@@ -828,11 +837,13 @@ final class LogWriter {
     ///
     /// @throws LedgerIoException if the queued frames cannot be made durable
     void close() {
+        closing = true;
         long frames;
         queueLock.lock();
         try {
             // No frame followed it, so no commit needs it
             deferred = null;
+            closed = true;
             frames = appended;
         } finally {
             queueLock.unlock();
@@ -871,8 +882,9 @@ final class LogWriter {
         if (preparation == null) {
             return;
         }
+        // A file operation would close its channel on an interrupted thread
+        var interrupted = Thread.interrupted();
         preparation.run();
-        var interrupted = false;
         try {
             while (true) {
                 try {

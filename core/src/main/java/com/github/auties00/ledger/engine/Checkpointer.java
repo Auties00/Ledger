@@ -43,6 +43,10 @@ final class Checkpointer {
     private static final int SPARES = 0;
     /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint.
     private static final int BACKLOG = 3;
+    // The epoch of the file of large values the last durable superblock records; guarded by the lock
+    private int durableEpoch;
+    // The highest epoch an earlier open used that only its log segments record, if above durableEpoch
+    private final int loggedEpoch;
 
     private final LiveLedger ledger;
     private final PageFile pages;
@@ -79,8 +83,11 @@ final class Checkpointer {
     /// @param deltas the delta pages of the last durable checkpoint
     /// @param deltaTable the blob holding their table, or `null` if there is none
     /// @param failures receives the failures of the checkpoints started on their own threads
+    /// @param durableEpoch the epoch of the file of large values the last superblock records
+    /// @param loggedEpoch the highest epoch recovery found, in the superblock or in the log, which units may take
     Checkpointer(LiveLedger ledger, PageFile pages, FreeSpace space, BlobFile blobs, LogWriter log, LogFiles files, long every,
-                 long number, DeltaTable deltas, PageRef deltaTable, Consumer<? super LedgerException> failures) {
+                 long number, DeltaTable deltas, PageRef deltaTable, Consumer<? super LedgerException> failures,
+                 int durableEpoch, int loggedEpoch) {
         this.ledger = ledger;
         this.pages = pages;
         this.space = space;
@@ -95,6 +102,8 @@ final class Checkpointer {
         this.scheduled = new AtomicBoolean();
         this.random = new SecureRandom();
         this.failures = failures;
+        this.durableEpoch = durableEpoch;
+        this.loggedEpoch = loggedEpoch;
         this.progressLock = new ReentrantLock();
         this.progress = progressLock.newCondition();
     }
@@ -181,7 +190,7 @@ final class Checkpointer {
             }
             var cut = ledger.cutCheckpoint(() -> closing ? log.nextOpenSegment() : log.currentSegment());
             if (cut == null) {
-                if (closing) {
+                if (closing && !epochOnlyInLog()) {
                     // The trees hold every commit, so the segments hold nothing a reopen needs but the one kept for it
                     retire(log.nextOpenSegment(), SPARES);
                 }
@@ -240,6 +249,9 @@ final class Checkpointer {
                                 nextDeltaTable),
                         writer.nonceHigh(), writer.nextNonce());
                 number++;
+                if (blobs != null) {
+                    durableEpoch = blobs.epoch();
+                }
                 deltas = nextDeltas;
                 deltaTable = nextDeltaTable;
             } catch (IOException exception) {
@@ -279,6 +291,19 @@ final class Checkpointer {
         } finally {
             lock.unlock();
         }
+    }
+
+    /// {@return whether an epoch of the file of large values that units may have taken is recorded only by the log}
+    ///
+    /// Units are sealed under their epoch and a counter, so an open that reused an epoch would reuse their nonces: a
+    /// unit written by a commit that failed, or by one a crash cut off, took its open's epoch without a checkpoint
+    /// recording it, and the segments that hold its epoch frame stay until one does.
+    private boolean epochOnlyInLog() {
+        if (blobs == null) {
+            return false;
+        }
+        return Integer.compareUnsigned(loggedEpoch, durableEpoch) > 0
+                || (blobs.epochTaken() && Integer.compareUnsigned(blobs.epoch(), durableEpoch) > 0);
     }
 
     /// Retires the log segments before `first`, keeping `spares` of them to be prepared again.
