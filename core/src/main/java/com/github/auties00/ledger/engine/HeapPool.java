@@ -39,8 +39,14 @@ public final class HeapPool {
     ///
     /// @param maxPooledBytes the most memory the free arrays may hold; arrays released past it are left to the
     ///                       collector
-    @SuppressWarnings("unchecked")
     public HeapPool(long maxPooledBytes) {
+        this(maxPooledBytes, true);
+    }
+
+    /// Creates a pool that keeps at most `maxPooledBytes` of free arrays, and that the trimmer of the process trims
+    /// only if `trimmed`; for tests that trim it themselves.
+    @SuppressWarnings("unchecked")
+    HeapPool(long maxPooledBytes, boolean trimmed) {
         this.free = new ConcurrentLinkedQueue[MAX_SHIFT - MIN_SHIFT + 1];
         for (var i = 0; i < free.length; i++) {
             free[i] = new ConcurrentLinkedQueue<>();
@@ -51,7 +57,9 @@ public final class HeapPool {
         for (var i = 0; i < free.length; i++) {
             pooledBySize[i] = new AtomicLong();
         }
-        Trimmer.watch(this);
+        if (trimmed) {
+            Trimmer.watch(this);
+        }
     }
 
     /// {@return an array of at least `capacity` bytes}

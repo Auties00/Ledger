@@ -21,7 +21,8 @@ class HeapPoolTest {
     @Test
     @DisplayName("frees its arrays once no array was acquired between two trims, and keeps them while one was")
     void trimsWhenIdle() {
-        var pool = new HeapPool(1 << 20);
+        // Not the process's trimmer's, which would trim it between the calls here
+        var pool = new HeapPool(1 << 20, false);
         pool.release(pool.acquire(4_096));
         pool.release(pool.acquire(65_536));
         pool.trimIfIdle();
