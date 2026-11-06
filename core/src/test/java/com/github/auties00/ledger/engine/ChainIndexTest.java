@@ -70,6 +70,109 @@ class ChainIndexTest {
     }
 
     @Test
+    @DisplayName("adds once and removes by identity with colliding hashes, keys of 1 to 11 bytes, probes that wrap and tables that shrink")
+    void strictModel() {
+        var random = new SplittableRandom(7);
+        for (var trial = 0; trial < 10; trial++) {
+            var index = new ChainIndex();
+            var model = new HashMap<String, Chain>();
+            // A few hashes for every key: equal hashes of different keys, probes from the last slots of a table
+            var forced = new int[]{0x0000FFFF, 0x0000FFFE, 0x7C00000F, 0};
+            for (var step = 0; step < 150_000; step++) {
+                // Phases of many keys and of few, so the segments grow and then shrink
+                var many = (step / 30_000) % 2 == 0;
+                var id = random.nextInt(many ? 3_000 : 300);
+                var length = 1 + id % 11;
+                var bytes = new byte[length];
+                for (var i = 0; i < length; i++) {
+                    bytes[i] = (byte) (id >>> (8 * (i % 4)));
+                }
+                bytes[length - 1] ^= (byte) (id / 256 + length);
+                var name = java.util.HexFormat.of().formatHex(bytes);
+                var hash = forced[Math.floorMod(java.util.Arrays.hashCode(bytes), forced.length)];
+                var key = MemorySegment.ofArray(bytes).asReadOnly();
+                switch (random.nextInt(many ? 3 : 4)) {
+                    case 0 -> {
+                        var created = new Chain(key, hash);
+                        var expected = model.get(name);
+                        assertSame(expected, index.putIfAbsent(created), "put " + name);
+                        if (expected == null) {
+                            model.put(name, created);
+                        }
+                    }
+                    case 1 -> {
+                        // Another chain of the same key is not the one held: removing it changes nothing
+                        index.remove(new Chain(key, hash));
+                        assertSame(model.get(name), index.get(key, hash), "removing another chain of " + name);
+                    }
+                    default -> {
+                        var held = model.remove(name);
+                        if (held != null) {
+                            index.remove(held);
+                        }
+                        assertNull(index.get(key, hash), "found " + name + " after its removal");
+                    }
+                }
+                assertEquals(model.size(), index.size());
+            }
+            for (var held : model.values()) {
+                assertSame(held, index.get(held.key, held.hash));
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("finds every chain a reader synchronized with the insertion of, while the segments grow")
+    void published() throws Exception {
+        var writers = 4;
+        var index = new ChainIndex();
+        var published = new java.util.concurrent.atomic.AtomicLongArray(writers);
+        var stop = new AtomicBoolean();
+        var failure = new AtomicReference<Throwable>();
+        var threads = new ArrayList<Thread>();
+        for (var w = 0; w < writers; w++) {
+            var writer = w;
+            threads.add(Thread.ofPlatform().start(() -> {
+                for (var n = 1L; !stop.get() && n <= 1_000_000; n++) {
+                    var created = chain(((long) writer << 40) | n);
+                    if (index.putIfAbsent(created) != null) {
+                        failure.compareAndSet(null, new AssertionError("a new key was held already"));
+                        return;
+                    }
+                    // What a commit's publication does for the chains it wrote
+                    published.setRelease(writer, n);
+                }
+            }));
+        }
+        for (var r = 0; r < 4; r++) {
+            var seed = r;
+            threads.add(Thread.ofPlatform().start(() -> {
+                var random = new SplittableRandom(seed);
+                while (!stop.get()) {
+                    var writer = random.nextInt(writers);
+                    var last = published.getAcquire(writer);
+                    for (var n = last; n > Math.max(0, last - 4); n--) {
+                        var bytes = keyOf(((long) writer << 40) | n);
+                        if (index.get(bytes, Segments.hash(bytes)) == null) {
+                            failure.compareAndSet(null, new AssertionError("a reader missed " + writer + ":" + n));
+                            stop.set(true);
+                            return;
+                        }
+                    }
+                }
+            }));
+        }
+        Thread.sleep(2_000);
+        stop.set(true);
+        for (var thread : threads) {
+            thread.join();
+        }
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+    }
+
+    @Test
     @DisplayName("never hides a chain it holds from a reader while writers add and remove others and the segments grow")
     void concurrent() throws Exception {
         var index = new ChainIndex();

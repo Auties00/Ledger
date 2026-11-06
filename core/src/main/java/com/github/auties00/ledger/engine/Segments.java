@@ -9,6 +9,8 @@ import java.util.Comparator;
 
 /// Operations on the memory segments that hold encoded keys and values.
 final class Segments {
+    // Mixed into every hash; drawn once per process
+    private static final long HASH_SEED = new java.security.SecureRandom().nextLong();
     /// Orders segments as unsigned bytes, a prefix before every longer segment it starts.
     static final Comparator<MemorySegment> UNSIGNED = Segments::compare;
     private static final ValueLayout.OfLong BIG_ENDIAN_LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
@@ -53,12 +55,14 @@ final class Segments {
         return left.mismatch(right) == -1;
     }
 
-    /// {@return a hash of the bytes of `segment`}
+    /// {@return a hash of the bytes of `segment`, under a seed of this process}
     ///
-    /// Keys often share long prefixes, a chat's id before a message's, so every byte counts.
+    /// Keys often share long prefixes, a chat's id before a message's, so every byte counts. The seed, random and never
+    /// stored, keeps keys that others choose, as the senders of messages choose their ids, from being made to collide:
+    /// the hash index probes a run of colliding keys one by one.
     static int hash(MemorySegment segment) {
         var length = segment.byteSize();
-        var hash = length * 0x9E3779B97F4A7C15L;
+        var hash = HASH_SEED ^ length * 0x9E3779B97F4A7C15L;
         var offset = 0L;
         for (; offset + Long.BYTES <= length; offset += Long.BYTES) {
             hash = Long.rotateLeft((hash ^ segment.get(ValueLayout.JAVA_LONG_UNALIGNED, offset)) * 0x9E3779B97F4A7C15L, 29);
