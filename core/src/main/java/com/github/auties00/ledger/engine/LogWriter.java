@@ -410,6 +410,20 @@ final class LogWriter {
         }
     }
 
+    /// {@return whether the frame of the commit at `sequence` is queued and no later commit's is}
+    ///
+    /// Only such a commit writes its group itself: with later commits queued behind it, the pool's flush goes on to
+    /// their group at once, where a commit that wrote its own would hand that group to the pool and wait for a thread
+    /// of it to wake.
+    private boolean alone(long sequence) {
+        queueLock.lock();
+        try {
+            return !queue.isEmpty() && lastQueued <= sequence;
+        } finally {
+            queueLock.unlock();
+        }
+    }
+
     /// {@return whether `frames` seal into the output and the current segment, so the group is written with one call
     /// that a write cut off by an interrupt repeats, with no rollover to prepare a segment on the caller's thread}
     private boolean fitsOneWrite(List<Queued> frames) {
@@ -439,7 +453,7 @@ final class LogWriter {
                 boolean units;
                 queueLock.lock();
                 try {
-                    if (queue.isEmpty() || (until != Long.MAX_VALUE && !fitsOneWrite(queue))) {
+                    if (queue.isEmpty() || (until != Long.MAX_VALUE && (lastQueued > until || !fitsOneWrite(queue)))) {
                         return;
                     }
                     group = queue;
@@ -765,7 +779,7 @@ final class LogWriter {
         }
         checkHealthy();
         waited = true;
-        if (timeout < 0 && !Thread.currentThread().isInterrupted()) {
+        if (timeout < 0 && !Thread.currentThread().isInterrupted() && alone(sequence)) {
             // Writes the group itself if no flush is writing: a wait with a timeout, which a slow force would outlast,
             // leaves it to the pool
             flush(sequence);
