@@ -15,6 +15,8 @@ import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
@@ -313,31 +315,54 @@ class DurableLedgerTest {
             }
         }
 
-        @Test
-        @DisplayName("a commit whose group's force is cut off by an interrupt is durable, and the log goes on")
-        void interruptedForce() throws Exception {
+        @ParameterizedTest(name = "{0}")
+        @ValueSource(strings = {"the force of its group", "the force of the file of large values"})
+        @DisplayName("a commit that writes its own group and is interrupted by another thread is durable, and the log goes on")
+        void interruptedLeader(String cutOff) throws Exception {
             var disk = CrashFileSystem.create();
+            var committer = Thread.currentThread();
             var armed = new java.util.concurrent.atomic.AtomicBoolean();
+            var interrupts = new java.util.concurrent.atomic.AtomicInteger();
+            var large = cutOff.contains("large");
             disk.intercept((path, kind) -> {
-                if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log") && armed.compareAndSet(true, false)) {
-                    // Whichever thread forces the group, the pool's or the commit's own, takes the interrupt
-                    Thread.currentThread().interrupt();
+                var target = large ? path.toString().endsWith(BlobFile.FILE) : path.toString().endsWith(".log");
+                // Only while the committing thread forces its own group, or waits for the file of large values
+                var leading = large || Thread.currentThread() == committer;
+                if (kind == ChangeInterceptor.ChangeKind.FORCE && target && leading && armed.compareAndSet(true, false)) {
+                    var interrupter = Thread.ofPlatform().start(committer::interrupt);
+                    try {
+                        interrupter.join();
+                        if (large) {
+                            // Long enough for the committer to take the interrupt in its wait
+                            Thread.sleep(20);
+                        }
+                    } catch (InterruptedException _) {
+                        Thread.currentThread().interrupt();
+                    }
+                    interrupts.incrementAndGet();
                 }
             });
-            try (var ledger = open(disk.getPath("/store"), NAMES)) {
-                for (var i = 0; i < 20; i++) {
+            var options = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(NAMES).largeValues(4_096);
+            try (var ledger = options.build()) {
+                for (var i = 0; i < 40; i++) {
                     armed.set(true);
-                    var commit = ledger.commit(ledger.newBatch().put(NAMES, "k" + i, "v" + i));
-                    commit.awaitDurable();
+                    var value = large ? "v".repeat(5_000) + i : "v" + i;
+                    var commit = ledger.commit(ledger.newBatch().put(NAMES, "k" + i, value));
+                    try {
+                        commit.awaitDurable();
+                    } catch (InterruptedException _) {
+                        // The pool forced the group, and the commit took the interrupt while it waited
+                        commit.awaitDurable();
+                    }
                     assertTrue(commit.isDurable());
-                    assertFalse(armed.get(), "no force of the log took the interrupt");
-                    // The commit's thread got its interrupt back, if it forced the group itself
                     Thread.interrupted();
                 }
+                ledger.commit(ledger.newBatch().put(NAMES, "after", "v")).awaitDurable();
             }
-            try (var ledger = open(disk.getPath("/store"), NAMES)) {
-                for (var i = 0; i < 20; i++) {
-                    assertEquals(Optional.of("v" + i), ledger.get(NAMES, "k" + i));
+            assertTrue(interrupts.get() > 0, "no commit forced its own group");
+            try (var ledger = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(NAMES).largeValues(4_096).build()) {
+                for (var i = 0; i < 40; i++) {
+                    assertEquals(Optional.of(large ? "v".repeat(5_000) + i : "v" + i), ledger.get(NAMES, "k" + i));
                 }
             }
         }
