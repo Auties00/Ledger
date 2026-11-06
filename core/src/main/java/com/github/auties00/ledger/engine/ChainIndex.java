@@ -112,9 +112,11 @@ final class ChainIndex {
                     SLOTS.setRelease(chains, slot, TOMBSTONE);
                     segment.size--;
                     // Tombstones end no probe: once they outnumber the chains, and fill a quarter of the table, they
-                    // go, and with them the length a churn of insertions and removals left the table at
+                    // go; and a table an eighth full shrinks, so a key space whose chains a checkpoint dropped does not
+                    // keep the slots of its busiest moment
                     var tombstones = segment.taken - segment.size;
-                    if (tombstones > segment.size && tombstones * 4 > chains.length) {
+                    if ((tombstones > segment.size && tombstones * 4 > chains.length)
+                            || (chains.length > INITIAL && segment.size * 8 < chains.length)) {
                         segment.rebuild();
                     }
                     return;

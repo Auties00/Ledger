@@ -100,6 +100,15 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         return this;
     }
 
+    /// {@return the most memory the free arrays of the store's pool may hold: an eighth of the page cache, at least 4
+    /// MiB}
+    ///
+    /// The pool recycles the arrays a store fills and empties over and over, batches, log buffers and pages, whose
+    /// working set is small; as large as the page cache, it held up to as much again in arrays no one used.
+    private long pooledBytes() {
+        return Math.max(4 * MIB, pageCache / 8);
+    }
+
     @Override
     public Ledger.Options pageCache(long bytes) {
         if (bytes < MIB) {
@@ -161,7 +170,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     @Override
     public Ledger build() {
         if (directory == null) {
-            var ledger = new LiveLedger(keyspaces.values(), new HeapPool(pageCache));
+            var ledger = new LiveLedger(keyspaces.values(), new HeapPool(pooledBytes()));
             ledger.assignIds();
             return ledger;
         }
@@ -182,7 +191,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             }
             var opened = StoreHeader.openOrCreate(directory, encryption);
             Files.createDirectories(logDirectory);
-            var heap = new HeapPool(pageCache);
+            var heap = new HeapPool(pooledBytes());
             pages = PageFile.open(directory, new PageCipher(opened.keys().pageKey()), pageCache, heap);
             var ledger = new LiveLedger(keyspaces.values(), heap);
             var superblock = pages.superblock();

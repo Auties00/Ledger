@@ -12,6 +12,7 @@ import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.WriteBatch;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
@@ -50,6 +51,8 @@ import java.util.function.LongSupplier;
 /// tree holds a version, the writer drops it from memory, except in resident key spaces, which keep every entry; a
 /// range removal stays as a record while a reader's tree may hold keys it removed.
 public final class LiveLedger implements Ledger {
+    /// The bytes by which the array a resident value came in may exceed it before the value takes an array of its own.
+    private static final int RESIDENT_SLACK = 64;
     private static final int READER_SLOTS = 256;
     private static final int SWEEP_BUDGET = 64;
     private static final int PRUNE_CHUNK = 1_024;
@@ -1385,12 +1388,13 @@ public final class LiveLedger implements Ledger {
 
     /// Drops from memory the versions of the keys a published checkpoint wrote that every reader's tree holds, a few
     /// keys per hold of the publishing role.
+    ///
+    /// A resident key keeps its newest version, but loses those its writes kept for the checkpoint, which read as of
+    /// its cut: left to the sweep, which visits a few chains a commit, a resident key written in a burst kept one older
+    /// version until enough commits came after.
     void pruneCut(Cut cut) {
         for (var keyspace : cut.keyspaces()) {
             var state = keyspace.state();
-            if (state.resident) {
-                continue;
-            }
             var chains = keyspace.dirty().iterator();
             while (chains.hasNext()) {
                 enterPublishing();
@@ -1982,6 +1986,12 @@ public final class LiveLedger implements Ledger {
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
             var length = Math.toIntExact(value.byteSize());
+            if (state.resident && external == null && (source == null || source.byteSize() > 2L * length + RESIDENT_SLACK)) {
+                // A resident version lives as long as its key does: on a value of its own, not on the array of the
+                // batch or the log frame it came in, which a session written beside ten messages held 12 times over
+                value = MemorySegment.ofArray(value.toArray(ValueLayout.JAVA_BYTE)).asReadOnly();
+                source = null;
+            }
             var version = source == null ? Version.of(stamp, value, 0, length, decoded, head, external)
                     : Version.of(stamp, source, offset, length, decoded, head, external);
             var blind = existed == TreeSearch.UNKNOWN;
