@@ -585,7 +585,7 @@ public final class LiveLedger implements Ledger {
                         case ArrayWriteBatch.PUT -> {
                             var value = writes.value(i);
                             var decoded = state.resident ? residentValue(state, writes.decodedValue(i), value) : null;
-                            applier.put(state, writes.key(i), value, decoded,
+                            applier.put(state, applier.claim(state, writes.key(i)), writes.key(i), value, writes.view(), writes.valueOffset(i), decoded,
                                     hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree), units == null ? null : units[i]);
                         }
                         case ArrayWriteBatch.DELETE ->
@@ -811,7 +811,7 @@ public final class LiveLedger implements Ledger {
                 }
                 var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(i, tree);
                 if (writes.kind(i) == ArrayWriteBatch.PUT) {
-                    applier.put(pending.states[i], pending.chains[i], writes.key(i), writes.value(i),
+                    applier.put(pending.states[i], pending.chains[i], writes.key(i), writes.value(i), writes.view(), writes.valueOffset(i),
                             pending.decoded == null ? null : pending.decoded[i], inTree, pending.units == null ? null : pending.units[i]);
                 } else {
                     applier.delete(pending.states[i], pending.chains[i], writes.key(i), inTree);
@@ -1956,13 +1956,13 @@ public final class LiveLedger implements Ledger {
         /// @param external the unit of the file of large values that holds `value` too, or `null`
         void put(KeyspaceState state, MemorySegment key, MemorySegment value, Object decoded, byte inTree, PageRef external) {
             // Usually opened already by the commit's prefetch
-            put(state, claim(state, key), key, value, decoded, inTree, external);
+            put(state, claim(state, key), key, value, null, 0, decoded, inTree, external);
         }
 
         /// {@return the chain of `key`, claimed for a write of an operation that runs alone}
         ///
         /// The claim keeps a prune that runs beside it, of a commit published before, from dropping the chain.
-        private Chain claim(KeyspaceState state, MemorySegment key) {
+        Chain claim(KeyspaceState state, MemorySegment key) {
             while (true) {
                 var chain = state.open(key);
                 if (chain.claimAlone(sequence)) {
@@ -1972,12 +1972,18 @@ public final class LiveLedger implements Ledger {
         }
 
         /// Applies a put of `key`, whose chain is `chain`, in the order and without the race the caller ensures.
-        void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, Object decoded, byte inTree,
-                 PageRef external) {
+        ///
+        /// @param source the read-only segment `value` is part of, which the version keeps in its place, or `null` for a
+        ///               value of its own
+        /// @param offset where `value` starts in `source`
+        void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, MemorySegment source, int offset,
+                 Object decoded, byte inTree, PageRef external) {
             var stamp = nextStamp();
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
-            var version = Version.of(stamp, value, decoded, head, external);
+            var length = Math.toIntExact(value.byteSize());
+            var version = source == null ? Version.of(stamp, value, 0, length, decoded, head, external)
+                    : Version.of(stamp, source, offset, length, decoded, head, external);
             var blind = existed == TreeSearch.UNKNOWN;
             if (blind) {
                 markBlind(chain);

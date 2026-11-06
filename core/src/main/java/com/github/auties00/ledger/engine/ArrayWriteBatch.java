@@ -237,6 +237,18 @@ public final class ArrayWriteBatch implements WriteBatch {
         return span(index, 2);
     }
 
+    /// {@return the read-only segment of the array every key and value of the batch is part of}
+    MemorySegment view() {
+        return view;
+    }
+
+    /// {@return where in [#view()] the value of write `index` starts}
+    ///
+    /// @param index a write that puts a value
+    int valueOffset(int index) {
+        return Math.toIntExact(spans[Objects.checkIndex(index, size) * 4 + 2]);
+    }
+
     /// {@return the value of write `index` as it was given, kept for resident key spaces; `null` otherwise}
     ///
     /// @param index the write
