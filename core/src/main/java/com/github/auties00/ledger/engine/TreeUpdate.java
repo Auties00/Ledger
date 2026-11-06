@@ -99,7 +99,7 @@ final class TreeUpdate {
         /// Records on the chain of a blind write whether the tree held the key.
         void settle(boolean inTree) {
             if (blind != null) {
-                blind.blindState = inTree ? TreeSearch.FOUND : TreeSearch.ABSENT;
+                blind.settle(inTree);
             }
         }
     }

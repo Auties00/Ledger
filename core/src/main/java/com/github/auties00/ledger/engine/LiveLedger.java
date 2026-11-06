@@ -1410,7 +1410,7 @@ public final class LiveLedger implements Ledger {
                     for (var i = 0; i < PRUNE_CHUNK && chains.hasNext(); i++) {
                         var chain = chains.next();
                         // A chain dropped since the cut may have been followed by another for the same key
-                        var current = chain.dropped ? state.chain(chain.key()) : chain;
+                        var current = chain.dropped() ? state.chain(chain.key()) : chain;
                         if (current != null) {
                             if (prune(state, current, current.head, bounds, Reads.boundOf(floor))) {
                                 requestSweep();
@@ -1914,8 +1914,7 @@ public final class LiveLedger implements Ledger {
 
         /// Records on `chain` that this commit writes its key blind: the tree settles what the write does to the count.
         private void markBlind(Chain chain) {
-            chain.blindSequence = sequence;
-            chain.blindState = TreeSearch.UNKNOWN;
+            chain.markBlind();
         }
 
         /// Records that this commit replaces `version`, if a unit no checkpoint has taken holds its value.
@@ -2034,7 +2033,7 @@ public final class LiveLedger implements Ledger {
         /// @param inTree whether the latest tree holds `key`, as [Hints] give it, or [TreeSearch#UNKNOWN]
         void delete(KeyspaceState state, MemorySegment key, byte inTree) {
             var chain = state.chain(key);
-            if (chain == null || !chain.ordered) {
+            if (chain == null || !chain.ordered()) {
                 var head = chain == null ? null : chain.head;
                 if (!Reads.exists(state, head, key, writerPoint(Reads.stamp(sequence, op) - 1), inTree)) {
                     nextStamp();

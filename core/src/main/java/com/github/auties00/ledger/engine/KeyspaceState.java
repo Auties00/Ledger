@@ -132,7 +132,7 @@ final class KeyspaceState {
                 }
             }
         }
-        if (!lazy && !chain.ordered) {
+        if (!lazy && !chain.ordered()) {
             order(chain);
         }
         return chain;
@@ -187,7 +187,7 @@ final class KeyspaceState {
             while (chain != null) {
                 var next = chain.nextUnordered;
                 chain.nextUnordered = null;
-                if (!chain.dropped && !chain.released()) {
+                if (!chain.dropped() && !chain.released()) {
                     // A plain read off the publishing role: a chain marked meanwhile is only ordered early
                     if (chain.dirtyCut <= cut) {
                         order(chain);
@@ -220,14 +220,14 @@ final class KeyspaceState {
     private void order(Chain chain) {
         // Released counts as dropped on both sides: another thread may have used the chain, and a prune dropped it,
         // while this one was still inserting it; a later chain of the key then holds the place
-        while (!chain.dropped && !chain.released()) {
+        while (!chain.dropped() && !chain.released()) {
             var previous = entries.putIfAbsent(chain.key(), chain);
             if (previous == null || previous == chain) {
                 inserted(chain);
                 return;
             }
             // A chain being dropped is released before it is marked dropped
-            if (!previous.dropped && !previous.released()) {
+            if (!previous.dropped() && !previous.released()) {
                 if (chain.released()) {
                     // Dropped since the check above, and replaced: the later chain is the key's
                     return;
@@ -272,11 +272,11 @@ final class KeyspaceState {
     }
 
     private void empty(Chain chain) {
-        chain.dropped = true;
+        chain.markDropped();
         chain.head = null;
         index.remove(chain);
         // Read after the store above, as [#inserted] reads the flag after its own store: one of them takes it out
-        if (chain.ordered) {
+        if (chain.ordered()) {
             leaving.add(chain);
         }
     }
@@ -284,8 +284,8 @@ final class KeyspaceState {
     /// Records that the ordered map holds `chain`, and takes it out again if it was dropped meanwhile, unseen by
     /// [#empty], which lists for removal only the chains it finds ordered.
     private void inserted(Chain chain) {
-        chain.ordered = true;
-        if (chain.dropped) {
+        chain.markOrdered();
+        if (chain.dropped()) {
             entries.remove(chain.key(), chain);
         }
     }

@@ -24,6 +24,17 @@ final class Chain {
     static final Comparator<Chain> BY_KEY = Chain::compareKeys;
     // The bits of keySpan that hold a key's length: as many as KeyCodec.MAX_LENGTH needs
     private static final int LENGTH_BITS = Integer.SIZE - Integer.numberOfLeadingZeros(KeyCodec.MAX_LENGTH);
+    // The bits of keySpan above the length that hold the key's offset in its chunk, at most 4,096: where an empty key
+    // lands in a full chunk
+    private static final int OFFSET_BITS = 13;
+    // The flags of keySpan, above the offset: the bytes of three fields of their own made the chain 56 bytes, 48 now
+    private static final int ORDERED = 1 << 24;
+    private static final int TAKEN_OUT = 1 << 25;
+    private static final int BLIND = 1 << 26;
+    private static final int SETTLED = 1 << 27;
+    private static final int IN_TREE = 1 << 28;
+    /// What [#blindState()] returns for a chain whose key no commit wrote blind.
+    static final byte NOT_BLIND = -1;
 
     /// What [#claimed] holds once the chain is dropped; above every sequence, so the claims stay monotonic.
     static final long DROPPED = Long.MAX_VALUE;
@@ -33,21 +44,17 @@ final class Chain {
     // The read-only view of the chunk of a KeySlab, or of an array of its own, that holds the key: a segment of the
     // key's own was 40 of the bytes a buffered write took on the heap
     private final MemorySegment keyChunk;
-    // Where the key starts in keyChunk, shifted left by LENGTH_BITS, and its length
-    private final int keySpan;
+    // Where the key starts in keyChunk, shifted left by LENGTH_BITS, and its length, which never change; and the flags,
+    // which only get set, through SPAN, so a plain read gets the key's bits right whatever flags it sees
+    @SuppressWarnings("FieldMayBeFinal")
+    private int keySpan;
     /// The hash of the key's bytes, as the hash index uses it.
     final int hash;
     /// The newest version, or `null` before the writer attaches the first one and once it drops the chain.
     volatile Version head;
-    /// Whether the ordered map holds the chain. In a key space that orders its chains eagerly, the writer attaches no
-    /// version before it does; in one that orders them lazily, the chain is listed among those a read of a range
-    /// orders first ([KeyspaceState#slice]). Either way every committed version a scan may see is in the map it walks.
-    volatile boolean ordered;
     /// The next of the chains a key space lists for a read of a range to order, or `null`; written before the chain
     /// is listed, and by the thread that takes the list.
     Chain nextUnordered;
-    /// Whether the writer took the chain out of the maps; no version is attached to it again.
-    volatile boolean dropped;
     /// The sequence of the last write claimed, 0 before any, or [#DROPPED]; only grows.
     @SuppressWarnings("unused")
     private volatile long claimed;
@@ -59,20 +66,19 @@ final class Chain {
     /// role. An `int`, which a key space's cuts do not outgrow in a lifetime of checkpoints, makes the chain 64 bytes
     /// rather than 72.
     int dirtyCut;
-    /// The sequence of the commit that wrote the key without knowing whether the tree held it ([BlindWrites]), or 0;
-    /// a chain has at most one such write, its first, since every later one finds a version in memory.
-    long blindSequence;
-    /// Whether the tree the blind write would have read held the key, as [TreeSearch#FOUND] or [TreeSearch#ABSENT],
-    /// or [TreeSearch#UNKNOWN] until the checkpoint that takes the write, or a count, finds out.
-    volatile byte blindState;
 
     private static final VarHandle CLAIMED;
     private static final VarHandle LAST_WRITER;
     private static final VarHandle HEAD;
+    private static final VarHandle SPAN;
 
     static {
+        if (LENGTH_BITS + OFFSET_BITS > Integer.numberOfTrailingZeros(ORDERED)) {
+            throw new ExceptionInInitializerError("A key's span overlaps the flags of its chain");
+        }
         try {
             var lookup = MethodHandles.lookup();
+            SPAN = lookup.findVarHandle(Chain.class, "keySpan", int.class);
             CLAIMED = lookup.findVarHandle(Chain.class, "claimed", long.class);
             LAST_WRITER = lookup.findVarHandle(Chain.class, "lastWriter", PendingCommit.class);
             HEAD = lookup.findVarHandle(Chain.class, "head", Version.class);
@@ -148,8 +154,11 @@ final class Chain {
         if (length >>> LENGTH_BITS != 0) {
             throw new IllegalArgumentException("Keys are at most " + KeyCodec.MAX_LENGTH + " bytes: " + length);
         }
+        if (offset >>> OFFSET_BITS != 0) {
+            throw new IllegalArgumentException("A key starts within " + (1 << OFFSET_BITS) + " bytes of its chunk: " + offset);
+        }
         this.keyChunk = keyChunk;
-        this.keySpan = Math.toIntExact(offset << LENGTH_BITS | length);
+        this.keySpan = (int) offset << LENGTH_BITS | length;
         this.hash = hash;
         this.dirtyCut = -1;
     }
@@ -165,7 +174,58 @@ final class Chain {
     }
 
     private long keyOffset() {
-        return keySpan >>> LENGTH_BITS;
+        return (keySpan >>> LENGTH_BITS) & ((1 << OFFSET_BITS) - 1);
+    }
+
+    /// {@return whether the ordered map holds the chain}
+    ///
+    /// In a key space that orders its chains eagerly, the writer attaches no version before it does; in one that
+    /// orders them lazily, the chain is listed among those a read of a range orders first ([KeyspaceState#slice]).
+    /// Either way every committed version a scan may see is in the map it walks.
+    boolean ordered() {
+        return ((int) SPAN.getVolatile(this) & ORDERED) != 0;
+    }
+
+    /// Records that the ordered map holds the chain, with a volatile update, which a read of [#dropped()] after it
+    /// follows.
+    void markOrdered() {
+        SPAN.getAndBitwiseOr(this, ORDERED);
+    }
+
+    /// {@return whether the writer took the chain out of the maps, after which no version is attached to it again}
+    boolean dropped() {
+        return ((int) SPAN.getVolatile(this) & TAKEN_OUT) != 0;
+    }
+
+    /// Records that the writer took the chain out of the maps, with a volatile update, which a read of [#ordered()]
+    /// after it follows.
+    void markDropped() {
+        SPAN.getAndBitwiseOr(this, TAKEN_OUT);
+    }
+
+    /// Records that a commit wrote the key without knowing whether the tree held it ([BlindWrites]).
+    ///
+    /// A chain has at most one such write, its first, since every later one finds a version in memory: so a
+    /// checkpoint whose cut sees a version of the chain takes the blind write too.
+    void markBlind() {
+        SPAN.getAndBitwiseOr(this, BLIND);
+    }
+
+    /// Records whether the tree the blind write would have read held the key; every thread that finds out finds the
+    /// same answer.
+    void settle(boolean inTree) {
+        SPAN.getAndBitwiseOr(this, BLIND | SETTLED | (inTree ? IN_TREE : 0));
+    }
+
+    /// {@return whether the tree the blind write would have read held the key, as [TreeSearch#FOUND] or
+    /// [TreeSearch#ABSENT], [TreeSearch#UNKNOWN] until the checkpoint that takes the write, or a count, finds out, or
+    /// [#NOT_BLIND] if no commit wrote the key blind}
+    byte blindState() {
+        var span = (int) SPAN.getVolatile(this);
+        if ((span & SETTLED) != 0) {
+            return (span & IN_TREE) != 0 ? TreeSearch.FOUND : TreeSearch.ABSENT;
+        }
+        return (span & BLIND) != 0 ? TreeSearch.UNKNOWN : NOT_BLIND;
     }
 
     /// {@return whether the key's bytes are those of `key`}
