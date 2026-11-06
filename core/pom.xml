@@ -37,8 +37,7 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
-                    <!-- The tests run on the class path; native access lets them run the full syncs of macOS -->
-                    <argLine>--enable-native-access=ALL-UNNAMED ${ledger.test.jvm}</argLine>
+                    <argLine>${ledger.test.jvm}</argLine>
                 </configuration>
             </plugin>
         </plugins>

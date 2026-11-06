@@ -94,8 +94,6 @@ final class LogWriter {
 
     // Owned by the flush task; null until the first group opens the first segment
     private FileChannel channel;
-    // Empties the drive's cache for the segment on macOS, or null
-    private FullSync.Handle fullSync;
     private long segmentNumber;
     private long position;
     private SecretKeySpec segmentKey;
@@ -210,7 +208,6 @@ final class LogWriter {
         waitedBefore = waited;
         waited = false;
         this.channel = FileChannel.open(segment.path(), StandardOpenOption.READ, StandardOpenOption.WRITE);
-        this.fullSync = FullSync.open(segment.path());
         this.segmentNumber = segment.number();
         this.currentSegment = segment.number();
         this.position = SEGMENT_HEADER;
@@ -791,20 +788,12 @@ final class LogWriter {
         }
     }
 
-    /// Forces the segment to stable storage, emptying the drive's cache on macOS when it can.
+    /// Forces the segment to stable storage; on macOS the JDK empties the drive's cache with `fcntl(F_FULLFSYNC)`.
     private void force() throws IOException {
-        if (fullSync != null) {
-            fullSync.force(channel, false);
-        } else {
-            channel.force(false);
-        }
+        channel.force(false);
     }
 
     private void closeSegment() throws IOException {
-        if (fullSync != null) {
-            fullSync.close();
-            fullSync = null;
-        }
         if (channel != null) {
             channel.close();
         }

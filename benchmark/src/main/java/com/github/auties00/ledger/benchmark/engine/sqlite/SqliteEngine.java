@@ -76,7 +76,7 @@ public final class SqliteEngine implements Engine {
             try (var statement = writer.createStatement()) {
                 statement.execute("PRAGMA journal_mode = WAL");
                 statement.execute("PRAGMA synchronous = NORMAL");
-                // On macOS a durable commit empties the drive's cache, as LMDB, RocksDB and Ledger make theirs do;
+                // On macOS a durable commit empties the drive's cache, as every other engine's does there;
                 // elsewhere SQLite ignores both
                 statement.execute("PRAGMA fullfsync = 1");
                 statement.execute("PRAGMA checkpoint_fullfsync = 1");
