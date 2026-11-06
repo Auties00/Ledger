@@ -37,7 +37,30 @@ final class FrameBody {
     private int size;
 
     FrameBody() {
-        this.data = new byte[256];
+        this(256);
+    }
+
+    /// Makes a body with room for `capacity` bytes before it grows.
+    FrameBody(int capacity) {
+        this.data = new byte[Math.max(16, capacity)];
+    }
+
+    /// {@return the bytes the body of a commit of `writes` takes, its large values in their units, near enough that it
+    /// seldom grows}
+    ///
+    /// A body that doubled from a small array allocated about twice its bytes, and kept up to twice as many in the
+    /// log's queue as the queue counts.
+    static int capacityFor(ArrayWriteBatch writes, PageRef[] units) {
+        var bytes = 16L;
+        for (var i = 0; i < writes.size(); i++) {
+            // The kind, the key space and the lengths, as variable-length numbers
+            bytes += 16 + writes.spanBytes(i);
+            if (units != null && units[i] != null) {
+                // The value is in its unit
+                bytes += PageRef.BYTES - writes.valueBytes(i);
+            }
+        }
+        return (int) Math.min(bytes, 64L << 20);
     }
 
     /// {@return the bytes of the body; only the first [#size()] are meaningful}

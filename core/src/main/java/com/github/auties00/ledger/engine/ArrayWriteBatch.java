@@ -237,6 +237,30 @@ public final class ArrayWriteBatch implements WriteBatch {
         return span(index, 2);
     }
 
+    /// {@return the bytes of the key, or lower bound, of write `index`, and of its value, or upper bound, 0 for those it
+    /// has not}
+    ///
+    /// @param index the write
+    long spanBytes(int index) {
+        Objects.checkIndex(index, size);
+        var bytes = 0L;
+        if (spans[index * 4] != ABSENT) {
+            bytes += spans[index * 4 + 1];
+        }
+        if (spans[index * 4 + 2] != ABSENT) {
+            bytes += spans[index * 4 + 3];
+        }
+        return bytes;
+    }
+
+    /// {@return the bytes of the value of write `index`, 0 if it has none}
+    ///
+    /// @param index the write
+    long valueBytes(int index) {
+        Objects.checkIndex(index, size);
+        return spans[index * 4 + 2] == ABSENT ? 0 : spans[index * 4 + 3];
+    }
+
     /// {@return the read-only segment of the array every key and value of the batch is part of}
     MemorySegment view() {
         return view;

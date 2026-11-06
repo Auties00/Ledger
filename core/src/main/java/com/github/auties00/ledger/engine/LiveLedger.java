@@ -576,7 +576,7 @@ public final class LiveLedger implements Ledger {
         try {
             ensureOpen();
             checkHealthy();
-            var applier = new Applier(sequenced.next, log != null);
+            var applier = new Applier(sequenced.next, log != null, writes.size(), log == null ? 0 : FrameBody.capacityFor(writes, units));
             if (outcome != null) {
                 outcome[0] = applier;
             }
@@ -805,7 +805,8 @@ public final class LiveLedger implements Ledger {
     /// go on, and its committing thread throws the failure.
     private void apply(PendingCommit pending) {
         var writes = pending.writes;
-        var applier = new Applier(pending.sequence, log != null, pending.writes.size());
+        var applier = new Applier(pending.sequence, log != null, pending.writes.size(),
+                log == null ? 0 : FrameBody.capacityFor(pending.writes, pending.units));
         try {
             for (var i = 0; i < writes.size(); i++) {
                 var predecessor = pending.predecessors[i];
@@ -1866,17 +1867,17 @@ public final class LiveLedger implements Ledger {
         private List<Version.External> replaced;
 
         Applier(long sequence, boolean journaled) {
-            this(sequence, journaled, 4);
+            this(sequence, journaled, 4, 256);
         }
 
-        /// Creates the applier of a commit of about `writes` writes.
-        Applier(long sequence, boolean journaled, int writes) {
+        /// Creates the applier of a commit of about `writes` writes, whose frame body takes about `frameBytes`.
+        Applier(long sequence, boolean journaled, int writes, int frameBytes) {
             this.sequence = sequence;
             // Most commits write one or two key spaces
             this.deltaStates = new KeyspaceState[2];
             this.deltas = new long[2];
             this.touched = new ArrayList<>(writes);
-            this.frame = journaled ? new FrameBody() : null;
+            this.frame = journaled ? new FrameBody(frameBytes) : null;
 
         }
 
