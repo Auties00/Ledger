@@ -362,9 +362,10 @@ public final class LiveLedger implements Ledger {
             log.append(FrameBody.CATALOG, latest(), catalog);
         }
         if (blobs != null) {
-            // Durable before this open's first unit, so no later open reuses its nonces
-            var frames = log.append(FrameBody.EPOCH, latest(), FrameBody.epoch(blobs.epoch()), 0);
-            blobs.epochGate(() -> log.awaitFrames(frames));
+            // Durable before this open's first unit, so no later open reuses its nonces; it goes to the log with the
+            // first commit, whose force it then shares, and a close with no commit drops it, as no unit took the epoch
+            log.defer(FrameBody.EPOCH, latest(), FrameBody.epoch(blobs.epoch()));
+            blobs.epochGate(() -> log.awaitFrames(log.flushDeferred()));
             log.useBlobs(blobs);
         }
     }

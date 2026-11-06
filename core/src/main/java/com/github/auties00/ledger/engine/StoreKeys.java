@@ -114,8 +114,10 @@ final class StoreKeys {
         return encrypted() ? new SecretKeySpec(expand(BLOB_INFO), "AES") : null;
     }
 
-    /// {@return the AES-256 key of log segment `number` of the store `storeId`, whose header holds `salt`}
-    SecretKeySpec segmentKey(byte[] storeId, long number, byte[] salt) {
-        return new SecretKeySpec(expand(SEGMENT_INFO, storeId, ByteBuffer.allocate(Long.BYTES).putLong(number).array(), salt), "AES");
+    /// {@return the AES-256 key of the use `useTag` of log segment `number` of the store `storeId`, whose header holds
+    /// `salt`}
+    SecretKeySpec segmentKey(byte[] storeId, long number, byte[] salt, long useTag) {
+        return new SecretKeySpec(expand(SEGMENT_INFO, storeId, ByteBuffer.allocate(Long.BYTES).putLong(number).array(), salt,
+                ByteBuffer.allocate(Long.BYTES).putLong(useTag).array()), "AES");
     }
 }
