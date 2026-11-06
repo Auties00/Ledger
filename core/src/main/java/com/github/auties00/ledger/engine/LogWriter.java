@@ -108,6 +108,10 @@ final class LogWriter {
     private static final int SLICE = 64 << 10;
     /// The bytes of frame bodies the queue holds before commits wait for the device.
     private static final long QUEUE_LIMIT = 64L << 20;
+    /// The heap a write takes in memory beside its bytes until a checkpoint takes it, as [#appendedHeap()] estimates
+    /// it: its chain, its version, its slot of the hash index and its key's copy, about 110 bytes, and a share of its
+    /// batch's array.
+    static final int WRITE_HEAP = 128;
     /// The bytes a second of log below which a new segment is written with zeros first, if the commits wait for it.
     private static final long ZEROED_RATE = 64L << 20;
     private final LogFiles files;
@@ -179,6 +183,8 @@ final class LogWriter {
     // The bytes of the frames queued since the writer opened, and of the units of BlobFile their commits wrote, written
     // under the queue lock
     private volatile long appendedBytes;
+    // The heap the commits queued since the writer opened hold until a checkpoint takes them, as estimated
+    private volatile long appendedHeap;
     // Whether a queued frame's commit wrote a unit of BlobFile, which the next group forces; guarded by the queue lock
     private boolean queuedUnits;
     // A frame that waits to be queued before the next one, or until a thread needs it durable; guarded by the queue lock
@@ -323,18 +329,19 @@ final class LogWriter {
     ///
     /// @throws LedgerIoException if the writer has stopped
     void append(byte type, long sequence, FrameBody body) {
-        append(type, sequence, body, 0);
+        append(type, sequence, body, 0, 0);
     }
 
-    /// Queues a frame as [#append(byte, long, FrameBody)] does, for a commit that wrote `unitBytes` of units of the
-    /// file of large values.
+    /// Queues a frame as [#append(byte, long, FrameBody)] does, for a commit of `writes` writes that wrote `unitBytes`
+    /// of units of the file of large values.
     ///
     /// The group that holds the frame forces that file beside the segment. The units count toward the growth that
-    /// starts a checkpoint, as if their values were in the frame: memory holds them until a checkpoint takes them.
+    /// starts a checkpoint, as if their values were in the frame: memory holds them until a checkpoint takes them. The
+    /// writes count toward [#appendedHeap()].
     ///
     /// @return the frames queued since the writer opened, the new one included
     /// @throws LedgerIoException if the writer has stopped
-    long append(byte type, long sequence, FrameBody body, long unitBytes) {
+    long append(byte type, long sequence, FrameBody body, long unitBytes, int writes) {
         checkHealthy();
         var length = body.size();
         long frames;
@@ -350,6 +357,7 @@ final class LogWriter {
             lastQueued = sequence;
             frames = ++appended;
             appendedBytes += 13 + length + unitBytes;
+            appendedHeap += 13 + length + unitBytes + (long) writes * WRITE_HEAP;
             queuedUnits |= unitBytes > 0;
         } finally {
             queueLock.unlock();
@@ -360,7 +368,7 @@ final class LogWriter {
         return frames;
     }
 
-    /// Queues the frames of `batch`, in its order, as [#append(byte, long, FrameBody, long)] queues each, and empties
+    /// Queues the frames of `batch`, in its order, as [#append(byte, long, FrameBody, long, int)] queues each, and empties
     /// it: one hold of the queue lock for a whole pass of the store's publisher.
     ///
     /// The batch waits on a full queue as one frame of its total size would. Either every frame is queued or, if the
@@ -384,6 +392,7 @@ final class LogWriter {
             lastQueued = batch.frames.getLast().sequence();
             appended += batch.frames.size();
             appendedBytes += batch.appendedBytes;
+            appendedHeap += batch.appendedHeap;
             queuedUnits |= batch.units;
         } finally {
             queueLock.unlock();
@@ -441,6 +450,7 @@ final class LogWriter {
         lastQueued = frame.sequence();
         deferredFrame = ++appended;
         appendedBytes += 13 + frame.body().size();
+        appendedHeap += 13 + frame.body().size();
     }
 
     /// Makes `blobs` the file of large values the commits write units to, which the groups force.
@@ -804,6 +814,8 @@ final class LogWriter {
         private long bodyBytes;
         // The bytes that count toward appendedBytes: headers, bodies and units
         private long appendedBytes;
+        // The heap that counts toward appendedHeap
+        private long appendedHeap;
         // Whether a commit of the batch wrote a unit of the file of large values
         private boolean units;
 
@@ -811,11 +823,13 @@ final class LogWriter {
             this.frames = new ArrayList<>();
         }
 
-        /// Adds a frame, which the writer owns once queued, for a commit that wrote `unitBytes` of units.
-        void add(byte type, long sequence, FrameBody body, long unitBytes) {
+        /// Adds a frame, which the writer owns once queued, for a commit of `writes` writes that wrote `unitBytes` of
+        /// units.
+        void add(byte type, long sequence, FrameBody body, long unitBytes, int writes) {
             frames.add(new Queued(type, sequence, body));
             bodyBytes += body.size();
             appendedBytes += 13 + body.size() + unitBytes;
+            appendedHeap += 13 + body.size() + unitBytes + (long) writes * WRITE_HEAP;
             units |= unitBytes > 0;
         }
 
@@ -824,6 +838,7 @@ final class LogWriter {
             frames.clear();
             bodyBytes = 0;
             appendedBytes = 0;
+            appendedHeap = 0;
             units = false;
         }
     }
@@ -972,6 +987,12 @@ final class LogWriter {
     /// {@return the bytes of the frames queued since the writer opened}
     long appendedBytes() {
         return appendedBytes;
+    }
+
+    /// {@return the heap the commits queued since the writer opened hold until a checkpoint takes them, estimated: the
+    /// bytes of their frames and units, and [#WRITE_HEAP] a write}
+    long appendedHeap() {
+        return appendedHeap;
     }
 
     /// {@return the offset in the current segment where the frames of the last group end, before their padding}

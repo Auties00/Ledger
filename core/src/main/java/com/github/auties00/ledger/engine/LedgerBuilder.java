@@ -36,6 +36,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private long checkpointEvery;
     private Duration commitWindow;
     private long segmentSize;
+    private long checkpointHeap;
     private Consumer<? super LedgerException> backgroundFailures;
     private long largeValues;
     private final Map<String, Long> largeValuesByKeyspace;
@@ -47,6 +48,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         this.checkpointEvery = defaultCheckpointEvery();
         this.commitWindow = Duration.ZERO;
         this.segmentSize = SEGMENT_SIZE;
+        // The writes the trees lack may hold up to half the heap before commits wait for more than two intervals
+        this.checkpointHeap = Runtime.getRuntime().maxMemory() / 2;
         this.backgroundFailures = _ -> {
         };
         this.largeValues = MIB;
@@ -57,6 +60,13 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     /// 64 MiB.
     LedgerBuilder segmentSize(long bytes) {
         this.segmentSize = bytes;
+        return this;
+    }
+
+    /// Sets the heap the writes the trees lack may hold before commits wait for a checkpoint, by the log's estimate,
+    /// so tests can reach it without filling half the heap.
+    LedgerBuilder checkpointHeap(long bytes) {
+        this.checkpointHeap = bytes;
         return this;
     }
 
@@ -272,7 +282,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));
             var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
                     superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures,
-                    superblock == null ? 0 : superblock.epoch(), epochs[0]);
+                    superblock == null ? 0 : superblock.epoch(), epochs[0], checkpointHeap);
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
             } else {

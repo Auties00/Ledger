@@ -941,7 +941,7 @@ public final class LiveLedger implements Ledger {
         do {
             commit = commit.next;
             if (commit.failure != null) {
-                batch.add(FrameBody.COMMIT, commit.sequence, new FrameBody(), 0);
+                batch.add(FrameBody.COMMIT, commit.sequence, new FrameBody(), 0, 0);
             } else {
                 commit.applier.queueFrame(batch);
             }
@@ -1286,8 +1286,8 @@ public final class LiveLedger implements Ledger {
     /// @param superseded the units of the file of large values whose versions commits at or below the cut replaced
     ///                   before any checkpoint took them: no tree points to them, and no recovery from this checkpoint
     ///                   on replays their commits
-    record Cut(long sequence, long logStart, long logBytes, TreeVersion base, int maxId, List<KeyspaceCut> keyspaces,
-               List<PageRef> superseded) {
+    record Cut(long sequence, long logStart, long logBytes, long logHeap, TreeVersion base, int maxId,
+               List<KeyspaceCut> keyspaces, List<PageRef> superseded) {
     }
 
     /// What changed in one key space since the last checkpoint.
@@ -1329,7 +1329,7 @@ public final class LiveLedger implements Ledger {
                     superseded.add(unit.version().unit);
                 }
             }
-            return new Cut(sequence, logStart.getAsLong(), log.appendedBytes(), base, maxId, cuts, superseded);
+            return new Cut(sequence, logStart.getAsLong(), log.appendedBytes(), log.appendedHeap(), base, maxId, cuts, superseded);
         } finally {
             exitPublishing();
         }
@@ -2138,7 +2138,7 @@ public final class LiveLedger implements Ledger {
             // Queued before it is visible, so the log holds every commit a reader can see, in order
             if (frame != null) {
                 try {
-                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes);
+                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, touched.size());
                     logged = true;
                 } catch (RuntimeException exception) {
                     rollback();
@@ -2151,7 +2151,7 @@ public final class LiveLedger implements Ledger {
         /// Adds the commit's frame, if it is journaled, to `batch`.
         void queueFrame(LogWriter.Batch batch) {
             if (frame != null) {
-                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes);
+                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, touched.size());
             }
         }
 
