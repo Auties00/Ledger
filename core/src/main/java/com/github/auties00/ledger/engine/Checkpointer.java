@@ -115,6 +115,16 @@ final class Checkpointer {
         this.progress = progressLock.newCondition();
     }
 
+    /// Counts the commits the open replayed, `bytes` of log holding `heap` by the log's estimate, as log the trees
+    /// lack, as if the writer had queued them before it opened: the first checkpoint starts as soon as they are an
+    /// interval, and commits wait for it while they hold the heap budget. Counted from 0, they let a crashed store
+    /// that replayed six intervals take six more, and up to the whole budget, before it waited.
+    void replayed(long bytes, long heap) {
+        cutBytes = -bytes;
+        publishedBytes = -bytes;
+        publishedHeap = -heap;
+    }
+
     /// Starts a checkpoint on a thread of its own if the log has grown enough since the last, and none is running.
     void maybeStart() {
         if (log.appendedBytes() - cutBytes < every || !scheduled.compareAndSet(false, true)) {

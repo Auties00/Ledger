@@ -123,6 +123,9 @@ public final class LiveLedger implements Ledger {
     private volatile boolean closed;
     private int sweepIndex;
     private Chain sweepAfter;
+    // The log bytes, and the heap by the log's estimate, of the commits the open replayed, which the trees lack
+    private long replayedBytes;
+    private long replayedHeap;
     // Whether a prune left a chain that a later one may shorten, so the sweep has work; guarded by the publishing role
     private boolean sweepPending;
     // Whether the sweep's current pass over the store found such a chain
@@ -337,7 +340,24 @@ public final class LiveLedger implements Ledger {
         });
         applier.publish();
         sequenced.next = sequence + 1;
+        var unitBytes = 0L;
+        for (var unit : units) {
+            unitBytes += unit.length;
+        }
+        replayedBytes += 13 + body.length + unitBytes;
+        replayedHeap += 13 + body.length + unitBytes + (long) applier.touched.size() * LogWriter.WRITE_HEAP;
         return true;
+    }
+
+    /// {@return the log bytes of the commits the open replayed, which the trees lack}
+    long replayedBytes() {
+        return replayedBytes;
+    }
+
+    /// {@return the heap the commits the open replayed hold until a checkpoint takes them, as [LogWriter#appendedHeap()]
+    /// estimates it}
+    long replayedHeap() {
+        return replayedHeap;
     }
 
     /// Gives an id to every key space the store does not know yet.
