@@ -32,23 +32,45 @@ sealed class Version permits Version.External {
 
     /// The commit sequence in the high bits and the position of the write in its batch in the low bits.
     final long stamp;
-    /// The encoded value, read-only, or `null` if this version removes the key.
-    final MemorySegment value;
+    // The read-only segment the encoded value is part of, the array of its batch, or `null` if this version removes the
+    // key: a slice of its own per version was 40 of the bytes a buffered write took on the heap
+    private final MemorySegment source;
+    // Where the value starts in source, and its length
+    private final int offset;
+    private final int length;
     /// The decoded value of a resident key space, or `null`.
     final Object decoded;
     /// The version this one replaced, or `null` once no reader can need it.
     volatile Version older;
 
     Version(long stamp, MemorySegment value, Object decoded, Version older) {
+        this(stamp, value, 0, value == null ? 0 : Math.toIntExact(value.byteSize()), decoded, older);
+    }
+
+    /// Makes a version of the `length` bytes at `offset` of `source`, a read-only segment.
+    Version(long stamp, MemorySegment source, int offset, int length, Object decoded, Version older) {
         this.stamp = stamp;
-        this.value = value;
+        this.source = source;
+        this.offset = offset;
+        this.length = length;
         this.decoded = decoded;
         OLDER.set(this, older);
     }
 
-    /// {@return a version of `value`, which the unit `external` of [BlobFile] also holds if it is not `null`}
-    static Version of(long stamp, MemorySegment value, Object decoded, Version older, PageRef external) {
-        return external == null ? new Version(stamp, value, decoded, older) : new External(stamp, value, decoded, older, external);
+    /// {@return a version of the `length` bytes at `offset` of `source`, a read-only segment, or of no value if
+    /// `source` is `null`, which the unit `external` of [BlobFile] also holds if it is not `null`}
+    static Version of(long stamp, MemorySegment source, int offset, int length, Object decoded, Version older, PageRef external) {
+        return external == null ? new Version(stamp, source, offset, length, decoded, older)
+                : new External(stamp, source, offset, length, decoded, older, external);
+    }
+
+    /// {@return the encoded value, read-only, or `null` if this version removes the key}
+    MemorySegment value() {
+        var whole = source;
+        if (whole == null) {
+            return null;
+        }
+        return offset == 0 && length == whole.byteSize() ? whole : whole.asSlice(offset, length);
     }
 
     /// {@return the unit of [BlobFile] that also holds [#value], or `null` if the value is in memory and the log only}
@@ -65,8 +87,8 @@ sealed class Version permits Version.External {
         /// holding the publishing role.
         long replacedAt;
 
-        External(long stamp, MemorySegment value, Object decoded, Version older, PageRef unit) {
-            super(stamp, value, decoded, older);
+        External(long stamp, MemorySegment source, int offset, int length, Object decoded, Version older, PageRef unit) {
+            super(stamp, source, offset, length, decoded, older);
             this.unit = unit;
             this.replacedAt = Long.MAX_VALUE;
         }
@@ -87,6 +109,6 @@ sealed class Version permits Version.External {
 
     /// {@return whether this version removes the key}
     boolean removes() {
-        return value == null;
+        return source == null;
     }
 }

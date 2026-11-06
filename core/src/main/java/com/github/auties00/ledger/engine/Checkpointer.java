@@ -358,7 +358,7 @@ final class Checkpointer {
                     ops.add(new TreeUpdate.Op(key, null, null, blind));
                 } else {
                     var external = version.external();
-                    ops.add(new TreeUpdate.Op(key, version.value, external, blind));
+                    ops.add(new TreeUpdate.Op(key, version.value(), external, blind));
                     if (external != null) {
                         adopted.add(external);
                     }

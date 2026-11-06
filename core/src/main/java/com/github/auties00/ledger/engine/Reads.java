@@ -175,7 +175,7 @@ final class Reads {
         var removals = state.removals;
         var version = KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals);
         if (version != null) {
-            return version == Version.HIDDEN ? Optional.empty() : Optional.of(value(state, keyspace, version.value, version.decoded));
+            return version == Version.HIDDEN ? Optional.empty() : Optional.of(value(state, keyspace, version.value(), version.decoded));
         }
         var value = treeValue(state, encoded, point, removals);
         return value == null ? Optional.empty() : Optional.of(keyspace.values().decode(value));
@@ -216,7 +216,7 @@ final class Reads {
             if (version == Version.HIDDEN) {
                 return Optional.empty();
             }
-            value = version.value;
+            value = version.value();
         } else {
             value = treeValue(state, encoded, point, removals);
             if (value == null) {
@@ -273,7 +273,7 @@ final class Reads {
                 MemorySegment value = null;
                 Object decoded = null;
                 if (version != null && version != Version.HIDDEN) {
-                    value = version.value;
+                    value = version.value();
                     decoded = version.decoded;
                 } else if (version == null && order == 0 && !hiddenSinceTree(key, point, removals)) {
                     value = tree.value();
