@@ -355,10 +355,10 @@ final class Checkpointer {
                 var blind = current != null && current.blindSequence != 0 && current.blindSequence <= cut.sequence()
                         && current.blindState == TreeSearch.UNKNOWN ? current : null;
                 if (version == null || version == Version.HIDDEN) {
-                    ops.add(new TreeUpdate.Op(key, null, null, blind));
+                    ops.add(new TreeUpdate.Op(key, null, blind));
                 } else {
+                    ops.add(new TreeUpdate.Op(key, version, blind));
                     var external = version.external();
-                    ops.add(new TreeUpdate.Op(key, version.value(), external, blind));
                     if (external != null) {
                         adopted.add(external);
                     }

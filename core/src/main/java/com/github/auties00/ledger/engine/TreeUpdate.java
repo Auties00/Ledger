@@ -68,14 +68,32 @@ final class TreeUpdate {
 
     /// The state of a key as of a checkpoint.
     ///
+    /// It keeps the version rather than a slice of its value, which it makes when it writes the key: a checkpoint holds
+    /// one state per key it takes, through the whole update.
+    ///
     /// @param key the key
-    /// @param value its value, or `null` if the key has none
-    /// @param external the unit of [BlobFile] a commit wrote the value to, which the tree takes, or `null`
+    /// @param version its version as of the checkpoint, or `null` if the key has none
     /// @param blind the chain of the key, if a blind write the checkpoint takes needs to know whether the tree held
     ///              the key ([BlindWrites]), which the update records on it; or `null`
-    record Op(MemorySegment key, MemorySegment value, PageRef external, Chain blind) {
+    record Op(MemorySegment key, Version version, Chain blind) {
+        /// Makes the state of `key` with `value`, or with none if `null`.
         Op(MemorySegment key, MemorySegment value) {
-            this(key, value, null, null);
+            this(key, value == null ? null : new Version(0, value, null, null), null);
+        }
+
+        /// {@return the value, or `null` if the key has none}
+        MemorySegment value() {
+            return version == null ? null : version.value();
+        }
+
+        /// {@return whether the key has no value}
+        boolean removes() {
+            return version == null || version.removes();
+        }
+
+        /// {@return the unit of [BlobFile] a commit wrote the value to, which the tree takes, or `null`}
+        PageRef external() {
+            return version == null ? null : version.external();
         }
 
         /// Records on the chain of a blind write whether the tree held the key.
@@ -509,7 +527,7 @@ final class TreeUpdate {
             while (op < opTo && Segments.compare(ops.get(op).key(), entry.key()) < 0) {
                 var put = ops.get(op++);
                 put.settle(false);
-                if (put.value() != null) {
+                if (!put.removes()) {
                     out.add(entry(put));
                     changed = true;
                 }
@@ -523,7 +541,7 @@ final class TreeUpdate {
                     release(entry);
                 }
                 changed = true;
-                if (state.value() != null) {
+                if (!state.removes()) {
                     out.add(entry(state));
                 }
                 continue;
@@ -541,7 +559,7 @@ final class TreeUpdate {
         while (op < opTo) {
             var put = ops.get(op++);
             put.settle(false);
-            if (put.value() != null) {
+            if (!put.removes()) {
                 out.add(entry(put));
                 changed = true;
             }
@@ -556,17 +574,19 @@ final class TreeUpdate {
     }
 
     private LeafEntry entry(Op op) throws IOException {
-        var length = op.value().byteSize();
-        if (op.external() != null) {
-            return new LeafEntry(op.key(), null, op.external(), (int) length, true);
+        var value = op.value();
+        var length = value.byteSize();
+        var external = op.external();
+        if (external != null) {
+            return new LeafEntry(op.key(), null, external, (int) length, true);
         }
         if (LeafEntry.fitsInline(op.key().byteSize(), length)) {
-            return new LeafEntry(op.key(), op.value(), null, (int) length);
+            return new LeafEntry(op.key(), value, null, (int) length);
         }
         var unitPages = PageFormat.pagesFor(length);
         var page = allocate(unitPages);
         var unit = new byte[unitPages * PageFormat.SIZE];
-        MemorySegment.copy(op.value(), 0, MemorySegment.ofArray(unit), PageFormat.HEADER, length);
+        MemorySegment.copy(value, 0, MemorySegment.ofArray(unit), PageFormat.HEADER, length);
         var ref = writer.write(PageFormat.VALUE, 0, page, unitPages, unit, (int) length, true);
         return new LeafEntry(op.key(), null, ref, (int) length);
     }
