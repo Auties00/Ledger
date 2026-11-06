@@ -410,12 +410,17 @@ final class LogWriter {
         }
     }
 
-    /// {@return whether the frame of the commit at `sequence` is queued and no later commit's is}
+    /// {@return whether the frame of the commit at `sequence` is queued, no later commit's is, and no other commit
+    /// waits for its durability}
     ///
-    /// Only such a commit writes its group itself: with later commits queued behind it, the pool's flush goes on to
-    /// their group at once, where a commit that wrote its own would hand that group to the pool and wait for a thread
-    /// of it to wake.
+    /// Only such a commit writes its group itself. With other commits under way, the pool's flush goes on to their
+    /// group at once, where a commit that wrote its own would hand that group to the pool and wait for a thread of it
+    /// to wake; and the wake of the pool's thread lets more commits join a group than a commit forcing its own at once
+    /// would, which at eight committers made fewer forces than leading did.
     private boolean alone(long sequence) {
+        if (!waiters.isEmpty()) {
+            return false;
+        }
         queueLock.lock();
         try {
             return !queue.isEmpty() && lastQueued <= sequence;
