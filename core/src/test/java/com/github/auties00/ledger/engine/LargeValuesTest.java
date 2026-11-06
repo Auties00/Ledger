@@ -240,6 +240,37 @@ class LargeValuesTest {
             }
         }
 
+        @Test
+        @DisplayName("gives the next opens a new epoch after a unit was written without a commit and nothing was checkpointed")
+        void epochOfLostUnit(@TempDir Path directory) throws Exception {
+            try (var ledger = open(directory, true)) {
+                ledger.commit(ledger.newBatch().put(FILES, "a", value(1, 10))).awaitDurable();
+            }
+            for (var round = 0; round < 2; round++) {
+                var ledger = (LiveLedger) open(directory, true);
+                int used;
+                try {
+                    // What a commit that failed after writing its units, or one a crash cut off, leaves
+                    used = ledger.blobsForTests().epoch();
+                    var unit = ledger.blobsForTests().write(java.lang.foreign.MemorySegment.ofArray(value(2, 5_000)));
+                    ledger.blobsForTests().release(unit);
+                } finally {
+                    if (round == 0) {
+                        ledger.close();
+                    } else {
+                        ledger.closeWithoutCheckpoint();
+                    }
+                }
+                // An open in between that commits nothing must not forget the epoch either
+                open(directory, true).close();
+                try (var reopened = (LiveLedger) open(directory, true)) {
+                    var epoch = reopened.blobsForTests().epoch();
+                    assertTrue(Integer.compareUnsigned(epoch, used) > 0, "epoch " + epoch + " after " + used);
+                    assertArrayEquals(value(1, 10), reopened.get(FILES, "a").orElseThrow());
+                }
+            }
+        }
+
         /// Overwrites every unit page of the file of large values with zeros.
         private static void damageUnits(Path directory) throws IOException {
             try (var channel = FileChannel.open(directory.resolve(BlobFile.FILE), StandardOpenOption.WRITE)) {

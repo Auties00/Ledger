@@ -111,15 +111,15 @@ final class LogRecovery {
                 long position = LogWriter.SEGMENT_HEADER;
                 if (!reader.read(position, frame, 0, LogWriter.FRAME_HEADER) || isZero(frame, 0, LogWriter.FRAME_HEADER)) {
                     // Prepared and never written, unless damage zeroed the first frame before groups a later force made
-                    // durable
-                    checkNoLaterGroup(reader, position, last, tag, crc, path);
+                    // durable, whose first frames may carry the sequence of the commit before them
+                    checkNoLaterGroup(reader, position, Long.MIN_VALUE, tag, crc, path);
                     empty = new LogFiles.Prepared(number, path, salt);
                     continue;
                 }
                 empty = null;
                 if (!wholeFrameHeader(frame, tag, crc) || (frame[17] & LogWriter.GROUP_START) == 0) {
                     // The torn first group of a use, which the next open follows with a segment of its own
-                    checkNoLaterGroup(reader, position, last, tag, crc, path);
+                    checkNoLaterGroup(reader, position, Long.MIN_VALUE, tag, crc, path);
                     continue;
                 }
                 var useTag = ByteBuffer.wrap(frame).getLong(LogWriter.USE_TAG_OFFSET);
