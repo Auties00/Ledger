@@ -20,6 +20,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.lang.foreign.ValueLayout;
@@ -599,9 +600,10 @@ class CheckpointTest {
             }
         }
 
-        @Test
-        @DisplayName("commits wait for checkpoints slower than they are, so the log the trees lack stays bounded")
-        void backpressure() throws Exception {
+        @ParameterizedTest(name = "heap budget {0} bytes")
+        @ValueSource(longs = {Long.MAX_VALUE, 1})
+        @DisplayName("commits wait for checkpoints slower than they are, so the log the trees lack stays within six intervals, or two once its writes pass the heap budget")
+        void backpressure(long heapBudget) throws Exception {
             var disk = CrashFileSystem.create();
             disk.intercept((path, kind) -> {
                 if (kind == ChangeInterceptor.ChangeKind.WRITE && dataFile(path)) {
@@ -614,16 +616,17 @@ class CheckpointTest {
             });
             var every = 1 << 20;
             var value = "v".repeat(64 << 10);
-            try (var ledger = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY))
-                    .keyspace(MESSAGES).checkpointEvery(every).build()) {
+            var options = (LedgerBuilder) Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY))
+                    .keyspace(MESSAGES).checkpointEvery(every);
+            try (var ledger = options.checkpointHeap(heapBudget).build()) {
                 var checkpointer = ((LiveLedger) ledger).checkpointer();
                 var largest = 0L;
                 for (var i = 0; i < 200; i++) {
                     ledger.commit(ledger.newBatch().put(MESSAGES, "m%05d".formatted(i), value));
                     largest = Math.max(largest, checkpointer.backlog());
                 }
-                // Three intervals, and the commit that found the log just under them
-                var bound = 3L * every + 2L * value.length();
+                // The intervals the budget allows, and the commit that found the log just under them
+                var bound = (heapBudget == 1 ? 2L : 6L) * every + 2L * value.length();
                 var observed = largest;
                 assertTrue(observed <= bound, () -> observed + " bytes of log the trees lacked, past " + bound);
                 assertEquals(200, ledger.size(MESSAGES));

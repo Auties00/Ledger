@@ -206,9 +206,9 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// Writes a checkpoint whenever the log has grown by `logBytes` since the last one.
         ///
         /// Fewer checkpoints write less, as each takes more writes to a page at once; more checkpoints hold less in
-        /// memory, since the writes since the last checkpoint stay there, about twice their bytes in the log and up to
-        /// three intervals of them, and open faster after a crash, since an open replays the log written since the
-        /// last checkpoint. The default is a sixteenth of the heap's maximum size ([Runtime#maxMemory()]), between
+        /// memory, since the writes since the last checkpoint stay there, up to six intervals of them while they hold
+        /// less than half the heap's maximum size and two whatever they hold, and open faster after a crash, since an
+        /// open replays the log written since the last checkpoint. The default is a sixteenth of the heap's maximum size ([Runtime#maxMemory()]), between
         /// 64 MiB and 512 MiB: 256 MiB for a heap of 4 GiB.
         ///
         /// @param logBytes the log growth between checkpoints, at least 1 MiB

@@ -40,8 +40,11 @@ final class Checkpointer {
     /// for it ([LogWriter#nextOpenSegment()]), so a spare saves it nothing, and forcing a spare that a copy of the store
     /// left in the OS cache held the first durable commit after the open for tens of milliseconds.
     private static final int SPARES = 0;
-    /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint.
-    private static final int BACKLOG = 3;
+    /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint, whatever the heap.
+    private static final int MAX_BACKLOG = 6;
+    /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint, if the writes behind it
+    /// hold more heap than the store's budget: one being checkpointed and the next.
+    private static final int MIN_BACKLOG = 2;
     // The epoch of the file of large values the last durable superblock records; guarded by the lock
     private int durableEpoch;
     // The highest epoch an earlier open used that only its log segments record, if above durableEpoch
@@ -66,6 +69,10 @@ final class Checkpointer {
     private final Consumer<? super LedgerException> failures;
     // The log's queued bytes at the cut of the last published checkpoint
     private volatile long publishedBytes;
+    // The log's estimate of the heap its commits held at the cut of the last published checkpoint
+    private volatile long publishedHeap;
+    // The heap the writes the trees lack may hold, by the log's estimate, before commits wait for a checkpoint
+    private final long heapBudget;
     // Signalled whenever a checkpoint ends, for the commits that wait on one
     private final ReentrantLock progressLock;
     private final Condition progress;
@@ -86,7 +93,7 @@ final class Checkpointer {
     /// @param loggedEpoch the highest epoch recovery found, in the superblock or in the log, which units may take
     Checkpointer(LiveLedger ledger, PageFile pages, FreeSpace space, BlobFile blobs, LogWriter log, LogFiles files, long every,
                  long number, DeltaTable deltas, PageRef deltaTable, Consumer<? super LedgerException> failures,
-                 int durableEpoch, int loggedEpoch) {
+                 int durableEpoch, int loggedEpoch, long heapBudget) {
         this.ledger = ledger;
         this.pages = pages;
         this.space = space;
@@ -103,14 +110,13 @@ final class Checkpointer {
         this.failures = failures;
         this.durableEpoch = durableEpoch;
         this.loggedEpoch = loggedEpoch;
+        this.heapBudget = heapBudget;
         this.progressLock = new ReentrantLock();
         this.progress = progressLock.newCondition();
     }
 
     /// Starts a checkpoint on a thread of its own if the log has grown enough since the last, and none is running.
     void maybeStart() {
-        // TODO: make committers wait while the log grows past a few intervals during a checkpoint, so memory stays
-        //  bounded under a write rate the checkpoints cannot keep up with
         if (log.appendedBytes() - cutBytes < every || !scheduled.compareAndSet(false, true)) {
             return;
         }
@@ -148,23 +154,36 @@ final class Checkpointer {
         }
     }
 
-    /// Makes the caller wait while the log holds more than [#BACKLOG] checkpoint intervals the trees do not, and a
-    /// checkpoint is running to take them in.
+    /// Makes the caller wait while the log holds more checkpoint intervals the trees do not than the heap allows, and a
+    /// checkpoint is running to take them in: more than [#MAX_BACKLOG], or more than [#MIN_BACKLOG] while the writes
+    /// behind them hold more than the heap budget.
     ///
-    /// It never waits while checkpoints fail: the commits go on, and the log grows until one succeeds.
+    /// A fixed backlog of three intervals held commits back on a large heap that had room for more, a quarter of the
+    /// overwrites of a store of 256-byte values, and let small values, whose writes take more heap than their bytes,
+    /// fill more than half of it. It never waits while checkpoints fail: the commits go on, and the log grows until one
+    /// succeeds.
     void throttle() {
-        if (log.appendedBytes() - publishedBytes <= BACKLOG * every || lastFailure != null || stopped != null) {
+        if (!behind() || lastFailure != null || stopped != null) {
             return;
         }
         maybeStart();
         progressLock.lock();
         try {
-            while (log.appendedBytes() - publishedBytes > BACKLOG * every && scheduled.get() && lastFailure == null) {
+            while (behind() && scheduled.get() && lastFailure == null) {
                 progress.awaitUninterruptibly();
             }
         } finally {
             progressLock.unlock();
         }
+    }
+
+    /// {@return whether the log holds more than the trees may lack}
+    private boolean behind() {
+        var bytes = log.appendedBytes() - publishedBytes;
+        if (bytes <= MIN_BACKLOG * every) {
+            return false;
+        }
+        return bytes > MAX_BACKLOG * every || log.appendedHeap() - publishedHeap > heapBudget;
     }
 
     /// {@return the bytes of log queued since the cut of the last published checkpoint, which the trees lack}
@@ -272,6 +291,7 @@ final class Checkpointer {
             }
             ledger.publish(cut, number, roots, catalog, freeList, blobFreeList, freed, update.freedExternal(), adopted);
             publishedBytes = cut.logBytes();
+            publishedHeap = cut.logHeap();
             signalProgress();
             ledger.pruneCut(cut);
             // While the store runs, as many as a checkpoint interval fills, so the log seldom writes into a new file
