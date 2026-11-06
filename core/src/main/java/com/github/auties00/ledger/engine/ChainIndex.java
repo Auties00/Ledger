@@ -6,9 +6,12 @@ import java.lang.invoke.VarHandle;
 
 /// The chains of a key space by the bytes of their keys: the hash index of [KeyspaceState].
 ///
-/// An open-addressing table of the chains themselves, split into segments by hash. A map of the JDK holds a node and a
-/// key object per chain besides the slot of its table, 56 bytes a buffered write, and a lookup follows both before it
-/// reaches the chain: here a lookup goes from the slot to the chain, which holds its key and hash.
+/// An open-addressing table of the chains themselves, split into segments by hash, with the hash of each slot's chain
+/// in an array beside it. A map of the JDK holds a node and a key object per chain besides the slot of its table, 56
+/// bytes a buffered write, and a lookup follows both before it reaches the chain. Here a lookup reads the hashes of
+/// consecutive slots, and goes to a chain only when its hash matches: a lookup of a key memory does not hold, the most
+/// common in a store larger than memory, reads a line or two of hashes. A table is at most half full, where a lookup
+/// of a missing key passes about two taken slots.
 ///
 /// Lookups take no lock and read the slots with acquire loads; insertions and removals take their segment's lock and
 /// publish a slot with a release store. A removal leaves a tombstone, so no chain ever moves while readers probe past
@@ -35,13 +38,16 @@ final class ChainIndex {
     /// {@return the chain of the key of `hash` whose bytes are `key`, or `null` if the index holds none}
     Chain get(MemorySegment key, int hash) {
         var table = segment(hash).table;
-        var mask = table.length - 1;
+        var chains = table.chains;
+        var hashes = table.hashes;
+        var mask = chains.length - 1;
         for (var slot = slot(hash) & mask; ; slot = (slot + 1) & mask) {
-            var chain = (Chain) SLOTS.getAcquire(table, slot);
+            var chain = (Chain) SLOTS.getAcquire(chains, slot);
             if (chain == null) {
                 return null;
             }
-            if (chain != TOMBSTONE && chain.hash == hash && Segments.equal(chain.key, key)) {
+            // Written before the release store of the chain, so read after its acquire load
+            if (hashes[slot] == hash && chain != TOMBSTONE && Segments.equal(chain.key, key)) {
                 return chain;
             }
         }
@@ -55,10 +61,12 @@ final class ChainIndex {
         synchronized (segment.lock) {
             while (true) {
                 var table = segment.table;
-                var mask = table.length - 1;
+                var chains = table.chains;
+                var hashes = table.hashes;
+                var mask = chains.length - 1;
                 var free = -1;
                 for (var slot = slot(chain.hash) & mask; ; slot = (slot + 1) & mask) {
-                    var held = table[slot];
+                    var held = chains[slot];
                     if (held == null) {
                         if (free < 0) {
                             free = slot;
@@ -69,20 +77,20 @@ final class ChainIndex {
                         if (free < 0) {
                             free = slot;
                         }
-                    } else if (held.hash == chain.hash && Segments.equal(held.key, chain.key)) {
+                    } else if (hashes[slot] == chain.hash && Segments.equal(held.key, chain.key)) {
                         return held;
                     }
                 }
-                if (table[free] == null && (segment.taken + 1) * 4 > table.length * 3) {
-                    // A slot no tombstone frees would fill the table past three quarters: probes would lengthen, and
-                    // one always needs an empty slot to end at
+                if (chains[free] == null && (segment.taken + 1) * 2 > chains.length) {
+                    // A slot no tombstone frees would fill the table past half: probes would lengthen
                     segment.rebuild();
                     continue;
                 }
-                if (table[free] == null) {
+                if (chains[free] == null) {
                     segment.taken++;
                 }
-                SLOTS.setRelease(table, free, chain);
+                hashes[free] = chain.hash;
+                SLOTS.setRelease(chains, free, chain);
                 segment.size++;
                 return null;
             }
@@ -93,20 +101,20 @@ final class ChainIndex {
     void remove(Chain chain) {
         var segment = segment(chain.hash);
         synchronized (segment.lock) {
-            var table = segment.table;
-            var mask = table.length - 1;
+            var chains = segment.table.chains;
+            var mask = chains.length - 1;
             for (var slot = slot(chain.hash) & mask; ; slot = (slot + 1) & mask) {
-                var held = table[slot];
+                var held = chains[slot];
                 if (held == null) {
                     return;
                 }
                 if (held == chain) {
-                    SLOTS.setRelease(table, slot, TOMBSTONE);
+                    SLOTS.setRelease(chains, slot, TOMBSTONE);
                     segment.size--;
                     // Tombstones end no probe: once they outnumber the chains, and fill a quarter of the table, they
                     // go, and with them the length a churn of insertions and removals left the table at
                     var tombstones = segment.taken - segment.size;
-                    if (tombstones > segment.size && tombstones * 4 > table.length) {
+                    if (tombstones > segment.size && tombstones * 4 > chains.length) {
                         segment.rebuild();
                     }
                     return;
@@ -134,32 +142,44 @@ final class ChainIndex {
         return hash * 0x9E3779B9;
     }
 
+    /// The slots of a segment, and the hashes of their chains, published together.
+    ///
+    /// @param chains the chain of each slot, [#TOMBSTONE] for one removed, `null` for an empty one
+    /// @param hashes the hash of each slot's chain, written before the chain is
+    private record Table(Chain[] chains, int[] hashes) {
+        static Table of(int capacity) {
+            return new Table(new Chain[capacity], new int[capacity]);
+        }
+    }
+
     /// One part of the index: its table, and the lock its writers take.
     private static final class Segment {
         private final Object lock = new Object();
         // Replaced whole when it grows; read by lookups without the lock
-        private volatile Chain[] table = new Chain[INITIAL];
+        private volatile Table table = Table.of(INITIAL);
         // The chains held; written under the lock
         private volatile int size;
         // The slots that are not empty, tombstones included; guarded by the lock
         private int taken;
 
-        /// Copies the chains into a table of twice as many slots as they need, without tombstones, and publishes it.
+        /// Copies the chains into a table of four times as many slots as they need, without tombstones, and publishes
+        /// it.
         private void rebuild() {
-            var old = table;
+            var old = table.chains;
             var capacity = INITIAL;
-            while (capacity < (size + 1) * 2) {
+            while (capacity < (size + 1) * 4) {
                 capacity <<= 1;
             }
-            var fresh = new Chain[capacity];
+            var fresh = Table.of(capacity);
             var mask = capacity - 1;
             for (var chain : old) {
                 if (chain != null && chain != TOMBSTONE) {
                     var slot = slot(chain.hash) & mask;
-                    while (fresh[slot] != null) {
+                    while (fresh.chains[slot] != null) {
                         slot = (slot + 1) & mask;
                     }
-                    fresh[slot] = chain;
+                    fresh.chains[slot] = chain;
+                    fresh.hashes[slot] = chain.hash;
                 }
             }
             taken = size;
