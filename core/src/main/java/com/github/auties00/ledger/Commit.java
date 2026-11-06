@@ -22,8 +22,8 @@ public interface Commit {
 
     /// Waits until this commit is on stable storage.
     ///
-    /// A commit that waits alone on a platform thread may write and force its group itself ([IoPool]): an interrupt
-    /// then lets them finish, and the wait returns once the commit is durable, with the thread's interrupt status set.
+    /// A commit that waits alone may write and force its group itself ([IoPool]): an interrupt then lets them finish,
+    /// and the wait returns once the commit is durable, with the thread's interrupt status set.
     ///
     /// @throws InterruptedException if interrupted while waiting; the commit still becomes durable
     /// @throws LedgerIoException if the force that should have made it durable failed

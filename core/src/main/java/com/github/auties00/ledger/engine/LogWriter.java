@@ -513,11 +513,12 @@ final class LogWriter {
     /// to wake; and the wake of the pool's thread lets more commits join a group than a commit forcing its own at once
     /// would, which at eight committers made fewer forces than leading did.
     ///
-    /// Only a platform thread does, so a force never holds the carrier of a virtual thread, and only without a commit
-    /// window, which the pool's flush waits out for the commits that join the group.
+    /// Only without a commit window, which the pool's flush waits out for the commits that join the group. A virtual
+    /// thread leads too: its force lends the carrier's place to another, as the JDK does for a force, and only the write
+    /// of the group into the file's cache holds the carrier; a commit of one virtual thread at a time made a fifth more
+    /// commits a second where it did.
     private boolean alone(long sequence) {
-        return commitWindowNanos == 0 && !Thread.currentThread().isVirtual() && waiters.isEmpty()
-                && lastQueued == sequence && durable < sequence;
+        return commitWindowNanos == 0 && waiters.isEmpty() && lastQueued == sequence && durable < sequence;
     }
 
     /// {@return whether `frames` seal into the output and the current segment, so the group is written with one call
