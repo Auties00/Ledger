@@ -6,6 +6,7 @@ import com.github.auties00.ledger.LedgerIoException;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,6 +17,7 @@ import java.util.BitSet;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
 
 /// The file of large values, `ledger.blobs`: values a commit writes once, in units of their own, instead of into its
@@ -39,8 +41,15 @@ final class BlobFile implements AutoCloseable {
     /// The trailing free pages, 64 MiB of them, below which [#trim()] keeps the file's length.
     private static final int TRIM_SLACK = 16_384;
 
+    /// The channels the threads of commits and reads write and read units through.
+    private static final int CHANNELS = 4;
+
     private final Path path;
+    // Forces and cuts the file, on the store's own threads only, so no interrupt of a caller closes it under them
     private final FileChannel channel;
+    // The channels callers write and read units through, each used by one thread at a time; one an interrupt closed is
+    // replaced
+    private final ArrayBlockingQueue<FileChannel> channels;
     private final PageCipher cipher;
     private final PageCache cache;
     private final HeapPool pool;
@@ -60,6 +69,17 @@ final class BlobFile implements AutoCloseable {
     private BlobFile(Path path, FileChannel channel, PageCipher cipher, PageCache cache, HeapPool pool, FreeSpace space) throws IOException {
         this.path = path;
         this.channel = channel;
+        this.channels = new ArrayBlockingQueue<>(CHANNELS);
+        try {
+            for (var i = 0; i < CHANNELS; i++) {
+                channels.add(FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE));
+            }
+        } catch (IOException exception) {
+            for (var open : channels) {
+                open.close();
+            }
+            throw exception;
+        }
         this.cipher = cipher;
         this.cache = cache;
         this.pool = pool;
@@ -131,19 +151,38 @@ final class BlobFile implements AutoCloseable {
         var header = new byte[PageFormat.HEADER];
         PageFile.header(header, PageFormat.EXTERNAL, 0, ref.page(), pages, Math.toIntExact(value.byteSize()), ref.nonceHigh(), ref.nonceLow());
         var buffer = pool.acquire(BUFFER);
+        var through = new FileChannel[]{takeChannel()};
+        var interrupted = new boolean[1];
         try {
             var position = new long[]{PageFormat.offset(ref.page())};
             cipher.seal(header, value, pages, buffer, (bytes, length) -> {
-                var source = ByteBuffer.wrap(bytes, 0, length);
-                while (source.hasRemaining()) {
-                    position[0] += channel.write(source, position[0]);
+                var start = position[0];
+                while (true) {
+                    try {
+                        var source = ByteBuffer.wrap(bytes, 0, length);
+                        var at = start;
+                        while (source.hasRemaining()) {
+                            at += through[0].write(source, at);
+                        }
+                        position[0] = at;
+                        return;
+                    } catch (ClosedByInterruptException _) {
+                        // The interrupt closed the channel: the same bytes again, at the same offset, on a new one,
+                        // and the caller gets its interrupt back
+                        interrupted[0] |= Thread.interrupted();
+                        through[0] = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
+                    }
                 }
             });
         } catch (IOException exception) {
             release(ref);
             throw new LedgerIoException(path + " could not be written", exception);
         } finally {
+            channels.offer(through[0]);
             pool.release(buffer);
+            if (interrupted[0]) {
+                Thread.currentThread().interrupt();
+            }
         }
         return ref;
     }
@@ -184,12 +223,20 @@ final class BlobFile implements AutoCloseable {
     byte[] readUnit(PageRef ref) {
         var length = ref.pages() * PageFormat.SIZE;
         var sealed = pool.acquire(length);
+        var through = takeChannel();
+        var interrupted = false;
         try {
             var target = ByteBuffer.wrap(sealed, 0, length);
             var position = PageFormat.offset(ref.page());
             while (target.hasRemaining()) {
-                if (channel.read(target, position + target.position()) < 0) {
-                    return null;
+                try {
+                    if (through.read(target, position + target.position()) < 0) {
+                        return null;
+                    }
+                } catch (ClosedByInterruptException _) {
+                    // The interrupt closed the channel; read on a new one and give the caller its interrupt back
+                    interrupted |= Thread.interrupted();
+                    through = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
                 }
             }
             var plain = new byte[length];
@@ -200,7 +247,39 @@ final class BlobFile implements AutoCloseable {
         } catch (IOException exception) {
             throw new LedgerIoException(path + " could not be read", exception);
         } finally {
+            channels.offer(through);
             pool.release(sealed);
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /// {@return a channel for a caller's write or read, open, waiting for one if every one is in use}
+    private FileChannel takeChannel() {
+        var interrupted = false;
+        try {
+            while (true) {
+                try {
+                    var taken = channels.take();
+                    if (taken.isOpen()) {
+                        return taken;
+                    }
+                    // An interrupt closed it after its last use, and it could not be replaced then
+                    try {
+                        return FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
+                    } catch (IOException exception) {
+                        channels.offer(taken);
+                        throw new LedgerIoException(path + " could not be opened", exception);
+                    }
+                } catch (InterruptedException _) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -303,6 +382,13 @@ final class BlobFile implements AutoCloseable {
             channel.close();
         } catch (IOException _) {
             // Every unit a commit relies on was forced with its log group
+        }
+        for (var open : channels) {
+            try {
+                open.close();
+            } catch (IOException _) {
+                // Nothing was left unforced through a caller's channel
+            }
         }
     }
 }

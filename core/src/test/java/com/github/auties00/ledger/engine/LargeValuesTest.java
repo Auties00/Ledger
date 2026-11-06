@@ -271,6 +271,33 @@ class LargeValuesTest {
             }
         }
 
+        @Test
+        @DisplayName("an interrupted reader or committer reads and writes its large value, and leaves the file usable for the others")
+        void interruptedCallers(@TempDir Path directory) throws Exception {
+            try (var ledger = (LiveLedger) open(directory, true)) {
+                ledger.commit(ledger.newBatch().put(FILES, "a", value(1, 50_000))).awaitDurable();
+                ledger.clearPageCacheForTests();
+                // An interrupted thread's file operations close their channel at once
+                Thread.currentThread().interrupt();
+                assertArrayEquals(value(1, 50_000), ledger.get(FILES, "a").orElseThrow());
+                assertTrue(Thread.interrupted(), "the reader lost its interrupt");
+                Thread.currentThread().interrupt();
+                var commit = ledger.commit(ledger.newBatch().put(FILES, "b", value(2, 50_000)));
+                assertTrue(Thread.interrupted(), "the committer lost its interrupt");
+                commit.awaitDurable();
+                // A checkpoint forces the file through a channel no caller's interrupt closed
+                Thread.currentThread().interrupt();
+                ledger.checkpoint();
+                assertTrue(Thread.interrupted(), "the checkpoint lost the interrupt");
+                ledger.clearPageCacheForTests();
+                assertArrayEquals(value(2, 50_000), ledger.get(FILES, "b").orElseThrow());
+            }
+            try (var ledger = open(directory, true)) {
+                assertArrayEquals(value(1, 50_000), ledger.get(FILES, "a").orElseThrow());
+                assertArrayEquals(value(2, 50_000), ledger.get(FILES, "b").orElseThrow());
+            }
+        }
+
         /// Overwrites every unit page of the file of large values with zeros.
         private static void damageUnits(Path directory) throws IOException {
             try (var channel = FileChannel.open(directory.resolve(BlobFile.FILE), StandardOpenOption.WRITE)) {
