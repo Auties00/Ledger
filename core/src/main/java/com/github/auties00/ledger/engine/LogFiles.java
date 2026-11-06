@@ -109,6 +109,11 @@ final class LogFiles {
     record Prepared(long number, Path path, byte[] salt) {
     }
 
+    /// {@return the directory of the segments}
+    Path directory() {
+        return directory;
+    }
+
     /// Prepares segment `number`, which must not exist, from a spare or a new file of `length` bytes.
     ///
     /// @param zeros whether a new file is first written with zeros to its full length

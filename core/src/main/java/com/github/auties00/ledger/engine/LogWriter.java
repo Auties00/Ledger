@@ -8,6 +8,8 @@ import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.GeneralSecurityException;
 import java.time.Duration;
@@ -144,6 +146,8 @@ final class LogWriter {
     private boolean queuedUnits;
     // The file of large values the commits write to, or null
     private volatile BlobFile blobs;
+    // Whether the file of large values is on the drive of the segments, set with it
+    private volatile boolean blobsShareDrive;
     private final AtomicBoolean scheduled;
     // The commits waiting for durability
     private final ConcurrentLinkedQueue<Waiter> waiters;
@@ -337,6 +341,20 @@ final class LogWriter {
     /// Makes `blobs` the file of large values the commits write units to, which the groups force.
     void useBlobs(BlobFile blobs) {
         this.blobs = blobs;
+        this.blobsShareDrive = sameDrive(blobs.path(), files.directory());
+    }
+
+    /// {@return whether `left` and `right` are on one file store, so emptying the drive's cache for one empties it
+    /// for the other}
+    private static boolean sameDrive(Path left, Path right) {
+        if (!FullSync.available(left) || !FullSync.available(right)) {
+            return false;
+        }
+        try {
+            return Files.getFileStore(left).equals(Files.getFileStore(right));
+        } catch (IOException | UnsupportedOperationException _) {
+            return false;
+        }
     }
 
     /// Waits until the first `frames` frames queued since the writer opened are durable.
@@ -414,6 +432,10 @@ final class LogWriter {
     /// beside the segment's, makes them all durable. A rollover waits for it before it forces the segment: the first
     /// frame of a group in the next segment then means, as it always does, that everything before it is durable.
     ///
+    /// Where the segment's force empties the drive's cache (macOS), the file of large values is only handed to the
+    /// drive, and the segment's force waits for that: emptying the cache once makes both durable, where emptying it
+    /// for each file doubled the wait of a commit of large values.
+    ///
     /// @return the bytes of the frame bodies written
     private long write(List<Queued> group, boolean units) throws IOException {
         if (channel == null) {
@@ -450,6 +472,10 @@ final class LogWriter {
         Arrays.fill(output, used, used + padding, (byte) 0);
         used += padding;
         drain();
+        if (unitForce != null && fullSync != null && blobsShareDrive) {
+            await(unitForce);
+            unitForce = null;
+        }
         force();
         forces++;
         if (unitForce != null) {
@@ -517,8 +543,14 @@ final class LogWriter {
     /// {@return the force of the file of large values, started on a thread of its own}
     private FutureTask<Void> forceUnits() {
         var file = blobs;
+        // The segment's force empties the drive's cache after this one, for both files
+        var toDrive = fullSync != null && blobsShareDrive;
         var task = new FutureTask<Void>(() -> {
-            file.force();
+            if (toDrive) {
+                file.forceToDrive();
+            } else {
+                file.force();
+            }
             return null;
         });
         Thread.ofVirtual().name("ledger-blob-force").start(task);

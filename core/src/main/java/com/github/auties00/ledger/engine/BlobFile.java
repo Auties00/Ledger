@@ -199,6 +199,17 @@ final class BlobFile implements AutoCloseable {
         }
     }
 
+    /// {@return the file}
+    Path path() {
+        return path;
+    }
+
+    /// Hands every unit written so far, and the length of the file, to the drive, without emptying its cache: a force
+    /// that empties it after this one, of any file, makes them durable.
+    void forceToDrive() throws IOException {
+        channel.force(true);
+    }
+
     /// Forces every unit written so far, and the length of the file.
     void force() throws IOException {
         if (fullSync != null) {
