@@ -20,11 +20,13 @@ import java.util.zip.CRC32C;
 /// %016x.prep   a new segment being prepared, which a crash may leave behind
 /// ```
 ///
-/// A segment is prepared before the log needs it ([#prepare(long)]): a spare, or a new file, gets the segment's header
-/// with a fresh salt and a zeroed first frame block, is forced, and only then takes its name, so recovery never meets a
-/// segment half prepared, and finds one never written empty at once. Once a checkpoint makes segments obsolete, they
-/// become spares ([#retireBefore(long, int)]) instead of being deleted: a spare keeps the length and the blocks its
-/// first use gave it, so writing into it leaves a force no file size and no block allocation to record.
+/// A segment is prepared before the log needs it ([#prepare(long, long)]): a spare, or a new file, gets the segment's
+/// header with a fresh salt and a zeroed first frame block, is forced, and only then takes its name, so recovery never
+/// meets a segment half prepared, and finds one never written empty at once. A spare has its blocks already, and a new
+/// file can be written with zeros to its full length first, except on Windows: writing into either leaves a force no
+/// file size and no block allocation to record, which on ext4 halved the time of a durable commit and spared one force
+/// in a thousand a wait of tens of milliseconds for a journal commit. Once a checkpoint makes segments obsolete, they become spares ([#retireBefore(long, int)]) instead of
+/// being deleted.
 ///
 /// It is safe for concurrent use: the log writer prepares while a checkpoint retires.
 final class LogFiles {
@@ -32,6 +34,9 @@ final class LogFiles {
     private static final String SPARE = ".spare";
     private static final String PREPARING = ".prep";
     private static final SecureRandom SALTS = new SecureRandom();
+    // Not on Windows, where forcing a growing file cost a durable commit no more than forcing one written with zeros
+    // first, and the zeros made an ingest of a history a fifth slower
+    private static final boolean ZERO_FILL = !System.getProperty("os.name", "").startsWith("Windows");
 
     private final Path directory;
     private final StoreKeys keys;
@@ -104,17 +109,19 @@ final class LogFiles {
     record Prepared(long number, Path path, byte[] salt) {
     }
 
-    /// Prepares segment `number`, which must not exist, from a spare or a new file.
+    /// Prepares segment `number`, which must not exist, from a spare or a new file of `length` bytes.
     ///
+    /// @param zeros whether a new file is first written with zeros to its full length
     /// @return the segment, durable under its name
-    Prepared prepare(long number) throws IOException {
+    Prepared prepare(long number, long length, boolean zeros) throws IOException {
         synchronized (lock) {
             var target = segment(number);
             var spares = spares();
             // A new file grows as its first use writes it: setting its length would allocate nothing on most
             // file systems and cost a slow allocation on NTFS, while a spare has its blocks already
             Path source;
-            if (spares.isEmpty()) {
+            var fresh = spares.isEmpty();
+            if (fresh) {
                 source = directory.resolve("%016x".formatted(number) + PREPARING);
                 Files.deleteIfExists(source);
                 Files.createFile(source);
@@ -134,6 +141,9 @@ final class LogFiles {
             crc.update(start.array(), 0, LogWriter.HEADER_CRC_OFFSET);
             start.putInt(LogWriter.HEADER_CRC_OFFSET, (int) crc.getValue());
             try (var channel = FileChannel.open(source, StandardOpenOption.WRITE)) {
+                if (fresh && zeros && ZERO_FILL) {
+                    fill(channel, start.capacity(), length);
+                }
                 // The header, and a first frame block of zeros that marks the segment as never written
                 while (start.hasRemaining()) {
                     channel.write(start, start.position());
@@ -143,6 +153,18 @@ final class LogFiles {
             Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
             Durability.forceDirectory(directory);
             return new Prepared(number, target, salt);
+        }
+    }
+
+    /// Writes zeros to `channel` from `from` to `to`, so the file has the blocks of its full length.
+    private static void fill(FileChannel channel, long from, long to) throws IOException {
+        var zeros = ByteBuffer.allocate(1 << 20);
+        var position = from;
+        while (position < to) {
+            zeros.clear().limit((int) Math.min(zeros.capacity(), to - position));
+            while (zeros.hasRemaining()) {
+                position += channel.write(zeros, position);
+            }
         }
     }
 
