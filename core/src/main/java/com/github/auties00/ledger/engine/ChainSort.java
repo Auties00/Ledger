@@ -1,8 +1,5 @@
 package com.github.auties00.ledger.engine;
 
-import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
-import java.nio.ByteOrder;
 import java.util.Arrays;
 
 /// Sorts the chains a checkpoint takes as [Chain#BY_KEY] orders them, keeping chains of equal keys in the order they
@@ -10,7 +7,7 @@ import java.util.Arrays;
 ///
 /// A comparison sort reads two chains, scattered over the heap, per comparison: a checkpoint of a million dirty keys
 /// spent a second of every processor sorting them. This one reads each chain once for each 8 bytes of its key it
-/// needs. It sorts the chains by the first 8 bytes of their keys, which [Chain#prefix] holds, with a radix sort over
+/// needs. It sorts the chains by the first 8 bytes of their keys, which [Chain#word(long)] reads, with a radix sort over
 /// arrays of their own; then each run of chains those bytes leave tied by the next 8 bytes, and so on until the keys
 /// end. A short run, or one of keys that end within the bytes that tie them, goes to the comparator.
 final class ChainSort {
@@ -18,7 +15,6 @@ final class ChainSort {
     private static final int SMALL_RUN = 48;
     private static final int DIGIT_BITS = 8;
     private static final int BUCKETS = 1 << DIGIT_BITS;
-    private static final ValueLayout.OfLong BIG_ENDIAN_LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
 
     private ChainSort() {
     }
@@ -32,7 +28,7 @@ final class ChainSort {
         }
         var words = new long[length];
         for (var i = 0; i < length; i++) {
-            words[i] = chains[i].prefix;
+            words[i] = chains[i].word(0);
         }
         var scratch = new Scratch(length);
         sortRun(chains, words, 0, length, 0, scratch);
@@ -63,9 +59,9 @@ final class ChainSort {
         }
         var longer = false;
         for (var i = from; i < to; i++) {
-            var key = chains[i].key;
-            longer |= key.byteSize() > offset;
-            words[i] = word(key, offset);
+            var chain = chains[i];
+            longer |= chain.keyLength() > offset;
+            words[i] = chain.word(offset);
         }
         if (!longer) {
             // Every key ends before offset, tied up to its end: only their lengths, or nothing, tell them apart
@@ -73,19 +69,6 @@ final class ChainSort {
             return;
         }
         sortRun(chains, words, from, to, offset, scratch);
-    }
-
-    /// {@return the 8 bytes of `key` at `offset`, big-endian, zero past its end}
-    private static long word(MemorySegment key, long offset) {
-        var size = key.byteSize();
-        if (offset + Long.BYTES <= size) {
-            return key.get(BIG_ENDIAN_LONG, offset);
-        }
-        var word = 0L;
-        for (var at = offset; at < size; at++) {
-            word |= (key.get(ValueLayout.JAVA_BYTE, at) & 0xFFL) << (56 - 8 * (at - offset));
-        }
-        return word;
     }
 
     /// Sorts the chains from `from` to `to` by `words`, as unsigned numbers, keeping chains of equal words in order: a

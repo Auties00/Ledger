@@ -18,9 +18,12 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 
 /// The hash index of a key space's chains, against a map of the JDK, alone and under concurrent writers and readers.
 class ChainIndexTest {
+    // Keys at offsets of shared chunks, as a key space holds them
+    private static final KeySlab SLAB = new KeySlab();
+
     private static Chain chain(long key) {
         var bytes = MemorySegment.ofArray(ByteBuffer.allocate(12).putLong(key).putInt((int) (key * 31)).array());
-        return new Chain(bytes, Segments.hash(bytes));
+        return SLAB.chain(bytes, Segments.hash(bytes));
     }
 
     private static MemorySegment keyOf(long key) {
@@ -93,7 +96,7 @@ class ChainIndexTest {
                 var key = MemorySegment.ofArray(bytes).asReadOnly();
                 switch (random.nextInt(many ? 3 : 4)) {
                     case 0 -> {
-                        var created = new Chain(key, hash);
+                        var created = random.nextBoolean() ? SLAB.chain(key, hash) : new Chain(key, hash);
                         var expected = model.get(name);
                         assertSame(expected, index.putIfAbsent(created), "put " + name);
                         if (expected == null) {
@@ -116,7 +119,7 @@ class ChainIndexTest {
                 assertEquals(model.size(), index.size());
             }
             for (var held : model.values()) {
-                assertSame(held, index.get(held.key, held.hash));
+                assertSame(held, index.get(held.key(), held.hash));
             }
         }
     }
@@ -219,7 +222,7 @@ class ChainIndexTest {
                     var random = new SplittableRandom(seed);
                     while (!stop.get()) {
                         var held = stable.get(random.nextInt(stable.size()));
-                        if (index.get(held.key, held.hash) != held) {
+                        if (index.get(held.key(), held.hash) != held) {
                             throw new AssertionError("a reader missed a chain the index holds");
                         }
                     }
@@ -238,7 +241,7 @@ class ChainIndexTest {
             throw new AssertionError(failure.get());
         }
         for (var held : stable) {
-            assertSame(held, index.get(held.key, held.hash));
+            assertSame(held, index.get(held.key(), held.hash));
         }
         // Each key found once accounts for one chain: a key held twice would make the size larger
         var found = stable.size();

@@ -8,8 +8,9 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 ///
 /// A key copied into an array of its own costs the array's header and, for the read-only view of it, a segment and a
 /// memory session of the segment's own: about a hundred bytes for a 16-byte key, on every key a commit writes. A copy
-/// here is a slice of a chunk's one read-only view, which shares that view's session. A chunk stays reachable while a
-/// chain holds a key in it, so chunks are small: a long-lived chain keeps a few kilobytes, not more.
+/// here is a span of a chunk's one read-only view, which its chain holds as the view, an offset and a length: no
+/// object of its own. A chunk stays reachable while a chain holds a key in it, so chunks are small: a long-lived chain
+/// keeps a few kilobytes, not more.
 ///
 /// It is safe for concurrent use: a copy claims its bytes with one atomic add, and a full chunk is replaced with a
 /// compare-and-set. Each thread copies into the chunk of a stripe of its own, by its id, as threads that shared one
@@ -30,11 +31,11 @@ final class KeySlab {
         this.stripes = new AtomicReferenceArray<>(STRIPES);
     }
 
-    /// {@return a read-only copy of `key`}
-    MemorySegment copy(MemorySegment key) {
+    /// {@return the chain of a read-only copy of `key`, whose hash is `hash`}
+    Chain chain(MemorySegment key, int hash) {
         var length = (int) key.byteSize();
         if (length > LARGEST) {
-            return Segments.copy(key);
+            return new Chain(Segments.copy(key), hash);
         }
         // Thread ids are consecutive: a multiplicative hash spreads them over the stripes
         var stripe = (int) ((Thread.currentThread().threadId() * 0x9E3779B97F4A7C15L) >>> 40) & (STRIPES - 1);
@@ -47,7 +48,7 @@ final class KeySlab {
             var start = chunk.used.getAndAdd(length);
             if (start + length <= CHUNK) {
                 MemorySegment.copy(key, 0, chunk.writable, start, length);
-                return chunk.view.asSlice(start, length);
+                return new Chain(chunk.view, start, length, hash);
             }
             // Full: the claim past its end is lost, and every thread that saw it full tries to replace it
             stripes.compareAndSet(stripe, chunk, new Chunk());

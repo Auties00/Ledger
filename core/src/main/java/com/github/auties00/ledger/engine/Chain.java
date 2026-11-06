@@ -18,23 +18,23 @@ import java.util.Comparator;
 /// the head knows, if a compare-and-set from the value it read succeeds, that no write was claimed in between: that
 /// is how any thread, holding no role, drops a chain whose writers have all published.
 final class Chain {
-    /// Orders chains as their keys: by [#prefix] first, which decides most comparisons without reading the keys.
-    static final Comparator<Chain> BY_KEY = (left, right) -> {
-        var order = Long.compareUnsigned(left.prefix, right.prefix);
-        return order != 0 ? order : Segments.compare(left.key, right.key);
-    };
+    /// Orders chains as their keys.
+    static final Comparator<Chain> BY_KEY = Chain::compareKeys;
+    // The bits of keySpan that hold a key's length, which is at most KeyCodec.MAX_LENGTH
+    private static final int LENGTH_BITS = 11;
 
     /// What [#claimed] holds once the chain is dropped; above every sequence, so the claims stay monotonic.
     static final long DROPPED = Long.MAX_VALUE;
     /// What [#claim(PendingCommit, long)] returns for a dropped chain.
     static final Object DROPPED_WRITER = new Object();
 
-    /// The key, in an array of its own.
-    final MemorySegment key;
+    // The read-only view of the chunk of a KeySlab, or of an array of its own, that holds the key: a segment of the
+    // key's own was 40 of the bytes a buffered write took on the heap
+    private final MemorySegment keyChunk;
+    // Where the key starts in keyChunk, shifted left by LENGTH_BITS, and its length
+    private final int keySpan;
     /// The hash of the key's bytes, as the hash index uses it.
     final int hash;
-    /// The first 8 bytes of the key, big-endian, zero after a shorter key's last.
-    final long prefix;
     /// The newest version, or `null` before the writer attaches the first one and once it drops the chain.
     volatile Version head;
     /// Whether the ordered map holds the chain. In a key space that orders its chains eagerly, the writer attaches no
@@ -136,19 +136,60 @@ final class Chain {
         return (long) CLAIMED.getVolatile(this) == DROPPED;
     }
 
+    /// Makes the chain of `key`, a read-only segment of its own.
     Chain(MemorySegment key, int hash) {
-        this.key = key;
+        this(key, 0, Math.toIntExact(key.byteSize()), hash);
+    }
+
+    /// Makes the chain of the `length` bytes at `offset` of `keyChunk`, a read-only segment no one writes them in.
+    Chain(MemorySegment keyChunk, long offset, int length, int hash) {
+        this.keyChunk = keyChunk;
+        this.keySpan = Math.toIntExact(offset << LENGTH_BITS | length);
         this.hash = hash;
-        this.prefix = prefix(key);
         this.dirtyCut = -1;
     }
 
-    private static long prefix(MemorySegment key) {
-        var prefix = 0L;
-        var length = (int) Math.min(Long.BYTES, key.byteSize());
-        for (var i = 0; i < length; i++) {
-            prefix |= (key.get(ValueLayout.JAVA_BYTE, i) & 0xFFL) << (56 - 8 * i);
-        }
-        return prefix;
+    /// {@return the key, a read-only segment made for the call}
+    MemorySegment key() {
+        return keyChunk.asSlice(keyOffset(), keyLength());
     }
+
+    /// {@return the bytes of the key}
+    int keyLength() {
+        return keySpan & ((1 << LENGTH_BITS) - 1);
+    }
+
+    private long keyOffset() {
+        return keySpan >>> LENGTH_BITS;
+    }
+
+    /// {@return whether the key's bytes are those of `key`}
+    boolean keyEquals(MemorySegment key) {
+        return Segments.equal(keyChunk, keyOffset(), keyLength(), key, 0, key.byteSize());
+    }
+
+    /// {@return whether the keys of `left` and `right` are equal}
+    static boolean sameKey(Chain left, Chain right) {
+        return Segments.equal(left.keyChunk, left.keyOffset(), left.keyLength(), right.keyChunk, right.keyOffset(), right.keyLength());
+    }
+
+    /// {@return the order of the keys of `left` and `right`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
+    static int compareKeys(Chain left, Chain right) {
+        return Segments.compare(left.keyChunk, left.keyOffset(), left.keyLength(), right.keyChunk, right.keyOffset(), right.keyLength());
+    }
+
+    /// {@return the 8 bytes of the key at `at`, big-endian, zero past its end}
+    long word(long at) {
+        var length = keyLength();
+        var offset = keyOffset();
+        if (at + Long.BYTES <= length) {
+            return keyChunk.get(Segments.BIG_ENDIAN_LONG, offset + at);
+        }
+        var word = 0L;
+        for (var i = at; i < length; i++) {
+            word |= (keyChunk.get(ValueLayout.JAVA_BYTE, offset + i) & 0xFFL) << (56 - 8 * (i - at));
+        }
+        return word;
+    }
+
 }
