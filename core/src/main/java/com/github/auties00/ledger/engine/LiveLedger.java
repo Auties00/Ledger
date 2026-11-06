@@ -1236,6 +1236,8 @@ public final class LiveLedger implements Ledger {
         } finally {
             exitExclusive();
         }
+        // The final checkpoint forces the files on this thread: an interrupt would close their channels under it
+        var interrupted = Thread.interrupted();
         try {
             if (log != null) {
                 log.close();
@@ -1250,6 +1252,9 @@ public final class LiveLedger implements Ledger {
                 } catch (Exception exception) {
                     // Everything is durable by now: a file, lock or pool that fails to close loses nothing
                 }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
             }
         }
     }
