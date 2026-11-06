@@ -7,7 +7,6 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.NavigableMap;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.locks.ReentrantLock;
@@ -20,8 +19,8 @@ import java.util.function.LongSupplier;
 /// checkpoint every reader's tree holds; a key with no version in memory is read from the tree. A resident key space
 /// holds every entry.
 ///
-/// The chains of the keys are in two maps: an ordered one for scans, and a hash index for lookups of one key, which
-/// at a million keys costs a fraction of a walk down the ordered one. A chain enters the index first, then the ordered
+/// The chains of the keys are in two maps: an ordered one for scans, and a hash index ([ChainIndex]) for lookups of
+/// one key, which at a million keys costs a fraction of a walk down the ordered one. A chain enters the index first, then the ordered
 /// map, and leaves them in the same order.
 ///
 /// A paged key space of a store in a directory orders its chains lazily: a new chain is only listed, and the reads of
@@ -42,7 +41,7 @@ final class KeyspaceState {
     // The chains in the order of their keys; a chain the writer dropped may stay a while, empty
     final ConcurrentSkipListMap<MemorySegment, Chain> entries;
     // The chains by the bytes of their keys
-    private final ConcurrentHashMap<IndexKey, Chain> index;
+    private final ChainIndex index;
     // The chains the writer dropped that the ordered map may still hold
     private final ConcurrentLinkedQueue<Chain> leaving;
     // Copy-on-write: the writer publishes a new array, readers keep the one they loaded
@@ -83,7 +82,7 @@ final class KeyspaceState {
         this.resident = keyspace.residency() == Keyspace.Residency.RESIDENT;
         this.id = -1;
         this.entries = new ConcurrentSkipListMap<>(Segments.UNSIGNED);
-        this.index = new ConcurrentHashMap<>();
+        this.index = new ChainIndex();
         this.leaving = new ConcurrentLinkedQueue<>();
         this.removals = RangeRemoval.NONE;
         this.counts = new ConcurrentSkipListMap<>();
@@ -96,7 +95,7 @@ final class KeyspaceState {
 
     /// {@return the chain of `key`, or `null` if memory holds none}
     Chain chain(MemorySegment key) {
-        return index.get(new IndexKey(key, Segments.hash(key)));
+        return index.get(key, Segments.hash(key));
     }
 
     /// {@return the chains memory holds, ordered or not}
@@ -117,15 +116,15 @@ final class KeyspaceState {
     /// when it gives the commit its writes, opens the key again.
     Chain open(MemorySegment key) {
         var hash = Segments.hash(key);
-        var chain = index.get(new IndexKey(key, hash));
+        var chain = index.get(key, hash);
         if (chain != null && chain.released()) {
             // Dropped, and maybe not out of the index yet: the key gets a chain of its own
-            index.remove(new IndexKey(chain.key, chain.hash), chain);
+            index.remove(chain);
             chain = null;
         }
         if (chain == null) {
             var created = new Chain(keys.copy(key), hash);
-            chain = index.putIfAbsent(new IndexKey(created.key, hash), created);
+            chain = index.putIfAbsent(created);
             if (chain == null) {
                 chain = created;
                 if (lazy) {
@@ -276,7 +275,7 @@ final class KeyspaceState {
     private void empty(Chain chain) {
         chain.dropped = true;
         chain.head = null;
-        index.remove(new IndexKey(chain.key, chain.hash), chain);
+        index.remove(chain);
         // Read after the store above, as [#inserted] reads the flag after its own store: one of them takes it out
         if (chain.ordered) {
             leaving.add(chain);
@@ -339,22 +338,6 @@ final class KeyspaceState {
         dirty = new ArrayList<>();
         dirtyCut++;
         return cut;
-    }
-
-    /// A key of the hash index: the bytes of a key, compared by content.
-    ///
-    /// @param bytes the key
-    /// @param hash [Segments#hash(MemorySegment)] of the key
-    private record IndexKey(MemorySegment bytes, int hash) {
-        @Override
-        public boolean equals(Object other) {
-            return other instanceof IndexKey key && key.hash == hash && Segments.compare(key.bytes, bytes) == 0;
-        }
-
-        @Override
-        public int hashCode() {
-            return hash;
-        }
     }
 
     /// {@return the version of `key` a reader with `bound` sees, [Version#HIDDEN] if it sees the key removed, or `null`
