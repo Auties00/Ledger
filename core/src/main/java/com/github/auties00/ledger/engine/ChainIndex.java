@@ -23,21 +23,28 @@ final class ChainIndex {
     private static final int SEGMENTS = 64;
     private static final int INITIAL = 16;
     private static final VarHandle SLOTS = MethodHandles.arrayElementVarHandle(Chain[].class);
+    private static final VarHandle SEGMENT_SLOTS = MethodHandles.arrayElementVarHandle(Segment[].class);
     // Marks a slot whose chain was removed; it ends no probe
     private static final Chain TOMBSTONE = new Chain(MemorySegment.ofArray(new byte[0]), 0);
+    // The table of every segment that holds no chain, which no one writes: a key space's segments took 12 KB of
+    // tables before its first write, and kept them once a checkpoint had dropped every chain
+    private static final Table EMPTY = Table.of(INITIAL);
 
+    // Each made with the first chain its hashes take, so a key space of a few keys keeps a few: 64 up front, and the
+    // locks beside them, cost every key space 3 KB
     private final Segment[] segments;
 
     ChainIndex() {
         this.segments = new Segment[SEGMENTS];
-        for (var i = 0; i < SEGMENTS; i++) {
-            segments[i] = new Segment();
-        }
     }
 
     /// {@return the chain of the key of `hash` whose bytes are `key`, or `null` if the index holds none}
     Chain get(MemorySegment key, int hash) {
-        var table = segment(hash).table;
+        var segment = (Segment) SEGMENT_SLOTS.getAcquire(segments, segmentOf(hash));
+        if (segment == null) {
+            return null;
+        }
+        var table = segment.table;
         var chains = table.chains;
         var hashes = table.hashes;
         var mask = chains.length - 1;
@@ -57,10 +64,14 @@ final class ChainIndex {
     ///
     /// @return the chain the index held for the key, or `null` if it took `chain`
     Chain putIfAbsent(Chain chain) {
-        var segment = segment(chain.hash);
-        synchronized (segment.lock) {
+        var segment = segmentFor(chain.hash);
+        synchronized (segment) {
             while (true) {
                 var table = segment.table;
+                if (table == EMPTY) {
+                    segment.table = Table.of(INITIAL);
+                    continue;
+                }
                 var chains = table.chains;
                 var hashes = table.hashes;
                 var mask = chains.length - 1;
@@ -99,8 +110,11 @@ final class ChainIndex {
 
     /// Takes `chain` itself out of the index, if it is there.
     void remove(Chain chain) {
-        var segment = segment(chain.hash);
-        synchronized (segment.lock) {
+        var segment = (Segment) SEGMENT_SLOTS.getAcquire(segments, segmentOf(chain.hash));
+        if (segment == null) {
+            return;
+        }
+        synchronized (segment) {
             var chains = segment.table.chains;
             var mask = chains.length - 1;
             for (var slot = slot(chain.hash) & mask; ; slot = (slot + 1) & mask) {
@@ -111,6 +125,12 @@ final class ChainIndex {
                 if (held == chain) {
                     SLOTS.setRelease(chains, slot, TOMBSTONE);
                     segment.size--;
+                    if (segment.size == 0) {
+                        // A segment a checkpoint emptied keeps no table
+                        segment.taken = 0;
+                        segment.table = EMPTY;
+                        return;
+                    }
                     // Tombstones end no probe: once they outnumber the chains, and fill a quarter of the table, they
                     // go; and a table a sixteenth full shrinks, so a key space whose chains a checkpoint dropped does
                     // not keep the slots of its busiest moment, while a table that just grew, an eighth full, does not
@@ -129,14 +149,29 @@ final class ChainIndex {
     /// {@return the number of chains the index holds, as of some moment of the call}
     int size() {
         var size = 0;
-        for (var segment : segments) {
-            size += segment.size;
+        for (var i = 0; i < SEGMENTS; i++) {
+            var segment = (Segment) SEGMENT_SLOTS.getAcquire(segments, i);
+            if (segment != null) {
+                size += segment.size;
+            }
         }
         return size;
     }
 
-    private Segment segment(int hash) {
-        return segments[(hash >>> 26) & (SEGMENTS - 1)];
+    private static int segmentOf(int hash) {
+        return (hash >>> 26) & (SEGMENTS - 1);
+    }
+
+    /// {@return the segment of `hash`, made if no chain of its hashes came before}
+    private Segment segmentFor(int hash) {
+        var at = segmentOf(hash);
+        var segment = (Segment) SEGMENT_SLOTS.getAcquire(segments, at);
+        if (segment != null) {
+            return segment;
+        }
+        var made = new Segment();
+        var witness = (Segment) SEGMENT_SLOTS.compareAndExchangeRelease(segments, at, null, made);
+        return witness == null ? made : witness;
     }
 
     // Orders the slots by the hash's low bits, apart from the high ones that pick the segment; it separates no keys the
@@ -155,11 +190,10 @@ final class ChainIndex {
         }
     }
 
-    /// One part of the index: its table, and the lock its writers take.
+    /// One part of the index: its table. Its writers lock the segment itself, which no code outside the index reaches.
     private static final class Segment {
-        private final Object lock = new Object();
         // Replaced whole when it grows; read by lookups without the lock
-        private volatile Table table = Table.of(INITIAL);
+        private volatile Table table = EMPTY;
         // The chains held; written under the lock
         private volatile int size;
         // The slots that are not empty, tombstones included; guarded by the lock
@@ -168,6 +202,11 @@ final class ChainIndex {
         /// Copies the chains into a table of four times as many slots as they need, without tombstones, and publishes
         /// it.
         private void rebuild() {
+            if (size == 0) {
+                taken = 0;
+                table = EMPTY;
+                return;
+            }
             var old = table.chains;
             var capacity = INITIAL;
             while (capacity < (size + 1) * 4) {

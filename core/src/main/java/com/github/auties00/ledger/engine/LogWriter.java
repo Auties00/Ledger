@@ -96,8 +96,14 @@ final class LogWriter {
     /// The length of a segment a close keeps for the next open: its header and a first frame block of zeros.
     static final long KEPT_LENGTH = SEGMENT_HEADER + ALIGNMENT;
     private static final SecureRandom TAGS = new SecureRandom();
-    /// The size of the buffer frames are sealed into and written from.
+    /// The largest size of the buffer frames are sealed into and written from.
     private static final int OUTPUT = 1 << 20;
+    /// The size the buffer starts at, and goes back to once groups no longer need more. A buffer of [#OUTPUT] bytes
+    /// from the start cost every store a megabyte, and as much again of the heap region it took whole, which a store
+    /// of small commits never used.
+    private static final int MIN_OUTPUT = 16 << 10;
+    /// The groups in a row, each fitting in half of [#MIN_OUTPUT], after which a larger buffer goes back to it.
+    private static final int SHRINK_AFTER = 256;
     /// The bytes of a frame body sealed in one call, a multiple of the AES block.
     private static final int SLICE = 64 << 10;
     /// The bytes of frame bodies the queue holds before commits wait for the device.
@@ -146,10 +152,13 @@ final class LogWriter {
     private boolean waitedBefore;
     private final Cipher cipher;
     private final CRC32C crc;
-    // The buffer frames are sealed into and written from, a slice at a time whatever their size
-    private final byte[] output;
+    // The buffer frames are sealed into and written from, a slice at a time whatever their size; it grows up to OUTPUT
+    // while a group needs more, so a group that fits is written with one call
+    private byte[] output;
     // The bytes of output not written yet
     private int used;
+    // The groups in a row written since one needed more than half of MIN_OUTPUT
+    private int smallGroups;
     // The emptied queue, which the next swap reuses
     private ArrayList<Queued> flushing;
     // Written by the flush task only
@@ -222,7 +231,7 @@ final class LogWriter {
             throw new IllegalStateException("AES-GCM is unavailable", exception);
         }
         this.crc = new CRC32C();
-        this.output = new byte[OUTPUT];
+        this.output = new byte[MIN_OUTPUT];
         this.flushing = new ArrayList<>();
         this.queueLock = new ReentrantLock();
         this.queueDrained = queueLock.newCondition();
@@ -611,6 +620,10 @@ final class LogWriter {
         if (channel == null) {
             rollover();
         }
+        // Between groups: the last drain's bytes, which an interrupted force writes again, are durable by now
+        if (smallGroups >= SHRINK_AFTER && output.length > MIN_OUTPUT) {
+            output = new byte[MIN_OUTPUT];
+        }
         var unitForce = units ? forceUnits() : null;
         var start = position;
         var groupStart = true;
@@ -641,6 +654,7 @@ final class LogWriter {
         room(padding);
         Arrays.fill(output, used, used + padding, (byte) 0);
         used += padding;
+        smallGroups = position + used - start <= MIN_OUTPUT / 2 ? smallGroups + 1 : 0;
         drain();
         force();
         forces++;
@@ -658,7 +672,7 @@ final class LogWriter {
     /// Seals `frame` into the output, writing the output out whenever it fills.
     ///
     /// The body goes to the cipher a slice at a time: the frame is the one GCM message a single call would make, and
-    /// the output stays [#OUTPUT] bytes whatever the frame's size.
+    /// the output stays at most [#OUTPUT] bytes whatever the frame's size.
     private void seal(Queued frame, int sealedLength, boolean groupStart) throws IOException {
         room(FRAME_HEADER);
         var at = used;
@@ -737,9 +751,17 @@ final class LogWriter {
         }
     }
 
-    /// Writes the output out if `bytes` more would not fit in it.
+    /// Makes room for `bytes` more in the output: grows it while it is smaller than [#OUTPUT], else writes it out.
     private void room(int bytes) throws IOException {
         if (used + bytes > output.length) {
+            if (output.length < OUTPUT) {
+                var grown = Math.min(OUTPUT, Math.max(2 * output.length, used + bytes));
+                // The bytes not written yet stay where they are
+                output = Arrays.copyOf(output, grown);
+                if (used + bytes <= grown) {
+                    return;
+                }
+            }
             drain();
         }
     }

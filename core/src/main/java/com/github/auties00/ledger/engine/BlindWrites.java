@@ -19,6 +19,10 @@ import java.util.function.Predicate;
 /// is known; any thread reads them.
 final class BlindWrites {
     private static final int INITIAL_CAPACITY = 64;
+    // The arrays of a run with no write listed, which no one writes, as the next write copies them: a key space with
+    // no blind write unfolded keeps none
+    private static final Chain[] NO_CHAINS = new Chain[0];
+    private static final long[] NO_WRITES = new long[0];
     // Take the place of the chains of folded writes, whose effect they give the same: a folded slot stays in arrays a
     // reader of an older run may walk, and kept the chain, its key and its key's chunk reachable after the checkpoint
     // that took the key dropped it
@@ -29,7 +33,7 @@ final class BlindWrites {
     private volatile Run run;
 
     BlindWrites() {
-        this.run = new Run(new Chain[INITIAL_CAPACITY], new long[INITIAL_CAPACITY], 0, 0, 0);
+        this.run = new Run(NO_CHAINS, NO_WRITES, 0, 0, 0);
     }
 
     /// Lists the blind write of `chain`'s key by commit `sequence`; holding the publishing role, in the order of the
@@ -73,7 +77,8 @@ final class BlindWrites {
             return;
         }
         // The arrays stay shared with the readers of the current run, which may still walk the writes folded here
-        var replacement = next > current.chains.length / 2
+        var replacement = next == end ? new Run(NO_CHAINS, NO_WRITES, 0, 0, folded)
+                : next > current.chains.length / 2
                 ? new Run(current, next, Math.max(INITIAL_CAPACITY, 2 * (end - next)), folded)
                 : new Run(current.chains, current.writes, next, end, folded);
         run = replacement;
