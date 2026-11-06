@@ -135,16 +135,25 @@ final class CrashFileChannel extends FileChannel {
         }
     }
 
+    /// Forces the file, interruptibly as the JDK's file channels do: an interrupt of the forcing thread closes the
+    /// channel, and the force throws [java.nio.channels.ClosedByInterruptException].
     @Override
     public void force(boolean metaData) throws IOException {
-        fileSystem.beforeChange(path, ChangeInterceptor.ChangeKind.FORCE);
-        synchronized (disk.lock) {
-            checkOpen();
-            if (file == null) {
-                disk.forceDirectory(path);
-            } else {
-                disk.force(file);
+        var completed = false;
+        begin();
+        try {
+            fileSystem.beforeChange(path, ChangeInterceptor.ChangeKind.FORCE);
+            synchronized (disk.lock) {
+                checkOpen();
+                if (file == null) {
+                    disk.forceDirectory(path);
+                } else {
+                    disk.force(file);
+                }
             }
+            completed = true;
+        } finally {
+            end(completed);
         }
     }
 
@@ -176,11 +185,21 @@ final class CrashFileChannel extends FileChannel {
         }
     }
 
+    /// Writes at `position`, interruptibly as [#force(boolean)] forces.
     @Override
     public int write(ByteBuffer src, long position) throws IOException {
-        fileSystem.beforeChange(path, ChangeInterceptor.ChangeKind.WRITE);
-        synchronized (disk.lock) {
-            return writeAt(src, position);
+        var completed = false;
+        begin();
+        try {
+            fileSystem.beforeChange(path, ChangeInterceptor.ChangeKind.WRITE);
+            int written;
+            synchronized (disk.lock) {
+                written = writeAt(src, position);
+            }
+            completed = true;
+            return written;
+        } finally {
+            end(completed);
         }
     }
 

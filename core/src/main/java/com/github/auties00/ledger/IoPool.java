@@ -5,7 +5,10 @@ import com.github.auties00.ledger.engine.PlatformIoPool;
 /// The platform threads that write and force the logs of one or more stores.
 ///
 /// Stores write and force their logs on platform threads so a force never holds the carrier of a virtual thread, and
-/// so an interrupted caller never interrupts a write midway, which would close the log under every other caller.
+/// so an interrupt never closes the log under every other caller. A commit on a platform thread that waits for its
+/// durability alone, with no commit window, writes and forces its group on its own thread instead, sparing two thread
+/// wakeups; an interrupt then lets the write and force finish, and the thread that sends it waits until the force
+/// returns.
 /// Several stores of one application can share a pool: a process holding many small stores needs a few threads,
 /// not a few per store.
 public sealed interface IoPool extends AutoCloseable permits PlatformIoPool {
