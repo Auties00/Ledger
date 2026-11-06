@@ -357,8 +357,12 @@ class DurableLedgerTest {
                     assertTrue(commit.isDurable());
                     Thread.interrupted();
                 }
+                armed.set(false);
                 ledger.commit(ledger.newBatch().put(NAMES, "after", "v")).awaitDurable();
+                // A close from an interrupted thread checkpoints all the same
+                committer.interrupt();
             }
+            assertTrue(Thread.interrupted(), "the close took the interrupt");
             assertTrue(interrupts.get() > 0, "no commit forced its own group");
             try (var ledger = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(NAMES).largeValues(4_096).build()) {
                 for (var i = 0; i < 40; i++) {
