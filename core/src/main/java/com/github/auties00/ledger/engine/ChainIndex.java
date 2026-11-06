@@ -47,7 +47,7 @@ final class ChainIndex {
                 return null;
             }
             // Written before the release store of the chain, so read after its acquire load
-            if (hashes[slot] == hash && chain != TOMBSTONE && Segments.equal(chain.key, key)) {
+            if (hashes[slot] == hash && chain != TOMBSTONE && chain.keyEquals(key)) {
                 return chain;
             }
         }
@@ -77,7 +77,7 @@ final class ChainIndex {
                         if (free < 0) {
                             free = slot;
                         }
-                    } else if (hashes[slot] == chain.hash && Segments.equal(held.key, chain.key)) {
+                    } else if (hashes[slot] == chain.hash && Chain.sameKey(held, chain)) {
                         return held;
                     }
                 }

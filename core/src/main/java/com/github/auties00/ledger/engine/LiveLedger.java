@@ -1410,7 +1410,7 @@ public final class LiveLedger implements Ledger {
                     for (var i = 0; i < PRUNE_CHUNK && chains.hasNext(); i++) {
                         var chain = chains.next();
                         // A chain dropped since the cut may have been followed by another for the same key
-                        var current = chain.dropped ? state.chain(chain.key) : chain;
+                        var current = chain.dropped ? state.chain(chain.key()) : chain;
                         if (current != null) {
                             if (prune(state, current, current.head, bounds, Reads.boundOf(floor))) {
                                 requestSweep();
@@ -2089,12 +2089,12 @@ public final class LiveLedger implements Ledger {
             grown[removals.length] = removal;
             state.removals = grown;
             for (var unit : inFlight) {
-                if (unit.state() == state && removal.covers(unit.chain().key)) {
+                if (unit.state() == state && removal.covers(unit.chain().key())) {
                     replace(unit.version());
                 }
             }
             for (var write : touched) {
-                if (write.state() == state && removal.covers(write.chain().key)) {
+                if (write.state() == state && removal.covers(write.chain().key())) {
                     replace(write.version());
                 }
             }

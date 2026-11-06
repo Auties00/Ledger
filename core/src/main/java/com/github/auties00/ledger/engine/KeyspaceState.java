@@ -122,7 +122,7 @@ final class KeyspaceState {
             chain = null;
         }
         if (chain == null) {
-            var created = new Chain(keys.copy(key), hash);
+            var created = keys.chain(key, hash);
             chain = index.putIfAbsent(created);
             if (chain == null) {
                 chain = created;
@@ -221,7 +221,7 @@ final class KeyspaceState {
         // Released counts as dropped on both sides: another thread may have used the chain, and a prune dropped it,
         // while this one was still inserting it; a later chain of the key then holds the place
         while (!chain.dropped && !chain.released()) {
-            var previous = entries.putIfAbsent(chain.key, chain);
+            var previous = entries.putIfAbsent(chain.key(), chain);
             if (previous == null || previous == chain) {
                 inserted(chain);
                 return;
@@ -234,7 +234,7 @@ final class KeyspaceState {
                 }
                 throw new IllegalStateException("Two chains hold one key of " + keyspace.name());
             }
-            if (entries.replace(chain.key, previous, chain)) {
+            if (entries.replace(chain.key(), previous, chain)) {
                 inserted(chain);
                 return;
             }
@@ -286,7 +286,7 @@ final class KeyspaceState {
     private void inserted(Chain chain) {
         chain.ordered = true;
         if (chain.dropped) {
-            entries.remove(chain.key, chain);
+            entries.remove(chain.key(), chain);
         }
     }
 
@@ -296,7 +296,7 @@ final class KeyspaceState {
     void removeDropped(int limit) {
         Chain chain;
         for (var i = 0; i < limit && (chain = leaving.poll()) != null; i++) {
-            entries.remove(chain.key, chain);
+            entries.remove(chain.key(), chain);
         }
     }
 
@@ -310,7 +310,7 @@ final class KeyspaceState {
         }
         // Each removal walks down the map, a few microseconds of cache misses at a million keys
         var stream = chains.size() < PARALLEL_REMOVALS ? chains.stream() : chains.parallelStream();
-        stream.forEach(dropped -> entries.remove(dropped.key, dropped));
+        stream.forEach(dropped -> entries.remove(dropped.key(), dropped));
     }
 
     /// Lists `chain` among the keys the next checkpoint writes, holding the publishing role.

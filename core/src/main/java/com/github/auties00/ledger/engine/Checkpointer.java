@@ -335,13 +335,13 @@ final class Checkpointer {
             var chains = keyspace.dirty().toArray(Chain[]::new);
             ChainSort.sort(chains);
             var ops = new ArrayList<TreeUpdate.Op>(chains.length);
-            MemorySegment previous = null;
+            Chain previous = null;
             for (var chain : chains) {
-                var key = chain.key;
-                if (previous != null && Segments.compare(previous, key) == 0) {
+                if (previous != null && Chain.sameKey(previous, chain)) {
                     continue;
                 }
-                previous = key;
+                previous = chain;
+                var key = chain.key();
                 // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
                 // otherwise another one, or none
                 var current = chain.released() ? state.chain(key) : chain;

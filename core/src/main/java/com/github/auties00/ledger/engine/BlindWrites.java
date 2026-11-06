@@ -99,7 +99,7 @@ final class BlindWrites {
             var state = chain.blindState;
             if (state == TreeSearch.UNKNOWN) {
                 // Every thread that resolves the write finds the same answer
-                state = inTree.test(chain.key) ? TreeSearch.FOUND : TreeSearch.ABSENT;
+                state = inTree.test(chain.key()) ? TreeSearch.FOUND : TreeSearch.ABSENT;
                 chain.blindState = state;
             }
             total += effect(state, write);

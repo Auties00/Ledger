@@ -50,10 +50,14 @@ class ChainSortTest {
         var random = new SplittableRandom(shape.hashCode());
         for (var size : new int[]{0, 1, 2, 47, 48, 49, 500, 20_000}) {
             var chains = new Chain[size];
+            // Keys in shared chunks, at offsets past 0, beside keys of their own
+            var slab = new KeySlab();
             for (var i = 0; i < size; i++) {
                 // Some keys twice, as a dropped chain and the one that replaced it
-                var key = i > 0 && random.nextInt(8) == 0 ? Segments.toBytes(chains[random.nextInt(i)].key) : keys.apply(random);
-                chains[i] = new Chain(MemorySegment.ofArray(key), Segments.hash(MemorySegment.ofArray(key)));
+                var key = i > 0 && random.nextInt(8) == 0 ? Segments.toBytes(chains[random.nextInt(i)].key()) : keys.apply(random);
+                var segment = MemorySegment.ofArray(key);
+                chains[i] = random.nextBoolean() ? slab.chain(segment, Segments.hash(segment))
+                        : new Chain(segment.asReadOnly(), Segments.hash(segment));
             }
             var expected = chains.clone();
             // A stable sort: chains of equal keys keep their order
