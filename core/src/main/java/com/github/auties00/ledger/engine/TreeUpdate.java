@@ -7,9 +7,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.RecursiveTask;
 
@@ -39,7 +37,7 @@ final class TreeUpdate {
     private final List<PageRef> freedExternal;
     private final List<PageRef> allocated;
     // The records each delta page gained or lost, by page
-    private final Map<Integer, Integer> records;
+    private final PageCounts records;
     // Fills the delta pages of this update's thread
     private final DeltaLeaves.Packer packer;
 
@@ -50,7 +48,7 @@ final class TreeUpdate {
         this.freed = new ArrayList<>();
         this.freedExternal = new ArrayList<>();
         this.allocated = new ArrayList<>();
-        this.records = new HashMap<>();
+        this.records = new PageCounts();
         this.packer = new DeltaLeaves.Packer(writer, new DeltaLeaves.Packer.Space() {
             @Override
             public long take(int least, int most) {
@@ -65,7 +63,7 @@ final class TreeUpdate {
             public void giveBack(int page, int pages) {
                 space.release(page, pages);
             }
-        }, (page, written) -> records.merge(page, written, Integer::sum));
+        }, records::add);
     }
 
     /// The state of a key as of a checkpoint.
@@ -328,7 +326,7 @@ final class TreeUpdate {
         for (var task : tasks) {
             freed.addAll(task.update.freed);
             freedExternal.addAll(task.update.freedExternal);
-            task.update.records.forEach((page, change) -> records.merge(page, change, Integer::sum));
+            records.addAll(task.update.records);
             replacements[task.index] = task.getRawResult();
         }
         return replacements;
@@ -407,7 +405,7 @@ final class TreeUpdate {
     }
 
     private void dropRecord(PageRef ref) {
-        records.merge(ref.page(), -1, Integer::sum);
+        records.add(ref.page(), -1);
     }
 
     /// The share of the writes of one child of a branch.

@@ -4,7 +4,6 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 
 import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
 
 /// The delta pages a checkpoint made durable and the records of each that its trees refer to.
 ///
@@ -53,11 +52,11 @@ final class DeltaTable {
     ///
     /// @param freed receives each delta page left with no live record
     /// @throws IllegalStateException if a page would hold fewer than no records, so the trees and the table disagree
-    DeltaTable apply(Map<Integer, Integer> changes, List<PageRef> freed) {
+    DeltaTable apply(PageCounts changes, List<PageRef> freed) {
         if (changes.isEmpty()) {
             return this;
         }
-        var changed = changes.keySet().stream().mapToInt(Integer::intValue).sorted().toArray();
+        var changed = changes.pages();
         var outPages = new int[pages.length + changed.length];
         var outRecords = new int[outPages.length];
         var size = 0;
@@ -71,7 +70,7 @@ final class DeltaTable {
                 count = records[i++];
             } else {
                 page = changed[j++];
-                count = changes.get(page);
+                count = changes.count(page);
                 if (i < pages.length && pages[i] == page) {
                     count += records[i++];
                 }

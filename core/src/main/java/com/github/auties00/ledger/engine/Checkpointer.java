@@ -7,7 +7,6 @@ import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.security.SecureRandom;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -307,9 +306,9 @@ final class Checkpointer {
         var treeBound = cut.base() == null ? -1 : Reads.boundOf(cut.base().sequence);
         for (var keyspace : cut.keyspaces()) {
             var state = keyspace.state();
-            // Listed in the order of their writes, off the publishing role: sorted here, on every processor
+            // Listed in the order of their writes, off the publishing role: sorted here
             var chains = keyspace.dirty().toArray(Chain[]::new);
-            Arrays.parallelSort(chains, Chain.BY_KEY);
+            ChainSort.sort(chains);
             var ops = new ArrayList<TreeUpdate.Op>(chains.length);
             MemorySegment previous = null;
             for (var chain : chains) {
@@ -318,8 +317,9 @@ final class Checkpointer {
                     continue;
                 }
                 previous = key;
-                // The key's chain now, which is another one if the writer dropped this one
-                var current = state.chain(key);
+                // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
+                // otherwise another one, or none
+                var current = chain.released() ? state.chain(key) : chain;
                 var version = KeyspaceState.resolve(current == null ? null : current.head, key, bound, keyspace.removals());
                 if (version == null && !state.resident) {
                     // No version at the cut in a paged key space: a commit that wrote the key rolled back, so the
