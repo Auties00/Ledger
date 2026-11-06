@@ -668,8 +668,8 @@ public final class LiveLedger implements Ledger {
         if (pending.failure != null) {
             throw rethrow(pending.failure);
         }
-        // The versions reference the batch's array, which the batch no longer writes: before anything else can throw,
-        // so a caller that reuses the batch after a failure never writes over values readers see
+        // The versions reference the batch's array, which the batch no longer writes once detached; a commit that
+        // failed published none of them, so the detach is due only here, before anything after publication can throw
         writes.detach();
         pruneWritten(pending.applier.touched);
         return ticket(pending.sequence);
