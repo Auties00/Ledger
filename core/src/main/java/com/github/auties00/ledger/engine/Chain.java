@@ -1,5 +1,7 @@
 package com.github.auties00.ledger.engine;
 
+import com.github.auties00.ledger.KeyCodec;
+
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
@@ -20,8 +22,8 @@ import java.util.Comparator;
 final class Chain {
     /// Orders chains as their keys.
     static final Comparator<Chain> BY_KEY = Chain::compareKeys;
-    // The bits of keySpan that hold a key's length, which is at most KeyCodec.MAX_LENGTH
-    private static final int LENGTH_BITS = 11;
+    // The bits of keySpan that hold a key's length: as many as KeyCodec.MAX_LENGTH needs
+    private static final int LENGTH_BITS = Integer.SIZE - Integer.numberOfLeadingZeros(KeyCodec.MAX_LENGTH);
 
     /// What [#claimed] holds once the chain is dropped; above every sequence, so the claims stay monotonic.
     static final long DROPPED = Long.MAX_VALUE;
@@ -143,6 +145,9 @@ final class Chain {
 
     /// Makes the chain of the `length` bytes at `offset` of `keyChunk`, a read-only segment no one writes them in.
     Chain(MemorySegment keyChunk, long offset, int length, int hash) {
+        if (length >>> LENGTH_BITS != 0) {
+            throw new IllegalArgumentException("Keys are at most " + KeyCodec.MAX_LENGTH + " bytes: " + length);
+        }
         this.keyChunk = keyChunk;
         this.keySpan = Math.toIntExact(offset << LENGTH_BITS | length);
         this.hash = hash;

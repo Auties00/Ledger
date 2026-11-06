@@ -58,8 +58,10 @@ public record Keyspace<K, V>(String name, Residency residency, KeyCodec<K> keys,
     /// Where a key space keeps its entries between reads.
     public enum Residency {
         /// Every entry is held in memory, decoded, from the moment the store opens: a read costs no I/O and no
-        /// decoding, and returns the instance the store holds. The store opens slower and uses memory in proportion
-        /// to the key space. For key spaces that are small and read often: sessions, chats, settings.
+        /// decoding, and returns the instance the store holds. That instance must not be modified: every read
+        /// returns it, and a byte array the store holds is also the value its next checkpoint writes, so a change
+        /// to one could reach the store's files without a commit. The store opens slower and uses memory in
+        /// proportion to the key space. For key spaces that are small and read often: sessions, chats, settings.
         RESIDENT,
         /// Entries are read from the store's files through the page cache and decoded on each read. For key spaces
         /// larger than memory should hold: messages, history.
