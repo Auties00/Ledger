@@ -37,8 +37,10 @@ import java.util.concurrent.locks.ReentrantLock;
 /// no checkpoint runs again until the store reopens: overwriting either superblock could leave none that authenticates.
 /// The log still holds every commit.
 final class Checkpointer {
-    /// The obsolete segments a closed store keeps for reuse: the next open writes into one rather than into a new file.
-    private static final int SPARES = 1;
+    /// The obsolete segments a closed store keeps for reuse: none. An open prepares its first segment beside its work,
+    /// so a spare saves it nothing, and forcing a spare that a copy of the store left in the OS cache held the first
+    /// durable commit after the open for tens of milliseconds.
+    private static final int SPARES = 0;
     /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint.
     private static final int BACKLOG = 3;
 
