@@ -83,7 +83,7 @@ class LiveLedgerMaintenanceTest {
         ledger.commit(ledger.newBatch().delete(NAMES, "a"));
         ledger.commit(ledger.newBatch().put(NAMES, "c", "3"));
         assertEquals(List.of("b", "c"), ledger.state(NAMES).entries.keySet().stream()
-                .map(key -> KeyCodec.utf8().decode(key))
+                .map(chain -> KeyCodec.utf8().decode(chain.key()))
                 .toList());
     }
 }

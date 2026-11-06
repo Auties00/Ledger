@@ -38,8 +38,11 @@ final class KeyspaceState {
     final boolean resident;
     // The id the log knows the key space by, set while the store opens
     int id;
-    // The chains in the order of their keys; a chain the writer dropped may stay a while, empty
-    final ConcurrentSkipListMap<MemorySegment, Chain> entries;
+    // The chains in the order of their keys, each keyed by a chain of its key: the one that entered its node, which
+    // stays its key when a later chain of the key replaces a dropped one, as their bytes are the same. A segment of
+    // each key as the map's key was 40 bytes of every resident entry. A chain the writer dropped may stay a while,
+    // empty
+    final ConcurrentSkipListMap<Chain, Chain> entries;
     // The chains by the bytes of their keys
     private final ChainIndex index;
     // The chains the writer dropped that the ordered map may still hold
@@ -81,7 +84,7 @@ final class KeyspaceState {
         this.keyspace = keyspace;
         this.resident = keyspace.residency() == Keyspace.Residency.RESIDENT;
         this.id = -1;
-        this.entries = new ConcurrentSkipListMap<>(Segments.UNSIGNED);
+        this.entries = new ConcurrentSkipListMap<>(Chain.BY_KEY);
         this.index = new ChainIndex();
         this.leaving = new ConcurrentLinkedQueue<>();
         this.removals = RangeRemoval.NONE;
@@ -221,7 +224,7 @@ final class KeyspaceState {
         // Released counts as dropped on both sides: another thread may have used the chain, and a prune dropped it,
         // while this one was still inserting it; a later chain of the key then holds the place
         while (!chain.dropped() && !chain.released()) {
-            var previous = entries.putIfAbsent(chain.key(), chain);
+            var previous = entries.putIfAbsent(chain, chain);
             if (previous == null || previous == chain) {
                 inserted(chain);
                 return;
@@ -234,7 +237,7 @@ final class KeyspaceState {
                 }
                 throw new IllegalStateException("Two chains hold one key of " + keyspace.name());
             }
-            if (entries.replace(chain.key(), previous, chain)) {
+            if (entries.replace(chain, previous, chain)) {
                 inserted(chain);
                 return;
             }
@@ -286,7 +289,7 @@ final class KeyspaceState {
     private void inserted(Chain chain) {
         chain.markOrdered();
         if (chain.dropped()) {
-            entries.remove(chain.key(), chain);
+            entries.remove(chain, chain);
         }
     }
 
@@ -296,7 +299,7 @@ final class KeyspaceState {
     void removeDropped(int limit) {
         Chain chain;
         for (var i = 0; i < limit && (chain = leaving.poll()) != null; i++) {
-            entries.remove(chain.key(), chain);
+            entries.remove(chain, chain);
         }
     }
 
@@ -310,7 +313,7 @@ final class KeyspaceState {
         }
         // Each removal walks down the map, a few microseconds of cache misses at a million keys
         var stream = chains.size() < PARALLEL_REMOVALS ? chains.stream() : chains.parallelStream();
-        stream.forEach(dropped -> entries.remove(dropped.key(), dropped));
+        stream.forEach(dropped -> entries.remove(dropped, dropped));
     }
 
     /// Lists `chain` among the keys the next checkpoint writes, holding the publishing role.
@@ -376,16 +379,18 @@ final class KeyspaceState {
     /// {@return the chains between `from`, included, and `to`, excluded, either `null` for no bound}
     ///
     /// It orders the listed chains first, so the map holds every chain a read of the range may need.
-    NavigableMap<MemorySegment, Chain> slice(MemorySegment from, MemorySegment to) {
+    NavigableMap<Chain, Chain> slice(MemorySegment from, MemorySegment to) {
         orderListed();
-        if (from != null && to != null) {
-            return Segments.compare(from, to) >= 0 ? entries.subMap(from, true, from, false) : entries.subMap(from, true, to, false);
+        var low = from == null ? null : Chain.probe(from);
+        var high = to == null ? null : Chain.probe(to);
+        if (low != null && high != null) {
+            return Segments.compare(from, to) >= 0 ? entries.subMap(low, true, low, false) : entries.subMap(low, true, high, false);
         }
-        if (from != null) {
-            return entries.tailMap(from, true);
+        if (low != null) {
+            return entries.tailMap(low, true);
         }
-        if (to != null) {
-            return entries.headMap(to, false);
+        if (high != null) {
+            return entries.headMap(high, false);
         }
         return entries;
     }

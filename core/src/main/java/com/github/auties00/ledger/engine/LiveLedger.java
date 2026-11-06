@@ -122,7 +122,7 @@ public final class LiveLedger implements Ledger {
     private final Padded.Role sweepWanted;
     private volatile boolean closed;
     private int sweepIndex;
-    private MemorySegment sweepAfter;
+    private Chain sweepAfter;
     // Whether a prune left a chain that a later one may shorten, so the sweep has work; guarded by the publishing role
     private boolean sweepPending;
     // Whether the sweep's current pass over the store found such a chain
