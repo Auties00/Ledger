@@ -37,9 +37,9 @@ import java.util.concurrent.locks.ReentrantLock;
 /// no checkpoint runs again until the store reopens: overwriting either superblock could leave none that authenticates.
 /// The log still holds every commit.
 final class Checkpointer {
-    /// The obsolete segments a closed store keeps for reuse: none. An open prepares its first segment beside its work,
-    /// so a spare saves it nothing, and forcing a spare that a copy of the store left in the OS cache held the first
-    /// durable commit after the open for tens of milliseconds.
+    /// The obsolete segments a closed store keeps for reuse: none. The next open writes into the segment the log kept
+    /// for it ([LogWriter#nextOpenSegment()]), so a spare saves it nothing, and forcing a spare that a copy of the store
+    /// left in the OS cache held the first durable commit after the open for tens of milliseconds.
     private static final int SPARES = 0;
     /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint.
     private static final int BACKLOG = 3;
@@ -179,11 +179,11 @@ final class Checkpointer {
             if (stopped != null) {
                 throw stopped;
             }
-            var cut = ledger.cutCheckpoint(() -> closing ? log.currentSegment() + 1 : log.currentSegment());
+            var cut = ledger.cutCheckpoint(() -> closing ? log.nextOpenSegment() : log.currentSegment());
             if (cut == null) {
                 if (closing) {
-                    // The trees hold every commit, so the segments hold nothing a reopen needs
-                    retire(Long.MAX_VALUE, SPARES);
+                    // The trees hold every commit, so the segments hold nothing a reopen needs but the one kept for it
+                    retire(log.nextOpenSegment(), SPARES);
                 }
                 return;
             }

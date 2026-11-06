@@ -19,16 +19,22 @@ import java.util.zip.CRC32C;
 /// Replays the log of a store when it opens.
 ///
 /// Segments are read in the order of their numbers, frames in the order of their offsets. Commit frames must carry
-/// consecutive sequences; a catalog frame carries the sequence of the commit before it. A frame that is cut short, fails
-/// authentication, or carries the tag of another segment's salt (an earlier use of the file) ends its segment: it is
-/// the torn tail of a group whose force never completed, or what lies past the last group, and the later segments
-/// were written by later opens or after a rollover, which recovered up to the same point. If a group written after a
-/// later force follows the frame, the frame was acknowledged and then damaged, and recovery refuses the log rather
-/// than drop it.
+/// consecutive sequences; a catalog frame carries the sequence of the commit before it. The first frame of a segment,
+/// the first of a group, gives the tag of the use of the segment the later ones must carry. A frame that is cut short,
+/// fails authentication, or carries the tag of another segment's salt (an earlier use of the file) or of another use
+/// of the segment ends its segment: it is the torn tail of a group whose force never completed, or what lies past the
+/// last group, and the later segments were written by later opens or after a rollover, which recovered up to the same
+/// point. If a group written after a later force follows the frame, the frame was acknowledged and then damaged, and
+/// recovery refuses the log rather than drop it. The search for such a group takes the first frame of a group of any
+/// use of the segment: at most one use writes past its first group ([LogWriter]).
 ///
-/// A segment whose first frame block is all zeros was prepared and never written. A segment's header is forced before
-/// it takes its name, so a last segment no longer than its header is a crash during its creation, and is deleted. Any
-/// other segment whose header is damaged, or names another store, another number or another encryption, is refused.
+/// A segment whose first frame header is all zeros was prepared and never written, unless such a group follows, and
+/// the next open writes into it. A segment's header is forced before it takes its name, so a last segment holding
+/// nothing past a damaged header is a crash during its creation, or a segment a close kept, and is deleted. Any other
+/// segment whose header is damaged, or names another store, another number or another encryption, is refused.
+///
+/// The commits recovery replays may be in the cache of a process that stopped before forcing them: the last segment
+/// that holds frames is forced before any commit follows them ([Result#lastWritten()]).
 ///
 /// A store with a checkpoint replays the log from the segment its superblock names, skipping the commits its trees
 /// hold; earlier segments hold nothing later, and become spares.
@@ -60,8 +66,9 @@ final class LogRecovery {
     ///
     /// @param lastSequence the sequence of the last commit replayed, or the checkpoint's
     /// @param lastSegment the number of the last segment, or 0 if there was none
-    /// @param lastEmpty whether the last segment holds no frame
-    record Result(long lastSequence, long lastSegment, boolean lastEmpty) {
+    /// @param empty the last segment if it was prepared and never written, which the next writer writes into; or `null`
+    /// @param lastWritten the last segment that holds a frame, or `null` if none does
+    record Result(long lastSequence, long lastSegment, LogFiles.Prepared empty, Path lastWritten) {
     }
 
     /// Replays the segments of `files` from `firstSegment`, retiring those before it.
@@ -76,16 +83,18 @@ final class LogRecovery {
         var crc = new CRC32C();
         var last = checkpoint;
         var lastSegment = 0L;
-        var lastEmpty = false;
+        LogFiles.Prepared empty = null;
+        Path lastWritten = null;
         for (var index = 0; index < segments.size(); index++) {
             var number = segments.get(index);
             var path = files.segment(number);
             try (var reader = new SegmentReader(path)) {
                 var header = new byte[LogWriter.SEGMENT_HEADER];
                 if (!reader.read(0, header, 0, header.length) || !intactSegmentHeader(header, crc)) {
-                    // The header is forced before the segment takes its name, so only a file no longer than its
+                    // The header is forced before the segment takes its name, so only a file holding nothing past its
                     // header can be a crash during its creation; the next open writes a segment in its place
-                    if (index == segments.size() - 1 && reader.size() <= LogWriter.SEGMENT_HEADER) {
+                    if (index == segments.size() - 1 && (reader.size() <= LogWriter.SEGMENT_HEADER
+                            || reader.isZero(LogWriter.SEGMENT_HEADER, reader.size() - LogWriter.SEGMENT_HEADER))) {
                         reader.close();
                         Files.delete(path);
                         continue;
@@ -98,15 +107,23 @@ final class LogRecovery {
                 lastSegment = number;
                 var salt = Arrays.copyOfRange(header, LogWriter.SALT_OFFSET, LogWriter.SALT_OFFSET + LogWriter.SALT_BYTES);
                 var tag = ByteBuffer.wrap(salt).getLong();
-                var segmentKey = keys.encrypted() ? keys.segmentKey(storeId, number, salt) : null;
                 var frame = new byte[LogWriter.FRAME_HEADER];
                 long position = LogWriter.SEGMENT_HEADER;
                 if (!reader.read(position, frame, 0, LogWriter.FRAME_HEADER) || isZero(frame, 0, LogWriter.FRAME_HEADER)) {
-                    // Prepared and never written
-                    lastEmpty = true;
+                    // Prepared and never written, unless damage zeroed the first frame before groups a later force made
+                    // durable
+                    checkNoLaterGroup(reader, position, last, tag, crc, path);
+                    empty = new LogFiles.Prepared(number, path, salt);
                     continue;
                 }
-                lastEmpty = false;
+                empty = null;
+                if (!wholeFrameHeader(frame, tag, crc) || (frame[17] & LogWriter.GROUP_START) == 0) {
+                    // The torn first group of a use, which the next open follows with a segment of its own
+                    checkNoLaterGroup(reader, position, last, tag, crc, path);
+                    continue;
+                }
+                var useTag = ByteBuffer.wrap(frame).getLong(LogWriter.USE_TAG_OFFSET);
+                var segmentKey = keys.encrypted() ? keys.segmentKey(storeId, number, salt, useTag) : null;
                 var afterPadding = false;
                 while (reader.read(position, frame, 0, LogWriter.FRAME_HEADER)) {
                     if (position % LogWriter.ALIGNMENT != 0) {
@@ -119,7 +136,7 @@ final class LogRecovery {
                             continue;
                         }
                     }
-                    if (!validFrameHeader(frame, tag, crc)
+                    if (!validFrameHeader(frame, tag, useTag, crc)
                             || (afterPadding && (frame[17] & LogWriter.GROUP_START) == 0)) {
                         checkNoLaterGroup(reader, position, last, tag, crc, path);
                         break;
@@ -142,6 +159,7 @@ final class LogRecovery {
                         checkNoLaterGroup(reader, position, last, tag, crc, path);
                         break;
                     }
+                    lastWritten = path;
                     var replayed = true;
                     switch (type) {
                         case FrameBody.COMMIT -> {
@@ -178,7 +196,7 @@ final class LogRecovery {
                 }
             }
         }
-        return new Result(last, lastSegment, lastEmpty);
+        return new Result(last, lastSegment, empty, lastWritten);
     }
 
     private static Cipher cipher(StoreKeys keys) {
@@ -210,15 +228,20 @@ final class LogRecovery {
                 && Arrays.equals(header, 24, 40, storeId, 0, 16);
     }
 
-    /// {@return whether `frame` starts with a frame header of the segment whose salt has `tag`}
-    private static boolean validFrameHeader(byte[] frame, long tag, CRC32C crc) {
+    /// {@return whether `frame` starts with a whole frame header of the segment whose salt has `tag`, of any use}
+    private static boolean wholeFrameHeader(byte[] frame, long tag, CRC32C crc) {
         var header = ByteBuffer.wrap(frame);
-        if (header.getInt(0) != LogWriter.MAGIC || header.getLong(20) != tag) {
+        if (header.getInt(0) != LogWriter.MAGIC || header.getLong(LogWriter.SEGMENT_TAG_OFFSET) != tag) {
             return false;
         }
         crc.reset();
         crc.update(frame, 0, LogWriter.FRAME_HEADER - Integer.BYTES);
         return header.getInt(LogWriter.FRAME_HEADER - Integer.BYTES) == (int) crc.getValue();
+    }
+
+    /// {@return whether `frame` starts with a frame header of the use `useTag` of the segment whose salt has `tag`}
+    private static boolean validFrameHeader(byte[] frame, long tag, long useTag, CRC32C crc) {
+        return wholeFrameHeader(frame, tag, crc) && ByteBuffer.wrap(frame).getLong(LogWriter.USE_TAG_OFFSET) == useTag;
     }
 
     /// {@return the body of the frame in `sealed`, its header then its sealed body, at `position` of its segment, or
@@ -251,13 +274,14 @@ final class LogRecovery {
         return Arrays.copyOfRange(sealed, LogWriter.FRAME_HEADER, LogWriter.FRAME_HEADER + bodyLength);
     }
 
-    /// Throws if a group written after a later force follows the invalid frame at `position`.
+    /// Throws if a group written after a later force, by any use of the segment whose salt has `tag`, follows the
+    /// invalid frame at `position`.
     private static void checkNoLaterGroup(SegmentReader reader, long position, long last, long tag, CRC32C crc, Path path) throws IOException {
         var frame = new byte[LogWriter.FRAME_HEADER];
         for (var candidate = (position / LogWriter.ALIGNMENT + 1) * LogWriter.ALIGNMENT;
              reader.read(candidate, frame, 0, LogWriter.FRAME_HEADER);
              candidate += LogWriter.ALIGNMENT) {
-            if (validFrameHeader(frame, tag, crc)
+            if (wholeFrameHeader(frame, tag, crc)
                     && (frame[17] & LogWriter.GROUP_START) != 0
                     && ByteBuffer.wrap(frame).getLong(8) > last) {
                 throw new LedgerCorruptedException(path + " is damaged at offset " + position + ", before data written after it", null);

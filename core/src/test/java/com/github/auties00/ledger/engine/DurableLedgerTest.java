@@ -436,6 +436,43 @@ class DurableLedgerTest {
         }
 
         @Test
+        @DisplayName("damage to the first frame header before data written after a later force is refused, not dropped")
+        void damagedFirstFrameHeader(@TempDir Path directory) throws Exception {
+            var crashed = open(directory, NAMES);
+            Path segment;
+            try {
+                crashed.commit(crashed.newBatch().put(NAMES, "a", "1")).awaitDurable();
+                crashed.commit(crashed.newBatch().put(NAMES, "b", "2")).awaitDurable();
+                segment = writing(directory, crashed);
+            } finally {
+                crash(crashed);
+            }
+            var bytes = Files.readAllBytes(segment);
+            // The first frame's header holds the tag of the use that wrote the segment
+            bytes[LogWriter.SEGMENT_HEADER + LogWriter.USE_TAG_OFFSET + 1] ^= 0x40;
+            Files.write(segment, bytes);
+            assertThrows(LedgerCorruptedException.class, () -> open(directory, NAMES));
+        }
+
+        @Test
+        @DisplayName("a first frame block zeroed before data written after a later force is refused, not taken for unwritten")
+        void zeroedFirstBlock(@TempDir Path directory) throws Exception {
+            var crashed = open(directory, NAMES);
+            Path segment;
+            try {
+                crashed.commit(crashed.newBatch().put(NAMES, "a", "1")).awaitDurable();
+                crashed.commit(crashed.newBatch().put(NAMES, "b", "2")).awaitDurable();
+                segment = writing(directory, crashed);
+            } finally {
+                crash(crashed);
+            }
+            var bytes = Files.readAllBytes(segment);
+            Arrays.fill(bytes, LogWriter.SEGMENT_HEADER, LogWriter.SEGMENT_HEADER + LogWriter.ALIGNMENT, (byte) 0);
+            Files.write(segment, bytes);
+            assertThrows(LedgerCorruptedException.class, () -> open(directory, NAMES));
+        }
+
+        @Test
         @DisplayName("a segment of another store is refused")
         void foreignSegment(@TempDir Path base) throws IOException {
             var first = base.resolve("first");
@@ -500,14 +537,41 @@ class DurableLedgerTest {
     @DisplayName("reusing the log")
     class Reuse {
         @Test
-        @DisplayName("a clean close leaves no log behind, and the next open starts from the checkpoint")
-        void cleanClose(@TempDir Path directory) throws IOException {
+        @DisplayName("a clean close leaves one empty segment of two blocks, which the next open writes into")
+        void cleanClose(@TempDir Path directory) throws Exception {
+            var kept = -1L;
             for (var round = 0; round < 3; round++) {
                 try (var ledger = open(directory, NAMES)) {
-                    ledger.commit(ledger.newBatch().put(NAMES, "k" + round, "v" + round));
+                    ledger.commit(ledger.newBatch().put(NAMES, "k" + round, "v" + round)).awaitDurable();
                     assertEquals(round + 1, ledger.size(NAMES));
+                    if (kept >= 0) {
+                        assertEquals(kept, ((LiveLedger) ledger).log().currentSegment());
+                    }
                 }
-                assertEquals(List.of(), logFiles(directory), "files left in the log");
+                var files = logFiles(directory);
+                assertEquals(1, files.size(), () -> "files left in the log: " + files);
+                kept = LogFiles.segmentNumber(files.getFirst().getFileName().toString());
+                assertTrue(kept >= 0, () -> files.getFirst() + " is not a segment");
+                assertEquals(LogWriter.KEPT_LENGTH, Files.size(files.getFirst()));
+            }
+        }
+
+        @Test
+        @DisplayName("a store opened and closed without a commit keeps the segment it was given")
+        void idleOpen(@TempDir Path directory) throws Exception {
+            try (var ledger = open(directory, NAMES)) {
+                ledger.commit(ledger.newBatch().put(NAMES, "a", "1"));
+            }
+            var before = logFiles(directory);
+            open(directory, NAMES).close();
+            assertEquals(before, logFiles(directory));
+            try (var ledger = open(directory, NAMES)) {
+                assertEquals(Optional.of("1"), ledger.get(NAMES, "a"));
+                ledger.commit(ledger.newBatch().put(NAMES, "b", "2")).awaitDurable();
+                assertEquals(LogFiles.segmentNumber(before.getFirst().getFileName().toString()), ((LiveLedger) ledger).log().currentSegment());
+            }
+            try (var ledger = open(directory, NAMES)) {
+                assertEquals(2, ledger.size(NAMES));
             }
         }
 
@@ -596,19 +660,31 @@ class DurableLedgerTest {
             var directory = base.resolve("store");
             open(directory, Encryption.none(), NAMES).close();
             Files.copy(used, directory.resolve("log").resolve("0000000000000099.spare"));
-            var crashed = open(directory, Encryption.none(), NAMES);
+            var crashed = ((LedgerBuilder) Ledger.builder().directory(directory).encryption(Encryption.none()).keyspace(NAMES))
+                    .segmentSize(16_384)
+                    .build();
             try {
+                // The first group goes to the segment the close kept, and the next segment is prepared from the spare:
+                // the commits roll over into it
                 crashed.commit(crashed.newBatch().put(NAMES, "own", "1")).awaitDurable();
+                var log = ((LiveLedger) crashed).log();
+                var first = log.currentSegment();
+                var commits = 0;
+                while (log.currentSegment() == first) {
+                    crashed.commit(crashed.newBatch().put(NAMES, "own" + commits++, "x".repeat(1_000))).awaitDurable();
+                }
+                crashed.commit(crashed.newBatch().put(NAMES, "last", "1")).awaitDurable();
             } finally {
                 crash(crashed);
             }
             try (var ledger = open(directory, Encryption.none(), NAMES)) {
-                assertEquals(List.of("own"), ledger.range(NAMES, KeyRange.all(), 20).stream().map(com.github.auties00.ledger.Entry::key).toList());
+                assertTrue(ledger.range(NAMES, KeyRange.all(), 1_000).stream().noneMatch(entry -> entry.key().startsWith("stale")));
+                assertEquals(Optional.of("1"), ledger.get(NAMES, "last"));
             }
         }
 
         @Test
-        @DisplayName("a segment a crash left prepared and unwritten is prepared again under its number")
+        @DisplayName("a segment a crash left prepared and unwritten is written under its number")
         void unwrittenSegment(@TempDir Path directory) throws Exception {
             var crashed = open(directory, NAMES);
             long number;

@@ -10,8 +10,10 @@ import com.github.auties00.ledger.LedgerException;
 import com.github.auties00.ledger.LedgerIoException;
 
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.BitSet;
 import java.util.function.Consumer;
 import java.time.Duration;
@@ -230,13 +232,20 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var pool = ioPool != null ? (PlatformIoPool) ioPool : (ownedPool = new PlatformIoPool(1));
             // Numbers only grow, past every segment and the first one the checkpoint may need
             var first = Math.max(recovered.lastSegment() + 1, Math.max(firstSegment, 1));
-            if (recovered.lastEmpty()) {
-                // Prepared by the last open and never written: prepared again, under a fresh salt
-                files.spare(recovered.lastSegment());
-                first = Math.max(recovered.lastSegment(), Math.max(firstSegment, 1));
+            var empty = recovered.empty();
+            if (empty != null) {
+                // Kept by the last close, or prepared by a crashed open and never written: the writer writes into it
+                first = empty.number();
+            }
+            if (recovered.lastWritten() != null) {
+                // What a process that stopped left in the cache, durable before a commit follows it
+                try (var channel = FileChannel.open(recovered.lastWritten(), StandardOpenOption.WRITE)) {
+                    FullSync.force(channel, recovered.lastWritten(), false);
+                }
+                blobs.force();
             }
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
-                    segmentSize, pool.executor(), commitWindow);
+                    segmentSize, pool.executor(), commitWindow, empty);
             var deltaTable = superblock == null ? null : superblock.deltaTable();
             var deltas = deltaTable == null ? DeltaTable.EMPTY
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));
