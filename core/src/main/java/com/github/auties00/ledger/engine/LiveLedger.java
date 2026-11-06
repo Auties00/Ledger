@@ -244,8 +244,7 @@ public final class LiveLedger implements Ledger {
         var stamp = Reads.stamp(sequence, 0);
         for (var entry : catalog.entries()) {
             var state = byId.get(entry.id());
-            state.counts.clear();
-            state.counts.put(sequence, entry.root() == null ? 0 : entry.root().count());
+            state.counts.reset(sequence, entry.root() == null ? 0 : entry.root().count());
             if (!state.resident || entry.root() == null) {
                 continue;
             }
@@ -1733,11 +1732,7 @@ public final class LiveLedger implements Ledger {
         for (var i = 0; i < order.size(); i++) {
             var state = order.get(i);
             applyRemovals(state, bounds[bounds.length - 1], dropBound, latestSequence);
-            var countFloor = state.counts.floorKey(oldest);
-            // Most commits find nothing to drop; a view of the map would cost more than the check
-            if (countFloor != null && state.counts.firstKey() < countFloor) {
-                state.counts.headMap(countFloor, false).clear();
-            }
+            state.counts.dropBelow(oldest);
             state.blind.fold(oldest);
         }
         sweep(bounds, cutBound, SWEEP_BUDGET);
@@ -1946,7 +1941,7 @@ public final class LiveLedger implements Ledger {
         long count(KeyspaceState state) {
             var point = writerPoint(Reads.stamp(sequence, op) - 1);
             var blind = state.blind.correction(sequence - 1, key -> Reads.inTreeOnly(state, key, point));
-            return state.counts.lastEntry().getValue() + blind + delta(state);
+            return state.counts.last() + blind + delta(state);
         }
 
         private long nextStamp() {
@@ -2191,7 +2186,7 @@ public final class LiveLedger implements Ledger {
             }
             for (var i = 0; i < deltaCount; i++) {
                 var state = deltaStates[i];
-                state.counts.put(sequence, state.counts.lastEntry().getValue() + deltas[i]);
+                state.counts.append(sequence, state.counts.last() + deltas[i]);
             }
         }
 

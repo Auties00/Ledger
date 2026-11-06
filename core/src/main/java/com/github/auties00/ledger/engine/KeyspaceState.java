@@ -47,7 +47,7 @@ final class KeyspaceState {
     // Copy-on-write: the writer publishes a new array, readers keep the one they loaded
     volatile RangeRemoval[] removals;
     // The number of entries visible as of each commit sequence that changed it, leaving out the blind writes
-    final ConcurrentSkipListMap<Long, Long> counts;
+    final CountHistory counts;
     // The writes whose effect on the count the trees settle
     final BlindWrites blind;
     // The copies of the keys the chains hold
@@ -85,12 +85,11 @@ final class KeyspaceState {
         this.index = new ChainIndex();
         this.leaving = new ConcurrentLinkedQueue<>();
         this.removals = RangeRemoval.NONE;
-        this.counts = new ConcurrentSkipListMap<>();
+        this.counts = new CountHistory(0, 0);
         this.blind = new BlindWrites();
         this.dirty = new ArrayList<>();
         this.keys = new KeySlab();
         this.ordering = new ReentrantLock();
-        counts.put(0L, 0L);
     }
 
     /// {@return the chain of `key`, or `null` if memory holds none}
@@ -392,8 +391,7 @@ final class KeyspaceState {
 
     /// {@return the number of entries a reader at `sequence` sees, leaving out the blind writes}
     long known(long sequence) {
-        var entry = counts.floorEntry(sequence);
-        return entry == null ? 0 : entry.getValue();
+        return counts.at(sequence);
     }
 
     /// {@return the number of entries `point` sees}
