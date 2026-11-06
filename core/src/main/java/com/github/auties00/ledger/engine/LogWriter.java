@@ -145,6 +145,8 @@ final class LogWriter {
     // The file of large values the commits write to, or null
     private volatile BlobFile blobs;
     private final AtomicBoolean scheduled;
+    // Held by the one flush that writes groups, on the pool or on the thread of a commit waiting for its group
+    private final AtomicBoolean running;
     // The commits waiting for durability
     private final ConcurrentLinkedQueue<Waiter> waiters;
 
@@ -185,6 +187,7 @@ final class LogWriter {
         this.queueDrained = queueLock.newCondition();
         this.queue = new ArrayList<>();
         this.scheduled = new AtomicBoolean();
+        this.running = new AtomicBoolean();
         this.waiters = new ConcurrentLinkedQueue<>();
         this.durabilityLock = new ReentrantLock();
         this.durabilityChanged = durabilityLock.newCondition();
@@ -365,8 +368,46 @@ final class LogWriter {
     }
 
     private void flush() {
+        flush(Long.MAX_VALUE);
+    }
+
+    /// Writes the queued groups until the queue is empty, or until the commit at `until` is durable, for a commit that
+    /// waits for its group on its own thread rather than for a thread of the pool to wake, then for its own to be woken.
+    ///
+    /// One flush writes at a time: another returns at once, and the one that writes looks at the queue again once it
+    /// stops, so the frames of a commit whose flush returned are never left behind. A flush for a commit hands what is
+    /// queued after its group to the pool.
+    private void flush(long until) {
+        while (running.compareAndSet(false, true)) {
+            try {
+                flushGroups(until);
+            } finally {
+                running.set(false);
+            }
+            boolean empty;
+            queueLock.lock();
+            try {
+                empty = queue.isEmpty();
+                if (empty) {
+                    scheduled.set(false);
+                }
+            } finally {
+                queueLock.unlock();
+            }
+            if (empty || failure != null) {
+                return;
+            }
+            if (until != Long.MAX_VALUE) {
+                executor.execute(this::flush);
+                return;
+            }
+        }
+    }
+
+    /// Writes the queued groups until the queue is empty or the commit at `until` is durable, holding [#running].
+    private void flushGroups(long until) {
         try {
-            while (true) {
+            while (durable < until) {
                 if (commitWindowNanos > 0) {
                     LockSupport.parkNanos(commitWindowNanos);
                 }
@@ -377,7 +418,6 @@ final class LogWriter {
                 queueLock.lock();
                 try {
                     if (queue.isEmpty()) {
-                        scheduled.set(false);
                         return;
                     }
                     group = queue;
@@ -677,6 +717,14 @@ final class LogWriter {
         }
         checkHealthy();
         waited = true;
+        if (timeout < 0 && !Thread.currentThread().isInterrupted()) {
+            // Writes the group itself if no flush is writing: a wait with a timeout, which a slow force would outlast,
+            // leaves it to the pool
+            flush(sequence);
+            if (durable >= sequence) {
+                return true;
+            }
+        }
         var waiter = new Waiter(Thread.currentThread(), sequence);
         waiters.add(waiter);
         try {
