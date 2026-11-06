@@ -180,7 +180,8 @@ final class ChainIndex {
             return segment;
         }
         var made = new Segment();
-        var witness = (Segment) SEGMENT_SLOTS.compareAndExchangeRelease(segments, at, null, made);
+        // A volatile exchange: a thread that loses the race reads the winner's segment as it was made
+        var witness = (Segment) SEGMENT_SLOTS.compareAndExchange(segments, at, null, made);
         return witness == null ? made : witness;
     }
 
