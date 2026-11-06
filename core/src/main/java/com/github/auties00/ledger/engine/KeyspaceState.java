@@ -317,7 +317,7 @@ final class KeyspaceState {
     /// Lists `chain` among the keys the next checkpoint writes, holding the publishing role.
     void markDirty(Chain chain) {
         if (chain.dirtyCut != dirtyCut) {
-            chain.dirtyCut = dirtyCut;
+            chain.dirtyCut = (int) dirtyCut;
             dirty.add(chain);
         }
     }

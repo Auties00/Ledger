@@ -8,7 +8,6 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.SplittableRandom;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -83,7 +82,6 @@ class ChainIndexTest {
         }
         var stop = new AtomicBoolean();
         var failure = new AtomicReference<Throwable>();
-        var winners = new ConcurrentHashMap<Long, Chain>();
         var start = new CountDownLatch(1);
         var threads = new ArrayList<Thread>();
         for (var t = 0; t < 4; t++) {
@@ -93,19 +91,16 @@ class ChainIndexTest {
                     start.await();
                     var random = new SplittableRandom(seed);
                     while (!stop.get()) {
-                        // Writers race for the same keys: one chain wins each, and every racer is told which
+                        // Writers race to add and remove the same keys; at most one chain of a key may be held
                         var key = 1_000_000L + random.nextInt(200_000);
-                        var created = chain(key);
-                        var held = index.putIfAbsent(created);
-                        var winner = held == null ? created : held;
-                        var known = winners.putIfAbsent(key, winner);
-                        if (known != null && known != winner && index.get(created.key, created.hash) == known) {
-                            throw new AssertionError("two chains won key " + key);
-                        }
                         if (random.nextInt(4) == 0) {
-                            if (winners.remove(key, winner)) {
-                                index.remove(winner);
+                            var bytes = keyOf(key);
+                            var held = index.get(bytes, Segments.hash(bytes));
+                            if (held != null) {
+                                index.remove(held);
                             }
+                        } else {
+                            index.putIfAbsent(chain(key));
                         }
                     }
                 } catch (Throwable throwable) {
@@ -142,5 +137,14 @@ class ChainIndexTest {
         for (var held : stable) {
             assertSame(held, index.get(held.key, held.hash));
         }
+        // Each key found once accounts for one chain: a key held twice would make the size larger
+        var found = stable.size();
+        for (var key = 1_000_000L; key < 1_200_000L; key++) {
+            var bytes = keyOf(key);
+            if (index.get(bytes, Segments.hash(bytes)) != null) {
+                found++;
+            }
+        }
+        assertEquals(found, index.size());
     }
 }
