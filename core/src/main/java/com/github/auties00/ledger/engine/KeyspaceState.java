@@ -343,6 +343,7 @@ final class KeyspaceState {
     /// if no version in memory is at or below its bound, so the key is read from the tree}
     ///
     /// @param head the newest version of `key`, or `null`
+    /// @param key the key, which only the range removals read: `null` if there are none
     /// @param removals the range removals the reader loaded
     static Version resolve(Version head, MemorySegment key, long bound, RangeRemoval[] removals) {
         var version = head;
