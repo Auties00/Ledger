@@ -314,6 +314,35 @@ class DurableLedgerTest {
         }
 
         @Test
+        @DisplayName("a commit whose group's force is cut off by an interrupt is durable, and the log goes on")
+        void interruptedForce() throws Exception {
+            var disk = CrashFileSystem.create();
+            var armed = new java.util.concurrent.atomic.AtomicBoolean();
+            disk.intercept((path, kind) -> {
+                if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log") && armed.compareAndSet(true, false)) {
+                    // Whichever thread forces the group, the pool's or the commit's own, takes the interrupt
+                    Thread.currentThread().interrupt();
+                }
+            });
+            try (var ledger = open(disk.getPath("/store"), NAMES)) {
+                for (var i = 0; i < 20; i++) {
+                    armed.set(true);
+                    var commit = ledger.commit(ledger.newBatch().put(NAMES, "k" + i, "v" + i));
+                    commit.awaitDurable();
+                    assertTrue(commit.isDurable());
+                    assertFalse(armed.get(), "no force of the log took the interrupt");
+                    // The commit's thread got its interrupt back, if it forced the group itself
+                    Thread.interrupted();
+                }
+            }
+            try (var ledger = open(disk.getPath("/store"), NAMES)) {
+                for (var i = 0; i < 20; i++) {
+                    assertEquals(Optional.of("v" + i), ledger.get(NAMES, "k" + i));
+                }
+            }
+        }
+
+        @Test
         @DisplayName("a wait for durability times out, takes an interrupt, and returns once the force ends")
         void waits() throws Exception {
             var disk = CrashFileSystem.create();

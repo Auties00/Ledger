@@ -7,6 +7,7 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 import java.security.GeneralSecurityException;
@@ -94,6 +95,10 @@ final class LogWriter {
 
     // Owned by the flush task; null until the first group opens the first segment
     private FileChannel channel;
+    // The file of the current segment, which an interrupted write reopens
+    private java.nio.file.Path segmentPath;
+    // Whether an interrupt closed the channel during the flush, which then gives the interrupt back to its thread
+    private boolean interruptedWrite;
     // Empties the drive's cache for the segment on macOS, or null
     private FullSync.Handle fullSync;
     private long segmentNumber;
@@ -213,6 +218,7 @@ final class LogWriter {
         waitedBefore = waited;
         waited = false;
         this.channel = FileChannel.open(segment.path(), StandardOpenOption.READ, StandardOpenOption.WRITE);
+        this.segmentPath = segment.path();
         this.fullSync = FullSync.open(segment.path());
         this.segmentNumber = segment.number();
         this.currentSegment = segment.number();
@@ -404,6 +410,22 @@ final class LogWriter {
         }
     }
 
+    /// {@return whether `frames` seal into the output and the current segment, so the group is written with one call
+    /// that a write cut off by an interrupt repeats, with no rollover to prepare a segment on the caller's thread}
+    private boolean fitsOneWrite(List<Queued> frames) {
+        if (channel == null) {
+            return false;
+        }
+        var bytes = 0L;
+        for (var frame : frames) {
+            bytes += FRAME_HEADER + frame.body().size() + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
+            if (bytes > OUTPUT - ALIGNMENT) {
+                return false;
+            }
+        }
+        return position + bytes + ALIGNMENT <= segmentSize;
+    }
+
     /// Writes the queued groups until the queue is empty or the commit at `until` is durable, holding [#running].
     private void flushGroups(long until) {
         try {
@@ -417,7 +439,7 @@ final class LogWriter {
                 boolean units;
                 queueLock.lock();
                 try {
-                    if (queue.isEmpty()) {
+                    if (queue.isEmpty() || (until != Long.MAX_VALUE && !fitsOneWrite(queue))) {
                         return;
                     }
                     group = queue;
@@ -445,7 +467,22 @@ final class LogWriter {
             stop(exception);
         } catch (RuntimeException | Error throwable) {
             stop(new IOException("The log writer failed", throwable));
+        } finally {
+            // A commit's thread gets its interrupt back; a thread of the pool, which nothing should interrupt, not
+            if (interruptedWrite) {
+                interruptedWrite = false;
+                if (until != Long.MAX_VALUE) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
+    }
+
+    /// Opens the segment again after an interrupt of the thread writing it closed its channel, with the interrupt
+    /// cleared until the flush ends, so a commit that writes its own group survives an interrupt.
+    private void reopen() throws IOException {
+        interruptedWrite |= Thread.interrupted();
+        channel = FileChannel.open(segmentPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
     }
 
     /// Seals and writes `group`, then forces it, and the file of large values if `units`.
@@ -585,12 +622,23 @@ final class LogWriter {
     }
 
     /// Writes the bytes of the output.
+    ///
+    /// An interrupt that closes the channel meanwhile has the bytes written again, the same bytes at the same offsets.
     private void drain() throws IOException {
-        var buffer = ByteBuffer.wrap(output, 0, used);
-        while (buffer.hasRemaining()) {
-            position += channel.write(buffer, position);
+        var start = position;
+        while (true) {
+            try {
+                var buffer = ByteBuffer.wrap(output, 0, used);
+                while (buffer.hasRemaining()) {
+                    position += channel.write(buffer, position);
+                }
+                used = 0;
+                return;
+            } catch (ClosedByInterruptException _) {
+                position = start;
+                reopen();
+            }
         }
-        used = 0;
     }
 
     /// A frame waiting in the queue.
@@ -840,11 +888,21 @@ final class LogWriter {
     }
 
     /// Forces the segment to stable storage, emptying the drive's cache on macOS when it can.
+    ///
+    /// An interrupt that closes the channel meanwhile has the segment forced again through a new one: a force makes the
+    /// file durable, whichever channel wrote it.
     private void force() throws IOException {
-        if (fullSync != null) {
-            fullSync.force(channel, false);
-        } else {
-            channel.force(false);
+        while (true) {
+            try {
+                if (fullSync != null) {
+                    fullSync.force(channel, false);
+                } else {
+                    channel.force(false);
+                }
+                return;
+            } catch (ClosedByInterruptException _) {
+                reopen();
+            }
         }
     }
 
