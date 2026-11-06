@@ -186,7 +186,8 @@ final class Checkpointer {
                 return;
             }
             cutBytes = cut.logBytes();
-            var writer = pages.writer(random.nextLong());
+            // Lagging once a second interval of log waits behind the cut: the commits will wait for this checkpoint
+            var writer = pages.writer(random.nextLong(), () -> log.appendedBytes() - cutBytes > every);
             space.rewindRuns();
             var update = new TreeUpdate(pages, writer, space);
             TreeRoot[] roots;

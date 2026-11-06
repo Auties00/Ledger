@@ -19,6 +19,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.stream.IntStream;
 
 /// The data file of a store: its units, read through the page cache and verified against the reference that named
@@ -447,7 +448,13 @@ final class PageFile implements AutoCloseable {
 
     /// {@return a writer of the units of one checkpoint, sealed under nonces that start with `nonceHigh`}
     Writer writer(long nonceHigh) {
-        return new Writer(nonceHigh);
+        return new Writer(nonceHigh, () -> true);
+    }
+
+    /// {@return a writer of the units of one checkpoint, sealed under nonces that start with `nonceHigh`, that forces
+    /// them beside its work only while `lagging` holds}
+    Writer writer(long nonceHigh, BooleanSupplier lagging) {
+        return new Writer(nonceHigh, lagging);
     }
 
     @Override
@@ -496,11 +503,14 @@ final class PageFile implements AutoCloseable {
         private long forcedUpTo;
         // The force beside the checkpoint, running or done, or null
         private FutureTask<Void> forcing;
+        // Whether the commits wait for the checkpoint, which only then forces beside its work
+        private final BooleanSupplier lagging;
 
-        private Writer(long nonceHigh) {
+        private Writer(long nonceHigh, BooleanSupplier lagging) {
             this.lock = new Object();
             this.nonceHigh = nonceHigh;
             this.staged = new TreeMap<>();
+            this.lagging = lagging;
         }
 
         /// Queues `unit`, whose content is filled in, as the unit of `pages` pages at `page`.
@@ -617,7 +627,11 @@ final class PageFile implements AutoCloseable {
         }
 
         /// Starts forcing what the checkpoint wrote so far, beside its work, once it wrote [#FORCE_EVERY] bytes since
-        /// the last force started and that one is done; throws the failure of that one.
+        /// the last force started and that one is done, while the checkpoint lags; throws the failure of that one.
+        ///
+        /// A checkpoint the commits do not wait for forces at its end only: forcing beside it made the device take
+        /// its writes while the commits' log writes queued behind them, which cost an ingest of a history a tenth of
+        /// its rate on Linux.
         private void forceBeside() throws IOException {
             if (forcing != null) {
                 if (!forcing.isDone()) {
@@ -626,7 +640,7 @@ final class PageFile implements AutoCloseable {
                 await(forcing);
                 forcing = null;
             }
-            if (!FORCE_BESIDE || written - forcedUpTo < FORCE_EVERY) {
+            if (!FORCE_BESIDE || written - forcedUpTo < FORCE_EVERY || !lagging.getAsBoolean()) {
                 return;
             }
             forcedUpTo = written;
