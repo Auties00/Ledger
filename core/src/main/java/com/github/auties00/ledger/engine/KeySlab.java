@@ -24,11 +24,10 @@ final class KeySlab {
 
     private final AtomicReferenceArray<Chunk> stripes;
 
+    /// Makes a slab whose stripes take their first chunk with their first key: a key space whose keys come from a
+    /// few threads keeps no chunk for the others, where one per stripe cost a key space up to a quarter of a megabyte.
     KeySlab() {
         this.stripes = new AtomicReferenceArray<>(STRIPES);
-        for (var i = 0; i < STRIPES; i++) {
-            stripes.set(i, new Chunk());
-        }
     }
 
     /// {@return a read-only copy of `key`}
@@ -41,6 +40,10 @@ final class KeySlab {
         var stripe = (int) ((Thread.currentThread().threadId() * 0x9E3779B97F4A7C15L) >>> 40) & (STRIPES - 1);
         while (true) {
             var chunk = stripes.get(stripe);
+            if (chunk == null) {
+                stripes.compareAndSet(stripe, null, new Chunk());
+                continue;
+            }
             var start = chunk.used.getAndAdd(length);
             if (start + length <= CHUNK) {
                 MemorySegment.copy(key, 0, chunk.writable, start, length);
