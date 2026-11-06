@@ -34,6 +34,8 @@ final class PageFile implements AutoCloseable {
     /// The most pages [#readAll(List, byte)] reads with one call.
     private static final int RUN_PAGES = 64;
     private static final int STAGED_LIMIT = 8 << 20;
+    // The staged bytes a flush seals before it writes them, which bounds the sealed arrays it holds at once
+    private static final long SEAL_WINDOW = 1 << 20;
     // The bytes a checkpoint writes from which it forces them beside its work, as the device takes them, instead of
     // all at once before its superblock: forced at the end, the writes of a checkpoint that rewrites hundreds of
     // megabytes kept the device idle while it built them, then made it wait seconds for them
@@ -572,8 +574,28 @@ final class PageFile implements AutoCloseable {
         }
 
         private void flushQueued() throws IOException {
-            var run = new ArrayList<ByteBuffer>();
             var entries = new ArrayList<>(staged.values());
+            // A window at a time: sealing all the staged units before writing any left the pool holding a whole flush
+            // of sealed arrays, 8 MiB, from one checkpoint to the next
+            for (var from = 0; from < entries.size(); ) {
+                var to = from;
+                var bytes = 0L;
+                while (to < entries.size() && (to == from || bytes + (long) entries.get(to).ref().pages() * PageFormat.SIZE <= SEAL_WINDOW)) {
+                    bytes += (long) entries.get(to).ref().pages() * PageFormat.SIZE;
+                    to++;
+                }
+                flushWindow(entries.subList(from, to));
+                from = to;
+            }
+            written += stagedBytes;
+            staged.clear();
+            stagedBytes = 0;
+            forceBeside();
+        }
+
+        /// Seals and writes the staged units of `entries`, in the order of their pages.
+        private void flushWindow(List<Staged> entries) throws IOException {
+            var run = new ArrayList<ByteBuffer>();
             var sealedUnits = new byte[entries.size()][];
             var runStart = -1L;
             var runEnd = -1L;
@@ -610,10 +632,6 @@ final class PageFile implements AutoCloseable {
                     }
                 }
             }
-            written += stagedBytes;
-            staged.clear();
-            stagedBytes = 0;
-            forceBeside();
         }
 
         /// Starts forcing what the checkpoint wrote so far, beside its work, once it wrote [#FORCE_EVERY] bytes since
