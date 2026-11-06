@@ -671,7 +671,11 @@ class DurableLedgerTest {
                 if (Files.isDirectory(file)) {
                     Files.createDirectories(destination);
                 } else if (!file.getFileName().toString().equals(DirectoryLock.FILE)) {
-                    Files.copy(file, destination);
+                    try {
+                        Files.copy(file, destination);
+                    } catch (java.nio.file.NoSuchFileException _) {
+                        // A segment being prepared beside the store took its name meanwhile: a crash would not see it
+                    }
                 }
             }
         }
