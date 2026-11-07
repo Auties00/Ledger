@@ -181,7 +181,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     @Override
     public Ledger build() {
         if (directory == null) {
-            var ledger = new LiveLedger(keyspaces.values(), HeapPool.process(pooledBytes()));
+            var ledger = new LiveLedger(keyspaces.values(), HeapPool.process());
+            HeapPool.join(ledger, pooledBytes());
             ledger.assignIds();
             return ledger;
         }
@@ -202,9 +203,10 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             }
             var opened = StoreHeader.openOrCreate(directory, encryption);
             Files.createDirectories(logDirectory);
-            var heap = HeapPool.process(pooledBytes());
+            var heap = HeapPool.process();
             pages = PageFile.open(directory, new PageCipher(opened.keys().pageKey()), pageCache, heap);
             var ledger = new LiveLedger(keyspaces.values(), heap);
+            HeapPool.join(ledger, pooledBytes());
             var superblock = pages.superblock();
             var blobPages = 0;
             var blobFree = new BitSet();
@@ -283,12 +285,13 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
                     superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures,
                     superblock == null ? 0 : superblock.epoch(), epochs[0], checkpointHeap);
-            checkpointer.open(ledger.replayedBytes(), ledger.replayedHeap());
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
             } else {
                 ledger.attach(log, catalog, checkpointer, pages, lock);
             }
+            // Once nothing can fail: a store that failed to open would count toward the process's budget
+            checkpointer.open(ledger.replayedBytes(), ledger.replayedHeap());
             return ledger;
         } catch (IOException exception) {
             release(pages, lock, ownedPool);

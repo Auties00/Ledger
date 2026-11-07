@@ -60,6 +60,40 @@ class PageCacheTest {
     }
 
     @Test
+    @DisplayName("caches nothing a read ends with after its cache closed, so the budget keeps no bytes of a closed store")
+    void putAfterClose() {
+        var budget = new PageCache.Budget();
+        var open = PageCache.in(budget, LIMIT);
+        var closed = PageCache.in(budget, LIMIT);
+        open.put(new PageRef(1, 1, 1, 1), new byte[PageFormat.SIZE], true);
+        closed.close();
+        closed.put(new PageRef(2, 1, 1, 2), new byte[PageFormat.SIZE], true);
+        assertNull(closed.get(new PageRef(2, 1, 1, 2)));
+        assertEquals(open.size(), budget.total());
+    }
+
+    @Test
+    @DisplayName("gives back the bytes and the limit of a cache never closed once the collector takes it")
+    void collectedCache() throws InterruptedException {
+        var budget = new PageCache.Budget();
+        var kept = PageCache.in(budget, LIMIT);
+        fillAndForget(budget);
+        for (var attempt = 0; attempt < 50 && (budget.total() != kept.size() || budget.limit() != LIMIT); attempt++) {
+            System.gc();
+            Thread.sleep(20);
+        }
+        assertEquals(kept.size(), budget.total(), "the forgotten cache still counts its bytes");
+        assertEquals(LIMIT, budget.limit(), "the forgotten cache still raises the limit");
+    }
+
+    private static void fillAndForget(PageCache.Budget budget) {
+        var forgotten = PageCache.in(budget, 4 * LIMIT);
+        for (var i = 0; i < 16; i++) {
+            forgotten.put(new PageRef(i, 1, 1, i), new byte[PageFormat.SIZE], true);
+        }
+    }
+
+    @Test
     @DisplayName("holds the largest limit an open cache of the budget asked for")
     void budgetLimit() {
         var budget = new PageCache.Budget();

@@ -1,6 +1,7 @@
 package com.github.auties00.ledger.engine;
 
 import java.util.Collections;
+import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -25,7 +26,7 @@ public final class HeapPool {
 
     private final ConcurrentLinkedQueue<byte[]>[] free;
     private final AtomicLong pooledBytes;
-    // Only grows, as stores ask the process's pool for more
+    // The most of the stores' asks, for the process's pool
     private volatile long maxPooledBytes;
     // The bytes each size holds free, which may not take more than half of maxPooledBytes: a checkpoint's flush
     // releases its many small arrays at once, and would otherwise leave no room for the large ones
@@ -36,22 +37,48 @@ public final class HeapPool {
     // The count of acquires the trimmer saw last; the trimmer's alone
     private int acquiresSeen;
 
-    // The pool the stores of the process share, made with the first
+    // The pool the stores of the process share, made with the first; guarded by the class
     private static HeapPool process;
+    // The stores that share it and the free bytes each asked it to keep, weakly; guarded by the class
+    private static final Map<Object, Long> OWNERS = new WeakHashMap<>();
 
-    /// {@return the pool the stores of the process share, which keeps at least `maxPooledBytes` of free arrays from
-    /// now on}
+    /// {@return the pool the stores of the process share}
     ///
-    /// A pool of each store's own let a process of many busy stores keep a pool for each.
-    static HeapPool process(long maxPooledBytes) {
+    /// It keeps as many free bytes as the most any store that [joined][#join(Object, long)] it asked for, and none
+    /// once every one left. A pool of each store's own let a process of many busy stores keep a pool for each.
+    static HeapPool process() {
         synchronized (HeapPool.class) {
             if (process == null) {
-                process = new HeapPool(maxPooledBytes);
-            } else if (process.maxPooledBytes < maxPooledBytes) {
-                process.maxPooledBytes = maxPooledBytes;
+                process = new HeapPool(0);
             }
             return process;
         }
+    }
+
+    /// Records that the store `owner` shares the process's pool and asks it to keep `maxPooledBytes` of free arrays;
+    /// it is held weakly, so a store never closed stops counting once the collector takes it.
+    static void join(Object owner, long maxPooledBytes) {
+        synchronized (HeapPool.class) {
+            OWNERS.put(owner, maxPooledBytes);
+            resize();
+        }
+    }
+
+    /// Records that the store `owner` no longer shares the process's pool, as it closes.
+    static void leave(Object owner) {
+        synchronized (HeapPool.class) {
+            OWNERS.remove(owner);
+            resize();
+        }
+    }
+
+    // Holding the class's lock
+    private static void resize() {
+        var largest = 0L;
+        for (var asked : OWNERS.values()) {
+            largest = Math.max(largest, asked);
+        }
+        process().maxPooledBytes = largest;
     }
 
     /// Creates a pool that keeps at most `maxPooledBytes` of free arrays.
@@ -133,6 +160,11 @@ public final class HeapPool {
             }
         }
         acquiresSeen = seen;
+    }
+
+    /// {@return the free bytes the pool keeps at most; for tests}
+    long maxPooledBytesForTests() {
+        return maxPooledBytes;
     }
 
     /// {@return the bytes of the free arrays; for tests}

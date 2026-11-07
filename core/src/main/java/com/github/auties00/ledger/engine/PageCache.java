@@ -1,7 +1,9 @@
 package com.github.auties00.ledger.engine;
 
-import java.util.IdentityHashMap;
+import java.lang.ref.Cleaner;
+import java.lang.ref.WeakReference;
 import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -37,6 +39,8 @@ final class PageCache {
     private final AtomicInteger clockSize;
     private final AtomicLong bytes;
     private final Budget budget;
+    // Set once the store closes: a read that ends after it caches nothing, or its bytes would stay in the budget
+    private volatile boolean closed;
 
     private PageCache(Budget budget) {
         this.entries = new ConcurrentHashMap<>();
@@ -112,12 +116,22 @@ final class PageCache {
             remove(key);
             return;
         }
+        if (closed) {
+            return;
+        }
         var entry = new Entry(key, ref.nonceHigh(), ref.nonceLow(), unit);
         entry.referenced = referenced;
         account(unit.length);
         var previous = entries.put(key, entry);
         if (previous != null) {
             drop(previous);
+        }
+        if (closed) {
+            // The close may have looked at the entries before this one went in
+            if (entries.remove(key, entry)) {
+                drop(entry);
+            }
+            return;
         }
         clock.offer(entry);
         clockSize.incrementAndGet();
@@ -148,8 +162,9 @@ final class PageCache {
         budget.total.addAndGet(delta);
     }
 
-    /// Drops every entry and leaves the budget, as the store closes.
+    /// Drops every entry and leaves the budget, as the store closes; a read that ends after it caches nothing.
     void close() {
+        closed = true;
         budget.leave(this);
         for (var entry : entries.values()) {
             if (entries.remove(entry.key, entry)) {
@@ -251,26 +266,31 @@ final class PageCache {
     /// The bytes some caches may hold together: those of the stores of the process, or a cache's own.
     ///
     /// Its limit is the largest any open cache asked for. It is safe for concurrent use: the total is one atomic
-    /// number, and the open caches a snapshot their joins and leaves replace.
+    /// number, and the open caches a snapshot their joins and leaves replace. It holds the caches weakly: a store
+    /// never closed leaves when the collector takes its cache, which gives its bytes back, as it could before the
+    /// stores shared a budget.
     static final class Budget {
         /// The budget of the caches of the stores of the process.
         static final Budget PROCESS = new Budget();
+        // Gives back the bytes of the caches the collector took
+        private static final Cleaner CLEANER = Cleaner.create(Thread.ofVirtual().name("ledger-cache-cleaner").factory());
 
         // The bytes the caches hold together
         private final AtomicLong total;
         private final Object lock;
-        // The open caches and the limits they asked for; guarded by the lock
+        // The open caches and the limits they asked for, weakly; guarded by the lock
         private final Map<PageCache, Long> asked;
         // The open caches, replaced on each join and leave
-        private volatile PageCache[] members;
+        private volatile WeakReference<PageCache>[] members;
         private volatile long limit;
 
         /// Makes a budget no cache shares yet.
+        @SuppressWarnings("unchecked")
         Budget() {
             this.total = new AtomicLong();
             this.lock = new Object();
-            this.asked = new IdentityHashMap<>();
-            this.members = new PageCache[0];
+            this.asked = new WeakHashMap<>();
+            this.members = new WeakReference[0];
         }
 
         private void join(PageCache cache, long requested) {
@@ -278,6 +298,15 @@ final class PageCache {
                 asked.put(cache, requested);
                 refresh();
             }
+            var budget = this;
+            var bytes = cache.bytes;
+            CLEANER.register(cache, () -> {
+                // Unreachable, so nothing adds to its bytes any more; 0 once it closed
+                budget.total.addAndGet(-bytes.getAndSet(0));
+                synchronized (budget.lock) {
+                    budget.refresh();
+                }
+            });
         }
 
         private void leave(PageCache cache) {
@@ -287,13 +316,19 @@ final class PageCache {
             }
         }
 
+        @SuppressWarnings("unchecked")
         private void refresh() {
             var largest = 0L;
-            for (var requested : asked.values()) {
-                largest = Math.max(largest, requested);
+            var open = new WeakReference[asked.size()];
+            var count = 0;
+            for (var entry : asked.entrySet()) {
+                largest = Math.max(largest, entry.getValue());
+                if (count < open.length) {
+                    open[count++] = new WeakReference<>(entry.getKey());
+                }
             }
             limit = largest;
-            members = asked.keySet().toArray(new PageCache[0]);
+            members = count == open.length ? open : java.util.Arrays.copyOf(open, count);
         }
 
         /// {@return the bytes the caches may hold together}
@@ -320,7 +355,11 @@ final class PageCache {
         private PageCache largest() {
             PageCache largest = null;
             var most = -1L;
-            for (var cache : members) {
+            for (var member : members) {
+                var cache = member.get();
+                if (cache == null) {
+                    continue;
+                }
                 var held = cache.bytes.get();
                 if (held > most) {
                     most = held;
