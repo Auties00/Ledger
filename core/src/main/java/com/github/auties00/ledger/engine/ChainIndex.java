@@ -168,6 +168,44 @@ final class ChainIndex {
         return size;
     }
 
+    /// {@return the next chain of a walk over the index from `cursor`, which it advances, or `null` once the walk has
+    /// visited every segment}
+    ///
+    /// The walk reads each segment's table as it reaches the segment and keeps to it, though the segment may grow and
+    /// publish another: it visits every chain the index held when it started and still held when it reached the chain's
+    /// segment, and may visit chains inserted or removed since. Safe beside insertions and removals.
+    Chain next(Cursor cursor) {
+        while (cursor.segment < SEGMENTS) {
+            if (cursor.chains == null) {
+                var segment = (Segment) SEGMENT_SLOTS.getAcquire(segments, cursor.segment);
+                if (segment == null) {
+                    cursor.segment++;
+                    continue;
+                }
+                cursor.chains = segment.table.chains;
+                cursor.slot = 0;
+            }
+            var chains = cursor.chains;
+            while (cursor.slot < chains.length) {
+                var chain = (Chain) SLOTS.getAcquire(chains, cursor.slot++);
+                if (chain != null && chain != TOMBSTONE) {
+                    return chain;
+                }
+            }
+            cursor.chains = null;
+            cursor.segment++;
+        }
+        return null;
+    }
+
+    /// Where a walk over the index stands: the segment it walks, the slots of that segment's table it keeps to, and the
+    /// next slot. A new cursor starts at the first segment.
+    static final class Cursor {
+        private int segment;
+        private Chain[] chains;
+        private int slot;
+    }
+
     private static int segmentOf(int hash) {
         return (hash >>> 26) & (SEGMENTS - 1);
     }

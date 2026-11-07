@@ -469,10 +469,48 @@ class CheckpointTest {
                 assertTrue(live.state(MESSAGES).chains() <= 1, () -> live.state(MESSAGES).chains() + " chains in memory");
                 // A paged key space orders its chains only for a read of a range, which none made
                 assertTrue(live.state(MESSAGES).entries.size() <= 1, () -> live.state(MESSAGES).entries.size() + " ordered");
+                // A resident key space keeps its chains, and orders them only for a read of a range too
+                assertEquals(5_000, live.state(CHATS).chains());
+                assertEquals(0, live.state(CHATS).entries.size());
+                assertEquals(Optional.of("chat 4321"), ledger.get(CHATS, "c04321"));
+                assertEquals(3, ledger.range(CHATS, KeyRange.atLeast("c04997"), 10).size());
                 assertEquals(5_000, live.state(CHATS).entries.size());
                 assertEquals(Optional.of("message 4321"), ledger.get(MESSAGES, "m04321"));
                 assertEquals(5_001, ledger.size(MESSAGES));
             }
+        }
+
+        @Test
+        @DisplayName("the sweep shortens the chain of a resident key a snapshot held back, though nothing ordered its key space")
+        void sweepsUnorderedResident(@TempDir Path directory) {
+            try (var ledger = open(directory, MESSAGES, CHATS)) {
+                var live = (LiveLedger) ledger;
+                for (var i = 0; i < 500; i++) {
+                    ledger.commit(ledger.newBatch().put(CHATS, "c%05d".formatted(i), "chat " + i));
+                }
+                ledger.commit(ledger.newBatch().put(CHATS, "pinned", "old"));
+                var snapshot = ledger.snapshot();
+                ledger.commit(ledger.newBatch().put(CHATS, "pinned", "new"));
+                assertEquals(2, versions(live, "pinned"));
+                assertEquals(Optional.of("old"), snapshot.get(CHATS, "pinned"));
+                snapshot.close();
+                // Each commit's maintenance sweeps a few chains, through the index: the key space has no ordered chain
+                for (var i = 0; i < 200 && versions(live, "pinned") > 1; i++) {
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "m%05d".formatted(i), "x"));
+                }
+                assertEquals(1, versions(live, "pinned"));
+                assertEquals(0, live.state(CHATS).entries.size());
+                assertEquals(Optional.of("new"), ledger.get(CHATS, "pinned"));
+            }
+        }
+
+        private static int versions(LiveLedger ledger, String key) {
+            var version = ledger.state(CHATS).head(Segments.encodeKey(KeyCodec.utf8(), key));
+            var length = 0;
+            for (; version != null; version = version.older) {
+                length++;
+            }
+            return length;
         }
 
         @Test
