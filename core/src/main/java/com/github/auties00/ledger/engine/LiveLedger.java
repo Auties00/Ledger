@@ -1282,6 +1282,9 @@ public final class LiveLedger implements Ledger {
                 checkpointer.run(true);
             }
         } finally {
+            if (checkpointer != null) {
+                checkpointer.close();
+            }
             for (var resource : resources) {
                 try {
                     resource.close();
