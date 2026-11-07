@@ -51,6 +51,93 @@ class MemoryRetentionTest {
         }
     }
 
+    @Test
+    @DisplayName("a paged value is copied, alone, off a batch that holds other bytes, into arrays below half a G1 region; one alone in its batch shares it")
+    void pagedValueLeavesItsBatch(@TempDir Path directory) throws Exception {
+        try (var ledger = (LiveLedger) Ledger.builder().directory(directory).encryption(Encryption.key(new byte[32]))
+                .keyspace(SESSIONS).keyspace(MESSAGES).build()) {
+            ledger.commit(ledger.newBatch().put(SESSIONS, new byte[]{1}, new byte[1_500]).put(MESSAGES, new byte[]{1}, new byte[1_500]))
+                    .awaitDurable();
+            // The session's bytes, which the store holds a copy of, are not kept for the message
+            assertEquals(1_500, head(ledger, MESSAGES, new byte[]{1}).sourceBytesForTests());
+            ledger.commit(ledger.newBatch().put(MESSAGES, new byte[]{2}, new byte[1_500])).awaitDurable();
+            assertEquals(1_501, head(ledger, MESSAGES, new byte[]{2}).sourceBytesForTests());
+            var batch = ledger.newBatch().put(SESSIONS, new byte[]{3}, new byte[64]);
+            for (var i = 0; i < 400; i++) {
+                batch.put(MESSAGES, new byte[]{3, (byte) (i >>> 8), (byte) i}, new byte[2_000]);
+            }
+            batch.put(MESSAGES, new byte[]{4}, new byte[ArrayWriteBatch.CHUNK_BYTES]);
+            ledger.commit(batch).awaitDurable();
+            var chunks = new HashSet<Long>();
+            for (var i = 0; i < 400; i++) {
+                var bytes = head(ledger, MESSAGES, new byte[]{3, (byte) (i >>> 8), (byte) i}).sourceBytesForTests();
+                assertTrue(bytes <= ArrayWriteBatch.CHUNK_BYTES, "a value of a large batch keeps " + bytes + " bytes");
+                chunks.add(bytes);
+            }
+            assertTrue(chunks.size() >= 2, "800,000 bytes of values took one array");
+            // A value of half a chunk or more takes an array of its own
+            assertEquals(ArrayWriteBatch.CHUNK_BYTES, head(ledger, MESSAGES, new byte[]{4}).sourceBytesForTests());
+        }
+    }
+
+    @Test
+    @DisplayName("the values a commit keeps, and the bounds of its range removal, survive the pool handing its batch's array to another batch")
+    void reusedBatchArray(@TempDir Path directory) throws Exception {
+        try (var ledger = (LiveLedger) Ledger.builder().directory(directory).encryption(Encryption.key(new byte[32]))
+                .keyspace(SESSIONS).keyspace(MESSAGES).build()) {
+            for (var i = 0; i < 10; i++) {
+                ledger.commit(ledger.newBatch().put(MESSAGES, new byte[]{5, (byte) i}, new byte[]{(byte) i})).awaitDurable();
+            }
+            // In the tree, so reads of them consult the removal's bounds rather than versions it cut
+            ledger.checkpoint();
+            // Large enough for the pool's arrays, with a resident value so the paged ones are copied off it
+            var first = ledger.newBatch().put(SESSIONS, new byte[]{1}, filled(3_000, 1))
+                    .deleteRange(MESSAGES, com.github.auties00.ledger.KeyRange.between(new byte[]{5, 2}, new byte[]{5, 6}));
+            for (var i = 0; i < 4; i++) {
+                first.put(MESSAGES, new byte[]{6, (byte) i}, filled(2_000, 10 + i));
+            }
+            ledger.commit(first).awaitDurable();
+            for (var round = 0; round < 8; round++) {
+                // Each batch takes an array of the same size from the pool and fills it with other bytes
+                var other = ledger.newBatch().put(SESSIONS, new byte[]{2}, filled(3_000, 0x7F));
+                for (var i = 0; i < 4; i++) {
+                    other.put(MESSAGES, new byte[]{7, (byte) round, (byte) i}, filled(2_000, 0x55));
+                }
+                ledger.commit(other).awaitDurable();
+            }
+            assertEquals(3_000, ledger.get(SESSIONS, new byte[]{1}).orElseThrow().length);
+            assertEquals(1, ledger.get(SESSIONS, new byte[]{1}).orElseThrow()[2_999]);
+            for (var i = 0; i < 4; i++) {
+                var value = ledger.get(MESSAGES, new byte[]{6, (byte) i}).orElseThrow();
+                assertEquals(2_000, value.length);
+                assertEquals(10 + i, value[0]);
+                assertEquals(10 + i, value[1_999]);
+            }
+            for (var i = 0; i < 10; i++) {
+                assertEquals(i < 2 || i >= 6, ledger.get(MESSAGES, new byte[]{5, (byte) i}).isPresent(), "key 5," + i);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("a store in memory keeps each paged value on an array of its own, not on its batch's")
+    void memoryStoreOwnsItsValues() throws Exception {
+        try (var ledger = (LiveLedger) Ledger.builder().memory().keyspace(MESSAGES).build()) {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < 50; i++) {
+                batch.put(MESSAGES, new byte[]{8, (byte) i}, new byte[200]);
+            }
+            ledger.commit(batch);
+            assertEquals(200, head(ledger, MESSAGES, new byte[]{8, 0}).sourceBytesForTests());
+        }
+    }
+
+    private static byte[] filled(int length, int value) {
+        var bytes = new byte[length];
+        java.util.Arrays.fill(bytes, (byte) value);
+        return bytes;
+    }
+
     private static Version head(LiveLedger ledger, Keyspace<?, ?> keyspace, byte[] key) {
         return ledger.state(keyspace).chain(MemorySegment.ofArray(key)).head;
     }

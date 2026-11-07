@@ -559,7 +559,7 @@ public final class LiveLedger implements Ledger {
         if (checkpointer != null) {
             checkpointer.throttle();
         }
-        writes.compact();
+        writes.prepare(pages == null);
         var units = writeUnits(writes);
         // Needed only to release the units of large values no log frame names
         var outcome = units == null ? null : new Applier[1];
@@ -611,12 +611,13 @@ public final class LiveLedger implements Ledger {
                         case ArrayWriteBatch.PUT -> {
                             var value = writes.value(i);
                             var decoded = state.resident ? residentValue(state, writes.decodedValue(i), value) : null;
-                            applier.put(state, applier.claim(state, writes.key(i)), writes.key(i), value, writes.view(), writes.valueOffset(i), decoded,
+                            applier.put(state, applier.claim(state, writes.key(i)), writes.key(i), value, writes.home(i), writes.homeOffset(i), decoded,
                                     hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree), units == null ? null : units[i]);
                         }
                         case ArrayWriteBatch.DELETE ->
                                 applier.delete(state, writes.key(i), hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree));
-                        case ArrayWriteBatch.DELETE_RANGE -> applier.deleteRange(state, writes.key(i), writes.value(i));
+                        // The removal keeps its bounds until a checkpoint, and the batch's array may go back to the pool
+                        case ArrayWriteBatch.DELETE_RANGE -> applier.deleteRange(state, ownCopy(writes.key(i)), ownCopy(writes.value(i)));
                         default -> throw new IllegalStateException("Unknown write kind " + writes.kind(i));
                     }
                 }
@@ -625,8 +626,8 @@ public final class LiveLedger implements Ledger {
                 applier.rollback();
                 throw throwable;
             }
-            // The versions reference the batch's array, which the batch no longer writes
-            writes.detach();
+            // The versions reference the batch's array, if any does, which the batch then no longer writes
+            writes.finish();
             var sequence = applier.publish();
             sequenced.next++;
             return ticket(sequence);
@@ -688,9 +689,10 @@ public final class LiveLedger implements Ledger {
         if (pending.failure != null) {
             throw rethrow(pending.failure);
         }
-        // The versions reference the batch's array, which the batch no longer writes once detached; a commit that
-        // failed published none of them, so the detach is due only here, before anything after publication can throw
-        writes.detach();
+        // The versions reference the batch's array, if any does, which the batch no longer writes once finished; a
+        // commit that failed published none of them, so the finish is due only here, before anything after
+        // publication can throw
+        writes.finish();
         pruneWritten(pending.applier.touched);
         return ticket(pending.sequence);
     }
@@ -839,7 +841,7 @@ public final class LiveLedger implements Ledger {
                 }
                 var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(i, tree);
                 if (writes.kind(i) == ArrayWriteBatch.PUT) {
-                    applier.put(pending.states[i], pending.chains[i], writes.key(i), writes.value(i), writes.view(), writes.valueOffset(i),
+                    applier.put(pending.states[i], pending.chains[i], writes.key(i), writes.value(i), writes.home(i), writes.homeOffset(i),
                             pending.decoded == null ? null : pending.decoded[i], inTree, pending.units == null ? null : pending.units[i]);
                 } else {
                     applier.delete(pending.states[i], pending.chains[i], writes.key(i), inTree);
@@ -1141,6 +1143,11 @@ public final class LiveLedger implements Ledger {
             }
             throw throwable;
         }
+    }
+
+    /// {@return a read-only copy of `segment` on an array of its own, or `null` if it is `null`}
+    private static MemorySegment ownCopy(MemorySegment segment) {
+        return segment == null ? null : MemorySegment.ofArray(Segments.toBytes(segment)).asReadOnly();
     }
 
     private static Object residentValue(KeyspaceState state, Object decoded, MemorySegment value) {
@@ -2019,6 +2026,10 @@ public final class LiveLedger implements Ledger {
             } else if (state.resident && (source == null || source.byteSize() > 2L * length + RESIDENT_SLACK)) {
                 // A resident version lives as long as its key does: on a value of its own, not on the array of the
                 // batch or the log frame it came in, which a session written beside ten messages held 12 times over
+                version = Version.ofOwn(stamp, Segments.toBytes(value), decoded, head, external);
+            } else if (source == null && pages == null) {
+                // A store in memory keeps a version until a write replaces it, so on an array of its own: on a batch's,
+                // a value that outlived the writes beside it kept them all, three times the bytes of each key
                 version = Version.ofOwn(stamp, Segments.toBytes(value), decoded, head, external);
             } else if (source == null) {
                 version = Version.of(stamp, value, 0, length, decoded, head, external);

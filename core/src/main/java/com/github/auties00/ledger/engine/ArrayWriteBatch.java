@@ -17,13 +17,24 @@ import java.util.Objects;
 /// array grows by doubling, and from [#INITIAL_CAPACITY] it comes from the store's [HeapPool].
 ///
 /// A range removal stores its bounds, each encoded or absent; the store reads them back through the accessors of
-/// this class when it applies the batch, then takes the array over with [#detach()].
+/// this class when it applies the batch, then starts it again with [#finish()].
 public final class ArrayWriteBatch implements WriteBatch {
     private static final int INITIAL_CAPACITY = 4_096;
     private static final byte[] EMPTY = new byte[0];
     private static final MemorySegment EMPTY_MEMORY = MemorySegment.ofArray(EMPTY);
     /// The writes a new batch has room for: most batches hold one or two.
     private static final int INITIAL_WRITES = 2;
+    /// The most bytes of the arrays [#prepare(boolean)] copies values into: below half a region of the smallest the
+    /// G1 collector makes, 1 MiB, so none takes a region of its own, as an object of half a region or more does.
+    static final int CHUNK_BYTES = 256 * 1024;
+    /// The bytes besides the values the store keeps that a batch may hold and still keep them on its own array.
+    private static final int SLACK = 64;
+    // No write has a home: the store copies every value it keeps
+    private static final byte HOMES_NONE = 0;
+    // Every write's home is the batch's own view
+    private static final byte HOMES_OWN = 1;
+    // A paged write's home is in homes, a resident one has none
+    private static final byte HOMES_CHUNKS = 2;
 
     /// A write of a value under a key.
     public static final byte PUT = 0;
@@ -44,6 +55,11 @@ public final class ArrayWriteBatch implements WriteBatch {
     private long used;
     // The batch's own array while the encodings are in a compact copy for the store, or null
     private byte[] spare;
+    // Where the store's versions find the values, as prepare decided: one of the HOMES_ constants
+    private byte homesMode;
+    // In HOMES_CHUNKS, the segment each write's value was copied into, or null, and where in it the value starts
+    private MemorySegment[] homes;
+    private int[] homeOffsets;
 
     private byte[] kinds;
     private Keyspace<?, ?>[] targets;
@@ -294,6 +310,142 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// {@return the bytes the encodings occupy}
     public long encodedBytes() {
         return used;
+    }
+
+    /// Decides where the store's versions find the values of the writes, [#home(int)], before the store reads the
+    /// writes through the accessors.
+    ///
+    /// The store keeps the value of a write to a [Keyspace.Residency#PAGED] key space until checkpoints have written
+    /// it and no read needs it, and with it whatever array the value is part of. A batch that holds little but those
+    /// values, at most [#SLACK] bytes or a sixteenth besides, keeps them on its own array, [compacted][#compact()];
+    /// any other has them copied, alone, into arrays below [#CHUNK_BYTES], and its own array goes back to the pool
+    /// once the commit [ends][#finish()]. On the batch's array, a message committed beside a session of 1.5 KiB kept
+    /// the session's bytes, which the store held a copy of already, until the next checkpoint, and a batch of a
+    /// thousand messages one array of over 2 MiB, which the collector gives regions of its own.
+    ///
+    /// @param copies whether the store copies every value it keeps, as a store in memory does, so no write has a home
+    void prepare(boolean copies) {
+        homes = null;
+        homeOffsets = null;
+        homesMode = HOMES_NONE;
+        if (copies) {
+            return;
+        }
+        var paged = 0L;
+        var resident = 0L;
+        for (var i = 0; i < size; i++) {
+            if (kinds[i] == PUT) {
+                if (targets[i].residency() == Keyspace.Residency.PAGED) {
+                    paged += spans[i * 4 + 3];
+                } else {
+                    resident += spans[i * 4 + 3];
+                }
+            }
+        }
+        // A batch of resident writes alone keeps them on its array as before, where the store's rule for resident
+        // values finds it small enough; any other copies them, so the paged values' array holds none
+        var kept = paged > 0 ? paged : resident;
+        if (kept == 0) {
+            return;
+        }
+        if (used <= CHUNK_BYTES && used - kept <= Math.max(SLACK, used / 16)) {
+            compact();
+            homesMode = HOMES_OWN;
+            return;
+        }
+        if (paged == 0) {
+            return;
+        }
+        homes = new MemorySegment[size];
+        homeOffsets = new int[size];
+        homesMode = HOMES_CHUNKS;
+        var chunk = (byte[]) null;
+        var chunkView = (MemorySegment) null;
+        var fill = 0;
+        var remaining = 0L;
+        for (var i = 0; i < size; i++) {
+            if (packed(i) && spans[i * 4 + 3] < CHUNK_BYTES / 2) {
+                remaining += spans[i * 4 + 3];
+            }
+        }
+        for (var i = 0; i < size; i++) {
+            if (!packed(i)) {
+                continue;
+            }
+            var offset = (int) spans[i * 4 + 2];
+            var length = (int) spans[i * 4 + 3];
+            if (length >= CHUNK_BYTES / 2) {
+                // A value of half a chunk or more gets an array of its own, which no other value shares
+                var own = Arrays.copyOfRange(data, offset, offset + length);
+                homes[i] = MemorySegment.ofArray(own).asReadOnly();
+                continue;
+            }
+            if (chunk == null || fill + length > chunk.length) {
+                // Every chunk but the last is more than half full, so they waste at most a value's bytes each
+                chunk = new byte[(int) Math.min(CHUNK_BYTES, remaining)];
+                chunkView = MemorySegment.ofArray(chunk).asReadOnly();
+                fill = 0;
+            }
+            System.arraycopy(data, offset, chunk, fill, length);
+            homes[i] = chunkView;
+            homeOffsets[i] = fill;
+            fill += length;
+            remaining -= length;
+        }
+    }
+
+    // Whether write `index` puts a value the store keeps on a chunk in HOMES_CHUNKS
+    private boolean packed(int index) {
+        return kinds[index] == PUT && targets[index].residency() == Keyspace.Residency.PAGED;
+    }
+
+    /// {@return the read-only segment the store's version of the value of write `index` slices, or `null` if the store
+    /// copies the value}
+    ///
+    /// The segment holds no write the batch makes after [#finish()].
+    ///
+    /// @param index a write that puts a value
+    MemorySegment home(int index) {
+        Objects.checkIndex(index, size);
+        return switch (homesMode) {
+            case HOMES_OWN -> view;
+            case HOMES_CHUNKS -> homes[index];
+            default -> null;
+        };
+    }
+
+    /// {@return where in [#home(int)] the value of write `index` starts}
+    ///
+    /// @param index a write that puts a value and has a home
+    int homeOffset(int index) {
+        Objects.checkIndex(index, size);
+        return switch (homesMode) {
+            case HOMES_OWN -> Math.toIntExact(spans[index * 4 + 2]);
+            case HOMES_CHUNKS -> homeOffsets[index];
+            default -> 0;
+        };
+    }
+
+    /// Starts the batch again, empty, once the store has applied its writes: it hands its array over to the store if
+    /// the versions slice it, [#detach()], and gives it back to the pool otherwise.
+    void finish() {
+        var own = homesMode == HOMES_OWN;
+        homes = null;
+        homeOffsets = null;
+        homesMode = HOMES_NONE;
+        if (own) {
+            detach();
+            return;
+        }
+        if (spare != null) {
+            pool.release(spare);
+            spare = null;
+        }
+        pool.release(data);
+        data = EMPTY;
+        memory = EMPTY_MEMORY;
+        view = EMPTY_MEMORY;
+        clear();
     }
 
     /// Moves the encodings into an array of their size if they leave a sixteenth of the batch's unused, before the
