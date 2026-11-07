@@ -7,9 +7,11 @@ import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.function.Consumer;
@@ -45,6 +47,9 @@ final class Checkpointer {
     /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint, if the writes behind it
     /// hold more heap than the store's budget: one being checkpointed and the next.
     private static final int MIN_BACKLOG = 2;
+    // The checkpointers of the open stores of the process, whose writes the trees lack share one heap budget: a budget
+    // of half the heap for each store let a process of several busy stores buffer more than the heap
+    private static final Set<Checkpointer> OPEN = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
     // The epoch of the file of large values the last durable superblock records; guarded by the lock
     private int durableEpoch;
     // The highest epoch an earlier open used that only its log segments record, if above durableEpoch
@@ -115,14 +120,21 @@ final class Checkpointer {
         this.progress = progressLock.newCondition();
     }
 
-    /// Counts the commits the open replayed, `bytes` of log holding `heap` by the log's estimate, as log the trees
-    /// lack, as if the writer had queued them before it opened: the first checkpoint starts as soon as they are an
-    /// interval, and commits wait for it while they hold the heap budget. Counted from 0, they let a crashed store
-    /// that replayed six intervals take six more, and up to the whole budget, before it waited.
-    void replayed(long bytes, long heap) {
-        cutBytes = -bytes;
-        publishedBytes = -bytes;
-        publishedHeap = -heap;
+    /// Starts counting the store's writes toward the heap budget of the process, those the open replayed included:
+    /// `replayedBytes` of log holding `replayedHeap` by the log's estimate, which count as log the trees lack, as if
+    /// the writer had queued them before it opened. The first checkpoint starts as soon as they are an interval, and
+    /// commits wait for it while they hold the budget; counted from 0, they let a crashed store that replayed six
+    /// intervals take six more, and up to the whole budget, before it waited.
+    void open(long replayedBytes, long replayedHeap) {
+        cutBytes = -replayedBytes;
+        publishedBytes = -replayedBytes;
+        publishedHeap = -replayedHeap;
+        OPEN.add(this);
+    }
+
+    /// Stops counting the store's writes toward the heap budget of the process, once it closes.
+    void close() {
+        OPEN.remove(this);
     }
 
     /// Starts a checkpoint on a thread of its own if the log has grown enough since the last, and none is running.
@@ -166,7 +178,7 @@ final class Checkpointer {
 
     /// Makes the caller wait while the log holds more checkpoint intervals the trees do not than the heap allows, and a
     /// checkpoint is running to take them in: more than [#MAX_BACKLOG], or more than [#MIN_BACKLOG] while the writes
-    /// behind them hold more than the heap budget.
+    /// the trees of every open store of the process lack hold more than the heap budget.
     ///
     /// A fixed backlog of three intervals held commits back on a large heap that had room for more, a quarter of the
     /// overwrites of a store of 256-byte values, and let small values, whose writes take more heap than their bytes,
@@ -193,7 +205,21 @@ final class Checkpointer {
         if (bytes <= MIN_BACKLOG * every) {
             return false;
         }
-        return bytes > MAX_BACKLOG * every || log.appendedHeap() - publishedHeap > heapBudget;
+        return bytes > MAX_BACKLOG * every || processBacklogHeap() > heapBudget;
+    }
+
+    /// {@return the heap the writes the trees of the store lack hold, by the log's estimate}
+    private long backlogHeap() {
+        return log.appendedHeap() - publishedHeap;
+    }
+
+    /// {@return the heap the writes the trees of every open store of the process lack hold, by their logs' estimates}
+    private long processBacklogHeap() {
+        var total = OPEN.contains(this) ? 0 : backlogHeap();
+        for (var checkpointer : OPEN.toArray(Checkpointer[]::new)) {
+            total += checkpointer.backlogHeap();
+        }
+        return total;
     }
 
     /// {@return the bytes of log queued since the cut of the last published checkpoint, which the trees lack}

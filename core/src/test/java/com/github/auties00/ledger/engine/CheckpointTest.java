@@ -600,6 +600,45 @@ class CheckpointTest {
             }
         }
 
+        @Test
+        @DisplayName("the heap budget is the process's: a store waits at two intervals while another store's writes fill the budget")
+        void processBudget(@TempDir Path directory) throws Exception {
+            var value = "v".repeat(64 << 10);
+            // A store that buffers about 6 MB, checkpointing only at close
+            try (var other = Ledger.builder().directory(directory.resolve("other")).encryption(Encryption.key(KEY))
+                    .keyspace(MESSAGES).checkpointEvery(1L << 30).build()) {
+                for (var i = 0; i < 100; i++) {
+                    other.commit(other.newBatch().put(MESSAGES, "o%05d".formatted(i), value));
+                }
+                other.awaitDurable();
+                var disk = CrashFileSystem.create();
+                disk.intercept((path, kind) -> {
+                    if (kind == ChangeInterceptor.ChangeKind.WRITE && dataFile(path)) {
+                        try {
+                            Thread.sleep(1);
+                        } catch (InterruptedException exception) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                });
+                var every = 1 << 20;
+                // A budget the other store's writes alone pass
+                var options = (LedgerBuilder) Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY))
+                        .keyspace(MESSAGES).checkpointEvery(every);
+                try (var ledger = options.checkpointHeap(4L << 20).build()) {
+                    var checkpointer = ((LiveLedger) ledger).checkpointer();
+                    var largest = 0L;
+                    for (var i = 0; i < 200; i++) {
+                        ledger.commit(ledger.newBatch().put(MESSAGES, "m%05d".formatted(i), value));
+                        largest = Math.max(largest, checkpointer.backlog());
+                    }
+                    var bound = 2L * every + 2L * value.length();
+                    var observed = largest;
+                    assertTrue(observed <= bound, () -> observed + " bytes of log the trees lacked, past " + bound);
+                }
+            }
+        }
+
         @ParameterizedTest(name = "heap budget {0} bytes")
         @ValueSource(longs = {Long.MAX_VALUE, 1})
         @DisplayName("commits wait for checkpoints slower than they are, so the log the trees lack stays within six intervals, or two once its writes pass the heap budget")

@@ -63,8 +63,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         return this;
     }
 
-    /// Sets the heap the writes the trees lack may hold before commits wait for a checkpoint, by the log's estimate,
-    /// so tests can reach it without filling half the heap.
+    /// Sets the heap the writes the trees of the process's stores lack may hold before this store's commits wait for
+    /// a checkpoint, by the logs' estimates, so tests can reach it without filling half the heap.
     LedgerBuilder checkpointHeap(long bytes) {
         this.checkpointHeap = bytes;
         return this;
@@ -283,7 +283,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
                     superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures,
                     superblock == null ? 0 : superblock.epoch(), epochs[0], checkpointHeap);
-            checkpointer.replayed(ledger.replayedBytes(), ledger.replayedHeap());
+            checkpointer.open(ledger.replayedBytes(), ledger.replayedHeap());
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
             } else {
