@@ -112,6 +112,11 @@ final class LogWriter {
     /// it: its chain, its version, its slot of the hash index and its key's copy, about 110 bytes, and a share of its
     /// batch's array.
     static final int WRITE_HEAP = 128;
+    /// The heap a commit takes beside its writes, as [#appendedHeap()] estimates it: the read-only view of the array
+    /// its values are kept on and that view's session, 72 bytes, and the array's header. Without it the estimate was
+    /// six tenths of what commits of one small write held, so the half of the heap the checkpoint backlog may take
+    /// held four fifths.
+    static final int COMMIT_HEAP = 128;
     /// The bytes a second of log below which a new segment is written with zeros first, if the commits wait for it.
     private static final long ZEROED_RATE = 64L << 20;
     private final LogFiles files;
@@ -357,7 +362,7 @@ final class LogWriter {
             lastQueued = sequence;
             frames = ++appended;
             appendedBytes += 13 + length + unitBytes;
-            appendedHeap += 13 + length + unitBytes + (long) writes * WRITE_HEAP;
+            appendedHeap += heapOf(length, unitBytes, writes);
             queuedUnits |= unitBytes > 0;
         } finally {
             queueLock.unlock();
@@ -829,7 +834,7 @@ final class LogWriter {
             frames.add(new Queued(type, sequence, body));
             bodyBytes += body.size();
             appendedBytes += 13 + body.size() + unitBytes;
-            appendedHeap += 13 + body.size() + unitBytes + (long) writes * WRITE_HEAP;
+            appendedHeap += heapOf(body.size(), unitBytes, writes);
             units |= unitBytes > 0;
         }
 
@@ -990,9 +995,15 @@ final class LogWriter {
     }
 
     /// {@return the heap the commits queued since the writer opened hold until a checkpoint takes them, estimated: the
-    /// bytes of their frames and units, and [#WRITE_HEAP] a write}
+    /// bytes of their frames and units, [#WRITE_HEAP] a write and [#COMMIT_HEAP] a commit}
     long appendedHeap() {
         return appendedHeap;
+    }
+
+    /// {@return the heap a commit of `writes` writes, whose frame body is `bodyBytes` and whose units are `unitBytes`,
+    /// holds until a checkpoint takes it, as [#appendedHeap()] estimates it}
+    static long heapOf(long bodyBytes, long unitBytes, int writes) {
+        return 13 + bodyBytes + unitBytes + (long) writes * WRITE_HEAP + (writes > 0 ? COMMIT_HEAP : 0);
     }
 
     /// {@return the offset in the current segment where the frames of the last group end, before their padding}
