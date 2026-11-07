@@ -198,8 +198,10 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         ///
         /// A store that holds more than its share of the limit, the limit over the open stores, evicts its own pages
         /// when the caches are full, and one within its share takes the room from the store that caches the most: one
-        /// busy store may use the whole limit while the others are idle. The cache is on the Java heap, so it counts
-        /// against the heap's maximum size. The default is 64 MiB. Resident key spaces are held whole, outside this
+        /// busy store may use the whole limit while the others are idle. A page no read used for between 30 and 60
+        /// seconds leaves the cache however full it is, so a store that stops reading gives its pages back. The cache
+        /// is on the Java heap, so it counts against the heap's maximum size. The default is a sixteenth of the heap's
+        /// maximum size ([Runtime#maxMemory()]), at most 64 MiB. Resident key spaces are held whole, outside this
         /// limit.
         ///
         /// @param bytes the limit, at least 1 MiB
@@ -212,8 +214,10 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// Fewer checkpoints write less, as each takes more writes to a page at once; more checkpoints hold less in
         /// memory, since the writes since the last checkpoint stay there, up to six intervals of them while those of
         /// every open store of the process hold less than half the heap's maximum size and two whatever they hold, and
-        /// open faster after a crash, since an open replays the log written since the last checkpoint. The default is a sixteenth of the heap's maximum size ([Runtime#maxMemory()]), between
-        /// 64 MiB and 512 MiB: 256 MiB for a heap of 4 GiB.
+        /// open faster after a crash, since an open replays the log written since the last checkpoint. A store that
+        /// commits nothing for between 30 and 60 seconds also checkpoints, once the writes since the last checkpoint
+        /// hold a megabyte of the heap, so an idle store does not keep them in memory. The default is a sixteenth of
+        /// the heap's maximum size ([Runtime#maxMemory()]), between 64 MiB and 512 MiB: 256 MiB for a heap of 4 GiB.
         ///
         /// @param logBytes the log growth between checkpoints, at least 1 MiB
         /// @return these options

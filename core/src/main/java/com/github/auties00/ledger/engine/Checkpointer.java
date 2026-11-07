@@ -37,7 +37,7 @@ import java.util.concurrent.locks.ReentrantLock;
 /// it writes its superblock leaves it unknown whether that superblock is durable, so the pages it wrote stay in use and
 /// no checkpoint runs again until the store reopens: overwriting either superblock could leave none that authenticates.
 /// The log still holds every commit.
-final class Checkpointer {
+final class Checkpointer implements IdleTicker.Watched {
     /// The obsolete segments a closed store keeps for reuse: none. The next open writes into the segment the log kept
     /// for it ([LogWriter#nextOpenSegment()]), so a spare saves it nothing, and forcing a spare that a copy of the store
     /// left in the OS cache held the first durable commit after the open for tens of milliseconds.
@@ -47,6 +47,10 @@ final class Checkpointer {
     /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint, if the writes behind it
     /// hold more heap than the store's budget: one being checkpointed and the next.
     private static final int MIN_BACKLOG = 2;
+    /// The heap, by the log's estimate, the writes the trees lack must hold before a store that went a tick of the
+    /// [IdleTicker] without a commit checkpoints them: below it, a store that writes now and then would checkpoint
+    /// after almost every write.
+    static final long IDLE_BACKLOG = 1L << 20;
     // The checkpointers of the open stores of the process, whose writes the trees lack share one heap budget: a budget
     // of half the heap for each store let a process of several busy stores buffer more than the heap
     private static final Set<Checkpointer> OPEN = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
@@ -83,6 +87,10 @@ final class Checkpointer {
     private final Condition progress;
     // Set when a superblock write failed: no checkpoint runs again in this open
     private volatile LedgerIoException stopped;
+    // The log's queued bytes at the last tick of the idle ticker; the ticker's alone
+    private long appendedAtTick;
+    // Set once the store closes: no tick starts a checkpoint, nor does one start on its own thread
+    private volatile boolean closed;
     // The delta pages of the last durable checkpoint, and the blob that holds their table, or null; guarded by the lock
     private DeltaTable deltas;
     private PageRef deltaTable;
@@ -129,22 +137,51 @@ final class Checkpointer {
         cutBytes = -replayedBytes;
         publishedBytes = -replayedBytes;
         publishedHeap = -replayedHeap;
+        appendedAtTick = log.appendedBytes();
         OPEN.add(this);
+        IdleTicker.watch(this);
     }
 
-    /// Stops counting the store's writes toward the heap budget of the process, once it closes.
+    /// Stops counting the store's writes toward the heap budget of the process, and checkpointing it when idle, once
+    /// it closes.
     void close() {
+        closed = true;
         OPEN.remove(this);
+        IdleTicker.unwatch(this);
+    }
+
+    /// Starts a checkpoint if the store committed nothing since the last tick of the [IdleTicker] and the writes the
+    /// trees lack hold at least [#IDLE_BACKLOG] of heap.
+    ///
+    /// Checkpoints otherwise start once every interval of log, so a store that wrote less than one and stopped kept
+    /// those writes in memory, more than their bytes in the log, for as long as it stayed open.
+    @Override
+    public void tick() {
+        var appended = log.appendedBytes();
+        var idle = appended == appendedAtTick;
+        appendedAtTick = appended;
+        if (idle && !closed && stopped == null && backlogHeap() >= IDLE_BACKLOG) {
+            start();
+        }
     }
 
     /// Starts a checkpoint on a thread of its own if the log has grown enough since the last, and none is running.
     void maybeStart() {
-        if (log.appendedBytes() - cutBytes < every || !scheduled.compareAndSet(false, true)) {
+        if (log.appendedBytes() - cutBytes >= every) {
+            start();
+        }
+    }
+
+    /// Starts a checkpoint on a thread of its own, unless one is running.
+    private void start() {
+        if (!scheduled.compareAndSet(false, true)) {
             return;
         }
         Thread.ofPlatform().daemon().name("ledger-checkpoint").start(() -> {
             try {
-                run(false);
+                if (!closed) {
+                    run(false);
+                }
                 lastFailure = null;
             } catch (RuntimeException failure) {
                 // The log still holds every commit; the next checkpoint retries
