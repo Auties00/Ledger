@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The recycling of a store's arrays, and the trim of a pool left idle.
 class HeapPoolTest {
@@ -16,6 +17,17 @@ class HeapPoolTest {
         assertEquals(8_192, array.length);
         pool.release(array);
         assertSame(array, pool.acquire(8_000));
+    }
+
+    @Test
+    @DisplayName("the process's pool keeps as much as the most any store that joined it asks for, and less once it leaves")
+    void processPool() {
+        var pool = HeapPool.process();
+        var owner = new Object();
+        HeapPool.join(owner, 1L << 40);
+        assertEquals(1L << 40, pool.maxPooledBytesForTests());
+        HeapPool.leave(owner);
+        assertTrue(pool.maxPooledBytesForTests() < 1L << 40, "the cap stayed at what the store that left asked");
     }
 
     @Test

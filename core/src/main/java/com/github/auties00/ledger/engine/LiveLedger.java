@@ -1285,6 +1285,7 @@ public final class LiveLedger implements Ledger {
             if (checkpointer != null) {
                 checkpointer.close();
             }
+            HeapPool.leave(this);
             for (var resource : resources) {
                 try {
                     resource.close();
