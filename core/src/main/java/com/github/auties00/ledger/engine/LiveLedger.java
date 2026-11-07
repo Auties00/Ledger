@@ -345,7 +345,7 @@ public final class LiveLedger implements Ledger {
             unitBytes += unit.length;
         }
         replayedBytes += 13 + body.length + unitBytes;
-        replayedHeap += 13 + body.length + unitBytes + (long) applier.touched.size() * LogWriter.WRITE_HEAP;
+        replayedHeap += LogWriter.heapOf(body.length, unitBytes, applier.touched.size());
         return true;
     }
 
