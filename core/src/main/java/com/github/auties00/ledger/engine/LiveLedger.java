@@ -1197,6 +1197,7 @@ public final class LiveLedger implements Ledger {
     private void afterCommit() {
         for (var state : sweepOrder) {
             state.removeDropped(COMMIT_REMOVALS);
+            state.unlinkDropped();
         }
         if (checkpointer != null) {
             checkpointer.maybeStart();
