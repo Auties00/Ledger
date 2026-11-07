@@ -91,7 +91,13 @@ final class PageFile implements AutoCloseable {
             Files.move(temporary, path, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
             Durability.forceDirectory(directory);
         }
-        return new PageFile(path, cipher, new PageCache(cacheBytes), pool);
+        var cache = PageCache.shared(cacheBytes);
+        try {
+            return new PageFile(path, cipher, cache, pool);
+        } catch (IOException | RuntimeException failure) {
+            cache.close();
+            throw failure;
+        }
     }
 
     /// {@return the newest superblock that authenticates, or `null` if no checkpoint was ever made durable}
@@ -455,6 +461,7 @@ final class PageFile implements AutoCloseable {
     @Override
     public void close() {
         closed = true;
+        cache.close();
         var external = blobs;
         if (external != null) {
             external.close();

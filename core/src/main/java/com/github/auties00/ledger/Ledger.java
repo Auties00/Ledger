@@ -193,10 +193,14 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// @return these options
         Options ioPool(IoPool pool);
 
-        /// Limits the memory that caches the pages of [Keyspace.Residency#PAGED] key spaces.
+        /// Limits the memory that caches the pages of [Keyspace.Residency#PAGED] key spaces, which the stores of the
+        /// process share: their caches hold at most the largest limit an open store asked for, together.
         ///
-        /// The cache is on the Java heap, so it counts against the heap's maximum size. The default is 64 MiB.
-        /// Resident key spaces are held whole, outside this limit.
+        /// A store that holds more than its share of the limit, the limit over the open stores, evicts its own pages
+        /// when the caches are full, and one within its share takes the room from the store that caches the most: one
+        /// busy store may use the whole limit while the others are idle. The cache is on the Java heap, so it counts
+        /// against the heap's maximum size. The default is 64 MiB. Resident key spaces are held whole, outside this
+        /// limit.
         ///
         /// @param bytes the limit, at least 1 MiB
         /// @return these options

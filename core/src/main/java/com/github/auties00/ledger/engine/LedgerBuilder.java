@@ -181,7 +181,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     @Override
     public Ledger build() {
         if (directory == null) {
-            var ledger = new LiveLedger(keyspaces.values(), new HeapPool(pooledBytes()));
+            var ledger = new LiveLedger(keyspaces.values(), HeapPool.process(pooledBytes()));
             ledger.assignIds();
             return ledger;
         }
@@ -202,7 +202,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             }
             var opened = StoreHeader.openOrCreate(directory, encryption);
             Files.createDirectories(logDirectory);
-            var heap = new HeapPool(pooledBytes());
+            var heap = HeapPool.process(pooledBytes());
             pages = PageFile.open(directory, new PageCipher(opened.keys().pageKey()), pageCache, heap);
             var ledger = new LiveLedger(keyspaces.values(), heap);
             var superblock = pages.superblock();

@@ -5,18 +5,20 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.ref.WeakReference;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/// The page cache on its own: lookups by nonce, the byte limit, and the memory of the entries it drops.
+/// The page cache on its own: lookups by nonce, the byte limit and the budget caches share, and the memory of the
+/// entries it drops.
 class PageCacheTest {
     private static final long LIMIT = 1 << 20;
 
     @Test
     @DisplayName("finds a unit only under the nonce it was cached with")
     void lookups() {
-        var cache = new PageCache(LIMIT);
+        var cache = PageCache.isolated(LIMIT);
         var unit = new byte[PageFormat.SIZE];
         cache.put(new PageRef(5, 1, 1, 1), unit, false);
         assertSame(unit, cache.get(new PageRef(5, 1, 1, 1)));
@@ -28,7 +30,7 @@ class PageCacheTest {
     @Test
     @DisplayName("stays within its limit")
     void limit() {
-        var cache = new PageCache(LIMIT);
+        var cache = PageCache.isolated(LIMIT);
         for (var i = 0; i < 200; i++) {
             cache.put(new PageRef(i * 16, 16, 1, i), new byte[16 * PageFormat.SIZE], i % 3 == 0);
             assertTrue(cache.size() <= LIMIT, "holds " + cache.size() + " bytes");
@@ -36,9 +38,44 @@ class PageCacheTest {
     }
 
     @Test
+    @DisplayName("lets one cache of a shared budget use the whole limit while the other is empty, and a cache that starts reading take back its share")
+    void sharedBudget() {
+        var budget = new PageCache.Budget();
+        var busy = PageCache.in(budget, LIMIT);
+        var idle = PageCache.in(budget, LIMIT);
+        var unit = PageFormat.SIZE;
+        for (var i = 0; i < 1_000; i++) {
+            busy.put(new PageRef(i, 1, 1, i), new byte[unit], true);
+        }
+        assertTrue(busy.size() >= LIMIT - unit, "the busy cache holds " + busy.size() + " bytes of " + LIMIT);
+        for (var i = 0; i < 1_000; i++) {
+            idle.put(new PageRef(i, 1, 1, i), new byte[unit], true);
+            assertTrue(budget.total() <= LIMIT, "the caches hold " + budget.total() + " bytes together");
+        }
+        // Each holds its share, as both keep reading
+        assertTrue(idle.size() >= LIMIT / 2 - unit, "the cache that started reading holds " + idle.size() + " bytes");
+        assertTrue(busy.size() >= LIMIT / 2 - unit, "the busy cache kept " + busy.size() + " bytes");
+        idle.close();
+        assertEquals(busy.size(), budget.total(), "a closed cache keeps no bytes in the budget");
+    }
+
+    @Test
+    @DisplayName("holds the largest limit an open cache of the budget asked for")
+    void budgetLimit() {
+        var budget = new PageCache.Budget();
+        var small = PageCache.in(budget, LIMIT);
+        var large = PageCache.in(budget, 4 * LIMIT);
+        assertEquals(4 * LIMIT, budget.limit());
+        large.close();
+        assertEquals(LIMIT, budget.limit());
+        small.close();
+        assertEquals(0, budget.limit());
+    }
+
+    @Test
     @DisplayName("keeps the clock bounded while pages are replaced and removed under the limit")
     void boundedClock() {
-        var cache = new PageCache(LIMIT);
+        var cache = PageCache.isolated(LIMIT);
         for (var i = 0; i < 100_000; i++) {
             cache.put(new PageRef(i % 4, 1, 1, i), new byte[PageFormat.SIZE], true);
             if (i % 2 == 0) {
@@ -51,7 +88,7 @@ class PageCacheTest {
     @Test
     @DisplayName("lets go of the array of an entry it replaced, removed or refused to replace")
     void dropsArrays() throws InterruptedException {
-        var cache = new PageCache(64L << 20);
+        var cache = PageCache.isolated(64L << 20);
         var replaced = cached(cache, 1);
         cache.put(new PageRef(1, 1, 2, 2), new byte[PageFormat.SIZE], true);
         var removed = cached(cache, 2);

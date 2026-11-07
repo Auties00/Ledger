@@ -1,12 +1,19 @@
 package com.github.auties00.ledger.engine;
 
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
-/// The opened units of the store's files, by file and first page, within one limit of bytes; it evicts with the CLOCK
-/// algorithm.
+/// The opened units of the store's files, by file and first page, within a limit of bytes it shares with the caches of
+/// the process's other stores ([Budget]); it evicts with the CLOCK algorithm.
+///
+/// While the caches of the process hold more than the limit, a cache that holds more than its share of it, the limit
+/// over the open caches, evicts its own entries; one within its share takes the room from the cache that holds the
+/// most. So one busy store may use the whole limit while the others are idle, and a store that starts reading takes
+/// back its share. A limit of each store's own let a process of many stores keep many limits of pages.
 ///
 /// An entry holds the plaintext of the unit and is never written again, so a reader keeps using an array the cache has
 /// evicted: the array goes to the collector, not back to a pool, and no read pins anything. An entry is found only
@@ -29,15 +36,33 @@ final class PageCache {
     // The entries in the clock, which may briefly differ from its length while threads race
     private final AtomicInteger clockSize;
     private final AtomicLong bytes;
-    private final long limit;
+    private final Budget budget;
 
-    /// Creates an empty cache of at most `limit` bytes.
-    PageCache(long limit) {
+    private PageCache(Budget budget) {
         this.entries = new ConcurrentHashMap<>();
         this.clock = new ConcurrentLinkedQueue<>();
         this.clockSize = new AtomicInteger();
         this.bytes = new AtomicLong();
-        this.limit = limit;
+        this.budget = budget;
+    }
+
+    /// {@return an empty cache that shares the limit of the process's caches, which `limit` raises to it if lower}
+    static PageCache shared(long limit) {
+        var cache = new PageCache(Budget.PROCESS);
+        Budget.PROCESS.join(cache, limit);
+        return cache;
+    }
+
+    /// {@return an empty cache of at most `limit` bytes of its own}
+    static PageCache isolated(long limit) {
+        return in(new Budget(), limit);
+    }
+
+    /// {@return an empty cache that shares `budget`, which `limit` raises to it if lower}
+    static PageCache in(Budget budget, long limit) {
+        var cache = new PageCache(budget);
+        budget.join(cache, limit);
+        return cache;
     }
 
     /// {@return the key of page `page` of `file`, [#DATA] or [#BLOBS]}
@@ -82,14 +107,14 @@ final class PageCache {
     ///
     /// @param referenced whether the unit counts as read, rather than written and maybe never read
     void put(long key, PageRef ref, byte[] unit, boolean referenced) {
-        if (unit.length > limit / 4) {
+        if (unit.length > budget.limit() / 4) {
             // A unit this large would evict most of the cache for one read; what the page held is out of date
             remove(key);
             return;
         }
         var entry = new Entry(key, ref.nonceHigh(), ref.nonceLow(), unit);
         entry.referenced = referenced;
-        bytes.addAndGet(unit.length);
+        account(unit.length);
         var previous = entries.put(key, entry);
         if (previous != null) {
             drop(previous);
@@ -114,8 +139,25 @@ final class PageCache {
 
     /// Accounts for `entry`, which this thread took out of the map, and lets go of its array.
     private void drop(Entry entry) {
-        bytes.addAndGet(-entry.length);
+        account(-entry.length);
         entry.unit = null;
+    }
+
+    private void account(long delta) {
+        bytes.addAndGet(delta);
+        budget.total.addAndGet(delta);
+    }
+
+    /// Drops every entry and leaves the budget, as the store closes.
+    void close() {
+        budget.leave(this);
+        for (var entry : entries.values()) {
+            if (entries.remove(entry.key, entry)) {
+                drop(entry);
+            }
+        }
+        clock.clear();
+        clockSize.set(0);
     }
 
     /// {@return the bytes the cache holds}
@@ -123,9 +165,10 @@ final class PageCache {
         return bytes.get();
     }
 
-    /// {@return whether the cache holds `bytes` fewer bytes than its limit, so caching them would evict nothing}
+    /// {@return whether the caches of the budget hold `bytes` fewer bytes than its limit, so caching them would evict
+    /// nothing}
     boolean hasRoom(long bytes) {
-        return this.bytes.get() + bytes <= limit;
+        return budget.total.get() + bytes <= budget.limit();
     }
 
     /// {@return the entries the clock holds, current or dropped, for tests that bound it}
@@ -135,44 +178,156 @@ final class PageCache {
 
     /// Drops every entry, so tests read units from the file.
     void clearForTests() {
-        entries.clear();
+        for (var entry : entries.values()) {
+            if (entries.remove(entry.key, entry)) {
+                drop(entry);
+            }
+        }
         clock.clear();
         clockSize.set(0);
-        bytes.set(0);
     }
 
-    /// Evicts entries while the cache holds more than its limit, and takes dropped entries out of the clock once they
-    /// outnumber the current ones.
+    /// Evicts entries while the caches of the budget hold more than its limit, from this cache while it holds more
+    /// than its share and from the one that holds the most otherwise, and takes dropped entries out of the clock once
+    /// they outnumber the current ones.
     ///
     /// Each dropped entry costs one step of a later sweep, so the work stays proportional to the puts.
     private void evict() {
-        // Every entry gets one more pass when referenced, so twice the clock bounds the sweep
-        var budget = 2 * clockSize.get() + 1;
-        while (budget-- > 0) {
-            var over = bytes.get() > limit;
-            if (!over && clockSize.get() <= 2 * entries.size() + SLACK) {
-                return;
+        while (budget.over()) {
+            var target = bytes.get() > budget.share() ? this : budget.largest();
+            if ((target == null || !target.evictOne()) && (target == this || !evictOne())) {
+                break;
             }
+        }
+        compact();
+    }
+
+    /// Evicts the next entry the clock finds unreferenced, giving each referenced one another pass.
+    ///
+    /// @return whether it evicted one; `false` if the clock holds none it could
+    private boolean evictOne() {
+        // Every entry gets one more pass when referenced, so twice the clock bounds the sweep
+        var steps = 2 * clockSize.get() + 1;
+        while (steps-- > 0) {
             var entry = clock.poll();
             if (entry == null) {
-                return;
+                return false;
             }
             clockSize.decrementAndGet();
             if (entries.get(entry.key) != entry) {
                 // Replaced or removed already
                 continue;
             }
-            if (over && !entry.referenced) {
+            if (!entry.referenced) {
                 if (entries.remove(entry.key, entry)) {
                     drop(entry);
+                    return true;
                 }
                 continue;
             }
-            if (over) {
-                entry.referenced = false;
-            }
+            entry.referenced = false;
             clock.offer(entry);
             clockSize.incrementAndGet();
+        }
+        return false;
+    }
+
+    /// Takes dropped entries out of the clock once they outnumber the current ones.
+    private void compact() {
+        var steps = 2 * clockSize.get() + 1;
+        while (steps-- > 0 && clockSize.get() > 2 * entries.size() + SLACK) {
+            var entry = clock.poll();
+            if (entry == null) {
+                return;
+            }
+            clockSize.decrementAndGet();
+            if (entries.get(entry.key) == entry) {
+                clock.offer(entry);
+                clockSize.incrementAndGet();
+            }
+        }
+    }
+
+    /// The bytes some caches may hold together: those of the stores of the process, or a cache's own.
+    ///
+    /// Its limit is the largest any open cache asked for. It is safe for concurrent use: the total is one atomic
+    /// number, and the open caches a snapshot their joins and leaves replace.
+    static final class Budget {
+        /// The budget of the caches of the stores of the process.
+        static final Budget PROCESS = new Budget();
+
+        // The bytes the caches hold together
+        private final AtomicLong total;
+        private final Object lock;
+        // The open caches and the limits they asked for; guarded by the lock
+        private final Map<PageCache, Long> asked;
+        // The open caches, replaced on each join and leave
+        private volatile PageCache[] members;
+        private volatile long limit;
+
+        /// Makes a budget no cache shares yet.
+        Budget() {
+            this.total = new AtomicLong();
+            this.lock = new Object();
+            this.asked = new IdentityHashMap<>();
+            this.members = new PageCache[0];
+        }
+
+        private void join(PageCache cache, long requested) {
+            synchronized (lock) {
+                asked.put(cache, requested);
+                refresh();
+            }
+        }
+
+        private void leave(PageCache cache) {
+            synchronized (lock) {
+                asked.remove(cache);
+                refresh();
+            }
+        }
+
+        private void refresh() {
+            var largest = 0L;
+            for (var requested : asked.values()) {
+                largest = Math.max(largest, requested);
+            }
+            limit = largest;
+            members = asked.keySet().toArray(new PageCache[0]);
+        }
+
+        /// {@return the bytes the caches may hold together}
+        long limit() {
+            return limit;
+        }
+
+        /// {@return the bytes the caches hold together}
+        long total() {
+            return total.get();
+        }
+
+        private boolean over() {
+            return total.get() > limit;
+        }
+
+        // The limit over the open caches
+        private long share() {
+            var caches = members.length;
+            return caches == 0 ? limit : limit / caches;
+        }
+
+        // The open cache that holds the most bytes, or null if none is open
+        private PageCache largest() {
+            PageCache largest = null;
+            var most = -1L;
+            for (var cache : members) {
+                var held = cache.bytes.get();
+                if (held > most) {
+                    most = held;
+                    largest = cache;
+                }
+            }
+            return largest;
         }
     }
 

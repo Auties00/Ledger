@@ -25,7 +25,8 @@ public final class HeapPool {
 
     private final ConcurrentLinkedQueue<byte[]>[] free;
     private final AtomicLong pooledBytes;
-    private final long maxPooledBytes;
+    // Only grows, as stores ask the process's pool for more
+    private volatile long maxPooledBytes;
     // The bytes each size holds free, which may not take more than half of maxPooledBytes: a checkpoint's flush
     // releases its many small arrays at once, and would otherwise leave no room for the large ones
     private final AtomicLong[] pooledBySize;
@@ -34,6 +35,24 @@ public final class HeapPool {
     private int acquires;
     // The count of acquires the trimmer saw last; the trimmer's alone
     private int acquiresSeen;
+
+    // The pool the stores of the process share, made with the first
+    private static HeapPool process;
+
+    /// {@return the pool the stores of the process share, which keeps at least `maxPooledBytes` of free arrays from
+    /// now on}
+    ///
+    /// A pool of each store's own let a process of many busy stores keep a pool for each.
+    static HeapPool process(long maxPooledBytes) {
+        synchronized (HeapPool.class) {
+            if (process == null) {
+                process = new HeapPool(maxPooledBytes);
+            } else if (process.maxPooledBytes < maxPooledBytes) {
+                process.maxPooledBytes = maxPooledBytes;
+            }
+            return process;
+        }
+    }
 
     /// Creates a pool that keeps at most `maxPooledBytes` of free arrays.
     ///
