@@ -37,6 +37,9 @@ import java.util.function.LongSupplier;
 final class KeyspaceState {
     /// The dropped chains from which [#removeDropped()] spreads the removals over the processors.
     private static final int PARALLEL_REMOVALS = 4_096;
+    /// The dropped chains the list may hold, at least, before a commit sweeps them off it; past it, as many as memory
+    /// holds chains, so a sweep's steps stay within twice the drops.
+    private static final int LISTED_DROPS = 4_096;
 
     final Keyspace<?, ?> keyspace;
     final boolean resident;
@@ -70,6 +73,8 @@ final class KeyspaceState {
     // Held while the listed chains are ordered or pruned, so a read of a range that finds the list empty waits for
     // the chains another thread took from it
     private final ReentrantLock ordering;
+    // The chains dropped while listed since the list was last pruned, which only a prune of the list lets go of
+    private final java.util.concurrent.atomic.AtomicInteger droppedListed;
 
     private static final VarHandle UNORDERED;
 
@@ -94,6 +99,7 @@ final class KeyspaceState {
         this.dirty = new ArrayList<>();
         this.keys = new KeySlab();
         this.ordering = new ReentrantLock();
+        this.droppedListed = new java.util.concurrent.atomic.AtomicInteger();
     }
 
     /// {@return the chain of `key`, or `null` if memory holds none}
@@ -175,6 +181,7 @@ final class KeyspaceState {
         }
         ordering.lock();
         try {
+            droppedListed.set(0);
             var chain = (Chain) UNORDERED.getAndSet(this, null);
             while (chain != null) {
                 var next = chain.nextUnordered;
@@ -199,38 +206,66 @@ final class KeyspaceState {
         }
         ordering.lock();
         try {
-            var chain = (Chain) UNORDERED.getAndSet(this, null);
-            Chain first = null;
-            Chain last = null;
-            while (chain != null) {
-                var next = chain.nextUnordered;
-                chain.nextUnordered = null;
-                if (!chain.dropped() && !chain.released()) {
-                    // A plain read off the publishing role: a chain marked meanwhile is only ordered early
-                    if (!resident && chain.dirtyCut <= cut) {
-                        order(chain);
-                    } else {
-                        if (first == null) {
-                            first = chain;
-                        } else {
-                            last.nextUnordered = chain;
-                        }
-                        last = chain;
-                    }
-                }
-                chain = next;
-            }
-            if (first != null) {
-                while (true) {
-                    var head = unordered;
-                    last.nextUnordered = head;
-                    if (UNORDERED.compareAndSet(this, head, first)) {
-                        break;
-                    }
-                }
-            }
+            unlinkListed(cut);
         } finally {
             ordering.unlock();
+        }
+    }
+
+    /// Takes the dropped chains off the list once the commits dropped more of them than a sweep of it costs, unless
+    /// another thread holds the list; safe for concurrent use.
+    ///
+    /// Only a checkpoint's prune and a read of a range took them off before, so a key space whose commits removed keys
+    /// memory did not hold kept a chain for each such commit, with its key's copy, until the next checkpoint: millions
+    /// of them, or for good while checkpoints failed.
+    void unlinkDropped() {
+        // The size of the index only past the floor: summing its segments at every commit would cost more than the sweep
+        var dropped = droppedListed.get();
+        if (dropped < LISTED_DROPS || dropped < index.size() || !ordering.tryLock()) {
+            return;
+        }
+        try {
+            unlinkListed(-1);
+        } finally {
+            ordering.unlock();
+        }
+    }
+
+    /// Unlinks from the list, in place, the chains that are dropped and, in a paged key space, those it orders, the
+    /// ones no commit wrote since `cut`; holding the ordering lock.
+    ///
+    /// The list is never taken whole: a read of a range that finds it empty does not wait for the lock, so a list put
+    /// back after a walk let a read that came during the walk miss every chain the walk kept, all of a resident key
+    /// space's. A chain leaves the list only once it is in the ordered map or dropped. Commits only push chains on the
+    /// head, and only holders of the lock unlink, so the links past the head change under this thread alone.
+    private void unlinkListed(long cut) {
+        droppedListed.set(0);
+        Chain previous = null;
+        var chain = unordered;
+        while (chain != null) {
+            var next = chain.nextUnordered;
+            var leaves = chain.dropped() || chain.released();
+            // A plain read off the publishing role: a chain marked meanwhile is only ordered early
+            if (!leaves && !resident && chain.dirtyCut <= cut) {
+                order(chain);
+                leaves = true;
+            }
+            if (!leaves) {
+                previous = chain;
+            } else {
+                if (previous == null && !UNORDERED.compareAndSet(this, chain, next)) {
+                    // A commit listed a chain before this one since the walk started: the link to unlink is its
+                    previous = unordered;
+                    while (previous.nextUnordered != chain) {
+                        previous = previous.nextUnordered;
+                    }
+                }
+                if (previous != null) {
+                    previous.nextUnordered = next;
+                }
+                chain.nextUnordered = null;
+            }
+            chain = next;
         }
     }
 
@@ -296,6 +331,8 @@ final class KeyspaceState {
         // Read after the store above, as [#inserted] reads the flag after its own store: one of them takes it out
         if (chain.ordered()) {
             leaving.add(chain);
+        } else if (lazy) {
+            droppedListed.incrementAndGet();
         }
     }
 
