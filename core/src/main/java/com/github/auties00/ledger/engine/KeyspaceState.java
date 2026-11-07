@@ -23,10 +23,14 @@ import java.util.function.LongSupplier;
 /// one key, which at a million keys costs a fraction of a walk down the ordered one. A chain enters the index first, then the ordered
 /// map, and leaves them in the same order.
 ///
-/// A paged key space of a store in a directory orders its chains lazily: a new chain is only listed, and the reads of
-/// a range order the listed ones before they walk the map ([#slice]). Its chains leave memory once a checkpoint takes
-/// them, so with no read of a range in between, as when a store takes writes it does not scan, the walk down the map
-/// to insert each new key, and the one to remove it, are never paid; a commit that wrote a new key paid both.
+/// A key space of a store in a directory orders its chains lazily: a new chain is only listed, and the reads of a
+/// range order the listed ones before they walk the map ([#slice]). A paged key space's chains leave memory once a
+/// checkpoint takes them, so with no read of a range in between, as when a store takes writes it does not scan, the
+/// walk down the map to insert each new key, and the one to remove it, are never paid; a commit that wrote a new key
+/// paid both. A resident key space keeps its chains, so one read only by key, as most are, never orders them: the
+/// ordered map cost each entry 73 bytes, its node, its index and its key's segment, a third of an entry of a 20-byte
+/// key and a 24-byte value, and an open walked down it for every entry it loaded. The sweep reaches its chains through
+/// the index instead ([#next(ChainIndex.Cursor)]).
 ///
 /// Readers use it concurrently with the commits. Commits create chains before they are given a sequence; everything
 /// else changes only under it.
@@ -102,6 +106,19 @@ final class KeyspaceState {
         return index.size();
     }
 
+    /// {@return whether the sweep reaches the chains through the index, as the ordered map may lack them: those of a
+    /// resident key space ordered lazily}
+    boolean sweepsIndex() {
+        return lazy && resident;
+    }
+
+    /// {@return the next chain of a walk over the index from `cursor`, or `null` once it visited them all}
+    ///
+    /// @see ChainIndex#next(ChainIndex.Cursor)
+    Chain next(ChainIndex.Cursor cursor) {
+        return index.next(cursor);
+    }
+
     /// {@return the newest version of `key` in memory, or `null`}
     Version head(MemorySegment key) {
         var chain = chain(key);
@@ -170,9 +187,10 @@ final class KeyspaceState {
         }
     }
 
-    /// Takes the dropped chains off the list, once a checkpoint dropped most of those it holds, and orders the chains
-    /// a prune left that no commit wrote since `cut`, so the sweep, which walks the ordered map, shortens them; safe
-    /// for concurrent use.
+    /// Takes the dropped chains off the list, once a checkpoint dropped most of those it holds, and, in a paged key
+    /// space, orders the chains a prune left that no commit wrote since `cut`, so the sweep, which walks the ordered map
+    /// there, shortens them; safe for concurrent use. A resident key space keeps the others listed: its sweep walks the
+    /// index.
     ///
     /// @param cut the number of the cut whose keys the prune went through, as [#markDirty] gave it to the chains
     void pruneListed(long cut) {
@@ -189,7 +207,7 @@ final class KeyspaceState {
                 chain.nextUnordered = null;
                 if (!chain.dropped() && !chain.released()) {
                     // A plain read off the publishing role: a chain marked meanwhile is only ordered early
-                    if (chain.dirtyCut <= cut) {
+                    if (!resident && chain.dirtyCut <= cut) {
                         order(chain);
                     } else {
                         if (first == null) {

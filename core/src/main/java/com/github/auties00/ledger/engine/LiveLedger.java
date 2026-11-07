@@ -123,6 +123,9 @@ public final class LiveLedger implements Ledger {
     private volatile boolean closed;
     private int sweepIndex;
     private MemorySegment sweepAfter;
+    // Where the sweep stands in the index of a key space it walks by index ([KeyspaceState#sweepsIndex()]), or null
+    // before it starts there
+    private ChainIndex.Cursor sweepCursor;
     // The log bytes, and the heap by the log's estimate, of the commits the open replayed, which the trees lack
     private long replayedBytes;
     private long replayedHeap;
@@ -195,7 +198,7 @@ public final class LiveLedger implements Ledger {
         this.pages = pages;
         this.space = space;
         for (var state : states.values()) {
-            state.lazy = !state.resident;
+            state.lazy = true;
         }
     }
 
@@ -1834,24 +1837,43 @@ public final class LiveLedger implements Ledger {
         }
         var visitedKeyspaces = 0;
         while (budget > 0 && visitedKeyspaces <= sweepOrder.size()) {
-            if (sweepIndex == 0 && sweepAfter == null) {
+            if (sweepIndex == 0 && sweepAfter == null && sweepCursor == null) {
                 sweepFound = false;
                 passBounds = bounds;
                 passCutBound = cutBound;
             }
             var state = sweepOrder.get(sweepIndex % sweepOrder.size());
-            // An apply may have put a newer version above the entry's value: the prune leaves it, and drops nothing
-            var entries = (sweepAfter == null ? state.entries : state.entries.tailMap(sweepAfter, false)).entrySet().iterator();
-            while (budget > 0 && entries.hasNext()) {
-                var entry = entries.next();
-                var chain = entry.getValue();
-                sweepFound |= prune(state, chain, chain.head, bounds, cutBound);
-                sweepAfter = entry.getKey();
-                budget--;
+            boolean finished;
+            if (state.sweepsIndex()) {
+                if (sweepCursor == null) {
+                    sweepCursor = new ChainIndex.Cursor();
+                }
+                finished = false;
+                while (budget > 0) {
+                    var chain = state.next(sweepCursor);
+                    if (chain == null) {
+                        finished = true;
+                        break;
+                    }
+                    sweepFound |= prune(state, chain, chain.head, bounds, cutBound);
+                    budget--;
+                }
+            } else {
+                // An apply may have put a newer version above the entry's value: the prune leaves it, and drops nothing
+                var entries = (sweepAfter == null ? state.entries : state.entries.tailMap(sweepAfter, false)).entrySet().iterator();
+                while (budget > 0 && entries.hasNext()) {
+                    var entry = entries.next();
+                    var chain = entry.getValue();
+                    sweepFound |= prune(state, chain, chain.head, bounds, cutBound);
+                    sweepAfter = entry.getKey();
+                    budget--;
+                }
+                finished = !entries.hasNext();
             }
-            if (!entries.hasNext()) {
+            if (finished) {
                 sweepIndex = (sweepIndex + 1) % sweepOrder.size();
                 sweepAfter = null;
+                sweepCursor = null;
                 visitedKeyspaces++;
                 if (sweepIndex == 0) {
                     if (!sweepFound) {
