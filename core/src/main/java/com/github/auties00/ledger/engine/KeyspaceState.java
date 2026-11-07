@@ -75,6 +75,8 @@ final class KeyspaceState {
     private final ReentrantLock ordering;
     // The chains dropped while listed since the list was last pruned, which only a prune of the list lets go of
     private final java.util.concurrent.atomic.AtomicInteger droppedListed;
+    // The dropped chains listed past which a commit sweeps them off, as of the last prune of the list
+    private volatile int listedDropsLimit = LISTED_DROPS;
 
     private static final VarHandle UNORDERED;
 
@@ -181,7 +183,7 @@ final class KeyspaceState {
         }
         ordering.lock();
         try {
-            droppedListed.set(0);
+            resetDropped();
             var chain = (Chain) UNORDERED.getAndSet(this, null);
             while (chain != null) {
                 var next = chain.nextUnordered;
@@ -219,9 +221,7 @@ final class KeyspaceState {
     /// memory did not hold kept a chain for each such commit, with its key's copy, until the next checkpoint: millions
     /// of them, or for good while checkpoints failed.
     void unlinkDropped() {
-        // The size of the index only past the floor: summing its segments at every commit would cost more than the sweep
-        var dropped = droppedListed.get();
-        if (dropped < LISTED_DROPS || dropped < index.size() || !ordering.tryLock()) {
+        if (droppedListed.get() < listedDropsLimit || !ordering.tryLock()) {
             return;
         }
         try {
@@ -229,6 +229,13 @@ final class KeyspaceState {
         } finally {
             ordering.unlock();
         }
+    }
+
+    /// Counts the dropped chains listed from 0 again, and sets how many make a commit sweep them off: the index's size
+    /// is summed here, as summing its segments at every commit cost more than the sweep; holding the ordering lock.
+    private void resetDropped() {
+        droppedListed.set(0);
+        listedDropsLimit = Math.max(LISTED_DROPS, index.size());
     }
 
     /// Unlinks from the list, in place, the chains that are dropped and, in a paged key space, those it orders, the
@@ -239,7 +246,7 @@ final class KeyspaceState {
     /// space's. A chain leaves the list only once it is in the ordered map or dropped. Commits only push chains on the
     /// head, and only holders of the lock unlink, so the links past the head change under this thread alone.
     private void unlinkListed(long cut) {
-        droppedListed.set(0);
+        resetDropped();
         Chain previous = null;
         var chain = unordered;
         while (chain != null) {
