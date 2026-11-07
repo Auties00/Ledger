@@ -201,8 +201,8 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// busy store may use the whole limit while the others are idle. A page no read used for between 30 and 60
         /// seconds leaves the cache however full it is, so a store that stops reading gives its pages back. The cache
         /// is on the Java heap, so it counts against the heap's maximum size. The default is a sixteenth of the heap's
-        /// maximum size ([Runtime#maxMemory()]), at most 64 MiB. Resident key spaces are held whole, outside this
-        /// limit.
+        /// maximum size ([Runtime#maxMemory()]), between 1 MiB and 64 MiB. Resident key spaces are held whole, outside
+        /// this limit.
         ///
         /// @param bytes the limit, at least 1 MiB
         /// @return these options
