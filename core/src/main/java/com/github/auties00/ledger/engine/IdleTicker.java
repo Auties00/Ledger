@@ -13,7 +13,7 @@ import java.util.WeakHashMap;
 final class IdleTicker {
     /// The time between two ticks: a pool that goes a tick without an acquire frees its arrays, a cached page that goes
     /// two ticks without a read leaves the cache, and a store that goes a tick without a commit checkpoints.
-    static final long PERIOD_MILLIS = 30_000;
+    static final long PERIOD_MILLIS = 3_600_000;
     // What the thread ticks, weakly; guarded by itself
     private static final Set<Watched> WATCHED = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
 
