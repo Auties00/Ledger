@@ -44,7 +44,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     /// Creates a builder with the default options.
     public LedgerBuilder() {
         this.keyspaces = new LinkedHashMap<>();
-        this.pageCache = 64 * MIB;
+        this.pageCache = defaultPageCache();
         this.checkpointEvery = defaultCheckpointEvery();
         this.commitWindow = Duration.ZERO;
         this.segmentSize = SEGMENT_SIZE;
@@ -127,6 +127,14 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         }
         this.pageCache = bytes;
         return this;
+    }
+
+    /// {@return the page cache limit of a store whose options do not choose one: a sixteenth of the heap's maximum size,
+    /// between 1 MiB and 64 MiB}
+    ///
+    /// The pages it caches count against the heap: 64 MiB whatever its size was a quarter of a heap of 256 MiB.
+    static long defaultPageCache() {
+        return Math.clamp(Runtime.getRuntime().maxMemory() / 16, MIB, 64 * MIB);
     }
 
     /// {@return the checkpoint interval of a store whose options do not choose one: a sixteenth of the heap's maximum

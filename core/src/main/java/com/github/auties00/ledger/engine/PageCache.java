@@ -22,7 +22,11 @@ import java.util.concurrent.atomic.AtomicLong;
 /// under the nonce its unit was sealed with ([PageRef]), so a page a later checkpoint reused never returns the unit it
 /// held before. An entry the cache drops lets go of its array at once, though the clock reaches it later: the memory
 /// the cache keeps reachable stays within its limit.
-final class PageCache {
+///
+/// An entry no read used for a whole period of the [IdleTicker] leaves at its next tick, however full the caches are:
+/// the clock evicts only past the limit, so a store that stopped reading kept a limit of pages, mostly the ones its last
+/// checkpoint wrote and no one read, for as long as it stayed open.
+final class PageCache implements IdleTicker.Watched {
     /// The dropped entries the clock may hold beyond the current ones before a sweep takes them out.
     private static final int SLACK = 64;
     /// The file of the trees, `ledger.data`.
@@ -52,9 +56,7 @@ final class PageCache {
 
     /// {@return an empty cache that shares the limit of the process's caches, which `limit` raises to it if lower}
     static PageCache shared(long limit) {
-        var cache = new PageCache(Budget.PROCESS);
-        Budget.PROCESS.join(cache, limit);
-        return cache;
+        return in(Budget.PROCESS, limit);
     }
 
     /// {@return an empty cache of at most `limit` bytes of its own}
@@ -66,6 +68,7 @@ final class PageCache {
     static PageCache in(Budget budget, long limit) {
         var cache = new PageCache(budget);
         budget.join(cache, limit);
+        IdleTicker.watch(cache);
         return cache;
     }
 
@@ -95,7 +98,14 @@ final class PageCache {
         if (unit == null || unit.length != ref.pages() * PageFormat.SIZE) {
             return null;
         }
-        entry.referenced = true;
+        // Written only when they change: a volatile store on every hit made the readers of one page, the root
+        // first, take its entry's line from each other
+        if (!entry.referenced) {
+            entry.referenced = true;
+        }
+        if (entry.idle) {
+            entry.idle = false;
+        }
         return unit;
     }
 
@@ -166,6 +176,7 @@ final class PageCache {
     void close() {
         closed = true;
         budget.leave(this);
+        IdleTicker.unwatch(this);
         for (var entry : entries.values()) {
             if (entries.remove(entry.key, entry)) {
                 drop(entry);
@@ -173,6 +184,20 @@ final class PageCache {
         }
         clock.clear();
         clockSize.set(0);
+    }
+
+    /// Evicts the entries no read used since the last tick, and marks the others to be evicted at the next unless a read
+    /// uses them; then takes the dropped entries out of the clock.
+    @Override
+    public void tick() {
+        for (var entry : entries.values()) {
+            if (!entry.idle) {
+                entry.idle = true;
+            } else if (entries.remove(entry.key, entry)) {
+                drop(entry);
+            }
+        }
+        compact();
     }
 
     /// {@return the bytes the cache holds}
@@ -378,6 +403,9 @@ final class PageCache {
         // The plaintext, or null once the cache dropped the entry
         volatile byte[] unit;
         volatile boolean referenced;
+        // Set by a tick of the idle ticker, cleared by a read: a tick that finds it set evicts the entry. Plain, as a
+        // stale read only delays an eviction by a tick or evicts an entry just read, which the next read caches again
+        boolean idle;
 
         Entry(long key, long nonceHigh, int nonceLow, byte[] unit) {
             this.key = key;

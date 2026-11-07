@@ -44,6 +44,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -554,6 +555,43 @@ class CheckpointTest {
             try (var ledger = open(directory, MESSAGES)) {
                 assertEquals(4_000, ledger.size(MESSAGES));
                 assertEquals(Optional.of(value + 3999), ledger.get(MESSAGES, "m03999"));
+            }
+        }
+
+        @Test
+        @DisplayName("a store that commits nothing for a tick of the idle ticker checkpoints, once its writes since the last hold a megabyte of heap")
+        void idle(@TempDir Path directory) throws Exception {
+            var value = "v".repeat(64 << 10);
+            Checkpointer checkpointer;
+            try (var ledger = Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(MESSAGES)
+                    .checkpointEvery(1L << 30).build()) {
+                var live = (LiveLedger) ledger;
+                checkpointer = live.checkpointer();
+                ledger.commit(ledger.newBatch().put(MESSAGES, "small", "x")).awaitDurable();
+                checkpointer.tick();
+                checkpointer.tick();
+                Thread.sleep(200);
+                assertNull(live.tree(), "an idle store checkpointed a few bytes");
+                for (var i = 0; i < 40; i++) {
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "m%05d".formatted(i), value));
+                }
+                ledger.awaitDurable();
+                // The commits since the last tick make this one busy
+                checkpointer.tick();
+                Thread.sleep(200);
+                assertNull(live.tree(), "a store checkpointed at a tick that saw commits");
+                checkpointer.tick();
+                var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+                while (live.tree() == null && System.nanoTime() < deadline) {
+                    Thread.sleep(10);
+                }
+                assertTrue(live.tree() != null, "an idle store with megabytes the trees lack did not checkpoint");
+                assertEquals(41, ledger.size(MESSAGES));
+            }
+            // A closed store's tick starts nothing
+            checkpointer.tick();
+            try (var ledger = open(directory, MESSAGES)) {
+                assertEquals(Optional.of(value), ledger.get(MESSAGES, "m00039"));
             }
         }
     }

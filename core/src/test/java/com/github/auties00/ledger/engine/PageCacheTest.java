@@ -28,6 +28,26 @@ class PageCacheTest {
     }
 
     @Test
+    @DisplayName("evicts at a tick of the idle ticker the entries no read used since the tick before, however far below its limit")
+    void idleEviction() {
+        var cache = PageCache.isolated(LIMIT);
+        for (var i = 0; i < 8; i++) {
+            cache.put(new PageRef(i, 1, 1, i), new byte[PageFormat.SIZE], i % 2 == 0);
+        }
+        // Less than a whole period without reads: marked, not evicted
+        cache.tick();
+        assertEquals(8L * PageFormat.SIZE, cache.size());
+        var read = cache.get(new PageRef(3, 1, 1, 3));
+        cache.tick();
+        assertEquals(PageFormat.SIZE, cache.size());
+        assertSame(read, cache.get(new PageRef(3, 1, 1, 3)));
+        assertNull(cache.get(new PageRef(2, 1, 1, 2)));
+        cache.tick();
+        cache.tick();
+        assertEquals(0, cache.size());
+    }
+
+    @Test
     @DisplayName("stays within its limit")
     void limit() {
         var cache = PageCache.isolated(LIMIT);

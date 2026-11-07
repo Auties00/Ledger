@@ -1,8 +1,6 @@
 package com.github.auties00.ledger.engine;
 
-import java.util.Collections;
 import java.util.Map;
-import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
@@ -15,15 +13,13 @@ import java.util.concurrent.atomic.AtomicLong;
 /// request above 1 MiB gets an array of its own, which is not recycled. Arrays come back with the contents of their
 /// last use: callers write before they read.
 ///
-/// A pool no array was taken from for between [#IDLE_MILLIS] and twice that gives its free arrays to the collector:
+/// A pool no array was taken from for a tick of the [IdleTicker], between one and two of its periods, gives its free
+/// arrays to the collector:
 /// a store whose last checkpoint left a megabyte of sealed arrays in its pool kept them as long as it stayed idle,
 /// which a process of many stores, most of them idle, paid for each.
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
-    /// How long a pool goes without an acquire, at least, before it frees its arrays.
-    static final long IDLE_MILLIS = 30_000;
-
     private final ConcurrentLinkedQueue<byte[]>[] free;
     private final AtomicLong pooledBytes;
     // The most of the stores' asks, for the process's pool
@@ -36,6 +32,8 @@ public final class HeapPool {
     private int acquires;
     // The count of acquires the trimmer saw last; the trimmer's alone
     private int acquiresSeen;
+    // What the idle ticker calls, which holds it weakly: the pool keeps it as long as it lives
+    private final IdleTicker.Watched trimmer;
 
     // The pool the stores of the process share, made with the first; guarded by the class
     private static HeapPool process;
@@ -89,8 +87,8 @@ public final class HeapPool {
         this(maxPooledBytes, true);
     }
 
-    /// Creates a pool that keeps at most `maxPooledBytes` of free arrays, and that the trimmer of the process trims
-    /// only if `trimmed`; for tests that trim it themselves.
+    /// Creates a pool that keeps at most `maxPooledBytes` of free arrays, and that the [IdleTicker] trims only if
+    /// `trimmed`; for tests that trim it themselves.
     @SuppressWarnings("unchecked")
     HeapPool(long maxPooledBytes, boolean trimmed) {
         this.free = new ConcurrentLinkedQueue[MAX_SHIFT - MIN_SHIFT + 1];
@@ -103,8 +101,9 @@ public final class HeapPool {
         for (var i = 0; i < free.length; i++) {
             pooledBySize[i] = new AtomicLong();
         }
+        this.trimmer = trimmed ? this::trimIfIdle : null;
         if (trimmed) {
-            Trimmer.watch(this);
+            IdleTicker.watch(trimmer);
         }
     }
 
@@ -170,35 +169,5 @@ public final class HeapPool {
     /// {@return the bytes of the free arrays; for tests}
     long pooledBytesForTests() {
         return pooledBytes.get();
-    }
-
-    /// The thread of the process that trims idle pools, started with the first pool.
-    private static final class Trimmer {
-        // The pools of the process, weakly: a store's pool goes when the store does
-        private static final Set<HeapPool> POOLS = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
-
-        static {
-            Thread.ofVirtual().name("ledger-pool-trimmer").start(Trimmer::run);
-        }
-
-        private Trimmer() {
-        }
-
-        static void watch(HeapPool pool) {
-            POOLS.add(pool);
-        }
-
-        private static void run() {
-            while (true) {
-                try {
-                    Thread.sleep(IDLE_MILLIS);
-                } catch (InterruptedException _) {
-                    return;
-                }
-                for (var pool : POOLS.toArray(HeapPool[]::new)) {
-                    pool.trimIfIdle();
-                }
-            }
-        }
     }
 }
