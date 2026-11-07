@@ -89,7 +89,7 @@ final class Checkpointer implements IdleTicker.Watched {
     private volatile LedgerIoException stopped;
     // The log's queued bytes at the last tick of the idle ticker; the ticker's alone
     private long appendedAtTick;
-    // Set once the store closes: no tick starts a checkpoint, nor does one start on its own thread
+    // Set as the store starts closing: no tick starts a checkpoint, and one started on its own thread writes nothing
     private volatile boolean closed;
     // The delta pages of the last durable checkpoint, and the blob that holds their table, or null; guarded by the lock
     private DeltaTable deltas;
@@ -142,10 +142,19 @@ final class Checkpointer implements IdleTicker.Watched {
         IdleTicker.watch(this);
     }
 
-    /// Stops counting the store's writes toward the heap budget of the process, and checkpointing it when idle, once
-    /// it closes.
+    /// Stops the checkpoints the store starts on its own threads, as it starts closing: one started from now on writes
+    /// nothing, so none outlives the files a close without a final checkpoint closes.
+    void beginClose() {
+        closed = true;
+    }
+
+    /// Waits for a checkpoint running on its own thread to end, then stops counting the store's writes toward the
+    /// heap budget of the process and checkpointing it when idle; once it has closed, before its files close.
     void close() {
         closed = true;
+        // A checkpoint holds the lock while it runs, and one that takes it after this finds the store closed
+        lock.lock();
+        lock.unlock();
         OPEN.remove(this);
         IdleTicker.unwatch(this);
     }
@@ -172,11 +181,26 @@ final class Checkpointer implements IdleTicker.Watched {
         }
     }
 
-    /// Starts a checkpoint on a thread of its own, unless one is running.
+    /// Starts a checkpoint on a thread of its own, unless one is running; a thread the system refuses is reported as a
+    /// failed checkpoint, which the next start retries.
     private void start() {
         if (!scheduled.compareAndSet(false, true)) {
             return;
         }
+        try {
+            startThread();
+        } catch (Throwable refused) {
+            // As under a limit of processes: left scheduled, no checkpoint would start again, and commits that fell
+            // behind would wait for one forever
+            var failure = new LedgerIoException("A checkpoint could not start its thread", new IOException(refused));
+            lastFailure = failure;
+            scheduled.set(false);
+            signalProgress();
+            report(failure);
+        }
+    }
+
+    private void startThread() {
         Thread.ofPlatform().daemon().name("ledger-checkpoint").start(() -> {
             try {
                 if (!closed) {
@@ -276,6 +300,10 @@ final class Checkpointer implements IdleTicker.Watched {
     void run(boolean closing) {
         lock.lock();
         try {
+            if (closed && !closing) {
+                // Started on its own thread before the store began closing, and found the lock after
+                return;
+            }
             if (stopped != null) {
                 throw stopped;
             }

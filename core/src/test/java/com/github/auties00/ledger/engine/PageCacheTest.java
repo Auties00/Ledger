@@ -31,6 +31,8 @@ class PageCacheTest {
     @DisplayName("evicts at a tick of the idle ticker the entries no read used since the tick before, however far below its limit")
     void idleEviction() {
         var cache = PageCache.isolated(LIMIT);
+        // Ticked by the test alone
+        IdleTicker.unwatch(cache);
         for (var i = 0; i < 8; i++) {
             cache.put(new PageRef(i, 1, 1, i), new byte[PageFormat.SIZE], i % 2 == 0);
         }

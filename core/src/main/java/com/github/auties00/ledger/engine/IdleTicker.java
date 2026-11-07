@@ -47,12 +47,19 @@ final class IdleTicker {
             } catch (InterruptedException _) {
                 return;
             }
-            for (var watched : WATCHED.toArray(Watched[]::new)) {
-                try {
-                    watched.tick();
-                } catch (RuntimeException _) {
-                    // One that fails loses its tick, not the others theirs
-                }
+            tickAll();
+        }
+    }
+
+    /// Calls [Watched#tick()] of everything watched, on the caller's thread; one that throws, an [Error] included,
+    /// loses its tick, not the others theirs, and the thread goes on: its end would stop the ticks of every store of
+    /// the process.
+    static void tickAll() {
+        for (var watched : WATCHED.toArray(Watched[]::new)) {
+            try {
+                watched.tick();
+            } catch (Throwable _) {
+                // Its next tick may succeed, as one that could not start a thread may
             }
         }
     }

@@ -567,6 +567,8 @@ class CheckpointTest {
                     .checkpointEvery(1L << 30).build()) {
                 var live = (LiveLedger) ledger;
                 checkpointer = live.checkpointer();
+                // Ticked by the test alone: a tick of the process's ticker between two of these would move them
+                IdleTicker.unwatch(checkpointer);
                 ledger.commit(ledger.newBatch().put(MESSAGES, "small", "x")).awaitDurable();
                 checkpointer.tick();
                 checkpointer.tick();
@@ -601,6 +603,37 @@ class CheckpointTest {
     class BackgroundWork {
         private static boolean dataFile(Path path) {
             return path.getFileName() != null && path.getFileName().toString().equals(PageFile.FILE);
+        }
+
+        @ParameterizedTest(name = "final checkpoint {0}")
+        @ValueSource(booleans = {false, true})
+        @DisplayName("a checkpoint an idle tick started as the store closes writes nothing after its files close, and the store loses nothing")
+        void tickThenClose(boolean checkpoint, @TempDir Path root) throws Exception {
+            var value = "v".repeat(64 << 10);
+            var reports = new ConcurrentLinkedQueue<LedgerException>();
+            for (var attempt = 0; attempt < 3; attempt++) {
+                var directory = Files.createDirectory(root.resolve("store" + attempt));
+                var ledger = (LiveLedger) Ledger.builder().directory(directory).encryption(Encryption.key(KEY))
+                        .keyspace(MESSAGES).checkpointEvery(1L << 30).onBackgroundFailure(reports::add).build();
+                for (var i = 0; i < 200; i++) {
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "m%05d".formatted(i), value));
+                }
+                ledger.awaitDurable();
+                // The first tick sees the commits, the second an idle store with megabytes the trees lack
+                ledger.checkpointer().tick();
+                ledger.checkpointer().tick();
+                if (checkpoint) {
+                    ledger.close();
+                } else {
+                    ledger.closeWithoutCheckpoint();
+                }
+                Thread.sleep(300);
+                try (var reopened = open(directory, MESSAGES)) {
+                    assertEquals(200, reopened.size(MESSAGES));
+                    assertEquals(Optional.of(value), reopened.get(MESSAGES, "m00199"));
+                }
+            }
+            assertTrue(reports.isEmpty(), () -> "reported: " + reports.peek() + ", caused by " + reports.peek().getCause());
         }
 
         @Test
