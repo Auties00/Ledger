@@ -801,8 +801,6 @@ final class KeyspaceState {
 
     /// {@return the version of the key whose bytes are `key` a reader with `bound` sees, as
     /// [#resolve(Version, MemorySegment, long, RangeRemoval\[\])] gives it}
-    ///
-    /// It makes a segment of `key` only for a removal that may hide the version.
     static Version resolve(Version head, byte[] key, long bound, RangeRemoval[] removals) {
         var version = head;
         while (version != null && version.stamp > bound) {
@@ -815,7 +813,7 @@ final class KeyspaceState {
             return Version.HIDDEN;
         }
         for (var removal : removals) {
-            if (removal.stamp() > version.stamp && removal.stamp() <= bound && removal.covers(MemorySegment.ofArray(key))) {
+            if (removal.stamp() > version.stamp && removal.stamp() <= bound && removal.covers(key)) {
                 return Version.HIDDEN;
             }
         }
