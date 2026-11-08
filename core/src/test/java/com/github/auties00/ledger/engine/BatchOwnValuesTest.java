@@ -153,7 +153,7 @@ class BatchOwnValuesTest {
         }
 
         @ParameterizedTest(name = "held {0}, more {1}")
-        @CsvSource({"0,2147483639", "2147483638,1", "1073741824,1073741815"})
+        @CsvSource({"0,2130706423", "2130706422,1", "1073741824,1056964599"})
         @DisplayName("has room up to what a log frame's array can hold")
         void room(long held, long more) {
             ArrayWriteBatch.checkRoom(held, more);
