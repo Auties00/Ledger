@@ -59,15 +59,18 @@ final class Reads {
 
     /// {@return the value of `key` in the tree of `point`, or `null` if it holds none or a later removal hides it}
     private static MemorySegment treeValue(KeyspaceState state, MemorySegment key, ReadPoint point, RangeRemoval[] removals) {
+        var hit = treeHit(state, key, point, removals);
+        return hit == null ? null : TreeSearch.value(point.pages(), hit.unit(), hit.entry());
+    }
+
+    /// {@return the entry of `key` in the tree of `point`, or `null` if it holds none or a later removal hides it}
+    private static TreeSearch.Hit treeHit(KeyspaceState state, MemorySegment key, ReadPoint point, RangeRemoval[] removals) {
         var root = point.root(state);
         if (root == null) {
             return null;
         }
         var hit = TreeSearch.find(point.pages(), root, key);
-        if (hit == null || hiddenSinceTree(key, point, removals)) {
-            return null;
-        }
-        return TreeSearch.value(point.pages(), hit.unit(), hit.entry());
+        return hit == null || hiddenSinceTree(key, point, removals) ? null : hit;
     }
 
     /// {@return whether the tree of `point` holds `key` and no later removal `point` sees hides it}
@@ -170,21 +173,35 @@ final class Reads {
         return total;
     }
 
+    /// {@return the value `point` sees under `key`}
+    ///
+    /// A resident key space returns the decoded value its version holds. Any other key space with byte array values
+    /// copies the value out of the array that holds it, a version's own or a page's, rather than decoding a segment
+    /// of it: the decoder's copy would zero the new array before filling it ([Segments#toBytes(byte\[\], int, int)]).
+    @SuppressWarnings("unchecked")
     static <K, V> Optional<V> get(KeyspaceState state, Keyspace<K, V> keyspace, K key, ReadPoint point) {
         var encoded = Segments.encodeKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
         var removals = state.removals;
         var version = KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals);
+        // Its decoder copies the encoding whole, so the copy here returns the same bytes
+        var bytes = keyspace.values() == BuiltinCodecs.BYTES_VALUE;
         if (version != null) {
             if (version == Version.HIDDEN) {
                 return Optional.empty();
             }
             // A resident key space reads the decoded value: no slice of the encoded one
-            @SuppressWarnings("unchecked")
-            var found = state.resident ? (V) version.decoded : keyspace.values().decode(version.value());
-            return Optional.of(found);
+            if (state.resident) {
+                return Optional.of((V) version.decoded);
+            }
+            return Optional.of(bytes ? (V) version.copyBytes() : keyspace.values().decode(version.value()));
         }
-        var value = treeValue(state, encoded, point, removals);
-        return value == null ? Optional.empty() : Optional.of(keyspace.values().decode(value));
+        var hit = treeHit(state, encoded, point, removals);
+        if (hit == null) {
+            return Optional.empty();
+        }
+        return Optional.of(bytes
+                ? (V) TreeSearch.valueBytes(point.pages(), hit.unit(), hit.entry())
+                : keyspace.values().decode(TreeSearch.value(point.pages(), hit.unit(), hit.entry())));
     }
 
     static <K, V> List<Entry<K, V>> range(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, int limit, ReadPoint point) {

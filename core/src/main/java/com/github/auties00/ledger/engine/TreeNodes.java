@@ -168,7 +168,23 @@ final class TreeNodes {
     /// {@return the read-only inline value of leaf entry `entry`}
     static MemorySegment inlineValue(byte[] unit, int entry) {
         var field = valueField(unit, entry);
-        return MemorySegment.ofArray(unit).asSlice(field + 3, Bytes.u16(unit, field + 1)).asReadOnly();
+        return MemorySegment.ofArray(unit).asSlice(inlineValueOffset(field), inlineValueLength(unit, field)).asReadOnly();
+    }
+
+    /// {@return the inline value of leaf entry `entry`, in a new array}
+    static byte[] inlineValueBytes(byte[] unit, int entry) {
+        var field = valueField(unit, entry);
+        return Segments.toBytes(unit, inlineValueOffset(field), inlineValueLength(unit, field));
+    }
+
+    // Where the inline value of the entry whose value field is at `field` starts
+    private static int inlineValueOffset(int field) {
+        return field + 3;
+    }
+
+    // The length of the inline value of the entry whose value field is at `field`
+    private static int inlineValueLength(byte[] unit, int field) {
+        return Bytes.u16(unit, field + 1);
     }
 
     static int blobLength(byte[] unit, int entry) {
