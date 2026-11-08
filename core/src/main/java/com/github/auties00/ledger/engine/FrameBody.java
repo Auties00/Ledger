@@ -50,14 +50,18 @@ final class FrameBody {
     ///
     /// A body that doubled from a small array allocated about twice its bytes, and kept up to twice as many in the
     /// log's queue as the queue counts.
+    ///
+    /// The encodings of the batch hold its keys, values and bounds, and the bytes a write whose codec threw had
+    /// reserved, which only make the estimate larger: only a commit with large values visits its writes.
     static int capacityFor(ArrayWriteBatch writes, PageRef[] units) {
-        var bytes = 16L;
-        for (var i = 0; i < writes.size(); i++) {
-            // The kind, the key space and the lengths, as variable-length numbers
-            bytes += 16 + writes.spanBytes(i);
-            if (units != null && units[i] != null) {
-                // The value is in its unit
-                bytes += PageRef.BYTES - writes.valueBytes(i);
+        // The kind, the key space and the lengths of each write, as variable-length numbers, and what they encode
+        var bytes = 16 + 16L * writes.size() + writes.encodedBytes();
+        if (units != null) {
+            for (var i = 0; i < units.length; i++) {
+                if (units[i] != null) {
+                    // The value is in its unit
+                    bytes += PageRef.BYTES - writes.valueBytes(i);
+                }
             }
         }
         return (int) Math.min(bytes, 64L << 20);
