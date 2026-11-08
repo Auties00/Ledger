@@ -35,6 +35,8 @@ import java.util.List;
 ///
 /// Every child's first key is the lowest key of its subtree, so a key below the first key of a branch's first child
 /// still belongs to it.
+///
+/// The array of a node the page cache holds may run past its page, with a [NodeIndex] its searches use.
 final class TreeNodes {
     /// The bytes a node's entries and their offsets may take.
     static final int CAPACITY = PageFormat.capacity(1) - 2;
@@ -43,6 +45,10 @@ final class TreeNodes {
     /// The fill below which a node a checkpoint rewrote merges with a neighbour.
     static final int MIN_FILL = CAPACITY / 4;
     private static final int BRANCH_FIXED = 4 + 8 + 4 + 8 + 1 + 2;
+    /// The bytes into a leaf entry where its key starts, its length in the two bytes before it.
+    static final int LEAF_KEY = 2;
+    /// The bytes into a branch entry where its key starts, its length in the two bytes before it.
+    static final int BRANCH_KEY = BRANCH_FIXED;
     private static final byte INLINE = 0;
     private static final byte BLOB = 1;
     private static final byte EXTERNAL = 2;
@@ -99,6 +105,9 @@ final class TreeNodes {
 
     /// {@return the index of the first entry of the leaf `unit` whose key is at or after `key`, or its count}
     static int lowerBound(byte[] unit, MemorySegment key) {
+        if (NodeIndex.isPresent(unit)) {
+            return NodeIndex.lowerBound(unit, key);
+        }
         var low = 0;
         var high = count(unit);
         while (low < high) {
@@ -181,6 +190,9 @@ final class TreeNodes {
 
     /// {@return the index of the child of the branch `unit` whose subtree would hold `key`}
     static int childFor(byte[] unit, MemorySegment key) {
+        if (NodeIndex.isPresent(unit)) {
+            return NodeIndex.childFor(unit, key);
+        }
         // The last child whose first key is at or before the key, or the first child
         var low = 1;
         var high = count(unit);
@@ -198,6 +210,9 @@ final class TreeNodes {
 
     /// {@return the index of the last child of the branch `unit` whose first key is before `key`, or -1}
     static int lastChildBefore(byte[] unit, MemorySegment key) {
+        if (NodeIndex.isPresent(unit)) {
+            return NodeIndex.lastChildBefore(unit, key);
+        }
         var low = 0;
         var high = count(unit);
         while (low < high) {

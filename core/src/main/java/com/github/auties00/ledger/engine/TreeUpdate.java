@@ -481,7 +481,7 @@ final class TreeUpdate {
     private byte[] read(PageRef ref, byte kind, boolean cached) {
         if (!ref.isRecord()) {
             var unit = writer.staged(ref);
-            return unit != null ? unit : pages.read(ref, kind, cached);
+            return unit != null ? unit : pages.readToReplace(ref, kind, cached);
         }
         var hit = pages.cached(ref, kind);
         if (hit != null) {
@@ -493,7 +493,7 @@ final class TreeUpdate {
                 return filling;
             }
             var staged = writer.staged(unit);
-            return staged != null ? staged : pages.read(unit, unitKind, cached);
+            return staged != null ? staged : pages.readToReplace(unit, unitKind, cached);
         });
     }
 

@@ -28,6 +28,18 @@ class PageCacheTest {
     }
 
     @Test
+    @DisplayName("finds a unit whose array runs past its pages, and charges for the whole array, but not one that stops short")
+    void arrayLengths() {
+        var cache = PageCache.isolated(LIMIT);
+        var indexed = new byte[PageFormat.SIZE + 100];
+        cache.put(new PageRef(5, 1, 1, 1), indexed, false);
+        assertSame(indexed, cache.get(new PageRef(5, 1, 1, 1)));
+        assertEquals(indexed.length, cache.size());
+        cache.put(new PageRef(6, 2, 1, 2), new byte[PageFormat.SIZE], false);
+        assertNull(cache.get(new PageRef(6, 2, 1, 2)));
+    }
+
+    @Test
     @DisplayName("evicts at a tick of the idle ticker the entries no read used since the tick before, however far below its limit")
     void idleEviction() {
         var cache = PageCache.isolated(LIMIT);

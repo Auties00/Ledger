@@ -89,13 +89,15 @@ final class PageCache implements IdleTicker.Watched {
     }
 
     /// {@return the plaintext of the unit `ref` names, at `key`, or `null` if the cache does not hold it}
+    ///
+    /// The array may run past the unit's pages, with a [NodeIndex].
     byte[] get(long key, PageRef ref) {
         var entry = entries.get(key);
         if (entry == null || entry.nonceHigh != ref.nonceHigh() || entry.nonceLow != ref.nonceLow()) {
             return null;
         }
         var unit = entry.unit;
-        if (unit == null || unit.length != ref.pages() * PageFormat.SIZE) {
+        if (unit == null || unit.length < ref.pages() * PageFormat.SIZE) {
             return null;
         }
         // Written only when they change: a volatile store on every hit made the readers of one page, the root

@@ -165,6 +165,8 @@ final class PageFile implements AutoCloseable {
 
     /// {@return the plaintext of the unit `ref` names, from the cache or the file}
     ///
+    /// A leaf or branch the cache takes as read gets a [NodeIndex], and its array runs past its page.
+    ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     /// @param cached whether to keep the unit in the cache
     /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
@@ -175,6 +177,33 @@ final class PageFile implements AutoCloseable {
         if (hit != null && kindMatches(hit[PageFormat.KIND], kind)) {
             return hit;
         }
+        return load(ref, kind, cached, referenced, referenced);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, from the cache or the file, for a checkpoint that replaces it}
+    ///
+    /// A node a checkpoint reads goes away with the checkpoint's copy-on-write, so the cache takes it without the
+    /// [NodeIndex] no search would use.
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    /// @param cached whether to keep the unit in the cache, as read
+    /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[] readToReplace(PageRef ref, byte kind, boolean cached) {
+        var hit = cache.get(ref);
+        if (hit != null && kindMatches(hit[PageFormat.KIND], kind)) {
+            return hit;
+        }
+        return load(ref, kind, cached, true, false);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, which the cache does not hold under its kind}
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    /// @param cached whether to keep the unit in the cache
+    /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
+    /// @param indexed whether a leaf or branch the cache takes gets a [NodeIndex]
+    private byte[] load(PageRef ref, byte kind, boolean cached, boolean referenced, boolean indexed) {
         if (ref.isRecord()) {
             // The delta page and the base go to the cache as the entries it evicts first: the leaf they make is what a
             // read uses again, and holding all three filled the cache with each leaf twice
@@ -183,6 +212,9 @@ final class PageFile implements AutoCloseable {
                 throw new LedgerCorruptedException(path + " holds a delta record where a branch belongs, at page " + ref.page(), null);
             }
             if (cached) {
+                if (indexed) {
+                    leaf = NodeIndex.attach(leaf);
+                }
                 cache.put(ref, leaf, referenced);
             }
             return leaf;
@@ -196,6 +228,9 @@ final class PageFile implements AutoCloseable {
                 throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
             }
             if (cached) {
+                if (indexed) {
+                    plain = NodeIndex.attach(plain);
+                }
                 cache.put(ref, plain, referenced);
             }
             return plain;
