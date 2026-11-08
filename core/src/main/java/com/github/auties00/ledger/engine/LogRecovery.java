@@ -18,8 +18,9 @@ import java.util.zip.CRC32C;
 
 /// Replays the log of a store when it opens.
 ///
-/// Segments are read in the order of their numbers, frames in the order of their offsets. Commit frames must carry
-/// consecutive sequences; a catalog frame carries the sequence of the commit before it. The first frame of a segment,
+/// Segments are read in the order of their numbers, frames in the order of their offsets. Commits must have
+/// consecutive sequences, whether each has a frame of its own or a run holds it, whose commits have the sequences from
+/// the one its frame carries; a catalog frame carries the sequence of the commit before it. The first frame of a segment,
 /// the first of a group, gives the tag of the use of the segment the later ones must carry. A frame that is cut short,
 /// fails authentication, or carries the tag of another segment's salt (an earlier use of the file) or of another use
 /// of the segment ends its segment: it is the torn tail of a group whose force never completed, or what lies past the
@@ -41,7 +42,8 @@ import java.util.zip.CRC32C;
 ///
 /// A commit whose units of [BlobFile] the file does not hold whole ends its segment like a frame that fails
 /// authentication: its group was forced beside that file, and acknowledged only once both forces completed, so without a
-/// later group it is a commit no one was told of.
+/// later group it is a commit no one was told of. The commits of its run before it are replayed, those after it are
+/// not. A run whose frame authenticates but whose entries are malformed is damage, not a tear, and is refused.
 ///
 /// Segments are read through a buffer, a part at a time.
 final class LogRecovery {
@@ -173,6 +175,23 @@ final class LogRecovery {
                                 }
                             }
                             // Otherwise held by the checkpoint's trees
+                        }
+                        case FrameBody.COMMITS -> {
+                            var commits = new FrameBody.RunReader(body);
+                            for (var next = sequence; replayed && commits.hasNext(); next++) {
+                                if (next <= checkpoint) {
+                                    // Held by the checkpoint's trees
+                                    commits.skip();
+                                    continue;
+                                }
+                                if (next != last + 1) {
+                                    throw new LedgerCorruptedException(path + " holds commit " + next + " after commit " + last, null);
+                                }
+                                replayed = sink.commit(next, commits.next());
+                                if (replayed) {
+                                    last = next;
+                                }
+                            }
                         }
                         case FrameBody.CATALOG -> {
                             if (sequence > last) {

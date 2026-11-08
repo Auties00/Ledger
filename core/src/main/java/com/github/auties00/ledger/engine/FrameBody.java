@@ -18,8 +18,14 @@ import java.util.Arrays;
 /// external  3, id, key length, key, value length, reference of the value's unit in ledger.blobs (20)
 /// ```
 ///
-/// A catalog body is entries of an id and a name; an epoch body is the epoch. Numbers are unsigned LEB128 varints;
-/// keys are never empty, so a bound of length 0 is an absent bound.
+/// A catalog body is entries of an id and a name; an epoch body is the epoch. A run body is the bodies of commits of
+/// consecutive sequences, from the one its frame carries, each after its length:
+///
+/// ```text
+/// run       body length, commit body, body length, commit body, ...   (at least one commit)
+/// ```
+///
+/// Numbers are unsigned LEB128 varints; keys are never empty, so a bound of length 0 is an absent bound.
 final class FrameBody {
     /// A frame holding a commit.
     static final byte COMMIT = 1;
@@ -27,6 +33,9 @@ final class FrameBody {
     static final byte CATALOG = 2;
     /// A frame holding the epoch of an open, durable before the open writes a unit of [BlobFile].
     static final byte EPOCH = 3;
+    /// A frame holding a run of commits of consecutive sequences, from the one it carries, which [LogWriter] seals as
+    /// one message.
+    static final byte COMMITS = 4;
 
     private static final byte PUT = 0;
     private static final byte DELETE = 1;
@@ -108,6 +117,30 @@ final class FrameBody {
             throw new LedgerCorruptedException("A log frame holds a malformed epoch", null);
         }
         return (int) epoch;
+    }
+
+    /// {@return the bytes a commit body of `length` bytes takes in a run body: its length, then its bytes}
+    static int runEntryBytes(int length) {
+        return varIntBytes(length) + length;
+    }
+
+    /// Writes this commit body into `target` at `offset` as an entry of a run body, its length then its bytes.
+    ///
+    /// @return the offset after the entry, `offset` plus [#runEntryBytes(int)] of [#size()]
+    int writeRunEntry(byte[] target, int offset) {
+        var value = size;
+        while ((value & ~0x7F) != 0) {
+            target[offset++] = (byte) ((value & 0x7F) | 0x80);
+            value >>>= 7;
+        }
+        target[offset++] = (byte) value;
+        System.arraycopy(data, 0, target, offset, size);
+        return offset + size;
+    }
+
+    /// {@return the bytes of `value` as an unsigned LEB128 varint}
+    private static int varIntBytes(int value) {
+        return value == 0 ? 1 : (38 - Integer.numberOfLeadingZeros(value)) / 7;
     }
 
     void delete(int keyspace, MemorySegment key) {
@@ -202,6 +235,46 @@ final class FrameBody {
         }
     }
 
+    /// The commit bodies of a run body, read one at a time.
+    static final class RunReader {
+        private final Reader reader;
+        private final int length;
+
+        /// Reads the run body `run`.
+        ///
+        /// @throws LedgerCorruptedException if it holds no commit
+        RunReader(byte[] run) {
+            if (run.length == 0) {
+                throw new LedgerCorruptedException("A log frame holds a run of no commits", null);
+            }
+            this.reader = new Reader(run);
+            this.length = run.length;
+        }
+
+        /// {@return whether a commit follows the ones read}
+        boolean hasNext() {
+            return reader.position < length;
+        }
+
+        /// {@return a copy of the body of the next commit, an array of its own as the body of a commit frame is}
+        ///
+        /// @throws LedgerCorruptedException if the entry is malformed or runs past the run
+        byte[] next() {
+            var size = (int) reader.readLength();
+            var body = Arrays.copyOfRange(reader.body, reader.position, reader.position + size);
+            reader.position += size;
+            return body;
+        }
+
+        /// Passes over the body of the next commit.
+        ///
+        /// @throws LedgerCorruptedException if the entry is malformed or runs past the run
+        void skip() {
+            var size = (int) reader.readLength();
+            reader.position += size;
+        }
+    }
+
     /// Receives the writes of a commit body.
     interface Visitor {
         void put(int keyspace, MemorySegment key, MemorySegment value);
@@ -253,9 +326,15 @@ final class FrameBody {
             throw new LedgerCorruptedException("A log frame holds a malformed number", null);
         }
 
-        MemorySegment readSegment() {
+        /// {@return a length, checked against what is left}
+        long readLength() {
             var length = readVarInt();
             check(length);
+            return length;
+        }
+
+        MemorySegment readSegment() {
+            var length = readLength();
             var segment = memory.asSlice(position, length);
             position += (int) length;
             return segment;
