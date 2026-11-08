@@ -122,7 +122,7 @@ class TreeUpdateTest {
             pages.cache().clearForTests();
             // A hot leaf, read before the scan
             var hot = segment("k000010".getBytes());
-            assertTrue(TreeSearch.find(pages, root, hot) != null);
+            assertTrue(TreeSearch.contains(pages, root, hot));
             var cursor = new TreeCursor(pages, root, null, null, false);
             var scanned = 0;
             while (cursor.next()) {
@@ -171,12 +171,21 @@ class TreeUpdateTest {
         }
         for (var i = 0; i < 50; i++) {
             var key = keys.get(random.nextInt(keys.size()));
-            var hit = root == null ? null : TreeSearch.find(pages, root, segment(key));
             var expected = model.get(key);
+            if (root == null) {
+                assertNull(expected);
+                continue;
+            }
+            assertEquals(expected != null, TreeSearch.contains(pages, root, segment(key)));
+            var unit = TreeSearch.leaf(pages, root, key);
+            var entry = TreeSearch.entryOf(unit, key);
             if (expected == null) {
-                assertNull(hit);
+                assertEquals(-1, entry);
             } else {
-                assertArrayEquals(expected, bytes(TreeSearch.value(pages, hit.unit(), hit.entry())));
+                assertArrayEquals(expected, bytes(TreeSearch.value(pages, unit, entry)));
+                if (TreeNodes.isInline(unit, entry)) {
+                    assertArrayEquals(expected, TreeNodes.inlineBytes(unit, entry));
+                }
             }
         }
     }
@@ -189,7 +198,7 @@ class TreeUpdateTest {
                     : to == null ? model.tailMap(from, true)
                     : model.subMap(from, true, to, false);
             var ordered = descending ? new ArrayList<>(expected.descendingMap().entrySet()) : new ArrayList<>(expected.entrySet());
-            var cursor = new TreeCursor(pages, root, from == null ? null : segment(from), to == null ? null : segment(to), descending);
+            var cursor = new TreeCursor(pages, root, from, to, descending);
             for (var entry : ordered) {
                 assertTrue(cursor.next(), "the cursor ended early");
                 assertArrayEquals(entry.getKey(), bytes(cursor.key()));

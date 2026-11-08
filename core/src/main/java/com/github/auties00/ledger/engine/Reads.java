@@ -57,29 +57,41 @@ final class Reads {
         return false;
     }
 
+    /// {@return whether a range removal the tree of `point` does not hold, and `point` sees, covers the key whose bytes
+    /// are `key`}
+    ///
+    /// It makes a segment of `key` only for a removal that may cover it.
+    private static boolean hiddenSinceTree(byte[] key, ReadPoint point, RangeRemoval[] removals) {
+        var treeBound = point.treeBound();
+        for (var removal : removals) {
+            if (removal.stamp() > treeBound && removal.stamp() <= point.bound() && removal.covers(MemorySegment.ofArray(key))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// {@return the value of `key` in the tree of `point`, or `null` if it holds none or a later removal hides it}
-    private static MemorySegment treeValue(KeyspaceState state, MemorySegment key, ReadPoint point, RangeRemoval[] removals) {
+    private static MemorySegment treeValue(KeyspaceState state, byte[] key, ReadPoint point, RangeRemoval[] removals) {
         var root = point.root(state);
-        if (root == null) {
+        if (root == null || hiddenSinceTree(key, point, removals)) {
             return null;
         }
-        var hit = TreeSearch.find(point.pages(), root, key);
-        if (hit == null || hiddenSinceTree(key, point, removals)) {
-            return null;
-        }
-        return TreeSearch.value(point.pages(), hit.unit(), hit.entry());
+        var unit = TreeSearch.leaf(point.pages(), root, key);
+        var entry = TreeSearch.entryOf(unit, key);
+        return entry == -1 ? null : TreeSearch.value(point.pages(), unit, entry);
     }
 
     /// {@return whether the tree of `point` holds `key` and no later removal `point` sees hides it}
     static boolean inTree(KeyspaceState state, MemorySegment key, ReadPoint point, RangeRemoval[] removals) {
         var root = point.root(state);
-        return root != null && TreeSearch.find(point.pages(), root, key) != null && !hiddenSinceTree(key, point, removals);
+        return root != null && TreeSearch.contains(point.pages(), root, key) && !hiddenSinceTree(key, point, removals);
     }
 
     /// {@return whether the tree of `point` holds `key`, whatever range removal since hides it}
     static boolean inTreeOnly(KeyspaceState state, MemorySegment key, ReadPoint point) {
         var root = point.root(state);
-        return root != null && TreeSearch.find(point.pages(), root, key) != null;
+        return root != null && TreeSearch.contains(point.pages(), root, key);
     }
 
     /// {@return whether `point` sees `key`, whose newest version in memory is `head`, as [TreeSearch#FOUND] or
@@ -171,7 +183,7 @@ final class Reads {
     }
 
     static <K, V> Optional<V> get(KeyspaceState state, Keyspace<K, V> keyspace, K key, ReadPoint point) {
-        var encoded = Segments.encodeKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
+        var encoded = Segments.lookupKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
         var removals = state.removals;
         var version = KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals);
         if (version != null) {
@@ -183,8 +195,22 @@ final class Reads {
             var found = state.resident ? (V) version.decoded : keyspace.values().decode(version.value());
             return Optional.of(found);
         }
-        var value = treeValue(state, encoded, point, removals);
-        return value == null ? Optional.empty() : Optional.of(keyspace.values().decode(value));
+        var root = point.root(state);
+        if (root == null || hiddenSinceTree(encoded, point, removals)) {
+            return Optional.empty();
+        }
+        var unit = TreeSearch.leaf(point.pages(), root, encoded);
+        var entry = TreeSearch.entryOf(unit, encoded);
+        if (entry == -1) {
+            return Optional.empty();
+        }
+        if (keyspace.values() == BuiltinCodecs.BYTES_VALUE && TreeNodes.isInline(unit, entry)) {
+            // Decoding it copies it out of the leaf: no segment over the leaf for that
+            @SuppressWarnings("unchecked")
+            var copied = (V) TreeNodes.inlineBytes(unit, entry);
+            return Optional.of(copied);
+        }
+        return Optional.of(keyspace.values().decode(TreeSearch.value(point.pages(), unit, entry)));
     }
 
     static <K, V> List<Entry<K, V>> range(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, int limit, ReadPoint point) {
@@ -214,7 +240,7 @@ final class Reads {
     static <K, R> Optional<R> readEncoded(KeyspaceState state, Keyspace<K, ?> keyspace, K key, ReadPoint point,
                                           Function<? super MemorySegment, ? extends R> reader) {
         Objects.requireNonNull(reader, "reader");
-        var encoded = Segments.encodeKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
+        var encoded = Segments.lookupKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
         var removals = state.removals;
         var version = KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals);
         MemorySegment value;
@@ -246,8 +272,11 @@ final class Reads {
     /// @return the number of entries passed
     static <K> long scan(KeyspaceState state, Keyspace<K, ?> keyspace, KeyRange<K> range, ReadPoint point, Visitor consumer) {
         Objects.requireNonNull(range, "range");
-        var from = range.from().map(key -> Segments.encodeKey(keyspace.keys(), key)).orElse(null);
-        var to = range.to().map(key -> Segments.encodeKey(keyspace.keys(), key)).orElse(null);
+        // Copies, whatever the codec: the cursor keeps its bounds while a visitor runs, which may change a caller's array
+        var fromBytes = range.from().map(key -> Segments.encodeKeyBytes(keyspace.keys(), key)).orElse(null);
+        var toBytes = range.to().map(key -> Segments.encodeKeyBytes(keyspace.keys(), key)).orElse(null);
+        var from = fromBytes == null ? null : MemorySegment.ofArray(fromBytes);
+        var to = toBytes == null ? null : MemorySegment.ofArray(toBytes);
         if (from != null && to != null && Segments.compare(from, to) >= 0) {
             return 0;
         }
@@ -256,7 +285,7 @@ final class Reads {
         var slice = state.slice(from, to);
         var memory = (descending ? slice.descendingMap() : slice).entrySet().iterator();
         var root = point.root(state);
-        var tree = root == null ? null : new TreeCursor(point.pages(), root, from, to, descending);
+        var tree = root == null ? null : new TreeCursor(point.pages(), root, fromBytes, toBytes, descending);
         var inTree = tree != null && tree.next();
         Map.Entry<MemorySegment, Chain> held = memory.hasNext() ? memory.next() : null;
         var visited = 0L;

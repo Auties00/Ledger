@@ -18,8 +18,9 @@ final class TreeCursor {
     static final int ADMITTED = 64;
 
     private final PageFile pages;
-    private final MemorySegment from;
-    private final MemorySegment to;
+    // The bounds in arrays, which the nodes compare with their keys word by word
+    private final byte[] from;
+    private final byte[] to;
     private final boolean descending;
     private byte[][] path;
     private int[] indexes;
@@ -36,7 +37,9 @@ final class TreeCursor {
     /// `null` for no bound.
     ///
     /// @param root the root, or `null` for an empty tree
-    TreeCursor(PageFile pages, TreeRoot root, MemorySegment from, MemorySegment to, boolean descending) {
+    /// @param from the lowest key, which the cursor keeps and no one may change while it is used
+    /// @param to the first key past the range, which the cursor keeps and no one may change while it is used
+    TreeCursor(PageFile pages, TreeRoot root, byte[] from, byte[] to, boolean descending) {
         this.pages = pages;
         this.from = from;
         this.to = to;

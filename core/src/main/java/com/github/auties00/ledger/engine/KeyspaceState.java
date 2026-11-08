@@ -106,7 +106,7 @@ final class KeyspaceState {
 
     /// {@return the chain of `key`, or `null` if memory holds none}
     Chain chain(MemorySegment key) {
-        return index.get(key, Segments.hash(key));
+        return index.holdsNone() ? null : index.get(key, Segments.hash(key));
     }
 
     /// {@return the chains memory holds, ordered or not}
@@ -130,6 +130,15 @@ final class KeyspaceState {
     /// {@return the newest version of `key` in memory, or `null`}
     Version head(MemorySegment key) {
         var chain = chain(key);
+        return chain == null ? null : chain.head;
+    }
+
+    /// {@return the newest version in memory of the key whose bytes are `key`, or `null`}
+    Version head(byte[] key) {
+        if (index.holdsNone()) {
+            return null;
+        }
+        var chain = index.get(key, Segments.hash(key));
         return chain == null ? null : chain.head;
     }
 
@@ -420,6 +429,29 @@ final class KeyspaceState {
         }
         for (var removal : removals) {
             if (removal.stamp() > version.stamp && removal.stamp() <= bound && removal.covers(key)) {
+                return Version.HIDDEN;
+            }
+        }
+        return version;
+    }
+
+    /// {@return the version of the key whose bytes are `key` a reader with `bound` sees, as
+    /// [#resolve(Version, MemorySegment, long, RangeRemoval\[\])] gives it}
+    ///
+    /// It makes a segment of `key` only for a removal that may hide the version.
+    static Version resolve(Version head, byte[] key, long bound, RangeRemoval[] removals) {
+        var version = head;
+        while (version != null && version.stamp > bound) {
+            version = version.older;
+        }
+        if (version == null) {
+            return null;
+        }
+        if (version.removes()) {
+            return Version.HIDDEN;
+        }
+        for (var removal : removals) {
+            if (removal.stamp() > version.stamp && removal.stamp() <= bound && removal.covers(MemorySegment.ofArray(key))) {
                 return Version.HIDDEN;
             }
         }
