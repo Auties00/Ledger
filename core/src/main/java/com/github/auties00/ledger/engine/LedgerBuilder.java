@@ -37,6 +37,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private Duration commitWindow;
     private long segmentSize;
     private long checkpointHeap;
+    private long forceDeferral;
     private Consumer<? super LedgerException> backgroundFailures;
     private long largeValues;
     private final Map<String, Long> largeValuesByKeyspace;
@@ -50,6 +51,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         this.segmentSize = SEGMENT_SIZE;
         // The writes the trees lack may hold up to half the heap before commits wait for more than two intervals
         this.checkpointHeap = Runtime.getRuntime().maxMemory() / 2;
+        this.forceDeferral = Checkpointer.FORCE_DEFERRAL;
         this.backgroundFailures = _ -> {
         };
         this.largeValues = MIB;
@@ -67,6 +69,13 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     /// a checkpoint, by the logs' estimates, so tests can reach it without filling half the heap.
     LedgerBuilder checkpointHeap(long bytes) {
         this.checkpointHeap = bytes;
+        return this;
+    }
+
+    /// Sets the longest a checkpoint started on the store's own thread holds its forces back for the log to go quiet,
+    /// so tests can make it hold them on any platform, for longer than a test runs, or never.
+    LedgerBuilder forceDeferral(Duration deferral) {
+        this.forceDeferral = deferral.toNanos();
         return this;
     }
 
@@ -292,7 +301,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));
             var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
                     superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures,
-                    superblock == null ? 0 : superblock.epoch(), epochs[0], checkpointHeap);
+                    superblock == null ? 0 : superblock.epoch(), epochs[0], checkpointHeap, forceDeferral);
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
             } else {

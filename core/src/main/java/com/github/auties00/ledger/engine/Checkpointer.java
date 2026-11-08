@@ -12,8 +12,11 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -29,6 +32,11 @@ import java.util.concurrent.locks.ReentrantLock;
 /// The store starts one on a platform thread of its own whenever the log has grown by the checkpoint interval since
 /// the last; [Ledger#checkpoint()][com.github.auties00.ledger.Ledger#checkpoint()] and
 /// [Ledger#close()][com.github.auties00.ledger.Ledger#close()] run one on the caller's thread. One runs at a time.
+///
+/// One started on its own thread that the commits do not wait for holds its forces back, once its pages are written,
+/// until the log has had nothing to write for a moment ([#awaitQuietLog]): the device takes the commits' groups
+/// first, and the pages in the lull after them. Nothing it wrote is durable state yet, so the wait changes when the
+/// checkpoint ends, not what a crash leaves.
 ///
 /// Every unit of a checkpoint is sealed under a nonce made of 8 random bytes drawn for the checkpoint and a counter,
 /// so no nonce repeats under the store's key, even across a checkpoint that a crash cut short.
@@ -51,6 +59,20 @@ final class Checkpointer implements IdleTicker.Watched {
     /// [IdleTicker] without a commit checkpoints them: below it, a store that writes now and then would checkpoint
     /// after almost every write.
     static final long IDLE_BACKLOG = 1L << 20;
+    /// The longest a checkpoint started on its own thread holds its forces back for the log to go quiet, in
+    /// nanoseconds, where the store's options set no other: about as long as the force of a checkpoint of a whole
+    /// interval takes. On Linux, the 250 MB of pages of the checkpoint that took in the first 256 MiB of an ingest of a
+    /// history, forced in 1.7 to 2.1 seconds while the ingest went on, made its final durable commit wait 0.9 to 1.1
+    /// seconds, where alone it waits 0.1 to 0.2. None on Windows, as for the forces beside a checkpoint's work
+    /// ([PageFile]): its cache writes the pages out while the checkpoint waits, so the wait would only make it end
+    /// later.
+    static final long FORCE_DEFERRAL = System.getProperty("os.name", "").startsWith("Windows") ? 0
+            : TimeUnit.SECONDS.toNanos(2);
+    /// The time between two looks at the log of a checkpoint that holds its forces back.
+    private static final long DEFERRAL_STEP = TimeUnit.MILLISECONDS.toNanos(5);
+    /// How long the log has had nothing to write, nor been given a frame, when a checkpoint that holds its forces back
+    /// forces them: two looks, so the moment between two groups of a stream does not pass for its end.
+    private static final long QUIET = 2 * DEFERRAL_STEP;
     // The checkpointers of the open stores of the process, whose writes the trees lack share one heap budget: a budget
     // of half the heap for each store let a process of several busy stores buffer more than the heap
     private static final Set<Checkpointer> OPEN = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
@@ -94,6 +116,16 @@ final class Checkpointer implements IdleTicker.Watched {
     // The delta pages of the last durable checkpoint, and the blob that holds their table, or null; guarded by the lock
     private DeltaTable deltas;
     private PageRef deltaTable;
+    // The longest a checkpoint started on its own thread holds its forces back, in nanoseconds; 0 for never
+    private final long forceDeferral;
+    // The callers waiting on the running checkpoint: commits throttle() holds back, and checkpoints and closes on their
+    // callers' threads waiting for the lock. While any waits, no checkpoint holds its forces back
+    private final AtomicInteger urgent;
+    // The thread of the checkpoint holding its forces back, which a caller that starts to wait on it unparks; or null
+    private volatile Thread deferring;
+    // How long the forces of the last checkpoint of this open took, in nanoseconds, or 0 before the first; guarded by
+    // the lock
+    private long forceNanos;
 
     /// Creates the checkpointer of `ledger`.
     ///
@@ -104,9 +136,11 @@ final class Checkpointer implements IdleTicker.Watched {
     /// @param failures receives the failures of the checkpoints started on their own threads
     /// @param durableEpoch the epoch of the file of large values the last superblock records
     /// @param loggedEpoch the highest epoch recovery found, in the superblock or in the log, which units may take
+    /// @param forceDeferral the longest a checkpoint started on its own thread holds its forces back for the log to go
+    ///                      quiet, in nanoseconds; 0 for never
     Checkpointer(LiveLedger ledger, PageFile pages, FreeSpace space, BlobFile blobs, LogWriter log, LogFiles files, long every,
                  long number, DeltaTable deltas, PageRef deltaTable, Consumer<? super LedgerException> failures,
-                 int durableEpoch, int loggedEpoch, long heapBudget) {
+                 int durableEpoch, int loggedEpoch, long heapBudget, long forceDeferral) {
         this.ledger = ledger;
         this.pages = pages;
         this.space = space;
@@ -126,6 +160,8 @@ final class Checkpointer implements IdleTicker.Watched {
         this.heapBudget = heapBudget;
         this.progressLock = new ReentrantLock();
         this.progress = progressLock.newCondition();
+        this.forceDeferral = forceDeferral;
+        this.urgent = new AtomicInteger();
     }
 
     /// Starts counting the store's writes toward the heap budget of the process, those the open replayed included:
@@ -146,12 +182,14 @@ final class Checkpointer implements IdleTicker.Watched {
     /// nothing, so none outlives the files a close without a final checkpoint closes.
     void beginClose() {
         closed = true;
+        wakeDeferral();
     }
 
     /// Waits for a checkpoint running on its own thread to end, then stops counting the store's writes toward the
     /// heap budget of the process and checkpointing it when idle; once it has closed, before its files close.
     void close() {
         closed = true;
+        wakeDeferral();
         // A checkpoint holds the lock while it runs, and one that takes it after this finds the store closed
         lock.lock();
         lock.unlock();
@@ -204,7 +242,7 @@ final class Checkpointer implements IdleTicker.Watched {
         Thread.ofPlatform().daemon().name("ledger-checkpoint").start(() -> {
             try {
                 if (!closed) {
-                    run(false);
+                    run(false, true);
                 }
                 lastFailure = null;
             } catch (RuntimeException failure) {
@@ -249,14 +287,35 @@ final class Checkpointer implements IdleTicker.Watched {
         if (!behind() || lastFailure != null || stopped != null) {
             return;
         }
-        maybeStart();
-        progressLock.lock();
+        // Counted until it stops waiting: the checkpoint it waits on forces at once, even if behind() turns false
+        // while it waits, as when another store's checkpoint frees the heap budget
+        hurry();
         try {
-            while (behind() && scheduled.get() && lastFailure == null) {
-                progress.awaitUninterruptibly();
+            maybeStart();
+            progressLock.lock();
+            try {
+                while (behind() && scheduled.get() && lastFailure == null) {
+                    progress.awaitUninterruptibly();
+                }
+            } finally {
+                progressLock.unlock();
             }
         } finally {
-            progressLock.unlock();
+            urgent.decrementAndGet();
+        }
+    }
+
+    /// Counts a caller that waits on the running checkpoint, and wakes that checkpoint if it holds its forces back.
+    private void hurry() {
+        urgent.incrementAndGet();
+        wakeDeferral();
+    }
+
+    /// Wakes the checkpoint that holds its forces back, if one does, to look again whether it may.
+    private void wakeDeferral() {
+        var thread = deferring;
+        if (thread != null) {
+            LockSupport.unpark(thread);
         }
     }
 
@@ -267,6 +326,12 @@ final class Checkpointer implements IdleTicker.Watched {
             return false;
         }
         return bytes > MAX_BACKLOG * every || processBacklogHeap() > heapBudget;
+    }
+
+    /// {@return whether a second interval of log waits behind the last cut, so the commits will wait for the checkpoint
+    /// of that cut}
+    private boolean lagging() {
+        return log.appendedBytes() - cutBytes > every;
     }
 
     /// {@return the heap the writes the trees of the store lack hold, by the log's estimate}
@@ -293,12 +358,31 @@ final class Checkpointer implements IdleTicker.Watched {
         return lastFailure;
     }
 
-    /// Writes a checkpoint of every commit made so far, unless the last one holds them all.
+    /// Writes a checkpoint of every commit made so far, unless the last one holds them all, on the caller's thread.
+    ///
+    /// A checkpoint started on its own thread that holds its forces back forces them at once, so this one waits only
+    /// for those forces; this one forces its own as soon as it has written them.
     ///
     /// @param closing whether the store is closing, so no commit follows and every log segment becomes obsolete
     /// @throws LedgerIoException if the checkpoint cannot be written; the store goes on, and the next one retries
     void run(boolean closing) {
-        lock.lock();
+        run(closing, false);
+    }
+
+    /// Writes a checkpoint as [#run(boolean)] does.
+    ///
+    /// @param background whether it runs on its own thread, so [#awaitQuietLog] may hold its forces back
+    private void run(boolean closing, boolean background) {
+        if (background) {
+            lock.lock();
+        } else {
+            hurry();
+            try {
+                lock.lock();
+            } finally {
+                urgent.decrementAndGet();
+            }
+        }
         try {
             if (closed && !closing) {
                 // Started on its own thread before the store began closing, and found the lock after
@@ -316,8 +400,8 @@ final class Checkpointer implements IdleTicker.Watched {
                 return;
             }
             cutBytes = cut.logBytes();
-            // Lagging once a second interval of log waits behind the cut: the commits will wait for this checkpoint
-            var writer = pages.writer(random.nextLong(), () -> log.appendedBytes() - cutBytes > every);
+            var cutNanos = System.nanoTime();
+            var writer = pages.writer(random.nextLong(), this::lagging);
             space.rewindRuns();
             var update = new TreeUpdate(pages, writer, space);
             TreeRoot[] roots;
@@ -356,12 +440,17 @@ final class Checkpointer implements IdleTicker.Watched {
                 }
                 freeList = writeFreeList(writer, update, freed);
                 writer.flush();
+                if (background) {
+                    awaitQuietLog(cutNanos);
+                }
+                var forceStart = System.nanoTime();
                 writer.awaitForce();
                 if (blobs != null) {
                     // The units the trees take were written by commits the log may not have forced yet
                     blobs.force();
                 }
                 pages.force();
+                forceNanos = System.nanoTime() - forceStart;
                 superblockWritten = true;
                 pages.writeSuperblock(new Superblock(number + 1, cut.sequence(), cut.logStart(), space.pageCount(), catalog, freeList,
                                 blobRuns == null ? 0 : blobRuns.pageCount(), blobFreeList, blobs == null ? 0 : blobs.epoch(),
@@ -411,6 +500,73 @@ final class Checkpointer implements IdleTicker.Watched {
         } finally {
             lock.unlock();
         }
+    }
+
+    /// Waits, for a checkpoint that wrote its pages on its own thread, until the log has had nothing to write and been
+    /// given no frame for [#QUIET], so its forces do not share the device with the commits' groups; at most
+    /// [#forceDeferral], and only while [#mayHoldForces] holds.
+    ///
+    /// It never throws, and nothing it waits on is durable state: a crash meanwhile leaves the last durable superblock
+    /// and the log as a crash during the forces would.
+    ///
+    /// @param cutNanos when the checkpoint cut its writes, by [System#nanoTime()]
+    private void awaitQuietLog(long cutNanos) {
+        if (forceDeferral == 0) {
+            return;
+        }
+        var start = System.nanoTime();
+        // Published before the first look, so a caller that starts to wait after it either unparks this thread or is
+        // seen by that look
+        deferring = Thread.currentThread();
+        try {
+            var appended = log.appendedBytes();
+            var quiet = log.idle();
+            var quietSince = start;
+            while (true) {
+                var now = System.nanoTime();
+                var waited = now - start;
+                // An interrupt, which nothing of the store makes, would keep the park from waiting at all
+                if ((quiet && now - quietSince >= QUIET) || waited >= forceDeferral
+                        || Thread.currentThread().isInterrupted() || !mayHoldForces(cutNanos, now)) {
+                    return;
+                }
+                // A return before the step, for an unpark or a spurious one, only looks again sooner
+                LockSupport.parkNanos(this, Math.min(DEFERRAL_STEP, forceDeferral - waited));
+                var bytes = log.appendedBytes();
+                if (bytes != appended || !log.idle()) {
+                    appended = bytes;
+                    quiet = false;
+                } else if (!quiet) {
+                    quiet = true;
+                    quietSince = System.nanoTime();
+                }
+            }
+        } finally {
+            deferring = null;
+        }
+    }
+
+    /// {@return whether a checkpoint that wrote its pages may hold its forces back a while longer}
+    ///
+    /// It may while the store is open, no caller waits on the checkpoint, the commits are neither behind nor about to
+    /// be ([#lagging()]), the writes the trees of the process's stores lack fit the heap budget, so no other store's
+    /// commits wait because of this one, and the log behind the cut stays within half an interval once forced: grown
+    /// at its rate since the cut for as long as the last checkpoint's forces took, so a checkpoint that a steady stream
+    /// would make lag before its forces end forces at once.
+    ///
+    /// @param now the time of the look, by [System#nanoTime()]
+    private boolean mayHoldForces(long cutNanos, long now) {
+        if (closed || stopped != null || urgent.get() > 0 || lagging() || behind() || processBacklogHeap() > heapBudget) {
+            return false;
+        }
+        var behindCut = log.appendedBytes() - cutBytes;
+        var projected = behindCut + (double) behindCut * forceNanos / Math.max(1, now - cutNanos);
+        return projected <= every / 2.0;
+    }
+
+    /// {@return whether a checkpoint started on its own thread holds its forces back now; for tests}
+    boolean deferringForTests() {
+        return deferring != null;
     }
 
     /// {@return whether an epoch of the file of large values that units may have taken is recorded only by the log}

@@ -994,6 +994,22 @@ final class LogWriter {
         return appendedBytes;
     }
 
+    /// {@return whether the writer has nothing to write: every frame queued so far is durable, or the writer stopped}
+    ///
+    /// A frame [#defer] holds back is not queued yet, so it leaves the writer idle.
+    boolean idle() {
+        if (failure != null) {
+            return true;
+        }
+        queueLock.lock();
+        try {
+            // A group leaves the count once it is forced, not once the flush takes it off the queue
+            return pendingBytes == 0;
+        } finally {
+            queueLock.unlock();
+        }
+    }
+
     /// {@return the heap the commits queued since the writer opened hold until a checkpoint takes them, estimated: the
     /// bytes of their frames and units, [#WRITE_HEAP] a write and [#COMMIT_HEAP] a commit}
     long appendedHeap() {
