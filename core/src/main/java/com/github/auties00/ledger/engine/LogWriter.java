@@ -19,12 +19,15 @@ import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.zip.CRC32C;
 
 /// Appends frames to the log and makes them durable in groups.
@@ -34,6 +37,16 @@ import java.util.zip.CRC32C;
 /// the segment once and wakes the commits waiting for any of them: commits that arrive while a force runs make the
 /// next group, so concurrent commits share forces. Each group is padded with zeros to a multiple of [#ALIGNMENT], where
 /// the next one starts, so the pages of acknowledged frames are never written again.
+///
+/// A force of the pool's flush that has frames to seal behind it runs on a forcing thread of the writer's own while the
+/// flush seals ahead what follows it: at a rollover, the rest of the group into the segment after it; at the end of a
+/// group holding at least [#AHEAD_FROM] bytes of frames queued behind it, or commits waiting for room in the queue, the
+/// next group, taken off the queue as it comes. What is sealed ahead is held in arrays of its own until the force
+/// returns, and the bytes of a group reach the file only once every earlier group's force has returned: recovery reads
+/// the first frame of a later group, or of a later segment, as a force having made everything before it durable. An
+/// ingest seals while the device forces, so the seal adds nothing to the forces' time. A commit that writes its own
+/// group, and a force with nothing queued behind it, force on their own thread: a hand-off costs two thread wakes,
+/// more than the seal it would hide.
 ///
 /// Segments come from [LogFiles] prepared: once a segment takes its first group, the next one is prepared on a thread
 /// of its own, so a rollover only forces the full segment and switches to the next, and no file is created or renamed
@@ -106,8 +119,22 @@ final class LogWriter {
     private static final int SHRINK_AFTER = 256;
     /// The bytes of a frame body sealed in one call, a multiple of the AES block.
     private static final int SLICE = 64 << 10;
-    /// The bytes of frame bodies the queue holds before commits wait for the device.
+    /// The bytes of the bodies of frames queued and not sealed yet past which commits wait for the device: a sealed
+    /// frame's body is let go, its bytes are in the output or held ahead.
     private static final long QUEUE_LIMIT = 64L << 20;
+    /// The bytes of each array frames are sealed ahead into: below half a G1 region of a heap of any size, and one of
+    /// the sizes the heap pool recycles.
+    private static final int AHEAD_ARRAY = 256 << 10;
+    /// The bytes an array sealed ahead into may leave unfilled at its end: more than a frame header, which never
+    /// splits, and than what a slice or a tag that does not fit leaves.
+    private static final int AHEAD_SLACK = 64;
+    /// The bytes of frames queued behind a group past which its force runs on the forcing thread while the flush seals
+    /// them: sealing 256 KiB takes about 200 microseconds, a hand-off of the force about a tenth of that.
+    static final long AHEAD_FROM = 256 << 10;
+    /// How long the forcing thread waits for its next force before it ends, so an idle store keeps no thread for it.
+    private static final long FORCER_IDLE = TimeUnit.SECONDS.toNanos(1);
+    /// What a force on the forcing thread returns when it completes.
+    private static final Object FORCED = new Object();
     /// The heap a write takes in memory beside its bytes until a checkpoint takes it, as [#appendedHeap()] estimates
     /// it: its chain, its version, its slot of the hash index and its key's copy, about 110 bytes, and a share of its
     /// batch's array.
@@ -125,6 +152,12 @@ final class LogWriter {
     private final long segmentSize;
     private final Executor executor;
     private final long commitWindowNanos;
+    // The pool the arrays sealed ahead into come from and go back to once a flush ends
+    private final HeapPool heap;
+    // The bytes queued behind a group from which its force runs on the forcing thread
+    private final long aheadFrom;
+    // The most bytes held ahead: a segment's frames, or a thirty-second of the heap if less
+    private final long aheadLimit;
 
     // Owned by the flush task; null until the first group opens the first segment
     private FileChannel channel;
@@ -170,6 +203,45 @@ final class LogWriter {
     private int smallGroups;
     // The emptied queue, which the next swap reuses
     private ArrayList<Queued> flushing;
+    // The emptied queue a take of the next group while a force runs reuses
+    private ArrayList<Queued> aheadTaken;
+    // The bytes of the bodies of the frames sealed since the queue's count last let them go; owned by the flush task
+    private long sealedBodies;
+    // Whether seal() holds what it seals in `held` rather than writing it: while a force runs on the forcing thread,
+    // the flush seals ahead, into arrays that reach the file once the force returns
+    private boolean holding;
+    // The arrays sealed ahead, in order, from heldStart to heldEnd of their segment; heldLengths holds the bytes of each
+    private final ArrayList<byte[]> held;
+    private int[] heldLengths;
+    private long heldStart;
+    private long heldEnd;
+    // Free arrays of AHEAD_ARRAY bytes to seal ahead into, which a flush gives back to the pool when it ends
+    private final ArrayList<byte[]> spare;
+    // What sealing ahead set aside until it ends: the output, where it is written, and the key and tags of its segment
+    private byte[] asideOutput;
+    private long asidePosition;
+    private SecretKeySpec asideKey;
+    private long asideSegmentTag;
+    private long asideUseTag;
+    // The next group of a flush of the pool, taken off the queue and sealed in part while the force of the group before
+    // it ran, and the instance the group being written uses; owned by the flush task
+    private NextGroup nextGroup;
+    private NextGroup writtenGroup;
+    // The flush task's thread while it waits, sealing ahead, for a frame to be queued or a segment to be prepared
+    private volatile Thread aheadWaiter;
+    // The frames sealed ahead so far, for tests; written by the flush task only
+    private volatile long sealedAhead;
+    // The thread that forces a segment while the flush seals ahead, started with the first such force and ending once
+    // idle for FORCER_IDLE or at close, or null; the channel it forces next, or null; whether close ended it
+    private final ReentrantLock forcerLock;
+    private final Condition forceRequested;
+    private Thread forcer;
+    private FileChannel forceTarget;
+    private boolean forcerStopped;
+    // What the last force on the forcing thread returned, FORCED or what it threw, or null while it runs; the thread
+    // it wakes then
+    private volatile Object forceOutcome;
+    private volatile Thread forceWaiter;
     // Written by the flush task only
     private volatile long forces;
     // The segment the flush task writes, for a checkpoint to read
@@ -179,7 +251,7 @@ final class LogWriter {
     // Signalled when a group is durable, for the commits waiting on a full queue
     private final Condition queueDrained;
     private ArrayList<Queued> queue;
-    // The bytes of the frame bodies queued and not durable yet
+    // The bytes of the frame bodies queued and not sealed yet
     private long pendingBytes;
     private volatile long lastQueued;
     // Frames queued since the writer opened; a catalog frame carries a sequence already durable, so close() waits on
@@ -227,15 +299,21 @@ final class LogWriter {
     /// @param commitWindow how long a flush waits for more commits before it starts
     /// @param empty the segment numbered `firstSegment`, which recovery found prepared and never written, to write
     ///              first; or `null`, to prepare one
+    /// @param heap the pool of the arrays frames are sealed ahead into
+    /// @param aheadFrom the bytes of frames queued behind a group from which its force runs on the forcing thread while
+    ///                  the flush seals them, [#AHEAD_FROM] but in tests
     /// @throws IOException if the segment cannot be prepared
     LogWriter(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long durable, long segmentSize,
-              Executor executor, Duration commitWindow, LogFiles.Prepared empty) throws IOException {
+              Executor executor, Duration commitWindow, LogFiles.Prepared empty, HeapPool heap, long aheadFrom) throws IOException {
         this.files = files;
         this.keys = keys;
         this.storeId = storeId;
         this.segmentSize = segmentSize;
         this.executor = executor;
         this.commitWindowNanos = commitWindow.toNanos();
+        this.heap = heap;
+        this.aheadFrom = aheadFrom;
+        this.aheadLimit = Math.min(segmentSize - SEGMENT_HEADER, Runtime.getRuntime().maxMemory() / 32);
         try {
             this.cipher = keys.encrypted() ? Cipher.getInstance("AES/GCM/NoPadding") : null;
         } catch (GeneralSecurityException exception) {
@@ -244,6 +322,14 @@ final class LogWriter {
         this.crc = new CRC32C();
         this.output = new byte[MIN_OUTPUT];
         this.flushing = new ArrayList<>();
+        this.aheadTaken = new ArrayList<>();
+        this.held = new ArrayList<>();
+        this.heldLengths = new int[8];
+        this.spare = new ArrayList<>();
+        this.nextGroup = new NextGroup();
+        this.writtenGroup = new NextGroup();
+        this.forcerLock = new ReentrantLock();
+        this.forceRequested = forcerLock.newCondition();
         this.queueLock = new ReentrantLock();
         this.queueDrained = queueLock.newCondition();
         this.queue = new ArrayList<>();
@@ -270,8 +356,15 @@ final class LogWriter {
         return LogFiles.segmentName(number);
     }
 
-    /// Starts writing `segment`.
+    /// Starts writing `segment`, under a use of a tag of its own.
     private void open(LogFiles.Prepared segment) throws IOException {
+        var useTag = TAGS.nextLong();
+        open(segment, useTag, keyOf(segment, useTag));
+    }
+
+    /// Starts writing `segment` under the use of `useTag`, whose key is `key`, drawn while a force ran so frames could be
+    /// sealed ahead into it.
+    private void open(LogFiles.Prepared segment, long useTag, SecretKeySpec key) throws IOException {
         var now = System.nanoTime();
         if (channel != null) {
             lastFill = now - segmentOpened;
@@ -285,23 +378,56 @@ final class LogWriter {
         this.currentSegment = segment.number();
         this.position = SEGMENT_HEADER;
         this.groupEnd = SEGMENT_HEADER;
-        this.segmentTag = ByteBuffer.wrap(segment.salt()).getLong();
-        this.useTag = TAGS.nextLong();
-        this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt(), useTag) : null;
+        this.segmentTag = tagOf(segment);
+        this.useTag = useTag;
+        this.segmentKey = key;
         this.next = null;
+    }
+
+    /// {@return the tag of `segment` its frame headers carry: the first 8 bytes of its salt}
+    private static long tagOf(LogFiles.Prepared segment) {
+        return ByteBuffer.wrap(segment.salt()).getLong();
+    }
+
+    /// {@return the key of the use of `segment` of `useTag`, or `null` if the frames are not encrypted}
+    private SecretKeySpec keyOf(LogFiles.Prepared segment, long useTag) {
+        return keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt(), useTag) : null;
     }
 
     /// Prepares the segment after the current one on a platform thread of its own.
     ///
     /// Not on the store's pool: creating and forcing a file costs tens of milliseconds on Windows, and a flush queued
-    /// behind it would make every commit waiting on that flush wait as long.
+    /// behind it would make every commit waiting on that flush wait as long. Its end wakes a flush that seals ahead
+    /// while it waits for the segment.
     private void prepareNext() {
         var number = segmentNumber + 1;
         // Filled slower than the rate, by commits that waited for its forces
         var zeros = (waited || waitedBefore) && lastFill >= 0 && lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE;
-        var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize, zeros && !closing));
+        var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize, zeros && !closing)) {
+            @Override
+            protected void done() {
+                wakeAhead();
+            }
+        };
         next = preparation;
         Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
+    }
+
+    /// Prepares the segment after the current one now, rather than once the group is written, if the bytes held ahead
+    /// and the frames of `group` from `from` go past the end of the current one: the rollover that ends it then finds
+    /// it prepared, and seals ahead into it while the full segment's force runs.
+    private void prepareIfBeyond(List<Queued> group, int from) {
+        if (next != null) {
+            return;
+        }
+        var room = segmentSize - position - (held.isEmpty() ? 0 : heldEnd - heldStart);
+        for (var index = from; index < group.size(); index++) {
+            room -= FRAME_HEADER + sealedLength(group.get(index));
+            if (room < 0) {
+                prepareNext();
+                return;
+            }
+        }
     }
 
     /// Switches to the prepared segment after the current one, preparing it here if its thread has not.
@@ -328,9 +454,9 @@ final class LogWriter {
     /// Queues a frame holding the first `body.size()` bytes of `body`, which the writer owns from now on.
     ///
     /// Called holding the store's publishing role, so frames queue in the order of their sequences. While the queue holds
-    /// more than [#QUEUE_LIMIT] bytes not durable yet, it waits for the device, which holds back every commit behind
+    /// more than [#QUEUE_LIMIT] bytes not sealed yet, it waits for the device, which holds back every commit behind
     /// it: memory stays bounded when commits come faster than the device takes them. A frame larger than the limit
-    /// waits for the queue to empty.
+    /// waits until every frame queued before it is sealed.
     ///
     /// @throws LedgerIoException if the writer has stopped
     void append(byte type, long sequence, FrameBody body) {
@@ -367,6 +493,7 @@ final class LogWriter {
         } finally {
             queueLock.unlock();
         }
+        wakeAhead();
         if (scheduled.compareAndSet(false, true)) {
             executor.execute(this::flush);
         }
@@ -403,6 +530,7 @@ final class LogWriter {
             queueLock.unlock();
             batch.clear();
         }
+        wakeAhead();
         if (scheduled.compareAndSet(false, true)) {
             executor.execute(this::flush);
         }
@@ -437,10 +565,19 @@ final class LogWriter {
         } finally {
             queueLock.unlock();
         }
+        wakeAhead();
         if (scheduled.compareAndSet(false, true)) {
             executor.execute(this::flush);
         }
         return frames;
+    }
+
+    /// Wakes the flush task if it waits, sealing ahead, for a frame to be queued or a segment to be prepared.
+    private void wakeAhead() {
+        var waiter = aheadWaiter;
+        if (waiter != null) {
+            LockSupport.unpark(waiter);
+        }
     }
 
     /// Queues the deferred frame, if any; holding the queue lock.
@@ -562,6 +699,9 @@ final class LogWriter {
     }
 
     /// Writes the queued groups until the queue is empty or the commit at `until` is durable, holding [#running].
+    ///
+    /// A flush of the pool returns only once the next group it took off the queue during a force is written and forced
+    /// too: its frames left the queue, and their commits would wait for a flush that never comes.
     private void flushGroups(long until) {
         leading = until != Long.MAX_VALUE;
         try {
@@ -571,33 +711,50 @@ final class LogWriter {
                 if (commitWindowNanos > 0) {
                     LockSupport.parkNanos(commitWindowNanos);
                 }
-                ArrayList<Queued> group;
+                var carried = nextGroup.frames.isEmpty() ? null : nextGroup;
+                ArrayList<Queued> taken = null;
                 long sequence;
                 long frames;
                 boolean units;
                 queueLock.lock();
                 try {
-                    if (queue.isEmpty() || (until != Long.MAX_VALUE && (lastQueued > until || !fitsOneWrite(queue)))) {
+                    if (carried == null && (queue.isEmpty() || (until != Long.MAX_VALUE && (lastQueued > until || !fitsOneWrite(queue))))) {
                         return;
                     }
-                    group = queue;
-                    sequence = lastQueued;
-                    frames = appended;
-                    units = queuedUnits;
-                    queuedUnits = false;
-                    queue = flushing;
+                    units = carried != null && carried.units;
+                    if (queue.isEmpty()) {
+                        sequence = carried.sequence;
+                        frames = carried.frameCount;
+                    } else {
+                        taken = queue;
+                        sequence = lastQueued;
+                        frames = appended;
+                        units |= queuedUnits;
+                        queuedUnits = false;
+                        queue = flushing;
+                    }
                 } finally {
                     queueLock.unlock();
                 }
-                var bodies = write(group, units);
-                group.clear();
-                flushing = group;
-                queueLock.lock();
-                try {
-                    pendingBytes -= bodies;
-                    queueDrained.signalAll();
-                } finally {
-                    queueLock.unlock();
+                if (carried == null) {
+                    write(taken, 0, units, null);
+                    taken.clear();
+                    flushing = taken;
+                } else {
+                    // What was queued since joins the group; the group after it is taken into the other instance
+                    nextGroup = writtenGroup;
+                    writtenGroup = carried;
+                    if (taken != null) {
+                        carried.frames.addAll(taken);
+                        taken.clear();
+                        flushing = taken;
+                    }
+                    write(carried.frames, carried.sealed, units, carried);
+                    carried.clear();
+                }
+                if (sealedBodies > 0) {
+                    // The bodies of the next group sealed ahead during the force
+                    release();
                 }
                 publish(sequence, frames);
             }
@@ -607,6 +764,12 @@ final class LogWriter {
             stop(new IOException("The log writer failed", throwable));
         } finally {
             leading = false;
+            if (failure != null) {
+                abandonAhead();
+            }
+            while (!spare.isEmpty()) {
+                heap.release(spare.removeLast());
+            }
             // A commit's thread gets its interrupt back; a thread of the pool, which nothing should interrupt, not
             if (interruptedWrite) {
                 interruptedWrite = false;
@@ -624,15 +787,23 @@ final class LogWriter {
         channel = FileChannel.open(segmentPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
     }
 
-    /// Seals and writes `group`, then forces it, and the file of large values if `units`.
+    /// Seals and writes the frames of `group` from `from`, then forces them, and the file of large values if `units`.
+    ///
+    /// The frames before `from` were sealed ahead while the force of the group before ran, as `carried` holds them:
+    /// they are written first, at the header of the next segment if `carried` says the group starts it, and the frames
+    /// sealed are let go from `group`.
     ///
     /// The commits of the group wrote their units before they queued their frames, so one force of that file, run
     /// beside the segment's, makes them all durable. A rollover waits for it before it forces the segment: the first
     /// frame of a group in the next segment then means, as it always does, that everything before it is durable.
-    ///
-    /// @return the bytes of the frame bodies written
-    private long write(List<Queued> group, boolean units) throws IOException {
-        if (channel == null) {
+    private void write(ArrayList<Queued> group, int from, boolean units, NextGroup carried) throws IOException {
+        if (carried != null && carried.segment != null) {
+            // The force of the group before made the current segment durable whole: the group starts the next one with
+            // no force of its own
+            closeSegment();
+            open(carried.segment, carried.useTag, carried.key);
+            prepareIfBeyond(group, from);
+        } else if (channel == null) {
             rollover();
         }
         // Between groups: the last drain's bytes, which an interrupted force writes again, are durable by now
@@ -641,26 +812,26 @@ final class LogWriter {
         }
         var unitForce = units ? forceUnits() : null;
         var start = position;
-        var groupStart = true;
-        var bodies = 0L;
-        for (var frame : group) {
-            var bodyLength = frame.body().size();
-            bodies += bodyLength;
-            var sealedLength = bodyLength + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
+        writeHeld();
+        var groupStart = from == 0;
+        for (var index = from; index < group.size(); ) {
+            var frame = group.get(index);
+            var sealedLength = sealedLength(frame);
             if (position + used + FRAME_HEADER + sealedLength > segmentSize && position + used > SEGMENT_HEADER) {
                 drain();
                 if (unitForce != null) {
                     await(unitForce);
                     unitForce = null;
                 }
-                force();
-                forces++;
-                closeSegment();
-                rollover();
-                start = position;
-                groupStart = true;
+                var sealed = rollover(group, index);
+                index += sealed;
+                start = SEGMENT_HEADER;
+                groupStart = sealed == 0;
+                continue;
             }
             seal(frame, sealedLength, groupStart);
+            sealedBodies += frame.body().size();
+            group.set(index++, null);
             groupStart = false;
         }
         // Zeros to the next block, where the next group starts: a reused file holds older bytes there
@@ -671,7 +842,17 @@ final class LogWriter {
         used += padding;
         smallGroups = position + used - start <= MIN_OUTPUT / 2 ? smallGroups + 1 : 0;
         drain();
-        force();
+        if (release() && !leading && startForce()) {
+            Object outcome;
+            try {
+                sealNextGroup();
+            } finally {
+                outcome = joinForce();
+            }
+            checkForced(outcome);
+        } else {
+            force();
+        }
         forces++;
         if (unitForce != null) {
             await(unitForce);
@@ -681,10 +862,461 @@ final class LogWriter {
         if (next == null) {
             prepareNext();
         }
-        return bodies;
     }
 
-    /// Seals `frame` into the output, writing the output out whenever it fills.
+    /// Forces the full segment and switches to the next one, prepared, for the frames of `group` from `from`.
+    ///
+    /// On a flush of the pool the force runs on the forcing thread while those frames are sealed ahead into the next
+    /// segment, once its preparation is done: none of them reaches the next segment before the force returns.
+    ///
+    /// @return the frames of `group` from `from` sealed ahead, which are written into the new segment
+    private int rollover(ArrayList<Queued> group, int from) throws IOException {
+        // The group's frames sealed so far are let go: the commits waiting for room queue the next group meanwhile
+        release();
+        var sealed = 0;
+        LogFiles.Prepared prepared = null;
+        var tag = 0L;
+        SecretKeySpec key = null;
+        if (!leading && startForce()) {
+            Object outcome;
+            try {
+                prepared = awaitPrepared();
+                if (prepared != null) {
+                    tag = TAGS.nextLong();
+                    key = keyOf(prepared, tag);
+                    if (beginAhead(SEGMENT_HEADER, tagOf(prepared), tag, key)) {
+                        try {
+                            while (from + sealed < group.size() && forceOutcome == null && sealAhead(group.get(from + sealed), sealed == 0)) {
+                                group.set(from + sealed, null);
+                                sealed++;
+                            }
+                        } finally {
+                            endAhead();
+                        }
+                    }
+                }
+            } finally {
+                outcome = joinForce();
+            }
+            checkForced(outcome);
+        } else {
+            force();
+        }
+        forces++;
+        closeSegment();
+        if (prepared != null) {
+            open(prepared, tag, key);
+        } else {
+            // Reports the preparation's failure, or prepares the segment here
+            rollover();
+        }
+        prepareIfBeyond(group, from + sealed);
+        writeHeld();
+        return sealed;
+    }
+
+    /// {@return the segment after the current one once its preparation is done; or `null` if it failed, which
+    /// [#rollover()] then reports}
+    ///
+    /// Waits while the full segment's force runs, through any interrupt: the rollover after the force would wait as long.
+    /// The preparation runs on its own thread, which may not have started yet, rather than here as a rollover runs it:
+    /// the wait costs nothing beside the force, and the file operations of an interrupted thread fail.
+    private LogFiles.Prepared awaitPrepared() {
+        if (next == null) {
+            prepareNext();
+        }
+        var preparation = next;
+        while (true) {
+            try {
+                return preparation.get();
+            } catch (InterruptedException _) {
+                interruptedWrite = true;
+            } catch (ExecutionException _) {
+                return null;
+            }
+        }
+    }
+
+    /// Seals ahead the next group while the force of the group just written runs on the forcing thread: the frames
+    /// queued, taken off the queue as they come, until the force returns, they fill what may be held ahead, or the next
+    /// one does not fit in its segment.
+    ///
+    /// A group whose first frame does not fit in the current segment starts the next one, once its preparation is done:
+    /// the force running makes the current segment durable whole, so the group needs no rollover force of its own.
+    private void sealNextGroup() throws IOException {
+        var group = nextGroup;
+        try {
+            while (forceOutcome == null) {
+                if (group.sealed == group.frames.size()) {
+                    var seen = take(group);
+                    if (seen >= 0) {
+                        awaitAhead(() -> appendedBytes != seen);
+                        continue;
+                    }
+                }
+                var frame = group.frames.get(group.sealed);
+                if (!holding && !beginNextGroup(group, frame)) {
+                    return;
+                }
+                if (!sealAhead(frame, group.sealed == 0)) {
+                    return;
+                }
+                group.frames.set(group.sealed++, null);
+            }
+        } finally {
+            if (holding) {
+                endAhead();
+            }
+        }
+    }
+
+    /// Takes everything queued into `group`, whose publication then covers it.
+    ///
+    /// @return -1 if it took frames, else the bytes queued since the writer opened, which the next frame queued changes
+    private long take(NextGroup group) {
+        ArrayList<Queued> taken;
+        queueLock.lock();
+        try {
+            if (queue.isEmpty()) {
+                return appendedBytes;
+            }
+            taken = queue;
+            group.sequence = lastQueued;
+            group.frameCount = appended;
+            group.units |= queuedUnits;
+            queuedUnits = false;
+            queue = aheadTaken;
+        } finally {
+            queueLock.unlock();
+        }
+        group.frames.addAll(taken);
+        taken.clear();
+        aheadTaken = taken;
+        return -1;
+    }
+
+    /// Begins sealing `group` ahead where its first frame, `frame`, goes: after the group just written, or at the header
+    /// of the segment after the current one if it does not fit, once that segment's preparation is done.
+    ///
+    /// @return whether sealing ahead began; not if the force returned before the preparation was done, the preparation
+    ///         failed, or no array could be had
+    private boolean beginNextGroup(NextGroup group, Queued frame) {
+        if (position + FRAME_HEADER + sealedLength(frame) <= segmentSize || position <= SEGMENT_HEADER) {
+            return beginAhead(position, segmentTag, useTag, segmentKey);
+        }
+        if (next == null) {
+            prepareNext();
+        }
+        var preparation = next;
+        awaitAhead(preparation::isDone);
+        if (preparation.state() != Future.State.SUCCESS) {
+            return false;
+        }
+        var prepared = preparation.resultNow();
+        var tag = TAGS.nextLong();
+        var key = keyOf(prepared, tag);
+        if (!beginAhead(SEGMENT_HEADER, tagOf(prepared), tag, key)) {
+            return false;
+        }
+        group.segment = prepared;
+        group.useTag = tag;
+        group.key = key;
+        return true;
+    }
+
+    /// Parks the flush task, which seals ahead, until the force on the forcing thread returns or `ready` holds; an
+    /// interrupt waits on, and [#joinForce()] takes it.
+    private void awaitAhead(BooleanSupplier ready) {
+        aheadWaiter = Thread.currentThread();
+        try {
+            while (forceOutcome == null && !ready.getAsBoolean()) {
+                LockSupport.park(this);
+                if (Thread.interrupted()) {
+                    interruptedWrite = true;
+                }
+            }
+        } finally {
+            aheadWaiter = null;
+        }
+    }
+
+    /// Seals `frame` ahead, unless it does not fit whole in its segment or in what may still be held ahead, or the
+    /// arrays it needs cannot be had: a frame is sealed ahead whole or not at all, as a frame sealed once at an offset
+    /// is never sealed there again.
+    ///
+    /// @return whether it sealed the frame
+    private boolean sealAhead(Queued frame, boolean groupStart) throws IOException {
+        var sealedLength = sealedLength(frame);
+        var bytes = (long) FRAME_HEADER + sealedLength;
+        if (position + used + bytes > segmentSize && position + used > SEGMENT_HEADER) {
+            return false;
+        }
+        if (position - heldStart + used + bytes > aheadLimit || !reserve(bytes)) {
+            return false;
+        }
+        seal(frame, sealedLength, groupStart);
+        sealedBodies += frame.body().size();
+        sealedAhead++;
+        return true;
+    }
+
+    /// Makes [#seal] hold what it seals, from offset `start` of the segment of the tags and the key given, until
+    /// [#endAhead()]; the output, written out whole, and where it goes are set aside meanwhile.
+    ///
+    /// @return whether it began; not if no array could be had
+    private boolean beginAhead(long start, long segmentTag, long useTag, SecretKeySpec key) {
+        byte[] array;
+        if (!spare.isEmpty()) {
+            array = spare.removeLast();
+        } else {
+            try {
+                array = heap.acquire(AHEAD_ARRAY);
+            } catch (OutOfMemoryError _) {
+                // Sealing ahead is not needed: the frames are sealed once the force returns, as without it
+                return false;
+            }
+        }
+        asideOutput = output;
+        asidePosition = position;
+        asideKey = segmentKey;
+        asideSegmentTag = this.segmentTag;
+        asideUseTag = this.useTag;
+        output = array;
+        used = 0;
+        position = start;
+        this.segmentTag = segmentTag;
+        this.useTag = useTag;
+        this.segmentKey = key;
+        heldStart = start;
+        holding = true;
+        return true;
+    }
+
+    /// Ends what [#beginAhead] began: what was sealed is held until [#writeHeld()], and the output is back.
+    private void endAhead() {
+        if (used > 0) {
+            keep(output, used);
+        } else {
+            spare.add(output);
+        }
+        heldEnd = position + used;
+        output = asideOutput;
+        used = 0;
+        position = asidePosition;
+        segmentKey = asideKey;
+        segmentTag = asideSegmentTag;
+        useTag = asideUseTag;
+        asideOutput = null;
+        asideKey = null;
+        holding = false;
+    }
+
+    /// Holds the first `length` bytes of `array`, sealed ahead, after the arrays held before it.
+    private void keep(byte[] array, int length) {
+        if (held.size() == heldLengths.length) {
+            heldLengths = Arrays.copyOf(heldLengths, 2 * heldLengths.length);
+        }
+        heldLengths[held.size()] = length;
+        held.add(array);
+    }
+
+    /// Holds the array sealed ahead into, which has no room for what comes next, and seals on into a spare one.
+    private void hold() {
+        keep(output, used);
+        position += used;
+        // reserve() took the arrays a frame needs before it began
+        output = spare.isEmpty() ? heap.acquire(AHEAD_ARRAY) : spare.removeLast();
+        used = 0;
+    }
+
+    /// Takes from the pool the spare arrays sealing `bytes` more ahead may need, so a frame begun is always finished.
+    ///
+    /// @return whether it could
+    private boolean reserve(long bytes) {
+        var room = output.length - used - AHEAD_SLACK;
+        var needed = bytes <= room ? 0 : (bytes - Math.max(0, room) + AHEAD_ARRAY - AHEAD_SLACK - 1) / (AHEAD_ARRAY - AHEAD_SLACK);
+        try {
+            while (spare.size() < needed) {
+                spare.add(heap.acquire(AHEAD_ARRAY));
+            }
+            return true;
+        } catch (OutOfMemoryError _) {
+            return false;
+        }
+    }
+
+    /// Writes the arrays sealed ahead, where the output would be written next, and keeps them to seal ahead into again.
+    private void writeHeld() throws IOException {
+        if (held.isEmpty()) {
+            return;
+        }
+        var at = heldStart;
+        for (var index = 0; index < held.size(); index++) {
+            var array = held.get(index);
+            var length = heldLengths[index];
+            while (true) {
+                try {
+                    var buffer = ByteBuffer.wrap(array, 0, length);
+                    var offset = at;
+                    while (buffer.hasRemaining()) {
+                        offset += channel.write(buffer, offset);
+                    }
+                    break;
+                } catch (ClosedByInterruptException _) {
+                    reopen();
+                }
+            }
+            at += length;
+        }
+        // Only once all are written: after a failed write, abandonAhead() gives back whatever is still held
+        spare.addAll(held);
+        held.clear();
+        position = at;
+    }
+
+    /// Drops what was sealed ahead and the next group taken, once the writer stopped: none of it may reach the file.
+    private void abandonAhead() {
+        for (var array : held) {
+            heap.release(array);
+        }
+        held.clear();
+        nextGroup.clear();
+        writtenGroup.clear();
+    }
+
+    /// Takes the bodies of the frames sealed since it last ran off the bytes the queue counts, and wakes the commits
+    /// waiting for room: a sealed frame's body is let go.
+    ///
+    /// @return whether a force now is worth running on the forcing thread while the flush seals ahead: at least
+    ///         [#aheadFrom] bytes are queued for the next group, or commits waited for room, which they queue during
+    ///         the force
+    private boolean release() {
+        var bodies = sealedBodies;
+        sealedBodies = 0;
+        queueLock.lock();
+        try {
+            var waiting = queueLock.hasWaiters(queueDrained);
+            if (bodies > 0) {
+                pendingBytes -= bodies;
+                queueDrained.signalAll();
+            }
+            return waiting || pendingBytes >= aheadFrom;
+        } finally {
+            queueLock.unlock();
+        }
+    }
+
+    /// Starts forcing the segment on the forcing thread, starting that thread if none runs.
+    ///
+    /// @return whether the force started; if not, the caller forces the segment itself
+    private boolean startForce() {
+        forceOutcome = null;
+        forceWaiter = Thread.currentThread();
+        forcerLock.lock();
+        try {
+            if (forcerStopped) {
+                return false;
+            }
+            forceTarget = channel;
+            if (forcer == null) {
+                try {
+                    forcer = Thread.ofPlatform().daemon().name("ledger-log-force").start(this::runForces);
+                } catch (OutOfMemoryError _) {
+                    // No thread to spare: the flush forces the segment itself
+                    forceTarget = null;
+                    return false;
+                }
+            } else {
+                forceRequested.signal();
+            }
+            return true;
+        } finally {
+            forcerLock.unlock();
+        }
+    }
+
+    /// Forces the segments the flush hands over, until none comes for [#FORCER_IDLE] or close ends it.
+    ///
+    /// A platform thread, not a virtual one: a force must start as soon as it is asked for, whatever the application's
+    /// virtual threads keep busy.
+    private void runForces() {
+        while (true) {
+            FileChannel target;
+            forcerLock.lock();
+            try {
+                var idle = FORCER_IDLE;
+                while ((target = forceTarget) == null) {
+                    if (forcerStopped || idle <= 0) {
+                        forcer = null;
+                        return;
+                    }
+                    try {
+                        idle = forceRequested.awaitNanos(idle);
+                    } catch (InterruptedException _) {
+                        // Nothing interrupts this thread: a stray interrupt must not end it with a force to come
+                    }
+                }
+                forceTarget = null;
+            } finally {
+                forcerLock.unlock();
+            }
+            Object outcome = FORCED;
+            try {
+                target.force(false);
+            } catch (Throwable throwable) {
+                outcome = throwable;
+            }
+            forceOutcome = outcome;
+            LockSupport.unpark(forceWaiter);
+        }
+    }
+
+    /// Waits for the force [#startForce()] started, through any interrupt: nothing closes the segment, or stops the
+    /// writer, while it runs.
+    ///
+    /// An interrupt of the flush meanwhile is taken, as [#reopen()] takes one: the force ran on a thread no interrupt
+    /// reached, so it can be trusted, and a later force of the flush on its own thread must not fail for it.
+    ///
+    /// @return [#FORCED], or what the force threw
+    private Object joinForce() {
+        Object outcome;
+        while ((outcome = forceOutcome) == null) {
+            LockSupport.park(this);
+            // Taken at once, or the park would return at once while the interrupt stands
+            interruptedWrite |= Thread.interrupted();
+        }
+        interruptedWrite |= Thread.interrupted();
+        return outcome;
+    }
+
+    /// Throws if the force on the forcing thread failed, `outcome` being what [#joinForce()] returned.
+    private static void checkForced(Object outcome) throws IOException {
+        if (outcome == FORCED) {
+            return;
+        }
+        if (outcome instanceof IOException failure) {
+            throw failure;
+        }
+        throw new IOException("The log segment could not be forced", (Throwable) outcome);
+    }
+
+    /// Ends the forcing thread, once nothing is written any more.
+    private void stopForcer() {
+        forcerLock.lock();
+        try {
+            forcerStopped = true;
+            forceRequested.signal();
+        } finally {
+            forcerLock.unlock();
+        }
+    }
+
+    /// {@return the bytes `frame` takes sealed, after its header}
+    private int sealedLength(Queued frame) {
+        return frame.body().size() + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
+    }
+
+    /// Seals `frame` into the output, writing the output out whenever it fills, or, sealing ahead, holding it.
     ///
     /// The body goes to the cipher a slice at a time: the frame is the one GCM message a single call would make, and
     /// the output stays at most [#OUTPUT] bytes whatever the frame's size.
@@ -707,7 +1339,7 @@ final class LogWriter {
                 // The cipher keeps the additional data, so the header may leave the output before the body is sealed
                 cipher.updateAAD(output, at, FRAME_HEADER);
                 for (var offset = 0; offset < length; ) {
-                    var slice = Math.min(SLICE, length - offset);
+                    var slice = fit(Math.min(SLICE, length - offset), TAG_BYTES);
                     room(slice + TAG_BYTES);
                     used += cipher.update(body, offset, slice, output, used);
                     offset += slice;
@@ -723,7 +1355,7 @@ final class LogWriter {
         crc.reset();
         crc.update(output, at, FRAME_HEADER);
         for (var offset = 0; offset < length; ) {
-            var slice = Math.min(SLICE, length - offset);
+            var slice = fit(Math.min(SLICE, length - offset), 0);
             room(slice);
             System.arraycopy(body, offset, output, used, slice);
             crc.update(body, offset, slice);
@@ -733,6 +1365,18 @@ final class LogWriter {
         room(Integer.BYTES);
         ByteBuffer.wrap(output, used, Integer.BYTES).putInt((int) crc.getValue());
         used += Integer.BYTES;
+    }
+
+    /// {@return `wanted` bytes of a body to seal next, or, sealing ahead, fewer that fill what is left of the array
+    /// beside `extra` bytes, a multiple of the AES block}
+    ///
+    /// The arrays sealed ahead into do not grow, and a slice that did not fit would leave a quarter of each empty.
+    private int fit(int wanted, int extra) {
+        if (!holding) {
+            return wanted;
+        }
+        var left = output.length - used - extra;
+        return wanted <= left || left < 16 ? wanted : left & -16;
     }
 
     /// {@return the force of the file of large values, started on a thread of its own}
@@ -766,9 +1410,14 @@ final class LogWriter {
         }
     }
 
-    /// Makes room for `bytes` more in the output: grows it while it is smaller than [#OUTPUT], else writes it out.
+    /// Makes room for `bytes` more in the output: grows it while it is smaller than [#OUTPUT], else writes it out;
+    /// sealing ahead, holds it and seals on into a spare array.
     private void room(int bytes) throws IOException {
         if (used + bytes > output.length) {
+            if (holding) {
+                hold();
+                return;
+            }
             if (output.length < OUTPUT) {
                 var grown = Math.min(OUTPUT, Math.max(2 * output.length, used + bytes));
                 // The bytes not written yet stay where they are
@@ -809,6 +1458,37 @@ final class LogWriter {
     /// @param sequence the sequence it carries
     /// @param body its body, which the writer owns
     private record Queued(byte type, long sequence, FrameBody body) {
+    }
+
+    /// The next group of a flush of the pool: the frames it took off the queue while the force of the group before ran,
+    /// the first of which it sealed ahead.
+    private static final class NextGroup {
+        // The frames, in order; the first `sealed` are held ahead, and let go from the list
+        final ArrayList<Queued> frames;
+        int sealed;
+        // The sequence and the frames queued at its last take off the queue, which its publication covers, and whether
+        // the commits of its frames wrote units of the file of large values
+        long sequence;
+        long frameCount;
+        boolean units;
+        // The prepared segment after the current one, whose header it starts at, with the tag and the key of the use
+        // drawn for it; or null, if it follows the group before in the current segment
+        LogFiles.Prepared segment;
+        long useTag;
+        SecretKeySpec key;
+
+        NextGroup() {
+            this.frames = new ArrayList<>();
+        }
+
+        /// Forgets the group, once written or dropped.
+        void clear() {
+            frames.clear();
+            sealed = 0;
+            units = false;
+            segment = null;
+            key = null;
+        }
     }
 
     /// The frames of consecutive commits, which [#appendAll(Batch)] queues together; the publisher of a store reuses
@@ -1021,6 +1701,11 @@ final class LogWriter {
         return forces;
     }
 
+    /// {@return the frames sealed ahead so far, while a force ran on the forcing thread}
+    long sealedAhead() {
+        return sealedAhead;
+    }
+
     /// Makes everything queued durable, then closes the segment.
     ///
     /// @throws LedgerIoException if the queued frames cannot be made durable
@@ -1047,9 +1732,10 @@ final class LogWriter {
                 durabilityLock.unlock();
             }
         } finally {
-            // The flush task has nothing left to write, or has stopped
+            // The flush task has nothing left to write, or has stopped, its last force joined either way
             closeChannel();
             keepNext();
+            stopForcer();
         }
     }
 
