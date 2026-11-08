@@ -37,8 +37,10 @@ on:
 permissions:
   contents: read
 
+# Each pair of refs gets its own group: hosted runners are separate machines, so runs of different heads can measure
+# side by side, while a second run of the same pair and workloads waits for the first
 concurrency:
-  group: compare-${{ inputs.os }}
+  group: compare-${{ inputs.os }}-${{ inputs.base }}-${{ inputs.head || github.sha }}-${{ inputs.pattern }}-${{ inputs.jmh-args }}
   cancel-in-progress: false
 
 defaults:
