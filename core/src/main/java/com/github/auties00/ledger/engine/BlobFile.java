@@ -283,9 +283,18 @@ final class BlobFile implements AutoCloseable {
         }
     }
 
-    /// Forces every unit written so far, and the length of the file.
+    /// Forces every unit written so far, with what reading them back needs: the length of the file and the blocks a
+    /// unit took.
+    ///
+    /// On Linux the force is `fdatasync`, which flushes a length or an allocation that changed and otherwise skips the
+    /// journal commit `fsync` waits for to record the file's modification time, all a unit that overwrites freed pages
+    /// changes besides its bytes. On macOS the JDK empties the drive's cache with `fcntl(F_FULLFSYNC)` and on Windows it
+    /// calls `FlushFileBuffers`, with or without the metadata.
+    ///
+    /// That spares this force alone: a group of commits waits for the log's force too, which commits the journal itself
+    /// for each group while it grows a segment, as it does through the first two segments of an open.
     void force() throws IOException {
-        channel.force(true);
+        channel.force(false);
     }
 
     /// Frees the pages of `ref` at once: a unit no commit made durable, or one a checkpoint superseded.

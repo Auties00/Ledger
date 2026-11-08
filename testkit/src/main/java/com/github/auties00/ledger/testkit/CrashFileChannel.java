@@ -150,6 +150,9 @@ final class CrashFileChannel extends FileChannel {
                 } else {
                     disk.force(file);
                 }
+                if (metaData) {
+                    fileSystem.metadataForced(path);
+                }
             }
             completed = true;
         } finally {

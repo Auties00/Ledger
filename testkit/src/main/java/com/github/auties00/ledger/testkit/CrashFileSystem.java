@@ -7,6 +7,7 @@ import java.nio.file.PathMatcher;
 import java.nio.file.WatchService;
 import java.nio.file.attribute.UserPrincipalLookupService;
 import java.nio.file.spi.FileSystemProvider;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.Random;
@@ -52,6 +53,8 @@ public final class CrashFileSystem extends FileSystem {
     private final CrashFileSystemProvider provider;
     private volatile boolean open;
     private volatile ChangeInterceptor interceptor;
+    // The forces that asked for metadata too, by the key of what they forced, guarded by the disk's lock
+    private final HashMap<String, Long> metadataForces;
 
     private CrashFileSystem(Disk disk) {
         this.disk = disk;
@@ -59,6 +62,7 @@ public final class CrashFileSystem extends FileSystem {
         this.open = true;
         this.interceptor = (_, _) -> {
         };
+        this.metadataForces = new HashMap<>();
     }
 
     /// {@return a new, empty file system}
@@ -119,6 +123,24 @@ public final class CrashFileSystem extends FileSystem {
         synchronized (disk.lock) {
             return disk.forces();
         }
+    }
+
+    /// {@return the forces of the file or directory at `path` so far that asked for its metadata too}
+    ///
+    /// A force keeps the same with or without metadata in this model, as the length and the blocks of a file are what
+    /// reading it back needs, which `fdatasync` flushes too; this tells only which of the two a store asked for.
+    ///
+    /// @param path a path of this file system
+    public long metadataForces(Path path) {
+        var key = ((CrashPath) path).key();
+        synchronized (disk.lock) {
+            return metadataForces.getOrDefault(key, 0L);
+        }
+    }
+
+    /// Counts a force of the entry at `key` that asked for metadata too, under the disk's lock.
+    void metadataForced(String key) {
+        metadataForces.merge(key, 1L, Long::sum);
     }
 
     /// {@return the changes made so far}

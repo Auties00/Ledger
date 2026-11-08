@@ -163,6 +163,42 @@ class CrashFileSystemTest {
     }
 
     @Nested
+    @DisplayName("forces")
+    class Forces {
+        @Test
+        @DisplayName("count those that asked for metadata, per path")
+        void metadata() throws IOException {
+            var fs = CrashFileSystem.create();
+            var file = fs.getPath("/file");
+            var other = fs.getPath("/other");
+            try (var channel = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+                channel.write(ByteBuffer.wrap(new byte[]{1, 2, 3}), 0);
+                channel.force(false);
+                assertEquals(0, fs.metadataForces(file));
+                channel.force(true);
+                assertEquals(1, fs.metadataForces(file));
+            }
+            assertEquals(0, fs.metadataForces(other));
+        }
+
+        @Test
+        @DisplayName("without metadata make a write past the end durable")
+        void growth() throws IOException {
+            var fs = CrashFileSystem.create();
+            var file = fs.getPath("/file");
+            var bytes = new byte[]{4, 5, 6};
+            try (var channel = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+                channel.write(ByteBuffer.wrap(bytes), 0);
+                channel.force(false);
+            }
+            forceDirectory(fs.getPath("/"));
+            for (var draw = 0L; draw < DRAWS; draw++) {
+                assertArrayEquals(bytes, Files.readAllBytes(fs.afterPowerLoss(new Random(draw)).getPath("/file")));
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("stopping the process")
     class Stopping {
         @Test
