@@ -15,6 +15,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The hash index of a key space's chains, against a map of the JDK, alone and under concurrent writers and readers.
 class ChainIndexTest {
@@ -60,6 +61,8 @@ class ChainIndexTest {
                     var expected = model.get(key);
                     var bytes = keyOf(key);
                     assertSame(expected, index.get(bytes, Segments.hash(bytes)), "get " + key);
+                    var array = Segments.toBytes(bytes);
+                    assertSame(expected, index.get(array, Segments.hash(array)), "get of an array " + key);
                 }
             }
         }
@@ -107,6 +110,7 @@ class ChainIndexTest {
                         // Another chain of the same key is not the one held: removing it changes nothing
                         index.remove(new Chain(key, hash));
                         assertSame(model.get(name), index.get(key, hash), "removing another chain of " + name);
+                        assertSame(model.get(name), index.get(bytes, hash), "removing another chain of " + name + ", by array");
                     }
                     default -> {
                         var held = model.remove(name);
@@ -117,10 +121,19 @@ class ChainIndexTest {
                     }
                 }
                 assertEquals(model.size(), index.size());
+                assertEquals(model.isEmpty(), index.holdsNone());
+                if (step % 64 == 0) {
+                    assertEquals(index.tablesForTests(), index.occupiedForTests());
+                }
             }
             for (var held : model.values()) {
                 assertSame(held, index.get(held.key(), held.hash));
+                assertSame(held, index.get(Segments.toBytes(held.key()), held.hash));
+                index.remove(held);
+                assertEquals(index.tablesForTests(), index.occupiedForTests());
             }
+            assertTrue(index.holdsNone());
+            assertEquals(0, index.tablesForTests());
         }
     }
 
@@ -165,6 +178,120 @@ class ChainIndexTest {
                 }
             }));
         }
+        Thread.sleep(2_000);
+        stop.set(true);
+        for (var thread : threads) {
+            thread.join();
+        }
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+    }
+
+    @Test
+    @DisplayName("counts the segments that hold a table through storms of insertions and removals over every segment")
+    void occupiedSegments() throws Exception {
+        var index = new ChainIndex();
+        assertTrue(index.holdsNone());
+        var failure = new AtomicReference<Throwable>();
+        var threads = new ArrayList<Thread>();
+        for (var t = 0; t < 4; t++) {
+            var seed = t;
+            threads.add(Thread.ofPlatform().start(() -> {
+                try {
+                    var random = new SplittableRandom(seed);
+                    var held = new ArrayList<Chain>();
+                    for (var step = 0; step < 300_000; step++) {
+                        // Few keys per thread, over and over down to none, so segments empty and fill
+                        var phase = (step >> 10) & 1;
+                        if (phase == 0 && held.size() < 200) {
+                            var created = chain(((long) seed << 40) | random.nextInt(1_000));
+                            if (index.putIfAbsent(created) == null) {
+                                held.add(created);
+                            }
+                        } else if (!held.isEmpty()) {
+                            index.remove(held.remove(random.nextInt(held.size())));
+                        }
+                    }
+                    if (seed % 2 == 0) {
+                        held.forEach(index::remove);
+                    }
+                } catch (Throwable throwable) {
+                    failure.compareAndSet(null, throwable);
+                }
+            }));
+        }
+        for (var thread : threads) {
+            thread.join();
+        }
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+        assertEquals(index.tablesForTests(), index.occupiedForTests());
+        assertEquals(index.size() == 0, index.holdsNone());
+        var walk = new ChainIndex.Cursor();
+        for (var chain = index.next(walk); chain != null; chain = index.next(walk)) {
+            index.remove(chain);
+        }
+        assertEquals(0, index.size());
+        assertEquals(0, index.tablesForTests());
+        assertEquals(0, index.occupiedForTests());
+        assertTrue(index.holdsNone());
+    }
+
+    @Test
+    @DisplayName("never reports no chain to a reader synchronized with the insertion of one it still holds, while other segments empty and fill")
+    void occupiedPublished() throws Exception {
+        var index = new ChainIndex();
+        var published = new java.util.concurrent.atomic.AtomicLong();
+        var acknowledged = new java.util.concurrent.atomic.AtomicLong();
+        var stop = new AtomicBoolean();
+        var failure = new AtomicReference<Throwable>();
+        var threads = new ArrayList<Thread>();
+        threads.add(Thread.ofPlatform().start(() -> {
+            for (var n = 1L; !stop.get(); n++) {
+                var created = chain(n);
+                index.putIfAbsent(created);
+                // What a commit's publication does for the chains it wrote
+                published.setRelease(n);
+                while (acknowledged.getAcquire() < n) {
+                    if (stop.get()) {
+                        // A reader may still be looking for this chain, which stays
+                        return;
+                    }
+                    Thread.onSpinWait();
+                }
+                // The chain stays until the reader looked, then leaves, often the last of the whole index
+                index.remove(created);
+            }
+        }));
+        threads.add(Thread.ofPlatform().start(() -> {
+            var random = new SplittableRandom(11);
+            while (!stop.get()) {
+                var created = chain((1L << 50) | random.nextInt(4));
+                if (index.putIfAbsent(created) == null) {
+                    index.remove(created);
+                }
+            }
+        }));
+        threads.add(Thread.ofPlatform().start(() -> {
+            var seen = 0L;
+            while (!stop.get()) {
+                var n = published.getAcquire();
+                if (n == seen) {
+                    Thread.onSpinWait();
+                    continue;
+                }
+                seen = n;
+                var array = Segments.toBytes(keyOf(n));
+                if (index.holdsNone() || index.get(array, Segments.hash(array)) == null) {
+                    failure.compareAndSet(null, new AssertionError("a reader missed " + n));
+                    stop.set(true);
+                    return;
+                }
+                acknowledged.setRelease(n);
+            }
+        }));
         Thread.sleep(2_000);
         stop.set(true);
         for (var thread : threads) {

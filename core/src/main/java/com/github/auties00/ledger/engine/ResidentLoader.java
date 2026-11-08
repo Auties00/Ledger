@@ -93,6 +93,11 @@ final class ResidentLoader {
         return complete || Segments.compare(key, below) < 0;
     }
 
+    /// {@return whether memory holds the entry of the key whose bytes are `key`, if it has one}
+    boolean holds(byte[] key) {
+        return complete || Segments.compare(key, 0, key.length, below) < 0;
+    }
+
     /// {@return the key below which memory holds every entry, or `null` once it holds them all}
     MemorySegment limit() {
         return complete ? null : below;

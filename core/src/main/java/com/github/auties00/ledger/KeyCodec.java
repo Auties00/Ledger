@@ -49,7 +49,8 @@ public sealed interface KeyCodec<K> permits FunctionKeyCodec {
 
     /// {@return a codec of byte arrays, ordered as unsigned bytes}
     ///
-    /// It is trusted: decoding copies each key into an array of its own.
+    /// It is trusted: decoding copies each key into an array of its own. A read by key uses the array it is given as the
+    /// encoded key, so the array must not change during the call; every other use copies it.
     static KeyCodec<byte[]> bytes() {
         return BuiltinCodecs.BYTES_KEY;
     }

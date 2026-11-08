@@ -21,20 +21,38 @@ import java.lang.invoke.VarHandle;
 /// well. A segment that fills grows by building a new table and publishing it: a reader on the old one sees the chains
 /// of the moment it was copied, and a chain inserted later is published by the commit that wrote it, which the reader
 /// synchronizes with before it looks, and so after its tag.
+///
+/// The index counts the segments that hold a table of their own, so a key space with no chain, as a paged one is once a
+/// checkpoint took them all, answers [#holdsNone()] without hashing the key. A segment counts from before the first
+/// chain of its table is published until after the table is dropped, so a reader that synchronized with the commit of a
+/// chain the index still holds never reads 0: every segment adds to the count before it takes from it, in the order of
+/// the count's own changes.
 final class ChainIndex {
     private static final int SEGMENTS = 64;
     private static final int INITIAL = 16;
     private static final VarHandle SLOTS = MethodHandles.arrayElementVarHandle(Chain[].class);
     private static final VarHandle SEGMENT_SLOTS = MethodHandles.arrayElementVarHandle(Segment[].class);
+    private static final VarHandle OCCUPIED;
     // Marks a slot whose chain was removed; it ends no probe
     private static final Chain TOMBSTONE = new Chain(MemorySegment.ofArray(new byte[0]), 0);
     // The table of every segment that holds no chain, which no one writes: a key space's segments took 12 KB of
     // tables before its first write, and kept them once a checkpoint had dropped every chain
     private static final Table EMPTY = Table.of(INITIAL);
 
+    static {
+        try {
+            OCCUPIED = MethodHandles.lookup().findVarHandle(ChainIndex.class, "occupied", int.class);
+        } catch (ReflectiveOperationException exception) {
+            throw new ExceptionInInitializerError(exception);
+        }
+    }
+
     // Each made with the first chain its hashes take, so a key space of a few keys keeps a few: 64 up front, and the
     // locks beside them, cost every key space 3 KB
     private final Segment[] segments;
+    // The segments whose table is not EMPTY, changed through setTable alone
+    @SuppressWarnings("unused")
+    private volatile int occupied;
 
     ChainIndex() {
         this.segments = new Segment[SEGMENTS];
@@ -66,6 +84,42 @@ final class ChainIndex {
         }
     }
 
+    /// {@return the chain of the key of `hash` whose bytes are `key`, or `null` if the index holds none}
+    ///
+    /// A lookup by an array, for a read: it makes a segment of `key` only for a chain whose tag and hash match, as the
+    /// lookup of a key memory does not hold finds none.
+    Chain get(byte[] key, int hash) {
+        var segment = (Segment) SEGMENT_SLOTS.getAcquire(segments, segmentOf(hash));
+        if (segment == null) {
+            return null;
+        }
+        var table = segment.table;
+        var tags = table.tags;
+        var chains = table.chains;
+        var mask = tags.length - 1;
+        var tag = tag(hash);
+        for (var slot = slot(hash) & mask; ; slot = (slot + 1) & mask) {
+            var held = tags[slot];
+            if (held == 0) {
+                return null;
+            }
+            if (held == tag) {
+                // Null while an insertion that wrote the tag has not published its chain, which this lookup need not see
+                var chain = (Chain) SLOTS.getAcquire(chains, slot);
+                if (chain != null && chain.hash == hash && chain != TOMBSTONE && chain.keyEquals(MemorySegment.ofArray(key))) {
+                    return chain;
+                }
+            }
+        }
+    }
+
+    /// {@return whether no segment holds a table of its own, so no lookup can find a chain}
+    ///
+    /// Like a lookup, it never hides a chain that was in the index when it was called and still is.
+    boolean holdsNone() {
+        return occupied == 0;
+    }
+
     /// Adds `chain` unless the index holds a chain of the same key.
     ///
     /// @return the chain the index held for the key, or `null` if it took `chain`
@@ -76,7 +130,7 @@ final class ChainIndex {
             while (true) {
                 var table = segment.table;
                 if (table == EMPTY) {
-                    segment.table = Table.of(INITIAL);
+                    setTable(segment, Table.of(INITIAL));
                     continue;
                 }
                 var tags = table.tags;
@@ -103,7 +157,7 @@ final class ChainIndex {
                 var fresh = tags[free] == 0;
                 if (fresh && (segment.taken + 1) * 4 > tags.length * 3) {
                     // A slot no tombstone frees would fill the table past three quarters: probes would lengthen
-                    segment.rebuild();
+                    rebuild(segment);
                     continue;
                 }
                 if (fresh) {
@@ -138,7 +192,7 @@ final class ChainIndex {
                     if (segment.size == 0) {
                         // A segment a checkpoint emptied keeps no table
                         segment.taken = 0;
-                        segment.table = EMPTY;
+                        setTable(segment, EMPTY);
                         return;
                     }
                     // Tombstones end no probe: once they outnumber the chains, and fill a quarter of the table, they
@@ -148,7 +202,7 @@ final class ChainIndex {
                     var tombstones = segment.taken - segment.size;
                     if ((tombstones > segment.size && tombstones * 4 > tags.length)
                             || (tags.length > INITIAL && segment.size * 16 < tags.length)) {
-                        segment.rebuild();
+                        rebuild(segment);
                     }
                     return;
                 }
@@ -166,6 +220,23 @@ final class ChainIndex {
             }
         }
         return size;
+    }
+
+    /// {@return the segments the count behind [#holdsNone()] takes to hold a table of their own}
+    int occupiedForTests() {
+        return occupied;
+    }
+
+    /// {@return the segments that hold a table of their own, each looked at in turn}
+    int tablesForTests() {
+        var tables = 0;
+        for (var i = 0; i < SEGMENTS; i++) {
+            var segment = (Segment) SEGMENT_SLOTS.getAcquire(segments, i);
+            if (segment != null && segment.table != EMPTY) {
+                tables++;
+            }
+        }
+        return tables;
     }
 
     /// {@return the next chain of a walk over the index from `cursor`, which it advances, or `null` once the walk has
@@ -204,6 +275,50 @@ final class ChainIndex {
         private int segment;
         private Chain[] chains;
         private int slot;
+    }
+
+    /// Makes `table` the table of `segment`, whose lock the caller holds, and counts the segment as it starts or stops
+    /// holding a table of its own: before the table is published, whose chains come after it, and after it is dropped.
+    private void setTable(Segment segment, Table table) {
+        var had = segment.table != EMPTY;
+        var has = table != EMPTY;
+        if (has && !had) {
+            OCCUPIED.getAndAdd(this, 1);
+        }
+        segment.table = table;
+        if (had && !has) {
+            OCCUPIED.getAndAdd(this, -1);
+        }
+    }
+
+    /// Copies the chains of `segment`, whose lock the caller holds, into a table at most half full, without tombstones,
+    /// and publishes it: one that filled doubles, to three eighths full.
+    private void rebuild(Segment segment) {
+        if (segment.size == 0) {
+            segment.taken = 0;
+            setTable(segment, EMPTY);
+            return;
+        }
+        var old = segment.table.chains;
+        var capacity = INITIAL;
+        while (capacity < (segment.size + 1) * 2) {
+            capacity <<= 1;
+        }
+        var fresh = Table.of(capacity);
+        var mask = capacity - 1;
+        for (var chain : old) {
+            if (chain != null && chain != TOMBSTONE) {
+                var slot = slot(chain.hash) & mask;
+                while (fresh.tags[slot] != 0) {
+                    slot = (slot + 1) & mask;
+                }
+                fresh.chains[slot] = chain;
+                fresh.tags[slot] = tag(chain.hash);
+            }
+        }
+        segment.taken = segment.size;
+        // The volatile store publishes the copied slots with the table
+        setTable(segment, fresh);
     }
 
     private static int segmentOf(int hash) {
@@ -256,35 +371,5 @@ final class ChainIndex {
         private volatile int size;
         // The slots that are not empty, tombstones included; guarded by the lock
         private int taken;
-
-        /// Copies the chains into a table at most half full, without tombstones, and publishes it: one that filled
-        /// doubles, to three eighths full.
-        private void rebuild() {
-            if (size == 0) {
-                taken = 0;
-                table = EMPTY;
-                return;
-            }
-            var old = table.chains;
-            var capacity = INITIAL;
-            while (capacity < (size + 1) * 2) {
-                capacity <<= 1;
-            }
-            var fresh = Table.of(capacity);
-            var mask = capacity - 1;
-            for (var chain : old) {
-                if (chain != null && chain != TOMBSTONE) {
-                    var slot = slot(chain.hash) & mask;
-                    while (fresh.tags[slot] != 0) {
-                        slot = (slot + 1) & mask;
-                    }
-                    fresh.chains[slot] = chain;
-                    fresh.tags[slot] = tag(chain.hash);
-                }
-            }
-            taken = size;
-            // The volatile store publishes the copied slots with the table
-            table = fresh;
-        }
     }
 }

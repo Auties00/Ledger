@@ -129,7 +129,8 @@ final class ResidentScan {
         if (root == null) {
             return null;
         }
-        var cursor = new TreeCursor(point.pages(), root, low, high, descending);
+        var cursor = new TreeCursor(point.pages(), root, low == null ? null : Segments.toBytes(low),
+                high == null ? null : Segments.toBytes(high), descending);
         while (cursor.next()) {
             if (passed(cursor)) {
                 return rest(cursor.key(), false);

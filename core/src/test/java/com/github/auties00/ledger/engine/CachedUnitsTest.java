@@ -21,6 +21,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -309,7 +310,7 @@ class CachedUnitsTest {
                             if (local.nextInt(40) == 0) {
                                 var from = keys.get(local.nextInt(keys.size()));
                                 var expected = model.tailMap(from, true).entrySet().iterator();
-                                var cursor = new TreeCursor(pages, tree, segment(from), null, false);
+                                var cursor = new TreeCursor(pages, tree, from.getBytes(StandardCharsets.US_ASCII), null, false);
                                 for (var n = 0; n < 100 && cursor.next(); n++) {
                                     var entry = expected.next();
                                     if (!entry.getKey().equals(string(cursor.key())) || !Arrays.equals(entry.getValue(), bytes(cursor.value()))) {
@@ -318,8 +319,10 @@ class CachedUnitsTest {
                                 }
                             } else {
                                 var key = keys.get(local.nextInt(keys.size()));
-                                var hit = TreeSearch.find(pages, tree, segment(key));
-                                if (hit == null || !Arrays.equals(model.get(key), bytes(TreeSearch.value(pages, hit.unit(), hit.entry())))) {
+                                var encoded = key.getBytes(StandardCharsets.US_ASCII);
+                                var unit = TreeSearch.leaf(pages, tree, encoded);
+                                var at = TreeSearch.entryOf(unit, encoded);
+                                if (at == -1 || !Arrays.equals(model.get(key), bytes(TreeSearch.value(pages, unit, at)))) {
                                     failures.add("the value of " + key);
                                 }
                             }
@@ -345,9 +348,11 @@ class CachedUnitsTest {
             assertArrayEquals(entry.getValue(), bytes(cursor.value()));
         }
         for (var entry : model.entrySet()) {
-            var hit = TreeSearch.find(pages, root, segment(entry.getKey()));
-            assertNotNull(hit, entry.getKey());
-            assertArrayEquals(entry.getValue(), bytes(TreeSearch.value(pages, hit.unit(), hit.entry())));
+            var encoded = entry.getKey().getBytes(StandardCharsets.US_ASCII);
+            var unit = TreeSearch.leaf(pages, root, encoded);
+            var at = TreeSearch.entryOf(unit, encoded);
+            assertNotEquals(-1, at, entry.getKey());
+            assertArrayEquals(entry.getValue(), bytes(TreeSearch.value(pages, unit, at)));
         }
     }
 
