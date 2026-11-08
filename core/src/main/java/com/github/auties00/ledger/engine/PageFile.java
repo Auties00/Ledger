@@ -537,9 +537,7 @@ final class PageFile implements AutoCloseable {
         ///
         /// @return the reference of the unit
         PageRef write(byte kind, int level, int page, int pages, byte[] unit, int length, boolean cached) throws IOException {
-            synchronized (lock) {
-                return write(kind, level, page, pages, unit, length, cached, nextNonce());
-            }
+            return write(kind, level, page, pages, unit, length, cached, nextNonce());
         }
 
         /// Queues `unit` as [#write(byte, int, int, int, byte\[\], int, boolean)] does, sealed under `nonce`, which
@@ -547,23 +545,25 @@ final class PageFile implements AutoCloseable {
         ///
         /// @return the reference of the unit
         PageRef write(byte kind, int level, int page, int pages, byte[] unit, int length, boolean cached, int nonce) throws IOException {
+            var ref = new PageRef(page, pages, nonceHigh, nonce);
+            header(unit, kind, level, page, pages, length, ref.nonceHigh(), ref.nonceLow());
             synchronized (lock) {
-                var ref = new PageRef(page, pages, nonceHigh, nonce);
-                header(unit, kind, level, page, pages, length, ref.nonceHigh(), ref.nonceLow());
                 if (staged.put(page, new Staged(ref, unit)) != null) {
                     throw new IllegalStateException("A checkpoint wrote page " + page + " twice");
                 }
                 stagedBytes += (long) pages * PageFormat.SIZE;
-                if (cached) {
-                    cache.put(ref, unit, false);
-                } else {
-                    cache.remove(page);
-                }
                 if (stagedBytes >= STAGED_LIMIT) {
                     flush();
                 }
-                return ref;
             }
+            // Outside the writer's lock: the tasks of a checkpoint all pass through it, for every unit they read too,
+            // so one waiting for the cache's lock, or rebuilding its table or evicting, would hold up the others
+            if (cached) {
+                cache.put(ref, unit, false);
+            } else {
+                cache.remove(page);
+            }
+            return ref;
         }
 
         /// {@return the plaintext of the queued unit `ref` names, or `null` if it is not queued}
