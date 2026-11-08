@@ -13,6 +13,10 @@ import java.util.Arrays;
 /// evicts before any other. A long scan reads each unit once, so caching what it reads would only evict the units
 /// other reads use: the PostgreSQL buffer manager holds a large sequential scan to a small ring for the same reason. A
 /// cache with room evicts nothing to take them, and keeps a key space small enough to fit for the next scan.
+///
+/// The keys and inline values a cursor hands out are slices of one read-only view per leaf. The bound a scan runs
+/// towards is compared with the far entry of each leaf it enters: keys being sorted, a far entry within the bound puts
+/// the whole leaf within it, so only the leaf that holds the bound compares its entries one by one.
 final class TreeCursor {
     /// The leaves and blobs a cursor adds to the page cache, enough for the pages of a chat a reader scrolls through.
     static final int ADMITTED = 64;
@@ -21,10 +25,18 @@ final class TreeCursor {
     private final MemorySegment from;
     private final MemorySegment to;
     private final boolean descending;
+    // The bound the scan runs towards, or null for none; seek() applies the other one
+    private final MemorySegment bound;
     private byte[][] path;
     private int[] indexes;
     private int depth;
     private byte[] leaf;
+    // A read-only view of the whole leaf
+    private MemorySegment leafView;
+    // Whether inside tells for this leaf: it reads the leaf's far entry, so only a leaf with an entry to visit knows it
+    private boolean boundKnown;
+    // Whether every entry of the leaf is within the bound the scan runs towards
+    private boolean inside;
     private int index;
     private int entry;
     private boolean started;
@@ -41,6 +53,7 @@ final class TreeCursor {
         this.from = from;
         this.to = to;
         this.descending = descending;
+        this.bound = descending ? from : to;
         this.path = new byte[8][];
         this.indexes = new int[8];
         if (root == null) {
@@ -65,12 +78,19 @@ final class TreeCursor {
             push(unit, child);
             unit = child(unit, child);
         }
-        leaf = unit;
+        enter(unit);
         if (descending) {
             index = (to == null ? TreeNodes.count(unit) : TreeNodes.lowerBound(unit, to)) - 1;
         } else {
             index = from == null ? 0 : TreeNodes.lowerBound(unit, from);
         }
+    }
+
+    /// Makes `unit` the current leaf.
+    private void enter(byte[] unit) {
+        leaf = unit;
+        leafView = MemorySegment.ofArray(unit).asReadOnly();
+        boundKnown = false;
     }
 
     private void push(byte[] unit, int child) {
@@ -101,14 +121,30 @@ final class TreeCursor {
             }
         }
         entry = TreeNodes.entry(leaf, index);
+        if (!boundKnown) {
+            inside = leafInside();
+            boundKnown = true;
+        }
+        if (inside || entryInside(entry)) {
+            return true;
+        }
+        exhausted = true;
+        return false;
+    }
+
+    /// {@return whether every entry of the current leaf, which has at least one, is within the bound the scan runs
+    /// towards}
+    private boolean leafInside() {
+        return bound == null || entryInside(TreeNodes.entry(leaf, descending ? 0 : TreeNodes.count(leaf) - 1));
+    }
+
+    /// {@return whether `entry` of the current leaf is within the bound the scan runs towards, which must not be
+    /// `null`: at or after `from` descending, before `to` ascending}
+    private boolean entryInside(int entry) {
         var offset = TreeNodes.leafKeyOffset(entry);
         var length = TreeNodes.leafKeyLength(leaf, entry);
-        if (descending ? from != null && TreeNodes.compare(leaf, offset, length, from) < 0
-                : to != null && TreeNodes.compare(leaf, offset, length, to) >= 0) {
-            exhausted = true;
-            return false;
-        }
-        return true;
+        var order = TreeNodes.compare(leafView, leaf, offset, length, bound);
+        return descending ? order >= 0 : order < 0;
     }
 
     private boolean nextLeaf() {
@@ -123,7 +159,7 @@ final class TreeCursor {
                     push(node, edge);
                     node = child(node, edge);
                 }
-                leaf = node;
+                enter(node);
                 index = descending ? TreeNodes.count(node) - 1 : 0;
                 return true;
             }
@@ -134,19 +170,19 @@ final class TreeCursor {
 
     /// {@return the key of the current entry, a read-only view of the leaf}
     MemorySegment key() {
-        return TreeNodes.leafKey(leaf, entry);
+        return TreeNodes.leafKey(leafView, leaf, entry);
     }
 
     /// {@return a negative number, zero or a positive number as the current entry's key sorts before, with or after
     /// `key`}
     int compareKey(MemorySegment key) {
-        return TreeNodes.compare(leaf, TreeNodes.leafKeyOffset(entry), TreeNodes.leafKeyLength(leaf, entry), key);
+        return TreeNodes.compare(leafView, leaf, TreeNodes.leafKeyOffset(entry), TreeNodes.leafKeyLength(leaf, entry), key);
     }
 
     /// {@return the value of the current entry, read-only, read from its blob if it has one}
     MemorySegment value() {
         if (TreeNodes.isInline(leaf, entry)) {
-            return TreeNodes.inlineValue(leaf, entry);
+            return TreeNodes.inlineValue(leafView, leaf, entry);
         }
         if (admit()) {
             return TreeSearch.value(pages, leaf, entry, true);

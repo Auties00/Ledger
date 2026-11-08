@@ -76,7 +76,15 @@ final class TreeNodes {
     /// {@return a negative number, zero or a positive number as the `length` bytes at `offset` of `unit` sort before,
     /// with or after `key`}
     static int compare(byte[] unit, int offset, int length, MemorySegment key) {
-        var mismatch = MemorySegment.mismatch(MemorySegment.ofArray(unit), offset, offset + length, key, 0, key.byteSize());
+        return compare(MemorySegment.ofArray(unit), unit, offset, length, key);
+    }
+
+    /// {@return a negative number, zero or a positive number as the `length` bytes at `offset` of `unit` sort before,
+    /// with or after `key`}
+    ///
+    /// @param view a view of the whole of `unit`
+    static int compare(MemorySegment view, byte[] unit, int offset, int length, MemorySegment key) {
+        var mismatch = MemorySegment.mismatch(view, offset, offset + length, key, 0, key.byteSize());
         if (mismatch == -1) {
             return 0;
         }
@@ -115,7 +123,14 @@ final class TreeNodes {
 
     /// {@return the read-only key of leaf entry `entry`}
     static MemorySegment leafKey(byte[] unit, int entry) {
-        return MemorySegment.ofArray(unit).asSlice(leafKeyOffset(entry), leafKeyLength(unit, entry)).asReadOnly();
+        return leafKey(MemorySegment.ofArray(unit).asReadOnly(), unit, entry);
+    }
+
+    /// {@return the read-only key of leaf entry `entry`, a slice of `view`}
+    ///
+    /// @param view a read-only view of the whole of `unit`
+    static MemorySegment leafKey(MemorySegment view, byte[] unit, int entry) {
+        return view.asSlice(leafKeyOffset(entry), leafKeyLength(unit, entry));
     }
 
     private static int valueField(byte[] unit, int entry) {
@@ -167,8 +182,15 @@ final class TreeNodes {
 
     /// {@return the read-only inline value of leaf entry `entry`}
     static MemorySegment inlineValue(byte[] unit, int entry) {
+        return inlineValue(MemorySegment.ofArray(unit).asReadOnly(), unit, entry);
+    }
+
+    /// {@return the read-only inline value of leaf entry `entry`, a slice of `view`}
+    ///
+    /// @param view a read-only view of the whole of `unit`
+    static MemorySegment inlineValue(MemorySegment view, byte[] unit, int entry) {
         var field = valueField(unit, entry);
-        return MemorySegment.ofArray(unit).asSlice(field + 3, Bytes.u16(unit, field + 1)).asReadOnly();
+        return view.asSlice(field + 3, Bytes.u16(unit, field + 1));
     }
 
     static int blobLength(byte[] unit, int entry) {

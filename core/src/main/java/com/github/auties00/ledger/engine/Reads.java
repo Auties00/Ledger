@@ -48,6 +48,9 @@ final class Reads {
 
     /// {@return whether a range removal the tree of `point` does not hold, and `point` sees, covers `key`}
     static boolean hiddenSinceTree(MemorySegment key, ReadPoint point, RangeRemoval[] removals) {
+        if (removals.length == 0) {
+            return false;
+        }
         var treeBound = point.treeBound();
         for (var removal : removals) {
             if (removal.stamp() > treeBound && removal.stamp() <= point.bound() && removal.covers(key)) {
