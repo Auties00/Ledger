@@ -45,12 +45,25 @@ public final class LedgerEngine implements Engine {
     /// @param encrypted whether the store encrypts its files, with AES-256-GCM
     /// @return the open engine
     public static LedgerEngine open(Path directory, EngineSettings settings, boolean encrypted) {
+        return open(directory, settings, encrypted, false);
+    }
+
+    /// Opens or creates the store in `directory`.
+    ///
+    /// @param settings the shared settings; their cache becomes the page cache
+    /// @param encrypted whether the store encrypts its files, with AES-256-GCM
+    /// @param residentAtOpen whether the open reads the resident key spaces whatever the store's default is
+    /// @return the open engine
+    public static LedgerEngine open(Path directory, EngineSettings settings, boolean encrypted, boolean residentAtOpen) {
         var keyspaces = new EnumMap<Keyspace, com.github.auties00.ledger.Keyspace<byte[], byte[]>>(Keyspace.class);
         var options = Ledger.builder()
                 .directory(directory)
                 .encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
                 .pageCache(Math.max(1L << 20, settings.cacheBytes()))
                 .largeValues(settings.largeValues());
+        if (residentAtOpen) {
+            options.loadResidentAtOpen(true);
+        }
         for (var keyspace : Keyspace.values()) {
             var name = keyspace.name().toLowerCase(Locale.ROOT).replace('_', '-');
             var resident = keyspace == Keyspace.SESSIONS || keyspace == Keyspace.CHATS;
