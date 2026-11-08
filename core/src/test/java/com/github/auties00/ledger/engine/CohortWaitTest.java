@@ -370,10 +370,14 @@ class CohortWaitTest {
     }
 
     @Test
-    @DisplayName("one committer at a time keeps writing its own groups")
+    @DisplayName("one committer at a time never makes the flush wait, and writes its own group after any other")
     void solitary() throws Exception {
         var disk = CrashFileSystem.create();
-        try (var ledger = open(disk.getPath("/store"), null)) {
+        try (var pool = IoPool.create(1); var ledger = open(disk.getPath("/store"), pool)) {
+            // Some of these groups are the pool's and some the committer's, however the two race
+            for (var round = 0; round < 50; round++) {
+                ledger.commit(ledger.newBatch().put(NAMES, "k" + round, "v")).awaitDurable();
+            }
             var committer = Thread.currentThread();
             var forcedHere = new AtomicLong();
             disk.intercept((path, kind) -> {
@@ -381,11 +385,12 @@ class CohortWaitTest {
                     forcedHere.incrementAndGet();
                 }
             });
-            for (var round = 0; round < 50; round++) {
-                ledger.commit(ledger.newBatch().put(NAMES, "k" + round, "v")).awaitDurable();
+            try (var _ = new HeldPool(pool)) {
+                for (var round = 0; round < 50; round++) {
+                    ledger.commit(ledger.newBatch().put(NAMES, "held" + round, "v")).awaitDurable();
+                }
             }
-            // The pool's thread may take a group before the committer reaches it; the rest are the committer's own
-            assertTrue(forcedHere.get() > 25, () -> forcedHere.get() + " of 50 groups forced by their committer");
+            assertEquals(50, forcedHere.get());
             assertEquals(0, log(ledger).cohortsGathered() + log(ledger).cohortsMissed());
         }
     }

@@ -345,31 +345,37 @@ class DurableLedgerTest {
                 }
             });
             var options = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(NAMES).largeValues(4_096);
-            try (var ledger = options.build()) {
-                for (var i = 0; i < 40; i++) {
-                    armed.set(true);
-                    var value = large ? "v".repeat(5_000) + i : "v" + i;
-                    var batch = ledger.newBatch().put(NAMES, "k" + i, value);
-                    for (var j = 0; wide && j < 80; j++) {
-                        batch.put(NAMES, "k" + i + "-" + j, "w".repeat(4_000) + j);
+            try (var pool = IoPool.create(1); var ledger = options.ioPool(pool).build()) {
+                // The first group opens the segment, which only the pool does
+                ledger.commit(ledger.newBatch().put(NAMES, "first", "v")).awaitDurable();
+                // The file of large values is forced whichever thread writes the group, and the pool writing it is the
+                // case of a commit taking the interrupt while it waits
+                try (var _ = large ? null : new HeldPool(pool)) {
+                    for (var i = 0; i < 40; i++) {
+                        armed.set(true);
+                        var value = large ? "v".repeat(5_000) + i : "v" + i;
+                        var batch = ledger.newBatch().put(NAMES, "k" + i, value);
+                        for (var j = 0; wide && j < 80; j++) {
+                            batch.put(NAMES, "k" + i + "-" + j, "w".repeat(4_000) + j);
+                        }
+                        var commit = ledger.commit(batch);
+                        try {
+                            commit.awaitDurable();
+                        } catch (InterruptedException _) {
+                            // The pool forced the group, and the commit took the interrupt while it waited
+                            commit.awaitDurable();
+                        }
+                        assertTrue(commit.isDurable());
+                        Thread.interrupted();
                     }
-                    var commit = ledger.commit(batch);
-                    try {
-                        commit.awaitDurable();
-                    } catch (InterruptedException _) {
-                        // The pool forced the group, and the commit took the interrupt while it waited
-                        commit.awaitDurable();
-                    }
-                    assertTrue(commit.isDurable());
-                    Thread.interrupted();
+                    armed.set(false);
+                    ledger.commit(ledger.newBatch().put(NAMES, "after", "v")).awaitDurable();
                 }
-                armed.set(false);
-                ledger.commit(ledger.newBatch().put(NAMES, "after", "v")).awaitDurable();
                 // A close from an interrupted thread checkpoints all the same
                 committer.interrupt();
             }
             assertTrue(Thread.interrupted(), "the close took the interrupt");
-            assertTrue(interrupts.get() > 0, "no commit forced its own group");
+            assertEquals(40, interrupts.get(), "a commit's force went uninterrupted");
             try (var ledger = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(NAMES).largeValues(4_096).build()) {
                 for (var i = 0; i < 40; i++) {
                     assertEquals(Optional.of(large ? "v".repeat(5_000) + i : "v" + i), ledger.get(NAMES, "k" + i));
