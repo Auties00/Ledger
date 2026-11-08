@@ -45,6 +45,7 @@ class PageCacheTest {
         var cache = PageCache.isolated(LIMIT);
         // A unit of two pages kept without its padding
         var unit = new byte[PageFormat.HEADER + 2_500];
+        PageFile.header(unit, PageFormat.LEAF, 0, 5, 2, 2_500, 1, 1);
         cache.put(new PageRef(5, 2, 1, 1), unit, false);
         assertSame(unit, cache.get(new PageRef(5, 2, 1, 1)));
         assertNull(cache.get(new PageRef(5, 1, 1, 1)), "a unit of one page at the same page and nonce");
@@ -437,13 +438,15 @@ class PageCacheTest {
             var record = new PageRef(11, 1, -9, 10, 300);
             var absent = new PageRef(12, 1, 11, 12);
             var value = new PageRef(13, 1, 13, 14);
-            var branch = new byte[PageFormat.SIZE];
             var children = new ArrayList<TreeNodes.Child>();
             for (var ref : List.of(plain, record, absent, value)) {
                 var firstKey = MemorySegment.ofArray(new byte[]{(byte) ref.page()});
                 children.add(new TreeNodes.Child(firstKey, ref, 1, false, 0, -1));
             }
-            PageFile.header(branch, PageFormat.BRANCH, 1, 20, 1, TreeNodes.writeBranch(branch, children, 0, children.size()), 1, 1);
+            var sizes = children.stream().mapToInt(TreeNodes.Child::size).toArray();
+            var length = TreeNodes.contentLength(sizes, 0, sizes.length);
+            var branch = TreeNodes.writeBranch(children, 0, sizes.length, length);
+            PageFile.header(branch, PageFormat.BRANCH, 1, 20, 1, length, 1, 1);
             for (var i = 0; i < children.size(); i++) {
                 assertEquals(children.get(i).ref(), TreeNodes.childRef(branch, i));
             }
