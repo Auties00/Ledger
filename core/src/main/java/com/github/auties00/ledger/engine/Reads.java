@@ -59,12 +59,10 @@ final class Reads {
 
     /// {@return whether a range removal the tree of `point` does not hold, and `point` sees, covers the key whose bytes
     /// are `key`}
-    ///
-    /// It makes a segment of `key` only for a removal that may cover it.
     private static boolean hiddenSinceTree(byte[] key, ReadPoint point, RangeRemoval[] removals) {
         var treeBound = point.treeBound();
         for (var removal : removals) {
-            if (removal.stamp() > treeBound && removal.stamp() <= point.bound() && removal.covers(MemorySegment.ofArray(key))) {
+            if (removal.stamp() > treeBound && removal.stamp() <= point.bound() && removal.covers(key)) {
                 return true;
             }
         }
@@ -74,12 +72,12 @@ final class Reads {
     /// {@return the value of `key` in the tree of `point`, or `null` if it holds none or a later removal hides it}
     private static MemorySegment treeValue(KeyspaceState state, byte[] key, ReadPoint point, RangeRemoval[] removals) {
         var root = point.root(state);
-        if (root == null || hiddenSinceTree(key, point, removals)) {
+        if (root == null) {
             return null;
         }
         var unit = TreeSearch.leaf(point.pages(), root, key);
         var entry = TreeSearch.entryOf(unit, key);
-        return entry == -1 ? null : TreeSearch.value(point.pages(), unit, entry);
+        return entry == -1 || hiddenSinceTree(key, point, removals) ? null : TreeSearch.value(point.pages(), unit, entry);
     }
 
     /// {@return whether the tree of `point` holds `key` and no later removal `point` sees hides it}
@@ -196,12 +194,12 @@ final class Reads {
             return Optional.of(found);
         }
         var root = point.root(state);
-        if (root == null || hiddenSinceTree(encoded, point, removals)) {
+        if (root == null) {
             return Optional.empty();
         }
         var unit = TreeSearch.leaf(point.pages(), root, encoded);
         var entry = TreeSearch.entryOf(unit, encoded);
-        if (entry == -1) {
+        if (entry == -1 || hiddenSinceTree(encoded, point, removals)) {
             return Optional.empty();
         }
         if (keyspace.values() == BuiltinCodecs.BYTES_VALUE && TreeNodes.isInline(unit, entry)) {
