@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.zip.CRC32C;
 
 /// Appends frames to the log and makes them durable in groups.
@@ -34,6 +35,19 @@ import java.util.zip.CRC32C;
 /// the segment once and wakes the commits waiting for any of them: commits that arrive while a force runs make the
 /// next group, so concurrent commits share forces. Each group is padded with zeros to a multiple of [#ALIGNMENT], where
 /// the next one starts, so the pages of acknowledged frames are never written again.
+///
+/// The commits a force wakes come back with their next ones only after the flush took the next group, so on their own
+/// they would always make the group after next: the committers would split into two halves that take turns, each
+/// commit waiting for two forces. After a force that woke two or more waiting commits, or one while another still
+/// waits, the flush therefore waits for them to wait again, their next frames queued, before it takes the next group,
+/// for at most three quarters of a force and [#MAX_COHORT_WAIT]: one force then serves both halves. It waits only while
+/// the woken commits and those queued behind them are at most [#COHORT_PER_PROCESSOR] a processor, as more take longer
+/// to come back than the force they save; a wait that runs out turns the next ones off for 2, then 4, up to 64 groups,
+/// and a close, a failure, a full queue or a task of another store waiting for the pool ends one at once.
+///
+/// A flush of the pool whose store shares the pool writes one group at a time while a task of another store waits for
+/// a thread: it submits itself again behind that task, so the stores on a pool take turns a group each. A store whose
+/// queue never drains would otherwise hold a thread for as long as its commits keep coming.
 ///
 /// Segments come from [LogFiles] prepared: once a segment takes its first group, the next one is prepared on a thread
 /// of its own, so a rollover only forces the full segment and switches to the next, and no file is created or renamed
@@ -119,12 +133,31 @@ final class LogWriter {
     static final int COMMIT_HEAP = 128;
     /// The bytes a second of log below which a new segment is written with zeros first, if the commits wait for it.
     private static final long ZEROED_RATE = 64L << 20;
+    /// The longest a flush waits for the commits the last force woke to come back, in nanoseconds: a force of a small
+    /// group took a tenth to a fifth of it on the devices measured.
+    private static final long MAX_COHORT_WAIT = 1_000_000;
+    /// How long a flush waiting for commits to come back spins before it yields its processor between looks, in
+    /// nanoseconds: the threads it waits for may need that processor, and a timed park, which lasts at least a
+    /// millisecond on Windows, would outlast the wait.
+    private static final long COHORT_SPIN = 4_000;
+    /// The woken and queued commits a processor past which a flush no longer waits for the woken ones: the wait pays
+    /// only while they come back in less than a force, and each takes a few microseconds of a processor on its way, so
+    /// 64 of them on 4 processors take about as long as the force they would save.
+    private static final int COHORT_PER_PROCESSOR = 4;
+    /// The waits in a row that ran out past which waits are turned off no longer: after the n-th, the flush writes 2
+    /// to the power of n groups without one.
+    private static final int MAX_COHORT_MISSES = 6;
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
     private final long segmentSize;
     private final Executor executor;
+    // Whether a task waits for a thread of the pool, which a flush of the pool gives up its thread to, or null if the
+    // store owns its pool
+    private final BooleanSupplier poolQueued;
     private final long commitWindowNanos;
+    // The woken and queued commits past which a flush no longer waits for the woken ones to come back
+    private final int maxCohort;
 
     // Owned by the flush task; null until the first group opens the first segment
     private FileChannel channel;
@@ -168,6 +201,26 @@ final class LogWriter {
     private int used;
     // The groups in a row written since one needed more than half of MIN_OUTPUT
     private int smallGroups;
+    // How long the last write and force of a group took, a moving average in nanoseconds, or 0 before the first group
+    private long forceNanos;
+    // The commits the last published group woke, its leader included; read by commits deciding whether to lead
+    private volatile int lastGroupWaiters;
+    // The commits the last published group woke and those queued behind it
+    private int cohortSpan;
+    // The commits the last published group woke that the next flush waits for, or 0; the registrations counted before
+    // they were woken, and when they were
+    private int cohort;
+    private long cohortBase;
+    private long cohortStart;
+    // The waits for a cohort in a row that ran out, and the groups still to publish without one
+    private int cohortMisses;
+    private int skippedGroups;
+    // Whether commits count their registrations as waiters, for a flush that waits for its cohort
+    private volatile boolean cohortArmed;
+    private final Padded.Count registered;
+    // The waits for a cohort that ended with all of it back and that ran out, for tests
+    private volatile long cohortsGathered;
+    private volatile long cohortsMissed;
     // The emptied queue, which the next swap reuses
     private ArrayList<Queued> flushing;
     // Written by the flush task only
@@ -181,6 +234,8 @@ final class LogWriter {
     private ArrayList<Queued> queue;
     // The bytes of the frame bodies queued and not durable yet
     private long pendingBytes;
+    // The commits waiting for room in the queue; written under the queue lock
+    private volatile int queueWaiters;
     private volatile long lastQueued;
     // Frames queued since the writer opened; a catalog frame carries a sequence already durable, so close() waits on
     // frames rather than on sequences
@@ -224,18 +279,25 @@ final class LogWriter {
     /// @param durable the sequence the log already holds durably
     /// @param segmentSize the size past which a new segment starts
     /// @param executor runs the flush task on platform threads
+    /// @param poolQueued whether a task waits for a thread of the pool, or `null` if the store owns its pool: a flush
+    ///                   waiting for the commits a force woke stops waiting once one does, and a flush of the pool
+    ///                   gives up its thread after the group it wrote
     /// @param commitWindow how long a flush waits for more commits before it starts
     /// @param empty the segment numbered `firstSegment`, which recovery found prepared and never written, to write
     ///              first; or `null`, to prepare one
     /// @throws IOException if the segment cannot be prepared
     LogWriter(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long durable, long segmentSize,
-              Executor executor, Duration commitWindow, LogFiles.Prepared empty) throws IOException {
+              Executor executor, BooleanSupplier poolQueued, Duration commitWindow, LogFiles.Prepared empty)
+            throws IOException {
         this.files = files;
         this.keys = keys;
         this.storeId = storeId;
         this.segmentSize = segmentSize;
         this.executor = executor;
+        this.poolQueued = poolQueued;
         this.commitWindowNanos = commitWindow.toNanos();
+        this.maxCohort = COHORT_PER_PROCESSOR * Runtime.getRuntime().availableProcessors();
+        this.registered = new Padded.Count();
         try {
             this.cipher = keys.encrypted() ? Cipher.getInstance("AES/GCM/NoPadding") : null;
         } catch (GeneralSecurityException exception) {
@@ -353,7 +415,7 @@ final class LogWriter {
         queueLock.lock();
         try {
             while (pendingBytes > 0 && pendingBytes + length > QUEUE_LIMIT && failure == null) {
-                queueDrained.awaitUninterruptibly();
+                awaitRoom();
             }
             checkHealthy();
             queueDeferred();
@@ -388,7 +450,7 @@ final class LogWriter {
         queueLock.lock();
         try {
             while (pendingBytes > 0 && pendingBytes + batch.bodyBytes > QUEUE_LIMIT && failure == null) {
-                queueDrained.awaitUninterruptibly();
+                awaitRoom();
             }
             checkHealthy();
             queueDeferred();
@@ -405,6 +467,16 @@ final class LogWriter {
         }
         if (scheduled.compareAndSet(false, true)) {
             executor.execute(this::flush);
+        }
+    }
+
+    /// Waits, holding the queue lock, for a group to leave the queue, counted in [#queueWaiters] meanwhile.
+    private void awaitRoom() {
+        queueWaiters++;
+        try {
+            queueDrained.awaitUninterruptibly();
+        } finally {
+            queueWaiters--;
         }
     }
 
@@ -497,7 +569,8 @@ final class LogWriter {
     ///
     /// One flush writes at a time: another returns at once, and the one that writes looks at the queue again once it
     /// stops, so the frames of a commit whose flush returned are never left behind. A flush for a commit hands what is
-    /// queued after its group to the pool.
+    /// queued after its group to the pool, as a flush of the pool does when a task of another store waits for its
+    /// thread.
     private void flush(long until) {
         while (running.compareAndSet(false, true)) {
             try {
@@ -518,7 +591,7 @@ final class LogWriter {
             if (empty || failure != null) {
                 return;
             }
-            if (until != Long.MAX_VALUE) {
+            if (until != Long.MAX_VALUE || poolWanted()) {
                 try {
                     executor.execute(this::flush);
                 } catch (RejectedExecutionException exception) {
@@ -529,20 +602,23 @@ final class LogWriter {
         }
     }
 
-    /// {@return whether the frame of the commit at `sequence` is queued, no later commit's is, and no other commit
-    /// waits for its durability}
+    /// {@return whether the frame of the commit at `sequence` is queued, no later commit's is, no other commit waits
+    /// for its durability, and the last group made at most one waiting commit durable}
     ///
     /// Only such a commit writes its group itself. With other commits under way, the pool's flush goes on to their
     /// group at once, where a commit that wrote its own would hand that group to the pool and wait for a thread of it
     /// to wake; and the wake of the pool's thread lets more commits join a group than a commit forcing its own at once
-    /// would, which at eight committers made fewer forces than leading did.
+    /// would, which at eight committers made fewer forces than leading did. Right after a group that woke several
+    /// commits, the first to come back finds no other waiting, as the rest are on their way: leading, it would write a
+    /// group of one while they queue behind it, where the pool's flush waits for them all.
     ///
     /// Only without a commit window, which the pool's flush waits out for the commits that join the group. A virtual
     /// thread leads too: its force lends the carrier's place to another, as the JDK does for a force, and only the write
     /// of the group into the file's cache holds the carrier; a commit of one virtual thread at a time made a fifth more
     /// commits a second where it did.
     private boolean alone(long sequence) {
-        return commitWindowNanos == 0 && waiters.isEmpty() && lastQueued == sequence && durable < sequence;
+        return commitWindowNanos == 0 && lastGroupWaiters <= 1 && waiters.isEmpty() && lastQueued == sequence
+                && durable < sequence;
     }
 
     /// {@return whether `frames` seal into the output and the current segment, so the group is written with one call
@@ -561,7 +637,13 @@ final class LogWriter {
         return position + bytes + ALIGNMENT <= segmentSize;
     }
 
-    /// Writes the queued groups until the queue is empty or the commit at `until` is durable, holding [#running].
+    /// {@return whether a task waits for a thread of the pool this store shares}
+    private boolean poolWanted() {
+        return poolQueued != null && poolQueued.getAsBoolean();
+    }
+
+    /// Writes the queued groups until the queue is empty, the commit at `until` is durable or, on the pool, a task
+    /// waits for this thread, holding [#running].
     private void flushGroups(long until) {
         leading = until != Long.MAX_VALUE;
         try {
@@ -570,6 +652,10 @@ final class LogWriter {
             while (durable < until && failure == null) {
                 if (commitWindowNanos > 0) {
                     LockSupport.parkNanos(commitWindowNanos);
+                } else if (cohort > 0 && !leading) {
+                    // With the queue empty too: had it returned, the next flush would take the first commits back as a
+                    // group of their own
+                    awaitCohort();
                 }
                 ArrayList<Queued> group;
                 long sequence;
@@ -592,14 +678,19 @@ final class LogWriter {
                 var bodies = write(group, units);
                 group.clear();
                 flushing = group;
+                boolean roomy;
                 queueLock.lock();
                 try {
                     pendingBytes -= bodies;
+                    roomy = pendingBytes < QUEUE_LIMIT / 2;
                     queueDrained.signalAll();
                 } finally {
                     queueLock.unlock();
                 }
-                publish(sequence, frames);
+                publish(sequence, frames, roomy);
+                if (!leading && poolWanted()) {
+                    return;
+                }
             }
         } catch (IOException exception) {
             stop(exception);
@@ -614,6 +705,49 @@ final class LogWriter {
                     Thread.currentThread().interrupt();
                 }
             }
+        }
+    }
+
+    /// Waits, holding [#running], until the commits the last group woke wait again, their next frames queued, so the
+    /// next group takes them beside the frames queued during the last force; or until three quarters of a force, at
+    /// most [#MAX_COHORT_WAIT], have passed since the last group was published.
+    ///
+    /// It spins, then yields between looks. A close, a failure, a commit waiting for room in the queue, or a task of
+    /// another store waiting for the pool ends it at once. A wait that runs out while a frame waits in the queue turns
+    /// the next ones off for twice as many groups as the last that ran out did, from 2 to 64; one that ends with all of
+    /// them back resets that.
+    private void awaitCohort() {
+        var target = cohort;
+        cohort = 0;
+        try {
+            var budget = Math.min(forceNanos - forceNanos / 4, MAX_COHORT_WAIT);
+            var looked = false;
+            while (registered.get() - cohortBase < target) {
+                var waited = System.nanoTime() - cohortStart;
+                if (waited >= budget) {
+                    // One that ran out before this flush started, after a commit's own group, or with no frame queued
+                    // since the group, as when the committers stop, held back no commit
+                    if (looked && lastQueued > durable) {
+                        cohortMisses = Math.min(cohortMisses + 1, MAX_COHORT_MISSES);
+                        skippedGroups = 1 << cohortMisses;
+                        cohortsMissed++;
+                    }
+                    return;
+                }
+                if (failure != null || closing || queueWaiters > 0 || poolWanted()) {
+                    return;
+                }
+                looked = true;
+                if (waited < COHORT_SPIN) {
+                    Thread.onSpinWait();
+                } else {
+                    Thread.yield();
+                }
+            }
+            cohortMisses = 0;
+            cohortsGathered++;
+        } finally {
+            cohortArmed = false;
         }
     }
 
@@ -670,8 +804,11 @@ final class LogWriter {
         Arrays.fill(output, used, used + padding, (byte) 0);
         used += padding;
         smallGroups = position + used - start <= MIN_OUTPUT / 2 ? smallGroups + 1 : 0;
+        var forceStart = System.nanoTime();
         drain();
         force();
+        var took = Math.max(1, System.nanoTime() - forceStart);
+        forceNanos = forceNanos == 0 ? took : forceNanos + (took - forceNanos) / 8;
         forces++;
         if (unitForce != null) {
             await(unitForce);
@@ -853,7 +990,22 @@ final class LogWriter {
         return ByteBuffer.allocate(12).putInt(0).putLong(offset).array();
     }
 
-    private void publish(long sequence, long frames) {
+    /// Makes the commits up to `sequence`, and the first `frames` frames, durable, wakes the commits waiting for them
+    /// and, if the queue is `roomy`, has the next flush of the pool wait for the woken commits to come back.
+    ///
+    /// One woken commit is waited for only while another still waits: two committers out of step wake one each, and
+    /// never merge otherwise, while a lone committer leaves no other waiting and is never held back.
+    private void publish(long sequence, long frames, boolean roomy) {
+        var arm = roomy && commitWindowNanos == 0 && skippedGroups == 0 && cohortSpan <= maxCohort && forceNanos > 0
+                && !closing;
+        if (skippedGroups > 0) {
+            skippedGroups--;
+        }
+        if (arm) {
+            // Before durable, which every woken commit reads before its next one registers
+            cohortBase = registered.get();
+            cohortArmed = true;
+        }
         durable = sequence;
         durabilityLock.lock();
         try {
@@ -862,19 +1014,34 @@ final class LogWriter {
         } finally {
             durabilityLock.unlock();
         }
-        wake(sequence);
+        // A commit that wrote its own group comes back too
+        var woken = wake(sequence) + (leading ? 1 : 0);
+        var span = woken + (int) Math.clamp(lastQueued - sequence, 0, Integer.MAX_VALUE);
+        lastGroupWaiters = woken;
+        cohortSpan = span;
+        if (arm && span <= maxCohort && (woken >= 2 || (woken == 1 && !waiters.isEmpty()))) {
+            cohort = woken;
+            cohortStart = System.nanoTime();
+        } else if (arm) {
+            cohortArmed = false;
+        }
     }
 
     /// Wakes the commits waiting for a sequence at or below `sequence`.
-    private void wake(long sequence) {
+    ///
+    /// @return the commits it woke
+    private int wake(long sequence) {
+        var woken = 0;
         for (var iterator = waiters.iterator(); iterator.hasNext(); ) {
             var waiter = iterator.next();
             if (waiter.sequence <= sequence) {
                 waiter.woken = true;
                 iterator.remove();
                 LockSupport.unpark(waiter.thread);
+                woken++;
             }
         }
+        return woken;
     }
 
     private void stop(IOException cause) {
@@ -942,6 +1109,9 @@ final class LogWriter {
         }
         var waiter = new Waiter(Thread.currentThread(), sequence);
         waiters.add(waiter);
+        if (cohortArmed) {
+            registered.increment();
+        }
         try {
             var deadline = timeout < 0 ? 0 : System.nanoTime() + timeout;
             while (durable < sequence) {
@@ -1019,6 +1189,16 @@ final class LogWriter {
     /// {@return the forces made so far}
     long forces() {
         return forces;
+    }
+
+    /// {@return the waits for the commits a force woke that ended with all of them back}
+    long cohortsGathered() {
+        return cohortsGathered;
+    }
+
+    /// {@return the waits for the commits a force woke that ran out}
+    long cohortsMissed() {
+        return cohortsMissed;
     }
 
     /// Makes everything queued durable, then closes the segment.
