@@ -12,6 +12,10 @@ import java.util.function.LongSupplier;
 /// A short read claims a slot of a fixed table with one compare-and-set; snapshots, and reads that find every slot
 /// busy, register in a locked multiset instead.
 ///
+/// The build of a checkpoint registers on its own ([#registerCheckpoint()]): it needs the versions at its sequence, as
+/// a snapshot does, but reads only the trees of the checkpoint before it and the versions above them, so it keeps no
+/// older tree in use, nor the versions only an older tree lacks.
+///
 /// The writer computes its bound by reading the latest sequence before it scans the slots and the multiset, and a
 /// read publishes its sequence, then checks the latest sequence is still that one, retrying if not. Either the
 /// writer's scan sees the published sequence, or the read's check came after the scan, so the read's sequence is at
@@ -34,6 +38,9 @@ final class ReaderTable {
     // The registrations in the registry, or about to be: raised before a registration reads the latest sequence, so a
     // writer that reads it zero after reading the latest sequence skips the registry, as it would skip a free slot
     private volatile int registrations;
+    // The sequence the build of a checkpoint reads at, or -1 if none is building; guarded by registryLock, and counted
+    // in registrations
+    private long checkpointRead;
     // What scan() collects into: only the holder of the store's publishing role scans
     private long[] scanned;
 
@@ -51,6 +58,7 @@ final class ReaderTable {
         this.latest = latest;
         this.registryLock = new Object();
         this.registry = new TreeMap<>();
+        this.checkpointRead = -1;
         this.scanned = new long[slots + 1];
     }
 
@@ -117,11 +125,36 @@ final class ReaderTable {
         }
     }
 
+    /// Registers the read of a checkpoint's build at the latest sequence, which holds until [#unregisterCheckpoint()].
+    /// Only one checkpoint builds at a time.
+    ///
+    /// Like a snapshot it is among the sequences a pass finds active, so the versions at its sequence stay, but it is
+    /// not the oldest reader: the build reads the trees it updates, which the next publication alone replaces, and the
+    /// chains written since their cut.
+    ///
+    /// @return the sequence of the read
+    long registerCheckpoint() {
+        synchronized (registryLock) {
+            registrations++;
+            checkpointRead = latest.getAsLong();
+            return checkpointRead;
+        }
+    }
+
+    /// Releases the read [#registerCheckpoint()] registered.
+    void unregisterCheckpoint() {
+        synchronized (registryLock) {
+            checkpointRead = -1;
+            registrations--;
+        }
+    }
+
     /// What one pass over the table found.
     ///
-    /// @param active every sequence a read or snapshot may be reading at, distinct, highest first; the first is the
-    ///               latest
-    /// @param oldest the lowest sequence a read or snapshot is reading at, the latest included, or [Long#MAX_VALUE]
+    /// @param active every sequence a read, a snapshot or a checkpoint's build may be reading at, distinct, highest
+    ///               first; the first is the latest
+    /// @param oldest the lowest sequence a read or snapshot is reading at, the latest included, or [Long#MAX_VALUE]; the
+    ///               trees older than the newest one published before it, and what they alone use, have no reader
     record Scan(long[] active, long oldest) {
     }
 
@@ -157,6 +190,13 @@ final class ReaderTable {
                         scanned = sequences;
                     }
                     sequences[count++] = sequence;
+                }
+                if (checkpointRead >= 0 && checkpointRead < current) {
+                    if (count == sequences.length) {
+                        sequences = Arrays.copyOf(sequences, count * 2);
+                        scanned = sequences;
+                    }
+                    sequences[count++] = checkpointRead;
                 }
             }
         }
@@ -204,6 +244,15 @@ final class ReaderTable {
                     }
                     sequences[count++] = sequence;
                 }
+                if (checkpointRead >= 0 && checkpointRead < current) {
+                    if (sequences == null) {
+                        sequences = new long[8];
+                        sequences[0] = current;
+                    } else if (count == sequences.length) {
+                        sequences = Arrays.copyOf(sequences, count * 2);
+                    }
+                    sequences[count++] = checkpointRead;
+                }
             }
         }
         if (sequences == null) {
@@ -212,7 +261,8 @@ final class ReaderTable {
         return new Scan(distinctDescending(sequences, count, current), oldest);
     }
 
-    /// {@return whether no read nor snapshot is registered, as one pass over the slots and the registry finds}
+    /// {@return whether no read, snapshot nor checkpoint's build is registered, as one pass over the slots and the
+    /// registry finds}
     ///
     /// Safe for concurrent use, under the rule of [#scanConcurrently()]: the caller reads the latest sequence first,
     /// and if this returns `true`, every read is at that sequence or later.
@@ -262,7 +312,8 @@ final class ReaderTable {
         return oldest;
     }
 
-    /// {@return every sequence a read or snapshot may be reading at, distinct, highest first; the first is the latest}
+    /// {@return every sequence a read, a snapshot or a checkpoint's build may be reading at, distinct, highest first;
+    /// the first is the latest}
     ///
     /// Only the holder of the store's publishing role calls it, so the latest sequence does not change during the call.
     long[] active() {
@@ -285,6 +336,12 @@ final class ReaderTable {
                     sequences = Arrays.copyOf(sequences, count * 2);
                 }
                 sequences[count++] = sequence;
+            }
+            if (checkpointRead >= 0 && checkpointRead < current) {
+                if (count == sequences.length) {
+                    sequences = Arrays.copyOf(sequences, count * 2);
+                }
+                sequences[count++] = checkpointRead;
             }
         }
         Arrays.sort(sequences, 1, count);

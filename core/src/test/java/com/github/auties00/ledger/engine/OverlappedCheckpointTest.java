@@ -17,6 +17,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -48,10 +49,11 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
-/// Checkpoints that build while the one before them is made durable ([Checkpointer.Overlap#ALWAYS]), on the file
-/// system in memory, whose forces of the data file the tests slow, hold or fail on the checkpoints' own threads so the
-/// two stages overlap: what reads see, what reopening and recovery find, the pages and units the checkpoints use, and
-/// what a failure of either stage leaves.
+/// Checkpoints that build while the one before them is made durable ([Checkpointer.Overlap#ALWAYS], or
+/// [Checkpointer.Overlap#BEHIND] once commits wait for the trees), on the file system in memory, whose forces of the
+/// data file the tests slow, hold or fail on the checkpoints' own threads so the two stages overlap: what reads see,
+/// what reopening and recovery find, what memory keeps, the pages and units the checkpoints use, and what a failure of
+/// either stage leaves.
 class OverlappedCheckpointTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.utf8());
@@ -220,6 +222,32 @@ class OverlappedCheckpointTest {
         ledger.commit(batch);
     }
 
+    /// Holds the forces of the data file on the checkpoints' own threads while it is held, each until a permit lets it
+    /// go: a checkpoint forces the data file twice, before its superblock and with it.
+    private static final class ForceGate implements ChangeInterceptor {
+        private final Semaphore permits = new Semaphore(0);
+        private final AtomicInteger waiting = new AtomicInteger();
+        private volatile boolean holding;
+
+        @Override
+        public void beforeChange(Path path, ChangeKind kind) {
+            if (holding && kind == ChangeKind.FORCE && dataFile(path) && checkpointThread()) {
+                waiting.incrementAndGet();
+                try {
+                    permits.acquireUninterruptibly();
+                } finally {
+                    waiting.decrementAndGet();
+                }
+            }
+        }
+
+        /// Stops holding, and lets go the forces it holds.
+        void open() {
+            holding = false;
+            permits.release(16);
+        }
+    }
+
     @Nested
     @DisplayName("reads")
     class Reads {
@@ -360,26 +388,6 @@ class OverlappedCheckpointTest {
     @Nested
     @DisplayName("large values")
     class LargeValues {
-        /// Holds the forces of the data file on the checkpoints' own threads while it is held, each until a permit lets
-        /// it go: a checkpoint forces the data file twice, before its superblock and with it.
-        private static final class ForceGate implements ChangeInterceptor {
-            private final Semaphore permits = new Semaphore(0);
-            private final AtomicInteger waiting = new AtomicInteger();
-            private volatile boolean holding;
-
-            @Override
-            public void beforeChange(Path path, ChangeKind kind) {
-                if (holding && kind == ChangeKind.FORCE && dataFile(path) && checkpointThread()) {
-                    waiting.incrementAndGet();
-                    try {
-                        permits.acquireUninterruptibly();
-                    } finally {
-                        waiting.decrementAndGet();
-                    }
-                }
-            }
-        }
-
         @Test
         @DisplayName("a checkpoint built beside the one before frees none of the units that one's publication frees or takes, which commits reuse after")
         void unitsOfTheCheckpointBefore() throws Exception {
@@ -408,8 +416,7 @@ class OverlappedCheckpointTest {
                 put(ledger, model, MESSAGES, "z", "z".repeat(6_000));
                 gate.permits.release(2);
                 await(() -> ledger.tree().number == 2 && checkpointer.queuedForTests() == 0, "the second checkpoint to publish");
-                gate.holding = false;
-                gate.permits.release(16);
+                gate.open();
                 for (var i = 0; i < 8; i++) {
                     put(ledger, model, MESSAGES, "w" + i, Character.toString('0' + i).repeat(6_000));
                     fill(ledger, model, "h" + i, 128 << 10);
@@ -422,6 +429,230 @@ class OverlappedCheckpointTest {
             try (var ledger = open(directory, Checkpointer.Overlap.NEVER, failures::add)) {
                 verify(ledger, model);
             }
+            CheckpointTest.verifyPages(directory, true);
+        }
+    }
+
+    @Nested
+    @DisplayName("memory")
+    class Memory {
+        private static final int FEW_KEYS = 200;
+        private static final long HEAP_BELOW_TWO_INTERVALS = 1 << 20;
+        private static final long HEAP_ABOVE_ANY_BACKLOG = 1L << 40;
+
+        @ParameterizedTest(name = "a snapshot taken before the publication: {0}")
+        @ValueSource(booleans = {false, true})
+        @DisplayName("a checkpoint published while the next one builds drops what its trees hold, unless a reader may read the trees before")
+        void publishedBesideBuild(boolean pinned) throws Exception {
+            var disk = CrashFileSystem.create();
+            // The first checkpoint on a thread of its own is the first to write, as the next one builds after it
+            var first = new AtomicReference<Thread>();
+            var building = new CountDownLatch(1);
+            var force = new CountDownLatch(1);
+            var build = new CountDownLatch(1);
+            disk.intercept((path, kind) -> {
+                if (!dataFile(path) || !checkpointThread()) {
+                    return;
+                }
+                var current = Thread.currentThread();
+                if (kind == ChangeKind.WRITE && first.compareAndSet(null, current)) {
+                    return;
+                }
+                if (kind == ChangeKind.FORCE && current == first.get()) {
+                    await(force);
+                } else if (kind == ChangeKind.WRITE && current != first.get() && building.getCount() > 0) {
+                    building.countDown();
+                    await(build);
+                }
+            });
+            var directory = disk.getPath("/store");
+            var model = emptyModel();
+            var failures = new ConcurrentLinkedQueue<LedgerException>();
+            try (var ledger = open(directory, Checkpointer.Overlap.ALWAYS, failures::add)) {
+                var state = ledger.state(MESSAGES);
+                var value = "f".repeat(2_000);
+                // The trees the checkpoint under test replaces, whose pages a snapshot may still read
+                for (var i = 0; i < FEW_KEYS; i++) {
+                    put(ledger, model, MESSAGES, "p%05d".formatted(i), "old");
+                }
+                ledger.checkpoint();
+                var before = ledger.tree().sequence;
+                for (var i = 0; i < FEW_KEYS; i++) {
+                    put(ledger, model, MESSAGES, "p%05d".formatted(i), value);
+                }
+                // Stops once the next checkpoint started, as commits wait for the first one past six intervals of log
+                for (var i = 0; ledger.checkpointer().overlappedForTests() == 0; i++) {
+                    put(ledger, model, MESSAGES, "m%07d".formatted(i), value);
+                }
+                await(building);
+                var snapshot = pinned ? ledger.snapshot() : null;
+                var seen = emptyModel();
+                seen.get(MESSAGES.name()).putAll(model.get(MESSAGES.name()));
+                put(ledger, model, MESSAGES, "after", value);
+                force.countDown();
+                await(() -> ledger.tree().number == 2 && ledger.checkpointer().queuedForTests() == 0,
+                        "the checkpoint to publish and prune beside the next one's build");
+                var published = ledger.tree().sequence;
+                if (snapshot == null) {
+                    assertEquals(ledger.latest() - published, state.chains(), "chains above the published cut");
+                    assertEquals(0, state.entries.size(), "chains ordered with no read of a range");
+                } else {
+                    assertEquals(ledger.latest() - before, state.chains(), "chains the snapshot may read above the trees before");
+                    verify(snapshot, seen);
+                    snapshot.close();
+                }
+                build.countDown();
+                await(() -> ledger.tree().number == 3 && ledger.checkpointer().queuedForTests() == 0,
+                        "the next checkpoint to publish and prune");
+                if (snapshot == null) {
+                    assertEquals(ledger.latest() - ledger.tree().sequence, state.chains(), "chains above the last cut");
+                } else {
+                    // The prune left them to the sweep, which moves with the commits
+                    for (var i = 0; state.chains() > 1; i++) {
+                        assertTrue(i < 1_000_000, "the sweep left the chains the snapshot kept");
+                        put(ledger, model, MESSAGES, "tick", "t");
+                    }
+                }
+                verify(ledger, model);
+                ledger.checkpoint();
+                assertEquals(0, state.chains(), "chains once the trees hold every commit");
+                assertEquals(0, state.entries.size(), "chains ordered once the trees hold every commit");
+                assertTrue(ledger.checkpointer().overlappedForTests() > 0, "no checkpoint built beside the force of another");
+            }
+            assertTrue(failures.isEmpty(), () -> "reported: " + failures.peek());
+            try (var ledger = open(directory, Checkpointer.Overlap.NEVER, failures::add)) {
+                verify(ledger, model);
+            }
+            CheckpointTest.verifyPages(directory, true);
+        }
+
+        @ParameterizedTest(name = "{0}, {1} writes a commit over {2} keys")
+        @CsvSource({
+                "BEHIND, 20, 0", "ALWAYS, 20, 0",
+                "NEVER, 100, 0", "BEHIND, 100, 0", "ALWAYS, 100, 0",
+                "NEVER, 1000, 0", "BEHIND, 1000, 0", "ALWAYS, 1000, 0",
+                "NEVER, 100, 200000", "BEHIND, 100, 200000", "ALWAYS, 100, 200000"
+        })
+        @DisplayName("sustained writes, also those larger than a sweep's share, keep the chains within what the trees lack, and none once the trees hold them")
+        void sustained(Checkpointer.Overlap overlap, int writes, int keys) throws Exception {
+            var disk = CrashFileSystem.create();
+            var store = new AtomicReference<LiveLedger>();
+            var builds = new AtomicInteger();
+            var started = new ThreadLocal<Boolean>();
+            disk.intercept((path, kind) -> {
+                if (!dataFile(path) || !checkpointThread()) {
+                    return;
+                }
+                if (kind == ChangeKind.FORCE) {
+                    sleep(10);
+                } else if (kind == ChangeKind.WRITE && started.get() == null) {
+                    // A build that lasts until the checkpoint before it published and commits wait for the trees again,
+                    // so that one's prune runs beside it; bounded, as the last ones have no commits to wait for
+                    started.set(true);
+                    var before = builds.getAndIncrement();
+                    var deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(200);
+                    var ledger = store.get();
+                    while (System.nanoTime() < deadline && (ledger.checkpointer().backlog() <= 2 * INTERVAL
+                            || (before > 0 && (ledger.tree() == null || ledger.tree().number < before)))) {
+                        sleep(1);
+                    }
+                }
+            });
+            var failures = new ConcurrentLinkedQueue<LedgerException>();
+            try (var ledger = (LiveLedger) options(disk.getPath("/store"), overlap, 1 << 16, failures::add, MESSAGES)
+                    .checkpointHeap(HEAP_BELOW_TWO_INTERVALS).build()) {
+                store.set(ledger);
+                var state = ledger.state(MESSAGES);
+                var log = ledger.log();
+                var value = "f".repeat(256);
+                var peak = 0;
+                var next = 0L;
+                while (log.appendedBytes() < 20 * INTERVAL) {
+                    var batch = ledger.newBatch();
+                    for (var i = 0; i < writes; i++) {
+                        var id = next++;
+                        batch.put(MESSAGES, "%09d".formatted(keys == 0 ? id : Math.floorMod(id * 2654435761L, (long) keys)), value);
+                    }
+                    ledger.commit(batch);
+                    peak = Math.max(peak, state.chains());
+                }
+                // Commits wait from two intervals of log on; those of the checkpoint a publication just freed them from
+                // leave memory once its prune reaches them
+                var bound = 4 * next * INTERVAL / log.appendedBytes() + writes;
+                var reached = peak;
+                assertTrue(reached <= bound, () -> "memory held " + reached + " chains where the trees lack at most " + bound);
+                var overlapped = ledger.checkpointer().overlappedForTests();
+                if (overlap == Checkpointer.Overlap.NEVER) {
+                    assertEquals(0, overlapped);
+                } else {
+                    assertTrue(overlapped > 0, "no checkpoint built beside the force of another");
+                }
+                await(() -> ledger.checkpointer().queuedForTests() == 0, "the checkpoints built to publish");
+                ledger.checkpoint();
+                assertEquals(0, state.chains(), "chains once the trees hold every commit");
+                assertEquals(0, state.entries.size(), "chains ordered once the trees hold every commit");
+            }
+            assertTrue(failures.isEmpty(), () -> "reported: " + failures.peek());
+        }
+
+        @Test
+        @DisplayName("BEHIND builds beside the force of the checkpoint before once commits wait for the trees")
+        void behindOverlapsWhileThrottled() throws Exception {
+            var disk = CrashFileSystem.create();
+            var gate = new ForceGate();
+            gate.holding = true;
+            disk.intercept(gate);
+            var directory = disk.getPath("/store");
+            var model = emptyModel();
+            var failures = new ConcurrentLinkedQueue<LedgerException>();
+            try (var ledger = (LiveLedger) options(directory, Checkpointer.Overlap.BEHIND, 4_096, failures::add)
+                    .checkpointHeap(HEAP_BELOW_TWO_INTERVALS).build()) {
+                var checkpointer = ledger.checkpointer();
+                fill(ledger, model, "m", INTERVAL + (64 << 10));
+                await(() -> gate.waiting.get() == 1, "the first checkpoint to force");
+                try (var executor = Executors.newThreadPerTaskExecutor(Thread.ofPlatform().daemon().factory())) {
+                    // Waits in the throttle once the log holds two intervals the trees lack, past the heap budget, which
+                    // is less than an interval since the first cut
+                    executor.execute(() -> fill(ledger, model, "n", 2 * INTERVAL));
+                    try {
+                        await(() -> checkpointer.overlappedForTests() > 0, "a checkpoint to build beside the force of the first");
+                    } finally {
+                        gate.open();
+                    }
+                }
+                assertTrue(checkpointer.lastFailure() == null, () -> "failed: " + checkpointer.lastFailure());
+                ledger.checkpoint();
+                verify(ledger, model);
+            }
+            assertTrue(failures.isEmpty(), () -> "reported: " + failures.peek());
+            CheckpointTest.verifyPages(directory, true);
+        }
+
+        @Test
+        @DisplayName("BEHIND leaves a checkpoint to build after the one before while commits do not wait for the trees")
+        void behindStaysSerialWhileNotThrottled() throws Exception {
+            var disk = CrashFileSystem.create();
+            var gate = new ForceGate();
+            gate.holding = true;
+            disk.intercept(gate);
+            var directory = disk.getPath("/store");
+            var model = emptyModel();
+            var failures = new ConcurrentLinkedQueue<LedgerException>();
+            try (var ledger = (LiveLedger) options(directory, Checkpointer.Overlap.BEHIND, 4_096, failures::add)
+                    .checkpointHeap(HEAP_ABOVE_ANY_BACKLOG).build()) {
+                var checkpointer = ledger.checkpointer();
+                fill(ledger, model, "m", INTERVAL + (64 << 10));
+                await(() -> gate.waiting.get() == 1, "the first checkpoint to force");
+                // More than an interval since the first cut, which ALWAYS starts the next build at, and below the backlog
+                fill(ledger, model, "n", 2 * INTERVAL);
+                assertEquals(1, checkpointer.queuedForTests(), "checkpoints built beside the first");
+                gate.open();
+                await(() -> ledger.tree() != null && ledger.tree().number >= 2 && checkpointer.queuedForTests() == 0,
+                        "the next checkpoint to follow the first");
+                assertEquals(0, checkpointer.overlappedForTests(), "builds beside a force");
+                verify(ledger, model);
+            }
+            assertTrue(failures.isEmpty(), () -> "reported: " + failures.peek());
             CheckpointTest.verifyPages(directory, true);
         }
     }

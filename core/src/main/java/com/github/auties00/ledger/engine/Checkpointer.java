@@ -38,6 +38,8 @@ import java.util.function.Consumer;
 /// ([FreeSpace#stage(List)]), so it writes no page the durable state or that one uses. It writes its
 /// superblock only once that one's is durable, since it takes the slot of the one before that. If that one fails
 /// before its superblock, this one is given up too, and that one's pages go back once this one no longer reads them.
+/// A build reads only the trees it updates and the versions above them, so that one's publication drops from memory,
+/// and frees the pages of the trees before, as it does with no build beside it ([ReaderTable#registerCheckpoint()]).
 ///
 /// Every unit of a checkpoint is sealed under a nonce made of 8 random bytes drawn for the checkpoint and a counter,
 /// so no nonce repeats under the store's key, even across a checkpoint that a crash cut short.
@@ -132,10 +134,11 @@ final class Checkpointer implements IdleTicker.Watched {
         /// Never: a checkpoint builds once the one before it is published, and is made durable on the thread that
         /// built it, which holds the build's lock until then.
         NEVER,
-        /// While the log has grown by the checkpoint interval since the cut of the one before, and commits wait for the
-        /// trees ([#throttle()]): a cut taken while they do not would only shrink the checkpoint.
+        /// While commits wait for the trees ([#throttle()]) and the log has grown by half the checkpoint interval since
+        /// the cut of the one before: a cut taken while they do not wait would only shrink the checkpoint.
         BEHIND,
-        /// While the log has grown by the checkpoint interval since the cut of the one before.
+        /// While the log has grown by the checkpoint interval since the cut of the one before, or by half of it while
+        /// commits wait for the trees.
         ALWAYS
     }
 
@@ -231,6 +234,18 @@ final class Checkpointer implements IdleTicker.Watched {
         }
     }
 
+    /// Starts a checkpoint for the commits that wait for the trees, if the log has grown by half the interval since the
+    /// last cut, and none is building.
+    ///
+    /// Commits that wait hold the log at two intervals since the cut before the last, which is less than one interval
+    /// since the last cut whenever that cut came after the commit that asked for it. Asking for a whole interval, the
+    /// next checkpoint would start only once the last one was durable, the wait a build beside its force avoids.
+    private void startForWaiters() {
+        if (log.appendedBytes() - cutBytes >= every / 2) {
+            start();
+        }
+    }
+
     /// Starts a checkpoint on a thread of its own, unless one is building or the ones built before keep it from
     /// building; a thread the system refuses is reported as a failed checkpoint, which the next start retries.
     private void start() {
@@ -299,6 +314,9 @@ final class Checkpointer implements IdleTicker.Watched {
         if (built != null) {
             // The next checkpoint may build while this one is made durable
             maybeStart();
+            if (behind()) {
+                startForWaiters();
+            }
             finishOwn(built);
         }
     }
@@ -350,7 +368,7 @@ final class Checkpointer implements IdleTicker.Watched {
         if (!behind() || lastFailure != null || stopped != null) {
             return;
         }
-        maybeStart();
+        startForWaiters();
         progressLock.lock();
         try {
             while (behind() && (scheduled.get() || queued != 0) && lastFailure == null && stopped == null) {
@@ -614,7 +632,7 @@ final class Checkpointer implements IdleTicker.Watched {
             abandon(cut, writer, update);
             throw throwable;
         } finally {
-            ledger.readers().unregister(cut.sequence());
+            ledger.readers().unregisterCheckpoint();
         }
     }
 

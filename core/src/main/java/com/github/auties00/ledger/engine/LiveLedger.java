@@ -1339,7 +1339,7 @@ public final class LiveLedger implements Ledger {
     }
 
     /// Cuts the writes of a checkpoint and registers a read at its sequence, which keeps the versions it needs until
-    /// [ReaderTable#unregister(long)].
+    /// [ReaderTable#unregisterCheckpoint()].
     ///
     /// A checkpoint built while the one before it has not published updates the trees of that one, `built`, rather
     /// than the latest published ones. Its publication will take the units of `taken` out of flight, so they are not
@@ -1358,7 +1358,7 @@ public final class LiveLedger implements Ledger {
             if (sequence == (base == null ? 0 : base.sequence)) {
                 return null;
             }
-            var registered = readers.register();
+            var registered = readers.registerCheckpoint();
             if (registered != sequence) {
                 throw new IllegalStateException("The latest sequence moved while the checkpoint held the publishing role");
             }
@@ -1604,6 +1604,9 @@ public final class LiveLedger implements Ledger {
     /// above it hold nothing older, or 0 if some reader may read no tree}
     ///
     /// A read at `s` uses at least the newest tree published before `s`; reads that start later use the latest tree.
+    /// The build of a checkpoint is left out of `oldestReader`, though it may be at a sequence below the publication
+    /// of the latest tree, the checkpoint it updates: it reads that tree and the versions above it, so what that tree
+    /// holds leaves memory while the next checkpoint builds.
     private long floor(long oldestReader) {
         var current = tree;
         if (current == null) {
@@ -1839,8 +1842,8 @@ public final class LiveLedger implements Ledger {
             sweepPending = true;
             sweptBounds = null;
         }
-        // A chain a pass left is left again under the same readers and floor, such as while a checkpoint's own read
-        // holds the floor back
+        // A chain a pass left is left again under the same readers and floor, such as while a snapshot holds the floor
+        // back
         if (sweptBounds != null && sameReaders(bounds, cutBound, sweptBounds, sweptCutBound)) {
             return;
         }
