@@ -121,6 +121,32 @@ class SegmentsCompareTest {
         }
     }
 
+    // A start of `base`, its last byte changed half of the time
+    private static byte[] variant(byte[] base, SplittableRandom random) {
+        var variant = Arrays.copyOf(base, 1 + random.nextInt(base.length));
+        if (random.nextBoolean()) {
+            variant[variant.length - 1] ^= (byte) (1 + random.nextInt(255));
+        }
+        return variant;
+    }
+
+    @Test
+    @DisplayName("a range removal covers the same keys by array as by segment, with or without either bound, past the bytes read as words too")
+    void removalCovers() {
+        var random = new SplittableRandom(23);
+        for (var round = 0; round < 40_000; round++) {
+            var base = new byte[1 + random.nextInt(200)];
+            random.nextBytes(base);
+            var key = variant(base, random);
+            var from = random.nextInt(4) == 0 ? null : variant(base, random);
+            var to = random.nextInt(4) == 0 ? null : variant(base, random);
+            var removal = new RangeRemoval(from == null ? null : MemorySegment.ofArray(from).asReadOnly(), to == null ? null : MemorySegment.ofArray(to).asReadOnly(), 1);
+            var expected = (from == null || Arrays.compareUnsigned(key, from) >= 0) && (to == null || Arrays.compareUnsigned(key, to) < 0);
+            assertEquals(expected, removal.covers(key));
+            assertEquals(expected, removal.covers(MemorySegment.ofArray(key)));
+        }
+    }
+
     @Test
     @DisplayName("agrees on random keys of 1 to 1024 bytes sharing prefixes of any length, keys of a small alphabet at nonzero offsets")
     void random() {

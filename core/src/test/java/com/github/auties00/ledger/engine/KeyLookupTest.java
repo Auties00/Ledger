@@ -9,6 +9,8 @@ import com.github.auties00.ledger.ValueCodec;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -107,6 +109,84 @@ class KeyLookupTest {
             assertNull(state.head(key(32, 2)));
             assertValue("first", ledger.get(PAGED, written));
             assertValue("tree32", ledger.get(PAGED, key(32, 1)));
+        }
+    }
+
+    // The bytes the calling thread allocated so far, by reflection: this module reads no management module
+    private static long allocatedBytes() throws ReflectiveOperationException {
+        var threads = Class.forName("java.lang.management.ManagementFactory").getMethod("getThreadMXBean").invoke(null);
+        return (long) Class.forName("com.sun.management.ThreadMXBean").getMethod("getCurrentThreadAllocatedBytes").invoke(threads);
+    }
+
+    // The fewest bytes a get of every key allocated in one of several rounds: the first rounds also pay for what the
+    // JVM has not linked or compiled yet
+    private static long bytesPerGet(Ledger ledger, byte[][] keys) throws ReflectiveOperationException {
+        var fewest = Long.MAX_VALUE;
+        for (var round = 0; round < 40; round++) {
+            var before = allocatedBytes();
+            for (var key : keys) {
+                assertTrue(ledger.get(PAGED, key).isPresent());
+            }
+            fewest = Math.min(fewest, (allocatedBytes() - before) / keys.length);
+        }
+        return fewest;
+    }
+
+    private static byte[][] keys(int length, int firstId, int count) {
+        var keys = new byte[count][];
+        for (var i = 0; i < count; i++) {
+            keys[i] = key(length, firstId + i);
+        }
+        return keys;
+    }
+
+    private static byte[] filled(int length, int last) {
+        var bound = new byte[length];
+        Arrays.fill(bound, (byte) 0xC3);
+        bound[length - 1] = (byte) last;
+        return bound;
+    }
+
+    @ParameterizedTest
+    @CsvSource({"32, 4", "32, 31", "100, 99"})
+    @DisplayName("what a read by key allocates does not grow with the range removals no checkpoint has made durable, from the tree or from memory")
+    void readsAllocateNothingPerRemoval(int keyLength, int shared, @TempDir Path directory) throws ReflectiveOperationException {
+        var removals = 1_024;
+        var inTree = keys(keyLength, 0, 100);
+        var inMemory = keys(keyLength, 100, 100);
+        try (var ledger = (LiveLedger) open(directory)) {
+            var batch = ledger.newBatch();
+            for (var key : inTree) {
+                batch.put(PAGED, key, bytes("tree"));
+            }
+            ledger.commit(batch);
+            ledger.checkpoint();
+            batch = ledger.newBatch();
+            for (var key : inMemory) {
+                batch.put(PAGED, key, bytes("memory"));
+            }
+            ledger.commit(batch);
+            var treeWithout = bytesPerGet(ledger, inTree);
+            var memoryWithout = bytesPerGet(ledger, inMemory);
+
+            // Every bound shares `shared` bytes with the keys and none covers a key: half end above them and decide at
+            // the lower bound, half end below them and decide at the upper bound
+            var above = KeyRange.between(filled(shared + 1, 0xFF), filled(shared + 2, 0xFF));
+            var below = KeyRange.between(Arrays.copyOf(filled(shared + 1, 0xC3), shared), filled(shared + 1, 0x00));
+            batch = ledger.newBatch();
+            for (var i = 0; i < removals; i++) {
+                batch.deleteRange(PAGED, i % 2 == 0 ? above : below);
+            }
+            ledger.commit(batch);
+
+            var state = ledger.state(PAGED);
+            assertEquals(removals, state.removals.length);
+            var treeWith = bytesPerGet(ledger, inTree);
+            var memoryWith = bytesPerGet(ledger, inMemory);
+            assertEquals(removals, state.removals.length);
+            // A segment per removal costs 72 bytes; the bound is far under that and far over what compiling changes
+            assertTrue(treeWith - treeWithout < removals * 8L, "from the tree: " + treeWithout + " bytes, then " + treeWith);
+            assertTrue(memoryWith - memoryWithout < removals * 8L, "from memory: " + memoryWithout + " bytes, then " + memoryWith);
         }
     }
 

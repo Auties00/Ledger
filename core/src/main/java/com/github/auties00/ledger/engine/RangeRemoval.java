@@ -46,4 +46,12 @@ final class RangeRemoval {
     boolean covers(MemorySegment key) {
         return (from == null || Segments.compare(key, from) >= 0) && (to == null || Segments.compare(key, to) < 0);
     }
+
+    /// {@return whether the key whose bytes are `key` is in the range}
+    ///
+    /// A read by key asks this of every removal since its tree, so it makes no segment of `key`.
+    boolean covers(byte[] key) {
+        return (from == null || Segments.compare(key, 0, key.length, from) >= 0)
+                && (to == null || Segments.compare(key, 0, key.length, to) < 0);
+    }
 }

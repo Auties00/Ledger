@@ -137,10 +137,15 @@ final class Segments {
         return leftTail != rightTail ? Long.compareUnsigned(leftTail, rightTail) : Integer.compare(leftLength, rightLength);
     }
 
-    // As compareTail of two segments
+    // As compareTail of two segments, but in words past WORDS too: a mismatch would take a segment of the array, and a
+    // read by key compares its key with the bounds of every range removal
     private static int compareTail(byte[] left, int leftFrom, int leftLength, MemorySegment right, long rightLength, int common) {
-        if (common > WORDS) {
-            return compareRest(MemorySegment.ofArray(left), leftFrom + WORDS, leftLength - WORDS, right, WORDS, rightLength - WORDS);
+        for (var at = WORDS; at + Long.BYTES <= common; at += Long.BYTES) {
+            var leftWord = Bytes.i64(left, leftFrom + at);
+            var rightWord = right.get(BIG_ENDIAN_LONG, at);
+            if (leftWord != rightWord) {
+                return Long.compareUnsigned(leftWord, rightWord);
+            }
         }
         long leftTail;
         long rightTail;
