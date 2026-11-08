@@ -496,7 +496,7 @@ final class Checkpointer implements IdleTicker.Watched {
             var base = roots[state.id];
             var root = update.apply(base, ops, TreeUpdate.merge(ranges));
             // The update settled the blind writes up to the cut but those of keys it skipped, looked up here
-            var blind = state.blind.correction(cut.sequence(), key -> base != null && TreeSearch.find(pages, base, key) != null);
+            var blind = state.blind.correction(cut.sequence(), key -> base != null && TreeSearch.contains(pages, base, key));
             var count = root == null ? 0 : root.count();
             if (count != keyspace.count() + blind) {
                 throw new IllegalStateException("The checkpoint of " + state.keyspace.name() + " holds " + count

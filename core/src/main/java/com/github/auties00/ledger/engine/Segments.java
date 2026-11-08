@@ -4,12 +4,21 @@ import com.github.auties00.ledger.KeyCodec;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Objects;
 
-/// Operations on the memory segments that hold encoded keys and values.
+/// Operations on the memory segments and byte arrays that hold encoded keys and values.
+///
+/// Every comparison here, whatever form its keys take, orders them as unsigned bytes, a prefix before every longer key
+/// it starts: the order of the trees, of the ordered maps of the key spaces and of the range removals. It reads the
+/// common bytes as big-endian words, whose unsigned order is the order of their bytes, and reads no byte outside the
+/// keys it compares. The first 8 bytes alone leave undecided the keys of one chat, which share a chat's id and the top
+/// of a timestamp there, and so most comparisons a walk down a tree or an ordered map makes; a mismatch decides them
+/// too, but its set-up costs more than the words it reads.
 final class Segments {
     // Mixed into every hash; drawn once per process
     private static final long HASH_SEED;
@@ -24,44 +33,129 @@ final class Segments {
     /// Orders segments as unsigned bytes, a prefix before every longer segment it starts.
     static final Comparator<MemorySegment> UNSIGNED = Segments::compare;
     static final ValueLayout.OfLong BIG_ENDIAN_LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+    private static final ValueLayout.OfInt BIG_ENDIAN_INT = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+    private static final ValueLayout.OfShort BIG_ENDIAN_SHORT = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+    // The words of an array in the order of the platform, as JAVA_LONG_UNALIGNED reads them out of a segment for the hash
+    private static final VarHandle NATIVE_LONG = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.nativeOrder());
+    /// The common bytes a comparison reads as words; past them a mismatch, whose set-up costs less than the words it
+    /// would skip in keys that long, finds the first byte that differs.
+    private static final int WORDS = 64;
 
     private Segments() {
     }
 
     /// {@return a negative number, zero or a positive number as `left` sorts before, with or after `right`}
     static int compare(MemorySegment left, MemorySegment right) {
-        // The first 8 bytes decide most comparisons of keys that do not share a prefix, without the set-up of a
-        // mismatch, which a walk down the ordered map of a large key space pays twenty times
-        if (left.byteSize() >= Long.BYTES && right.byteSize() >= Long.BYTES) {
-            var leftPrefix = left.get(BIG_ENDIAN_LONG, 0);
-            var rightPrefix = right.get(BIG_ENDIAN_LONG, 0);
-            if (leftPrefix != rightPrefix) {
-                return Long.compareUnsigned(leftPrefix, rightPrefix);
-            }
-        }
-        var mismatch = left.mismatch(right);
-        if (mismatch == -1) {
-            return 0;
-        }
-        if (mismatch == left.byteSize()) {
-            return -1;
-        }
-        if (mismatch == right.byteSize()) {
-            return 1;
-        }
-        return Byte.compareUnsigned(left.get(ValueLayout.JAVA_BYTE, mismatch), right.get(ValueLayout.JAVA_BYTE, mismatch));
+        return compare(left, 0, left.byteSize(), right, 0, right.byteSize());
     }
 
     /// {@return the order of the `leftLength` bytes at `leftFrom` of `left` and the `rightLength` bytes at `rightFrom`
     /// of `right`, as [#compare(MemorySegment, MemorySegment)] gives}
     static int compare(MemorySegment left, long leftFrom, long leftLength, MemorySegment right, long rightFrom, long rightLength) {
-        if (leftLength >= Long.BYTES && rightLength >= Long.BYTES) {
-            var leftPrefix = left.get(BIG_ENDIAN_LONG, leftFrom);
-            var rightPrefix = right.get(BIG_ENDIAN_LONG, rightFrom);
-            if (leftPrefix != rightPrefix) {
-                return Long.compareUnsigned(leftPrefix, rightPrefix);
+        var common = Math.min(leftLength, rightLength);
+        var words = Math.min(common, WORDS) & -Long.BYTES;
+        for (var at = 0L; at < words; at += Long.BYTES) {
+            var leftWord = left.get(BIG_ENDIAN_LONG, leftFrom + at);
+            var rightWord = right.get(BIG_ENDIAN_LONG, rightFrom + at);
+            if (leftWord != rightWord) {
+                return Long.compareUnsigned(leftWord, rightWord);
             }
         }
+        return words == common
+                ? Long.compare(leftLength, rightLength)
+                : compareTail(left, leftFrom, leftLength, right, rightFrom, rightLength, common);
+    }
+
+    /// {@return the order of the `leftLength` bytes at `leftFrom` of `left` and the `rightLength` bytes at `rightFrom`
+    /// of `right`, as [#compare(MemorySegment, MemorySegment)] gives}
+    static int compare(byte[] left, int leftFrom, int leftLength, byte[] right, int rightFrom, int rightLength) {
+        var common = Math.min(leftLength, rightLength);
+        var words = Math.min(common, WORDS) & -Long.BYTES;
+        for (var at = 0; at < words; at += Long.BYTES) {
+            var leftWord = Bytes.i64(left, leftFrom + at);
+            var rightWord = Bytes.i64(right, rightFrom + at);
+            if (leftWord != rightWord) {
+                return Long.compareUnsigned(leftWord, rightWord);
+            }
+        }
+        return words == common
+                ? Integer.compare(leftLength, rightLength)
+                : compareTail(left, leftFrom, leftLength, right, rightFrom, rightLength, common);
+    }
+
+    /// {@return the order of the `leftLength` bytes at `leftFrom` of `left` and `right`, as
+    /// [#compare(MemorySegment, MemorySegment)] gives}
+    static int compare(byte[] left, int leftFrom, int leftLength, MemorySegment right) {
+        var rightLength = right.byteSize();
+        var common = (int) Math.min(leftLength, rightLength);
+        var words = Math.min(common, WORDS) & -Long.BYTES;
+        for (var at = 0; at < words; at += Long.BYTES) {
+            var leftWord = Bytes.i64(left, leftFrom + at);
+            var rightWord = right.get(BIG_ENDIAN_LONG, at);
+            if (leftWord != rightWord) {
+                return Long.compareUnsigned(leftWord, rightWord);
+            }
+        }
+        return words == common
+                ? Long.compare(leftLength, rightLength)
+                : compareTail(left, leftFrom, leftLength, right, rightLength, common);
+    }
+
+    // What decides two ranges whose whole words are equal, kept apart from the words so the comparison the ordered maps
+    // call at every step stays small enough to inline: the rest of keys longer than WORDS, or the bytes after the last
+    // whole word, then the lengths. A word that ends the common bytes overlaps the last word read, whose bytes are equal
+    private static int compareTail(MemorySegment left, long leftFrom, long leftLength, MemorySegment right, long rightFrom, long rightLength, long common) {
+        if (common > WORDS) {
+            return compareRest(left, leftFrom + WORDS, leftLength - WORDS, right, rightFrom + WORDS, rightLength - WORDS);
+        }
+        long leftTail;
+        long rightTail;
+        if (common >= Long.BYTES) {
+            leftTail = left.get(BIG_ENDIAN_LONG, leftFrom + common - Long.BYTES);
+            rightTail = right.get(BIG_ENDIAN_LONG, rightFrom + common - Long.BYTES);
+        } else {
+            leftTail = tail(left, leftFrom, (int) common);
+            rightTail = tail(right, rightFrom, (int) common);
+        }
+        return leftTail != rightTail ? Long.compareUnsigned(leftTail, rightTail) : Long.compare(leftLength, rightLength);
+    }
+
+    // As compareTail of two segments
+    private static int compareTail(byte[] left, int leftFrom, int leftLength, byte[] right, int rightFrom, int rightLength, int common) {
+        if (common > WORDS) {
+            return Arrays.compareUnsigned(left, leftFrom + WORDS, leftFrom + leftLength, right, rightFrom + WORDS, rightFrom + rightLength);
+        }
+        long leftTail;
+        long rightTail;
+        if (common >= Long.BYTES) {
+            leftTail = Bytes.i64(left, leftFrom + common - Long.BYTES);
+            rightTail = Bytes.i64(right, rightFrom + common - Long.BYTES);
+        } else {
+            leftTail = tail(left, leftFrom, common);
+            rightTail = tail(right, rightFrom, common);
+        }
+        return leftTail != rightTail ? Long.compareUnsigned(leftTail, rightTail) : Integer.compare(leftLength, rightLength);
+    }
+
+    // As compareTail of two segments
+    private static int compareTail(byte[] left, int leftFrom, int leftLength, MemorySegment right, long rightLength, int common) {
+        if (common > WORDS) {
+            return compareRest(MemorySegment.ofArray(left), leftFrom + WORDS, leftLength - WORDS, right, WORDS, rightLength - WORDS);
+        }
+        long leftTail;
+        long rightTail;
+        if (common >= Long.BYTES) {
+            leftTail = Bytes.i64(left, leftFrom + common - Long.BYTES);
+            rightTail = right.get(BIG_ENDIAN_LONG, common - Long.BYTES);
+        } else {
+            leftTail = tail(left, leftFrom, common);
+            rightTail = tail(right, 0, common);
+        }
+        return leftTail != rightTail ? Long.compareUnsigned(leftTail, rightTail) : Long.compare(leftLength, rightLength);
+    }
+
+    // The order of two ranges past the common bytes the words read
+    private static int compareRest(MemorySegment left, long leftFrom, long leftLength, MemorySegment right, long rightFrom, long rightLength) {
         var mismatch = MemorySegment.mismatch(left, leftFrom, leftFrom + leftLength, right, rightFrom, rightFrom + rightLength);
         if (mismatch == -1) {
             return 0;
@@ -75,29 +169,51 @@ final class Segments {
         return Byte.compareUnsigned(left.get(ValueLayout.JAVA_BYTE, leftFrom + mismatch), right.get(ValueLayout.JAVA_BYTE, rightFrom + mismatch));
     }
 
+    /// {@return the 1 to 7 bytes at `from` of `segment`, as a big-endian number}
+    private static long tail(MemorySegment segment, long from, int length) {
+        var value = 0L;
+        var at = from;
+        if ((length & Integer.BYTES) != 0) {
+            value = segment.get(BIG_ENDIAN_INT, at) & 0xFFFFFFFFL;
+            at += Integer.BYTES;
+        }
+        if ((length & Short.BYTES) != 0) {
+            value = value << Short.SIZE | segment.get(BIG_ENDIAN_SHORT, at) & 0xFFFF;
+            at += Short.BYTES;
+        }
+        if ((length & 1) != 0) {
+            value = value << Byte.SIZE | segment.get(ValueLayout.JAVA_BYTE, at) & 0xFF;
+        }
+        return value;
+    }
+
+    /// {@return the 1 to 7 bytes at `from` of `array`, as a big-endian number}
+    private static long tail(byte[] array, int from, int length) {
+        var value = 0L;
+        var at = from;
+        if ((length & Integer.BYTES) != 0) {
+            value = Bytes.i32(array, at) & 0xFFFFFFFFL;
+            at += Integer.BYTES;
+        }
+        if ((length & Short.BYTES) != 0) {
+            value = value << Short.SIZE | Bytes.u16(array, at);
+            at += Short.BYTES;
+        }
+        if ((length & 1) != 0) {
+            value = value << Byte.SIZE | array[at] & 0xFF;
+        }
+        return value;
+    }
+
     /// {@return whether the `leftLength` bytes at `leftFrom` of `left` are the `rightLength` bytes at `rightFrom` of
     /// `right`}
     static boolean equal(MemorySegment left, long leftFrom, long leftLength, MemorySegment right, long rightFrom, long rightLength) {
-        if (leftLength != rightLength) {
-            return false;
-        }
-        if (leftLength >= Long.BYTES && left.get(ValueLayout.JAVA_LONG_UNALIGNED, leftFrom) != right.get(ValueLayout.JAVA_LONG_UNALIGNED, rightFrom)) {
-            return false;
-        }
-        return MemorySegment.mismatch(left, leftFrom, leftFrom + leftLength, right, rightFrom, rightFrom + rightLength) == -1;
+        return leftLength == rightLength && compare(left, leftFrom, leftLength, right, rightFrom, rightLength) == 0;
     }
 
     /// {@return whether `left` and `right` hold the same bytes}
     static boolean equal(MemorySegment left, MemorySegment right) {
-        var length = left.byteSize();
-        if (length != right.byteSize()) {
-            return false;
-        }
-        // The first 8 bytes tell most keys apart without the set-up of a mismatch
-        if (length >= Long.BYTES && left.get(ValueLayout.JAVA_LONG_UNALIGNED, 0) != right.get(ValueLayout.JAVA_LONG_UNALIGNED, 0)) {
-            return false;
-        }
-        return left.mismatch(right) == -1;
+        return equal(left, 0, left.byteSize(), right, 0, right.byteSize());
     }
 
     /// {@return a hash of the bytes of `segment`, under a seed of this process}
@@ -123,6 +239,31 @@ final class Segments {
             }
             hash = fold(hash ^ tail, HASH_KEY);
         }
+        return finish(hash);
+    }
+
+    /// {@return the hash of the bytes of `array`, the one [#hash(MemorySegment)] gives a segment of the same bytes}
+    ///
+    /// Chains are indexed by the hash of their segments, so a lookup by an array that hashed its bytes otherwise would
+    /// miss them and read the tree.
+    static int hash(byte[] array) {
+        var length = array.length;
+        var hash = HASH_SEED ^ length * 0x9E3779B97F4A7C15L;
+        var offset = 0;
+        for (; offset + Long.BYTES <= length; offset += Long.BYTES) {
+            hash = fold(hash ^ (long) NATIVE_LONG.get(array, offset), HASH_KEY);
+        }
+        if (offset < length) {
+            var tail = 0L;
+            for (var shift = 0; offset < length; offset++, shift += 8) {
+                tail |= (array[offset] & 0xFFL) << shift;
+            }
+            hash = fold(hash ^ tail, HASH_KEY);
+        }
+        return finish(hash);
+    }
+
+    private static int finish(long hash) {
         hash = fold(hash, HASH_KEY ^ 0x9E3779B97F4A7C15L);
         return (int) (hash ^ (hash >>> 32));
     }
@@ -174,13 +315,38 @@ final class Segments {
     ///
     /// @throws IllegalArgumentException if the key encodes to no bytes or more than [KeyCodec#MAX_LENGTH]
     static <K> MemorySegment encodeKey(KeyCodec<K> codec, K key) {
-        var size = codec.sizeOf(key);
-        if (size < 1 || size > KeyCodec.MAX_LENGTH) {
-            throw new IllegalArgumentException("Keys are 1 to " + KeyCodec.MAX_LENGTH + " bytes: " + size);
-        }
-        var array = new byte[size];
+        var array = new byte[checkedLength(codec.sizeOf(key))];
         var segment = MemorySegment.ofArray(array);
         codec.encode(key, segment);
         return segment.asReadOnly();
+    }
+
+    /// {@return `key` encoded into an array of its own}
+    ///
+    /// @throws IllegalArgumentException if the key encodes to no bytes or more than [KeyCodec#MAX_LENGTH]
+    static <K> byte[] encodeKeyBytes(KeyCodec<K> codec, K key) {
+        var array = new byte[checkedLength(codec.sizeOf(key))];
+        codec.encode(key, MemorySegment.ofArray(array));
+        return array;
+    }
+
+    /// {@return `key` encoded for a lookup that keeps nothing of it past the call: the caller's array itself for a key
+    /// of [KeyCodec#bytes()], which is its own encoding and must not change during the call}
+    ///
+    /// @throws IllegalArgumentException if the key encodes to no bytes or more than [KeyCodec#MAX_LENGTH]
+    static <K> byte[] lookupKey(KeyCodec<K> codec, K key) {
+        if (codec == BuiltinCodecs.BYTES_KEY) {
+            var array = (byte[]) key;
+            checkedLength(array.length);
+            return array;
+        }
+        return encodeKeyBytes(codec, key);
+    }
+
+    private static int checkedLength(int length) {
+        if (length < 1 || length > KeyCodec.MAX_LENGTH) {
+            throw new IllegalArgumentException("Keys are 1 to " + KeyCodec.MAX_LENGTH + " bytes: " + length);
+        }
+        return length;
     }
 }

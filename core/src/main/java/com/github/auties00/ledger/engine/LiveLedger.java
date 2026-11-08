@@ -1677,7 +1677,7 @@ public final class LiveLedger implements Ledger {
             var write = missing[i];
             try {
                 var root = point.root(states.get(writes.keyspace(write).name()));
-                found[write] = TreeSearch.find(pages, root, writes.key(write)) != null ? TreeSearch.FOUND : TreeSearch.ABSENT;
+                found[write] = TreeSearch.contains(pages, root, writes.key(write)) ? TreeSearch.FOUND : TreeSearch.ABSENT;
             } catch (RuntimeException _) {
                 // Left unknown: the lookup as the write applies reads the page again and reports the failure
             }

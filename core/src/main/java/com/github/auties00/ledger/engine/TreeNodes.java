@@ -1,7 +1,6 @@
 package com.github.auties00.ledger.engine;
 
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -76,17 +75,13 @@ final class TreeNodes {
     /// {@return a negative number, zero or a positive number as the `length` bytes at `offset` of `unit` sort before,
     /// with or after `key`}
     static int compare(byte[] unit, int offset, int length, MemorySegment key) {
-        var mismatch = MemorySegment.mismatch(MemorySegment.ofArray(unit), offset, offset + length, key, 0, key.byteSize());
-        if (mismatch == -1) {
-            return 0;
-        }
-        if (mismatch == length) {
-            return -1;
-        }
-        if (mismatch == key.byteSize()) {
-            return 1;
-        }
-        return Byte.compareUnsigned(unit[offset + (int) mismatch], key.get(ValueLayout.JAVA_BYTE, mismatch));
+        return Segments.compare(unit, offset, length, key);
+    }
+
+    /// {@return a negative number, zero or a positive number as the `length` bytes at `offset` of `unit` sort before,
+    /// with or after `key`}
+    static int compare(byte[] unit, int offset, int length, byte[] key) {
+        return Segments.compare(unit, offset, length, key, 0, key.length);
     }
 
     static int leafKeyLength(byte[] unit, int entry) {
@@ -99,6 +94,22 @@ final class TreeNodes {
 
     /// {@return the index of the first entry of the leaf `unit` whose key is at or after `key`, or its count}
     static int lowerBound(byte[] unit, MemorySegment key) {
+        var low = 0;
+        var high = count(unit);
+        while (low < high) {
+            var middle = (low + high) >>> 1;
+            var entry = entry(unit, middle);
+            if (compare(unit, leafKeyOffset(entry), leafKeyLength(unit, entry), key) < 0) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        return low;
+    }
+
+    /// {@return the index of the first entry of the leaf `unit` whose key is at or after `key`, or its count}
+    static int lowerBound(byte[] unit, byte[] key) {
         var low = 0;
         var high = count(unit);
         while (low < high) {
@@ -212,8 +223,25 @@ final class TreeNodes {
         return low - 1;
     }
 
+    /// {@return the index of the child of the branch `unit` whose subtree would hold `key`}
+    static int childFor(byte[] unit, byte[] key) {
+        // The last child whose first key is at or before the key, or the first child
+        var low = 1;
+        var high = count(unit);
+        while (low < high) {
+            var middle = (low + high) >>> 1;
+            var entry = entry(unit, middle);
+            if (compare(unit, entry + BRANCH_FIXED, Bytes.u16(unit, entry + BRANCH_FIXED - 2), key) <= 0) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        return low - 1;
+    }
+
     /// {@return the index of the last child of the branch `unit` whose first key is before `key`, or -1}
-    static int lastChildBefore(byte[] unit, MemorySegment key) {
+    static int lastChildBefore(byte[] unit, byte[] key) {
         var low = 0;
         var high = count(unit);
         while (low < high) {
