@@ -6,7 +6,8 @@ import java.time.Duration;
 ///
 /// The batch is visible from the moment its commit exists. Waiting is optional: an application that needs a write
 /// on stable storage before it acts, an acknowledgement sent over the network for example, waits; one that does not
-/// lets the store make it durable with the commits that follow.
+/// lets the store make it durable with the commits that follow, at the latest after
+/// [Ledger.Options#durabilityDelay(Duration)]. Either way it reaches the file at once, so a crash of the process keeps it.
 public interface Commit {
     /// {@return the position of this commit in the store's order of commits}
     ///
@@ -15,7 +16,8 @@ public interface Commit {
 
     /// {@return whether this commit is on stable storage}
     ///
-    /// The answer never changes from `true` to `false`.
+    /// The answer never changes from `true` to `false`. Asking does not hurry the commit: with no thread waiting for
+    /// it or for a later one, it may stay `false` for [Ledger.Options#durabilityDelay(Duration)].
     ///
     /// @throws LedgerIoException if the force that should have made it durable failed
     boolean isDurable();
@@ -29,7 +31,8 @@ public interface Commit {
     /// @throws LedgerIoException if the force that should have made it durable failed
     void awaitDurable() throws InterruptedException;
 
-    /// Waits until this commit is on stable storage or `timeout` elapses.
+    /// Waits until this commit is on stable storage or `timeout` elapses, forcing it at once if nothing else is about
+    /// to.
     ///
     /// @param timeout the longest wait
     /// @return whether the commit is durable

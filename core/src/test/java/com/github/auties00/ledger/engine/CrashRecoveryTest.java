@@ -14,6 +14,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -167,7 +168,9 @@ class CrashRecoveryTest {
 
     private static Ledger open(Path directory, Encryption encryption, long largeValues, WriteThrough.Mode writeThrough) {
         return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(encryption).keyspace(MESSAGES).keyspace(CHATS)
-                .largeValues(largeValues))
+                .largeValues(largeValues)
+                // A timer past the end of the workload: a dry run counts the forces of a run that only the commits decide
+                .durabilityDelay(Duration.ofMinutes(1)))
                 .segmentSize(16_384)
                 .writeThrough(writeThrough)
                 .build();

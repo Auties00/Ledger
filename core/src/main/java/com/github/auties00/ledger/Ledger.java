@@ -50,7 +50,9 @@ import java.util.function.Consumer;
 /// # Durability
 /// A durable commit survives a crash of the process and a loss of power. A commit that is visible but not yet
 /// durable survives a crash of the process only. When the store opens it recovers every durable commit and drops
-/// the rest; it never recovers part of a batch.
+/// the rest; it never recovers part of a batch. A commit no thread waits for starts to be forced at the latest
+/// [Options#durabilityDelay(Duration)] after it reaches the file, which is a moment after it returns, or sooner with the
+/// first commit a thread waits for.
 ///
 /// A failed force leaves the store unable to tell which commits reached stable storage, so it stops: every later
 /// commit, and every wait for durability, throws [LedgerIoException]. Reopen the store to recover.
@@ -318,6 +320,23 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// @return these options
         /// @throws IllegalArgumentException if `window` is negative or longer than one second
         Options commitWindow(Duration window);
+
+        /// Lets commits no thread waits for stay off stable storage for up to `delay`.
+        ///
+        /// Their frames are written to the file at once, whatever the delay, so a crash of the process keeps them; only
+        /// a loss of power within the delay may lose them. A wait for any of them, [Commit#awaitDurable()] with or
+        /// without a timeout or [Ledger#awaitDurable()], ends the delay at once, and a force made for a later commit
+        /// takes them along: a commit followed by one a thread waits for shares its force. The default, 100
+        /// milliseconds, spares the device a force per group of a burst of such commits, and the commits behind it the
+        /// time they would wait for one. Zero forces each group as soon as it is written.
+        ///
+        /// The delay holds while commits keep coming, and ends when the force starts. That force takes a thread of the
+        /// store's [IoPool]: on a pool other stores keep busy, it starts once one is free.
+        ///
+        /// @param delay the longest delay, from zero to one minute
+        /// @return these options
+        /// @throws IllegalArgumentException if `delay` is negative or longer than one minute
+        Options durabilityDelay(Duration delay);
 
         /// Opens the store.
         ///
