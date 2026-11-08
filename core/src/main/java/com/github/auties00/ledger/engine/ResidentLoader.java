@@ -22,7 +22,9 @@ import java.util.function.IntConsumer;
 ///
 /// It runs on a virtual thread of its own from the first use of its key space ([#start()]), and reads the leaves on
 /// [#THREADS] threads, which leave the other processors to the reads of the store and to the compiler, busy after an
-/// open; or on the opening thread ([#loadNow()]), on as many threads as the data file has read channels.
+/// open; or on the opening thread ([#loadNow()]), on as many threads as the data file has read channels. Once a thread
+/// waits for it or a long scan reads beside it ([#awaitRun(MemorySegment)]), its next runs take every read channel too,
+/// since a read or a write is waiting for them.
 final class ResidentLoader {
     /// The threads a loader running beside the store reads the leaves on.
     private static final int THREADS = 2;
@@ -36,6 +38,8 @@ final class ResidentLoader {
     private static final int DONE = 3;
     /// Sorts before every key: a key is at least one byte.
     private static final MemorySegment NOTHING = MemorySegment.ofArray(new byte[0]).asReadOnly();
+    /// The value of [#reading] for a run that reaches the last leaf, by identity.
+    private static final MemorySegment LAST_LEAF = MemorySegment.ofArray(new byte[0]).asReadOnly();
 
     private final LiveLedger ledger;
     private final PageFile pages;
@@ -48,6 +52,10 @@ final class ResidentLoader {
     private final Condition progress;
     // Memory holds every entry of a key below it; only grows, written by the loader after each run it installs
     private volatile MemorySegment below;
+    // The first key after the run the loader is reading, or null while it reads none; written by the loader
+    private volatile MemorySegment reading;
+    // Set once a thread needs the loader to go faster: its next runs take every read channel
+    private volatile boolean hurried;
     // Set once memory holds every entry, after the last run
     private volatile boolean complete;
     // IDLE before the first use, or after a stop; written holding the lock
@@ -112,6 +120,7 @@ final class ResidentLoader {
         if (key == null ? complete : holds(key)) {
             return;
         }
+        hurried = true;
         lock.lock();
         try {
             var attempt = launch(true);
@@ -127,6 +136,36 @@ final class ResidentLoader {
         } finally {
             lock.unlock();
         }
+    }
+
+    /// Has the next runs read on every read channel and, if the loader is reading the run that holds the keys next to
+    /// `key`, in either direction, waits until that run is in memory; for a long scan, which would read the same leaves
+    /// again one at a time.
+    ///
+    /// It waits for a run in flight alone, which needs no thread that waits here: it returns at once from a loader
+    /// that reads no leaves, as one that failed or stopped, or that has yet to reach the key.
+    ///
+    /// @return whether it waited
+    boolean awaitRun(MemorySegment key) {
+        hurried = true;
+        if (!readingFor(key)) {
+            return false;
+        }
+        lock.lock();
+        try {
+            while (readingFor(key)) {
+                progress.awaitUninterruptibly();
+            }
+        } finally {
+            lock.unlock();
+        }
+        return true;
+    }
+
+    /// {@return whether the run the loader is reading holds the keys next to `key`, which memory does not hold yet}
+    private boolean readingFor(MemorySegment key) {
+        var end = reading;
+        return end != null && (end == LAST_LEAF || Segments.compare(key, end) < 0) && !holds(key);
     }
 
     /// Starts a thread for the next attempt, holding the lock, unless the loader is stopping, done or running, or
@@ -233,7 +272,8 @@ final class ResidentLoader {
     }
 
     /// Installs the entries from [#below] on, `firstRun` leaves first and twice as many each run after, up to
-    /// `threads` reads of [PageFile#RUN_PAGES] pages a run.
+    /// `threads` reads of [PageFile#RUN_PAGES] pages a run; once [#hurried], every run takes all it can on every read
+    /// channel.
     private void load(int threads, int firstRun) {
         var readers = ledger.readers();
         // The registration keeps the tree and its pages, which a checkpoint published meanwhile would free
@@ -245,22 +285,32 @@ final class ResidentLoader {
             var root = trees == null ? null : trees.root(state.id);
             if (root != null) {
                 var leaves = TreeSearch.leaves(pages, root, from, threads);
+                var width = threads;
                 var run = firstRun;
-                var maxRun = threads * PageFile.RUN_PAGES;
                 var runs = 0;
                 for (var start = 0; start < leaves.size(); ) {
                     if (stopping) {
                         return;
                     }
+                    if (hurried && width < PageFile.READ_CHANNELS) {
+                        width = PageFile.READ_CHANNELS;
+                        run = width * PageFile.RUN_PAGES;
+                    }
                     var end = Math.min(leaves.size(), start + run);
-                    var refs = leaves.subList(start, end);
-                    install(pages.readAll(refs, PageFile.NODE, threads), from);
+                    var refs = leaves.subList(start, end).stream().map(TreeSearch.Leaf::ref).toList();
+                    reading = end == leaves.size() ? LAST_LEAF : leaves.get(end).first();
+                    try {
+                        install(pages.readAll(refs, PageFile.NODE, width), from);
+                    } finally {
+                        reading = null;
+                        signal();
+                    }
                     // In memory now: a read that cached one of them on its way reads memory from here on
                     for (var ref : refs) {
                         pages.cache().remove(ref);
                     }
                     start = end;
-                    run = Math.min(maxRun, 2 * run);
+                    run = Math.min(width * PageFile.RUN_PAGES, 2 * run);
                     step(++runs);
                 }
             }
@@ -295,14 +345,17 @@ final class ResidentLoader {
                 last = key;
             }
         }
-        if (last == null) {
-            return;
+        if (last != null) {
+            // Past the last key: a key between it and the next leaf's first has no entry
+            below = after(last);
         }
-        // Past the last key: a key between it and the next leaf's first has no entry
-        var next = new byte[Math.toIntExact(last.byteSize()) + 1];
-        MemorySegment.copy(last, 0, MemorySegment.ofArray(next), 0, next.length - 1);
-        below = MemorySegment.ofArray(next).asReadOnly();
-        signal();
+    }
+
+    /// {@return the key right after `key`, on an array of its own}
+    static MemorySegment after(MemorySegment key) {
+        var next = new byte[Math.toIntExact(key.byteSize()) + 1];
+        MemorySegment.copy(key, 0, MemorySegment.ofArray(next), 0, next.length - 1);
+        return MemorySegment.ofArray(next).asReadOnly();
     }
 
     /// Marks every entry loaded and lets the key space read memory alone.

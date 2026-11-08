@@ -37,6 +37,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.IntConsumer;
@@ -60,6 +61,8 @@ class ResidentLoadTest {
     private static final Keyspace<String, String> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.utf8());
     // The value whose decoding fails, or null
     private static final AtomicReference<String> REFUSED = new AtomicReference<>();
+    // The decoding that waits for the test, or null
+    private static final AtomicReference<Hold> HELD = new AtomicReference<>();
     private static final Keyspace<String, String> FRAGILE = Keyspace.resident("fragile", KeyCodec.utf8(), ValueCodec.of(
             String::length,
             (value, target) -> MemorySegment.copy(value.getBytes(StandardCharsets.US_ASCII), 0, target, ValueLayout.JAVA_BYTE, 0, value.length()),
@@ -67,6 +70,10 @@ class ResidentLoadTest {
                 var value = new String(source.toArray(ValueLayout.JAVA_BYTE), StandardCharsets.US_ASCII);
                 if (value.equals(REFUSED.get())) {
                     throw new IllegalStateException("refused " + value);
+                }
+                var held = HELD.get();
+                if (held != null && value.equals(held.value())) {
+                    held.hold();
                 }
                 return value;
             }));
@@ -179,6 +186,22 @@ class ResidentLoadTest {
         var entries = new ArrayList<Entry<String, String>>(map.size());
         map.forEach((key, value) -> entries.add(new Entry<>(key, value)));
         return entries;
+    }
+
+    /// Holds the decoding of `value`, which the loader does in the middle of a run, until the test releases it.
+    private record Hold(String value, CountDownLatch reached, CountDownLatch released) {
+        Hold(String value) {
+            this(value, new CountDownLatch(1), new CountDownLatch(1));
+        }
+
+        void hold() {
+            reached.countDown();
+            try {
+                assertTrue(released.await(60, TimeUnit.SECONDS), "never released");
+            } catch (InterruptedException exception) {
+                throw new IllegalStateException(exception);
+            }
+        }
     }
 
     /// Pauses the loader at the steps given, until the test releases it.
@@ -566,6 +589,8 @@ class ResidentLoadTest {
             assertEquals(Optional.of(value(1_100)), ledger.get(FRAGILE, key(1_100)));
             assertThrows(IllegalStateException.class, () -> ledger.get(FRAGILE, key(700)));
             assertEquals(ENTRIES, ledger.size(FRAGILE));
+            // A long scan reads on from the tree: the loader it would wait for has stopped
+            assertEquals(ENTRIES, ledger.forEachEncoded(FRAGILE, KeyRange.all(), (_, _) -> true));
             // A write of a key the loader did not reach retries the load, and throws its failure again
             assertThrows(IllegalStateException.class, () -> ledger.commit(ledger.newBatch().put(FRAGILE, key(900), "x")));
             assertNotNull(reports.poll(60, TimeUnit.SECONDS));
@@ -581,6 +606,253 @@ class ResidentLoadTest {
         }
         try (var ledger = open(directory, false)) {
             checkReads(ledger, FRAGILE, model);
+        }
+    }
+
+    @ParameterizedTest(name = "descending {0}")
+    @ValueSource(booleans = {false, true})
+    @DisplayName("a scan ahead of the loader reads memory from where the loader has passed it, and the tree beyond")
+    void scanFollowsLoader(boolean descending, @TempDir Path directory) throws Exception {
+        var model = populate(directory, SESSIONS, ENTRIES);
+        try (var ledger = open(directory, false)) {
+            var live = (LiveLedger) ledger;
+            var pause = new Pause(1, 2);
+            live.hookResidentLoadsForTests(pause);
+            assertEquals(Optional.of(value(0)), ledger.get(SESSIONS, key(0)));
+            pause.awaitPaused(1);
+            var before = limit(live, SESSIONS);
+            var after = new AtomicReference<String>();
+            var trigger = descending ? model.lastKey() : model.ceilingKey(before);
+            var visited = new ArrayList<Entry<String, String>>();
+            var range = descending ? KeyRange.<String>all().reversed() : KeyRange.<String>all();
+            ledger.forEach(SESSIONS, range, (key, value) -> {
+                if (key.equals(trigger)) {
+                    pause.release(1);
+                    awaitPausedQuietly(pause, 2);
+                    after.set(limit(live, SESSIONS));
+                }
+                visited.add(new Entry<>(key, value));
+                // Memory gives the instance the store holds, the tree an instance of the read's own
+                var inMemory = after.get() == null ? key.compareTo(before) < 0 : !key.equals(trigger) && key.compareTo(after.get()) < 0;
+                assertEquals(inMemory, value == ledger.get(SESSIONS, key).orElseThrow(), key);
+                return true;
+            });
+            var expected = entries(model);
+            if (descending) {
+                Collections.reverse(expected);
+            }
+            assertEquals(expected, visited);
+            pause.release(2);
+            awaitLoaded(live, SESSIONS);
+        }
+    }
+
+    @Test
+    @DisplayName("a scan the load ends beside reads memory alone from there")
+    void scanOutlivesLoader(@TempDir Path directory) throws Exception {
+        var model = populate(directory, SESSIONS, ENTRIES);
+        try (var ledger = open(directory, false)) {
+            var live = (LiveLedger) ledger;
+            var pause = new Pause(1);
+            live.hookResidentLoadsForTests(pause);
+            assertEquals(Optional.of(value(0)), ledger.get(SESSIONS, key(0)));
+            pause.awaitPaused(1);
+            var first = new AtomicBoolean(true);
+            var visited = new ArrayList<Entry<String, String>>();
+            ledger.forEach(SESSIONS, KeyRange.between(key(600), key(900)), (key, value) -> {
+                visited.add(new Entry<>(key, value));
+                if (first.getAndSet(false)) {
+                    pause.release(1);
+                    try {
+                        awaitLoaded(live, SESSIONS);
+                    } catch (InterruptedException exception) {
+                        throw new IllegalStateException(exception);
+                    }
+                } else {
+                    assertSame(ledger.get(SESSIONS, key).orElseThrow(), value, key);
+                }
+                return true;
+            });
+            assertEquals(entries(model.subMap(key(600), key(900))), visited);
+        }
+    }
+
+    @Test
+    @DisplayName("a long scan waits for the run the loader is reading rather than read its leaves too")
+    void scanWaitsForRun(@TempDir Path directory) throws Exception {
+        var model = populate(directory, FRAGILE, ENTRIES);
+        // In the fourth run: 16, 32 and 64 leaves of two entries each come before it, and it takes 128
+        var held = new Hold(value(400));
+        HELD.set(held);
+        try (var ledger = open(directory, false)) {
+            var live = (LiveLedger) ledger;
+            assertEquals(Optional.of(value(0)), ledger.get(FRAGILE, key(0)));
+            assertTrue(held.reached().await(60, TimeUnit.SECONDS));
+            var inMemory = model.headMap(limit(live, FRAGILE)).size();
+            assertEquals(224, inMemory);
+            var visited = new AtomicInteger();
+            var scan = Thread.ofPlatform().start(() -> ledger.forEachEncoded(FRAGILE, KeyRange.all(), (_, _) -> {
+                visited.incrementAndGet();
+                return true;
+            }));
+            awaitParked(scan, visited);
+            // The eight leaves it reads on its own at most, of two entries each
+            assertTrue(visited.get() >= inMemory && visited.get() <= inMemory + 2 * 8, "visited " + visited);
+            held.released().countDown();
+            scan.join();
+            assertEquals(ENTRIES, visited.get());
+            awaitLoaded(live, FRAGILE);
+        } finally {
+            held.released().countDown();
+            HELD.set(null);
+        }
+    }
+
+    /// Waits until `thread` parks and `progress` stays put.
+    private static void awaitParked(Thread thread, AtomicInteger progress) throws InterruptedException {
+        var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+        var last = -1;
+        while (true) {
+            assertTrue(thread.isAlive(), "ended without parking, at " + progress);
+            assertTrue(System.nanoTime() < deadline, "never parked: " + thread.getState() + " at " + progress);
+            var now = progress.get();
+            if (thread.getState() == Thread.State.WAITING && now == last) {
+                return;
+            }
+            last = now;
+            Thread.sleep(100);
+        }
+    }
+
+    private static void awaitPausedQuietly(Pause pause, int step) {
+        try {
+            pause.awaitPaused(step);
+        } catch (InterruptedException exception) {
+            throw new IllegalStateException(exception);
+        }
+    }
+
+    @Test
+    @DisplayName("a long scan beside the loader makes its next runs read as wide as an open, and in as few runs")
+    void scanHurriesLoader(@TempDir Path directory) throws Exception {
+        var model = populate(directory, SESSIONS, ENTRIES);
+        try (var ledger = open(directory, false)) {
+            var live = (LiveLedger) ledger;
+            var pause = new Pause(1);
+            var runs = new AtomicInteger();
+            live.hookResidentLoadsForTests(step -> {
+                runs.accumulateAndGet(step, Math::max);
+                pause.accept(step);
+            });
+            assertEquals(Optional.of(value(0)), ledger.get(SESSIONS, key(0)));
+            pause.awaitPaused(1);
+            // Past the leaves a scan reads alone; the loader reads none now, so the scan does not wait
+            var seen = new AtomicInteger();
+            ledger.forEachEncoded(SESSIONS, KeyRange.atLeast(key(100)), (_, _) -> seen.incrementAndGet() < 40);
+            pause.release(1);
+            awaitLoaded(live, SESSIONS);
+            // Beside the store, without a scan, it takes seven: 16 leaves, then 512, then the 72 left of 600
+            assertEquals(3, runs.get());
+            assertEquals(ENTRIES, live.state(SESSIONS).chains());
+            checkReads(ledger, SESSIONS, model);
+        }
+    }
+
+    @Test
+    @DisplayName("a write that waits for the loader makes its next runs read as wide as an open, and in as few runs")
+    void writeHurriesLoader(@TempDir Path directory) throws Exception {
+        populate(directory, SESSIONS, ENTRIES);
+        try (var ledger = open(directory, false)) {
+            var live = (LiveLedger) ledger;
+            var pause = new Pause(1);
+            var runs = new AtomicInteger();
+            live.hookResidentLoadsForTests(step -> {
+                runs.accumulateAndGet(step, Math::max);
+                pause.accept(step);
+            });
+            assertEquals(Optional.of(value(0)), ledger.get(SESSIONS, key(0)));
+            pause.awaitPaused(1);
+            var write = Thread.ofPlatform().start(() -> ledger.commit(ledger.newBatch().put(SESSIONS, key(ENTRIES - 1), "x")));
+            awaitParked(write, new AtomicInteger());
+            pause.release(1);
+            write.join();
+            awaitLoaded(live, SESSIONS);
+            assertEquals(3, runs.get());
+            assertEquals(Optional.of("x"), ledger.get(SESSIONS, key(ENTRIES - 1)));
+        }
+    }
+
+    @Test
+    @DisplayName("a scan of a transaction sees what its visitor writes ahead of it, past where the loader was")
+    void scanSeesOwnWrites(@TempDir Path directory) throws Exception {
+        var model = populate(directory, SESSIONS, ENTRIES);
+        try (var ledger = open(directory, false)) {
+            var live = (LiveLedger) ledger;
+            var pause = new Pause(1);
+            live.hookResidentLoadsForTests(pause);
+            assertEquals(Optional.of(value(0)), ledger.get(SESSIONS, key(0)));
+            pause.awaitPaused(1);
+            var trigger = model.ceilingKey(limit(live, SESSIONS));
+            var visited = new ArrayList<Entry<String, String>>();
+            ledger.update(transaction -> transaction.forEach(SESSIONS, KeyRange.all(), (key, value) -> {
+                visited.add(new Entry<>(key, value));
+                if (key.equals(trigger)) {
+                    pause.release(1);
+                    transaction.put(SESSIONS, key(300), "own");
+                    transaction.delete(SESSIONS, key(301));
+                }
+                return true;
+            }));
+            model.put(key(300), "own");
+            model.remove(key(301));
+            assertEquals(entries(model), visited);
+            assertEquals(entries(model), ledger.range(SESSIONS, KeyRange.all(), Integer.MAX_VALUE));
+        }
+    }
+
+    @Test
+    @DisplayName("scans in both directions beside a running loader visit every entry once and in order")
+    void scansRaceLoader(@TempDir Path directory) throws Exception {
+        var model = populate(directory, SESSIONS, ENTRIES);
+        var expected = entries(model);
+        var reversed = new ArrayList<>(expected);
+        Collections.reverse(reversed);
+        for (var round = 0; round < 8; round++) {
+            try (var ledger = open(directory, false)) {
+                var live = (LiveLedger) ledger;
+                // A slower loader in some rounds, so the scans meet it at different keys
+                var delay = round % 4;
+                live.hookResidentLoadsForTests(_ -> {
+                    try {
+                        Thread.sleep(delay);
+                    } catch (InterruptedException exception) {
+                        throw new IllegalStateException(exception);
+                    }
+                });
+                var failures = new ConcurrentLinkedQueue<String>();
+                var scans = new ArrayList<Thread>();
+                for (var scan = 0; scan < 4; scan++) {
+                    var descending = scan % 2 == 1;
+                    scans.add(Thread.ofPlatform().start(() -> {
+                        var range = descending ? KeyRange.<String>all().reversed() : KeyRange.<String>all();
+                        try {
+                            for (var i = 0; i < 3; i++) {
+                                var visited = ledger.range(SESSIONS, range, Integer.MAX_VALUE);
+                                if (!visited.equals(descending ? reversed : expected)) {
+                                    failures.add((descending ? "descending" : "ascending") + " scan read " + visited.size() + " entries");
+                                }
+                            }
+                        } catch (RuntimeException exception) {
+                            failures.add("scan failed: " + exception);
+                        }
+                    }));
+                }
+                for (var scan : scans) {
+                    scan.join();
+                }
+                assertTrue(failures.isEmpty(), failures.size() + " failures, first: " + failures.peek());
+                awaitLoaded(live, SESSIONS);
+            }
         }
     }
 

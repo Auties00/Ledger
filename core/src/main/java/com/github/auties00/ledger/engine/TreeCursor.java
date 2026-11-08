@@ -132,6 +132,12 @@ final class TreeCursor {
         return false;
     }
 
+    /// {@return whether the current entry is the last of its leaf in the cursor's order, so that the next [#next()]
+    /// reads another leaf}
+    boolean lastOfLeaf() {
+        return descending ? index == 0 : index == TreeNodes.count(leaf) - 1;
+    }
+
     /// {@return the key of the current entry, a read-only view of the leaf}
     MemorySegment key() {
         return TreeNodes.leafKey(leaf, entry);

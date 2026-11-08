@@ -25,7 +25,8 @@ import java.util.function.Function;
 ///
 /// A resident key space reads memory alone, but for the keys its loader has not put there yet ([ResidentLoader]):
 /// those it reads from the tree alone, where every read finds them as it sees them. A read checks where a key is
-/// before it reads memory, so the chains the loader installed before it moved past the key are there.
+/// before it reads memory, so the chains the loader installed before it moved past the key are there. A scan does so
+/// as it advances ([ResidentScan]).
 final class Reads {
     /// The bits of a stamp that number the writes of one batch.
     static final int OP_BITS = 24;
@@ -286,7 +287,7 @@ final class Reads {
     ///
     /// It merges the versions in memory with the tree: a key with a version in memory at or below the bound takes it,
     /// and shadows the tree's entry for the same key. A resident key space whose loader has not put every entry in
-    /// memory reads the keys below the loader's position from memory alone, and the others from the tree alone.
+    /// memory reads through a [ResidentScan].
     ///
     /// @return the number of entries passed
     static <K> long scan(KeyspaceState state, Keyspace<K, ?> keyspace, KeyRange<K> range, ReadPoint point, Visitor consumer) {
@@ -300,27 +301,13 @@ final class Reads {
         var removals = state.removals;
         // Read before memory, as a read of one key reads it
         var loader = state.resident ? state.loading : null;
-        var limit = loader == null ? null : loader.limit();
-        TreeRoot root;
-        var memoryTo = to;
-        var treeFrom = from;
-        if (limit == null) {
-            root = point.root(state);
-        } else {
-            root = point.treeRoot(state);
-            if (to == null || Segments.compare(limit, to) < 0) {
-                memoryTo = limit;
-            }
-            if (from == null || Segments.compare(limit, from) > 0) {
-                treeFrom = limit;
-            }
-            if (to != null && Segments.compare(treeFrom, to) >= 0) {
-                root = null;
-            }
+        if (loader != null && loader.limit() != null) {
+            return new ResidentScan(state, loader, point, removals, from, to, descending, consumer).run();
         }
-        var slice = state.slice(from, memoryTo);
+        var root = point.root(state);
+        var slice = state.slice(from, to);
         var memory = (descending ? slice.descendingMap() : slice).entrySet().iterator();
-        var tree = root == null ? null : new TreeCursor(point.pages(), root, treeFrom, to, descending);
+        var tree = root == null ? null : new TreeCursor(point.pages(), root, from, to, descending);
         var inTree = tree != null && tree.next();
         Map.Entry<MemorySegment, Chain> held = memory.hasNext() ? memory.next() : null;
         var visited = 0L;

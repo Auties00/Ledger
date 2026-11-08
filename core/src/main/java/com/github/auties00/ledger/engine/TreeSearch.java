@@ -61,31 +61,36 @@ final class TreeSearch {
                 : -1;
     }
 
-    /// {@return the references of the leaves of the tree under `root` that may hold keys at or after `from`, in key
-    /// order}
+    /// A leaf of a tree, as its parent names it.
+    ///
+    /// @param first the lowest key of the leaf, a read-only view of the parent, or `null` for a leaf with no parent
+    record Leaf(PageRef ref, MemorySegment first) {
+    }
+
+    /// {@return the leaves of the tree under `root` that may hold keys at or after `from`, in key order}
     ///
     /// It reads the branches a level at a time, with [PageFile#readAll(List, byte, int)] on up to `threads` threads,
     /// and none of the leaves: a store that just opened finds its file out of the OS cache as often as not, and
     /// reading the nodes of a level one after another made the reader wait for each read in turn.
-    static List<PageRef> leaves(PageFile pages, TreeRoot root, MemorySegment from, int threads) {
+    static List<Leaf> leaves(PageFile pages, TreeRoot root, MemorySegment from, int threads) {
         var top = pages.read(root.ref(), PageFile.NODE, true);
         if (TreeNodes.isLeaf(top)) {
-            return List.of(root.ref());
+            return List.of(new Leaf(root.ref(), null));
         }
         var level = List.of(top);
         while (true) {
-            var refs = new ArrayList<PageRef>();
+            var children = new ArrayList<Leaf>();
             for (var node = 0; node < level.size(); node++) {
                 var unit = level.get(node);
                 // Only the first node of a level is on the path to `from`: those after it hold later keys alone
                 for (var i = node == 0 ? TreeNodes.childFor(unit, from) : 0; i < TreeNodes.count(unit); i++) {
-                    refs.add(TreeNodes.childRef(unit, i));
+                    children.add(new Leaf(TreeNodes.childRef(unit, i), TreeNodes.childKey(unit, i)));
                 }
             }
             if (TreeNodes.level(level.getFirst()) == 1) {
-                return refs;
+                return children;
             }
-            level = Arrays.asList(pages.readAll(refs, PageFile.NODE, threads));
+            level = Arrays.asList(pages.readAll(children.stream().map(Leaf::ref).toList(), PageFile.NODE, threads));
         }
     }
 

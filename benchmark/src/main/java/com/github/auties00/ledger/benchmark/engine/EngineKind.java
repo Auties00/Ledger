@@ -31,6 +31,14 @@ public enum EngineKind {
             return LedgerEngine.open(directory, settings, false);
         }
     },
+    /// Ledger as [#LEDGER], reading its resident key spaces while it opens rather than from their first use. Not in the
+    /// workloads' default engines: it is there to compare the two ways of loading them.
+    LEDGER_RESIDENT_AT_OPEN("ledger-resident-at-open", false, true) {
+        @Override
+        public Engine open(Path directory, EngineSettings settings) {
+            return LedgerEngine.open(directory, settings, true, true);
+        }
+    },
     /// H2 MVStore, the engine under Cobalt's current store: a copy-on-write B-tree written as append-only chunks.
     MVSTORE("mvstore", false) {
         @Override

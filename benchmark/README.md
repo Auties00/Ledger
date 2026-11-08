@@ -8,6 +8,7 @@ JMH workloads that compare Ledger with other embedded storage engines. Some work
 |---|---|---|
 | `ledger` | Ledger, encrypting its files with AES-256-GCM: a group-committed log checkpointed into copy-on-write B+trees; sessions and chats resident, the rest paged | yes |
 | `ledger-plain` | The same without encryption | yes |
+| `ledger-resident-at-open` | `ledger`, reading its resident key spaces while it opens; only when `-p engine` names it, to compare the two ways of loading them | yes |
 | `mvstore` | H2 MVStore 2.5.252, configured as Cobalt's current store configures it | yes |
 | `mvstore-encrypted` | The same, with MVStore's XTS-AES file encryption (not authenticated) | yes |
 | `rocksdb` | RocksDB 11.8.1 through JNI: an LSM tree with a write-ahead log and group commit | no |
