@@ -345,7 +345,14 @@ class DurableLedgerTest {
                 }
             });
             var options = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(NAMES).largeValues(4_096);
-            try (var ledger = options.build()) {
+            var released = new java.util.concurrent.CountDownLatch(1);
+            try (var pool = IoPool.create(1); var ledger = options.ioPool(pool).build()) {
+                if (!large) {
+                    // A commit writes its own group only if it starts the flush before the pool's thread does, and a
+                    // commit of 81 writes still has them to publish once it queues its frame: with the thread free, all
+                    // 40 such commits of a cold JVM can lose that race
+                    occupy(pool, released);
+                }
                 for (var i = 0; i < 40; i++) {
                     armed.set(true);
                     var value = large ? "v".repeat(5_000) + i : "v" + i;
@@ -364,12 +371,13 @@ class DurableLedgerTest {
                     Thread.interrupted();
                 }
                 armed.set(false);
+                released.countDown();
                 ledger.commit(ledger.newBatch().put(NAMES, "after", "v")).awaitDurable();
                 // A close from an interrupted thread checkpoints all the same
                 committer.interrupt();
             }
             assertTrue(Thread.interrupted(), "the close took the interrupt");
-            assertTrue(interrupts.get() > 0, "no commit forced its own group");
+            assertEquals(40, interrupts.get(), "a commit's force went by without the interrupt");
             try (var ledger = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(NAMES).largeValues(4_096).build()) {
                 for (var i = 0; i < 40; i++) {
                     assertEquals(Optional.of(large ? "v".repeat(5_000) + i : "v" + i), ledger.get(NAMES, "k" + i));
@@ -378,6 +386,22 @@ class DurableLedgerTest {
                     }
                 }
             }
+        }
+
+        /// Keeps the only thread of `pool` from any other task until `released` opens, and returns once it runs, with every
+        /// task queued before it done. The thread takes its next task after a minute at most, so a commit that left its
+        /// group to the pool fails an assertion rather than hanging the test.
+        private static void occupy(IoPool pool, java.util.concurrent.CountDownLatch released) throws InterruptedException {
+            var occupied = new java.util.concurrent.CountDownLatch(1);
+            ((PlatformIoPool) pool).executor().execute(() -> {
+                occupied.countDown();
+                try {
+                    released.await(1, java.util.concurrent.TimeUnit.MINUTES);
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            occupied.await();
         }
 
         @Test
