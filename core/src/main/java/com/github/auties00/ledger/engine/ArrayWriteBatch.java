@@ -11,10 +11,16 @@ import java.util.Arrays;
 import java.util.Map;
 import java.util.Objects;
 
-/// A [WriteBatch] that encodes into one growing array and records each write as offsets into it.
+/// A [WriteBatch] that encodes into arrays and records each write as offsets into them.
 ///
 /// A batch's first array has the size of its first write, which a batch of one write, the usual one, keeps as is; the
 /// array grows by doubling, and from [#INITIAL_CAPACITY] it comes from the store's [HeapPool].
+///
+/// A batch that outgrows [#CHUNK_BYTES] moves to a rope of arrays of that size from the pool, which never grow, so no
+/// batch copies its bytes more than that once: the values of paged key spaces go on chunks of their own, which the
+/// store's versions keep as they are, and everything the store copies goes on others, which return to the pool once the
+/// commit [ends][#finish()]. An array of over 1 MiB, which a doubling array of a batch of a thousand messages was, the
+/// pool does not recycle and the collector gives regions of its own.
 ///
 /// A value of half a [chunk][#CHUNK_BYTES] or more never enters that array: it takes an array of its own at the put,
 /// which is private to the batch, is never written again, and is what the file of large values seals and the store's
@@ -35,8 +41,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     private static final MemorySegment EMPTY_MEMORY = MemorySegment.ofArray(EMPTY);
     /// The writes a new batch has room for: most batches hold one or two.
     private static final int INITIAL_WRITES = 2;
-    /// The most bytes of the arrays [#prepare(boolean)] copies values into: below half a region of the smallest the
-    /// G1 collector makes, 1 MiB, so none takes a region of its own, as an object of half a region or more does.
+    /// The most bytes of a batch's array, of the chunks of its rope, and of the array [#prepare(boolean)] copies values
+    /// into: below half a region of the smallest the G1 collector makes, 1 MiB, so none takes a region of its own, as
+    /// an object of half a region or more does.
     static final int CHUNK_BYTES = 256 * 1024;
     /// The least bytes of a value that takes an array of its own, which [#CHUNK_BYTES] could hold few of.
     private static final int OWN_BYTES = CHUNK_BYTES / 2;
@@ -48,6 +55,8 @@ public final class ArrayWriteBatch implements WriteBatch {
     private static final byte HOMES_OWN = 1;
     // A paged write's home is in homes, a resident one has none
     private static final byte HOMES_CHUNKS = 2;
+    // A paged write's home is the home of its chunk of the rope, a resident one has none
+    private static final byte HOMES_ROPE = 3;
 
     /// A write of a value under a key.
     public static final byte PUT = 0;
@@ -60,8 +69,14 @@ public final class ArrayWriteBatch implements WriteBatch {
     private static final long ABSENT = -1;
     // The offset of a value on an array of its own, in owns
     private static final long OWN = -2;
-    // The most bytes of keys and values a batch holds
-    private static final long MAX_BYTES = Integer.MAX_VALUE - 8;
+    // The bytes a log frame takes for a write besides its key and value: its kind, its key space and the lengths, as
+    // variable-length numbers
+    private static final int WRITE_OVERHEAD = 16;
+    // The most bytes of keys, values and their overhead in a log frame, whose body is one array: the 16 MiB below the
+    // largest array cover what checkRoom does not see, the batch's array and the frame's own header
+    private static final long MAX_BYTES = Integer.MAX_VALUE - 8 - (16 << 20);
+    // What reserve returns once the batch's encodings are on a rope: every span of a write then has its own place
+    private static final long ON_ROPE = -1;
 
     private final Object owner;
     private final HeapPool pool;
@@ -91,6 +106,16 @@ public final class ArrayWriteBatch implements WriteBatch {
     private byte[][] owns;
     // The bytes of the arrays in owns
     private long ownBytes;
+    // The chunks of the rope by the number a span's offset holds in its high bits, or null while the encodings are on
+    // data, whose spans hold 0 there: the number 0 is no chunk's
+    private Chunk[] chunks;
+    private int chunkCount;
+    // The chunks the next key and the next paged value go on; null before the first, or for values once a prepare
+    // exposed theirs
+    private Chunk keyChunk;
+    private Chunk valueChunk;
+    // The bytes of the encodings on the rope
+    private long ropeBytes;
     private int size;
     // The totals of the writes, written only by add() and clear(): whether a write removes a range
     private boolean removesRanges;
@@ -131,13 +156,15 @@ public final class ArrayWriteBatch implements WriteBatch {
         if (valueLength >= OWN_BYTES) {
             checkRoom(valueLength);
             var own = encodeOwn(keyspace.values(), value, (int) valueLength);
-            var ownKeyOffset = reserve(keyLength);
-            keyspace.keys().encode(key, memory.asSlice(ownKeyOffset, keyLength));
+            var ownKeyOffset = encodeKey(keyspace, key, keyLength);
             addOwn(keyspace, keyspace.residency() == Keyspace.Residency.RESIDENT ? value : null, ownKeyOffset, keyLength, own);
             return this;
         }
         // One reservation for both, so a batch of one write grows its array once
         var keyOffset = reserve(keyLength + valueLength);
+        if (keyOffset == ON_ROPE) {
+            return putOnRope(keyspace, key, value, keyLength, (int) valueLength);
+        }
         var valueOffset = keyOffset + keyLength;
         keyspace.keys().encode(key, memory.asSlice(keyOffset, keyLength));
         keyspace.values().encode(value, memory.asSlice(valueOffset, valueLength));
@@ -155,11 +182,24 @@ public final class ArrayWriteBatch implements WriteBatch {
             checkRoom(valueLength);
             var own = copyOwn(value);
             var ownKeyOffset = reserve(keyLength);
-            MemorySegment.copy(key, 0, memory, ownKeyOffset, keyLength);
+            if (ownKeyOffset == ON_ROPE) {
+                checkRoom(keyLength);
+                ownKeyOffset = takeKey(keyLength);
+            }
+            MemorySegment.copy(key, 0, slot(ownKeyOffset, keyLength), 0, keyLength);
             addOwn(keyspace, null, ownKeyOffset, keyLength, own);
             return this;
         }
         var keyOffset = reserve(keyLength + valueLength);
+        if (keyOffset == ON_ROPE) {
+            checkRoom(keyLength + valueLength);
+            var keyPosition = takeKey(keyLength);
+            var valuePosition = takeFor(keyspace, (int) valueLength);
+            MemorySegment.copy(key, 0, slot(keyPosition, keyLength), 0, keyLength);
+            MemorySegment.copy(value, 0, slot(valuePosition, (int) valueLength), 0, valueLength);
+            add(PUT, keyspace, null, keyPosition, keyLength, valuePosition, valueLength);
+            return this;
+        }
         var valueOffset = keyOffset + keyLength;
         MemorySegment.copy(key, 0, memory, keyOffset, keyLength);
         MemorySegment.copy(value, 0, memory, valueOffset, valueLength);
@@ -171,9 +211,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     public <K> WriteBatch delete(Keyspace<K, ?> keyspace, K key) {
         checkOpened(keyspace);
         var keyLength = checkKeyLength(keyspace.keys().sizeOf(Objects.requireNonNull(key, "key")));
-        var keyOffset = reserve(keyLength);
-        keyspace.keys().encode(key, memory.asSlice(keyOffset, keyLength));
-        add(DELETE, keyspace, null, keyOffset, keyLength, ABSENT, 0);
+        add(DELETE, keyspace, null, encodeKey(keyspace, key, keyLength), keyLength, ABSENT, 0);
         return this;
     }
 
@@ -181,19 +219,45 @@ public final class ArrayWriteBatch implements WriteBatch {
     public <K> WriteBatch deleteRange(Keyspace<K, ?> keyspace, KeyRange<K> range) {
         checkOpened(keyspace);
         Objects.requireNonNull(range, "range");
-        var from = range.from().map(key -> encodeKey(keyspace, key)).orElse(null);
-        var to = range.to().map(key -> encodeKey(keyspace, key)).orElse(null);
-        add(DELETE_RANGE, keyspace, null,
-                from == null ? ABSENT : from[0], from == null ? 0 : from[1],
-                to == null ? ABSENT : to[0], to == null ? 0 : to[1]);
+        var from = range.from().orElse(null);
+        var to = range.to().orElse(null);
+        var fromLength = from == null ? 0 : checkKeyLength(keyspace.keys().sizeOf(from));
+        var toLength = to == null ? 0 : checkKeyLength(keyspace.keys().sizeOf(to));
+        var fromOffset = ABSENT;
+        var toOffset = ABSENT;
+        if (fromLength + toLength > 0) {
+            // One reservation for both: a bound reserved alone would not be among the spans a move to the rope rewrites
+            var offset = reserve(fromLength + toLength);
+            if (offset == ON_ROPE) {
+                checkRoom(fromLength + toLength);
+                fromOffset = from == null ? ABSENT : takeKey(fromLength);
+                toOffset = to == null ? ABSENT : takeKey(toLength);
+            } else {
+                fromOffset = from == null ? ABSENT : offset;
+                toOffset = to == null ? ABSENT : offset + fromLength;
+            }
+            if (from != null) {
+                keyspace.keys().encode(from, slot(fromOffset, fromLength));
+            }
+            if (to != null) {
+                keyspace.keys().encode(to, slot(toOffset, toLength));
+            }
+        }
+        add(DELETE_RANGE, keyspace, null, fromOffset, fromLength, toOffset, toLength);
         return this;
     }
 
-    private <K> long[] encodeKey(Keyspace<K, ?> keyspace, K key) {
-        var length = checkKeyLength(keyspace.keys().sizeOf(key));
+    /// {@return where the batch holds `key`, which it encoded there}
+    private <K> long encodeKey(Keyspace<K, ?> keyspace, K key, int length) {
         var offset = reserve(length);
+        if (offset == ON_ROPE) {
+            checkRoom(length);
+            offset = takeKey(length);
+            keyspace.keys().encode(key, slot(offset, length));
+            return offset;
+        }
         keyspace.keys().encode(key, memory.asSlice(offset, length));
-        return new long[]{offset, length};
+        return offset;
     }
 
     private void checkOpened(Keyspace<?, ?> keyspace) {
@@ -256,10 +320,10 @@ public final class ArrayWriteBatch implements WriteBatch {
         }
     }
 
-    /// Checks that the batch has room for `length` bytes more, which the store's log frame must hold too, its body
-    /// being one array.
+    /// Checks that the batch has room for a write of `length` bytes more, which the store's log frame must hold too,
+    /// its body being one array.
     private void checkRoom(long length) {
-        checkRoom(used + ownBytes, length);
+        checkRoom(encodedBytes() + (size + 1L) * WRITE_OVERHEAD, length);
     }
 
     /// Checks that a batch of `held` bytes has room for `length` bytes more.
@@ -271,26 +335,181 @@ public final class ArrayWriteBatch implements WriteBatch {
         }
     }
 
+    /// {@return where in the batch's array `length` bytes are reserved, or [#ON_ROPE] if the batch's encodings are on a
+    /// rope, with no reservation made}
+    ///
+    /// @param length more than 0: on a rope, the array is empty, so every reservation comes here to [#grow(long)]
     private long reserve(long length) {
         var needed = used + length;
         if (needed > data.length) {
-            var capacity = Math.max(needed, (long) data.length * 2);
-            checkRoom(capacity + ownBytes, 0);
-            // Below the pool's smallest array, an array of the size the batch needs: the store keeps it without the
-            // copy compact() would make. The pool takes back only its own sizes, so it ignores these arrays
-            var grown = capacity < INITIAL_CAPACITY ? new byte[(int) capacity] : pool.acquire((int) capacity);
-            System.arraycopy(data, 0, grown, 0, (int) used);
-            if (!exposed) {
-                pool.release(data);
-            }
-            exposed = false;
-            data = grown;
-            memory = MemorySegment.ofArray(data);
-            view = memory.asReadOnly();
+            return grow(length);
         }
         var offset = used;
         used = needed;
         return offset;
+    }
+
+    /// Makes room for a reservation of `length` bytes the batch's array has none for: in a larger array, up to
+    /// [#CHUNK_BYTES], and on a rope past it.
+    private long grow(long length) {
+        if (chunks != null) {
+            return ON_ROPE;
+        }
+        var needed = used + length;
+        if (needed > CHUNK_BYTES) {
+            moveToRope();
+            return ON_ROPE;
+        }
+        var capacity = Math.min(CHUNK_BYTES, Math.max(needed, (long) data.length * 2));
+        // Below the pool's smallest array, an array of the size the batch needs: the store keeps it without the
+        // copy compact() would make. The pool takes back only its own sizes, so it ignores these arrays
+        var grown = capacity < INITIAL_CAPACITY ? new byte[(int) capacity] : pool.acquire((int) capacity);
+        System.arraycopy(data, 0, grown, 0, (int) used);
+        if (!exposed) {
+            pool.release(data);
+        }
+        exposed = false;
+        data = grown;
+        memory = MemorySegment.ofArray(data);
+        view = memory.asReadOnly();
+        var offset = used;
+        used = needed;
+        return offset;
+    }
+
+    /// Moves the encodings of the batch to a rope, rewriting the spans of its writes; only a put of a value below
+    /// [#OWN_BYTES] or a key comes here, so none has a span that outgrows a chunk.
+    private void moveToRope() {
+        chunks = new Chunk[8];
+        chunkCount = 1;
+        for (var i = 0; i < size; i++) {
+            moveWrite(i);
+        }
+        dropData();
+        used = 0;
+    }
+
+    /// Moves the bytes of write `index` to the rope, by a call of its own, which the JIT compiles once a few thousand
+    /// writes have made it, as it would not compile the loop of a method called once a batch.
+    private void moveWrite(int index) {
+        if (spans[index * 4] != ABSENT) {
+            spans[index * 4] = moveKey(spans[index * 4], (int) spans[index * 4 + 1]);
+        }
+        var second = spans[index * 4 + 2];
+        if (second >= 0) {
+            var length = (int) spans[index * 4 + 3];
+            var position = packed(index) ? takeValue(length) : takeKey(length);
+            moveBytes(second, position, length);
+            spans[index * 4 + 2] = position;
+        }
+    }
+
+    private long moveKey(long offset, int length) {
+        var position = takeKey(length);
+        moveBytes(offset, position, length);
+        return position;
+    }
+
+    private void moveBytes(long offset, long position, int length) {
+        System.arraycopy(data, (int) offset, chunks[(int) (position >>> 32)].array, (int) position, length);
+    }
+
+    private <K, V> WriteBatch putOnRope(Keyspace<K, V> keyspace, K key, V value, int keyLength, int valueLength) {
+        checkRoom(keyLength + valueLength);
+        var keyPosition = takeKey(keyLength);
+        var valuePosition = takeFor(keyspace, valueLength);
+        keyspace.keys().encode(key, slot(keyPosition, keyLength));
+        keyspace.values().encode(value, slot(valuePosition, valueLength));
+        add(PUT, keyspace, keyspace.residency() == Keyspace.Residency.RESIDENT ? value : null,
+                keyPosition, keyLength, valuePosition, valueLength);
+        return this;
+    }
+
+    /// {@return the rope's place for a value of `length` bytes of `keyspace`}
+    ///
+    /// A paged one goes on the chunks versions keep, a resident one, which the store copies, with the keys.
+    private long takeFor(Keyspace<?, ?> keyspace, int length) {
+        return keyspace.residency() == Keyspace.Residency.PAGED ? takeValue(length) : takeKey(length);
+    }
+
+    private long takeKey(int length) {
+        if (keyChunk == null || keyChunk.fill + length > CHUNK_BYTES) {
+            keyChunk = newChunk(false);
+        }
+        return take(keyChunk, length);
+    }
+
+    private long takeValue(int length) {
+        if (valueChunk == null || valueChunk.fill + length > CHUNK_BYTES) {
+            valueChunk = newChunk(true);
+        }
+        return take(valueChunk, length);
+    }
+
+    private long take(Chunk chunk, int length) {
+        var position = (long) chunk.number << 32 | chunk.fill;
+        chunk.fill += length;
+        ropeBytes += length;
+        return position;
+    }
+
+    private Chunk newChunk(boolean values) {
+        if (chunkCount == chunks.length) {
+            chunks = Arrays.copyOf(chunks, chunkCount * 2);
+        }
+        var chunk = new Chunk(chunkCount, pool.acquire(CHUNK_BYTES), values);
+        chunks[chunkCount++] = chunk;
+        return chunk;
+    }
+
+    /// {@return the writable segment of the `length` bytes at `position`, on the batch's array or its rope}
+    private MemorySegment slot(long position, int length) {
+        var chunk = (int) (position >>> 32);
+        return chunk == 0 ? memory.asSlice(position, length) : chunks[chunk].memory.asSlice((int) position, length);
+    }
+
+    /// Lets go of the rope, if the batch has one: every chunk returns to the pool but those that are their values' home,
+    /// which the versions may slice and no one writes again.
+    private void leaveRope() {
+        if (chunks == null) {
+            return;
+        }
+        for (var i = 1; i < chunkCount; i++) {
+            var chunk = chunks[i];
+            if (chunk.home != chunk.view) {
+                pool.release(chunk.array);
+            }
+        }
+        chunks = null;
+        chunkCount = 0;
+        keyChunk = null;
+        valueChunk = null;
+        ropeBytes = 0;
+    }
+
+    /// One array of a batch's rope.
+    private static final class Chunk {
+        // The number the offsets of the spans on it hold in their high bits
+        final int number;
+        final byte[] array;
+        final MemorySegment memory;
+        // A read-only view of memory, which the accessors slice
+        final MemorySegment view;
+        // Whether it holds values of paged key spaces, which the store's versions keep; otherwise bytes the store copies
+        final boolean values;
+        // The bytes taken
+        int fill;
+        // What the versions of its values slice once a prepare exposed it: its view, or a copy of its bytes in an array
+        // of their size; null for a chunk no prepare exposed
+        MemorySegment home;
+
+        Chunk(int number, byte[] array, boolean values) {
+            this.number = number;
+            this.array = array;
+            this.memory = MemorySegment.ofArray(array);
+            this.view = memory.asReadOnly();
+            this.values = values;
+        }
     }
 
     private void add(byte kind, Keyspace<?, ?> keyspace, Object value, long firstOffset, long firstLength,
@@ -353,6 +572,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         largestValueBytes = 0;
         owns = null;
         ownBytes = 0;
+        leaveRope();
         // What a commit that failed prepared
         homes = null;
         homeOffsets = null;
@@ -431,7 +651,12 @@ public final class ArrayWriteBatch implements WriteBatch {
     ///
     /// @param index a write that puts a value
     byte[] valueArray(int index) {
-        return spans[Objects.checkIndex(index, size) * 4 + 2] == OWN ? owns[index] : data;
+        var offset = spans[Objects.checkIndex(index, size) * 4 + 2];
+        if (offset == OWN) {
+            return owns[index];
+        }
+        var chunk = (int) (offset >>> 32);
+        return chunk == 0 ? data : chunks[chunk].array;
     }
 
     /// {@return where in [#valueArray(int)] the value of write `index` starts}
@@ -440,6 +665,11 @@ public final class ArrayWriteBatch implements WriteBatch {
     int valueArrayOffset(int index) {
         var offset = spans[Objects.checkIndex(index, size) * 4 + 2];
         return offset == OWN ? 0 : (int) offset;
+    }
+
+    /// {@return the arrays of the batch's rope, none of them above [#CHUNK_BYTES], or 0 if it has none; for tests}
+    int chunksForTests() {
+        return chunks == null ? 0 : chunkCount - 1;
     }
 
     /// {@return the value of write `index` as it was given, kept for resident key spaces; `null` otherwise}
@@ -455,10 +685,12 @@ public final class ArrayWriteBatch implements WriteBatch {
         if (offset < 0) {
             return offset == ABSENT ? null : MemorySegment.ofArray(owns[index]).asReadOnly();
         }
-        return view.asSlice(offset, spans[index * 4 + field + 1]);
+        var length = spans[index * 4 + field + 1];
+        var chunk = (int) (offset >>> 32);
+        return chunk == 0 ? view.asSlice(offset, length) : chunks[chunk].view.asSlice((int) offset, length);
     }
 
-    /// {@return the read-only segment of the batch's array; for tests}
+    /// {@return the read-only segment of the batch's array, the home of no value once the batch is on a rope; for tests}
     MemorySegment viewForTests() {
         return view;
     }
@@ -470,7 +702,7 @@ public final class ArrayWriteBatch implements WriteBatch {
 
     /// {@return the bytes the encodings occupy, on whichever arrays}
     public long encodedBytes() {
-        return used + ownBytes;
+        return used + ownBytes + ropeBytes;
     }
 
     /// Decides where the store's versions find the values of the writes, [#home(int)], before the store reads the
@@ -483,7 +715,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// once the commit [ends][#finish()]. On the batch's array, a message committed beside a session of 1.5 KiB kept
     /// the session's bytes, which the store held a copy of already, until the next checkpoint, and a batch of a
     /// thousand messages one array of over 2 MiB, which the collector gives regions of its own. A value on an array of
-    /// its own stays there and counts for none of this.
+    /// its own stays there and counts for none of this. A batch on a rope has its paged values alone on their chunks
+    /// already, which it hands over as they are, but for the last one, copied to an array of its bytes if it leaves
+    /// more than [#SLACK] bytes or a sixteenth unused.
     ///
     /// A commit that fails prepares again when it is retried: a prepare writes nothing a former one exposed.
     ///
@@ -495,6 +729,10 @@ public final class ArrayWriteBatch implements WriteBatch {
         if (copies) {
             return;
         }
+        if (chunks != null) {
+            prepareRope();
+            return;
+        }
         var paged = pagedValueBytes;
         // A batch of resident writes alone keeps them on its array as before, where the store's rule for resident
         // values finds it small enough; any other copies them, so the paged values' array holds none
@@ -502,7 +740,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         if (kept == 0) {
             return;
         }
-        if (used <= CHUNK_BYTES && used - kept <= Math.max(SLACK, used / 16)) {
+        if (used - kept <= Math.max(SLACK, used / 16)) {
             compact();
             homesMode = HOMES_OWN;
             exposed = true;
@@ -514,42 +752,51 @@ public final class ArrayWriteBatch implements WriteBatch {
         homes = new MemorySegment[size];
         homeOffsets = new int[size];
         homesMode = HOMES_CHUNKS;
-        // The packer counts down a copy of the total: a commit that fails before it finishes the batch leaves the
-        // batch's writes, and committing it again prepares them again
-        var packer = new Packer(paged);
+        // At most CHUNK_BYTES, as the batch's array is
+        var packer = new Packer((int) paged);
         for (var i = 0; i < size; i++) {
             packer.pack(i);
         }
     }
 
-    // Whether write `index` puts a value the store keeps on a chunk in HOMES_CHUNKS
+    /// Exposes the chunks of values no prepare has: from here on no one writes them, as a commit that fails may leave
+    /// versions on them, so a write added for a retry starts a new chunk, and a retry finds each chunk's home as it was.
+    ///
+    /// Every chunk but the last is more than half full, as its next value did not fit, so they waste at most a value's
+    /// bytes each.
+    private void prepareRope() {
+        homesMode = HOMES_ROPE;
+        var last = valueChunk;
+        valueChunk = null;
+        for (var i = 1; i < chunkCount; i++) {
+            var chunk = chunks[i];
+            if (chunk.values && chunk.home == null) {
+                var unused = chunk.array.length - chunk.fill;
+                chunk.home = chunk == last && unused > Math.max(SLACK, chunk.array.length / 16)
+                        ? MemorySegment.ofArray(Arrays.copyOf(chunk.array, chunk.fill)).asReadOnly()
+                        : chunk.view;
+            }
+        }
+    }
+
+    // Whether write `index` puts a value the store keeps on a chunk, in HOMES_CHUNKS and HOMES_ROPE
     private boolean packed(int index) {
         return kinds[index] == PUT && spans[index * 4 + 2] != OWN && targets[index].residency() == Keyspace.Residency.PAGED;
     }
 
-    /// The chunks [#prepare(boolean)] copies the values of paged key spaces into, in the order of the writes.
+    /// The array [#prepare(boolean)] copies the values of paged key spaces into, in the order of the writes.
     ///
-    /// The values, all below half a chunk, fill chunks of [#CHUNK_BYTES], the last no larger than the values left for
-    /// it. Each write is packed by a call of its own, which the JIT compiles once a few thousand writes have made it,
-    /// as it would not compile the loop of a method called once a commit through the first large commits of a process.
+    /// Each write is packed by a call of its own, which the JIT compiles once a few thousand writes have made it, as it
+    /// would not compile the loop of a method called once a commit through the first large commits of a process.
     private final class Packer {
-        // The bytes of the values not packed yet
-        private long remaining;
-        private byte[] chunk;
-        private MemorySegment chunkView;
+        private final byte[] chunk;
+        private final MemorySegment chunkView;
         private int fill;
 
-        Packer(long remaining) {
-            this.remaining = remaining;
-            // Every value fits the first one, which is as large as all of them or a whole chunk
-            startChunk();
-        }
-
-        // Starts a chunk as large as the values left for it, at most a whole one
-        private void startChunk() {
-            chunk = new byte[(int) Math.min(CHUNK_BYTES, remaining)];
+        /// Makes the array for values of `bytes` bytes in all.
+        Packer(int bytes) {
+            chunk = new byte[bytes];
             chunkView = MemorySegment.ofArray(chunk).asReadOnly();
-            fill = 0;
         }
 
         /// Gives write `index` its home, if it puts a value to a paged key space.
@@ -559,15 +806,10 @@ public final class ArrayWriteBatch implements WriteBatch {
             }
             var offset = (int) spans[index * 4 + 2];
             var length = (int) spans[index * 4 + 3];
-            if (fill + length > chunk.length) {
-                // Every chunk but the last is more than half full, so they waste at most a value's bytes each
-                startChunk();
-            }
             System.arraycopy(data, offset, chunk, fill, length);
             homes[index] = chunkView;
             homeOffsets[index] = fill;
             fill += length;
-            remaining -= length;
         }
     }
 
@@ -582,6 +824,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         return switch (homesMode) {
             case HOMES_OWN -> spans[index * 4 + 2] == OWN ? null : view;
             case HOMES_CHUNKS -> homes[index];
+            case HOMES_ROPE -> packed(index) ? chunks[(int) (spans[index * 4 + 2] >>> 32)].home : null;
             default -> null;
         };
     }
@@ -594,12 +837,13 @@ public final class ArrayWriteBatch implements WriteBatch {
         return switch (homesMode) {
             case HOMES_OWN -> spans[index * 4 + 2] == OWN ? 0 : Math.toIntExact(spans[index * 4 + 2]);
             case HOMES_CHUNKS -> homeOffsets[index];
+            case HOMES_ROPE -> packed(index) ? (int) spans[index * 4 + 2] : 0;
             default -> 0;
         };
     }
 
-    /// Starts the batch again, empty, once the store has applied its writes: it hands its array over to the store if
-    /// the versions slice it, [#detach()], and gives it back to the pool otherwise.
+    /// Starts the batch again, empty, once the store has applied its writes: it hands over to the store the arrays the
+    /// versions slice, and gives the others back to the pool.
     void finish() {
         dropData();
         clear();
@@ -629,7 +873,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// [#INITIAL_CAPACITY] of its batch, and a batch that grew by doubling a quarter of its array on average, every
     /// byte of which the store held for each write. The batch keeps its own array for its next writes.
     public void compact() {
-        if (spare != null || used > data.length - data.length / 16) {
+        if (chunks != null || spare != null || used > data.length - data.length / 16) {
             return;
         }
         spare = data;
@@ -649,9 +893,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     ///
     /// @return the array holding the encodings
     /// @throws IllegalStateException if the encodings are not all on that array, as those of a value of half a chunk or
-    ///                               more never are
+    ///                               more and of a batch on a rope never are
     public byte[] detach() {
-        if (ownBytes != 0) {
+        if (ownBytes != 0 || chunks != null) {
             throw new IllegalStateException("The encodings are not on one array");
         }
         var detached = data;

@@ -232,9 +232,11 @@ class BatchTotalsTest {
             }
             var kept = paged > 0 ? paged : resident;
             var used = batch.encodedBytes() - ownBytes;
-            // The rule of ArrayWriteBatch.prepare: no homes, the batch's own array (64 bytes of slack), or chunks
-            var own = kept > 0 && used <= ArrayWriteBatch.CHUNK_BYTES && used - kept <= Math.max(64, used / 16);
-            var chunks = kept > 0 && !own && paged > 0;
+            // The rule of ArrayWriteBatch.prepare: chunks of a rope once a batch outgrew its array, and otherwise no homes,
+            // the batch's own array (64 bytes of slack), or chunks
+            var rope = batch.chunksForTests() > 0;
+            var own = !rope && kept > 0 && used - kept <= Math.max(64, used / 16);
+            var chunks = rope || kept > 0 && !own && paged > 0;
             for (var i = 0; i < batch.size(); i++) {
                 if (batch.kind(i) != ArrayWriteBatch.PUT) {
                     continue;

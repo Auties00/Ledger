@@ -201,7 +201,7 @@ final class FrameBody {
 
     private void ensure(int extra) {
         if (size + extra > data.length) {
-            data = Arrays.copyOf(data, Math.max(size + extra, data.length * 2));
+            data = Arrays.copyOf(data, (int) Math.min(Integer.MAX_VALUE - 8, Math.max((long) size + extra, data.length * 2L)));
         }
     }
 
