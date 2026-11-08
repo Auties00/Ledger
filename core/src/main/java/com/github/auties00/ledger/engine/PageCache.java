@@ -387,6 +387,13 @@ final class PageCache implements IdleTicker.Watched {
         }
     }
 
+    /// Runs `action` holding the lock of the cache, so tests can make whatever changes the cache wait for it.
+    void whileLockedForTests(Runnable action) {
+        synchronized (lock) {
+            action.run();
+        }
+    }
+
     /// Evicts entries while the caches of the budget hold more than its limit, from this cache while it holds more than
     /// its share and from the one that holds the most otherwise.
     ///

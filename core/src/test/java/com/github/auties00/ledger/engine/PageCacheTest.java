@@ -4,11 +4,15 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.ref.WeakReference;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -458,6 +462,46 @@ class PageCacheTest {
             assertSame(recordLeaf, pages.node(branch, 1));
             assertNull(pages.cachedNode(branch, 2));
             assertNull(pages.cachedNode(branch, 3), "a unit of another kind is no node");
+        }
+    }
+
+    @Test
+    @DisplayName("a checkpoint's writer that waits for the cache's lock holds up none of the other tasks passing through the writer")
+    void writerWaitsOutsideItsLock(@TempDir Path directory) throws Exception {
+        try (var pages = PageFile.open(directory, new PageCipher(null), LIMIT, new HeapPool(1 << 20))) {
+            var writer = pages.writer(1);
+            var unit = new byte[PageFormat.SIZE];
+            var failure = new AtomicReference<Exception>();
+            var queued = new CountDownLatch(1);
+            var refs = new AtomicReference<PageRef>();
+            var writing = new Thread(() -> {
+                try {
+                    refs.set(writer.write(PageFormat.LEAF, 0, 10, 1, unit, 0, true));
+                } catch (IOException exception) {
+                    failure.set(exception);
+                }
+            });
+            var other = new Thread(() -> {
+                while (writer.written() == 0) {
+                    Thread.onSpinWait();
+                }
+                queued.countDown();
+            });
+            other.setDaemon(true);
+            pages.cache().whileLockedForTests(() -> {
+                writing.start();
+                other.start();
+                try {
+                    assertTrue(queued.await(10, TimeUnit.SECONDS), "the writer's lock stayed held while the cache's was taken");
+                    assertNull(refs.get(), "the write waits for the cache");
+                } catch (InterruptedException exception) {
+                    throw new IllegalStateException(exception);
+                }
+            });
+            writing.join();
+            assertNull(failure.get());
+            assertSame(unit, pages.cache().get(refs.get()), "the write ends with its unit cached");
+            assertSame(unit, writer.staged(refs.get()));
         }
     }
 
