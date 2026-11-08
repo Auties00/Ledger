@@ -48,6 +48,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -808,6 +809,44 @@ class ResidentLoadTest {
             assertEquals(entries(model), visited);
             assertEquals(entries(model), ledger.range(SESSIONS, KeyRange.all(), Integer.MAX_VALUE));
         }
+    }
+
+    @Test
+    @DisplayName("a descending scan beside the loader links no chain, and the first after the load links those it installed, which stay linked through later writes")
+    void linksAfterLoad(@TempDir Path directory) throws Exception {
+        var model = populate(directory, SESSIONS, ENTRIES);
+        try (var ledger = open(directory, false)) {
+            var live = (LiveLedger) ledger;
+            var pause = new Pause(1);
+            live.hookResidentLoadsForTests(pause);
+            assertEquals(Optional.of(value(0)), ledger.get(SESSIONS, key(0)));
+            pause.awaitPaused(1);
+            var state = live.state(SESSIONS);
+            assertEquals(descending(model), ledger.range(SESSIONS, KeyRange.<String>all().reversed(), Integer.MAX_VALUE));
+            assertFalse(state.entries.isEmpty());
+            for (var chain : state.entries.values()) {
+                assertNull(chain.below());
+            }
+            pause.release(1);
+            awaitLoaded(live, SESSIONS);
+            assertEquals(descending(model), ledger.range(SESSIONS, KeyRange.<String>all().reversed(), Integer.MAX_VALUE));
+            var below = Chain.BOTTOM;
+            for (var chain : state.entries.values()) {
+                assertSame(below, chain.below());
+                below = chain;
+            }
+            assertEquals(ENTRIES, state.entries.size());
+            ledger.commit(ledger.newBatch().put(SESSIONS, key(500) + "a", "entered").delete(SESSIONS, key(501)));
+            model.put(key(500) + "a", "entered");
+            model.remove(key(501));
+            assertEquals(descending(model), ledger.range(SESSIONS, KeyRange.<String>all().reversed(), Integer.MAX_VALUE));
+        }
+    }
+
+    private static List<Entry<String, String>> descending(Map<String, String> model) {
+        var descending = entries(model);
+        Collections.reverse(descending);
+        return descending;
     }
 
     @Test

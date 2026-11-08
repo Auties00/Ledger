@@ -27,7 +27,7 @@ class LazyOrderingTest {
         var field = KeyspaceState.class.getDeclaredField("unordered");
         field.setAccessible(true);
         var count = 0;
-        for (var chain = (Chain) field.get(state); chain != null; chain = chain.nextUnordered) {
+        for (var chain = (Chain) field.get(state); chain != null; chain = chain.link) {
             count++;
         }
         return count;
