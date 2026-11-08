@@ -65,6 +65,9 @@ final class KeyspaceState {
     private int dirtyCut;
     // The bytes from which a value a batch puts goes to the file of large values, set while the store opens
     long largeValues = Long.MAX_VALUE;
+    // The versions whose units of the file of large values no published checkpoint has taken; guarded by the
+    // publishing role
+    final InFlightUnits inFlight;
     // Whether the key space orders its chains lazily, set while the store opens, before any chain is opened
     boolean lazy;
     // The chains opened and not yet ordered, newest first, linked through Chain.nextUnordered
@@ -102,6 +105,7 @@ final class KeyspaceState {
         this.keys = new KeySlab();
         this.ordering = new ReentrantLock();
         this.droppedListed = new java.util.concurrent.atomic.AtomicInteger();
+        this.inFlight = new InFlightUnits();
     }
 
     /// {@return the chain of `key`, or `null` if memory holds none}

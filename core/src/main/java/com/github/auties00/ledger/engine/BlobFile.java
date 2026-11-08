@@ -13,17 +13,21 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /// The file of large values, `ledger.blobs`: values a commit writes once, in units of their own, instead of into its
 /// log frame and again at the next checkpoint.
 ///
-/// A commit seals each of its large values into free pages before it is given a sequence, and its log frame records
+/// A commit seals each of its large values into free pages before it is given a sequence, the values of a commit that
+/// holds many too large for a leaf together, mostly into one run of them ([#writeAll(List)]), and its log frame records
 /// where the unit is; the log forces this file with the segment, in parallel, so a durable commit has durable values.
 /// The checkpoint that holds the commit points its leaf at the unit, with no copy. The file holds no superblock: the
 /// data file's records its free pages, which list as free every unit no checkpoint has taken, since recovery claims
@@ -40,16 +44,25 @@ final class BlobFile implements AutoCloseable {
     private static final int BUFFER = 1 << 20;
     /// The trailing free pages, 64 MiB of them, below which [#trim()] keeps the file's length.
     private static final int TRIM_SLACK = 16_384;
-
-    /// The channels the threads of commits and reads write and read units through.
-    private static final int CHANNELS = 4;
+    /// The channels the threads of reads read units through, as many as the data file has: positional reads of one
+    /// channel wait for each other on Windows.
+    private static final int READ_CHANNELS = 8;
+    /// The channels the threads of commits write units through, apart from those of the reads, so a commit that writes
+    /// megabytes holds no reader back.
+    private static final int WRITE_CHANNELS = 4;
+    /// The most threads that seal and write the units of one [#writeAll(List)].
+    private static final int WRITERS = 4;
+    /// The bytes of units of a [#writeAll(List)] for each thread that seals and writes them: below it, a thread of its
+    /// own would cost more than it takes off the commit.
+    private static final long WRITER_BYTES = 512 << 10;
+    /// The name of the threads that seal and write a share of the units of a [#writeAll(List)].
+    static final String WRITER_NAME = "ledger-blob-writer";
 
     private final Path path;
     // Forces and cuts the file, on the store's own threads only, so no interrupt of a caller closes it under them
     private final FileChannel channel;
-    // The channels callers write and read units through, each used by one thread at a time; one an interrupt closed is
-    // replaced
-    private final ArrayBlockingQueue<FileChannel> channels;
+    private final Channels readers;
+    private final Channels writers;
     private final PageCipher cipher;
     private final PageCache cache;
     private final HeapPool pool;
@@ -65,21 +78,16 @@ final class BlobFile implements AutoCloseable {
     private volatile Runnable epochGate;
     // Whether a unit was sealed under this open's epoch, which a later open must then not reuse
     private volatile boolean epochTaken;
+    // The commits that write units and have not ended; guarded by lock
+    private int commits;
+    // Whether the store is closing, so no commit starts writing units; guarded by lock
+    private boolean closing;
 
-    private BlobFile(Path path, FileChannel channel, PageCipher cipher, PageCache cache, HeapPool pool, FreeSpace space) throws IOException {
+    private BlobFile(Path path, FileChannel channel, PageCipher cipher, PageCache cache, HeapPool pool, FreeSpace space) {
         this.path = path;
         this.channel = channel;
-        this.channels = new ArrayBlockingQueue<>(CHANNELS);
-        try {
-            for (var i = 0; i < CHANNELS; i++) {
-                channels.add(FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE));
-            }
-        } catch (IOException exception) {
-            for (var open : channels) {
-                open.close();
-            }
-            throw exception;
-        }
+        this.readers = new Channels(path, READ_CHANNELS);
+        this.writers = new Channels(path, WRITE_CHANNELS);
         this.cipher = cipher;
         this.cache = cache;
         this.pool = pool;
@@ -129,6 +137,51 @@ final class BlobFile implements AutoCloseable {
         return epochTaken;
     }
 
+    /// Records that a commit is about to write units, which [#awaitCommits()] waits for until [#exitCommit()].
+    ///
+    /// What a commit still writes once its store has closed lands in pages the store's last checkpoint lists as free,
+    /// which the next open gives to values it acknowledges: so no commit writes a unit outside this.
+    ///
+    /// @throws IllegalStateException if the store is closing
+    void enterCommit() {
+        synchronized (lock) {
+            if (closing) {
+                throw new IllegalStateException("The store is closed");
+            }
+            commits++;
+        }
+    }
+
+    /// Records that a commit [#enterCommit()] recorded has ended, whether it succeeded or not.
+    void exitCommit() {
+        synchronized (lock) {
+            if (--commits == 0 && closing) {
+                lock.notifyAll();
+            }
+        }
+    }
+
+    /// Stops commits from starting to write units, and waits for those that have started to end.
+    ///
+    /// They end on their own, so this is called before the store closes anything, while the log still takes their
+    /// frames. It waits through interrupts, which the thread gets back.
+    void awaitCommits() {
+        var interrupted = false;
+        synchronized (lock) {
+            closing = true;
+            while (commits > 0) {
+                try {
+                    lock.wait();
+                } catch (InterruptedException _) {
+                    interrupted = true;
+                }
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     /// Seals `value` into free pages and writes it, without forcing it.
     ///
     /// The unit is in flight until a checkpoint takes it or [#release(PageRef)] frees it.
@@ -136,49 +189,24 @@ final class BlobFile implements AutoCloseable {
     /// @return where the unit is
     /// @throws LedgerIoException if the file cannot be written; the pages are free again
     PageRef write(MemorySegment value) {
-        var gate = epochGate;
-        if (gate != null) {
-            gate.run();
-            epochGate = null;
-        }
-        epochTaken = true;
+        passEpochGate();
         var pages = PageFormat.pagesFor(value.byteSize());
         PageRef ref;
         synchronized (lock) {
             ref = new PageRef(space.allocate(pages), pages, counter.getAndIncrement(), epoch);
             unadopted.add(ref);
         }
-        var header = new byte[PageFormat.HEADER];
-        PageFile.header(header, PageFormat.EXTERNAL, 0, ref.page(), pages, Math.toIntExact(value.byteSize()), ref.nonceHigh(), ref.nonceLow());
         var buffer = pool.acquire(BUFFER);
-        var through = new FileChannel[]{takeChannel()};
         var interrupted = new boolean[1];
         try {
-            var position = new long[]{PageFormat.offset(ref.page())};
-            cipher.seal(header, value, pages, buffer, (bytes, length) -> {
-                var start = position[0];
-                while (true) {
-                    try {
-                        var source = ByteBuffer.wrap(bytes, 0, length);
-                        var at = start;
-                        while (source.hasRemaining()) {
-                            at += through[0].write(source, at);
-                        }
-                        position[0] = at;
-                        return;
-                    } catch (ClosedByInterruptException _) {
-                        // The interrupt closed the channel: the same bytes again, at the same offset, on a new one,
-                        // and the caller gets its interrupt back
-                        interrupted[0] |= Thread.interrupted();
-                        through[0] = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
-                    }
-                }
-            });
+            stream(value, ref, new byte[PageFormat.HEADER], buffer, interrupted);
         } catch (IOException exception) {
             release(ref);
             throw new LedgerIoException(path + " could not be written", exception);
+        } catch (RuntimeException | Error throwable) {
+            release(ref);
+            throw throwable;
         } finally {
-            channels.offer(through[0]);
             pool.release(buffer);
             if (interrupted[0]) {
                 Thread.currentThread().interrupt();
@@ -187,11 +215,239 @@ final class BlobFile implements AutoCloseable {
         return ref;
     }
 
+    /// Seals each of `values` into a unit of its own and writes them, without forcing them.
+    ///
+    /// The units take one run of free pages where one holds them all, in the order of `values`, and are sealed back to
+    /// back into buffers of a megabyte, each written with one call: a batch of thousands of values of a few kilobytes
+    /// costs a system call a megabyte rather than one a unit, and more only for the shorter runs it fills where no run
+    /// holds it all ([FreeSpace#allocateAll(int\[\], int)]). From twice [#WRITER_BYTES] of units, up to [#WRITERS]
+    /// threads seal and write them, the calling thread among them, each a share of whole units, so no unit's seal is
+    /// split between threads. The call returns once every thread is done, failed or not, so no write of a failed call
+    /// lands in the pages it gave back, which another unit may take at once.
+    ///
+    /// The units are in flight until a checkpoint takes them or [#release(PageRef)] frees them.
+    ///
+    /// @return where each unit is, in the order of `values`
+    /// @throws LedgerIoException if the file cannot be written; the pages of every unit are free again
+    PageRef[] writeAll(List<MemorySegment> values) {
+        if (values.isEmpty()) {
+            return new PageRef[0];
+        }
+        passEpochGate();
+        var refs = new PageRef[values.size()];
+        var sizes = new int[refs.length];
+        var total = 0L;
+        for (var i = 0; i < sizes.length; i++) {
+            sizes[i] = PageFormat.pagesFor(values.get(i).byteSize());
+            total += sizes[i];
+        }
+        synchronized (lock) {
+            var firsts = space.allocateAll(sizes, Math.toIntExact(total));
+            for (var i = 0; i < refs.length; i++) {
+                refs[i] = new PageRef(firsts[i], sizes[i], counter.getAndIncrement(), epoch);
+                unadopted.add(refs[i]);
+            }
+        }
+        var bounds = shares(refs, total);
+        var failures = new Throwable[bounds.length - 1];
+        var threads = new Thread[failures.length];
+        for (var share = 1; share < threads.length; share++) {
+            var from = bounds[share];
+            var to = bounds[share + 1];
+            var index = share;
+            try {
+                threads[share] = Thread.ofVirtual().name(WRITER_NAME).start(() -> {
+                    try {
+                        // No one else holds this thread, so nothing interrupts it
+                        writeShare(values, refs, from, to, new boolean[1]);
+                    } catch (Throwable failure) {
+                        failures[index] = failure;
+                    }
+                });
+            } catch (Throwable failure) {
+                failures[share] = failure;
+            }
+        }
+        var interrupted = new boolean[1];
+        try {
+            writeShare(values, refs, bounds[0], bounds[1], interrupted);
+        } catch (Throwable failure) {
+            failures[0] = failure;
+        }
+        for (var thread : threads) {
+            if (thread != null) {
+                join(thread, interrupted);
+            }
+        }
+        if (interrupted[0]) {
+            Thread.currentThread().interrupt();
+        }
+        Throwable failure = null;
+        for (var each : failures) {
+            if (each == null) {
+                continue;
+            }
+            if (failure == null) {
+                failure = each;
+            } else {
+                failure.addSuppressed(each);
+            }
+        }
+        if (failure != null) {
+            for (var ref : refs) {
+                release(ref);
+            }
+            switch (failure) {
+                case IOException exception -> throw new LedgerIoException(path + " could not be written", exception);
+                case RuntimeException exception -> throw exception;
+                case Error error -> throw error;
+                default -> throw new IllegalStateException("A unit could not be written", failure);
+            }
+        }
+        return refs;
+    }
+
+    /// {@return the bounds of the shares of `refs` the threads of a [#writeAll(List)] seal and write, the first one's
+    /// start then each one's end: whole units, about as many pages in each, one share for each [#WRITER_BYTES]}
+    ///
+    /// @param pages the pages of every unit of `refs`
+    private static int[] shares(PageRef[] refs, long pages) {
+        var shares = (int) Math.clamp(pages * PageFormat.SIZE / WRITER_BYTES, 1, Math.min(WRITERS, refs.length));
+        var bounds = new int[shares + 1];
+        var cuts = 1;
+        var before = 0L;
+        for (var i = 0; i < refs.length - 1 && cuts < shares; i++) {
+            before += refs[i].pages();
+            if (before * shares >= pages * cuts) {
+                bounds[cuts++] = i + 1;
+            }
+        }
+        bounds[cuts] = refs.length;
+        return cuts == shares ? bounds : Arrays.copyOf(bounds, cuts + 1);
+    }
+
+    /// Seals the units `from` to `to` of `refs`, of the values at the same indexes of `values`, and writes them: back
+    /// to back into a buffer, written whenever the next unit does not fit or does not follow the last in the file; a
+    /// unit larger than the buffer streams through it.
+    ///
+    /// @param interrupted set if an interrupt of the thread closed a channel it wrote through
+    private void writeShare(List<MemorySegment> values, PageRef[] refs, int from, int to, boolean[] interrupted) throws IOException {
+        var bytes = 0L;
+        for (var i = from; i < to; i++) {
+            bytes += (long) refs[i].pages() * PageFormat.SIZE;
+        }
+        // A share smaller than a buffer takes no more than it needs, which every unit of the share then fits
+        var buffer = pool.acquire((int) Math.min(BUFFER, bytes));
+        var header = new byte[PageFormat.HEADER];
+        try {
+            var used = 0;
+            var start = 0L;
+            for (var i = from; i < to; i++) {
+                var ref = refs[i];
+                var value = values.get(i);
+                var length = (long) ref.pages() * PageFormat.SIZE;
+                var position = PageFormat.offset(ref.page());
+                if (length > buffer.length) {
+                    writeAt(buffer, used, start, interrupted);
+                    used = 0;
+                    stream(value, ref, header, buffer, interrupted);
+                    continue;
+                }
+                if (used + length > buffer.length || position != start + used) {
+                    writeAt(buffer, used, start, interrupted);
+                    used = 0;
+                }
+                if (used == 0) {
+                    start = position;
+                }
+                header(header, ref, value);
+                cipher.seal(header, value, ref.pages(), buffer, used);
+                used += (int) length;
+            }
+            writeAt(buffer, used, start, interrupted);
+        } finally {
+            pool.release(buffer);
+        }
+    }
+
+    /// Seals `value` into the unit `ref` through `buffer`, of at least 64 KiB, writing each part where it belongs.
+    ///
+    /// @param header receives the unit's header
+    /// @param interrupted set if an interrupt of the thread closed a channel it wrote through
+    private void stream(MemorySegment value, PageRef ref, byte[] header, byte[] buffer, boolean[] interrupted) throws IOException {
+        header(header, ref, value);
+        var position = new long[]{PageFormat.offset(ref.page())};
+        cipher.seal(header, value, ref.pages(), buffer, (bytes, length) -> {
+            writeAt(bytes, length, position[0], interrupted);
+            position[0] += length;
+        });
+    }
+
+    /// Fills `header` with the header of the unit `ref`, which holds `value`.
+    private static void header(byte[] header, PageRef ref, MemorySegment value) {
+        PageFile.header(header, PageFormat.EXTERNAL, 0, ref.page(), ref.pages(), Math.toIntExact(value.byteSize()),
+                ref.nonceHigh(), ref.nonceLow());
+    }
+
+    /// Writes the first `length` bytes of `bytes` at `position`, through a channel of the commits.
+    ///
+    /// An interrupt that closes the channel meanwhile has the same bytes written again at the same offset, through a
+    /// new one, never sealed again: their nonce is taken.
+    ///
+    /// @param interrupted set if an interrupt of the thread closed the channel, for the caller to give it back
+    private void writeAt(byte[] bytes, int length, long position, boolean[] interrupted) throws IOException {
+        if (length == 0) {
+            return;
+        }
+        var through = writers.take();
+        try {
+            while (true) {
+                try {
+                    var source = ByteBuffer.wrap(bytes, 0, length);
+                    var at = position;
+                    while (source.hasRemaining()) {
+                        at += through.write(source, at);
+                    }
+                    return;
+                } catch (ClosedByInterruptException _) {
+                    interrupted[0] |= Thread.interrupted();
+                    through = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
+                }
+            }
+        } finally {
+            writers.offer(through);
+        }
+    }
+
+    /// Makes the epoch durable before the first unit of this open, then records that units take it: no unit is sealed
+    /// under an epoch a later open may reuse.
+    private void passEpochGate() {
+        var gate = epochGate;
+        if (gate != null) {
+            gate.run();
+            epochGate = null;
+        }
+        epochTaken = true;
+    }
+
+    /// Waits for `thread` to end, through interrupts, which `interrupted` records for the caller to give back.
+    private static void join(Thread thread, boolean[] interrupted) {
+        while (true) {
+            try {
+                thread.join();
+                return;
+            } catch (InterruptedException _) {
+                interrupted[0] = true;
+            }
+        }
+    }
+
     /// {@return the plaintext of the unit `ref` names, header included}
     ///
     /// @param cached whether to keep the unit in the page cache
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
+    /// @throws IllegalStateException if the store has closed, as a read of the data file then does
     byte[] read(PageRef ref, boolean cached) {
         return read(ref, cached, true);
     }
@@ -220,12 +476,14 @@ final class BlobFile implements AutoCloseable {
     /// {@return the plaintext of the unit `ref` names, or `null` if the file does not hold it whole}
     ///
     /// @throws LedgerIoException if the file cannot be read
+    /// @throws IllegalStateException if the store has closed
     byte[] readUnit(PageRef ref) {
         var length = ref.pages() * PageFormat.SIZE;
         var sealed = pool.acquire(length);
-        var through = takeChannel();
+        FileChannel through = null;
         var interrupted = false;
         try {
+            through = readers.take();
             var target = ByteBuffer.wrap(sealed, 0, length);
             var position = PageFormat.offset(ref.page());
             while (target.hasRemaining()) {
@@ -247,36 +505,10 @@ final class BlobFile implements AutoCloseable {
         } catch (IOException exception) {
             throw new LedgerIoException(path + " could not be read", exception);
         } finally {
-            channels.offer(through);
+            if (through != null) {
+                readers.offer(through);
+            }
             pool.release(sealed);
-            if (interrupted) {
-                Thread.currentThread().interrupt();
-            }
-        }
-    }
-
-    /// {@return a channel for a caller's write or read, open, waiting for one if every one is in use}
-    private FileChannel takeChannel() {
-        var interrupted = false;
-        try {
-            while (true) {
-                try {
-                    var taken = channels.take();
-                    if (taken.isOpen()) {
-                        return taken;
-                    }
-                    // An interrupt closed it after its last use, and it could not be replaced then
-                    try {
-                        return FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
-                    } catch (IOException exception) {
-                        channels.offer(taken);
-                        throw new LedgerIoException(path + " could not be opened", exception);
-                    }
-                } catch (InterruptedException _) {
-                    interrupted = true;
-                }
-            }
-        } finally {
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }
@@ -383,11 +615,103 @@ final class BlobFile implements AutoCloseable {
         } catch (IOException _) {
             // Every unit a commit relies on was forced with its log group
         }
-        for (var open : channels) {
+        readers.close();
+        writers.close();
+    }
+
+    /// Channels of the file, each used by one thread at a time, opened as threads need them, up to a limit; one an
+    /// interrupt closed is replaced when it is next taken. Once closed they refuse new uses, and a channel a thread
+    /// was using closes when it comes back.
+    private static final class Channels {
+        private static final long RETRY_MILLIS = 50;
+
+        private final Path path;
+        private final int limit;
+        private final ArrayBlockingQueue<FileChannel> idle;
+        // The channels opened, idle or in use, at most limit
+        private final AtomicInteger opened;
+        private volatile boolean closed;
+
+        Channels(Path path, int limit) {
+            this.path = path;
+            this.limit = limit;
+            this.idle = new ArrayBlockingQueue<>(limit);
+            this.opened = new AtomicInteger();
+        }
+
+        /// {@return an open channel, waiting through interrupts, which the thread gets back, while `limit` are in use}
+        ///
+        /// @throws LedgerIoException if a channel cannot be opened
+        /// @throws IllegalStateException if the channels are closed
+        FileChannel take() {
+            var interrupted = false;
             try {
-                open.close();
-            } catch (IOException _) {
-                // Nothing was left unforced through a caller's channel
+                while (true) {
+                    if (closed) {
+                        throw new IllegalStateException("The store is closed");
+                    }
+                    var taken = idle.poll();
+                    if (taken == null) {
+                        if (opened.getAndUpdate(count -> count < limit ? count + 1 : count) < limit) {
+                            return open(null);
+                        }
+                        try {
+                            // Timed: a thread that fails to open its channel gives nothing back for this one to take
+                            taken = idle.poll(RETRY_MILLIS, TimeUnit.MILLISECONDS);
+                        } catch (InterruptedException _) {
+                            interrupted = true;
+                        }
+                    }
+                    if (taken != null) {
+                        // An interrupt may have closed it after its last use, and it could not be replaced then
+                        return taken.isOpen() ? taken : open(taken);
+                    }
+                }
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        /// Gives back a channel [#take()] returned, even one an interrupt closed.
+        void offer(FileChannel channel) {
+            idle.offer(channel);
+            // Read after the offer: a close that came before it, and so may not have seen this channel, is seen here
+            if (closed) {
+                closeIdle();
+            }
+        }
+
+        /// {@return a new channel, in place of `closed`, or of none}
+        private FileChannel open(FileChannel closed) {
+            try {
+                return FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            } catch (IOException exception) {
+                if (closed != null) {
+                    idle.offer(closed);
+                } else {
+                    opened.decrementAndGet();
+                }
+                throw new LedgerIoException(path + " could not be opened", exception);
+            }
+        }
+
+        /// Closes the channels no thread uses, and those threads use as they come back.
+        void close() {
+            closed = true;
+            closeIdle();
+        }
+
+        /// Closes the channels no thread uses now.
+        private void closeIdle() {
+            FileChannel open;
+            while ((open = idle.poll()) != null) {
+                try {
+                    open.close();
+                } catch (IOException _) {
+                    // Nothing was left unforced through a caller's channel: forces go through the file's own
+                }
             }
         }
     }

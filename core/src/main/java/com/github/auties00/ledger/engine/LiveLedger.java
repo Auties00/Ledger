@@ -74,6 +74,9 @@ public final class LiveLedger implements Ledger {
     /// The most threads a commit reads tree pages with before it is given a sequence, about the queue depth that
     /// keeps a solid-state drive busy.
     private static final int PREFETCH_THREADS = 32;
+    /// The values too large for a leaf a batch puts in a paged key space, at least, for it to write them to the file of
+    /// large values: a commit of one message, or of a few, keeps them in the log, whose force is then the only one.
+    private static final int BULK_VALUES = 16;
 
     private final Map<String, KeyspaceState> states;
     private List<KeyspaceState> sweepOrder;
@@ -152,9 +155,10 @@ public final class LiveLedger implements Ledger {
     private BlobFile blobs;
     // The threshold of the key spaces the store finds in its catalog without being opened with them
     private long largeValues = Long.MAX_VALUE;
-    // The versions whose units of the file of large values no published checkpoint has taken; guarded by the
-    // publishing role
-    private final ArrayList<InFlight> inFlight;
+    // The values too large for a leaf a batch must hold in a paged key space, and the bytes their units must take, or
+    // -1 for the key space's threshold, for the batch to write them all to the file of large values
+    private int bulkValues = BULK_VALUES;
+    private long bulkBytes = -1;
 
     /// Creates an empty store with `keyspaces`.
     ///
@@ -190,7 +194,6 @@ public final class LiveLedger implements Ledger {
         sequenced.next = 1;
         this.byId = new HashMap<>();
         this.resources = new AutoCloseable[0];
-        this.inFlight = new ArrayList<>();
     }
 
     /// Makes this store one in a directory, whose checkpoints are in `pages`; called before anything is recovered.
@@ -210,6 +213,14 @@ public final class LiveLedger implements Ledger {
         for (var state : states.values()) {
             state.largeValues = overrides.getOrDefault(state.keyspace.name(), threshold);
         }
+    }
+
+    /// Makes a batch write its values too large for a leaf in a paged key space to the file of large values once it
+    /// puts `values` of them there, whose units take `bytes` together, in place of [#BULK_VALUES] taking at least the
+    /// key space's threshold; for tests, which route small batches there.
+    void bulkValues(int values, long bytes) {
+        this.bulkValues = values;
+        this.bulkBytes = bytes;
     }
 
     /// Records that the store knows the key space `name` as `id`.
@@ -577,6 +588,9 @@ public final class LiveLedger implements Ledger {
                         blobs.release(unit);
                     }
                 }
+            }
+            if (units != null) {
+                blobs.exitCommit();
             }
         }
         afterCommit();
@@ -1110,30 +1124,121 @@ public final class LiveLedger implements Ledger {
     }
 
     /// Writes to the file of large values, before the commit is given a sequence, each value `writes` puts that is
-    /// at least its key space's threshold.
+    /// at least its key space's threshold, and the values too large for a leaf that it puts in a paged key space, once
+    /// it puts there at least [#BULK_VALUES] of them, whose units take at least the threshold together.
     ///
-    /// The commit's frame then records where each unit is instead of the value, which no checkpoint copies again: a
-    /// large value reaches the device once, where the log and a checkpoint would write it twice.
+    /// The commit's frame then records where each unit is instead of the value, which no checkpoint copies again: such
+    /// a value reaches the device once, where the log and a checkpoint would write it twice. A value too large for a
+    /// leaf is one a checkpoint writes into a unit of its own anyway, so the commit writes the unit in its place, all
+    /// of the commit's together ([BlobFile#writeAll(List)]); a commit of a few keeps them in the log, as a force of the
+    /// file of large values beside the log's would cost it more than the bytes it saves, where a history sync's batches
+    /// of thousands of messages move most of their bytes off the log and out of the next checkpoint. The threshold is
+    /// against the bytes of the units, whole pages, since those are what that force writes.
     ///
-    /// @return the unit of each write, `null` for one without; or `null` if no write has one
+    /// A commit with units is recorded with [BlobFile#enterCommit()], so a close waits for it; the caller ends that with
+    /// [BlobFile#exitCommit()].
+    ///
+    /// @return the unit of each write, `null` for one without; or `null` if no write has one, and nothing was recorded
+    /// @throws IllegalStateException if the store began closing after the commit checked it was open
     private PageRef[] writeUnits(ArrayWriteBatch writes) {
         if (blobs == null) {
             return null;
         }
         PageRef[] units = null;
         try {
+            // The key spaces whose values too large for a leaf may go to the file together, with their count and the
+            // bytes of their units
+            KeyspaceState[] bulk = null;
+            int[] bulkCounts = null;
+            long[] bulkSums = null;
+            var bulkStates = 0;
+            // A commit of a few writes, as most are, pays for none of it
+            var counting = writes.size() >= bulkValues;
+            Keyspace<?, ?> keyspace = null;
+            KeyspaceState state = null;
             for (var i = 0; i < writes.size(); i++) {
                 if (writes.kind(i) != ArrayWriteBatch.PUT) {
                     continue;
                 }
-                var value = writes.value(i);
-                if (value.byteSize() < states.get(writes.keyspace(i).name()).largeValues) {
+                if (writes.keyspace(i) != keyspace) {
+                    keyspace = writes.keyspace(i);
+                    state = states.get(keyspace.name());
+                }
+                var length = writes.valueBytes(i);
+                if (length >= state.largeValues) {
+                    if (units == null) {
+                        blobs.enterCommit();
+                        units = new PageRef[writes.size()];
+                    }
+                    units[i] = blobs.write(writes.value(i));
                     continue;
                 }
-                if (units == null) {
-                    units = new PageRef[writes.size()];
+                if (!counting || !bulkCandidate(state, writes.keyBytes(i), length)) {
+                    continue;
                 }
-                units[i] = blobs.write(value);
+                var slot = 0;
+                while (slot < bulkStates && bulk[slot] != state) {
+                    slot++;
+                }
+                if (slot == bulkStates) {
+                    if (bulk == null) {
+                        bulk = new KeyspaceState[2];
+                        bulkCounts = new int[2];
+                        bulkSums = new long[2];
+                    } else if (bulkStates == bulk.length) {
+                        bulk = Arrays.copyOf(bulk, bulkStates * 2);
+                        bulkCounts = Arrays.copyOf(bulkCounts, bulkStates * 2);
+                        bulkSums = Arrays.copyOf(bulkSums, bulkStates * 2);
+                    }
+                    bulk[bulkStates++] = state;
+                }
+                bulkCounts[slot]++;
+                bulkSums[slot] += (long) PageFormat.pagesFor(length) * PageFormat.SIZE;
+            }
+            var qualified = 0;
+            for (var slot = 0; slot < bulkStates; slot++) {
+                var threshold = bulkBytes < 0 ? bulk[slot].largeValues : bulkBytes;
+                if (bulkCounts[slot] >= bulkValues && bulkSums[slot] >= threshold) {
+                    bulk[qualified] = bulk[slot];
+                    bulkCounts[qualified++] = bulkCounts[slot];
+                }
+            }
+            if (qualified == 0) {
+                return units;
+            }
+            var count = 0;
+            for (var slot = 0; slot < qualified; slot++) {
+                count += bulkCounts[slot];
+            }
+            var values = new ArrayList<MemorySegment>(count);
+            var indexes = new int[count];
+            keyspace = null;
+            var routed = false;
+            for (var i = 0; i < writes.size(); i++) {
+                if (writes.kind(i) != ArrayWriteBatch.PUT) {
+                    continue;
+                }
+                if (writes.keyspace(i) != keyspace) {
+                    keyspace = writes.keyspace(i);
+                    state = states.get(keyspace.name());
+                    routed = false;
+                    for (var slot = 0; slot < qualified; slot++) {
+                        routed |= bulk[slot] == state;
+                    }
+                }
+                var length = writes.valueBytes(i);
+                if (routed && length < state.largeValues && bulkCandidate(state, writes.keyBytes(i), length)) {
+                    indexes[values.size()] = i;
+                    values.add(writes.value(i));
+                }
+            }
+            if (units == null) {
+                blobs.enterCommit();
+                units = new PageRef[writes.size()];
+            }
+            var written = blobs.writeAll(values);
+            for (var k = 0; k < written.length; k++) {
+                units[indexes[k]] = written[k];
             }
             return units;
         } catch (RuntimeException | Error throwable) {
@@ -1143,9 +1248,20 @@ public final class LiveLedger implements Ledger {
                         blobs.release(unit);
                     }
                 }
+                blobs.exitCommit();
             }
             throw throwable;
         }
+    }
+
+    /// {@return whether a put of a `keyBytes` key and a `valueBytes` value in `state`, below its threshold, may go to the
+    /// file of large values with the values like it of its batch: a value too large for a leaf, in a paged key space
+    /// that writes values to that file}
+    ///
+    /// Paged key spaces only, so an open, which reads every value of the resident key spaces, finds theirs in the data
+    /// file, as it always has.
+    private static boolean bulkCandidate(KeyspaceState state, long keyBytes, long valueBytes) {
+        return !state.resident && state.largeValues != Long.MAX_VALUE && !TreeNodes.LeafEntry.fitsInline(keyBytes, valueBytes);
     }
 
     /// {@return a read-only copy of `segment` on an array of its own, or `null` if it is `null`}
@@ -1266,6 +1382,21 @@ public final class LiveLedger implements Ledger {
         return blobs;
     }
 
+    /// {@return the versions of every key space whose units of the file of large values no published checkpoint has
+    /// taken; for tests}
+    int inFlightForTests() {
+        enterPublishing();
+        try {
+            var count = 0;
+            for (var state : states.values()) {
+                count += state.inFlight.size();
+            }
+            return count;
+        } finally {
+            exitPublishing();
+        }
+    }
+
     /// Drops every unit the page cache holds, so the next reads go to the file. For tests of reads that miss it.
     void clearPageCacheForTests() {
         if (pages != null) {
@@ -1274,6 +1405,11 @@ public final class LiveLedger implements Ledger {
     }
 
     private void close(boolean checkpoint) {
+        // Before the store counts as closed, so the commits writing units apply, and before the last checkpoint, which
+        // lists as free the pages of any unit no commit has applied
+        if (blobs != null) {
+            blobs.awaitCommits();
+        }
         enterExclusive();
         try {
             if (closed) {
@@ -1362,10 +1498,12 @@ public final class LiveLedger implements Ledger {
             }
             var bound = Reads.boundOf(sequence);
             var superseded = new ArrayList<PageRef>();
-            for (var unit : inFlight) {
-                if (unit.version().stamp <= bound && unit.version().replacedAt <= sequence) {
-                    superseded.add(unit.version().unit);
-                }
+            for (var state : states.values()) {
+                state.inFlight.forEach(version -> {
+                    if (version.stamp <= bound && version.replacedAt <= sequence) {
+                        superseded.add(version.unit);
+                    }
+                });
             }
             return new Cut(sequence, logStart.getAsLong(), log.appendedBytes(), log.appendedHeap(), base, maxId, cuts, superseded);
         } finally {
@@ -1421,8 +1559,10 @@ public final class LiveLedger implements Ledger {
                     blobs.adopt(unit);
                 }
                 var bound = Reads.boundOf(cut.sequence());
-                inFlight.removeIf(unit -> unit.version().stamp <= bound
-                        && (adopted.contains(unit.version().unit) || unit.version().replacedAt <= cut.sequence()));
+                for (var state : states.values()) {
+                    state.inFlight.removeIf(version -> version.stamp <= bound
+                            && (adopted.contains(version.unit) || version.replacedAt <= cut.sequence()));
+                }
             }
         } finally {
             exitPublishing();
@@ -2148,11 +2288,7 @@ public final class LiveLedger implements Ledger {
             var removal = new RangeRemoval(from, to, stamp);
             grown[removals.length] = removal;
             state.removals = grown;
-            for (var unit : inFlight) {
-                if (unit.state() == state && removal.covers(unit.chain().key())) {
-                    replace(unit.version());
-                }
-            }
+            state.inFlight.forEachIn(from, to, this::replace);
             for (var write : touched) {
                 if (write.state() == state && removal.covers(write.chain().key())) {
                     replace(write.version());
@@ -2234,7 +2370,7 @@ public final class LiveLedger implements Ledger {
                         continue;
                     }
                     if (write.version() instanceof Version.External external) {
-                        inFlight.add(new InFlight(write.state(), write.chain(), external));
+                        write.state().inFlight.add(write.chain(), external);
                     }
                     if (pages != null) {
                         write.state().markDirty(write.chain());
@@ -2282,12 +2418,6 @@ public final class LiveLedger implements Ledger {
             }
         }
 
-    }
-
-    /// A version whose value a unit of the file of large values holds, which no published checkpoint has taken.
-    ///
-    /// @param chain the chain of its key
-    private record InFlight(KeyspaceState state, Chain chain, Version.External version) {
     }
 
     /// A key a commit wrote.

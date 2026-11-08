@@ -62,6 +62,58 @@ final class FreeSpace {
         }
     }
 
+    /// {@return the first page of each of the units of `pages` pages a caller writes together, none of them free any more}
+    ///
+    /// They take the first run that holds them all, one after another. Without one they take the runs too short for
+    /// all of them, from the first, as far as those go, then the pages past the end of the file: what a removal of some
+    /// units written together frees is as short as those units, and a file that took only runs holding a whole commit
+    /// would grow for good beside them.
+    ///
+    /// @param total the pages of all the units
+    int[] allocateAll(int[] pages, int total) {
+        synchronized (lock) {
+            var firsts = new int[pages.length];
+            var lowest = free.nextSetBit(lowestFree);
+            lowestFree = lowest < 0 ? Math.max(lowestFree, pageCount) : lowest;
+            var start = lowest;
+            while (start >= 0 && start < pageCount) {
+                var end = Math.min(free.nextClearBit(start), pageCount);
+                if (end - start >= total) {
+                    free.clear(start, start + total);
+                    for (var i = 0; i < pages.length; i++) {
+                        firsts[i] = start;
+                        start += pages[i];
+                    }
+                    return firsts;
+                }
+                start = free.nextSetBit(end);
+            }
+            // Where the search of the next unit starts, and the fewest pages no run from there holds: each unit moves
+            // the first on, so a commit walks the runs of the file about once, however many units it holds
+            var from = lowest;
+            var noRun = Integer.MAX_VALUE;
+            for (var i = 0; i < pages.length; i++) {
+                var run = pages[i] < noRun ? from : -1;
+                while (run >= 0 && run < pageCount && Math.min(free.nextClearBit(run), pageCount) - run < pages[i]) {
+                    run = free.nextSetBit(free.nextClearBit(run));
+                }
+                if (run >= 0 && run < pageCount) {
+                    free.clear(run, run + pages[i]);
+                    firsts[i] = run;
+                    from = free.nextSetBit(run + pages[i]);
+                } else {
+                    noRun = Math.min(noRun, pages[i]);
+                    // Past the end of the file, from the free pages that reach it
+                    var tail = free.previousClearBit(pageCount - 1) + 1;
+                    free.clear(tail, pageCount);
+                    firsts[i] = tail;
+                    pageCount = tail + pages[i];
+                }
+            }
+            return firsts;
+        }
+    }
+
     /// Takes a run of free pages for units written one after another: the next run of at least `least` pages since
     /// the last [#rewindRuns()], up to `most` of them, or `most` pages past the end of the file.
     ///

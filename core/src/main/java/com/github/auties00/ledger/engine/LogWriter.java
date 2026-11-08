@@ -106,8 +106,10 @@ final class LogWriter {
     private static final int SHRINK_AFTER = 256;
     /// The bytes of a frame body sealed in one call, a multiple of the AES block.
     private static final int SLICE = 64 << 10;
-    /// The bytes of frame bodies the queue holds before commits wait for the device.
-    private static final long QUEUE_LIMIT = 64L << 20;
+    /// The bytes of frame bodies, and of the units of the file of large values their commits wrote, the queue holds
+    /// before commits wait for the device: a group forces those units with its segment, so a commit that moved its
+    /// values to that file is held back as one that kept them in its frame.
+    static final long QUEUE_LIMIT = 64L << 20;
     /// The heap a write takes in memory beside its bytes until a checkpoint takes it, as [#appendedHeap()] estimates
     /// it: its chain, its version, its slot of the hash index and its key's copy, about 110 bytes, and a share of its
     /// batch's array.
@@ -179,8 +181,10 @@ final class LogWriter {
     // Signalled when a group is durable, for the commits waiting on a full queue
     private final Condition queueDrained;
     private ArrayList<Queued> queue;
-    // The bytes of the frame bodies queued and not durable yet
+    // The bytes of the frame bodies queued and not durable yet, and of the units of BlobFile their commits wrote
     private long pendingBytes;
+    // The bytes pendingBytes may reach before commits wait, QUEUE_LIMIT outside tests
+    private final long queueLimit;
     private volatile long lastQueued;
     // Frames queued since the writer opened; a catalog frame carries a sequence already durable, so close() waits on
     // frames rather than on sequences
@@ -223,17 +227,19 @@ final class LogWriter {
     ///                     the number of `empty`
     /// @param durable the sequence the log already holds durably
     /// @param segmentSize the size past which a new segment starts
+    /// @param queueLimit the bytes the queue holds before commits wait for the device
     /// @param executor runs the flush task on platform threads
     /// @param commitWindow how long a flush waits for more commits before it starts
     /// @param empty the segment numbered `firstSegment`, which recovery found prepared and never written, to write
     ///              first; or `null`, to prepare one
     /// @throws IOException if the segment cannot be prepared
     LogWriter(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long durable, long segmentSize,
-              Executor executor, Duration commitWindow, LogFiles.Prepared empty) throws IOException {
+              long queueLimit, Executor executor, Duration commitWindow, LogFiles.Prepared empty) throws IOException {
         this.files = files;
         this.keys = keys;
         this.storeId = storeId;
         this.segmentSize = segmentSize;
+        this.queueLimit = queueLimit;
         this.executor = executor;
         this.commitWindowNanos = commitWindow.toNanos();
         try {
@@ -328,9 +334,9 @@ final class LogWriter {
     /// Queues a frame holding the first `body.size()` bytes of `body`, which the writer owns from now on.
     ///
     /// Called holding the store's publishing role, so frames queue in the order of their sequences. While the queue holds
-    /// more than [#QUEUE_LIMIT] bytes not durable yet, it waits for the device, which holds back every commit behind
-    /// it: memory stays bounded when commits come faster than the device takes them. A frame larger than the limit
-    /// waits for the queue to empty.
+    /// more than its limit of bytes not durable yet, [#QUEUE_LIMIT], it waits for the device, which holds back every
+    /// commit behind it: memory stays bounded when commits come faster than the device takes them. A frame larger than
+    /// the limit waits for the queue to empty.
     ///
     /// @throws LedgerIoException if the writer has stopped
     void append(byte type, long sequence, FrameBody body) {
@@ -340,9 +346,9 @@ final class LogWriter {
     /// Queues a frame as [#append(byte, long, FrameBody)] does, for a commit of `writes` writes that wrote `unitBytes`
     /// of units of the file of large values.
     ///
-    /// The group that holds the frame forces that file beside the segment. The units count toward the growth that
-    /// starts a checkpoint, as if their values were in the frame: memory holds them until a checkpoint takes them. The
-    /// writes count toward [#appendedHeap()].
+    /// The group that holds the frame forces that file beside the segment. The units count as if their values were in
+    /// the frame toward the queue's limit, since that force writes them, and toward the growth that starts a
+    /// checkpoint, since memory holds them until a checkpoint takes them. The writes count toward [#appendedHeap()].
     ///
     /// @return the frames queued since the writer opened, the new one included
     /// @throws LedgerIoException if the writer has stopped
@@ -352,13 +358,13 @@ final class LogWriter {
         long frames;
         queueLock.lock();
         try {
-            while (pendingBytes > 0 && pendingBytes + length > QUEUE_LIMIT && failure == null) {
+            while (pendingBytes > 0 && pendingBytes + length + unitBytes > queueLimit && failure == null) {
                 queueDrained.awaitUninterruptibly();
             }
             checkHealthy();
             queueDeferred();
-            queue.add(new Queued(type, sequence, body));
-            pendingBytes += length;
+            queue.add(new Queued(type, sequence, body, unitBytes));
+            pendingBytes += length + unitBytes;
             lastQueued = sequence;
             frames = ++appended;
             appendedBytes += 13 + length + unitBytes;
@@ -387,13 +393,13 @@ final class LogWriter {
         checkHealthy();
         queueLock.lock();
         try {
-            while (pendingBytes > 0 && pendingBytes + batch.bodyBytes > QUEUE_LIMIT && failure == null) {
+            while (pendingBytes > 0 && pendingBytes + batch.queuedBytes > queueLimit && failure == null) {
                 queueDrained.awaitUninterruptibly();
             }
             checkHealthy();
             queueDeferred();
             queue.addAll(batch.frames);
-            pendingBytes += batch.bodyBytes;
+            pendingBytes += batch.queuedBytes;
             lastQueued = batch.frames.getLast().sequence();
             appended += batch.frames.size();
             appendedBytes += batch.appendedBytes;
@@ -415,7 +421,7 @@ final class LogWriter {
     void defer(byte type, long sequence, FrameBody body) {
         queueLock.lock();
         try {
-            deferred = new Queued(type, sequence, body);
+            deferred = new Queued(type, sequence, body, 0);
         } finally {
             queueLock.unlock();
         }
@@ -630,7 +636,7 @@ final class LogWriter {
     /// beside the segment's, makes them all durable. A rollover waits for it before it forces the segment: the first
     /// frame of a group in the next segment then means, as it always does, that everything before it is durable.
     ///
-    /// @return the bytes of the frame bodies written
+    /// @return the bytes of the frame bodies written, and of their commits' units
     private long write(List<Queued> group, boolean units) throws IOException {
         if (channel == null) {
             rollover();
@@ -645,7 +651,7 @@ final class LogWriter {
         var bodies = 0L;
         for (var frame : group) {
             var bodyLength = frame.body().size();
-            bodies += bodyLength;
+            bodies += bodyLength + frame.units();
             var sealedLength = bodyLength + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
             if (position + used + FRAME_HEADER + sealedLength > segmentSize && position + used > SEGMENT_HEADER) {
                 drain();
@@ -808,15 +814,16 @@ final class LogWriter {
     /// @param type the frame type
     /// @param sequence the sequence it carries
     /// @param body its body, which the writer owns
-    private record Queued(byte type, long sequence, FrameBody body) {
+    /// @param units the bytes of the units of the file of large values its commit wrote
+    private record Queued(byte type, long sequence, FrameBody body, long units) {
     }
 
     /// The frames of consecutive commits, which [#appendAll(Batch)] queues together; the publisher of a store reuses
     /// one across its passes.
     static final class Batch {
         private final ArrayList<Queued> frames;
-        // The bytes of the bodies, which count toward the queue's limit
-        private long bodyBytes;
+        // The bytes of the bodies and of their commits' units, which count toward the queue's limit
+        private long queuedBytes;
         // The bytes that count toward appendedBytes: headers, bodies and units
         private long appendedBytes;
         // The heap that counts toward appendedHeap
@@ -831,8 +838,8 @@ final class LogWriter {
         /// Adds a frame, which the writer owns once queued, for a commit of `writes` writes that wrote `unitBytes` of
         /// units.
         void add(byte type, long sequence, FrameBody body, long unitBytes, int writes) {
-            frames.add(new Queued(type, sequence, body));
-            bodyBytes += body.size();
+            frames.add(new Queued(type, sequence, body, unitBytes));
+            queuedBytes += body.size() + unitBytes;
             appendedBytes += 13 + body.size() + unitBytes;
             appendedHeap += heapOf(body.size(), unitBytes, writes);
             units |= unitBytes > 0;
@@ -841,7 +848,7 @@ final class LogWriter {
         /// Forgets every frame.
         void clear() {
             frames.clear();
-            bodyBytes = 0;
+            queuedBytes = 0;
             appendedBytes = 0;
             appendedHeap = 0;
             units = false;

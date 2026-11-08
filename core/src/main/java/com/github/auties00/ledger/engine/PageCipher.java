@@ -6,6 +6,7 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -47,6 +48,44 @@ final class PageCipher {
             cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, plain, PageFormat.NONCE, 12));
             cipher.updateAAD(plain, 0, PageFormat.HEADER);
             Sealing.encrypt(cipher, plain, PageFormat.HEADER, tag - PageFormat.HEADER, out, offset + PageFormat.HEADER);
+        } catch (GeneralSecurityException exception) {
+            throw new IllegalStateException("A unit could not be sealed", exception);
+        } finally {
+            ciphers.offer(cipher);
+        }
+    }
+
+    /// Seals the unit of `pages` pages whose header is `header` and whose content is `content` into `out` at `offset`.
+    ///
+    /// The unit is the one [#seal(byte\[\], int, byte\[\], int)] makes of the same header and content, with no copy of
+    /// it beside `out`: the content is copied into its place there and encrypted in place, so units sealed back to back
+    /// into one buffer cost one copy of their content each.
+    ///
+    /// @param header the unit's header, filled in, of [PageFormat#HEADER] bytes
+    /// @throws IllegalArgumentException if the content does not fit the unit
+    void seal(byte[] header, MemorySegment content, int pages, byte[] out, int offset) {
+        var length = pages * PageFormat.SIZE;
+        var tag = length - PageFormat.TAG;
+        var end = PageFormat.HEADER + content.byteSize();
+        if (end > tag) {
+            throw new IllegalArgumentException("A unit of " + pages + " pages holds at most " + PageFormat.capacity(pages) + " bytes");
+        }
+        System.arraycopy(header, 0, out, offset, PageFormat.HEADER);
+        MemorySegment.copy(content, ValueLayout.JAVA_BYTE, 0, out, offset + PageFormat.HEADER, (int) content.byteSize());
+        Arrays.fill(out, offset + (int) end, offset + tag, (byte) 0);
+        if (key == null) {
+            var crc = new CRC32C();
+            crc.update(out, offset, tag);
+            Bytes.i32(out, offset + tag, (int) crc.getValue());
+            Arrays.fill(out, offset + tag + Integer.BYTES, offset + length, (byte) 0);
+            return;
+        }
+        var cipher = take();
+        try {
+            cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, header, PageFormat.NONCE, 12));
+            cipher.updateAAD(header, 0, PageFormat.HEADER);
+            // In place: a cipher is copy-safe, and encryption at the offset it reads from overwrites no unread input
+            Sealing.encrypt(cipher, out, offset + PageFormat.HEADER, tag - PageFormat.HEADER, out, offset + PageFormat.HEADER);
         } catch (GeneralSecurityException exception) {
             throw new IllegalStateException("A unit could not be sealed", exception);
         } finally {

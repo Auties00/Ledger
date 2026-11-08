@@ -36,7 +36,10 @@ import java.util.function.Consumer;
 ///
 /// A value of a batch at least [Options#largeValues(long)] long, 1 MiB by default, is written once, to a file of
 /// its own, before the commit applies; its log frame records where it is, and the next checkpoint takes it from
-/// there. Other values reach the device twice, in the log and in a checkpoint.
+/// there. So are the values of a [Keyspace.Residency#PAGED] key space too large to share a leaf of its tree with
+/// another, about 2 KiB with their key, when a batch puts at least 16 of them there, taking at least that size together
+/// in that file's pages of 4 KiB, as a batch of a history sync does. Other values reach the device twice, in the log and
+/// in a checkpoint.
 ///
 /// The writes since the last checkpoint stay in memory until the next one. When commits come faster than
 /// checkpoints can write them, and the log holds three checkpoint intervals ([Options#checkpointEvery(long)]) the
@@ -70,8 +73,9 @@ import java.util.function.Consumer;
 /// holding a carrier. The store writes and
 /// forces its log on the platform threads of its [IoPool], and writes the checkpoints it starts on its own on a
 /// platform thread of their own; a read of a page the cache does not hold reads the file on the calling thread. A
-/// commit writes its large values on the calling thread, and reads the pages of the trees its writes need, which
-/// the cache does not hold, on virtual threads of its own, before it waits for the writer.
+/// commit writes its large values on the calling thread, those of a batch of many values too large for a leaf also on
+/// up to three virtual threads of its own from a megabyte of them, and reads the pages of the trees its writes need,
+/// which the cache does not hold, on virtual threads of its own, before it waits for the writer.
 ///
 /// # Lifecycle
 /// A store holds an exclusive lock on its directory from [Options#build()] until [#close()]: one process, and one
@@ -242,6 +246,12 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// bandwidth is the limit. Such a commit forces that file beside the log, in parallel; a commit without one
         /// forces the log only. Transactions keep their values in the log. The default is 1 MiB;
         /// [Long#MAX_VALUE] writes every value to the log.
+        ///
+        /// A batch that puts at least 16 values too large to share a leaf with another, about 2 KiB with their key, in
+        /// a [Keyspace.Residency#PAGED] key space, taking at least `bytes` together in that file's pages of 4 KiB,
+        /// writes them to that file too: a checkpoint would write each into pages of its own anyway, so they reach the
+        /// device once, and a batch of a history sync moves most of its bytes off the log and out of the next
+        /// checkpoint. A batch of a few such values keeps them in the log, whose force is then the only one.
         ///
         /// @param bytes the size from which a value goes to its own file, at least 4 KiB
         /// @return these options

@@ -59,6 +59,7 @@ Workloads Ledger is not built for, in `workload.limits`:
 | `AdHocQueryBenchmark` | A question no key space indexes, answered by scanning everything |
 | `SqlIndexQueryBenchmark` | The same question answered by SQLite with an index created on the spot |
 | `LargeValueBenchmark` | Values of 1 and 16 MiB |
+| `BulkValuesBenchmark` | A history sync on Ledger alone, sweeping the bytes from which a batch writes its values too large for a leaf once |
 | `PinnedReaderBenchmark` | File growth while a long reader pins an old version |
 
 Design measurements, in `workload.memory`:

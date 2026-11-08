@@ -269,6 +269,14 @@ public final class ArrayWriteBatch implements WriteBatch {
         return bytes;
     }
 
+    /// {@return the bytes of the key of write `index`, or of the lower bound of a range, 0 if it has none}
+    ///
+    /// @param index the write
+    long keyBytes(int index) {
+        Objects.checkIndex(index, size);
+        return spans[index * 4] == ABSENT ? 0 : spans[index * 4 + 1];
+    }
+
     /// {@return the bytes of the value of write `index`, 0 if it has none}
     ///
     /// @param index the write

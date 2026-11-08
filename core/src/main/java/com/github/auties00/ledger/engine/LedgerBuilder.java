@@ -40,6 +40,11 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private Consumer<? super LedgerException> backgroundFailures;
     private long largeValues;
     private final Map<String, Long> largeValuesByKeyspace;
+    // The values too large for a leaf, and the bytes of their units, from which a batch writes them to the file of
+    // large values, or -1 for the store's own rule
+    private int bulkValues;
+    private long bulkBytes;
+    private long queueLimit;
 
     /// Creates a builder with the default options.
     public LedgerBuilder() {
@@ -54,12 +59,30 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         };
         this.largeValues = MIB;
         this.largeValuesByKeyspace = new LinkedHashMap<>();
+        this.bulkValues = -1;
+        this.bulkBytes = -1;
+        this.queueLimit = LogWriter.QUEUE_LIMIT;
     }
 
     /// Sets the size past which the log starts a new segment, so tests can roll segments over without writing
     /// 64 MiB.
     LedgerBuilder segmentSize(long bytes) {
         this.segmentSize = bytes;
+        return this;
+    }
+
+    /// Makes a batch write its values too large for a leaf in a paged key space to the file of large values once it
+    /// puts `values` of them there, whose units take `bytes` together, so tests can route small batches there.
+    LedgerBuilder bulkValues(int values, long bytes) {
+        this.bulkValues = values;
+        this.bulkBytes = bytes;
+        return this;
+    }
+
+    /// Sets the bytes the log's queue holds before commits wait for the device, so tests can fill it without queueing
+    /// tens of megabytes.
+    LedgerBuilder queueLimit(long bytes) {
+        this.queueLimit = bytes;
         return this;
     }
 
@@ -226,6 +249,9 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var blobs = BlobFile.open(directory, new PageCipher(opened.keys().blobKey()), pages.cache(), heap, blobPages, blobFree);
             pages.useBlobs(blobs);
             ledger.useBlobs(blobs, largeValues, largeValuesByKeyspace);
+            if (bulkValues >= 0) {
+                ledger.bulkValues(bulkValues, bulkBytes);
+            }
             var epochs = new int[]{superblock == null ? 0 : superblock.epoch()};
             FreeSpace space;
             if (superblock == null) {
@@ -286,7 +312,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                 Durability.forceDirectory(logDirectory);
             }
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
-                    segmentSize, pool.executor(), commitWindow, empty);
+                    segmentSize, queueLimit, pool.executor(), commitWindow, empty);
             var deltaTable = superblock == null ? null : superblock.deltaTable();
             var deltas = deltaTable == null ? DeltaTable.EMPTY
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));
