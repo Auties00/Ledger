@@ -5,7 +5,9 @@ import com.github.auties00.ledger.KeyCodec;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.Objects;
 
 /// Operations on the memory segments that hold encoded keys and values.
 final class Segments {
@@ -143,9 +145,29 @@ final class Segments {
     /// `MemorySegment.toArray` does the same, but builds the name of the array class for its size check on every
     /// call, which costs more than copying a short value.
     static byte[] toBytes(MemorySegment segment) {
-        var array = new byte[Math.toIntExact(segment.byteSize())];
-        MemorySegment.copy(segment, 0, MemorySegment.ofArray(array), 0, array.length);
+        return toBytes(segment, 0, Math.toIntExact(segment.byteSize()));
+    }
+
+    /// {@return the `length` bytes at `offset` of `segment`, in a new array}
+    ///
+    /// @throws IndexOutOfBoundsException if `segment` holds fewer
+    static byte[] toBytes(MemorySegment segment, long offset, int length) {
+        var array = new byte[length];
+        MemorySegment.copy(segment, offset, MemorySegment.ofArray(array), 0, length);
         return array;
+    }
+
+    /// {@return the `length` bytes at `offset` of `array`, in a new array}
+    ///
+    /// An array copy fills the new array whole, so the compiler leaves out the zeroing of its allocation; it cannot
+    /// for a segment copy, which writes an array twice, as zeros and then as the value: for a value of a megabyte or
+    /// more, whose array the allocation's slow path zeroes, that is a third of what a read of it costs. The bounds are
+    /// checked first: past the end of `array`, [Arrays#copyOfRange(byte\[\], int, int)] would pad with zeros.
+    ///
+    /// @throws IndexOutOfBoundsException if `array` holds fewer
+    static byte[] toBytes(byte[] array, int offset, int length) {
+        Objects.checkFromIndexSize(offset, length, array.length);
+        return Arrays.copyOfRange(array, offset, offset + length);
     }
 
     /// {@return `key` encoded into a read-only segment of its own}
