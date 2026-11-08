@@ -178,7 +178,9 @@ class WriteThroughTest {
                 }
                 ledger.checkpoint();
                 warmForces = disk.forces();
-                for (var i = 0; i < 40; i++) {
+                // Forty that wait are forty groups even if each that does not wait shares the group of the next: the
+                // segment prepared before the checkpoint left spares, and the rest of the current one, hold 29
+                for (var i = 0; i < 60; i++) {
                     commit(ledger, i % 3 != 0);
                 }
                 writtenThrough = log.writtenThrough();
