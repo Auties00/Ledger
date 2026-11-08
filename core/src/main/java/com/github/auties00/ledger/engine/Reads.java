@@ -22,6 +22,10 @@ import java.util.function.Function;
 ///
 /// A key with a version in memory at or below the bound reads that version; any other key reads the tree, unless a
 /// range removal stamped after the tree's checkpoint and within the bound covers it.
+///
+/// A resident key space reads memory alone, but for the keys its loader has not put there yet ([ResidentLoader]):
+/// those it reads from the tree alone, where every read finds them as it sees them. A read checks where a key is
+/// before it reads memory, so the chains the loader installed before it moved past the key are there.
 final class Reads {
     /// The bits of a stamp that number the writes of one batch.
     static final int OP_BITS = 24;
@@ -41,9 +45,12 @@ final class Reads {
         return (sequence << OP_BITS) | MAX_OPS;
     }
 
+    /// {@return the value of an entry a scan found: the decoded value of a resident version, or `value` decoded}
+    ///
+    /// @param decoded the decoded value of a resident version, or `null` for an entry of a tree
     @SuppressWarnings("unchecked")
     private static <V> V value(KeyspaceState state, Keyspace<?, V> keyspace, MemorySegment value, Object decoded) {
-        return state.resident ? (V) decoded : keyspace.values().decode(value);
+        return state.resident && decoded != null ? (V) decoded : keyspace.values().decode(value);
     }
 
     /// {@return whether a range removal the tree of `point` does not hold, and `point` sees, covers `key`}
@@ -57,15 +64,20 @@ final class Reads {
         return false;
     }
 
-    /// {@return the value of `key` in the tree of `point`, or `null` if it holds none or a later removal hides it}
-    private static MemorySegment treeValue(KeyspaceState state, MemorySegment key, ReadPoint point, RangeRemoval[] removals) {
-        var hit = treeHit(state, key, point, removals);
+    /// {@return the value of `key` in the tree of `point` under `root`, or `null` if it holds none or a later removal
+    /// hides it}
+    ///
+    /// @param root the root of the key space's tree, or `null` if the read uses none
+    private static MemorySegment treeValue(MemorySegment key, ReadPoint point, TreeRoot root, RangeRemoval[] removals) {
+        var hit = treeHit(key, point, root, removals);
         return hit == null ? null : TreeSearch.value(point.pages(), hit.unit(), hit.entry());
     }
 
-    /// {@return the entry of `key` in the tree of `point`, or `null` if it holds none or a later removal hides it}
-    private static TreeSearch.Hit treeHit(KeyspaceState state, MemorySegment key, ReadPoint point, RangeRemoval[] removals) {
-        var root = point.root(state);
+    /// {@return the entry of `key` in the tree of `point` under `root`, or `null` if it holds none or a later removal
+    /// hides it}
+    ///
+    /// @param root the root of the key space's tree, or `null` if the read uses none
+    private static TreeSearch.Hit treeHit(MemorySegment key, ReadPoint point, TreeRoot root, RangeRemoval[] removals) {
         if (root == null) {
             return null;
         }
@@ -182,9 +194,12 @@ final class Reads {
     static <K, V> Optional<V> get(KeyspaceState state, Keyspace<K, V> keyspace, K key, ReadPoint point) {
         var encoded = Segments.encodeKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
         var removals = state.removals;
-        var version = KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals);
         // Its decoder copies the encoding whole, so the copy here returns the same bytes
         var bytes = keyspace.values() == BuiltinCodecs.BYTES_VALUE;
+        if (state.resident && !state.loaded(encoded)) {
+            return treeGet(keyspace, encoded, point, point.treeRoot(state), removals, bytes);
+        }
+        var version = KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals);
         if (version != null) {
             if (version == Version.HIDDEN) {
                 return Optional.empty();
@@ -195,7 +210,18 @@ final class Reads {
             }
             return Optional.of(bytes ? (V) version.copyBytes() : keyspace.values().decode(version.value()));
         }
-        var hit = treeHit(state, encoded, point, removals);
+        return treeGet(keyspace, encoded, point, point.root(state), removals, bytes);
+    }
+
+    /// {@return the value of `key` in the tree of `point` under `root`, decoded, or empty if it holds none or a later
+    /// removal hides it}
+    ///
+    /// @param root the root of the key space's tree, or `null` if the read uses none
+    /// @param bytes whether the values are byte arrays, which copy out of the array that holds them
+    @SuppressWarnings("unchecked")
+    private static <V> Optional<V> treeGet(Keyspace<?, V> keyspace, MemorySegment key, ReadPoint point, TreeRoot root,
+                                           RangeRemoval[] removals, boolean bytes) {
+        var hit = treeHit(key, point, root, removals);
         if (hit == null) {
             return Optional.empty();
         }
@@ -233,7 +259,8 @@ final class Reads {
         Objects.requireNonNull(reader, "reader");
         var encoded = Segments.encodeKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
         var removals = state.removals;
-        var version = KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals);
+        var loaded = !state.resident || state.loaded(encoded);
+        var version = loaded ? KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals) : null;
         MemorySegment value;
         if (version != null) {
             if (version == Version.HIDDEN) {
@@ -241,7 +268,7 @@ final class Reads {
             }
             value = version.value();
         } else {
-            value = treeValue(state, encoded, point, removals);
+            value = treeValue(encoded, point, loaded ? point.root(state) : point.treeRoot(state), removals);
             if (value == null) {
                 return Optional.empty();
             }
@@ -258,7 +285,8 @@ final class Reads {
     /// Passes the entries of `range` `point` sees to `consumer`, in the order of the range, until it returns `false`.
     ///
     /// It merges the versions in memory with the tree: a key with a version in memory at or below the bound takes it,
-    /// and shadows the tree's entry for the same key.
+    /// and shadows the tree's entry for the same key. A resident key space whose loader has not put every entry in
+    /// memory reads the keys below the loader's position from memory alone, and the others from the tree alone.
     ///
     /// @return the number of entries passed
     static <K> long scan(KeyspaceState state, Keyspace<K, ?> keyspace, KeyRange<K> range, ReadPoint point, Visitor consumer) {
@@ -270,10 +298,29 @@ final class Reads {
         }
         var descending = range.descending();
         var removals = state.removals;
-        var slice = state.slice(from, to);
+        // Read before memory, as a read of one key reads it
+        var loader = state.resident ? state.loading : null;
+        var limit = loader == null ? null : loader.limit();
+        TreeRoot root;
+        var memoryTo = to;
+        var treeFrom = from;
+        if (limit == null) {
+            root = point.root(state);
+        } else {
+            root = point.treeRoot(state);
+            if (to == null || Segments.compare(limit, to) < 0) {
+                memoryTo = limit;
+            }
+            if (from == null || Segments.compare(limit, from) > 0) {
+                treeFrom = limit;
+            }
+            if (to != null && Segments.compare(treeFrom, to) >= 0) {
+                root = null;
+            }
+        }
+        var slice = state.slice(from, memoryTo);
         var memory = (descending ? slice.descendingMap() : slice).entrySet().iterator();
-        var root = point.root(state);
-        var tree = root == null ? null : new TreeCursor(point.pages(), root, from, to, descending);
+        var tree = root == null ? null : new TreeCursor(point.pages(), root, treeFrom, to, descending);
         var inTree = tree != null && tree.next();
         Map.Entry<MemorySegment, Chain> held = memory.hasNext() ? memory.next() : null;
         var visited = 0L;

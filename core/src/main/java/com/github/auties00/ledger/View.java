@@ -9,7 +9,9 @@ import java.util.function.Function;
 /// The reads a [Ledger], a [Snapshot] and a [Transaction] share.
 ///
 /// Values come back as their [ValueCodec] decoded them. Those of a [Keyspace.Residency#RESIDENT] key space are the
-/// instances the store holds, so every read of a key returns the same instance until it is written again.
+/// instances the store holds, so every read of a key returns the same instance until it is written again, once the
+/// store holds the key's entry in memory; until then, as after an open that has not loaded the key space yet, each
+/// read decodes an instance of its own.
 ///
 /// The `Encoded` reads skip the codecs: they hand the encoded bytes, in the store's own memory, to a function that
 /// runs while the memory is valid, for a caller that copies the bytes elsewhere or reads a few of them.

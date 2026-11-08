@@ -6,6 +6,7 @@ import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
+import com.github.auties00.ledger.LedgerException;
 import com.github.auties00.ledger.Snapshot;
 import com.github.auties00.ledger.Transaction;
 import com.github.auties00.ledger.ValueCodec;
@@ -25,11 +26,13 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.IntConsumer;
 import java.util.function.LongSupplier;
 
 /// A store: the engine of [Ledger.Builder#memory()], and of a store in a directory, which also journals every commit
@@ -48,7 +51,9 @@ import java.util.function.LongSupplier;
 ///
 /// A store in a directory reads each key space's tree under the writes in memory ([ReadPoint]). Once every reader's
 /// tree holds a version, the writer drops it from memory, except in resident key spaces, which keep every entry; a
-/// range removal stays as a record while a reader's tree may hold keys it removed.
+/// range removal stays as a record while a reader's tree may hold keys it removed. A resident key space gets the
+/// entries of the checkpoint the store opened from through its [ResidentLoader], from its first use on a thread of the
+/// loader's own, or while the store opens; a write of a key the loader has not reached waits for it.
 public final class LiveLedger implements Ledger {
     /// The bytes by which the array a resident value came in may exceed it before the value takes an array of its own.
     private static final int RESIDENT_SLACK = 64;
@@ -158,6 +163,9 @@ public final class LiveLedger implements Ledger {
     // The versions whose units of the file of large values no published checkpoint has taken; guarded by the
     // publishing role
     private final ArrayList<InFlight> inFlight;
+    // The resident key spaces whose loaders have not put every entry in memory yet: while there is none, a commit
+    // looks for no key to wait for
+    private final AtomicInteger unloaded;
 
     /// Creates an empty store with `keyspaces`.
     ///
@@ -194,6 +202,7 @@ public final class LiveLedger implements Ledger {
         this.byId = new HashMap<>();
         this.resources = new AutoCloseable[0];
         this.inFlight = new ArrayList<>();
+        this.unloaded = new AtomicInteger();
     }
 
     /// Makes this store one in a directory, whose checkpoints are in `pages`; called before anything is recovered.
@@ -241,8 +250,13 @@ public final class LiveLedger implements Ledger {
     }
 
     /// Starts from the checkpoint `superblock` names, whose catalog is `catalog`: binds its key spaces, publishes its
-    /// trees and loads the entries of the resident key spaces.
-    void loadCheckpoint(Superblock superblock, Catalog.Contents catalog) {
+    /// trees and gives each resident key space with entries its [ResidentLoader].
+    ///
+    /// @param residentAtOpen whether the loaders put the entries in memory now, rather than from the first use of
+    ///                       their key spaces
+    /// @param failures receives the failures of the loaders that run beside the store
+    void loadCheckpoint(Superblock superblock, Catalog.Contents catalog, boolean residentAtOpen,
+                        Consumer<? super LedgerException> failures) {
         maxId = Math.max(maxId, catalog.maxId());
         var roots = new TreeRoot[catalog.maxId() + 1];
         for (var entry : catalog.entries()) {
@@ -261,19 +275,34 @@ public final class LiveLedger implements Ledger {
             if (!state.resident || entry.root() == null) {
                 continue;
             }
-            for (var leaf : TreeSearch.leaves(pages, entry.root())) {
-                for (var i = 0; i < TreeNodes.count(leaf); i++) {
-                    var offset = TreeNodes.entry(leaf, i);
-                    var value = TreeSearch.value(pages, leaf, offset, false);
-                    var decoded = state.keyspace.values().decode(value);
-                    // The decoded array is the encoding: the version keeps one copy, not that and its leaf too
-                    state.open(TreeNodes.leafKey(leaf, offset)).head = decoded instanceof byte[] bytes
-                            && state.keyspace.values() == BuiltinCodecs.BYTES_VALUE
-                            ? new Version(stamp, bytes, decoded, null)
-                            : new Version(stamp, value, decoded, null);
-                }
+            var loader = new ResidentLoader(this, pages, state, stamp, failures);
+            state.loading = loader;
+            unloaded.incrementAndGet();
+            if (residentAtOpen) {
+                loader.loadNow();
             }
         }
+    }
+
+    /// Records that a loader put every entry of its key space in memory.
+    void residentLoaded() {
+        unloaded.decrementAndGet();
+    }
+
+    /// Makes the loaders of the resident key spaces call `hook` after they register their read, with 0, and after
+    /// each run of leaves they install, with the runs installed so far; for tests that pause them there.
+    void hookResidentLoadsForTests(IntConsumer hook) {
+        for (var state : states.values()) {
+            var loader = state.loading;
+            if (loader != null) {
+                loader.stepHookForTests = hook;
+            }
+        }
+    }
+
+    /// {@return whether memory holds every entry of the key space `keyspace`, for tests of its loader}
+    boolean residentLoadedForTests(Keyspace<?, ?> keyspace) {
+        return states.get(keyspace.name()).loading == null;
     }
 
     /// Replays the commit `sequence` the log holds, unless the file of large values lacks one of its units.
@@ -287,18 +316,22 @@ public final class LiveLedger implements Ledger {
         FrameBody.readCommit(body, new FrameBody.Visitor() {
             @Override
             public void put(int keyspace, MemorySegment key, MemorySegment value) {
+                loadForReplay(keyspace);
             }
 
             @Override
             public void delete(int keyspace, MemorySegment key) {
+                loadForReplay(keyspace);
             }
 
             @Override
             public void deleteRange(int keyspace, MemorySegment from, MemorySegment to) {
+                loadForReplay(keyspace);
             }
 
             @Override
             public void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
+                loadForReplay(keyspace);
                 var unit = blobs == null || missing[0] ? null : blobs.readUnit(ref);
                 if (unit == null || Bytes.i32(unit, PageFormat.LENGTH) != length) {
                     missing[0] = true;
@@ -359,6 +392,19 @@ public final class LiveLedger implements Ledger {
         return true;
     }
 
+    /// Puts in memory every entry of the key space `id` if it is a resident one whose loader has not, before the log's
+    /// replay writes it: the replay writes as an exclusive operation does, without waiting for keys.
+    private void loadForReplay(int id) {
+        if (unloaded.get() == 0) {
+            return;
+        }
+        var state = byId.get(id);
+        var loader = state == null ? null : state.loading;
+        if (loader != null) {
+            loader.loadNow();
+        }
+    }
+
     /// {@return the log bytes of the commits the open replayed, which the trees lack}
     long replayedBytes() {
         return replayedBytes;
@@ -411,6 +457,11 @@ public final class LiveLedger implements Ledger {
         var state = states.get(keyspace.name());
         if (state == null || !state.keyspace.equals(keyspace)) {
             throw new IllegalArgumentException("The store was not opened with " + keyspace);
+        }
+        // The first use of a resident key space starts its loader
+        var loader = state.loading;
+        if (loader != null) {
+            loader.start();
         }
         return state;
     }
@@ -575,6 +626,9 @@ public final class LiveLedger implements Ledger {
         var outcome = units == null ? null : new Applier[1];
         Commit commit;
         try {
+            if (unloaded.get() != 0) {
+                awaitLoaded(writes);
+            }
             commit = writes.removesRanges() ? commitAlone(writes, units, outcome) : commitPipelined(writes, units, outcome);
         } finally {
             if (outcome != null && (outcome[0] == null || !outcome[0].logged())) {
@@ -1329,6 +1383,13 @@ public final class LiveLedger implements Ledger {
         } finally {
             exitExclusive();
         }
+        // Before the files close: a loader reads them, and needs no role, so none waits for this thread
+        for (var state : states.values()) {
+            var loader = state.loading;
+            if (loader != null) {
+                loader.stop();
+            }
+        }
         // The final checkpoint forces the files on this thread: an interrupt would close their channels under it
         var interrupted = Thread.interrupted();
         try {
@@ -1590,6 +1651,23 @@ public final class LiveLedger implements Ledger {
         }
         found[index] = TreeSearch.lookupCached(pages, root, key);
         return found[index] == TreeSearch.UNKNOWN;
+    }
+
+    /// Waits until memory holds the entry of every key `writes` writes in a resident key space, and every entry of a
+    /// resident key space it removes a range of, before any chain of them is opened.
+    private void awaitLoaded(ArrayWriteBatch writes) {
+        var size = writes.size();
+        for (var i = 0; i < size; i++) {
+            awaitLoaded(writes, i);
+        }
+    }
+
+    /// Waits until memory holds what write `index` of `writes` writes, if it writes a resident key space.
+    private void awaitLoaded(ArrayWriteBatch writes, int index) {
+        var state = states.get(writes.keyspace(index).name());
+        if (state.loading != null) {
+            state.awaitLoaded(writes.kind(index) == ArrayWriteBatch.DELETE_RANGE ? null : writes.key(index));
+        }
     }
 
     /// Looks up the keys of every `step`-th write of `missing` from `first` in the trees of `point`, reading the file,

@@ -29,6 +29,7 @@ import java.util.Random;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
@@ -264,6 +265,13 @@ class ByteValueReadsTest {
                 ledger.checkpoint();
             }
             try (var ledger = open(directory, Long.MAX_VALUE)) {
+                // The first read starts the load, and reads the key from the tree unless the load has passed it
+                assertArrayEquals(huge, ledger.get(SESSIONS, "huge").orElseThrow());
+                var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+                while (!((LiveLedger) ledger).residentLoadedForTests(SESSIONS)) {
+                    assertTrue(System.nanoTime() < deadline, "the load did not end");
+                    Thread.onSpinWait();
+                }
                 var held = ledger.get(SESSIONS, "huge").orElseThrow();
                 assertArrayEquals(huge, held);
                 assertSame(held, ledger.get(SESSIONS, "huge").orElseThrow());

@@ -87,7 +87,10 @@ import java.util.function.Consumer;
 /// commit writes its large values on the calling thread, and reads the pages of the trees its writes need, which
 /// the cache does not hold, on virtual threads of its own, before it waits for the writer. On Windows a commit whose
 /// thread writes its own group through to stable storage holds a virtual thread's carrier while the device takes the
-/// write, as the JDK lends a carrier only for its own blocking calls.
+/// write, as the JDK lends a carrier only for its own blocking calls. The entries of a
+/// [resident][Keyspace.Residency#RESIDENT] key space are read into memory on virtual threads of the store's own, from
+/// the first use of the key space after the store opens, unless [Options#loadResidentAtOpen(boolean)] has the open
+/// read them.
 ///
 /// # Lifecycle
 /// A store holds an exclusive lock on its directory from [Options#build()] until [#close()]: one process, and one
@@ -241,11 +244,13 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         Options checkpointEvery(long logBytes);
 
         /// Sends the failures of the work the store does on its own threads to `listener`: a checkpoint it started
-        /// that could not be written.
+        /// that could not be written, or the entries of a resident key space it could not read into memory.
         ///
         /// The store goes on after such a failure, since its log still holds every commit, and its next checkpoint
-        /// retries; until one succeeds the log grows and opening replays more of it. A failure of the log itself stops
-        /// the store instead, and every later commit throws it. Without a listener, these failures are not reported.
+        /// retries; until one succeeds the log grows and opening replays more of it. Reads of a resident key space
+        /// whose entries could not be read into memory read them from the store's files, and the next write of an
+        /// entry not read yet tries again, throwing the failure if it repeats. A failure of the log itself stops the
+        /// store instead, and every later commit throws it. Without a listener, these failures are not reported.
         ///
         /// @param listener receives each failure on the thread that met it, and must not block for long
         /// @return these options
@@ -272,6 +277,21 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// @return these options
         /// @throws IllegalArgumentException if `bytes` is below 4 KiB
         Options largeValues(Keyspace<?, ?> keyspace, long bytes);
+
+        /// Makes [#build()] read the entries of every [Keyspace.Residency#RESIDENT] key space into memory if `atOpen`,
+        /// rather than leave each key space to be read on threads of the store's own from its first use.
+        ///
+        /// By default the open reads none of them: it returns as soon as the store can be read, and the first read,
+        /// write or count of a resident key space starts reading its entries into memory, in the order of their keys.
+        /// Until then a read of an entry not in memory yet reads it from the store's files, as a read of a
+        /// [paged][Keyspace.Residency#PAGED] key space does, and a write of one waits until it is in memory; a
+        /// range removal in the key space waits for every entry. An open after a crash whose log writes to a resident
+        /// key space reads that key space while it opens either way. Read at open, every entry is in memory once
+        /// [#build()] returns, which takes the time the reads take.
+        ///
+        /// @param atOpen whether the open reads the entries of the resident key spaces
+        /// @return these options
+        Options loadResidentAtOpen(boolean atOpen);
 
         /// Lets a commit wait up to `window` for other commits to join the force it starts.
         ///
