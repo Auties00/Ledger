@@ -51,7 +51,10 @@ public sealed interface WriteBatch permits ArrayWriteBatch {
     /// Adds a removal of every entry of `range`.
     ///
     /// The cost does not grow with the number of entries removed: the store records the range and drops its pages
-    /// when it next writes them.
+    /// when it next writes them. A store in a directory counts the entries a removal of a paged key space takes away
+    /// once the commit is visible, on a virtual thread of its own: the count reads the pages on the paths to the
+    /// range's bounds, so a page there that fails authentication, or a file that cannot be read, fails the next
+    /// [View#size(Keyspace)] of the key space and the next checkpoint, not the commit.
     ///
     /// @param keyspace the key space to write
     /// @param range the keys to remove; its order does not matter
