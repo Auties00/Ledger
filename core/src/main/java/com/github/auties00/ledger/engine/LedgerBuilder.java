@@ -40,6 +40,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private Consumer<? super LedgerException> backgroundFailures;
     private long largeValues;
     private final Map<String, Long> largeValuesByKeyspace;
+    // Null for the mode the system property names
+    private WriteThrough.Mode writeThrough;
 
     /// Creates a builder with the default options.
     public LedgerBuilder() {
@@ -60,6 +62,14 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     /// 64 MiB.
     LedgerBuilder segmentSize(long bytes) {
         this.segmentSize = bytes;
+        return this;
+    }
+
+    /// Sets how the log writes the groups that one write holds, in place of the system property
+    /// `ledger.log.writeThrough`, so tests can write through on a file system that simulates failures, and force on
+    /// one that would write through.
+    LedgerBuilder writeThrough(WriteThrough.Mode mode) {
+        this.writeThrough = Objects.requireNonNull(mode, "mode");
         return this;
     }
 
@@ -285,8 +295,9 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                 pages.force();
                 Durability.forceDirectory(logDirectory);
             }
+            var through = WriteThrough.of(writeThrough != null ? writeThrough : WriteThrough.Mode.fromProperty(), logDirectory);
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
-                    segmentSize, pool.executor(), commitWindow, empty);
+                    segmentSize, pool.executor(), commitWindow, empty, through);
             var deltaTable = superblock == null ? null : superblock.deltaTable();
             var deltas = deltaTable == null ? DeltaTable.EMPTY
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));
