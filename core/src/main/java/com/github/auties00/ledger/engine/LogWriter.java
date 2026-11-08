@@ -83,6 +83,16 @@ import java.util.zip.CRC32C;
 ///                 associated data; without encryption, the body and the CRC-32C of header and body
 /// ```
 ///
+/// The commit frames of a group whose sequences follow on and whose bodies hold at most [#RUN_MAX_BODY] bytes are
+/// written as runs, frames of type [FrameBody#COMMITS] holding up to [#RUN_BYTES] bytes of their bodies and carrying the
+/// sequence of the first: a GCM message costs a key schedule, a check that its key and nonce differ from the last
+/// ones, and the hashing of its header whatever its length, which for the frame of a commit of one small write was most
+/// of the time a flush took, and a message below 512 bytes never reaches the vectorized GCM. A frame of at most
+/// [#RUN_MAX_BODY] bytes, a run or not, is copied into the output whole, then sealed in place in one call. A run of
+/// one commit is written as the frame of that commit. Runs never cross a group or a segment, so a group starts, ends
+/// and rolls over at the frames it would one frame per commit; a group torn by a crash drops its runs whole, commits
+/// of a group never acknowledged durable.
+///
 /// A failed write or force stops the writer for good: [#awaitDurable(long)] and every later [#append] throw. A failed
 /// write through only moves the writer to forces.
 final class LogWriter {
@@ -114,6 +124,12 @@ final class LogWriter {
     private static final int SHRINK_AFTER = 256;
     /// The bytes of a frame body sealed in one call, a multiple of the AES block.
     private static final int SLICE = 64 << 10;
+    /// The largest commit body a run takes, and the largest frame body sealed in place; a larger one is a frame of its
+    /// own, whose header and tag weigh nothing beside it.
+    static final int RUN_MAX_BODY = 16 << 10;
+    /// The most bytes of entries a run holds, which the output takes whole before they are sealed in one call: past
+    /// it, a GCM setup costs a few hundredths of the time of the bytes it seals.
+    static final int RUN_BYTES = 64 << 10;
     /// The bytes of frame bodies the queue holds before commits wait for the device.
     private static final long QUEUE_LIMIT = 64L << 20;
     /// The heap a write takes in memory beside its bytes until a checkpoint takes it, as [#appendedHeap()] estimates
@@ -618,7 +634,8 @@ final class LogWriter {
         return bytes >= 0 && position + bytes + ALIGNMENT <= segmentSize;
     }
 
-    /// {@return the bytes `frames` seal into, or -1 if the output cannot hold them and a block of padding}
+    /// {@return a bound on the bytes `frames` seal into, each counted as a frame of its own, more than the run that may
+    /// hold it takes; or -1 if the output cannot hold that many and a block of padding}
     private long sealedBytes(List<Queued> frames) {
         var bytes = 0L;
         for (var frame : frames) {
@@ -746,9 +763,14 @@ final class LogWriter {
         var groupStart = true;
         var bodies = 0L;
         for (var frame : group) {
+            bodies += frame.body().size();
+        }
+        var count = group.size();
+        for (var index = 0; index < count; ) {
+            var frame = group.get(index);
             var bodyLength = frame.body().size();
-            bodies += bodyLength;
-            var sealedLength = bodyLength + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
+            var sealedLength = bodyLength + sealOverhead();
+            // The test of the frame alone: a run takes the commits after its first only while it fits in the segment
             if (position + used + FRAME_HEADER + sealedLength > segmentSize && position + used > SEGMENT_HEADER) {
                 drain();
                 if (unitForce != null) {
@@ -762,7 +784,14 @@ final class LogWriter {
                 start = position;
                 groupStart = true;
             }
-            seal(frame, sealedLength, groupStart);
+            if (bodyLength > RUN_MAX_BODY) {
+                seal(frame, sealedLength, groupStart);
+                index++;
+            } else {
+                var end = runEnd(group, index);
+                sealRun(group, index, end, groupStart);
+                index = end;
+            }
             groupStart = false;
         }
         // Zeros to the next block, where the next group starts: a reused file holds older bytes there
@@ -790,6 +819,101 @@ final class LogWriter {
         return bodies;
     }
 
+    /// {@return the bytes sealing adds to a frame body: the GCM tag, or the CRC-32C without encryption}
+    private int sealOverhead() {
+        return keys.encrypted() ? TAG_BYTES : Integer.BYTES;
+    }
+
+    /// {@return the end, exclusive, of the frames of `group` from `first` on that one frame holds: the commit frames
+    /// whose sequences follow on from the one at `first`, each of at most [#RUN_MAX_BODY] bytes, while their entries
+    /// hold at most [#RUN_BYTES] bytes and the frame fits in the segment; only the frame at `first` if none joins it}
+    private int runEnd(List<Queued> group, int first) {
+        var frame = group.get(first);
+        if (frame.type() != FrameBody.COMMIT) {
+            return first + 1;
+        }
+        var limit = Math.min(RUN_BYTES, segmentSize - position - used - FRAME_HEADER - sealOverhead());
+        var entries = (long) FrameBody.runEntryBytes(frame.body().size());
+        var sequence = frame.sequence();
+        var end = first + 1;
+        for (var count = group.size(); end < count; end++) {
+            var next = group.get(end);
+            var length = next.body().size();
+            if (next.type() != FrameBody.COMMIT || next.sequence() != sequence + 1 || length > RUN_MAX_BODY) {
+                break;
+            }
+            var entry = FrameBody.runEntryBytes(length);
+            if (entries + entry > limit) {
+                break;
+            }
+            entries += entry;
+            sequence++;
+        }
+        return end;
+    }
+
+    /// Seals the frames of `group` from `first` to `end`, exclusive, as one frame: a run of commits, or the frame at
+    /// `first` alone.
+    ///
+    /// The frame takes its place in the output whole before its body is sealed there, in place: the JDK's GCM
+    /// encrypts an array onto itself at the same offset without a copy, where an output offset past the input's makes
+    /// it copy the whole array first.
+    private void sealRun(List<Queued> group, int first, int end, boolean groupStart) throws IOException {
+        var frame = group.get(first);
+        var single = end - first == 1;
+        var plainLength = 0;
+        if (single) {
+            plainLength = frame.body().size();
+        } else {
+            for (var index = first; index < end; index++) {
+                plainLength += FrameBody.runEntryBytes(group.get(index).body().size());
+            }
+        }
+        var sealedLength = plainLength + sealOverhead();
+        room(FRAME_HEADER + sealedLength);
+        var at = used;
+        var frameOffset = position + at;
+        writeHeader(at, sealedLength, frame.sequence(), single ? frame.type() : FrameBody.COMMITS, groupStart);
+        var bodyAt = at + FRAME_HEADER;
+        if (single) {
+            System.arraycopy(frame.body().array(), 0, output, bodyAt, plainLength);
+        } else {
+            var offset = bodyAt;
+            for (var index = first; index < end; index++) {
+                offset = group.get(index).body().writeRunEntry(output, offset);
+            }
+        }
+        if (cipher != null) {
+            try {
+                cipher.init(Cipher.ENCRYPT_MODE, segmentKey, new GCMParameterSpec(TAG_BYTES * 8, nonce(frameOffset)));
+                cipher.updateAAD(output, at, FRAME_HEADER);
+                cipher.doFinal(output, bodyAt, plainLength, output, bodyAt);
+            } catch (GeneralSecurityException exception) {
+                throw new IOException("A log frame could not be sealed", exception);
+            }
+        } else {
+            crc.reset();
+            crc.update(output, at, FRAME_HEADER + plainLength);
+            Bytes.i32(output, bodyAt + plainLength, (int) crc.getValue());
+        }
+        used = bodyAt + sealedLength;
+    }
+
+    /// Writes the header of a frame at `at` of the output.
+    private void writeHeader(int at, int sealedLength, long sequence, byte type, boolean groupStart) {
+        Bytes.i32(output, at, MAGIC);
+        Bytes.i32(output, at + 4, sealedLength);
+        Bytes.i64(output, at + 8, sequence);
+        output[at + 16] = type;
+        output[at + 17] = groupStart ? GROUP_START : 0;
+        Bytes.u16(output, at + 18, 0);
+        Bytes.i64(output, at + SEGMENT_TAG_OFFSET, segmentTag);
+        Bytes.i64(output, at + USE_TAG_OFFSET, useTag);
+        crc.reset();
+        crc.update(output, at, FRAME_HEADER - Integer.BYTES);
+        Bytes.i32(output, at + FRAME_HEADER - Integer.BYTES, (int) crc.getValue());
+    }
+
     /// Seals `frame` into the output, writing the output out whenever it fills.
     ///
     /// The body goes to the cipher a slice at a time: the frame is the one GCM message a single call would make, and
@@ -798,12 +922,7 @@ final class LogWriter {
         room(FRAME_HEADER);
         var at = used;
         var frameOffset = position + used;
-        var header = ByteBuffer.wrap(output, at, FRAME_HEADER);
-        header.putInt(MAGIC).putInt(sealedLength).putLong(frame.sequence()).put(frame.type()).put(groupStart ? GROUP_START : 0)
-                .putShort((short) 0).putLong(segmentTag).putLong(useTag);
-        crc.reset();
-        crc.update(output, at, FRAME_HEADER - Integer.BYTES);
-        header.putInt((int) crc.getValue());
+        writeHeader(at, sealedLength, frame.sequence(), frame.type(), groupStart);
         used += FRAME_HEADER;
         var body = frame.body().array();
         var length = frame.body().size();
