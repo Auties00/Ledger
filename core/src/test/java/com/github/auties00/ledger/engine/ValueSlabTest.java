@@ -12,9 +12,11 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -284,6 +286,136 @@ class ValueSlabTest {
     }
 
     @Nested
+    @DisplayName("through a store's commits")
+    class ThroughCommits {
+        private static final long WINDOW = 250_000_000L;
+        private static final int LARGE_CHUNK = (int) (2 * MIB) - 64;
+
+        private final AtomicLong now = new AtomicLong(1_000);
+        private long next;
+
+        private LiveLedger measured(Path directory) {
+            ValueSlab.measureNewForTests(now::get, () -> 2 * MIB);
+            try {
+                return (LiveLedger) store(directory).build();
+            } finally {
+                ValueSlab.measureNewForTests(null, null);
+            }
+        }
+
+        private static byte[] key(long number) {
+            return ByteBuffer.allocate(Long.BYTES).putLong(number).array();
+        }
+
+        private byte[] commitFresh(LiveLedger ledger, int length) {
+            var key = key(next++);
+            ledger.commit(ledger.newBatch().put(MESSAGES, key, new byte[length]));
+            return key;
+        }
+
+        // The number of commits holds at least 64 samples, so the checkpoint after them counts
+        private void freshInterval(LiveLedger ledger) {
+            for (var i = 0; i < 8_000; i++) {
+                commitFresh(ledger, 1_024);
+            }
+        }
+
+        private long sourceBytesOfFresh(LiveLedger ledger, int length) throws InterruptedException {
+            var key = key(next++);
+            ledger.commit(ledger.newBatch().put(MESSAGES, key, new byte[length])).awaitDurable();
+            return head(ledger, MESSAGES, key).sourceBytesForTests();
+        }
+
+        @Test
+        @Timeout(120)
+        @DisplayName("fast commits turn the slab hot, overwrites of a few keys turn it down for the key space, and checkpoints of other writes bring it back")
+        void activates(@TempDir Path directory) throws Exception {
+            try (var ledger = measured(directory)) {
+                var slab = ledger.valueSlab();
+                var overwrites = ledger.state(MESSAGES).overwrites;
+                assertFalse(slab.hot());
+                assertEquals(0, slab.capacity());
+                for (var window = 0; window < 6 && !slab.hot(); window++) {
+                    now.addAndGet(WINDOW);
+                    // 20 MiB a second, above the 16 of chunks of 2 MiB
+                    for (var i = 0; i < 1_280; i++) {
+                        commitFresh(ledger, 4_096);
+                    }
+                }
+                assertTrue(slab.hot());
+                assertEquals(LARGE_CHUNK, slab.capacity());
+                assertEquals(LARGE_CHUNK, sourceBytesOfFresh(ledger, 4_096));
+                assertTrue(overwrites.worthwhile());
+                ledger.checkpoint();
+                assertTrue(overwrites.worthwhile());
+
+                for (var i = 0; i < 40_000 && overwrites.worthwhile(); i++) {
+                    ledger.commit(ledger.newBatch().put(MESSAGES, new byte[]{9, (byte) (i % 4)}, new byte[1_024]));
+                }
+                assertFalse(overwrites.worthwhile());
+                assertTrue(sourceBytesOfFresh(ledger, 1_024) < LARGE_CHUNK);
+
+                ledger.checkpoint();
+                assertFalse(overwrites.worthwhile());
+                var checkpoints = 0;
+                while (!overwrites.worthwhile()) {
+                    assertTrue(++checkpoints <= 6, "the share came back within a few checkpoints");
+                    freshInterval(ledger);
+                    assertFalse(overwrites.worthwhile(), "the share settled at a checkpoint holds until the next");
+                    ledger.checkpoint();
+                }
+                assertTrue(slab.hot());
+                assertEquals(LARGE_CHUNK, sourceBytesOfFresh(ledger, 1_024));
+            }
+        }
+
+        @Test
+        @Timeout(120)
+        @DisplayName("a key space whose deliveries of 1-8 KB are removed 64 later never turns the slab hot, at the rate of a webhook inbox")
+        void removedSoon(@TempDir Path directory) throws Exception {
+            var inFlight = 64;
+            try (var ledger = measured(directory)) {
+                var slab = ledger.valueSlab();
+                for (var window = 0; window < 8; window++) {
+                    now.addAndGet(WINDOW);
+                    // 12,000 deliveries a second, averaging 4.6 KB
+                    for (var i = 0; i < 3_000; i++) {
+                        var number = next++;
+                        var size = 1_024 + (int) Math.floorMod(number * 7_919, 7_169);
+                        ledger.commit(ledger.newBatch().put(MESSAGES, key(number), new byte[size]));
+                        if (number >= inFlight) {
+                            ledger.commit(ledger.newBatch().delete(MESSAGES, key(number - inFlight)));
+                        }
+                    }
+                }
+                assertFalse(ledger.state(MESSAGES).overwrites.worthwhile());
+                assertFalse(slab.hot());
+                assertEquals(0, slab.chunkBytes());
+            }
+        }
+
+        @Test
+        @Timeout(120)
+        @DisplayName("a key space that keeps its deliveries turns the slab hot at the same rate")
+        void kept(@TempDir Path directory) throws Exception {
+            try (var ledger = measured(directory)) {
+                var slab = ledger.valueSlab();
+                for (var window = 0; window < 8; window++) {
+                    now.addAndGet(WINDOW);
+                    for (var i = 0; i < 3_000; i++) {
+                        var number = next++;
+                        var size = 1_024 + (int) Math.floorMod(number * 7_919, 7_169);
+                        ledger.commit(ledger.newBatch().put(MESSAGES, key(number), new byte[size]));
+                    }
+                }
+                assertTrue(ledger.state(MESSAGES).overwrites.worthwhile());
+                assertTrue(slab.hot());
+                assertTrue(slab.chunkBytes() > 0);
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("alone")
     class Alone {
         @Test
@@ -358,19 +490,71 @@ class ValueSlabTest {
 
         @Test
         @Timeout(60)
-        @DisplayName("a slab over the process's budget declines at once, and has its chunk once another slab closes")
+        @DisplayName("a slab over the process's budget declines at once, and has its chunk in the window after another slab closes")
         void budget() {
+            var now = new AtomicLong(1_000);
             var budget = new ValueSlab.Budget(REGION);
-            var first = new ValueSlab(System::nanoTime, () -> REGION, budget);
-            var second = new ValueSlab(System::nanoTime, () -> REGION, budget);
+            var first = new ValueSlab(now::get, () -> REGION, budget);
+            var second = new ValueSlab(now::get, () -> REGION, budget);
             first.forceHotForTests(REGION);
             second.forceHotForTests(REGION);
             assertTrue(place(first, new byte[100]));
             assertFalse(place(second, new byte[100]));
             assertEquals(0, second.heldForTests());
             first.close();
+            now.addAndGet(250_000_000L);
+            second.note(1L << 18);
             assertTrue(place(second, new byte[100]));
             assertEquals(1, second.heldForTests());
+        }
+
+        @Test
+        @DisplayName("a slab refused a chunk asks the budget, under its lock, once a window rather than once a value, and tells a commit before it makes room for homes")
+        void refusalCost() {
+            var now = new AtomicLong(1_000);
+            var budget = new ValueSlab.Budget(REGION);
+            var first = new ValueSlab(now::get, () -> REGION, budget);
+            var second = new ValueSlab(now::get, () -> REGION, budget);
+            first.forceHotForTests(REGION);
+            second.forceHotForTests(REGION);
+            assertTrue(place(first, new byte[100]));
+            assertTrue(second.accepting());
+            var before = budget.reservesForTests();
+            for (var i = 0; i < 10_000; i++) {
+                assertFalse(place(second, new byte[1]));
+            }
+            assertEquals(before + 1, budget.reservesForTests());
+            assertFalse(second.accepting());
+            assertTrue(first.accepting(), "a slab holding the chunk is not refused");
+            now.addAndGet(250_000_000L);
+            second.note(1L << 18);
+            assertTrue(second.accepting());
+            for (var i = 0; i < 10_000; i++) {
+                assertFalse(place(second, new byte[1]));
+            }
+            assertEquals(before + 2, budget.reservesForTests());
+        }
+
+        @Test
+        @Timeout(60)
+        @DisplayName("every thread, whatever its id, has a stripe that may hold a chunk")
+        void everyThreadHasAStripe() throws Exception {
+            var budget = new ValueSlab.Budget(Long.MAX_VALUE);
+            var slab = new ValueSlab(System::nanoTime, () -> REGION, budget);
+            slab.forceHotForTests(REGION);
+            var declined = new AtomicInteger();
+            // One after the other, so no thread finds its stripe's chunk being made
+            for (var t = 0; t < 256; t++) {
+                Thread.ofPlatform().start(() -> {
+                    if (!place(slab, new byte[1])) {
+                        declined.incrementAndGet();
+                    }
+                }).join();
+            }
+            assertEquals(0, declined.get());
+            assertTrue(slab.heldForTests() <= 8, "held " + slab.heldForTests() + " chunks");
+            assertEquals(slab.heldForTests(), budget.reservesForTests(), "no thread was refused");
+            slab.close();
         }
 
         @Test
@@ -494,6 +678,45 @@ class ValueSlabTest {
                 assertEquals(1, asked.get());
             }
 
+            @ParameterizedTest(name = "{0}")
+            @ValueSource(classes = {NoClassDefFoundError.class, OutOfMemoryError.class, IllegalStateException.class})
+            @DisplayName("turns off for good when asking for the region fails, without failing the commit that asked")
+            void failedQuestion(Class<? extends Throwable> failure) throws Exception {
+                var thrown = failure.getDeclaredConstructor().newInstance();
+                var slab = new ValueSlab(now::get, () -> {
+                    asked.incrementAndGet();
+                    if (thrown instanceof Error error) {
+                        throw error;
+                    }
+                    throw (RuntimeException) thrown;
+                }, new ValueSlab.Budget(32 * MIB));
+                for (var i = 0; i < 5; i++) {
+                    window(slab, 8 * MIB);
+                }
+                assertTrue(slab.off());
+                assertFalse(slab.hot());
+                assertEquals(0, slab.capacity());
+                assertEquals(1, asked.get());
+            }
+
+            @Test
+            @DisplayName("a tick of a store still filling chunks lets go of one that took nothing since the last tick, as a thread that stopped leaves it")
+            void unused() {
+                var slab = slab(2 * MIB);
+                warm(slab);
+                assertTrue(place(slab, new byte[100]));
+                slab.tick(false);
+                assertTrue(place(slab, new byte[100]));
+                slab.tick(false);
+                assertEquals(1, slab.heldForTests());
+                slab.tick(false);
+                assertEquals(0, slab.heldForTests());
+                assertTrue(slab.hot());
+                assertEquals(2 * MIB - 64 - 200, slab.slackBytes());
+                assertTrue(place(slab, new byte[100]));
+                assertEquals(1, slab.heldForTests());
+            }
+
             @Test
             @DisplayName("a tick cools a store that is idle or went silent, not one still filling chunks")
             void ticks() {
@@ -562,7 +785,7 @@ class ValueSlabTest {
         @DisplayName("a share too high stops the slab before the interval ends")
         void early() {
             var overwrites = new ValueSlab.Overwrites();
-            for (var i = 0; i < 255; i++) {
+            for (var i = 0; i < 63; i++) {
                 overwrites.sample(version(1), 1_024);
             }
             assertTrue(overwrites.worthwhile());
@@ -596,6 +819,42 @@ class ValueSlabTest {
             interval(overwrites, 10, 10, 1_024, 200);
             overwrites.cut(300);
             assertTrue(overwrites.worthwhile());
+        }
+
+        @Test
+        @DisplayName("a removal of a version in no tree counts as an overwrite; one of a version a checkpoint took, or of a removal, does not")
+        void removals() {
+            var dying = new ValueSlab.Overwrites();
+            dying.cut(100);
+            for (var i = 0; i < 64; i++) {
+                dying.sample(null, 4_096);
+                dying.sampleRemoval(version(101));
+            }
+            assertFalse(dying.worthwhile());
+            var kept = new ValueSlab.Overwrites();
+            kept.cut(100);
+            for (var i = 0; i < 64; i++) {
+                kept.sample(null, 4_096);
+                kept.sampleRemoval(version(100));
+                kept.sampleRemoval(new Version(200, (MemorySegment) null, null, null));
+                kept.sampleRemoval(null);
+            }
+            assertTrue(kept.worthwhile());
+            kept.cut(200);
+            assertTrue(kept.worthwhile());
+        }
+
+        @ParameterizedTest(name = "every {0}th commit from {1}")
+        @CsvSource({"1,0", "2,0", "2,1", "3,1", "4,3", "64,0", "64,32"})
+        @DisplayName("the sample does not follow a pattern of the commits")
+        void sampling(int stride, int start) {
+            var samples = 0;
+            for (var i = 0; i < 1 << 16; i++) {
+                if (ValueSlab.Overwrites.sampled(start + (long) stride * i)) {
+                    samples++;
+                }
+            }
+            assertTrue(samples > 512 && samples < 2_048, samples + " samples");
         }
 
         @Test

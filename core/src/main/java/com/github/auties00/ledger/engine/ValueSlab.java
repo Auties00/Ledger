@@ -28,20 +28,23 @@ import java.util.function.LongSupplier;
 ///
 /// A chunk stays reachable while a version holds a value on it, overwritten values beside it included, so a slab only
 /// serves a store that fills chunks fast, whose chunks a checkpoint soon lets go of, and a key space that does not
-/// overwrite most of what it writes, as [Overwrites] judges. The slab starts cold, when it takes no value; it
-/// [measures][#note(long)] the bytes it would have taken, over all threads, and turns hot once they would have filled
-/// [#FAST_CHUNKS] chunks a second for [#FAST_WINDOWS] windows in a row. It turns cold again after [#SLOW_WINDOWS] windows
-/// at a [#SLOW_SHARE]th of that rate, or at a [tick][#tick(boolean)] of a store that went quiet, and lets go of its
-/// chunks then: a store of occasional writes never makes one.
+/// overwrite or remove most of what it writes before a checkpoint takes it, as [Overwrites] judges. The slab starts
+/// cold, when it takes no value; it [measures][#note(long)] the bytes it would have taken, over all threads, and turns
+/// hot once they would have filled [#FAST_CHUNKS] chunks a second for [#FAST_WINDOWS] windows in a row. It turns cold
+/// again after [#SLOW_WINDOWS] windows at a [#SLOW_SHARE]th of that rate, or at a [tick][#tick(boolean)] of a store that
+/// went quiet, and lets go of its chunks then: a store of occasional writes never makes one.
 ///
 /// Only the collector G1 treats such an array so: a parallel collector copies it and ZGC relocates it, dead bytes
 /// included. Under any other collector, or without the module `jdk.management` to ask, the slab stays cold for good.
-/// It asks only once a store is fast, as loading the management classes would cost an open tens of milliseconds.
+/// It asks only once a store is fast, as loading the management classes would cost an open tens of milliseconds, and
+/// a question that fails, as it may on the tight heap of a fast store, turns it off too: where a value goes never fails
+/// a commit.
 ///
 /// It is safe for concurrent use: a copy claims its bytes with a compare-and-set, as in [KeySlab], and a chunk is never
 /// used again once replaced, nor recycled. A commit that claimed bytes on a chunk just dropped still copies into it,
 /// and its version keeps the chunk reachable. A value is published by the release store that makes its version the
-/// head of its chain, as the thread that makes the version copied the value before.
+/// head of its chain, as the thread that makes the version copied the value before. A thread that finds no chunk and
+/// is refused one takes no lock again until the next window, so a store past its limits pays a few reads a commit.
 final class ValueSlab {
     /// The bytes of a region a chunk's array leaves for its header and the alignment: enough to take exactly one region.
     private static final int HEADROOM = 64;
@@ -61,12 +64,14 @@ final class ValueSlab {
     private static final int SLOW_SHARE = 4;
     /// The time without a window after which a tick turns the slab cold, whatever its last windows found.
     private static final long SILENCE_NANOS = IdleTicker.PERIOD_MILLIS * 1_000_000L / 2;
-    /// The chunks a store holds at once: the tails of more would be heap neither the values nor a checkpoint needs.
+    /// The chunks a store holds at once, a power of two: the tails of more would be heap neither the values nor a
+    /// checkpoint needs.
     private static final int MAX_HELD = 8;
     /// The fraction of the heap the chunks every store of the process holds at once may take.
     private static final int HEAP_SHARE = 64;
-    /// The stripes of the chunks, as many as [KeySlab]'s: threads running at once seldom share one.
-    private static final int STRIPES = Integer.highestOneBit(Math.clamp(2L * Runtime.getRuntime().availableProcessors() - 1, 1, 63)) << 1;
+    /// The stripes of the chunks, as many as [KeySlab]'s, so threads running at once seldom share one, up to
+    /// [#MAX_HELD]: with more, a thread on a stripe past the chunks the store may hold would never have one.
+    private static final int STRIPES = Math.min(Integer.highestOneBit(Math.clamp(2L * Runtime.getRuntime().availableProcessors() - 1, 1, 63)) << 1, MAX_HELD);
     /// The counters of the measurement, a power of two.
     private static final int COUNTERS = 8;
     /// The `int`s from one counter to the next: 128 bytes, the pair of lines Intel's spatial prefetcher fetches together.
@@ -80,6 +85,9 @@ final class ValueSlab {
     private static final Budget PROCESS = new Budget(Runtime.getRuntime().maxMemory() / HEAP_SHARE);
     // The region of every slab made from now on, to which it is forced hot, or 0
     private static volatile long forcedRegionForTests;
+    // The clock and the region of every slab a store makes from now on, or null for the JVM's
+    private static volatile LongSupplier clockForTests;
+    private static volatile LongSupplier regionForTests;
 
     static {
         try {
@@ -102,6 +110,8 @@ final class ValueSlab {
     private final AtomicLong tails;
     // The start of the window, whose closer the compare-and-set on it picks
     private final AtomicLong windowStart;
+    // The start of the window in which the limits last refused a chunk: no thread without a chunk asks again in it
+    private volatile long refusedWindow;
     // The bytes each thread's counter saw, racy: a lost addition only lowers the rate; made with the first note
     private int[] counted;
     // The sum of the counters at the start of the window, and the windows in a row at each rate; the closer's alone
@@ -114,8 +124,6 @@ final class ValueSlab {
     private volatile boolean hot;
     // Whether it never will, so it measures nothing either
     private volatile boolean off;
-    // Whether two threads claimed from one chunk at once, after which each thread uses the stripe of its id; only ever set
-    private volatile boolean contended;
     // Whether the store closed, so the slab makes no more chunks
     private volatile boolean closed;
     // Whether a test decided hot and cold, so the measurement does not
@@ -123,7 +131,7 @@ final class ValueSlab {
 
     /// Makes a cold slab that asks the JVM for the region, once it needs it.
     ValueSlab() {
-        this(System::nanoTime, ValueSlab::collectorRegion, PROCESS);
+        this(clockForTests != null ? clockForTests : System::nanoTime, regionForTests != null ? regionForTests : ValueSlab::collectorRegion, PROCESS);
     }
 
     /// Makes a cold slab.
@@ -140,6 +148,7 @@ final class ValueSlab {
         this.made = new AtomicLong();
         this.tails = new AtomicLong();
         this.windowStart = new AtomicLong(clock.getAsLong());
+        this.refusedWindow = Long.MIN_VALUE;
         var forcedRegion = forcedRegionForTests;
         if (forcedRegion > 0) {
             forceHotForTests(forcedRegion);
@@ -154,6 +163,12 @@ final class ValueSlab {
     /// {@return whether the slab takes values at the moment}
     boolean hot() {
         return hot;
+    }
+
+    /// {@return whether a value of this thread may find a place: the slab is hot, and the limits did not just refuse the
+    /// chunk this thread's stripe lacks}
+    boolean accepting() {
+        return hot && (refusedWindow != windowStart.get() || stripes.get(stripe()) != null);
     }
 
     /// {@return whether the slab will never take a value, so a commit has no need to measure them}
@@ -220,10 +235,19 @@ final class ValueSlab {
         }
     }
 
-    /// Asks for the region, and turns the slab off for good if it cannot use it: the collector is not G1, or a chunk
-    /// takes more than the budget.
+    /// Asks for the region, and turns the slab off for good if it cannot use it: the collector is not G1, a chunk takes
+    /// more than the budget, or the question fails.
+    ///
+    /// This runs inside a commit that has applied nothing yet, so nothing may leave it: the first question loads the
+    /// management classes, and an [OutOfMemoryError] there would leave [Collector] erroneous, with every later question
+    /// of the process a [NoClassDefFoundError].
     private void learnRegion() {
-        var bytes = region.getAsLong();
+        long bytes;
+        try {
+            bytes = region.getAsLong();
+        } catch (Throwable _) {
+            bytes = 0;
+        }
         if (bytes <= HEADROOM || bytes > budget.limit) {
             off = true;
         } else {
@@ -232,8 +256,8 @@ final class ValueSlab {
     }
 
     /// Copies a value into a chunk and records where as the home of write `index`, unless the slab declines it: the
-    /// value does not fit a chunk, another thread is making the chunk of its stripe, or the store holds all the chunks
-    /// it may. Never waits for another thread.
+    /// value does not fit a chunk, another thread is making the chunk of its stripe, or the limits refuse the stripe
+    /// one. Never waits for another thread.
     ///
     /// @param source the array holding the value
     /// @param offset where the value starts in `source`
@@ -245,18 +269,15 @@ final class ValueSlab {
         if (length > capacity) {
             return false;
         }
-        var stripe = contended ? stripe() : 0;
+        var stripe = stripe();
         while (true) {
             var chunk = stripes.get(stripe);
             if (chunk == FILLING) {
-                if (!contended) {
-                    contended = true;
-                }
                 return false;
             }
             var start = chunk == null ? 0 : (int) USED.getVolatile(chunk);
             if (chunk == null || start + length > chunk.array.length) {
-                if (!replace(stripe, chunk)) {
+                if (chunk == null && refusedWindow == windowStart.get() || !replace(stripe, chunk)) {
                     return false;
                 }
                 continue;
@@ -267,11 +288,7 @@ final class ValueSlab {
                 offsets[index] = start;
                 return true;
             }
-            // Another thread claimed from the chunk meanwhile
-            if (!contended) {
-                contended = true;
-            }
-            stripe = stripe();
+            // Another thread claimed from the chunk meanwhile: the loop reads its new end
         }
     }
 
@@ -298,7 +315,11 @@ final class ValueSlab {
     /// {@return a new chunk counted against the limits, or `null` if they, or the heap, allow none}
     private Chunk make() {
         var size = capacity;
-        if (!hot || !budget.reserve(this, size)) {
+        if (!hot) {
+            return null;
+        }
+        if (!budget.reserve(this, size)) {
+            refusedWindow = windowStart.get();
             return null;
         }
         try {
@@ -340,6 +361,23 @@ final class ValueSlab {
         }
     }
 
+    /// Takes off the stripes the chunks that took no value since the last tick: those of threads that stopped, which a
+    /// store that stays fast would otherwise hold against its limits.
+    private void dropUnused() {
+        for (var stripe = 0; stripe < STRIPES; stripe++) {
+            var chunk = stripes.get(stripe);
+            if (chunk == null || chunk == FILLING) {
+                continue;
+            }
+            var used = (int) USED.getVolatile(chunk);
+            if (used != chunk.usedAtTick) {
+                chunk.usedAtTick = used;
+            } else if (stripes.compareAndSet(stripe, chunk, null)) {
+                retire(chunk);
+            }
+        }
+    }
+
     /// Lets go of the chunks of a store that stopped filling them, at a tick of the [IdleTicker].
     ///
     /// @param idle whether the store committed nothing since the last tick
@@ -348,6 +386,8 @@ final class ValueSlab {
             drop();
         } else if (idle || !hot || clock.getAsLong() - windowStart.get() >= SILENCE_NANOS) {
             cool();
+        } else {
+            dropUnused();
         }
     }
 
@@ -404,6 +444,13 @@ final class ValueSlab {
         forcedRegionForTests = regionBytes;
     }
 
+    /// Makes every slab a store makes from now on measure by `clock` and ask `region`, or the JVM if `null`; for tests
+    /// that run a store's commits through the measurement with no timing involved.
+    static void measureNewForTests(LongSupplier clock, LongSupplier region) {
+        clockForTests = clock;
+        regionForTests = region;
+    }
+
     /// {@return the chunks the stripes hold; for tests}
     int heldForTests() {
         return held.get();
@@ -417,6 +464,8 @@ final class ValueSlab {
         // The slabs that hold a chunk or did, weakly: a store never closed leaves once the collector takes it
         private final Set<ValueSlab> slabs;
         private final Object lock;
+        // The chunks asked for, guarded by the lock
+        private long reserves;
 
         /// Makes a budget of `limit` bytes of chunks.
         Budget(long limit) {
@@ -429,6 +478,7 @@ final class ValueSlab {
         /// may}
         private boolean reserve(ValueSlab slab, int size) {
             synchronized (lock) {
+                reserves++;
                 if (slab.closed || slab.held.get() >= MAX_HELD) {
                     return false;
                 }
@@ -451,29 +501,39 @@ final class ValueSlab {
                 slabs.remove(slab);
             }
         }
+
+        /// {@return the times a slab asked for a chunk, each one a pass through the process-wide lock; for tests}
+        long reservesForTests() {
+            synchronized (lock) {
+                return reserves;
+            }
+        }
     }
 
     /// What a key space's commits say about whether its values may share chunks.
     ///
-    /// A value on an array of its own leaves memory as soon as a commit replaces it. On a chunk, it stays until the
-    /// chunk's other values have gone too, so a key space that overwrites versions no checkpoint has taken yet keeps
-    /// their bytes for nothing. A share `s` of the values overwritten keeps `s / (1 - s)` values' bytes dead for each
-    /// value left, which is judged against what a value on its own array costs beside its bytes, so the limit of the
-    /// share is `TOLERATED / (average + TOLERATED)`: two thirds for values of 128 bytes, a fifth for values of 1 KiB.
+    /// A value on an array of its own leaves memory as soon as a commit replaces or removes it, usually dying in eden. On
+    /// a chunk, it stays until the chunk's other values have gone too, so a key space that overwrites or removes versions
+    /// no checkpoint has taken yet keeps their bytes for nothing, and one that removes what it writes within a young
+    /// collection has no survivors for a chunk to save. A share `s` of the values replaced so keeps `s / (1 - s)` values'
+    /// bytes dead for each value left, which is judged against what a value on its own array costs beside its bytes, so
+    /// the limit of the share is `TOLERATED / (average + TOLERATED)`: two thirds for values of 128 bytes, a fifth for
+    /// values of 1 KiB.
     ///
     /// A share is that of a whole interval between two checkpoints, since it grows over one, from none right after a
     /// checkpoint; the last interval counts for half of what is settled, so a burst of overwrites does not stop the
-    /// slab for good. One commit in `SAMPLE_MASK + 1` is sampled, on its committing thread: the counters are racy, an
+    /// slab for good. One commit in 64 is [sampled][#sampled(long)], on its committing thread: the counters are racy, an
     /// estimate that only decides where a value goes, and they are touched too rarely for the threads to queue on
     /// their line.
     static final class Overwrites {
-        /// The commit sequences with these bits clear are sampled.
-        static final long SAMPLE_MASK = 63;
+        /// The top bits of a commit's hashed sequence that are clear when it is sampled.
+        private static final int SAMPLE_BITS = 6;
         /// The bytes the dead values may cost each value left at the limit of the share: twice the 120 or so an array
         /// of its own, its view and the view's session cost.
         private static final int TOLERATED = 256;
-        /// The samples at which the share so far is judged, so one too high stops the slab before the interval ends.
-        private static final int JUDGE_EVERY = 256;
+        /// The samples at which the share so far is judged, so one too high stops the slab before the interval ends:
+        /// about 4,096 puts, which a key space of large values passes before the slab can turn hot on it.
+        private static final int JUDGE_EVERY = 64;
         /// The samples an interval needs to count.
         private static final int MIN_SAMPLES = 64;
         /// The samples at which the counters halve, so a store whose checkpoints fail does not overflow them.
@@ -495,6 +555,14 @@ final class ValueSlab {
         Overwrites() {
             this.settled = -1;
             this.worthwhile = true;
+        }
+
+        /// {@return whether a commit with this sequence is sampled}
+        ///
+        /// The sequence is hashed so the sample does not follow a pattern of the commits: of a store that alternates a
+        /// put and a removal, the multiples of 64 would all be puts, or all removals.
+        static boolean sampled(long sequence) {
+            return (sequence * 0x9E3779B97F4A7C15L) >>> Long.SIZE - SAMPLE_BITS == 0;
         }
 
         /// {@return whether the key space's values may share chunks}
@@ -519,6 +587,14 @@ final class ValueSlab {
             replaced = over;
             if (sampled % JUDGE_EVERY == 0) {
                 judge(Math.max(settled, share(sampled, over)));
+            }
+        }
+
+        /// Counts a removal of `head`, the newest version in memory, if any, as a replacement of the value it holds.
+        void sampleRemoval(Version head) {
+            var over = replaced;
+            if (head != null && !head.removes() && head.stamp > cutBound && over < MAX_SAMPLES) {
+                replaced = over + 1;
             }
         }
 
@@ -560,10 +636,13 @@ final class ValueSlab {
     private static final class Chunk extends ChunkPadding {
         private final byte[] array;
         private final MemorySegment view;
+        // The bytes claimed at the last tick that saw the chunk, or -1; the ticks' alone
+        private int usedAtTick;
 
         private Chunk(int capacity) {
             this.array = new byte[capacity];
             this.view = MemorySegment.ofArray(array).asReadOnly();
+            this.usedAtTick = -1;
         }
     }
 
@@ -578,8 +657,9 @@ final class ValueSlab {
                     return 0;
                 }
                 return Long.parseLong(diagnostics.getVMOption("G1HeapRegionSize").getValue());
-            } catch (LinkageError | RuntimeException _) {
-                // The module is optional: an application that does not resolve it gets a store without the slab
+            } catch (Throwable _) {
+                // The module is optional: an application that does not resolve it gets a store without the slab. So
+                // does one whose heap is too tight to load the classes, whose commit this must not fail
                 return 0;
             }
         }

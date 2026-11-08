@@ -372,13 +372,13 @@ public final class ArrayWriteBatch implements WriteBatch {
         packChunks();
     }
 
-    /// Gives `slab` the paged values it may take if it is hot, and counts them toward its rate either way: those below
-    /// half a chunk of this batch, that no unit of the file of large values holds too, of a key space that does not
-    /// overwrite most of what it writes.
+    /// Gives `slab` the paged values it may take if it is accepting them, and counts them toward its rate either way:
+    /// those below half a chunk of this batch, that no unit of the file of large values holds too, of a key space that
+    /// does not overwrite or remove most of what it writes.
     ///
     /// @return whether it took any, so the writes it took have their homes and the batch is in [#HOMES_CHUNKS]
     private boolean placeOnSlab(ValueSlab slab, Map<String, KeyspaceState> states) {
-        var hot = slab.hot();
+        var accepting = slab.accepting();
         var eligible = 0L;
         var placed = false;
         for (var i = 0; i < size; i++) {
@@ -391,7 +391,7 @@ public final class ArrayWriteBatch implements WriteBatch {
                 continue;
             }
             eligible += length;
-            if (hot) {
+            if (accepting) {
                 if (homes == null) {
                     homes = new MemorySegment[size];
                     homeOffsets = new int[size];

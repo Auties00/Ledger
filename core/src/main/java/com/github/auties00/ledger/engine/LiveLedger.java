@@ -2054,7 +2054,7 @@ public final class LiveLedger implements Ledger {
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
             var length = Math.toIntExact(value.byteSize());
-            if (source != null && !state.resident && (sequence & ValueSlab.Overwrites.SAMPLE_MASK) == 0) {
+            if (source != null && !state.resident && ValueSlab.Overwrites.sampled(sequence)) {
                 state.overwrites.sample(head, length);
             }
             Version version;
@@ -2133,6 +2133,10 @@ public final class LiveLedger implements Ledger {
                     touched.add(new Touched(state, chain, null, false));
                 }
                 return;
+            }
+            // A recovery's removals count for nothing: the puts of its commits are not sampled either
+            if (frame != null && !state.resident && ValueSlab.Overwrites.sampled(sequence)) {
+                state.overwrites.sampleRemoval(head);
             }
             var version = new Version(stamp, (MemorySegment) null, null, head);
             var blind = existed == TreeSearch.UNKNOWN;
