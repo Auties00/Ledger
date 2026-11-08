@@ -883,6 +883,79 @@ class CheckpointTest {
                 assertEquals(model.size(), ledger.size(values));
             }
         }
+
+        @Test
+        @DisplayName("read the cold leaves of many branches together beside readers on other threads, and a loss of power after them keeps every durable commit")
+        void coldCheckpointsBesideReaders() throws Exception {
+            var values = Keyspace.paged("values", KeyCodec.int64(), LONGS);
+            var random = new Random(37);
+            var model = new TreeMap<Long, Long>();
+            var disk = CrashFileSystem.create();
+            var options = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(values)
+                    .pageCache(1 << 20);
+            CrashFileSystem survivor;
+            try (var ledger = options.build()) {
+                for (var first = 0L; first < 60_000; first += 5_000) {
+                    var batch = ledger.newBatch();
+                    for (var key = first; key < first + 5_000; key++) {
+                        batch.put(values, key * 2, key);
+                        model.put(key * 2, key);
+                    }
+                    ledger.commit(batch);
+                }
+                ledger.checkpoint();
+                // Readers of the keys the writes leave alone, those of 2 modulo 4, while the checkpoints read the
+                // leaves around them
+                var stop = new AtomicBoolean();
+                var failures = new ConcurrentLinkedQueue<Throwable>();
+                var readers = new ArrayList<Thread>();
+                for (var t = 0; t < 4; t++) {
+                    readers.add(Thread.ofPlatform().start(() -> {
+                        try {
+                            while (!stop.get()) {
+                                var key = ThreadLocalRandom.current().nextLong(30_000) * 4 + 2;
+                                assertEquals(Optional.of(key / 2), ledger.get(values, key), "key " + key);
+                            }
+                        } catch (Throwable throwable) {
+                            failures.add(throwable);
+                        }
+                    }));
+                }
+                try {
+                    for (var round = 0; round < 6; round++) {
+                        ((LiveLedger) ledger).clearPageCacheForTests();
+                        var writes = ledger.newBatch();
+                        for (var i = 0; i < 2_000; i++) {
+                            var key = (long) random.nextInt(30_000) * 4;
+                            if (random.nextInt(4) == 0) {
+                                writes.delete(values, key);
+                                model.remove(key);
+                            } else {
+                                writes.put(values, key, (long) round);
+                                model.put(key, (long) round);
+                            }
+                        }
+                        ledger.commit(writes).awaitDurable();
+                        ledger.checkpoint();
+                    }
+                } finally {
+                    stop.set(true);
+                    for (var reader : readers) {
+                        reader.join();
+                    }
+                }
+                assertTrue(failures.isEmpty(), () -> "a reader failed: " + failures);
+                survivor = disk.afterPowerLoss(new Random(41));
+            }
+            try (var ledger = Ledger.builder().directory(survivor.getPath("/store")).encryption(Encryption.key(KEY))
+                    .keyspace(values).pageCache(1 << 20).build()) {
+                assertEquals(model.size(), ledger.size(values));
+                for (var key = 0L; key < 120_000; key += 2) {
+                    assertEquals(Optional.ofNullable(model.get(key)), ledger.get(values, key), "key " + key);
+                }
+            }
+            verifyPages(survivor.getPath("/store"), true);
+        }
     }
 
     @Nested

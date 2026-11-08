@@ -59,12 +59,31 @@ final class DeltaLeaves {
     /// @throws LedgerCorruptedException if the page does not hold the record, or the leaf would not fit in a page
     static byte[] materialize(PageRef ref, Source source) {
         var page = source.read(ref.unit(), PageFormat.DELTA);
-        if (ref.slot() >= Bytes.u16(page, COUNT)) {
-            throw new LedgerCorruptedException("A delta page holds no record " + ref.slot() + " at page " + ref.page(), null);
-        }
-        var record = Bytes.u16(page, COUNT + 2 + 2 * ref.slot());
-        var base = new PageRef(Bytes.i32(page, record), 1, Bytes.i64(page, record + 4), Bytes.i32(page, record + 12));
-        var entries = apply(TreeNodes.leafEntries(source.read(base, PageFormat.LEAF)), changes(page, record));
+        var record = recordOffset(ref, page);
+        var base = baseAt(page, record);
+        return materialize(ref, page, record, base, source.read(base, PageFormat.LEAF));
+    }
+
+    /// {@return the leaf the delta record `ref` makes of its base, as a leaf unit whose header names the base}
+    ///
+    /// @param page the delta page of the record
+    /// @param baseLeaf the plaintext of the base leaf, which [#base(PageRef, byte\[\])] names
+    /// @throws LedgerCorruptedException if the page does not hold the record, or the leaf would not fit in a page
+    static byte[] materialize(PageRef ref, byte[] page, byte[] baseLeaf) {
+        var record = recordOffset(ref, page);
+        return materialize(ref, page, record, baseAt(page, record), baseLeaf);
+    }
+
+    /// {@return the base leaf of the delta record `ref`, which its delta page `page` names}
+    ///
+    /// @throws LedgerCorruptedException if the page does not hold the record
+    static PageRef base(PageRef ref, byte[] page) {
+        return baseAt(page, recordOffset(ref, page));
+    }
+
+    /// {@return the leaf the record at `record` of the delta page `page` makes of `baseLeaf`, the plaintext of `base`}
+    private static byte[] materialize(PageRef ref, byte[] page, int record, PageRef base, byte[] baseLeaf) {
+        var entries = apply(TreeNodes.leafEntries(baseLeaf), changes(page, record));
         var size = 0;
         for (var entry : entries) {
             size += entry.size();
@@ -76,6 +95,21 @@ final class DeltaLeaves {
         var length = TreeNodes.writeLeaf(unit, entries, 0, entries.size());
         TreeNodes.deltaHeader(unit, base, length);
         return unit;
+    }
+
+    /// {@return the offset in the delta page `page` of the record `ref` names}
+    ///
+    /// @throws LedgerCorruptedException if the page does not hold the record
+    private static int recordOffset(PageRef ref, byte[] page) {
+        if (ref.slot() >= Bytes.u16(page, COUNT)) {
+            throw new LedgerCorruptedException("A delta page holds no record " + ref.slot() + " at page " + ref.page(), null);
+        }
+        return Bytes.u16(page, COUNT + 2 + 2 * ref.slot());
+    }
+
+    /// {@return the base leaf the record at `record` of the delta page `page` names}
+    private static PageRef baseAt(byte[] page, int record) {
+        return new PageRef(Bytes.i32(page, record), 1, Bytes.i64(page, record + 4), Bytes.i32(page, record + 12));
     }
 
     /// {@return the entries of record `slot` of the delta page `page`, as views of it}

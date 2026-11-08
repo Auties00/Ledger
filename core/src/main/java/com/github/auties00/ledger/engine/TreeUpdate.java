@@ -1,5 +1,6 @@
 package com.github.auties00.ledger.engine;
 
+import com.github.auties00.ledger.LedgerException;
 import com.github.auties00.ledger.engine.TreeNodes.Child;
 import com.github.auties00.ledger.engine.TreeNodes.LeafEntry;
 
@@ -7,8 +8,10 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
-import java.util.concurrent.ForkJoinTask;
+import java.util.Map;
 import java.util.concurrent.RecursiveTask;
 
 /// Applies the writes of one checkpoint to a key space's tree, copy on write.
@@ -26,6 +29,9 @@ import java.util.concurrent.RecursiveTask;
 /// checkpoint that fails gives them back. The delta records it writes and those it drops are counted by page, which
 /// [#finishDeltas(DeltaTable)] applies to the table of delta pages once every tree is updated. A branch with many
 /// writes below it updates its children's subtrees in parallel, in the common fork-join pool.
+///
+/// A branch whose writes reach two of its children or more reads the units their updates start from together, before
+/// the first of them, rather than each as its update comes to it ([#readChildren(List, Plan\[\], byte\[\]\[\], byte\[\]\[\])]).
 final class TreeUpdate {
     /// The writes below a branch from which its children's subtrees are updated on every processor.
     private static final int PARALLEL_OPS = 4_096;
@@ -196,7 +202,7 @@ final class TreeUpdate {
         } else {
             var unit = read(root.ref(), PageFile.NODE, true);
             var node = new Child(null, root.ref(), root.count(), root.blobs(), TreeNodes.level(unit), -1);
-            var replaced = update(node, unit, null, null, ops, 0, ops.size(), removals, 0, removals.size(), true);
+            var replaced = update(node, unit, null, null, null, ops, 0, ops.size(), removals, 0, removals.size(), true);
             if (replaced == null) {
                 return root;
             }
@@ -230,8 +236,10 @@ final class TreeUpdate {
 
     /// {@return the nodes that replace `node`, or `null` if the writes change nothing under it}
     ///
+    /// @param unit the plaintext of `node`, or of the leaf its delta record makes
+    /// @param deltaPage the delta page of `node`'s record if it was read already, or `null`
     /// @param root whether `node` is the root, which is never a delta record
-    private List<Child> update(Child node, byte[] unit, MemorySegment low, MemorySegment high, List<Op> ops,
+    private List<Child> update(Child node, byte[] unit, byte[] deltaPage, MemorySegment low, MemorySegment high, List<Op> ops,
                                int opFrom, int opTo, List<Range> removals, int remFrom, int remTo, boolean root) throws IOException {
         if (TreeNodes.isLeaf(unit)) {
             var entries = TreeNodes.leafEntries(unit);
@@ -241,7 +249,7 @@ final class TreeUpdate {
             }
             var base = TreeNodes.base(unit, node.ref());
             if (!root) {
-                var delta = writeDelta(node.ref(), base, entries, merged);
+                var delta = writeDelta(node.ref(), base, entries, merged, deltaPage);
                 if (delta != null) {
                     return delta.isEmpty() ? null : delta;
                 }
@@ -286,9 +294,16 @@ final class TreeUpdate {
             }
             op = opEnd;
         }
+        byte[][] nodes = null;
+        byte[][] deltaPages = null;
+        if (updates > 1) {
+            nodes = new byte[children.size()][];
+            deltaPages = new byte[children.size()][];
+            readChildren(children, plans, nodes, deltaPages);
+        }
         var replacements = updates > 1 && opTo - opFrom >= PARALLEL_OPS
-                ? updateInParallel(children, plans, ops, removals)
-                : updateInTurn(children, plans, ops, removals);
+                ? updateInParallel(children, plans, nodes, deltaPages, ops, removals)
+                : updateInTurn(children, plans, nodes, deltaPages, ops, removals);
         var out = new ArrayList<Child>(children.size() + 4);
         var changed = false;
         for (var i = 0; i < children.size(); i++) {
@@ -312,13 +327,19 @@ final class TreeUpdate {
     }
 
     /// {@return what replaces each child that `plans` gives a share of the writes to, `null` where nothing does}
+    ///
+    /// @param nodes the plaintext of each child's node read already, by child, or `null` for none; emptied as the
+    ///              updates take them
+    /// @param deltaPages the delta page of each child's record read already, by child, or `null` for none; emptied as
+    ///                   the updates take them
     @SuppressWarnings("unchecked")
-    private List<Child>[] updateInTurn(List<Child> children, Plan[] plans, List<Op> ops, List<Range> removals) throws IOException {
+    private List<Child>[] updateInTurn(List<Child> children, Plan[] plans, byte[][] nodes, byte[][] deltaPages,
+                                       List<Op> ops, List<Range> removals) throws IOException {
         var replacements = (List<Child>[]) new List<?>[children.size()];
         for (var i = 0; i < children.size(); i++) {
             var plan = plans[i];
             if (plan != null && plan != Plan.DROP) {
-                replacements[i] = update(children.get(i), ops, removals, plan);
+                replacements[i] = update(children.get(i), take(nodes, i), take(deltaPages, i), ops, removals, plan);
             }
         }
         return replacements;
@@ -330,25 +351,49 @@ final class TreeUpdate {
     /// the free space are shared, and safe for concurrent use. A checkpoint of a write rate that rewrites most leaves
     /// would otherwise rewrite them on one processor.
     ///
+    /// It returns, or throws the failure of the first task that failed, only once every task ended: a task still running
+    /// after a failure would take pages after the checkpoint gave its pages back, which no one would give back, and write
+    /// into the writer of a checkpoint that is over.
+    ///
+    /// @param nodes the plaintext of each child's node read already, by child, or `null` for none; emptied as the tasks
+    ///              take them
+    /// @param deltaPages the delta page of each child's record read already, by child, or `null` for none; emptied as
+    ///                   the tasks take them
     /// @return what replaces each child, `null` where nothing does
     @SuppressWarnings("unchecked")
-    private List<Child>[] updateInParallel(List<Child> children, Plan[] plans, List<Op> ops, List<Range> removals) throws IOException {
+    private List<Child>[] updateInParallel(List<Child> children, Plan[] plans, byte[][] nodes, byte[][] deltaPages,
+                                           List<Op> ops, List<Range> removals) throws IOException {
         var replacements = (List<Child>[]) new List<?>[children.size()];
         var tasks = new ArrayList<Subtree>();
         for (var i = 0; i < children.size(); i++) {
             var plan = plans[i];
             if (plan != null && plan != Plan.DROP) {
-                tasks.add(new Subtree(i, new TreeUpdate(pages, writer, space), children.get(i), ops, removals, plan));
+                tasks.add(new Subtree(i, new TreeUpdate(pages, writer, space), children.get(i), take(nodes, i),
+                        take(deltaPages, i), ops, removals, plan));
             }
         }
         try {
-            ForkJoinTask.invokeAll(tasks);
-        } catch (UncheckedIOException exception) {
-            throw exception.getCause();
+            for (var i = 1; i < tasks.size(); i++) {
+                tasks.get(i).fork();
+            }
+            tasks.getFirst().quietlyInvoke();
+            for (var i = 1; i < tasks.size(); i++) {
+                tasks.get(i).quietlyJoin();
+            }
         } finally {
             // Whatever the tasks took, even those of a failed update, goes back if the checkpoint fails
             for (var task : tasks) {
                 allocated.addAll(task.update.allocated);
+            }
+        }
+        for (var task : tasks) {
+            switch (task.getException()) {
+                case null -> {
+                }
+                case UncheckedIOException exception -> throw exception.getCause();
+                case RuntimeException exception -> throw exception;
+                case Error error -> throw error;
+                case Throwable other -> throw new IllegalStateException(other);
             }
         }
         for (var task : tasks) {
@@ -361,9 +406,172 @@ final class TreeUpdate {
     }
 
     /// {@return the nodes that replace `child`, or `null` if the writes `plan` gives it change nothing under it}
-    private List<Child> update(Child child, List<Op> ops, List<Range> removals, Plan plan) throws IOException {
-        var unit = read(child.ref(), PageFile.NODE, true);
-        return update(child, unit, plan.low(), plan.high(), ops, plan.opFrom(), plan.opTo(), removals, plan.remFrom(), plan.remTo(), false);
+    ///
+    /// @param node the plaintext of the child's node if it was read already, or `null`
+    /// @param deltaPage the delta page of the child's record if it was read already, or `null`
+    private List<Child> update(Child child, byte[] node, byte[] deltaPage, List<Op> ops, List<Range> removals, Plan plan) throws IOException {
+        var unit = node != null ? node : read(child.ref(), PageFile.NODE, true);
+        return update(child, unit, deltaPage, plan.low(), plan.high(), ops, plan.opFrom(), plan.opTo(), removals,
+                plan.remFrom(), plan.remTo(), false);
+    }
+
+    /// {@return the unit at `index` of `units`, which it empties, or `null` if `units` is `null`}
+    private static byte[] take(byte[][] units, int index) {
+        if (units == null) {
+            return null;
+        }
+        var unit = units[index];
+        units[index] = null;
+        return unit;
+    }
+
+    /// Fills `nodes` and `deltaPages`, by child, with the units the updates of the children `plans` gives a share of
+    /// the writes to start from: the node of each child, a leaf or a branch, or the leaf its delta record makes; and
+    /// the delta page of each record, which [#writeDelta] reads again.
+    ///
+    /// What this update fills, the writer queues or the cache holds comes from there; the rest is read from the file
+    /// together, with [PageFile#readBatch(List, byte\[\])]: first the nodes and the delta pages, then the bases of the
+    /// records whose leaves the cache lacks. A read as each child's update comes to it would keep one read in flight on
+    /// each thread of the checkpoint, and on Windows a read that meets a force of the log takes as long as the force.
+    /// The children are units of the tree before the update, which never takes their pages, so their file pages hold
+    /// them.
+    ///
+    /// The units it reads go to the cache as reads of them would: a node as one read, a delta page and a base as
+    /// entries the cache evicts first. The leaf of a record goes to `nodes` alone: the update nearly always gives the
+    /// record up, so no read would find the leaf again, and in the cache it would outlast the leaf that replaces it,
+    /// which enters as an entry the cache evicts first. A read that fails leaves the slots of what it read empty: the
+    /// update of each child then reads what it lacks itself, and fails as it would have.
+    private void readChildren(List<Child> children, Plan[] plans, byte[][] nodes, byte[][] deltaPages) {
+        var refs = new ArrayList<PageRef>();
+        var kinds = new byte[children.size()];
+        // The index in refs of what each child lacks, its node or its record's delta page, or -1
+        var reads = new int[children.size()];
+        // The index in refs of each delta page, which the records of several children may share
+        Map<PageRef, Integer> deltaReads = null;
+        for (var i = 0; i < children.size(); i++) {
+            reads[i] = -1;
+            var plan = plans[i];
+            if (plan == null || plan == Plan.DROP) {
+                continue;
+            }
+            var ref = children.get(i).ref();
+            if (!ref.isRecord()) {
+                nodes[i] = inMemory(ref, PageFile.NODE);
+                if (nodes[i] == null) {
+                    reads[i] = refs.size();
+                    kinds[refs.size()] = PageFile.NODE;
+                    refs.add(ref);
+                }
+                continue;
+            }
+            nodes[i] = pages.cached(ref, PageFile.NODE);
+            var unit = ref.unit();
+            deltaPages[i] = inMemory(unit, PageFormat.DELTA);
+            if (deltaPages[i] == null) {
+                if (deltaReads == null) {
+                    deltaReads = new HashMap<>();
+                }
+                var index = deltaReads.get(unit);
+                if (index == null) {
+                    index = refs.size();
+                    deltaReads.put(unit, index);
+                    kinds[refs.size()] = PageFormat.DELTA;
+                    refs.add(unit);
+                }
+                reads[i] = index;
+            }
+        }
+        try {
+            if (!refs.isEmpty()) {
+                var units = pages.readBatch(refs, Arrays.copyOf(kinds, refs.size()));
+                for (var k = 0; k < units.length; k++) {
+                    pages.cache().put(refs.get(k), units[k], kinds[k] != PageFormat.DELTA);
+                }
+                for (var i = 0; i < children.size(); i++) {
+                    if (reads[i] != -1) {
+                        if (children.get(i).ref().isRecord()) {
+                            deltaPages[i] = units[reads[i]];
+                        } else {
+                            nodes[i] = units[reads[i]];
+                        }
+                    }
+                }
+            }
+            readRecordLeaves(children, plans, nodes, deltaPages);
+        } catch (LedgerException _) {
+            // Each update reads what it lacks itself, and fails as it would have
+        }
+    }
+
+    /// Fills `nodes` with the leaf of each record among the children `plans` gives a share of the writes to whose leaf
+    /// it lacks, made from the record's delta page in `deltaPages` and its base, the bases the cache lacks read
+    /// together.
+    private void readRecordLeaves(List<Child> children, Plan[] plans, byte[][] nodes, byte[][] deltaPages) {
+        byte[][] bases = null;
+        List<PageRef> refs = null;
+        // The index in refs of each child's base, or -1
+        int[] reads = null;
+        // The index in refs of each base, in case records share one
+        Map<PageRef, Integer> baseReads = null;
+        for (var i = 0; i < children.size(); i++) {
+            var plan = plans[i];
+            var ref = children.get(i).ref();
+            if (plan == null || plan == Plan.DROP || !ref.isRecord() || nodes[i] != null) {
+                continue;
+            }
+            if (bases == null) {
+                bases = new byte[children.size()][];
+                refs = new ArrayList<>();
+                reads = new int[children.size()];
+                Arrays.fill(reads, -1);
+                baseReads = new HashMap<>();
+            }
+            var base = DeltaLeaves.base(ref, deltaPages[i]);
+            bases[i] = inMemory(base, PageFormat.LEAF);
+            if (bases[i] == null) {
+                var index = baseReads.get(base);
+                if (index == null) {
+                    index = refs.size();
+                    baseReads.put(base, index);
+                    refs.add(base);
+                }
+                reads[i] = index;
+            }
+        }
+        if (bases == null) {
+            return;
+        }
+        if (!refs.isEmpty()) {
+            var kinds = new byte[refs.size()];
+            Arrays.fill(kinds, PageFormat.LEAF);
+            var units = pages.readBatch(refs, kinds);
+            for (var k = 0; k < units.length; k++) {
+                pages.cache().put(refs.get(k), units[k], false);
+            }
+            for (var i = 0; i < children.size(); i++) {
+                if (reads[i] != -1) {
+                    bases[i] = units[reads[i]];
+                }
+            }
+        }
+        for (var i = 0; i < children.size(); i++) {
+            if (bases[i] != null) {
+                nodes[i] = DeltaLeaves.materialize(children.get(i).ref(), deltaPages[i], bases[i]);
+            }
+        }
+    }
+
+    /// {@return the plaintext of the unit `ref` names if this update fills it, the writer queues it or the cache holds
+    /// it, or `null`}
+    ///
+    /// @param kind the kind a cached unit must have, or [PageFile#NODE] for a leaf or a branch
+    private byte[] inMemory(PageRef ref, byte kind) {
+        var filling = packer.filling(ref);
+        if (filling != null) {
+            return filling;
+        }
+        var staged = writer.staged(ref);
+        return staged != null ? staged : pages.cached(ref, kind);
     }
 
     /// Writes the leaf `ref`, made from the leaf `base`, as a delta record if what changed since `base` makes a small
@@ -375,9 +583,11 @@ final class TreeUpdate {
     /// rather than reading the record and its base.
     ///
     /// @param entries the entries of the leaf `ref` names, before the writes
+    /// @param deltaPage the delta page of the record `ref` names if it was read already, or `null`
     /// @return the record, alone; an empty list if `merged` is what `ref` holds already; or `null` if the leaf is to
     ///         be written whole
-    private List<Child> writeDelta(PageRef ref, PageRef base, List<LeafEntry> entries, List<LeafEntry> merged) throws IOException {
+    private List<Child> writeDelta(PageRef ref, PageRef base, List<LeafEntry> entries, List<LeafEntry> merged,
+                                   byte[] deltaPage) throws IOException {
         if (merged.isEmpty()) {
             return null;
         }
@@ -399,7 +609,8 @@ final class TreeUpdate {
             // record would make two reads, and whose writes a checkpoint takes few of
             return null;
         }
-        var changes = ref.isRecord() ? DeltaLeaves.combine(DeltaLeaves.record(read(ref.unit(), PageFormat.DELTA, true), ref.slot()), touched)
+        var changes = ref.isRecord()
+                ? DeltaLeaves.combine(DeltaLeaves.record(deltaPage != null ? deltaPage : read(ref.unit(), PageFormat.DELTA, true), ref.slot()), touched)
                 : touched;
         var size = DeltaLeaves.recordSize(changes);
         if (size > DeltaLeaves.MAX_RECORD) {
@@ -450,14 +661,21 @@ final class TreeUpdate {
         private final int index;
         private final TreeUpdate update;
         private final Child child;
+        // The plaintext of the child's node and of its record's delta page if read already, or null; emptied as the
+        // update starts, which holds them only while it runs
+        private byte[] node;
+        private byte[] deltaPage;
         private final List<Op> ops;
         private final List<Range> removals;
         private final Plan plan;
 
-        Subtree(int index, TreeUpdate update, Child child, List<Op> ops, List<Range> removals, Plan plan) {
+        Subtree(int index, TreeUpdate update, Child child, byte[] node, byte[] deltaPage, List<Op> ops,
+                List<Range> removals, Plan plan) {
             this.index = index;
             this.update = update;
             this.child = child;
+            this.node = node;
+            this.deltaPage = deltaPage;
             this.ops = ops;
             this.removals = removals;
             this.plan = plan;
@@ -465,8 +683,12 @@ final class TreeUpdate {
 
         @Override
         protected List<Child> compute() {
+            var unit = node;
+            var page = deltaPage;
+            node = null;
+            deltaPage = null;
             try {
-                var replacement = update.update(child, ops, removals, plan);
+                var replacement = update.update(child, unit, page, ops, removals, plan);
                 // The records of the subtree end its own pages, so the branch above reads them back from the writer
                 update.packer.close();
                 return replacement;
