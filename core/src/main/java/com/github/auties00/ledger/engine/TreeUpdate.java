@@ -114,6 +114,73 @@ final class TreeUpdate {
         }
     }
 
+    /// The states of the keys of one checkpoint, in key order and of different keys, beside the first 8 bytes of each
+    /// key.
+    ///
+    /// The bytes sit in an array of their own, so finding where a child's share of the writes ends looks at the array
+    /// rather than at each state, its chain and its key, scattered over the heap, at every level of the tree. Bytes that
+    /// differ decide the order of two keys; only equal ones, as the keys of one chat have, read the keys.
+    static final class Ops {
+        private final Op[] ops;
+        private final long[] prefixes;
+        private final int size;
+
+        /// Takes the first `size` of `ops`, not copied.
+        ///
+        /// @param prefixes the first 8 bytes of each key, as [Chain#word(long)] reads them
+        Ops(Op[] ops, long[] prefixes, int size) {
+            this.ops = ops;
+            this.prefixes = prefixes;
+            this.size = size;
+        }
+
+        /// {@return the number of states}
+        int size() {
+            return size;
+        }
+
+        /// {@return the state at `index`}
+        Op get(int index) {
+            return ops[index];
+        }
+
+        /// {@return the order of the key at `index` and `key`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
+        ///
+        /// @param prefix the first 8 bytes of `key`, as [Segments#word(MemorySegment, long, long)] reads them
+        int compare(int index, long prefix, MemorySegment key) {
+            var order = Long.compareUnsigned(prefixes[index], prefix);
+            return order != 0 ? order : ops[index].compareKey(key);
+        }
+
+        /// {@return the first index from `from` to `to` whose key is not below `key`, or `to` if none is}
+        ///
+        /// It doubles its steps from `from`, then halves the last one: a child's share of a few writes takes a few
+        /// looks, and one of a million about forty.
+        int firstNotBelow(int from, int to, MemorySegment key) {
+            var prefix = Segments.word(key, 0, key.byteSize());
+            var low = from;
+            var high = to;
+            // Past the largest step an int holds, the halving takes the rest
+            for (var step = 1; step > 0 && step <= high - low; step <<= 1) {
+                var probe = low + step - 1;
+                if (compare(probe, prefix, key) >= 0) {
+                    high = probe;
+                    break;
+                }
+                low = probe + 1;
+            }
+            while (low < high) {
+                var middle = (low + high) >>> 1;
+                if (compare(middle, prefix, key) >= 0) {
+                    high = middle;
+                } else {
+                    low = middle + 1;
+                }
+            }
+            return low;
+        }
+    }
+
     /// A range of keys removed.
     ///
     /// @param from the lowest key removed, or `null` for no lower bound
@@ -180,10 +247,10 @@ final class TreeUpdate {
     /// {@return the root of the tree after `ops` and `removals`, or `null` if it is empty}
     ///
     /// @param root the root before, or `null` for an empty tree
-    /// @param ops the states of the keys written, in key order
+    /// @param ops the states of the keys written
     /// @param removals the removed ranges, sorted and disjoint; they apply before `ops`
-    TreeRoot apply(TreeRoot root, List<Op> ops, List<Range> removals) throws IOException {
-        if (ops.isEmpty() && removals.isEmpty()) {
+    TreeRoot apply(TreeRoot root, Ops ops, List<Range> removals) throws IOException {
+        if (ops.size() == 0 && removals.isEmpty()) {
             return root;
         }
         List<Child> result;
@@ -231,7 +298,7 @@ final class TreeUpdate {
     /// {@return the nodes that replace `node`, or `null` if the writes change nothing under it}
     ///
     /// @param root whether `node` is the root, which is never a delta record
-    private List<Child> update(Child node, byte[] unit, MemorySegment low, MemorySegment high, List<Op> ops,
+    private List<Child> update(Child node, byte[] unit, MemorySegment low, MemorySegment high, Ops ops,
                                int opFrom, int opTo, List<Range> removals, int remFrom, int remTo, boolean root) throws IOException {
         if (TreeNodes.isLeaf(unit)) {
             var entries = TreeNodes.leafEntries(unit);
@@ -259,10 +326,7 @@ final class TreeUpdate {
             var child = children.get(i);
             var childLow = i == 0 ? low : child.firstKey();
             var childHigh = i == children.size() - 1 ? high : children.get(i + 1).firstKey();
-            var opEnd = op;
-            while (opEnd < opTo && (childHigh == null || ops.get(opEnd).compareKey(childHigh) < 0)) {
-                opEnd++;
-            }
+            var opEnd = childHigh == null ? opTo : ops.firstNotBelow(op, opTo, childHigh);
             // The removed ranges that meet the keys the child holds, from its first key
             var remStart = rem;
             while (remStart < remTo && removals.get(remStart).to() != null
@@ -313,7 +377,7 @@ final class TreeUpdate {
 
     /// {@return what replaces each child that `plans` gives a share of the writes to, `null` where nothing does}
     @SuppressWarnings("unchecked")
-    private List<Child>[] updateInTurn(List<Child> children, Plan[] plans, List<Op> ops, List<Range> removals) throws IOException {
+    private List<Child>[] updateInTurn(List<Child> children, Plan[] plans, Ops ops, List<Range> removals) throws IOException {
         var replacements = (List<Child>[]) new List<?>[children.size()];
         for (var i = 0; i < children.size(); i++) {
             var plan = plans[i];
@@ -332,7 +396,7 @@ final class TreeUpdate {
     ///
     /// @return what replaces each child, `null` where nothing does
     @SuppressWarnings("unchecked")
-    private List<Child>[] updateInParallel(List<Child> children, Plan[] plans, List<Op> ops, List<Range> removals) throws IOException {
+    private List<Child>[] updateInParallel(List<Child> children, Plan[] plans, Ops ops, List<Range> removals) throws IOException {
         var replacements = (List<Child>[]) new List<?>[children.size()];
         var tasks = new ArrayList<Subtree>();
         for (var i = 0; i < children.size(); i++) {
@@ -361,7 +425,7 @@ final class TreeUpdate {
     }
 
     /// {@return the nodes that replace `child`, or `null` if the writes `plan` gives it change nothing under it}
-    private List<Child> update(Child child, List<Op> ops, List<Range> removals, Plan plan) throws IOException {
+    private List<Child> update(Child child, Ops ops, List<Range> removals, Plan plan) throws IOException {
         var unit = read(child.ref(), PageFile.NODE, true);
         return update(child, unit, plan.low(), plan.high(), ops, plan.opFrom(), plan.opTo(), removals, plan.remFrom(), plan.remTo(), false);
     }
@@ -450,11 +514,11 @@ final class TreeUpdate {
         private final int index;
         private final TreeUpdate update;
         private final Child child;
-        private final List<Op> ops;
+        private final Ops ops;
         private final List<Range> removals;
         private final Plan plan;
 
-        Subtree(int index, TreeUpdate update, Child child, List<Op> ops, List<Range> removals, Plan plan) {
+        Subtree(int index, TreeUpdate update, Child child, Ops ops, List<Range> removals, Plan plan) {
             this.index = index;
             this.update = update;
             this.child = child;
@@ -527,14 +591,17 @@ final class TreeUpdate {
     }
 
     /// {@return the entries of a leaf after the writes that reach it, or `null` if they change none}
-    private List<LeafEntry> merge(List<LeafEntry> entries, List<Op> ops, int opFrom, int opTo, List<Range> removals,
+    private List<LeafEntry> merge(List<LeafEntry> entries, Ops ops, int opFrom, int opTo, List<Range> removals,
                                   int remFrom, int remTo) throws IOException {
         var out = new ArrayList<LeafEntry>(entries.size() + (opTo - opFrom));
         var changed = false;
         var op = opFrom;
         var rem = remFrom;
         for (var entry : entries) {
-            while (op < opTo && ops.get(op).compareKey(entry.key()) < 0) {
+            var key = entry.key();
+            var prefix = Segments.word(key, 0, key.byteSize());
+            var order = 1;
+            while (op < opTo && (order = ops.compare(op, prefix, key)) < 0) {
                 var put = ops.get(op++);
                 put.settle(false);
                 if (!put.removes()) {
@@ -542,7 +609,7 @@ final class TreeUpdate {
                     changed = true;
                 }
             }
-            if (op < opTo && ops.get(op).compareKey(entry.key()) == 0) {
+            if (op < opTo && order == 0) {
                 // The key's state as of the checkpoint, which already takes the removals into account
                 var state = ops.get(op++);
                 state.settle(true);

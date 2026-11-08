@@ -73,6 +73,21 @@ final class Segments {
         return Byte.compareUnsigned(left.get(ValueLayout.JAVA_BYTE, leftFrom + mismatch), right.get(ValueLayout.JAVA_BYTE, rightFrom + mismatch));
     }
 
+    /// {@return the first 8 of the `length` bytes at `from` of `segment`, big-endian, zero past their end}
+    ///
+    /// As unsigned numbers, the words of two keys that differ order them as [#compare(MemorySegment, MemorySegment)]
+    /// does; words that are equal say nothing, as the keys may differ past them, or by trailing zero bytes alone.
+    static long word(MemorySegment segment, long from, long length) {
+        if (length >= Long.BYTES) {
+            return segment.get(BIG_ENDIAN_LONG, from);
+        }
+        var word = 0L;
+        for (var i = 0L; i < length; i++) {
+            word |= (segment.get(ValueLayout.JAVA_BYTE, from + i) & 0xFFL) << (56 - 8 * i);
+        }
+        return word;
+    }
+
     /// {@return whether the `leftLength` bytes at `leftFrom` of `left` are the `rightLength` bytes at `rightFrom` of
     /// `right`}
     static boolean equal(MemorySegment left, long leftFrom, long leftLength, MemorySegment right, long rightFrom, long rightLength) {

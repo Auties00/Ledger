@@ -1,7 +1,10 @@
 package com.github.auties00.ledger.engine;
 
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -16,6 +19,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.function.Function;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -32,7 +37,93 @@ class TreeUpdateTest {
     @ValueSource(booleans = {true, false})
     @DisplayName("random rounds leave the tree equal to the model, with every page reachable or free")
     void randomRounds(boolean encrypted, @TempDir Path directory) throws Exception {
-        var random = new Random(encrypted ? 7 : 11);
+        rounds(encrypted, new Random(encrypted ? 7 : 11), directory, random -> {
+            var key = new byte[1 + random.nextInt(40)];
+            random.nextBytes(key);
+            return key;
+        });
+    }
+
+    static Stream<Arguments> keyShapes() {
+        return Stream.of(
+                Arguments.of("keys of 1 to 12 bytes around 0x80 and ending in zero bytes", (Function<Random, byte[]>) random -> {
+                    var key = new byte[1 + random.nextInt(12)];
+                    for (var i = 0; i < key.length; i++) {
+                        key[i] = new byte[]{0x00, 0x7F, (byte) 0x80, (byte) 0xFF}[random.nextInt(4)];
+                    }
+                    return key;
+                }),
+                Arguments.of("keys that share their first 8 bytes, above 0x80, so branch keys equal the writes' in them", (Function<Random, byte[]>) random -> {
+                    var key = new byte[8 + random.nextInt(16)];
+                    Arrays.fill(key, 0, 8, (byte) 0xE1);
+                    for (var i = 8; i < key.length; i++) {
+                        key[i] = (byte) random.nextInt(256);
+                    }
+                    return key;
+                }),
+                Arguments.of("groups of keys that share their first 8 bytes, or end within them", (Function<Random, byte[]>) random -> {
+                    var key = new byte[3 + random.nextInt(18)];
+                    var group = (byte) (0x70 + random.nextInt(32));
+                    Arrays.fill(key, 0, Math.min(8, key.length), group);
+                    for (var i = 8; i < key.length; i++) {
+                        key[i] = (byte) random.nextInt(4);
+                    }
+                    return key;
+                }));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("keyShapes")
+    @DisplayName("random rounds leave the tree equal to the model, whichever bytes the keys share and however short they are")
+    void roundsOfKeyShapes(String shape, Function<Random, byte[]> keyShape, @TempDir Path directory) throws Exception {
+        rounds(true, new Random(shape.hashCode()), directory, keyShape);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("keyShapes")
+    @DisplayName("the search for a child's share of the writes finds what a walk over them does")
+    void searchMatchesWalk(String shape, Function<Random, byte[]> keyShape) {
+        var random = new Random(shape.hashCode() * 17L);
+        var keys = new TreeMap<byte[], byte[]>(UNSIGNED);
+        for (var i = 0; i < 3_000; i++) {
+            keys.put(keyShape.apply(random), new byte[0]);
+        }
+        var ops = new ArrayList<TreeUpdate.Op>();
+        for (var key : keys.keySet()) {
+            ops.add(new TreeUpdate.Op(segment(key), segment(new byte[0])));
+        }
+        var indexed = ops(ops);
+        for (var i = 0; i < 5_000; i++) {
+            var probe = segment(keyShape.apply(random));
+            var from = random.nextInt(ops.size() + 1);
+            var to = from + random.nextInt(ops.size() - from + 1);
+            var expected = from;
+            while (expected < to && ops.get(expected).compareKey(probe) < 0) {
+                expected++;
+            }
+            assertEquals(expected, indexed.firstNotBelow(from, to, probe));
+        }
+    }
+
+    @Test
+    @DisplayName("the search compares the bytes of keys as unsigned, and takes a key that ends within them for what it is")
+    void searchEdges() {
+        var keys = new byte[][]{{}, {0}, {0, 0}, {1}, {1, 0}, {1, 0, 0, 0, 0, 0, 0, 0}, {1, 0, 0, 0, 0, 0, 0, 0, 0},
+                {1, 0, 0, 0, 0, 0, 0, 0, 1}, {0x7F}, {(byte) 0x80}, {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF}};
+        var ops = new ArrayList<TreeUpdate.Op>();
+        for (var key : keys) {
+            ops.add(new TreeUpdate.Op(segment(key), segment(new byte[0])));
+        }
+        var indexed = ops(ops);
+        for (var i = 0; i < keys.length; i++) {
+            assertEquals(i, indexed.firstNotBelow(0, keys.length, segment(keys[i])));
+            assertEquals(i, indexed.firstNotBelow(i, keys.length, segment(keys[i])));
+            assertEquals(i, indexed.firstNotBelow(0, i, segment(keys[i])));
+            assertEquals(0, indexed.compare(i, Segments.word(segment(keys[i]), 0, keys[i].length), segment(keys[i])));
+        }
+    }
+
+    private static void rounds(boolean encrypted, Random random, Path directory, Function<Random, byte[]> keyShape) throws Exception {
         var cipher = new PageCipher(encrypted ? new SecretKeySpec(new byte[32], "AES") : null);
         var pool = new HeapPool(1 << 20);
         try (var pages = PageFile.open(directory, cipher, 1 << 20, pool)) {
@@ -40,9 +131,7 @@ class TreeUpdateTest {
             var model = new TreeMap<byte[], byte[]>(UNSIGNED);
             var keys = new ArrayList<byte[]>();
             for (var i = 0; i < 30_000; i++) {
-                var key = new byte[1 + random.nextInt(40)];
-                random.nextBytes(key);
-                keys.add(key);
+                keys.add(keyShape.apply(random));
             }
             TreeRoot root = null;
             var deltas = DeltaTable.EMPTY;
@@ -84,7 +173,7 @@ class TreeUpdateTest {
                 }
                 var writer = pages.writer(random.nextLong());
                 var update = new TreeUpdate(pages, writer, space);
-                root = update.apply(root, ops, ranges);
+                root = update.apply(root, ops(ops), ranges);
                 deltas = update.finishDeltas(deltas);
                 writer.flush();
                 for (var unit : update.freed()) {
@@ -117,7 +206,7 @@ class TreeUpdateTest {
                 ops.add(new TreeUpdate.Op(segment("k%06d".formatted(i).getBytes()), segment(new byte[150])));
             }
             var writer = pages.writer(1);
-            var root = new TreeUpdate(pages, writer, space).apply(null, ops, List.of());
+            var root = new TreeUpdate(pages, writer, space).apply(null, ops(ops), List.of());
             writer.flush();
             pages.cache().clearForTests();
             // A hot leaf, read before the scan
@@ -134,6 +223,14 @@ class TreeUpdateTest {
             var late = TreeSearch.lookupCached(pages, root, segment("k019990".getBytes()));
             assertEquals(cacheBytes > 16 << 20 ? TreeSearch.FOUND : TreeSearch.UNKNOWN, late);
         }
+    }
+
+    private static TreeUpdate.Ops ops(List<TreeUpdate.Op> ops) {
+        var prefixes = new long[ops.size()];
+        for (var i = 0; i < prefixes.length; i++) {
+            prefixes[i] = ops.get(i).keyed().word(0);
+        }
+        return new TreeUpdate.Ops(ops.toArray(TreeUpdate.Op[]::new), prefixes, prefixes.length);
     }
 
     private static byte[] value(Random random) {

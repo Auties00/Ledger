@@ -3,7 +3,6 @@ package com.github.auties00.ledger.engine;
 import com.github.auties00.ledger.KeyCodec;
 
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Comparator;
@@ -250,16 +249,7 @@ final class Chain {
 
     /// {@return the 8 bytes of the key at `at`, big-endian, zero past its end}
     long word(long at) {
-        var length = keyLength();
-        var offset = keyOffset();
-        if (at + Long.BYTES <= length) {
-            return keyChunk.get(Segments.BIG_ENDIAN_LONG, offset + at);
-        }
-        var word = 0L;
-        for (var i = at; i < length; i++) {
-            word |= (keyChunk.get(ValueLayout.JAVA_BYTE, offset + i) & 0xFFL) << (56 - 8 * (i - at));
-        }
-        return word;
+        return Segments.word(keyChunk, keyOffset() + at, keyLength() - at);
     }
 
 }

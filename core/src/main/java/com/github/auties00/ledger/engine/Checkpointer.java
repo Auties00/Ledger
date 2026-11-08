@@ -7,11 +7,14 @@ import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.function.Consumer;
@@ -51,6 +54,11 @@ final class Checkpointer implements IdleTicker.Watched {
     /// [IdleTicker] without a commit checkpoints them: below it, a store that writes now and then would checkpoint
     /// after almost every write.
     static final long IDLE_BACKLOG = 1L << 20;
+    /// The dirty chains of a key space from which a checkpoint resolves them on every processor: the small checkpoints
+    /// of a store that commits a little at a time stay on the checkpoint's thread.
+    private static final int PARALLEL_CHAINS = 1 << 16;
+    /// The dirty chains each task of a checkpoint that resolves them on every processor takes.
+    private static final int RESOLVE_CHUNK = 1 << 14;
     // The checkpointers of the open stores of the process, whose writes the trees lack share one heap budget: a budget
     // of half the heap for each store let a process of several busy stores buffer more than the heap
     private static final Set<Checkpointer> OPEN = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
@@ -454,39 +462,8 @@ final class Checkpointer implements IdleTicker.Watched {
             var state = keyspace.state();
             // Listed in the order of their writes, off the publishing role: sorted here
             var chains = keyspace.dirty().toArray(Chain[]::new);
-            ChainSort.sort(chains);
-            var ops = new ArrayList<TreeUpdate.Op>(chains.length);
-            var removals = keyspace.removals();
-            Chain previous = null;
-            for (var chain : chains) {
-                if (previous != null && Chain.sameKey(previous, chain)) {
-                    continue;
-                }
-                previous = chain;
-                // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
-                // otherwise another one, or none
-                var current = chain.released() ? state.chain(chain.key()) : chain;
-                // The key, a segment of its own, only for the range removals to cover
-                var key = removals.length == 0 ? null : chain.key();
-                var version = KeyspaceState.resolve(current == null ? null : current.head, key, bound, removals);
-                if (version == null && !state.resident) {
-                    // No version at the cut in a paged key space: a commit that wrote the key rolled back, so the
-                    // tree is right. A resident one holds every entry, so there the key is gone
-                    continue;
-                }
-                // A blind write the cut takes, the chain's first and so at or below the cut, which sees a version of it:
-                // the leaf the update merges tells whether the tree held the key
-                var blind = current != null && current.blindState() == TreeSearch.UNKNOWN ? current : null;
-                if (version == null || version == Version.HIDDEN) {
-                    ops.add(new TreeUpdate.Op(chain, null, blind));
-                } else {
-                    ops.add(new TreeUpdate.Op(chain, version, blind));
-                    var external = version.external();
-                    if (external != null) {
-                        adopted.add(external);
-                    }
-                }
-            }
+            var words = ChainSort.sort(chains);
+            var ops = resolve(chains, words, state, keyspace.removals(), bound, adopted);
             var ranges = new ArrayList<TreeUpdate.Range>();
             for (var removal : keyspace.removals()) {
                 if (removal.stamp() > treeBound && removal.stamp() <= bound) {
@@ -505,6 +482,87 @@ final class Checkpointer implements IdleTicker.Watched {
             roots[state.id] = root;
         }
         return roots;
+    }
+
+    /// {@return the state as of `bound` of each key `chains` list that has one to write}
+    ///
+    /// From [#PARALLEL_CHAINS] chains on, the chains are read on every processor, in the common fork-join pool: sorted,
+    /// they lie scattered over the heap, and each costs a few waits on memory, which the other processors spend on the
+    /// chains that come next. Nothing here depends on the order the chains are read in, as the states go by position,
+    /// and the commits that go on race with each read the same whichever thread makes it. A failure on any processor
+    /// reaches the caller.
+    ///
+    /// @param chains the chains the cut lists, sorted
+    /// @param words the first 8 bytes of each chain's key, which the states returned take over
+    /// @param adopted receives the units of the file of large values the trees take
+    static TreeUpdate.Ops resolve(Chain[] chains, long[] words, KeyspaceState state, RangeRemoval[] removals, long bound, Set<PageRef> adopted) {
+        var ops = new TreeUpdate.Op[chains.length];
+        if (chains.length < PARALLEL_CHAINS || ForkJoinPool.getCommonPoolParallelism() <= 1) {
+            resolve(chains, words, 0, chains.length, state, removals, bound, ops, adopted);
+        } else {
+            var tasks = new ArrayList<ForkJoinTask<List<PageRef>>>(chains.length / RESOLVE_CHUNK + 1);
+            for (var from = 0; from < chains.length; from += RESOLVE_CHUNK) {
+                var start = from;
+                var end = Math.min(chains.length, from + RESOLVE_CHUNK);
+                tasks.add(ForkJoinTask.adapt(() -> {
+                    var units = new ArrayList<PageRef>();
+                    resolve(chains, words, start, end, state, removals, bound, ops, units);
+                    return units;
+                }));
+            }
+            ForkJoinTask.invokeAll(tasks);
+            for (var task : tasks) {
+                adopted.addAll(task.getRawResult());
+            }
+        }
+        var size = 0;
+        for (var i = 0; i < ops.length; i++) {
+            if (ops[i] == null) {
+                continue;
+            }
+            if (size != i) {
+                ops[size] = ops[i];
+                words[size] = words[i];
+            }
+            size++;
+        }
+        return new TreeUpdate.Ops(ops, words, size);
+    }
+
+    /// Sets each position of `ops` from `from` to `to` to the state as of `bound` of the key of the chain there, if that
+    /// is the first of `chains` with the key and the key has a state to write.
+    private static void resolve(Chain[] chains, long[] words, int from, int to, KeyspaceState state, RangeRemoval[] removals, long bound,
+                                TreeUpdate.Op[] ops, Collection<PageRef> adopted) {
+        for (var i = from; i < to; i++) {
+            var chain = chains[i];
+            // Keys that differ in their first 8 bytes need no look at them
+            if (i > 0 && words[i] == words[i - 1] && Chain.sameKey(chains[i - 1], chain)) {
+                continue;
+            }
+            // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
+            // otherwise another one, or none
+            var current = chain.released() ? state.chain(chain.key()) : chain;
+            // The key, a segment of its own, only for the range removals to cover
+            var key = removals.length == 0 ? null : chain.key();
+            var version = KeyspaceState.resolve(current == null ? null : current.head, key, bound, removals);
+            if (version == null && !state.resident) {
+                // No version at the cut in a paged key space: a commit that wrote the key rolled back, so the
+                // tree is right. A resident one holds every entry, so there the key is gone
+                continue;
+            }
+            // A blind write the cut takes, the chain's first and so at or below the cut, which sees a version of it:
+            // the leaf the update merges tells whether the tree held the key
+            var blind = current != null && current.blindState() == TreeSearch.UNKNOWN ? current : null;
+            if (version == null || version == Version.HIDDEN) {
+                ops[i] = new TreeUpdate.Op(chain, null, blind);
+            } else {
+                ops[i] = new TreeUpdate.Op(chain, version, blind);
+                var external = version.external();
+                if (external != null) {
+                    adopted.add(external);
+                }
+            }
+        }
     }
 
     private PageRef writeCatalog(LiveLedger.Cut cut, TreeRoot[] roots, PageFile.Writer writer, TreeUpdate update) throws IOException {
