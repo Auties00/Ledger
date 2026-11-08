@@ -11,10 +11,14 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.ReentrantLock;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The list of chains a key space orders lazily: what a read of a range sees beside a prune of the list, and the
@@ -76,6 +80,32 @@ class LazyOrderingTest {
         var slice = state.slice(null, null);
         pruner.join();
         assertEquals(chains, slice.size(), "the read of the range saw " + slice.size() + " of " + chains + " chains");
+    }
+
+    @Test
+    @DisplayName("a read of a range finds a chain a commit found in the index before the thread that created it listed it")
+    void chainNotListedYet() throws Exception {
+        var state = new KeyspaceState(MESSAGES);
+        state.lazy = true;
+        var key = Segments.encodeKey(KeyCodec.utf8(), "k");
+        // The creator is descheduled between its insert into the index and its push on the list
+        var created = new Chain(key, Segments.hash(key));
+        var index = KeyspaceState.class.getDeclaredField("index");
+        index.setAccessible(true);
+        ((ChainIndex) index.get(state)).putIfAbsent(created);
+        // Another commit opens the key, and must not publish a version of it before a read of a range can find it
+        try (var other = Executors.newSingleThreadExecutor()) {
+            var opened = other.submit(() -> state.open(key));
+            assertThrows(TimeoutException.class, () -> opened.get(200, TimeUnit.MILLISECONDS));
+            // The creator goes on, and lists the chain with no other thread writing its link
+            var list = KeyspaceState.class.getDeclaredMethod("list", Chain.class);
+            list.setAccessible(true);
+            list.invoke(state, created);
+            assertSame(created, opened.get(30, TimeUnit.SECONDS));
+        }
+        assertSame(created, state.slice(null, null).get(key));
+        assertEquals(1, state.slice(null, null).size());
+        assertEquals(0, listed(state));
     }
 
     @Test

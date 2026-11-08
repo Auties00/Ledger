@@ -250,6 +250,12 @@ final class KeyspaceState {
     /// Safe for concurrent use: commits call it for the keys they are about to write, so the ordered map, the costly
     /// one, grows before their turn. A chain dropped meanwhile is returned dropped; the sequencer, which finds it so
     /// when it gives the commit its writes, opens the key again.
+    ///
+    /// A read of a range finds the chain it returns. A chain enters the index before the thread that created it lists
+    /// or orders it, and a commit that finds it there may publish before that thread goes on. So one that finds it
+    /// neither listed nor ordered orders it itself where chains order eagerly, and otherwise waits the few instructions
+    /// until its creator lists it: the link of a chain holds the list until a thread orders it and the chain below it
+    /// after, so the creator alone may enter it on the list.
     Chain open(MemorySegment key) {
         var hash = Segments.hash(key);
         var chain = index.get(key, hash);
@@ -269,10 +275,21 @@ final class KeyspaceState {
                 }
             }
         }
-        if (!lazy && !chain.ordered()) {
-            order(chain);
+        if (!chain.reachable()) {
+            if (lazy) {
+                awaitListed(chain);
+            } else {
+                order(chain);
+            }
         }
         return chain;
+    }
+
+    /// Waits until the thread that created `chain`, which entered the index and is about to enter the list, listed it.
+    private static void awaitListed(Chain chain) {
+        while (!chain.reachable()) {
+            Thread.yield();
+        }
     }
 
     /// Lists `chain` among those a read of a range orders first.
@@ -281,6 +298,7 @@ final class KeyspaceState {
             var head = unordered;
             chain.link = head;
             if (UNORDERED.compareAndSet(this, head, chain)) {
+                chain.markListed();
                 return;
             }
         }
