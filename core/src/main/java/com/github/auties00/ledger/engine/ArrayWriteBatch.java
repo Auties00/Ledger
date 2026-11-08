@@ -59,6 +59,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     private byte homesMode;
     // In HOMES_CHUNKS, the segment each write's value was copied into, or null, and where in it the value starts
     private MemorySegment[] homes;
+    private byte[][] homeArrays;
     private int[] homeOffsets;
 
     private byte[] kinds;
@@ -326,6 +327,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// @param copies whether the store copies every value it keeps, as a store in memory does, so no write has a home
     void prepare(boolean copies) {
         homes = null;
+        homeArrays = null;
         homeOffsets = null;
         homesMode = HOMES_NONE;
         if (copies) {
@@ -357,6 +359,7 @@ public final class ArrayWriteBatch implements WriteBatch {
             return;
         }
         homes = new MemorySegment[size];
+        homeArrays = new byte[size][];
         homeOffsets = new int[size];
         homesMode = HOMES_CHUNKS;
         var chunk = (byte[]) null;
@@ -378,6 +381,7 @@ public final class ArrayWriteBatch implements WriteBatch {
                 // A value of half a chunk or more gets an array of its own, which no other value shares
                 var own = Arrays.copyOfRange(data, offset, offset + length);
                 homes[i] = MemorySegment.ofArray(own).asReadOnly();
+                homeArrays[i] = own;
                 continue;
             }
             if (chunk == null || fill + length > chunk.length) {
@@ -388,6 +392,7 @@ public final class ArrayWriteBatch implements WriteBatch {
             }
             System.arraycopy(data, offset, chunk, fill, length);
             homes[i] = chunkView;
+            homeArrays[i] = chunk;
             homeOffsets[i] = fill;
             fill += length;
             remaining -= length;
@@ -414,6 +419,21 @@ public final class ArrayWriteBatch implements WriteBatch {
         };
     }
 
+    /// {@return the array [#home(int)] is a view of, or `null` if the store copies the value}
+    ///
+    /// No one writes the array once [#prepare(boolean)] returned and the pool never gets it back, as [#finish()] and
+    /// [#detach()] say, so whoever refers to it may do so after the batch has started again.
+    ///
+    /// @param index a write that puts a value
+    byte[] homeArray(int index) {
+        Objects.checkIndex(index, size);
+        return switch (homesMode) {
+            case HOMES_OWN -> data;
+            case HOMES_CHUNKS -> homeArrays[index];
+            default -> null;
+        };
+    }
+
     /// {@return where in [#home(int)] the value of write `index` starts}
     ///
     /// @param index a write that puts a value and has a home
@@ -431,6 +451,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     void finish() {
         var own = homesMode == HOMES_OWN;
         homes = null;
+        homeArrays = null;
         homeOffsets = null;
         homesMode = HOMES_NONE;
         if (own) {

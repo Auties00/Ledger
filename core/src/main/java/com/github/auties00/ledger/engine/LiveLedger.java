@@ -603,7 +603,7 @@ public final class LiveLedger implements Ledger {
         try {
             ensureOpen();
             checkHealthy();
-            var applier = new Applier(sequenced.next, log != null, writes.size(), log == null ? 0 : FrameBody.capacityFor(writes, units));
+            var applier = new Applier(sequenced.next, log == null ? null : FrameBody.forCommit(writes, units), writes.size());
             if (outcome != null) {
                 outcome[0] = applier;
             }
@@ -614,7 +614,7 @@ public final class LiveLedger implements Ledger {
                         case ArrayWriteBatch.PUT -> {
                             var value = writes.value(i);
                             var decoded = state.resident ? residentValue(state, writes.decodedValue(i), value) : null;
-                            applier.put(state, applier.claim(state, writes.key(i)), writes.key(i), value, writes.home(i), writes.homeOffset(i), decoded,
+                            applier.put(state, applier.claim(state, writes.key(i)), writes.key(i), value, writes.home(i), writes.homeArray(i), writes.homeOffset(i), decoded,
                                     hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree), units == null ? null : units[i]);
                         }
                         case ArrayWriteBatch.DELETE ->
@@ -834,8 +834,7 @@ public final class LiveLedger implements Ledger {
     /// go on, and its committing thread throws the failure.
     private void apply(PendingCommit pending) {
         var writes = pending.writes;
-        var applier = new Applier(pending.sequence, log != null, pending.writes.size(),
-                log == null ? 0 : FrameBody.capacityFor(pending.writes, pending.units));
+        var applier = new Applier(pending.sequence, log == null ? null : FrameBody.forCommit(writes, pending.units), writes.size());
         try {
             for (var i = 0; i < writes.size(); i++) {
                 var predecessor = pending.predecessors[i];
@@ -844,7 +843,7 @@ public final class LiveLedger implements Ledger {
                 }
                 var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(i, tree);
                 if (writes.kind(i) == ArrayWriteBatch.PUT) {
-                    applier.put(pending.states[i], pending.chains[i], writes.key(i), writes.value(i), writes.home(i), writes.homeOffset(i),
+                    applier.put(pending.states[i], pending.chains[i], writes.key(i), writes.value(i), writes.home(i), writes.homeArray(i), writes.homeOffset(i),
                             pending.decoded == null ? null : pending.decoded[i], inTree, pending.units == null ? null : pending.units[i]);
                 } else {
                     applier.delete(pending.states[i], pending.chains[i], writes.key(i), inTree);
@@ -1924,18 +1923,19 @@ public final class LiveLedger implements Ledger {
         private List<Version.External> replaced;
 
         Applier(long sequence, boolean journaled) {
-            this(sequence, journaled, 4, 256);
+            this(sequence, journaled ? new FrameBody() : null, 4);
         }
 
-        /// Creates the applier of a commit of about `writes` writes, whose frame body takes about `frameBytes`.
-        Applier(long sequence, boolean journaled, int writes, int frameBytes) {
+        /// Creates the applier of a commit of about `writes` writes.
+        ///
+        /// @param frame the empty body of the commit's frame, or `null` when nothing is journaled
+        Applier(long sequence, FrameBody frame, int writes) {
             this.sequence = sequence;
             // Most commits write one or two key spaces
             this.deltaStates = new KeyspaceState[2];
             this.deltas = new long[2];
             this.touched = new ArrayList<>(writes);
-            this.frame = journaled ? new FrameBody(frameBytes) : null;
-
+            this.frame = frame;
         }
 
         /// {@return whether the commit's frame is queued in the log}
@@ -2017,7 +2017,13 @@ public final class LiveLedger implements Ledger {
         /// @param external the unit of the file of large values that holds `value` too, or `null`
         void put(KeyspaceState state, MemorySegment key, MemorySegment value, Object decoded, byte inTree, PageRef external) {
             // Usually opened already by the commit's prefetch
-            put(state, claim(state, key), key, value, null, 0, decoded, inTree, external);
+            put(state, claim(state, key), key, value, null, null, 0, decoded, inTree, external);
+        }
+
+        /// Applies a put of `key` whose value is the whole of `value`, an array of its own that no one writes from now
+        /// on, so the commit's frame may refer to it.
+        void putOwn(KeyspaceState state, MemorySegment key, byte[] value, Object decoded) {
+            put(state, claim(state, key), key, MemorySegment.ofArray(value).asReadOnly(), null, value, 0, decoded, TreeSearch.UNKNOWN, null);
         }
 
         /// {@return the chain of `key`, claimed for a write of an operation that runs alone}
@@ -2036,23 +2042,32 @@ public final class LiveLedger implements Ledger {
         ///
         /// @param source the read-only segment `value` is part of, which the version keeps in its place, or `null` for a
         ///               value of its own
-        /// @param offset where `value` starts in `source`
-        void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, MemorySegment source, int offset,
+        /// @param array the array `value` lies in at `offset`, which no one writes from now on and the store's pool never
+        ///              hands out, so the commit's frame may refer to it; or `null` if `value` may be on any other memory
+        /// @param offset where `value` starts in `source`, and in `array` if there is one
+        void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, MemorySegment source, byte[] array, int offset,
                  Object decoded, byte inTree, PageRef external) {
             var stamp = nextStamp();
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
             var length = Math.toIntExact(value.byteSize());
             Version version;
+            // The array the frame may refer to, and where the value starts in it
+            var kept = array;
+            var keptAt = offset;
             if (state.resident && state.keyspace.values() == BuiltinCodecs.BYTES_VALUE) {
                 // A byte array is its own encoding: one copy of the store's serves the reads, which return the instance
                 // the store holds, and the checkpoints, where the caller's array and a copy of it served them apart
                 var own = Segments.toBytes(value);
                 version = Version.ofOwn(stamp, own, own, head, external);
+                // Reads hand this instance out, so the frame keeps a copy of its own
+                kept = null;
             } else if (state.resident && (source == null || source.byteSize() > 2L * length + RESIDENT_SLACK)) {
                 // A resident version lives as long as its key does: on a value of its own, not on the array of the
                 // batch or the log frame it came in, which a session written beside ten messages held 12 times over
-                version = Version.ofOwn(stamp, Segments.toBytes(value), decoded, head, external);
+                kept = Segments.toBytes(value);
+                keptAt = 0;
+                version = Version.ofOwn(stamp, kept, decoded, head, external);
             } else if (source == null && pages == null) {
                 // A store in memory keeps a version until a write replaces it, so on an array of its own: on a batch's,
                 // a value that outlived the writes beside it kept them all, three times the bytes of each key
@@ -2079,6 +2094,8 @@ public final class LiveLedger implements Ledger {
                 if (external != null) {
                     frame.putExternal(state.id, key, value.byteSize(), external);
                     unitBytes += value.byteSize();
+                } else if (kept != null) {
+                    frame.put(state.id, key, kept, keptAt, length);
                 } else {
                     frame.put(state.id, key, value);
                 }

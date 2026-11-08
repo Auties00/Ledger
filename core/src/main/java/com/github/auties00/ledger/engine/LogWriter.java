@@ -104,7 +104,8 @@ final class LogWriter {
     private static final int MIN_OUTPUT = 16 << 10;
     /// The groups in a row, each fitting in half of [#MIN_OUTPUT], after which a larger buffer goes back to it.
     private static final int SHRINK_AFTER = 256;
-    /// The bytes of a frame body sealed in one call, a multiple of the AES block.
+    /// The bytes of a frame body sealed in one call, a multiple of the AES block, so the cipher holds no part of a block
+    /// back between two calls for a frame.
     private static final int SLICE = 64 << 10;
     /// The bytes of frame bodies the queue holds before commits wait for the device.
     private static final long QUEUE_LIMIT = 64L << 20;
@@ -687,7 +688,8 @@ final class LogWriter {
     /// Seals `frame` into the output, writing the output out whenever it fills.
     ///
     /// The body goes to the cipher a slice at a time: the frame is the one GCM message a single call would make, and
-    /// the output stays at most [#OUTPUT] bytes whatever the frame's size.
+    /// the output stays at most [#OUTPUT] bytes whatever the frame's size. Each byte of the body is read once, so the
+    /// tag or checksum of a frame always covers the bytes the frame holds, whatever an array it refers to holds later.
     private void seal(Queued frame, int sealedLength, boolean groupStart) throws IOException {
         room(FRAME_HEADER);
         var at = used;
@@ -699,19 +701,13 @@ final class LogWriter {
         crc.update(output, at, FRAME_HEADER - Integer.BYTES);
         header.putInt((int) crc.getValue());
         used += FRAME_HEADER;
-        var body = frame.body().array();
-        var length = frame.body().size();
+        var body = frame.body();
         if (cipher != null) {
             try {
                 cipher.init(Cipher.ENCRYPT_MODE, segmentKey, new GCMParameterSpec(TAG_BYTES * 8, nonce(frameOffset)));
                 // The cipher keeps the additional data, so the header may leave the output before the body is sealed
                 cipher.updateAAD(output, at, FRAME_HEADER);
-                for (var offset = 0; offset < length; ) {
-                    var slice = Math.min(SLICE, length - offset);
-                    room(slice + TAG_BYTES);
-                    used += cipher.update(body, offset, slice, output, used);
-                    offset += slice;
-                }
+                encrypt(body);
                 room(2 * TAG_BYTES);
                 used += cipher.doFinal(output, used);
             } catch (GeneralSecurityException exception) {
@@ -719,20 +715,64 @@ final class LogWriter {
             }
             return;
         }
-        // Without encryption the CRC covers the header and the body
+        // Without encryption the CRC covers the header and the body, as the output holds them
         crc.reset();
         crc.update(output, at, FRAME_HEADER);
-        for (var offset = 0; offset < length; ) {
-            var slice = Math.min(SLICE, length - offset);
-            room(slice);
-            System.arraycopy(body, offset, output, used, slice);
-            crc.update(body, offset, slice);
-            used += slice;
-            offset += slice;
+        for (var piece = 0; piece < body.pieces(); piece++) {
+            var array = body.pieceArray(piece);
+            var offset = body.pieceOffset(piece);
+            for (var left = body.pieceLength(piece); left > 0; ) {
+                var slice = Math.min(SLICE, left);
+                room(slice);
+                System.arraycopy(array, offset, output, used, slice);
+                crc.update(output, used, slice);
+                used += slice;
+                offset += slice;
+                left -= slice;
+            }
         }
         room(Integer.BYTES);
         ByteBuffer.wrap(output, used, Integer.BYTES).putInt((int) crc.getValue());
         used += Integer.BYTES;
+    }
+
+    /// Encrypts the pieces of `body` into the output, past the frame's header.
+    ///
+    /// Every call to the cipher but the last takes [#SLICE] bytes. Pieces shorter than that are gathered in the output
+    /// itself and encrypted in place: a call per value of a kilobyte would keep the cipher from its fastest path, which
+    /// runs on long inputs only, and make it hold part of a block back at each call, in an array it allocates for that.
+    /// A piece that reaches the cipher with nothing gathered before it goes without a copy, if it holds a slice or ends
+    /// the body, as the whole of a body that refers to nothing does.
+    private void encrypt(FrameBody body) throws IOException, GeneralSecurityException {
+        var remaining = body.size();
+        var gathered = 0;
+        for (var piece = 0; piece < body.pieces(); piece++) {
+            var array = body.pieceArray(piece);
+            var offset = body.pieceOffset(piece);
+            var left = body.pieceLength(piece);
+            while (left > 0) {
+                int taken;
+                if (gathered == 0 && (left >= SLICE || left == remaining)) {
+                    taken = Math.min(SLICE, left);
+                    room(taken + TAG_BYTES);
+                    used += cipher.update(array, offset, taken, output, used);
+                } else {
+                    if (gathered == 0) {
+                        room(Math.min(SLICE, remaining) + TAG_BYTES);
+                    }
+                    taken = Math.min(SLICE - gathered, left);
+                    System.arraycopy(array, offset, output, used + gathered, taken);
+                    gathered += taken;
+                    if (gathered == SLICE || taken == remaining) {
+                        used += cipher.update(output, used, gathered, output, used);
+                        gathered = 0;
+                    }
+                }
+                offset += taken;
+                left -= taken;
+                remaining -= taken;
+            }
+        }
     }
 
     /// {@return the force of the file of large values, started on a thread of its own}
@@ -807,7 +847,7 @@ final class LogWriter {
     ///
     /// @param type the frame type
     /// @param sequence the sequence it carries
-    /// @param body its body, which the writer owns
+    /// @param body its body, which the writer owns, on arrays no one writes
     private record Queued(byte type, long sequence, FrameBody body) {
     }
 

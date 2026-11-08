@@ -88,9 +88,9 @@ final class LiveTransaction implements Transaction {
         if (size < 0 || size > ValueCodec.MAX_LENGTH) {
             throw new IllegalArgumentException("Values are at most " + ValueCodec.MAX_LENGTH + " bytes: " + size);
         }
-        var encodedValue = MemorySegment.ofArray(new byte[Math.toIntExact(size)]);
-        keyspace.values().encode(value, encodedValue);
-        applier.put(state, encodedKey, encodedValue.asReadOnly(), state.resident ? value : null);
+        var encodedValue = new byte[Math.toIntExact(size)];
+        keyspace.values().encode(value, MemorySegment.ofArray(encodedValue));
+        applier.putOwn(state, encodedKey, encodedValue, state.resident ? value : null);
         return this;
     }
 
@@ -105,8 +105,8 @@ final class LiveTransaction implements Transaction {
             throw new IllegalArgumentException("Values are at most " + ValueCodec.MAX_LENGTH + " bytes: " + value.byteSize());
         }
         var ownKey = Segments.copy(key);
-        var ownValue = Segments.copy(value);
-        applier.put(state, ownKey, ownValue, state.resident ? keyspace.values().decode(ownValue) : null);
+        var ownValue = Segments.toBytes(value);
+        applier.putOwn(state, ownKey, ownValue, state.resident ? keyspace.values().decode(MemorySegment.ofArray(ownValue).asReadOnly()) : null);
         return this;
     }
 
