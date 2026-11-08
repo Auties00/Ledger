@@ -110,6 +110,27 @@ jobs:
           JMH_ARGS: ${{ inputs.jmh-args }}
         run: |
           mkdir -p results
+          # A workload that prints nothing for 30 minutes has hung: record the threads of every JVM into results/ and
+          # kill the benchmark's fork, so that JMH goes on to the next workload and the job still reports the others.
+          (
+            size=-1; still=0
+            while [ ! -f results/.done ]; do
+              sleep 60
+              now=$(cat results/*.log 2>/dev/null | wc -c)
+              if [ "$now" = "$size" ]; then still=$((still + 1)); else still=0; size=$now; fi
+              if [ "$still" -ge 30 ]; then
+                still=0
+                stamp=$(date +%H%M%S)
+                echo "No output for 30 minutes at $stamp" >> results/watchdog.txt
+                for pid in $(jps -q); do
+                  { jps -l | grep "^$pid " ; timeout 60 jcmd "$pid" Thread.print; } > "results/threads-$stamp-$pid.txt" 2>&1
+                done
+                for pid in $(jps -l | grep -i forkedmain | cut -d' ' -f1); do
+                  if command -v taskkill > /dev/null; then taskkill //F //PID "$pid"; else kill -9 "$pid"; fi
+                done >> results/watchdog.txt 2>&1
+              fi
+            done
+          ) &
           for round in $(seq 1 "$ROUNDS"); do
             for side in base head; do
               echo "::group::$side, round $round"
@@ -119,6 +140,7 @@ jobs:
               echo "::endgroup::"
             done
           done
+          touch results/.done
 
       - name: Summarize
         if: always() && hashFiles('results/*.json') != ''
