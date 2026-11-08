@@ -5,14 +5,15 @@ import java.util.Set;
 import java.util.WeakHashMap;
 
 /// The thread of the process that gives back what its stores hold while they are idle, one tick every
-/// [#PERIOD_MILLIS]: the free arrays of pools no one took one from, the cached pages no read used, and the writes the
-/// trees of a store that stopped writing lack.
+/// [#PERIOD_MILLIS]: the free arrays of pools no one took one from, the cached pages no read used, the read channels of
+/// checkpoints that stopped, and the writes the trees of a store that stopped writing lack.
 ///
 /// It holds what it watches weakly, so a store that is never closed stops being watched once the collector takes it.
 /// It starts with the first object it watches and never stops; between ticks it is a parked virtual thread.
 final class IdleTicker {
     /// The time between two ticks: a pool that goes a tick without an acquire frees its arrays, a cached page that goes
-    /// two ticks without a read leaves the cache, and a store that goes a tick without a commit checkpoints.
+    /// two ticks without a read leaves the cache, a read channel of the checkpoints that goes a tick without a read
+    /// closes, and a store that goes a tick without a commit checkpoints.
     static final long PERIOD_MILLIS = 30_000;
     // What the thread ticks, weakly; guarded by itself
     private static final Set<Watched> WATCHED = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));

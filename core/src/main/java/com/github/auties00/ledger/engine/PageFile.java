@@ -17,7 +17,9 @@ import java.util.TreeMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.stream.IntStream;
@@ -26,13 +28,18 @@ import java.util.stream.IntStream;
 /// them, and the superblocks.
 ///
 /// Reads run on the calling thread, each on a channel of its own from a small pool: Windows serializes positional
-/// reads on one channel, and an interrupt during a read closes the channel it ran on, which then is replaced. Writes run
-/// on the one thread that writes a checkpoint, through a [Writer].
+/// reads on one channel, and an interrupt during a read closes the channel it ran on, which then is replaced. The reads
+/// a checkpoint batches ([#readBatch(List, byte\[\])]) take channels of a pool of their own, so they never keep the
+/// store's other reads waiting for one. Writes run on the one thread that writes a checkpoint, through a [Writer].
 final class PageFile implements AutoCloseable {
     static final String FILE = "ledger.data";
     /// The channels reads take turns on, and the most threads [#readAll(List, byte, int)] reads on.
     static final int READ_CHANNELS = 8;
-    /// The most pages [#readAll(List, byte, int)] reads with one call.
+    /// The most reads of [#readBatch(List, byte\[\])] that run at once, however many threads of a checkpoint batch
+    /// reads. On Windows a read that meets a force of the log ends only with the force, about 12 ms later, however many
+    /// are in flight, so the reads a checkpoint gets done in that time are the reads it has in flight.
+    private static final int BATCH_READS = 32;
+    /// The most pages [#readAll(List, byte, int)] and [#readBatch(List, byte\[\])] read with one call.
     static final int RUN_PAGES = 64;
     private static final int STAGED_LIMIT = 8 << 20;
     // The staged bytes a flush seals before it writes them, which bounds the sealed arrays it holds at once
@@ -51,7 +58,13 @@ final class PageFile implements AutoCloseable {
     private final PageCipher cipher;
     private final PageCache cache;
     private final HeapPool pool;
-    private final ArrayBlockingQueue<FileChannel> readers;
+    private final ReadChannels readers;
+    // The channels of the reads a checkpoint batches, opened as they are first needed
+    private final ReadChannels batchReaders;
+    // Closes the batch channels no read took for a tick of the idle ticker, which holds it weakly
+    private final IdleTicker.Watched trimmer;
+    // The leaves the batches read, for tests that a checkpoint reads the bases of delta records together
+    private final AtomicLong batchedLeaves = new AtomicLong();
     private final FileChannel writer;
     // The file of large values, which leaves point into
     private volatile BlobFile blobs;
@@ -63,15 +76,16 @@ final class PageFile implements AutoCloseable {
         this.cache = cache;
         this.pool = pool;
         this.writer = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
-        this.readers = new ArrayBlockingQueue<>(READ_CHANNELS);
+        this.readers = new ReadChannels(READ_CHANNELS);
+        this.batchReaders = new ReadChannels(BATCH_READS);
+        this.trimmer = batchReaders::trimIfIdle;
         try {
-            for (var i = 0; i < READ_CHANNELS; i++) {
-                readers.add(FileChannel.open(path, StandardOpenOption.READ));
-            }
+            readers.open(READ_CHANNELS);
         } catch (IOException exception) {
             close();
             throw exception;
         }
+        IdleTicker.watch(trimmer);
     }
 
     /// Opens the data file of the store in `directory`, creating it with two empty superblocks if there is none.
@@ -192,7 +206,7 @@ final class PageFile implements AutoCloseable {
         var length = ref.pages() * PageFormat.SIZE;
         var sealed = pool.acquire(length);
         try {
-            readFully(sealed, length, PageFormat.offset(ref.page()));
+            readFully(readers, readers.take(), sealed, length, PageFormat.offset(ref.page()));
             // The header is the additional data of the tag and the open copies it as it is, so what it says holds once
             // the unit authenticates: it is checked first, and tells the bytes to keep
             var content = Bytes.i32(sealed, PageFormat.LENGTH);
@@ -214,13 +228,54 @@ final class PageFile implements AutoCloseable {
     /// {@return the plaintext of the units `refs` name, in their order, none of them cached}
     ///
     /// Units in consecutive pages are read with one call, up to [#RUN_PAGES] pages, and the calls run on at most
-    /// `threads` virtual threads, and no more than there are read channels: reading many units one after another out of
-    /// the OS cache made the caller wait for each read in turn.
+    /// `threads` threads, the caller's and virtual ones, and no more than there are read channels: reading many units
+    /// one after another out of the OS cache made the caller wait for each read in turn.
     ///
     /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
     /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
     /// @throws LedgerIoException if the file cannot be read
     byte[][] readAll(List<PageRef> refs, byte kind, int threads) {
+        var kinds = new byte[refs.size()];
+        Arrays.fill(kinds, kind);
+        return readRuns(refs, kinds, readers, Math.min(READ_CHANNELS, threads), true);
+    }
+
+    /// {@return the plaintext of the units `refs` name, in their order, read from the file, none of them cached and each
+    /// as long as the page cache would keep it}
+    ///
+    /// For the reads of a checkpoint, whose caller looked in the cache and in the checkpoint's writer already. Units in
+    /// consecutive pages are read with one call, up to [#RUN_PAGES] pages; the calls run on the caller's thread and on
+    /// virtual threads, on channels apart from those of the store's other reads, and at most [#BATCH_READS] of them at
+    /// once across every thread that calls this method. A single call runs on the caller's thread alone.
+    ///
+    /// @param refs the units, none of them a delta record and none named twice
+    /// @param kinds the kind each unit must have, by index, or [#NODE] for a leaf or a branch
+    /// @throws IllegalArgumentException if a reference names a delta record
+    /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[][] readBatch(List<PageRef> refs, byte[] kinds) {
+        var leaves = 0;
+        for (var i = 0; i < refs.size(); i++) {
+            var ref = refs.get(i);
+            if (ref.isRecord()) {
+                throw new IllegalArgumentException("A batch reads units, not the delta record at page " + ref.page());
+            }
+            if (kinds[i] == PageFormat.LEAF) {
+                leaves++;
+            }
+        }
+        batchedLeaves.addAndGet(leaves);
+        return readRuns(refs, kinds, batchReaders, BATCH_READS, false);
+    }
+
+    /// {@return the plaintext of the units `refs` name, in their order, read in runs of consecutive pages on at most
+    /// `threads` threads, the caller's among them, each run on a channel of `channels`}
+    ///
+    /// Every thread it starts ends before it returns or throws.
+    ///
+    /// @param throughCache whether a unit read alone, a delta record or one the cache holds among them, is read
+    ///                     through [#read(PageRef, byte, boolean)]
+    private byte[][] readRuns(List<PageRef> refs, byte[] kinds, ReadChannels channels, int threads, boolean throughCache) {
         var units = new byte[refs.size()][];
         var order = new Integer[refs.size()];
         for (var i = 0; i < order.length; i++) {
@@ -234,7 +289,7 @@ final class PageFile implements AutoCloseable {
         var next = -1;
         for (var index : order) {
             var ref = refs.get(index);
-            var alone = ref.isRecord() || cache.get(ref) != null;
+            var alone = throughCache && (ref.isRecord() || cache.get(ref) != null);
             if (!run.isEmpty() && (alone || ref.page() != next || runPages + ref.pages() > RUN_PAGES)) {
                 runs.add(run.stream().mapToInt(Integer::intValue).toArray());
                 run.clear();
@@ -252,62 +307,85 @@ final class PageFile implements AutoCloseable {
             runs.add(run.stream().mapToInt(Integer::intValue).toArray());
         }
         var claimed = new AtomicInteger();
-        var failure = new AtomicReference<RuntimeException>();
+        var failure = new AtomicReference<Throwable>();
         Runnable reader = () -> {
             for (var i = claimed.getAndIncrement(); i < runs.size() && failure.get() == null; i = claimed.getAndIncrement()) {
                 try {
-                    readRun(refs, runs.get(i), kind, units);
-                } catch (RuntimeException exception) {
-                    failure.compareAndSet(null, exception);
+                    var indexes = runs.get(i);
+                    if (throughCache && indexes.length == 1) {
+                        units[indexes[0]] = read(refs.get(indexes[0]), kinds[indexes[0]], false);
+                    } else {
+                        readRun(channels, refs, indexes, kinds, units, !throughCache);
+                    }
+                } catch (Throwable throwable) {
+                    // An error too, such as running out of memory: the slot it left empty would read as a unit
+                    failure.compareAndSet(null, throwable);
                 }
             }
         };
-        var running = Math.min(Math.min(READ_CHANNELS, threads), runs.size());
-        if (running <= 1) {
-            reader.run();
-        } else {
-            var started = new Thread[running];
-            for (var i = 0; i < running; i++) {
-                started[i] = Thread.ofVirtual().name("ledger-read").start(reader);
+        var started = new Thread[Math.max(0, Math.min(threads, runs.size()) - 1)];
+        var count = 0;
+        try {
+            for (; count < started.length; count++) {
+                started[count] = Thread.ofVirtual().name("ledger-read").start(reader);
             }
-            var interrupted = false;
-            for (var thread : started) {
-                while (true) {
-                    try {
-                        thread.join();
-                        break;
-                    } catch (InterruptedException _) {
-                        interrupted = true;
-                    }
+        } catch (Throwable throwable) {
+            // The threads started read on and are joined; the caller's reads nothing more
+            failure.compareAndSet(null, throwable);
+        }
+        reader.run();
+        var interrupted = false;
+        for (var i = 0; i < count; i++) {
+            while (true) {
+                try {
+                    started[i].join();
+                    break;
+                } catch (InterruptedException _) {
+                    interrupted = true;
                 }
             }
-            if (interrupted) {
-                Thread.currentThread().interrupt();
-            }
         }
-        if (failure.get() != null) {
-            throw failure.get();
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
-        return units;
+        return switch (failure.get()) {
+            case null -> units;
+            case RuntimeException exception -> throw exception;
+            case Error error -> throw error;
+            case Throwable other -> throw new IllegalStateException(other);
+        };
     }
 
-    /// Reads the units at `indexes` of `refs`, in consecutive pages, with one call, into `units`.
-    private void readRun(List<PageRef> refs, int[] indexes, byte kind, byte[][] units) {
-        if (indexes.length == 1) {
-            units[indexes[0]] = read(refs.get(indexes[0]), kind, false);
-            return;
-        }
+    /// Reads the units at `indexes` of `refs`, in consecutive pages, with one call on a channel of `channels`, into
+    /// `units`.
+    ///
+    /// It takes the channel before the array the call reads into, so the arrays the reads hold at once are bounded by
+    /// the channels in use, not by the threads that wait for one.
+    ///
+    /// @param forCache whether each unit may end with its content, as the page cache keeps it
+    private void readRun(ReadChannels channels, List<PageRef> refs, int[] indexes, byte[] kinds, byte[][] units, boolean forCache) {
         var first = refs.get(indexes[0]).page();
         var last = refs.get(indexes[indexes.length - 1]);
         var length = (last.page() + last.pages() - first) * PageFormat.SIZE;
-        var sealed = pool.acquire(length);
+        var channel = channels.take();
+        byte[] sealed;
         try {
-            readFully(sealed, length, PageFormat.offset(first));
+            sealed = pool.acquire(length);
+        } catch (Throwable throwable) {
+            channels.give(channel);
+            throw throwable;
+        }
+        try {
+            readFully(channels, channel, sealed, length, PageFormat.offset(first));
             for (var index : indexes) {
                 var ref = refs.get(index);
-                var plain = new byte[ref.pages() * PageFormat.SIZE];
-                if (!cipher.open(sealed, (ref.page() - first) * PageFormat.SIZE, ref.pages(), plain) || !ref.describes(plain)
-                        || !kindMatches(plain[PageFormat.KIND], kind)) {
+                var offset = (ref.page() - first) * PageFormat.SIZE;
+                // The header is the additional data of the tag, so a length it lies about fails the open
+                var content = Bytes.i32(sealed, offset + PageFormat.LENGTH);
+                var plain = PageFormat.fits(ref.pages(), content)
+                        ? cipher.open(sealed, offset, ref.pages(), forCache ? PageFormat.cachedLength(ref.pages(), content) : ref.pages() * PageFormat.SIZE, pool)
+                        : null;
+                if (plain == null || !ref.describes(plain) || !kindMatches(plain[PageFormat.KIND], kinds[index])) {
                     throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
                 }
                 units[index] = plain;
@@ -325,12 +403,18 @@ final class PageFile implements AutoCloseable {
         return hit != null && kindMatches(hit[PageFormat.KIND], kind) ? hit : null;
     }
 
+    /// {@return the leaves [#readBatch(List, byte\[\])] was asked for, for tests of what a checkpoint reads together}
+    long batchedLeavesForTests() {
+        return batchedLeaves.get();
+    }
+
     private static boolean kindMatches(byte actual, byte expected) {
         return expected == NODE ? actual == PageFormat.LEAF || actual == PageFormat.BRANCH : actual == expected;
     }
 
-    private void readFully(byte[] array, int length, long position) {
-        var channel = takeChannel();
+    /// Reads `length` bytes at `position` into `array` on `channel`, which `channels` gave, and gives it back to them,
+    /// or the channel that replaced it if an interrupt closed it.
+    private void readFully(ReadChannels channels, FileChannel channel, byte[] array, int length, long position) {
         var interrupted = false;
         try {
             var buffer = ByteBuffer.wrap(array, 0, length);
@@ -348,7 +432,7 @@ final class PageFile implements AutoCloseable {
         } catch (IOException exception) {
             throw new LedgerIoException(path + " could not be read", exception);
         } finally {
-            readers.offer(channel);
+            channels.give(channel);
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }
@@ -356,7 +440,7 @@ final class PageFile implements AutoCloseable {
     }
 
     private boolean readAvailable(byte[] array, long position) {
-        var channel = takeChannel();
+        var channel = readers.take();
         try {
             var buffer = ByteBuffer.wrap(array);
             while (buffer.hasRemaining()) {
@@ -368,37 +452,7 @@ final class PageFile implements AutoCloseable {
         } catch (IOException exception) {
             throw new LedgerIoException(path + " could not be read", exception);
         } finally {
-            readers.offer(channel);
-        }
-    }
-
-    private FileChannel takeChannel() {
-        if (closed) {
-            throw new IllegalStateException("The store is closed");
-        }
-        var interrupted = false;
-        try {
-            while (true) {
-                try {
-                    var channel = readers.take();
-                    if (channel.isOpen()) {
-                        return channel;
-                    }
-                    // A channel an interrupt closed and that could not be replaced at the time
-                    try {
-                        return FileChannel.open(path, StandardOpenOption.READ);
-                    } catch (IOException exception) {
-                        readers.offer(channel);
-                        throw new LedgerIoException(path + " could not be opened", exception);
-                    }
-                } catch (InterruptedException _) {
-                    interrupted = true;
-                }
-            }
-        } finally {
-            if (interrupted) {
-                Thread.currentThread().interrupt();
-            }
+            readers.give(channel);
         }
     }
 
@@ -468,22 +522,106 @@ final class PageFile implements AutoCloseable {
     @Override
     public void close() {
         closed = true;
+        IdleTicker.unwatch(trimmer);
         cache.close();
         var external = blobs;
         if (external != null) {
             external.close();
         }
-        for (var channel : readers) {
+        readers.closeIdle();
+        batchReaders.closeIdle();
+        try {
+            writer.close();
+        } catch (IOException _) {
+            // Every write a checkpoint relies on was forced before its superblock
+        }
+    }
+
+    /// Read channels of the file, each serving one read at a time, at most a number of them in use at once.
+    ///
+    /// A read waits for a channel while all are in use. One is opened when a read finds none idle, or finds one an
+    /// interrupt closed; one given back after the file closed is closed, so none outlives the file, not even one a read
+    /// held while the file closed.
+    private final class ReadChannels {
+        private final Semaphore permits;
+        private final ArrayBlockingQueue<FileChannel> idle;
+        // Whether a read took a channel since the last trim; plain, as a stale read only delays a trim or closes
+        // channels just used, which the next reads open again, and written only when it changes, so the reads of
+        // every thread do not take its line from each other
+        private boolean used;
+
+        /// Makes a pool of at most `capacity` channels in use at once, none open yet.
+        ReadChannels(int capacity) {
+            this.permits = new Semaphore(capacity);
+            this.idle = new ArrayBlockingQueue<>(capacity);
+        }
+
+        /// Opens `count` channels, at most the capacity, idle until reads take them.
+        void open(int count) throws IOException {
+            for (var i = 0; i < count; i++) {
+                idle.add(FileChannel.open(path, StandardOpenOption.READ));
+            }
+        }
+
+        /// {@return a channel for one read alone, which [#give(FileChannel)] gives back; waits while every channel is in
+        /// use}
+        ///
+        /// @throws IllegalStateException if the file is closed
+        /// @throws LedgerIoException if a channel cannot be opened
+        FileChannel take() {
+            if (closed) {
+                throw new IllegalStateException("The store is closed");
+            }
+            permits.acquireUninterruptibly();
+            if (!used) {
+                used = true;
+            }
+            var channel = idle.poll();
+            if (channel != null && channel.isOpen()) {
+                return channel;
+            }
+            // None open yet, or one an interrupt closed and that could not be replaced at the time
+            try {
+                return FileChannel.open(path, StandardOpenOption.READ);
+            } catch (IOException exception) {
+                permits.release();
+                throw new LedgerIoException(path + " could not be opened", exception);
+            }
+        }
+
+        /// Gives back `channel`, which [#take()] gave or which replaced the one it gave.
+        void give(FileChannel channel) {
+            if (!idle.offer(channel)) {
+                close(channel);
+            }
+            permits.release();
+            if (closed) {
+                closeIdle();
+            }
+        }
+
+        /// Closes the idle channels if no read took one since the last call.
+        void trimIfIdle() {
+            if (used) {
+                used = false;
+            } else {
+                closeIdle();
+            }
+        }
+
+        /// Closes the idle channels; the reads that find none idle later open others.
+        void closeIdle() {
+            for (var channel = idle.poll(); channel != null; channel = idle.poll()) {
+                close(channel);
+            }
+        }
+
+        private static void close(FileChannel channel) {
             try {
                 channel.close();
             } catch (IOException _) {
                 // Nothing was written through a read channel
             }
-        }
-        try {
-            writer.close();
-        } catch (IOException _) {
-            // Every write a checkpoint relies on was forced before its superblock
         }
     }
 
