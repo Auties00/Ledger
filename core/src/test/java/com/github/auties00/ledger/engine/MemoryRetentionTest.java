@@ -68,13 +68,14 @@ class MemoryRetentionTest {
             }
             batch.put(MESSAGES, new byte[]{4}, new byte[ArrayWriteBatch.CHUNK_BYTES]);
             ledger.commit(batch).awaitDurable();
-            var chunks = new HashSet<Long>();
+            var chunks = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>());
             for (var i = 0; i < 400; i++) {
-                var bytes = head(ledger, MESSAGES, new byte[]{3, (byte) (i >>> 8), (byte) i}).sourceBytesForTests();
+                var version = head(ledger, MESSAGES, new byte[]{3, (byte) (i >>> 8), (byte) i});
+                var bytes = version.sourceBytesForTests();
                 assertTrue(bytes <= ArrayWriteBatch.CHUNK_BYTES, "a value of a large batch keeps " + bytes + " bytes");
-                chunks.add(bytes);
+                chunks.add(version.sourceForTests());
             }
-            assertTrue(chunks.size() >= 2, "800,000 bytes of values took one array");
+            assertTrue(chunks.size() >= 4, "800,000 bytes of values took " + chunks.size() + " arrays");
             // A value of half a chunk or more takes an array of its own
             assertEquals(ArrayWriteBatch.CHUNK_BYTES, head(ledger, MESSAGES, new byte[]{4}).sourceBytesForTests());
         }
