@@ -30,9 +30,10 @@ import java.util.stream.IntStream;
 /// on the one thread that writes a checkpoint, through a [Writer].
 final class PageFile implements AutoCloseable {
     static final String FILE = "ledger.data";
-    private static final int READ_CHANNELS = 8;
+    /// The channels reads take turns on, and the most threads [#readAll(List, byte)] reads on.
+    static final int READ_CHANNELS = 8;
     /// The most pages [#readAll(List, byte)] reads with one call.
-    private static final int RUN_PAGES = 64;
+    static final int RUN_PAGES = 64;
     private static final int STAGED_LIMIT = 8 << 20;
     // The staged bytes a flush seals before it writes them, which bounds the sealed arrays it holds at once
     private static final long SEAL_WINDOW = 1 << 20;
@@ -214,6 +215,17 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
     /// @throws LedgerIoException if the file cannot be read
     byte[][] readAll(List<PageRef> refs, byte kind) {
+        return readAll(refs, kind, READ_CHANNELS);
+    }
+
+    /// {@return the plaintext of the units `refs` name, in their order, none of them cached}
+    ///
+    /// It reads as [#readAll(List, byte)] does, on at most `threads` threads.
+    ///
+    /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
+    /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[][] readAll(List<PageRef> refs, byte kind, int threads) {
         var units = new byte[refs.size()][];
         var order = new Integer[refs.size()];
         for (var i = 0; i < order.length; i++) {
@@ -255,12 +267,12 @@ final class PageFile implements AutoCloseable {
                 }
             }
         };
-        var threads = Math.min(READ_CHANNELS, runs.size());
-        if (threads <= 1) {
+        var running = Math.min(Math.min(READ_CHANNELS, threads), runs.size());
+        if (running <= 1) {
             reader.run();
         } else {
-            var started = new Thread[threads];
-            for (var i = 0; i < threads; i++) {
+            var started = new Thread[running];
+            for (var i = 0; i < running; i++) {
                 started[i] = Thread.ofVirtual().name("ledger-read").start(reader);
             }
             var interrupted = false;

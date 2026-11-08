@@ -11,6 +11,12 @@ record ReadPoint(long bound, TreeVersion tree, PageFile pages) {
         return tree == null || state.resident ? null : tree.root(state.id);
     }
 
+    /// {@return the root of the tree of `state` in the trees the read uses, resident or not, or `null` if they hold
+    /// none: where a read of a resident key space finds a key its loader has not put in memory}
+    TreeRoot treeRoot(KeyspaceState state) {
+        return tree == null ? null : tree.root(state.id);
+    }
+
     /// {@return the bound of the stamps the tree holds}
     long treeBound() {
         return Reads.boundOf(tree.sequence);

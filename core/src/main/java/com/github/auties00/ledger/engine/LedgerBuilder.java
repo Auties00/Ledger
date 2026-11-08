@@ -44,6 +44,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private WriteThrough.Mode writeThrough;
     // Null to make one from the mode
     private WriteThrough writeThroughWay;
+    private boolean residentAtOpen;
 
     /// Creates a builder with the default options.
     public LedgerBuilder() {
@@ -176,6 +177,12 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     }
 
     @Override
+    public Ledger.Options loadResidentAtOpen(boolean atOpen) {
+        this.residentAtOpen = atOpen;
+        return this;
+    }
+
+    @Override
     public Ledger.Options commitWindow(Duration window) {
         Objects.requireNonNull(window, "window");
         if (window.isNegative() || window.compareTo(Duration.ofSeconds(1)) > 0) {
@@ -254,7 +261,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                 var free = Catalog.decodeFreeList(pages.read(superblock.freeList(), PageFormat.FREE_LIST, false), superblock.pageCount());
                 space = new FreeSpace(superblock.pageCount(), free);
                 ledger.useDataFile(pages, space);
-                ledger.loadCheckpoint(superblock, Catalog.decode(pages.read(superblock.catalog(), PageFormat.CATALOG, false)));
+                ledger.loadCheckpoint(superblock, Catalog.decode(pages.read(superblock.catalog(), PageFormat.CATALOG, false)),
+                        residentAtOpen, backgroundFailures);
             }
             var firstSegment = superblock == null ? 0 : superblock.logStart();
             var files = new LogFiles(logDirectory, opened.keys(), opened.header().storeId());

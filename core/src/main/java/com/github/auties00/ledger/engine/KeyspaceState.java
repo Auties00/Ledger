@@ -17,7 +17,8 @@ import java.util.function.LongSupplier;
 ///
 /// In a store in a directory, the entries of a [Keyspace.Residency#PAGED] key space are only those written since the
 /// checkpoint every reader's tree holds; a key with no version in memory is read from the tree. A resident key space
-/// holds every entry.
+/// holds every entry, once its [loader][ResidentLoader] has put in memory those of the checkpoint the store opened from;
+/// until then a key the loader has not reached is read from the tree, and no commit writes it.
 ///
 /// The chains of the keys are in two maps: an ordered one for scans, and a hash index ([ChainIndex]) for lookups of
 /// one key, which at a million keys costs a fraction of a walk down the ordered one. A chain enters the index first, then the ordered
@@ -77,6 +78,10 @@ final class KeyspaceState {
     private final java.util.concurrent.atomic.AtomicInteger droppedListed;
     // The dropped chains listed past which a commit sweeps them off, as of the last prune of the list
     private volatile int listedDropsLimit = LISTED_DROPS;
+    /// What puts in memory the entries of the checkpoint the store opened from, in a resident key space, or `null`
+    /// once memory holds them all, or in a key space that holds every entry from the start; set while the store opens,
+    /// cleared by the loader after its last run.
+    volatile ResidentLoader loading;
 
     private static final VarHandle UNORDERED;
 
@@ -125,6 +130,53 @@ final class KeyspaceState {
     /// @see ChainIndex#next(ChainIndex.Cursor)
     Chain next(ChainIndex.Cursor cursor) {
         return index.next(cursor);
+    }
+
+    /// {@return whether a read of `key` reads memory as the key space's residency says, which is `false` only in a
+    /// resident key space, for a key its loader has not reached}
+    ///
+    /// A read of a resident key space calls it before it reads memory, and reads a key it returns `false` for from
+    /// its own tree alone: no commit wrote the key.
+    boolean loaded(MemorySegment key) {
+        var loader = loading;
+        return loader == null || loader.holds(key);
+    }
+
+    /// Waits until memory holds the entry of `key`, if it has one, or every entry if `key` is `null`, before a write
+    /// of it: no commit writes a key of a resident key space its loader has not passed.
+    ///
+    /// @throws IllegalStateException if the store closes meanwhile
+    /// @throws RuntimeException the failure of the load, which the next write retries
+    void awaitLoaded(MemorySegment key) {
+        var loader = loading;
+        if (loader != null) {
+            loader.await(key);
+        }
+    }
+
+    /// Puts in memory the chain of `key`, whose only version is `head`, unless memory holds a chain of it; for the
+    /// loader of a resident key space, which no commit writes beside.
+    ///
+    /// The chain has its version before it is in the index, so the sweep, which walks the index, never finds it empty.
+    void install(MemorySegment key, Version head) {
+        var hash = Segments.hash(key);
+        var chain = index.get(key, hash);
+        if (chain != null) {
+            if (!chain.released()) {
+                return;
+            }
+            index.remove(chain);
+        }
+        var created = keys.chain(key, hash);
+        created.head = head;
+        if (index.putIfAbsent(created) != null) {
+            return;
+        }
+        if (lazy) {
+            list(created);
+        } else {
+            order(created);
+        }
     }
 
     /// {@return the newest version of `key` in memory, or `null`}

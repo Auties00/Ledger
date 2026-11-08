@@ -18,7 +18,8 @@ import java.util.function.Function;
 /// It runs alone, holding the sequencing and publishing roles once every commit given a sequence has published, and
 /// applies each write at once under a sequence no reader sees yet; its own reads
 /// use that sequence's bound, so they see the latest commit and the transaction's writes so far. Every key and value
-/// is encoded into memory of its own, which stays valid once the transaction publishes.
+/// is encoded into memory of its own, which stays valid once the transaction publishes. A write of a key of a resident
+/// key space whose loader has not reached it waits for the loader, which takes no role.
 final class LiveTransaction implements Transaction {
     private final LiveLedger ledger;
     private final LiveLedger.Applier applier;
@@ -90,6 +91,7 @@ final class LiveTransaction implements Transaction {
         }
         var encodedValue = MemorySegment.ofArray(new byte[Math.toIntExact(size)]);
         keyspace.values().encode(value, encodedValue);
+        state.awaitLoaded(encodedKey);
         applier.put(state, encodedKey, encodedValue.asReadOnly(), state.resident ? value : null);
         return this;
     }
@@ -106,6 +108,7 @@ final class LiveTransaction implements Transaction {
         }
         var ownKey = Segments.copy(key);
         var ownValue = Segments.copy(value);
+        state.awaitLoaded(ownKey);
         applier.put(state, ownKey, ownValue, state.resident ? keyspace.values().decode(ownValue) : null);
         return this;
     }
@@ -113,7 +116,9 @@ final class LiveTransaction implements Transaction {
     @Override
     public <K> Transaction delete(Keyspace<K, ?> keyspace, K key) {
         var state = state(keyspace);
-        applier.delete(state, Segments.encodeKey(keyspace.keys(), Objects.requireNonNull(key, "key")));
+        var encodedKey = Segments.encodeKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
+        state.awaitLoaded(encodedKey);
+        applier.delete(state, encodedKey);
         return this;
     }
 
@@ -123,6 +128,7 @@ final class LiveTransaction implements Transaction {
         Objects.requireNonNull(range, "range");
         var from = range.from().map(key -> Segments.encodeKey(keyspace.keys(), key)).orElse(null);
         var to = range.to().map(key -> Segments.encodeKey(keyspace.keys(), key)).orElse(null);
+        state.awaitLoaded(null);
         applier.deleteRange(state, from, to);
         return this;
     }

@@ -153,6 +153,16 @@ final class PageCache implements IdleTicker.Watched {
         remove(key(DATA, page));
     }
 
+    /// Drops the unit `ref` of the data file names, or the leaf its delta record makes, if the cache holds it; a unit
+    /// of another nonce the cache holds for its page stays.
+    void remove(PageRef ref) {
+        var key = key(ref);
+        var entry = entries.get(key);
+        if (entry != null && entry.nonceHigh == ref.nonceHigh() && entry.nonceLow == ref.nonceLow() && entries.remove(key, entry)) {
+            drop(entry);
+        }
+    }
+
     /// Drops whatever the cache holds at `key`.
     void remove(long key) {
         var previous = entries.remove(key);

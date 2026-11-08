@@ -61,23 +61,32 @@ final class TreeSearch {
                 : -1;
     }
 
-    /// {@return the leaves of the tree under `root`, in key order, without caching them}
+    /// {@return the references of the leaves of the tree under `root` that may hold keys at or after `from`, in key
+    /// order}
     ///
-    /// It reads the tree a level at a time, with [PageFile#readAll(List, byte)]: a store that just opened finds its
-    /// file out of the OS cache as often as not, and reading the leaves of its resident key spaces one after another
-    /// made the open wait for each read in turn.
-    static List<byte[]> leaves(PageFile pages, TreeRoot root) {
-        var level = List.of(pages.read(root.ref(), PageFile.NODE, false));
-        while (!TreeNodes.isLeaf(level.getFirst())) {
+    /// It reads the branches a level at a time, with [PageFile#readAll(List, byte, int)] on up to `threads` threads,
+    /// and none of the leaves: a store that just opened finds its file out of the OS cache as often as not, and
+    /// reading the nodes of a level one after another made the reader wait for each read in turn.
+    static List<PageRef> leaves(PageFile pages, TreeRoot root, MemorySegment from, int threads) {
+        var top = pages.read(root.ref(), PageFile.NODE, true);
+        if (TreeNodes.isLeaf(top)) {
+            return List.of(root.ref());
+        }
+        var level = List.of(top);
+        while (true) {
             var refs = new ArrayList<PageRef>();
-            for (var unit : level) {
-                for (var i = 0; i < TreeNodes.count(unit); i++) {
+            for (var node = 0; node < level.size(); node++) {
+                var unit = level.get(node);
+                // Only the first node of a level is on the path to `from`: those after it hold later keys alone
+                for (var i = node == 0 ? TreeNodes.childFor(unit, from) : 0; i < TreeNodes.count(unit); i++) {
                     refs.add(TreeNodes.childRef(unit, i));
                 }
             }
-            level = Arrays.asList(pages.readAll(refs, PageFile.NODE));
+            if (TreeNodes.level(level.getFirst()) == 1) {
+                return refs;
+            }
+            level = Arrays.asList(pages.readAll(refs, PageFile.NODE, threads));
         }
-        return level;
     }
 
     /// {@return the read-only value of leaf entry `entry` of `unit`, read from its blob if it has one}
