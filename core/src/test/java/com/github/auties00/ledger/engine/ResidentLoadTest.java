@@ -79,6 +79,7 @@ class ResidentLoadTest {
                 return value;
             }));
     private static final Keyspace<String, byte[]> RAW = Keyspace.resident("raw", KeyCodec.utf8(), ValueCodec.bytes());
+    private static final Keyspace<byte[], byte[]> RAW_KEYS = Keyspace.resident("raw_keys", KeyCodec.bytes(), ValueCodec.bytes());
     private static final int ENTRIES = 1_200;
 
     private static String key(int index) {
@@ -547,6 +548,82 @@ class ResidentLoadTest {
             assertArrayEquals(ownValue, ledger.get(RAW, key(1_100)).orElseThrow());
             assertArrayEquals(large, ledger.get(RAW, key(1_150)).orElseThrow());
             assertArrayEquals(filled(1_199, 1_400), ledger.get(RAW, key(1_199)).orElseThrow());
+        }
+    }
+
+    private static Ledger openRawKeys(Path directory) {
+        return Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(RAW_KEYS).loadResidentAtOpen(false).build();
+    }
+
+    private static void assertRawKey(Ledger ledger, byte[] key, byte[] expected) {
+        var what = new String(key, StandardCharsets.US_ASCII);
+        if (expected == null) {
+            assertTrue(ledger.get(RAW_KEYS, key).isEmpty(), what);
+            assertTrue(ledger.readEncoded(RAW_KEYS, key, segment -> segment.byteSize()).isEmpty(), what);
+        } else {
+            assertArrayEquals(expected, ledger.get(RAW_KEYS, key).orElseThrow(), what);
+            assertArrayEquals(expected, ledger.readEncoded(RAW_KEYS, key, segment -> segment.toArray(ValueLayout.JAVA_BYTE)).orElseThrow(), what);
+        }
+    }
+
+    @Test
+    @DisplayName("a key looked up by its array reads the tree or memory as the loader's position says, at the position and around it, and a scan keeps its bounds")
+    void arrayKeysAcrossThePosition(@TempDir Path directory) throws Exception {
+        var model = new TreeMap<String, byte[]>();
+        try (var ledger = openRawKeys(directory)) {
+            for (var start = 0; start < ENTRIES; start += 100) {
+                var batch = ledger.newBatch();
+                for (var i = start; i < start + 100; i++) {
+                    model.put(key(i), filled(i, 1_400));
+                    batch.put(RAW_KEYS, key(i).getBytes(StandardCharsets.US_ASCII), model.get(key(i)));
+                }
+                ledger.commit(batch);
+            }
+        }
+        try (var ledger = openRawKeys(directory)) {
+            var live = (LiveLedger) ledger;
+            var pause = new Pause(1);
+            live.hookResidentLoadsForTests(pause);
+            ledger.get(RAW_KEYS, key(0).getBytes(StandardCharsets.US_ASCII));
+            pause.awaitPaused(1);
+            var limit = limit(live, RAW_KEYS);
+            assertNotNull(limit);
+            var position = model.ceilingKey(limit);
+            assertNotNull(position, "the load is at its end");
+            assertFalse(position.equals(model.firstKey()), "the load has not started");
+            for (var entry : model.entrySet()) {
+                var encoded = entry.getKey().getBytes(StandardCharsets.US_ASCII);
+                assertRawKey(ledger, encoded, entry.getValue());
+                // An extension sorts right after its key and a prefix right before it, on either side of the position
+                assertRawKey(ledger, Arrays.copyOf(encoded, encoded.length + 1), null);
+                assertRawKey(ledger, Arrays.copyOf(encoded, encoded.length - 1), null);
+            }
+            assertRawKey(ledger, limit.getBytes(StandardCharsets.ISO_8859_1), model.get(limit));
+
+            // Over the position: a visitor that changes the arrays of its range changes nothing of the scan
+            var index = Integer.parseInt(position.substring(1));
+            var low = key(Math.max(0, index - 10));
+            var high = key(Math.min(ENTRIES - 1, index + 10));
+            var from = low.getBytes(StandardCharsets.US_ASCII);
+            var to = high.getBytes(StandardCharsets.US_ASCII);
+            var expected = new ArrayList<>(model.subMap(low, high).keySet());
+            var seen = new ArrayList<String>();
+            ledger.forEach(RAW_KEYS, KeyRange.between(from, to), (key, _) -> {
+                seen.add(new String(key, StandardCharsets.US_ASCII));
+                Arrays.fill(from, (byte) 0xFF);
+                Arrays.fill(to, (byte) 0x00);
+                return true;
+            });
+            assertEquals(expected, seen);
+
+            pause.release(1);
+            awaitLoaded(live, RAW_KEYS);
+            for (var entry : model.entrySet()) {
+                var encoded = entry.getKey().getBytes(StandardCharsets.US_ASCII);
+                assertRawKey(ledger, encoded, entry.getValue());
+                assertRawKey(ledger, Arrays.copyOf(encoded, encoded.length + 1), null);
+                assertRawKey(ledger, Arrays.copyOf(encoded, encoded.length - 1), null);
+            }
         }
     }
 
