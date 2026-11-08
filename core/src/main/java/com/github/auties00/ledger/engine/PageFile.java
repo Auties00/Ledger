@@ -12,13 +12,16 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
-import java.util.TreeMap;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 import java.util.stream.IntStream;
 
@@ -26,13 +29,15 @@ import java.util.stream.IntStream;
 /// them, and the superblocks.
 ///
 /// Reads run on the calling thread, each on a channel of its own from a small pool: Windows serializes positional
-/// reads on one channel, and an interrupt during a read closes the channel it ran on, which then is replaced. Writes run
-/// on the one thread that writes a checkpoint, through a [Writer].
+/// reads on one channel, and an interrupt during a read closes the channel it ran on, which then is replaced. Units are
+/// written by the threads of the checkpoint that writes them, through a [Writer].
 final class PageFile implements AutoCloseable {
     static final String FILE = "ledger.data";
     private static final int READ_CHANNELS = 8;
-    /// The most pages [#readAll(List, byte)] reads with one call.
+    /// The most pages [#readAll(List, byte)] reads with one call, and a [Writer] writes with one call but for a unit
+    /// longer than that.
     private static final int RUN_PAGES = 64;
+    /// The queued bytes from which a [Writer] flushes its queue.
     private static final int STAGED_LIMIT = 8 << 20;
     // The staged bytes a flush seals before it writes them, which bounds the sealed arrays it holds at once
     private static final long SEAL_WINDOW = 1 << 20;
@@ -449,13 +454,19 @@ final class PageFile implements AutoCloseable {
 
     /// {@return a writer of the units of one checkpoint, sealed under nonces that start with `nonceHigh`}
     Writer writer(long nonceHigh) {
-        return new Writer(nonceHigh, () -> true);
+        return new Writer(nonceHigh, () -> true, STAGED_LIMIT, 0);
     }
 
     /// {@return a writer of the units of one checkpoint, sealed under nonces that start with `nonceHigh`, that forces
     /// them beside its work only while `lagging` holds}
     Writer writer(long nonceHigh, BooleanSupplier lagging) {
-        return new Writer(nonceHigh, lagging);
+        return new Writer(nonceHigh, lagging, STAGED_LIMIT, 0);
+    }
+
+    /// {@return a writer as [#writer(long)] gives, that flushes its queue from `stagedLimit` bytes and whose nonces end
+    /// with counters from `firstNonce`; for tests}
+    Writer writerForTests(long nonceHigh, long stagedLimit, int firstNonce) {
+        return new Writer(nonceHigh, () -> true, stagedLimit, firstNonce);
     }
 
     @Override
@@ -480,23 +491,38 @@ final class PageFile implements AutoCloseable {
         }
     }
 
-    /// Writes the units of one checkpoint: it queues them, then seals and writes them in order of their pages,
-    /// coalescing consecutive ones into one call.
+    /// Writes the units of one checkpoint: it queues them, then seals and writes them in order of their pages, each run
+    /// of consecutive pages with one positional write.
     ///
     /// Each unit gets the next nonce of the checkpoint: the checkpoint's random first 8 bytes and a counter. A queued
-    /// unit is read back through [#staged(PageRef)], since the file does not hold it yet.
+    /// unit is read back through [#staged(PageRef)], since the file does not hold it yet; it leaves the queue once the
+    /// write of its run returned, so a read finds every unit the writer took either queued or in the file.
     ///
-    /// It is safe for concurrent use, as the tasks of a checkpoint that rewrites its trees in parallel use it; a flush
-    /// seals its units on every processor.
+    /// It is safe for concurrent use, as the tasks of a checkpoint that rewrites its trees in parallel use it, and
+    /// queueing a unit takes no lock. The task whose unit brings the queue to its limit flushes it, unless another one
+    /// is flushing, while the others go on queueing; one that brings it to twice the limit waits for that flush and
+    /// flushes in turn, so the queue holds at most about twice the limit. A flush seals its units on every processor: a
+    /// lock that queueing shared with the flushes kept every other task of the checkpoint waiting through each flush,
+    /// and gave its seals no help.
+    ///
+    /// Once a flush fails, every later write and flush throws, and once the checkpoint [discards][#discard()] the
+    /// writer nothing it queued reaches the file: a write after the checkpoint gave its pages back could overwrite a
+    /// unit a later checkpoint wrote there.
     final class Writer {
         /// The queued units from which a flush seals them on every processor.
         private static final int PARALLEL_SEALS = 16;
+        private static final Comparator<Staged> BY_PAGE = Comparator.comparingInt(entry -> entry.ref().page());
 
-        private final Object lock;
         private final long nonceHigh;
-        private int nonceLow;
-        private final TreeMap<Integer, Staged> staged;
-        private long stagedBytes;
+        private final AtomicInteger nonceLow;
+        // The queued units by page; one leaves once the write of its run returned
+        private final ConcurrentHashMap<Integer, Staged> staged;
+        // The bytes of the queued units, which lags the queue by the units being queued or written
+        private final AtomicLong stagedBytes;
+        // The queued bytes from which a write flushes the queue
+        private final long stagedLimit;
+        // Held by the one thread that flushes, and by a discard; guards written, forcedUpTo and forcing
+        private final ReentrantLock flushing;
         private long written;
         // The bytes written when the last force beside the checkpoint started
         private long forcedUpTo;
@@ -504,11 +530,18 @@ final class PageFile implements AutoCloseable {
         private FutureTask<Void> forcing;
         // Whether the commits wait for the checkpoint, which only then forces beside its work
         private final BooleanSupplier lagging;
+        // Set holding flushing once the checkpoint failed: nothing is queued or written after it
+        private volatile boolean discarded;
+        // What made a flush fail, which every later write and flush throws
+        private volatile Throwable failure;
 
-        private Writer(long nonceHigh, BooleanSupplier lagging) {
-            this.lock = new Object();
+        private Writer(long nonceHigh, BooleanSupplier lagging, long stagedLimit, int firstNonce) {
             this.nonceHigh = nonceHigh;
-            this.staged = new TreeMap<>();
+            this.nonceLow = new AtomicInteger(firstNonce);
+            this.staged = new ConcurrentHashMap<>();
+            this.stagedBytes = new AtomicLong();
+            this.stagedLimit = stagedLimit;
+            this.flushing = new ReentrantLock();
             this.lagging = lagging;
         }
 
@@ -517,10 +550,10 @@ final class PageFile implements AutoCloseable {
         /// The writer, and the page cache if `cached`, own `unit` from now on.
         ///
         /// @return the reference of the unit
+        /// @throws IOException if this write flushed the queue and that failed, or an earlier flush failed
+        /// @throws IllegalStateException if the writer was discarded
         PageRef write(byte kind, int level, int page, int pages, byte[] unit, int length, boolean cached) throws IOException {
-            synchronized (lock) {
-                return write(kind, level, page, pages, unit, length, cached, nextNonce());
-            }
+            return write(kind, level, page, pages, unit, length, cached, nextNonce());
         }
 
         /// Queues `unit` as [#write(byte, int, int, int, byte\[\], int, boolean)] does, sealed under `nonce`, which
@@ -528,31 +561,57 @@ final class PageFile implements AutoCloseable {
         ///
         /// @return the reference of the unit
         PageRef write(byte kind, int level, int page, int pages, byte[] unit, int length, boolean cached, int nonce) throws IOException {
-            synchronized (lock) {
-                var ref = new PageRef(page, pages, nonceHigh, nonce);
-                header(unit, kind, level, page, pages, length, ref.nonceHigh(), ref.nonceLow());
-                if (staged.put(page, new Staged(ref, unit)) != null) {
-                    throw new IllegalStateException("A checkpoint wrote page " + page + " twice");
-                }
-                stagedBytes += (long) pages * PageFormat.SIZE;
-                if (cached) {
-                    cache.put(ref, unit, false);
-                } else {
-                    cache.remove(page);
-                }
-                if (stagedBytes >= STAGED_LIMIT) {
-                    flush();
-                }
-                return ref;
+            ensureUsable();
+            var ref = new PageRef(page, pages, nonceHigh, nonce);
+            header(unit, kind, level, page, pages, length, nonceHigh, nonce);
+            if (staged.putIfAbsent(page, new Staged(ref, unit)) != null) {
+                throw new IllegalStateException("A checkpoint wrote page " + page + " twice");
             }
+            if (cached) {
+                cache.put(ref, unit, false);
+            } else {
+                cache.remove(page);
+            }
+            var queued = stagedBytes.addAndGet((long) pages * PageFormat.SIZE);
+            if (queued >= stagedLimit) {
+                flushFull(queued >= 2 * stagedLimit);
+            }
+            return ref;
+        }
+
+        /// Flushes the queue, which reached its limit, unless another thread is flushing it and `wait` is false.
+        ///
+        /// It looks at the queue again once it let go of the lock: a thread whose unit brought the queue to its limit
+        /// while the lock was held left that queue to the holder, which flushes it unless another thread already does.
+        ///
+        /// @param wait whether the queue holds twice its limit, so the caller waits for a running flush rather than
+        ///             queue more
+        private void flushFull(boolean wait) throws IOException {
+            do {
+                if (wait) {
+                    flushing.lock();
+                    wait = false;
+                } else if (!flushing.tryLock()) {
+                    return;
+                }
+                try {
+                    while (stagedBytes.get() >= stagedLimit) {
+                        flushQueued();
+                    }
+                } finally {
+                    flushing.unlock();
+                }
+            } while (stagedBytes.get() >= stagedLimit);
         }
 
         /// {@return the plaintext of the queued unit `ref` names, or `null` if it is not queued}
         byte[] staged(PageRef ref) {
-            synchronized (lock) {
-                var entry = staged.get(ref.page());
-                return entry != null && entry.ref().equals(ref) ? entry.unit() : null;
+            // A unit of an earlier checkpoint, as most a checkpoint reads are, was never queued here
+            if (ref.nonceHigh() != nonceHigh) {
+                return null;
             }
+            var entry = staged.get(ref.page());
+            return entry != null && entry.ref().equals(ref) ? entry.unit() : null;
         }
 
         /// {@return the first 8 bytes of every nonce of this writer}
@@ -562,87 +621,150 @@ final class PageFile implements AutoCloseable {
 
         /// {@return the next nonce, for a unit written outside this writer or whose reference is needed before it is
         /// queued}
+        ///
+        /// @throws IllegalStateException if every nonce was taken: the counter never wraps, which would seal two units
+        ///                               under one nonce
         int nextNonce() {
-            synchronized (lock) {
-                if (nonceLow == -1) {
+            while (true) {
+                var nonce = nonceLow.get();
+                if (nonce == -1) {
                     throw new IllegalStateException("A checkpoint ran out of nonces");
                 }
-                return nonceLow++;
+                if (nonceLow.compareAndSet(nonce, nonce + 1)) {
+                    return nonce;
+                }
             }
         }
 
-        /// Seals and writes every queued unit.
+        /// Seals and writes every queued unit, waiting for a flush another thread runs.
         ///
         /// The units leave the queue once they are written, so a read of one meanwhile still finds it there.
+        ///
+        /// @throws IOException if the flush fails, or an earlier one did
+        /// @throws IllegalStateException if the writer was discarded
         void flush() throws IOException {
-            synchronized (lock) {
-                flushQueued();
-            }
-        }
-
-        private void flushQueued() throws IOException {
-            var entries = new ArrayList<>(staged.values());
-            // A window at a time: sealing all the staged units before writing any left the pool holding a whole flush
-            // of sealed arrays, 8 MiB, from one checkpoint to the next
-            for (var from = 0; from < entries.size(); ) {
-                var to = from;
-                var bytes = 0L;
-                while (to < entries.size() && (to == from || bytes + (long) entries.get(to).ref().pages() * PageFormat.SIZE <= SEAL_WINDOW)) {
-                    bytes += (long) entries.get(to).ref().pages() * PageFormat.SIZE;
-                    to++;
-                }
-                flushWindow(entries.subList(from, to));
-                from = to;
-            }
-            written += stagedBytes;
-            staged.clear();
-            stagedBytes = 0;
-            forceBeside();
-        }
-
-        /// Seals and writes the staged units of `entries`, in the order of their pages.
-        private void flushWindow(List<Staged> entries) throws IOException {
-            var run = new ArrayList<ByteBuffer>();
-            var sealedUnits = new byte[entries.size()][];
-            var runStart = -1L;
-            var runEnd = -1L;
+            flushing.lock();
             try {
-                var indexes = IntStream.range(0, entries.size());
-                (entries.size() < PARALLEL_SEALS ? indexes : indexes.parallel()).forEach(index -> {
-                    var entry = entries.get(index);
-                    var sealed = pool.acquire(entry.ref().pages() * PageFormat.SIZE);
-                    cipher.seal(entry.unit(), entry.ref().pages(), sealed, 0);
-                    sealedUnits[index] = sealed;
-                });
-                for (var index = 0; index < entries.size(); index++) {
-                    var entry = entries.get(index);
-                    var length = entry.ref().pages() * PageFormat.SIZE;
-                    var sealed = sealedUnits[index];
-                    var start = PageFormat.offset(entry.ref().page());
-                    if (start != runEnd && !run.isEmpty()) {
-                        writeRun(run, runStart);
-                        run.clear();
-                    }
-                    if (run.isEmpty()) {
-                        runStart = start;
-                    }
-                    run.add(ByteBuffer.wrap(sealed, 0, length));
-                    runEnd = start + length;
-                }
-                if (!run.isEmpty()) {
-                    writeRun(run, runStart);
+                ensureUsable();
+                while (!staged.isEmpty()) {
+                    flushQueued();
                 }
             } finally {
-                for (var sealed : sealedUnits) {
-                    if (sealed != null) {
-                        pool.release(sealed);
+                flushing.unlock();
+            }
+        }
+
+        /// Throws what stops this writer from queueing or writing, if anything does.
+        private void ensureUsable() throws IOException {
+            if (discarded) {
+                throw new IllegalStateException("The checkpoint of this writer failed");
+            }
+            var failed = failure;
+            if (failed != null) {
+                throw new IOException("A flush of the checkpoint failed", failed);
+            }
+        }
+
+        /// Seals and writes the units queued when it starts, in the order of their pages; holding [#flushing].
+        ///
+        /// A failure stays: the units it left unwritten stay queued, for [#discard()] to drop, and every later write
+        /// and flush throws it, so no other thread writes on into pages the failed checkpoint gives back.
+        private void flushQueued() throws IOException {
+            ensureUsable();
+            var entries = staged.values().toArray(Staged[]::new);
+            Arrays.sort(entries, BY_PAGE);
+            try {
+                // A window at a time: sealing all the staged units before writing any left the pool holding a whole
+                // flush of sealed arrays, 8 MiB, from one checkpoint to the next
+                for (var from = 0; from < entries.length; ) {
+                    from = flushWindow(entries, from);
+                }
+                forceBeside();
+            } catch (IOException | RuntimeException | Error exception) {
+                failure = exception;
+                throw exception;
+            }
+        }
+
+        /// Seals and writes the units of `entries`, sorted by page, from `from` up to [#SEAL_WINDOW] bytes of them;
+        /// holding [#flushing].
+        ///
+        /// The units are sealed side by side into arrays of up to [#RUN_PAGES] pages, or of their own pages for a
+        /// longer unit, and each run of consecutive pages in one array goes to the file with one write: a write of a
+        /// buffer for each unit, gathered or not, is a system call for each unit on Windows. A unit leaves the queue
+        /// once its run is written.
+        ///
+        /// @return the index past the units written
+        private int flushWindow(Staged[] entries, int from) throws IOException {
+            var to = from;
+            var left = 0L;
+            while (to < entries.length && (to == from || left + entries[to].length() <= SEAL_WINDOW)) {
+                left += entries[to].length();
+                to++;
+            }
+            var count = to - from;
+            // The array each unit is sealed into and where in it
+            var arrays = new byte[count][];
+            var offsets = new int[count];
+            // The first unit of each run, then the end of the window
+            var runs = new int[count + 1];
+            var runCount = 0;
+            var slabs = new ArrayList<byte[]>();
+            try {
+                byte[] slab = null;
+                var capacity = 0L;
+                var used = 0;
+                var next = -1;
+                for (var index = 0; index < count; index++) {
+                    var ref = entries[from + index].ref();
+                    var length = ref.pages() * PageFormat.SIZE;
+                    if (slab == null || used + length > capacity) {
+                        // No larger than the units left to seal, so a flush of a few units takes a small array
+                        capacity = Math.max(length, Math.min((long) RUN_PAGES * PageFormat.SIZE, left));
+                        slab = pool.acquire((int) capacity);
+                        slabs.add(slab);
+                        used = 0;
+                        next = -1;
+                    }
+                    if (ref.page() != next) {
+                        runs[runCount++] = index;
+                    }
+                    arrays[index] = slab;
+                    offsets[index] = used;
+                    used += length;
+                    left -= length;
+                    next = ref.page() + ref.pages();
+                }
+                runs[runCount] = count;
+                var indexes = IntStream.range(0, count);
+                (count < PARALLEL_SEALS ? indexes : indexes.parallel()).forEach(index -> {
+                    var entry = entries[from + index];
+                    cipher.seal(entry.unit(), entry.ref().pages(), arrays[index], offsets[index]);
+                });
+                for (var run = 0; run < runCount; run++) {
+                    var first = runs[run];
+                    var end = runs[run + 1];
+                    var length = offsets[end - 1] + entries[from + end - 1].length() - offsets[first];
+                    writeRun(arrays[first], offsets[first], length, PageFormat.offset(entries[from + first].ref().page()));
+                    for (var index = first; index < end; index++) {
+                        var entry = entries[from + index];
+                        if (staged.remove(entry.ref().page(), entry)) {
+                            written += entry.length();
+                            stagedBytes.addAndGet(-entry.length());
+                        }
                     }
                 }
+            } finally {
+                for (var slab : slabs) {
+                    pool.release(slab);
+                }
             }
+            return to;
         }
 
         /// Starts forcing what the checkpoint wrote so far, beside its work, once it wrote [#FORCE_EVERY] bytes since
-        /// the last force started and that one is done, while the checkpoint lags; throws the failure of that one.
+        /// the last force started and that one is done, while the checkpoint lags; throws the failure of that one;
+        /// holding [#flushing].
         ///
         /// A checkpoint the commits do not wait for forces at its end only: forcing beside it made the device take
         /// its writes while the commits' log writes queued behind them, which cost an ingest of a history a tenth of
@@ -671,12 +793,16 @@ final class PageFile implements AutoCloseable {
         /// Waits for the force running beside the checkpoint, if any.
         ///
         /// @throws IOException if it failed: a write it did not make durable may be lost even if a later force
-        ///                     succeeds, so the checkpoint fails
+        ///                     succeeds, so the checkpoint fails; or if a flush failed
         void awaitForce() throws IOException {
             FutureTask<Void> running;
-            synchronized (lock) {
+            flushing.lock();
+            try {
+                ensureUsable();
                 running = forcing;
                 forcing = null;
+            } finally {
+                flushing.unlock();
             }
             if (running != null) {
                 await(running);
@@ -695,43 +821,46 @@ final class PageFile implements AutoCloseable {
             }
         }
 
-        private void writeRun(ArrayList<ByteBuffer> run, long position) throws IOException {
-            var buffers = run.toArray(ByteBuffer[]::new);
-            var remaining = 0L;
-            for (var buffer : buffers) {
-                remaining += buffer.remaining();
-            }
-            writer.position(position);
-            while (remaining > 0) {
-                remaining -= writer.write(buffers);
+        /// Writes the `length` bytes of `array` from `offset` to the file at `position`.
+        private void writeRun(byte[] array, int offset, int length, long position) throws IOException {
+            var buffer = ByteBuffer.wrap(array, offset, length);
+            while (buffer.hasRemaining()) {
+                PageFile.this.writer.write(buffer, position + buffer.position() - offset);
             }
         }
 
-        /// {@return the bytes written or queued so far}
-        long written() {
-            synchronized (lock) {
-                return written + stagedBytes;
-            }
-        }
-
-        /// Drops every queued unit, for a checkpoint that failed.
+        /// Drops every queued unit, for a checkpoint that failed, once a flush that runs ends; nothing is queued or
+        /// written after.
         void discard() {
+            FutureTask<Void> running;
+            flushing.lock();
             try {
-                awaitForce();
-            } catch (IOException _) {
-                // The checkpoint failed already; its pages go back
-            }
-            synchronized (lock) {
+                discarded = true;
                 for (var entry : staged.values()) {
                     cache.remove(entry.ref().page());
                 }
                 staged.clear();
-                stagedBytes = 0;
+                stagedBytes.set(0);
+                running = forcing;
+                forcing = null;
+            } finally {
+                flushing.unlock();
+            }
+            if (running != null) {
+                try {
+                    await(running);
+                } catch (IOException _) {
+                    // The checkpoint failed already; its pages go back
+                }
             }
         }
     }
 
     /// A queued unit.
     private record Staged(PageRef ref, byte[] unit) {
+        /// {@return the bytes of the unit}
+        int length() {
+            return ref.pages() * PageFormat.SIZE;
+        }
     }
 }

@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.RecursiveTask;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /// Applies the writes of one checkpoint to a key space's tree, copy on write.
 ///
@@ -330,21 +331,24 @@ final class TreeUpdate {
     /// the free space are shared, and safe for concurrent use. A checkpoint of a write rate that rewrites most leaves
     /// would otherwise rewrite them on one processor.
     ///
+    /// It returns, or throws, once every task that started has ended: a task of a failed update that ran on would take
+    /// pages after its checkpoint gave back those it listed, and queue units the checkpoint discarded. A task that has
+    /// not started when another one fails returns at once.
+    ///
     /// @return what replaces each child, `null` where nothing does
     @SuppressWarnings("unchecked")
     private List<Child>[] updateInParallel(List<Child> children, Plan[] plans, List<Op> ops, List<Range> removals) throws IOException {
         var replacements = (List<Child>[]) new List<?>[children.size()];
         var tasks = new ArrayList<Subtree>();
+        var failed = new AtomicBoolean();
         for (var i = 0; i < children.size(); i++) {
             var plan = plans[i];
             if (plan != null && plan != Plan.DROP) {
-                tasks.add(new Subtree(i, new TreeUpdate(pages, writer, space), children.get(i), ops, removals, plan));
+                tasks.add(new Subtree(i, new TreeUpdate(pages, writer, space), children.get(i), ops, removals, plan, failed));
             }
         }
         try {
-            ForkJoinTask.invokeAll(tasks);
-        } catch (UncheckedIOException exception) {
-            throw exception.getCause();
+            runAll(tasks);
         } finally {
             // Whatever the tasks took, even those of a failed update, goes back if the checkpoint fails
             for (var task : tasks) {
@@ -358,6 +362,39 @@ final class TreeUpdate {
             replacements[task.index] = task.getRawResult();
         }
         return replacements;
+    }
+
+    /// Runs `tasks` in the common fork-join pool, the first on this thread, until every one that started has ended.
+    ///
+    /// [ForkJoinTask#invokeAll(java.util.Collection)] returns at the first failure and cancels the tasks left, which
+    /// marks those already running done while they run on.
+    ///
+    /// @throws IOException if the first task of `tasks` that failed could not read or write a unit; what any other
+    ///                     failure of it threw is thrown as it is
+    private static void runAll(List<Subtree> tasks) throws IOException {
+        for (var i = tasks.size() - 1; i > 0; i--) {
+            tasks.get(i).fork();
+        }
+        Throwable failure = null;
+        for (var i = 0; i < tasks.size(); i++) {
+            var task = tasks.get(i);
+            if (i == 0) {
+                task.quietlyInvoke();
+            } else {
+                task.quietlyJoin();
+            }
+            if (failure == null && task.isCompletedAbnormally()) {
+                failure = task.getException();
+            }
+        }
+        switch (failure) {
+            case null -> {
+            }
+            case UncheckedIOException exception -> throw exception.getCause();
+            case RuntimeException exception -> throw exception;
+            case Error error -> throw error;
+            default -> throw new IllegalStateException("A subtree failed", failure);
+        }
     }
 
     /// {@return the nodes that replace `child`, or `null` if the writes `plan` gives it change nothing under it}
@@ -453,25 +490,36 @@ final class TreeUpdate {
         private final List<Op> ops;
         private final List<Range> removals;
         private final Plan plan;
+        // Set by the first task of the same branch that fails, which fails the checkpoint: a task that starts after it
+        // has nothing to do
+        private final AtomicBoolean failed;
 
-        Subtree(int index, TreeUpdate update, Child child, List<Op> ops, List<Range> removals, Plan plan) {
+        Subtree(int index, TreeUpdate update, Child child, List<Op> ops, List<Range> removals, Plan plan, AtomicBoolean failed) {
             this.index = index;
             this.update = update;
             this.child = child;
             this.ops = ops;
             this.removals = removals;
             this.plan = plan;
+            this.failed = failed;
         }
 
         @Override
         protected List<Child> compute() {
+            if (failed.get()) {
+                return null;
+            }
             try {
                 var replacement = update.update(child, ops, removals, plan);
                 // The records of the subtree end its own pages, so the branch above reads them back from the writer
                 update.packer.close();
                 return replacement;
             } catch (IOException exception) {
+                failed.set(true);
                 throw new UncheckedIOException(exception);
+            } catch (RuntimeException | Error throwable) {
+                failed.set(true);
+                throw throwable;
             }
         }
     }
