@@ -4,7 +4,6 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.LedgerIoException;
 
 import java.io.IOException;
-import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.FileChannel;
@@ -129,37 +128,37 @@ final class BlobFile implements AutoCloseable {
         return epochTaken;
     }
 
-    /// Seals `value` into free pages and writes it, without forcing it.
+    /// Seals the `length` bytes of `value` at `offset` into free pages and writes them, without forcing them.
     ///
     /// The unit is in flight until a checkpoint takes it or [#release(PageRef)] frees it.
     ///
     /// @return where the unit is
     /// @throws LedgerIoException if the file cannot be written; the pages are free again
-    PageRef write(MemorySegment value) {
+    PageRef write(byte[] value, int offset, int length) {
         var gate = epochGate;
         if (gate != null) {
             gate.run();
             epochGate = null;
         }
         epochTaken = true;
-        var pages = PageFormat.pagesFor(value.byteSize());
+        var pages = PageFormat.pagesFor(length);
         PageRef ref;
         synchronized (lock) {
             ref = new PageRef(space.allocate(pages), pages, counter.getAndIncrement(), epoch);
             unadopted.add(ref);
         }
         var header = new byte[PageFormat.HEADER];
-        PageFile.header(header, PageFormat.EXTERNAL, 0, ref.page(), pages, Math.toIntExact(value.byteSize()), ref.nonceHigh(), ref.nonceLow());
+        PageFile.header(header, PageFormat.EXTERNAL, 0, ref.page(), pages, length, ref.nonceHigh(), ref.nonceLow());
         var buffer = pool.acquire(BUFFER);
         var through = new FileChannel[]{takeChannel()};
         var interrupted = new boolean[1];
         try {
             var position = new long[]{PageFormat.offset(ref.page())};
-            cipher.seal(header, value, pages, buffer, (bytes, length) -> {
+            cipher.seal(header, value, offset, length, pages, buffer, (bytes, count) -> {
                 var start = position[0];
                 while (true) {
                     try {
-                        var source = ByteBuffer.wrap(bytes, 0, length);
+                        var source = ByteBuffer.wrap(bytes, 0, count);
                         var at = start;
                         while (source.hasRemaining()) {
                             at += through[0].write(source, at);
