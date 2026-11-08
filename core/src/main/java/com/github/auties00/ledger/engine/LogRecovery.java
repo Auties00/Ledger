@@ -113,7 +113,7 @@ final class LogRecovery {
                     // Prepared and never written, unless damage zeroed the first frame before groups a later force made
                     // durable, whose first frames may carry the sequence of the commit before them
                     checkNoLaterGroup(reader, position, Long.MIN_VALUE, tag, crc, path);
-                    empty = new LogFiles.Prepared(number, path, salt);
+                    empty = new LogFiles.Prepared(number, path, salt, reader.size() / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT);
                     continue;
                 }
                 empty = null;

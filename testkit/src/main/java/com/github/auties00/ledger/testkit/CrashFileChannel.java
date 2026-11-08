@@ -13,6 +13,12 @@ import java.nio.channels.WritableByteChannel;
 
 /// A channel on a file or a directory of a [CrashFileSystem]; a channel on a directory reads nothing, and its
 /// [#force(boolean)] makes the namespace changes that touched the directory durable.
+///
+/// A channel opened with [java.nio.file.StandardOpenOption#DSYNC] or [java.nio.file.StandardOpenOption#SYNC] makes
+/// each write durable before it returns, the bytes it wrote and the size that holds them, as `O_DSYNC` does: the write
+/// is made as any other, then forced alone, a force that [CrashFileSystem#stopAtForce(long)] counts and that the
+/// interceptor sees, so a stop there leaves the write to a loss of power as a stop at a force leaves the writes before
+/// it.
 final class CrashFileChannel extends FileChannel {
     private final CrashFileSystem fileSystem;
     private final Disk disk;
@@ -21,10 +27,13 @@ final class CrashFileChannel extends FileChannel {
     private final boolean readable;
     private final boolean writable;
     private final boolean append;
+    private final boolean sync;
     private long position;
 
-    /// Creates a channel on `file`, or on the directory at `path` if `file` is `null`.
-    CrashFileChannel(CrashFileSystem fileSystem, String path, Disk.FileNode file, boolean readable, boolean writable, boolean append) {
+    /// Creates a channel on `file`, or on the directory at `path` if `file` is `null`, whose writes are durable once
+    /// they return if `sync`.
+    CrashFileChannel(CrashFileSystem fileSystem, String path, Disk.FileNode file, boolean readable, boolean writable,
+                     boolean append, boolean sync) {
         this.fileSystem = fileSystem;
         this.disk = fileSystem.disk();
         this.path = path;
@@ -32,6 +41,7 @@ final class CrashFileChannel extends FileChannel {
         this.readable = readable;
         this.writable = writable;
         this.append = append;
+        this.sync = sync;
     }
 
     private Disk.FileNode file() throws IOException {
@@ -77,14 +87,20 @@ final class CrashFileChannel extends FileChannel {
     @Override
     public int write(ByteBuffer src) throws IOException {
         fileSystem.beforeChange(path, ChangeInterceptor.ChangeKind.WRITE);
+        long at;
+        int written;
         synchronized (disk.lock) {
             if (append) {
                 position = file().size;
             }
-            var written = writeAt(src, position);
+            at = position;
+            written = writeAt(src, position);
             position += written;
-            return written;
         }
+        if (sync) {
+            forceWritten(at, written);
+        }
+        return written;
     }
 
     @Override
@@ -195,7 +211,8 @@ final class CrashFileChannel extends FileChannel {
         }
     }
 
-    /// Writes at `position`, interruptibly as [#force(boolean)] forces.
+    /// Writes at `position`, interruptibly as [#force(boolean)] forces: an interrupt of a write of a channel opened
+    /// with `DSYNC` may come once the bytes are written and before they are durable.
     @Override
     public int write(ByteBuffer src, long position) throws IOException {
         var completed = false;
@@ -206,10 +223,25 @@ final class CrashFileChannel extends FileChannel {
             synchronized (disk.lock) {
                 written = writeAt(src, position);
             }
+            if (sync) {
+                forceWritten(position, written);
+            }
             completed = true;
             return written;
         } finally {
             end(completed);
+        }
+    }
+
+    /// Makes the `length` bytes a write of a channel opened with `DSYNC` wrote at `offset` durable.
+    private void forceWritten(long offset, int length) throws IOException {
+        if (length == 0) {
+            return;
+        }
+        fileSystem.beforeChange(path, ChangeInterceptor.ChangeKind.FORCE);
+        synchronized (disk.lock) {
+            checkOpen();
+            disk.forceRange(file(), offset, length);
         }
     }
 

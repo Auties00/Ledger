@@ -31,9 +31,12 @@ import java.util.Set;
 ///
 /// # What a loss of power keeps
 /// The model journals metadata in order and caches file data, as ext4, XFS, APFS and NTFS do, and assumes no more
-/// than POSIX promises. A write is durable once a force of its file returns; until then it may be kept, dropped, or
-/// kept in some of its 512-byte sectors only, in any combination with the other writes since that force, and a
-/// dropped write may still leave the file grown, with zeros. A truncation is durable once a force of its file returns.
+/// than POSIX promises. A write is durable once a force of its file returns, or once it returns if its channel was
+/// opened with [java.nio.file.StandardOpenOption#DSYNC] or [java.nio.file.StandardOpenOption#SYNC]; until then it may
+/// be kept, dropped, or kept in some of its 512-byte sectors only, in any combination with the other writes since that
+/// force, and a dropped write may still leave the file grown, with zeros. A write of a `DSYNC` channel counts as a
+/// force for [#stopAtForce(long)], and the interceptor sees it as a write and then a force. A truncation is durable
+/// once a force of its file returns.
 /// Creating, renaming and deleting are durable once a force of a directory they touch returns (a channel opened on the
 /// directory for reading, then forced); a loss of power keeps a prefix, in order, of those not forced, and a file
 /// whose entry it drops is gone, with its data.

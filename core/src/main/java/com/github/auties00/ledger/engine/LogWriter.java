@@ -49,6 +49,12 @@ import java.util.zip.CRC32C;
 /// [#ZEROED_RATE]: the zeros halve the time of a force on Linux, but double the bytes the device takes, which slowed an
 /// ingest of a history, whose commits do not wait, and 256 committers writing 100 MB a second, by a fifth.
 ///
+/// Where [WriteThrough] can, a group that one write holds and that lands below the bytes its segment already has is
+/// written through to stable storage instead, durable once the write returns, and not forced: one round trip to the
+/// device where a write and a force take two. The segment is opened a second time for it. A group of several writes,
+/// one that rolls over, or one that would grow the file is written into the cache and forced as before, so an ingest
+/// keeps the bandwidth of the cache, and a file system that refuses the writes through moves the writer to forces.
+///
 /// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames. Each use of it, the writing of one
 /// open, draws a random tag, and the key of the use derives from the segment's number, a random salt of its own and
 /// that tag: the offset of a frame is a unique nonce under its key, even where an open writes into a segment that an
@@ -76,7 +82,8 @@ import java.util.zip.CRC32C;
 ///                 associated data; without encryption, the body and the CRC-32C of header and body
 /// ```
 ///
-/// A failed write or force stops the writer for good: [#awaitDurable(long)] and every later [#append] throw.
+/// A failed write or force stops the writer for good: [#awaitDurable(long)] and every later [#append] throw. A failed
+/// write through only moves the writer to forces.
 final class LogWriter {
     static final int SEGMENT_HEADER = 4_096;
     static final int ALIGNMENT = 4_096;
@@ -125,9 +132,18 @@ final class LogWriter {
     private final long segmentSize;
     private final Executor executor;
     private final long commitWindowNanos;
+    // How the flush task opens segments to write groups through; owned by it
+    private final WriteThrough writeThrough;
 
     // Owned by the flush task; null until the first group opens the first segment
     private FileChannel channel;
+    // The current segment opened to write through, or null where its groups are forced
+    private WriteThrough.Handle throughFile;
+    // The bytes the current segment had when it was prepared, below which a write changes neither its size nor the
+    // length of its data
+    private long valid;
+    // The end of the bytes of the current segment a force or a write through made durable
+    private long forcedPosition;
     // The file of the current segment, which an interrupted write reopens
     private java.nio.file.Path segmentPath;
     // Whether an interrupt closed the channel or cut a wait short during the flush, which then gives the interrupt
@@ -172,6 +188,8 @@ final class LogWriter {
     private ArrayList<Queued> flushing;
     // Written by the flush task only
     private volatile long forces;
+    // The groups written through, of the forces; written by the flush task only
+    private volatile long writtenThrough;
     // The segment the flush task writes, for a checkpoint to read
     private volatile long currentSegment;
 
@@ -227,15 +245,17 @@ final class LogWriter {
     /// @param commitWindow how long a flush waits for more commits before it starts
     /// @param empty the segment numbered `firstSegment`, which recovery found prepared and never written, to write
     ///              first; or `null`, to prepare one
+    /// @param writeThrough how the segments are opened to write groups through, which the writer owns from now on
     /// @throws IOException if the segment cannot be prepared
     LogWriter(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long durable, long segmentSize,
-              Executor executor, Duration commitWindow, LogFiles.Prepared empty) throws IOException {
+              Executor executor, Duration commitWindow, LogFiles.Prepared empty, WriteThrough writeThrough) throws IOException {
         this.files = files;
         this.keys = keys;
         this.storeId = storeId;
         this.segmentSize = segmentSize;
         this.executor = executor;
         this.commitWindowNanos = commitWindow.toNanos();
+        this.writeThrough = writeThrough;
         try {
             this.cipher = keys.encrypted() ? Cipher.getInstance("AES/GCM/NoPadding") : null;
         } catch (GeneralSecurityException exception) {
@@ -284,11 +304,51 @@ final class LogWriter {
         this.segmentNumber = segment.number();
         this.currentSegment = segment.number();
         this.position = SEGMENT_HEADER;
+        // Its preparation forced the header
+        this.forcedPosition = SEGMENT_HEADER;
+        this.valid = segment.valid();
         this.groupEnd = SEGMENT_HEADER;
         this.segmentTag = ByteBuffer.wrap(segment.salt()).getLong();
         this.useTag = TAGS.nextLong();
         this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt(), useTag) : null;
         this.next = null;
+        // A segment of its header and first block holds at most one group through, which the probe would cost
+        this.throughFile = valid > KEPT_LENGTH ? openThrough() : null;
+    }
+
+    /// {@return the current segment opened to write through, or `null` if [#writeThrough] has no way left}
+    ///
+    /// Each way is probed with a write of zeros over the segment's first frame block, which a prepared segment holds
+    /// already, so a file system that opens the file that way but refuses its writes, as some refuse the alignment
+    /// of `O_DIRECT` at the write and not at the open, moves the writer to the next way down before a group needs it.
+    /// An interrupt that cuts the probe short has it run again, and is given back to a commit's thread when the flush
+    /// ends.
+    private WriteThrough.Handle openThrough() {
+        while (writeThrough.enabled()) {
+            WriteThrough.Handle handle = null;
+            try {
+                handle = writeThrough.open(segmentPath);
+                handle.write(new byte[ALIGNMENT], ALIGNMENT, output.length, SEGMENT_HEADER);
+                return handle;
+            } catch (ClosedByInterruptException _) {
+                interruptedWrite |= Thread.interrupted();
+            } catch (IOException | RuntimeException | LinkageError _) {
+                writeThrough.downgrade();
+            }
+            closeQuietly(handle);
+        }
+        return null;
+    }
+
+    private static void closeQuietly(WriteThrough.Handle handle) {
+        if (handle == null) {
+            return;
+        }
+        try {
+            handle.close();
+        } catch (IOException _) {
+            // Nothing was written through it that a group depends on
+        }
     }
 
     /// Prepares the segment after the current one on a platform thread of its own.
@@ -540,7 +600,8 @@ final class LogWriter {
     /// Only without a commit window, which the pool's flush waits out for the commits that join the group. A virtual
     /// thread leads too: its force lends the carrier's place to another, as the JDK does for a force, and only the write
     /// of the group into the file's cache holds the carrier; a commit of one virtual thread at a time made a fifth more
-    /// commits a second where it did.
+    /// commits a second where it did. On Windows the write of a group through to stable storage holds the carrier too,
+    /// one at a time as only one flush runs, while the other carriers go on.
     private boolean alone(long sequence) {
         return commitWindowNanos == 0 && waiters.isEmpty() && lastQueued == sequence && durable < sequence;
     }
@@ -551,14 +612,38 @@ final class LogWriter {
         if (channel == null) {
             return false;
         }
+        var bytes = sealedBytes(frames);
+        return bytes >= 0 && position + bytes + ALIGNMENT <= segmentSize;
+    }
+
+    /// {@return the bytes `frames` seal into, or -1 if the output cannot hold them and a block of padding}
+    private long sealedBytes(List<Queued> frames) {
         var bytes = 0L;
         for (var frame : frames) {
             bytes += FRAME_HEADER + frame.body().size() + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
             if (bytes > OUTPUT - ALIGNMENT) {
-                return false;
+                return -1;
             }
         }
-        return position + bytes + ALIGNMENT <= segmentSize;
+        return bytes;
+    }
+
+    /// {@return whether `group` is written through: it seals into one write, which starts where everything before it
+    /// is durable and ends, padded, within the bytes the segment had when it was prepared}
+    ///
+    /// Within those bytes a write changes neither the size of the file nor the length of its data, so it needs no
+    /// metadata written with it: the one write with forced unit access that makes a write through cheaper than a
+    /// write and a force.
+    private boolean writesThrough(List<Queued> group) {
+        if (throughFile == null || position != forcedPosition) {
+            return false;
+        }
+        var bytes = sealedBytes(group);
+        if (bytes < 0) {
+            return false;
+        }
+        var end = (position + bytes + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT;
+        return end <= valid && position + bytes + ALIGNMENT <= segmentSize;
     }
 
     /// Writes the queued groups until the queue is empty or the commit at `until` is durable, holding [#running].
@@ -617,18 +702,31 @@ final class LogWriter {
         }
     }
 
-    /// Opens the segment again after an interrupt of the thread writing it closed its channel, with the interrupt
-    /// cleared until the flush ends, so a commit that writes its own group survives an interrupt.
+    /// Opens the segment again after an interrupt of the thread writing it closed its channel, or its handle to write
+    /// through, with the interrupt cleared until the flush ends, so a commit that writes its own group survives an
+    /// interrupt. Only what the interrupt closed is opened again; a handle to write through that cannot be leaves the
+    /// segment's groups to forces.
     private void reopen() throws IOException {
         interruptedWrite |= Thread.interrupted();
-        channel = FileChannel.open(segmentPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        if (!channel.isOpen()) {
+            channel = FileChannel.open(segmentPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        }
+        if (throughFile != null && !throughFile.isOpen()) {
+            try {
+                throughFile = writeThrough.open(segmentPath);
+            } catch (IOException | RuntimeException | LinkageError _) {
+                throughFile = null;
+            }
+        }
     }
 
-    /// Seals and writes `group`, then forces it, and the file of large values if `units`.
+    /// Seals and writes `group`, then forces it, and the file of large values if `units`; or writes it through, if
+    /// [#writesThrough(List)], and forces only that file.
     ///
     /// The commits of the group wrote their units before they queued their frames, so one force of that file, run
-    /// beside the segment's, makes them all durable. A rollover waits for it before it forces the segment: the first
-    /// frame of a group in the next segment then means, as it always does, that everything before it is durable.
+    /// beside the segment's write and force, makes them all durable before the group is. A rollover waits for it
+    /// before it forces the segment: the first frame of a group in the next segment then means, as it always does,
+    /// that everything before it is durable.
     ///
     /// @return the bytes of the frame bodies written
     private long write(List<Queued> group, boolean units) throws IOException {
@@ -639,6 +737,8 @@ final class LogWriter {
         if (smallGroups >= SHRINK_AFTER && output.length > MIN_OUTPUT) {
             output = new byte[MIN_OUTPUT];
         }
+        // Before a frame is sealed, while the output holds no byte of the group
+        var through = writesThrough(group);
         var unitForce = units ? forceUnits() : null;
         var start = position;
         var groupStart = true;
@@ -670,8 +770,12 @@ final class LogWriter {
         Arrays.fill(output, used, used + padding, (byte) 0);
         used += padding;
         smallGroups = position + used - start <= MIN_OUTPUT / 2 ? smallGroups + 1 : 0;
-        drain();
-        force();
+        if (through) {
+            writeThrough();
+        } else {
+            drain();
+            force();
+        }
         forces++;
         if (unitForce != null) {
             await(unitForce);
@@ -801,6 +905,39 @@ final class LogWriter {
                 reopen();
             }
         }
+    }
+
+    /// Writes the bytes of the output, a group padded to a block, through to stable storage: durable once this
+    /// returns, as a force would make them.
+    ///
+    /// An interrupt that closes the handle meanwhile has the bytes written again through a new one, the same bytes at
+    /// the same offsets, as [#drain()] does. A write through that fails otherwise, as one a file system refuses the
+    /// alignment of does, moves the writer to forces: the group is written again into the cache and forced, which
+    /// makes each of its pages dirty again whatever the failed write left on the device, so a force that succeeds
+    /// makes the group durable, and one that fails stops the writer as it always does.
+    private void writeThrough() throws IOException {
+        var start = position;
+        lastDrainStart = start;
+        lastDrainLength = used;
+        while (throughFile != null) {
+            try {
+                throughFile.write(output, used, output.length, start);
+                position = start + used;
+                used = 0;
+                forcedPosition = position;
+                writtenThrough++;
+                return;
+            } catch (ClosedByInterruptException _) {
+                reopen();
+            } catch (IOException _) {
+                break;
+            }
+        }
+        writeThrough.disable();
+        closeQuietly(throughFile);
+        throughFile = null;
+        drain();
+        force();
     }
 
     /// A frame waiting in the queue.
@@ -1016,9 +1153,14 @@ final class LogWriter {
         return groupStart;
     }
 
-    /// {@return the forces made so far}
+    /// {@return the forces made so far, a group written through counting as one}
     long forces() {
         return forces;
+    }
+
+    /// {@return the groups written through so far, for tests}
+    long writtenThrough() {
+        return writtenThrough;
     }
 
     /// Makes everything queued durable, then closes the segment.
@@ -1100,6 +1242,14 @@ final class LogWriter {
 
     /// Forces the segment to stable storage; on macOS the JDK empties the drive's cache with `fcntl(F_FULLFSYNC)`.
     ///
+    /// A write through gives the same guarantee for the bytes it writes, with no force: on Linux `O_DSYNC` is the
+    /// guarantee of `fdatasync`, which flushes the device's cache or writes with forced unit access, as the force
+    /// does; on Windows a write through a handle opened with `FILE_FLAG_NO_BUFFERING` and `FILE_FLAG_WRITE_THROUGH`
+    /// also requests a write-through of the drive's cache, and the metadata it changes is written through with it.
+    /// Only [WriteThrough.Mode#DSYNC] asks for less on Windows, `FILE_FLAG_WRITE_THROUGH` alone; on macOS, whose
+    /// `O_DSYNC` leaves the bytes in the drive's cache, the groups of a store on the default file system are always
+    /// forced.
+    ///
     /// An interrupt of a commit writing its own group that closes the channel meanwhile has the group written again
     /// through a new one, then forced: the interrupt may hide a failure of the force, after which the file system may
     /// report the next force a success with the group not on disk, so the pages are made dirty again first. A group of
@@ -1108,6 +1258,7 @@ final class LogWriter {
         while (true) {
             try {
                 channel.force(false);
+                forcedPosition = position;
                 return;
             } catch (ClosedByInterruptException exception) {
                 if (!leading) {
@@ -1135,9 +1286,18 @@ final class LogWriter {
         }
     }
 
+    /// Closes the channel of the current segment and its handle to write through.
     private void closeSegment() throws IOException {
-        if (channel != null) {
-            channel.close();
+        var handle = throughFile;
+        throughFile = null;
+        try {
+            if (handle != null) {
+                handle.close();
+            }
+        } finally {
+            if (channel != null) {
+                channel.close();
+            }
         }
     }
 

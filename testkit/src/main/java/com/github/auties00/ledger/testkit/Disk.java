@@ -20,9 +20,9 @@ import java.util.SplittableRandom;
 /// It models a file system that journals its metadata in order and caches file data, as ext4, XFS, APFS and NTFS do,
 /// and assumes no more than POSIX promises:
 ///
-/// - a write is durable once a force of its file returns; until then a loss of power may keep it, drop it, or keep
-///   any of its 512-byte sectors, in any combination with the other writes since the force, and may extend the file
-///   over it while dropping its data;
+/// - a write is durable once a force of its file returns, or once it returns itself if its channel was opened with
+///   `DSYNC`; until then a loss of power may keep it, drop it, or keep any of its 512-byte sectors, in any combination
+///   with the other writes since the force, and may extend the file over it while dropping its data;
 /// - a truncation is durable once a force of its file returns;
 /// - creating, renaming and deleting are durable once a force of a directory they touch returns; a loss of power keeps
 ///   an unforced prefix of them, in the order they ran, and a file whose entry it does not keep is gone with its data;
@@ -308,6 +308,46 @@ final class Disk {
         file.durableData = Arrays.copyOf(file.data, (int) file.size);
         file.durableSize = file.size;
         file.changes.clear();
+    }
+
+    /// Makes the `length` bytes of `file` at `offset` durable, and a size that holds them, as a write through a
+    /// channel opened with `DSYNC` is once it returns; the other writes since the last force stay at risk outside
+    /// those bytes.
+    ///
+    /// A truncation not yet durable makes the whole file durable instead, as the journal commit of the size that a
+    /// file system makes for such a write writes the file's data before it.
+    void forceRange(FileNode file, long offset, long length) throws IOException {
+        for (var change : file.changes) {
+            if (change.truncation() >= 0) {
+                force(file);
+                return;
+            }
+        }
+        alive();
+        forced();
+        var end = offset + length;
+        if (end > file.durableSize) {
+            file.durableData = Arrays.copyOf(file.durableData, (int) end);
+            file.durableSize = end;
+        }
+        System.arraycopy(file.data, (int) offset, file.durableData, (int) offset, (int) length);
+        var kept = new ArrayList<Change>(file.changes.size());
+        for (var change : file.changes) {
+            var from = change.offset();
+            var to = from + change.bytes().length;
+            if (to <= offset || from >= end) {
+                kept.add(change);
+                continue;
+            }
+            if (from < offset) {
+                kept.add(new Change(from, Arrays.copyOfRange(change.bytes(), 0, (int) (offset - from)), -1));
+            }
+            if (to > end) {
+                kept.add(new Change(end, Arrays.copyOfRange(change.bytes(), (int) (end - from), (int) (to - from)), -1));
+            }
+        }
+        file.changes.clear();
+        file.changes.addAll(kept);
     }
 
     /// Takes the lock of `file` for `holder`.
