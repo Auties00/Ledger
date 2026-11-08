@@ -161,6 +161,11 @@ public final class HeapPool {
         acquiresSeen = seen;
     }
 
+    /// {@return the arrays taken from the pool so far; for tests that count the reads of a file}
+    int acquiresForTests() {
+        return acquires;
+    }
+
     /// {@return the free bytes the pool keeps at most; for tests}
     long maxPooledBytesForTests() {
         return maxPooledBytes;

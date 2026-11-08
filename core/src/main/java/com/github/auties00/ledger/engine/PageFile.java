@@ -18,6 +18,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.stream.IntStream;
@@ -77,6 +78,23 @@ final class PageFile implements AutoCloseable {
     ///
     /// @param cacheBytes the most bytes the page cache holds
     static PageFile open(Path directory, PageCipher cipher, long cacheBytes, HeapPool pool) throws IOException {
+        return open(directory, cipher, PageCache.shared(cacheBytes), pool);
+    }
+
+    /// Opens the data file of the store in `directory` as [#open(Path, PageCipher, long, HeapPool)] does, with `cache`,
+    /// which it closes as it closes.
+    static PageFile open(Path directory, PageCipher cipher, PageCache cache, HeapPool pool) throws IOException {
+        try {
+            return new PageFile(create(directory), cipher, cache, pool);
+        } catch (IOException | RuntimeException failure) {
+            cache.close();
+            throw failure;
+        }
+    }
+
+    /// {@return the path of the data file of the store in `directory`, created with two empty superblocks if there is
+    /// none}
+    private static Path create(Path directory) throws IOException {
         var path = directory.resolve(FILE);
         if (!Files.exists(path)) {
             var temporary = directory.resolve(FILE + ".tmp");
@@ -91,13 +109,7 @@ final class PageFile implements AutoCloseable {
             Files.move(temporary, path, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
             Durability.forceDirectory(directory);
         }
-        var cache = PageCache.shared(cacheBytes);
-        try {
-            return new PageFile(path, cipher, cache, pool);
-        } catch (IOException | RuntimeException failure) {
-            cache.close();
-            throw failure;
-        }
+        return path;
     }
 
     /// {@return the newest superblock that authenticates, or `null` if no checkpoint was ever made durable}
@@ -187,6 +199,27 @@ final class PageFile implements AutoCloseable {
             }
             return leaf;
         }
+        return readUnit(ref, kind, cached, referenced);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, for a checkpoint that reads it to replace it: the cache stays as
+    /// it was, whether or not it holds the unit}
+    ///
+    /// A node a checkpoint replaces is dead once the checkpoint ends. Caching or promoting it, while the units the
+    /// checkpoint writes go in as the first the clock evicts, would make a checkpoint larger than the cache keep the old
+    /// nodes and evict the new ones.
+    ///
+    /// @param ref a unit, not a delta record
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[] readForReplace(PageRef ref, byte kind) {
+        var hit = peek(ref, kind);
+        return hit != null ? hit : readUnit(ref, kind, false, false);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, read from the file and authenticated}
+    private byte[] readUnit(PageRef ref, byte kind, boolean cached, boolean referenced) {
         var length = ref.pages() * PageFormat.SIZE;
         var sealed = pool.acquire(length);
         try {
@@ -316,6 +349,22 @@ final class PageFile implements AutoCloseable {
     byte[] cached(PageRef ref, byte kind) {
         var hit = cache.get(ref);
         return hit != null && kindMatches(hit[PageFormat.KIND], kind) ? hit : null;
+    }
+
+    /// {@return what [#cached(PageRef, byte)] finds for `ref`, without counting as a read of the unit}
+    ///
+    /// A hit of another kind reads as a miss, so the read from the file that follows fails as it would without the hit.
+    byte[] peek(PageRef ref, byte kind) {
+        var hit = cache.peek(ref);
+        return hit != null && kindMatches(hit[PageFormat.KIND], kind) ? hit : null;
+    }
+
+    /// Counts `unit`, the plaintext of what `ref` names that [#readForReplace(PageRef, byte)] or [#peek(PageRef, byte)]
+    /// gave, as read, caching it if the cache does not hold it: the checkpoint that read it found it outlives it.
+    void keep(PageRef ref, byte[] unit) {
+        if (cache.get(ref) == null) {
+            cache.put(ref, unit, true);
+        }
     }
 
     private static boolean kindMatches(byte actual, byte expected) {
@@ -504,12 +553,28 @@ final class PageFile implements AutoCloseable {
         private FutureTask<Void> forcing;
         // Whether the commits wait for the checkpoint, which only then forces beside its work
         private final BooleanSupplier lagging;
+        // The bytes of leaves, values and delta pages admits counted, and the most it lets evict other entries
+        private final AtomicLong admitted;
+        private final long admission;
 
         private Writer(long nonceHigh, BooleanSupplier lagging) {
             this.lock = new Object();
             this.nonceHigh = nonceHigh;
             this.staged = new TreeMap<>();
             this.lagging = lagging;
+            this.admitted = new AtomicLong();
+            this.admission = cache.admission();
+        }
+
+        /// {@return whether the page cache should take a leaf, a value or a delta page of `bytes` bytes this checkpoint
+        /// writes}
+        ///
+        /// Each call counts `bytes` against what the checkpoint may cache. Past [PageCache#admission()] only what fits in
+        /// free room goes in, as a scan's leaves do: a checkpoint that writes more than the cache holds would otherwise
+        /// evict its own first units for its last ones, none read in between. Branches never ask, as a reader and the
+        /// next checkpoint's lookups need them all to reach a leaf.
+        boolean admits(long bytes) {
+            return cache.holds(bytes) && (admitted.addAndGet(bytes) <= admission || cache.hasRoom(bytes));
         }
 
         /// Queues `unit`, whose content is filled in, as the unit of `pages` pages at `page`.

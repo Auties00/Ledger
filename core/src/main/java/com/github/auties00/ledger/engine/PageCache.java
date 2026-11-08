@@ -35,6 +35,8 @@ final class PageCache implements IdleTicker.Watched {
     static final int BLOBS = 1;
     /// The first of the keys of the leaves delta records make, one per slot of a delta page of `ledger.data`.
     private static final int RECORDS = 2;
+    /// The least bytes [#admission()] gives while the limit allows it: 4,096 leaves.
+    private static final long MIN_ADMISSION = 16L << 20;
 
     private final ConcurrentHashMap<Long, Entry> entries;
     // The entries in eviction order, current or dropped
@@ -91,11 +93,8 @@ final class PageCache implements IdleTicker.Watched {
     /// {@return the plaintext of the unit `ref` names, at `key`, or `null` if the cache does not hold it}
     byte[] get(long key, PageRef ref) {
         var entry = entries.get(key);
-        if (entry == null || entry.nonceHigh != ref.nonceHigh() || entry.nonceLow != ref.nonceLow()) {
-            return null;
-        }
-        var unit = entry.unit;
-        if (unit == null || unit.length != ref.pages() * PageFormat.SIZE) {
+        var unit = entry == null ? null : entry.unit(ref);
+        if (unit == null) {
             return null;
         }
         // Written only when they change: a volatile store on every hit made the readers of one page, the root
@@ -107,6 +106,15 @@ final class PageCache implements IdleTicker.Watched {
             entry.idle = false;
         }
         return unit;
+    }
+
+    /// {@return what [#get(PageRef)] finds for `ref`, without counting as a read of the entry}
+    ///
+    /// For a checkpoint that reads a node to replace it: the old node dies with the checkpoint, so the read must not
+    /// earn it another pass of the clock, or a tick of the [IdleTicker], over the units the checkpoint writes.
+    byte[] peek(PageRef ref) {
+        var entry = entries.get(key(ref));
+        return entry == null ? null : entry.unit(ref);
     }
 
     /// Caches `unit`, the plaintext of the unit `ref` of the data file names, replacing whatever the cache held for its
@@ -121,7 +129,7 @@ final class PageCache implements IdleTicker.Watched {
     ///
     /// @param referenced whether the unit counts as read, rather than written and maybe never read
     void put(long key, PageRef ref, byte[] unit, boolean referenced) {
-        if (unit.length > budget.limit() / 4) {
+        if (!holds(unit.length)) {
             // A unit this large would evict most of the cache for one read; what the page held is out of date
             remove(key);
             return;
@@ -146,6 +154,16 @@ final class PageCache implements IdleTicker.Watched {
         clock.offer(entry);
         clockSize.incrementAndGet();
         evict();
+    }
+
+    /// {@return whether the cache would keep a unit of `bytes` bytes: one above a quarter of the limit it never does}
+    boolean holds(long bytes) {
+        return bytes <= budget.limit() / 4;
+    }
+
+    /// Drops whatever the cache holds at the place of the unit or the delta record `ref` names, under any nonce.
+    void remove(PageRef ref) {
+        remove(key(ref));
     }
 
     /// Drops whatever the cache holds for page `page` of the data file.
@@ -211,9 +229,25 @@ final class PageCache implements IdleTicker.Watched {
         return budget.total.get() + bytes <= budget.limit();
     }
 
+    /// {@return the bytes of leaves, values and delta pages one checkpoint may cache at the cost of evicting others}
+    ///
+    /// Half of this cache's share of the limit, so a checkpoint that writes more than the cache holds leaves it the
+    /// units it wrote first and the other half to the reads, rather than a turnover of units no one reads before the
+    /// clock takes them. At least [#MIN_ADMISSION] while that is at most half the limit, as a process of many stores
+    /// would otherwise cache next to nothing of what each of them writes.
+    long admission() {
+        return Math.max(budget.share() / 2, Math.min(budget.limit() / 2, MIN_ADMISSION));
+    }
+
     /// {@return the entries the clock holds, current or dropped, for tests that bound it}
     int clockLengthForTests() {
         return clock.size();
+    }
+
+    /// {@return whether the entry for `ref` counts as read, for tests of what a checkpoint promotes}
+    boolean referencedForTests(PageRef ref) {
+        var entry = entries.get(key(ref));
+        return entry != null && entry.unit(ref) != null && entry.referenced;
     }
 
     /// Drops every entry, so tests read units from the file.
@@ -413,6 +447,15 @@ final class PageCache implements IdleTicker.Watched {
             this.nonceLow = nonceLow;
             this.length = unit.length;
             this.unit = unit;
+        }
+
+        /// {@return the plaintext if the entry holds the unit `ref` names, or `null`}
+        byte[] unit(PageRef ref) {
+            if (nonceHigh != ref.nonceHigh() || nonceLow != ref.nonceLow()) {
+                return null;
+            }
+            var held = unit;
+            return held == null || held.length != ref.pages() * PageFormat.SIZE ? null : held;
         }
     }
 }

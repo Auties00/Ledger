@@ -276,7 +276,7 @@ final class DeltaLeaves {
             if (unit == null) {
                 return;
             }
-            writer.write(PageFormat.DELTA, 0, page, 1, unit, PageFormat.capacity(1), true, nonce);
+            writer.write(PageFormat.DELTA, 0, page, 1, unit, PageFormat.capacity(1), writer.admits(PageFormat.SIZE), nonce);
             written.accept(page, records);
             unit = null;
         }
