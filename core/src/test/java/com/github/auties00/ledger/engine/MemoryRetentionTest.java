@@ -60,6 +60,7 @@ class MemoryRetentionTest {
     void pagedValueLeavesItsBatch(@TempDir Path directory) throws Exception {
         try (var ledger = (LiveLedger) Ledger.builder().directory(directory).encryption(Encryption.key(new byte[32]))
                 .keyspace(SESSIONS).keyspace(MESSAGES).build()) {
+            ledger.valueSlab().forceColdForTests();
             ledger.commit(ledger.newBatch().put(SESSIONS, new byte[]{1}, new byte[1_500]).put(MESSAGES, new byte[]{1}, new byte[1_500]))
                     .awaitDurable();
             // The session's bytes, which the store holds a copy of, are not kept for the message
