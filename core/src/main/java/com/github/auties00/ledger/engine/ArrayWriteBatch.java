@@ -57,8 +57,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     private byte[] spare;
     // Where the store's versions find the values, as prepare decided: one of the HOMES_ constants
     private byte homesMode;
-    // In HOMES_CHUNKS, the segment each write's value was copied into, or null, and where in it the value starts
-    private MemorySegment[] homes;
+    // In HOMES_CHUNKS, where each write's value was copied: the read-only segment of a chunk, or an array of its own
+    // that is the value; null for a write the store copies; and where in a chunk the value starts
+    private Object[] homes;
     private int[] homeOffsets;
 
     private byte[] kinds;
@@ -222,6 +223,10 @@ public final class ArrayWriteBatch implements WriteBatch {
         Arrays.fill(values, 0, size, null);
         size = 0;
         used = 0;
+        // What a commit that failed prepared: the arrays of its large values, which nothing else holds
+        homes = null;
+        homeOffsets = null;
+        homesMode = HOMES_NONE;
     }
 
     /// {@return the kind of write `index`: [#PUT], [#DELETE] or [#DELETE_RANGE]}
@@ -356,7 +361,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         if (paged == 0) {
             return;
         }
-        homes = new MemorySegment[size];
+        homes = new Object[size];
         homeOffsets = new int[size];
         homesMode = HOMES_CHUNKS;
         var chunk = (byte[]) null;
@@ -375,9 +380,9 @@ public final class ArrayWriteBatch implements WriteBatch {
             var offset = (int) spans[i * 4 + 2];
             var length = (int) spans[i * 4 + 3];
             if (length >= CHUNK_BYTES / 2) {
-                // A value of half a chunk or more gets an array of its own, which no other value shares
-                var own = Arrays.copyOfRange(data, offset, offset + length);
-                homes[i] = MemorySegment.ofArray(own).asReadOnly();
+                // A value of half a chunk or more gets an array of its own, which no other value shares: the version
+                // keeps the array, which a read copies with an array copy, rather than a segment hiding it
+                homes[i] = Arrays.copyOfRange(data, offset, offset + length);
                 continue;
             }
             if (chunk == null || fill + length > chunk.length) {
@@ -399,13 +404,13 @@ public final class ArrayWriteBatch implements WriteBatch {
         return kinds[index] == PUT && targets[index].residency() == Keyspace.Residency.PAGED;
     }
 
-    /// {@return the read-only segment the store's version of the value of write `index` slices, or `null` if the store
-    /// copies the value}
+    /// {@return where the store's version of the value of write `index` finds it: a read-only segment it slices, or an
+    /// array of its own that is the value, which no one writes; `null` if the store copies the value}
     ///
-    /// The segment holds no write the batch makes after [#finish()].
+    /// Neither holds a write the batch makes after [#finish()].
     ///
     /// @param index a write that puts a value
-    MemorySegment home(int index) {
+    Object home(int index) {
         Objects.checkIndex(index, size);
         return switch (homesMode) {
             case HOMES_OWN -> view;

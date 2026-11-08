@@ -108,6 +108,21 @@ final class TreeSearch {
         return MemorySegment.ofArray(blob).asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry)).asReadOnly();
     }
 
+    /// {@return the value of leaf entry `entry` of `unit` in a new array, read from its blob if it has one, which goes
+    /// to the cache as for [#value(PageFile, byte\[\], int)]}
+    ///
+    /// It copies from the array that holds the value, so the new array is not zeroed first, as a copy of the segment
+    /// [#value(PageFile, byte\[\], int)] returns would have it.
+    static byte[] valueBytes(PageFile pages, byte[] unit, int entry) {
+        if (TreeNodes.isInline(unit, entry)) {
+            return TreeNodes.inlineValueBytes(unit, entry);
+        }
+        var holder = TreeNodes.isExternal(unit, entry)
+                ? pages.blobs().read(TreeNodes.blobRef(unit, entry), true, true)
+                : pages.read(TreeNodes.blobRef(unit, entry), PageFormat.VALUE, true, true);
+        return Segments.toBytes(holder, PageFormat.HEADER, TreeNodes.blobLength(unit, entry));
+    }
+
     /// {@return the entries of the tree under `root` from `from`, included, to `to`, excluded, either `null` for no
     /// bound}
     ///

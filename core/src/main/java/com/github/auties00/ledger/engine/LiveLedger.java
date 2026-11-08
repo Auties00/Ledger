@@ -2034,10 +2034,11 @@ public final class LiveLedger implements Ledger {
 
         /// Applies a put of `key`, whose chain is `chain`, in the order and without the race the caller ensures.
         ///
-        /// @param source the read-only segment `value` is part of, which the version keeps in its place, or `null` for a
-        ///               value of its own
-        /// @param offset where `value` starts in `source`
-        void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, MemorySegment source, int offset,
+        /// @param source the read-only segment `value` is part of, or an array of its own that is `value`, which no one
+        ///               writes, as [ArrayWriteBatch#home(int)] gives them: the version keeps it in its place; or
+        ///               `null` for a value of its own
+        /// @param offset where `value` starts in a segment `source`
+        void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, Object source, int offset,
                  Object decoded, byte inTree, PageRef external) {
             var stamp = nextStamp();
             var head = chain.head;
@@ -2049,7 +2050,8 @@ public final class LiveLedger implements Ledger {
                 // the store holds, and the checkpoints, where the caller's array and a copy of it served them apart
                 var own = Segments.toBytes(value);
                 version = Version.ofOwn(stamp, own, own, head, external);
-            } else if (state.resident && (source == null || source.byteSize() > 2L * length + RESIDENT_SLACK)) {
+            } else if (state.resident && (source == null
+                    || source instanceof MemorySegment segment && segment.byteSize() > 2L * length + RESIDENT_SLACK)) {
                 // A resident version lives as long as its key does: on a value of its own, not on the array of the
                 // batch or the log frame it came in, which a session written beside ten messages held 12 times over
                 version = Version.ofOwn(stamp, Segments.toBytes(value), decoded, head, external);
@@ -2059,8 +2061,10 @@ public final class LiveLedger implements Ledger {
                 version = Version.ofOwn(stamp, Segments.toBytes(value), decoded, head, external);
             } else if (source == null) {
                 version = Version.of(stamp, value, 0, length, decoded, head, external);
+            } else if (source instanceof byte[] own) {
+                version = Version.ofOwn(stamp, own, decoded, head, external);
             } else {
-                version = Version.of(stamp, source, offset, length, decoded, head, external);
+                version = Version.of(stamp, (MemorySegment) source, offset, length, decoded, head, external);
             }
             var blind = existed == TreeSearch.UNKNOWN;
             if (blind) {

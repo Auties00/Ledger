@@ -33,8 +33,9 @@ sealed class Version permits Version.External {
     /// The commit sequence in the high bits and the position of the write in its batch in the low bits.
     final long stamp;
     // The read-only segment the encoded value is part of, the array of its batch; or the array that is the value, which
-    // a resident version keeps, and whose segment and session, 72 bytes, a read of its encoding makes; or `null` if
-    // this version removes the key. A slice of its own per version was 40 of the bytes a buffered write took
+    // a resident version keeps, as does a paged one its batch gave an array of its own, and whose segment and session,
+    // 72 bytes, a read of its encoding makes; or `null` if this version removes the key. A slice of its own per version
+    // was 40 of the bytes a buffered write took
     private final Object source;
     // Where the value starts in source, and its length
     private final int offset;
@@ -94,6 +95,20 @@ sealed class Version permits Version.External {
         return offset == 0 && length == whole.byteSize() ? whole : whole.asSlice(offset, length);
     }
 
+    /// {@return the encoded value in a new array, or `null` if this version removes the key}
+    ///
+    /// A value on an array of its own is copied with an array copy, which spares the zeroing of the new array a copy
+    /// of [#value] pays ([Segments#toBytes(byte\[\], int, int)]); one on a read-only segment, which hides its array,
+    /// cannot be.
+    byte[] copyBytes() {
+        var held = source;
+        if (held instanceof byte[] array) {
+            return Segments.toBytes(array, offset, length);
+        }
+        // No slice of the segment: the copy reads the value where it is
+        return held == null ? null : Segments.toBytes((MemorySegment) held, offset, length);
+    }
+
     /// {@return the unit of [BlobFile] that also holds [#value], or `null` if the value is in memory and the log only}
     PageRef external() {
         return null;
@@ -136,6 +151,11 @@ sealed class Version permits Version.External {
             case MemorySegment segment -> segment.byteSize();
             default -> throw new IllegalStateException();
         };
+    }
+
+    /// {@return whether the value is an array of its own, which [#copyBytes] copies with an array copy; for tests}
+    boolean ownsArrayForTests() {
+        return source instanceof byte[];
     }
 
     /// {@return whether this version removes the key}
