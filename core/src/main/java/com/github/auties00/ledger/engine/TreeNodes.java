@@ -258,9 +258,28 @@ final class TreeNodes {
 
     static PageRef childRef(byte[] unit, int index) {
         var entry = entry(unit, index);
-        var slot = (unit[entry + 24] & IS_DELTA) == 0 ? -1
+        return new PageRef(childPage(unit, entry), 1, childNonceHigh(unit, entry), childNonceLow(unit, entry), childSlot(unit, entry));
+    }
+
+    /// {@return the first page of the child at branch entry `entry`}
+    static int childPage(byte[] unit, int entry) {
+        return Bytes.i32(unit, entry);
+    }
+
+    /// {@return the first 8 bytes of the nonce of the child at branch entry `entry`}
+    static long childNonceHigh(byte[] unit, int entry) {
+        return Bytes.i64(unit, entry + 4);
+    }
+
+    /// {@return the last 4 bytes of the nonce of the child at branch entry `entry`}
+    static int childNonceLow(byte[] unit, int entry) {
+        return Bytes.i32(unit, entry + 12);
+    }
+
+    /// {@return the delta record of the child at branch entry `entry`, or -1 if the child is a unit of its own}
+    static int childSlot(byte[] unit, int entry) {
+        return (unit[entry + 24] & IS_DELTA) == 0 ? -1
                 : Bytes.u16(unit, entry + BRANCH_FIXED + Bytes.u16(unit, entry + BRANCH_FIXED - 2));
-        return new PageRef(Bytes.i32(unit, entry), 1, Bytes.i64(unit, entry + 4), Bytes.i32(unit, entry + 12), slot);
     }
 
     static long childCount(byte[] unit, int index) {

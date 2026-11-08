@@ -234,7 +234,7 @@ final class PageFile implements AutoCloseable {
         var next = -1;
         for (var index : order) {
             var ref = refs.get(index);
-            var alone = ref.isRecord() || cache.get(ref) != null;
+            var alone = ref.isRecord() || cache.peek(ref) != null;
             if (!run.isEmpty() && (alone || ref.page() != next || runPages + ref.pages() > RUN_PAGES)) {
                 runs.add(run.stream().mapToInt(Integer::intValue).toArray());
                 run.clear();
@@ -323,6 +323,25 @@ final class PageFile implements AutoCloseable {
     byte[] cached(PageRef ref, byte kind) {
         var hit = cache.get(ref);
         return hit != null && kindMatches(hit[PageFormat.KIND], kind) ? hit : null;
+    }
+
+    /// {@return the node child `index` of the branch `parent` names, from the cache or the file}
+    ///
+    /// A child the cache holds costs no [PageRef]: the page, nonce and slot come straight from the branch.
+    ///
+    /// @throws LedgerCorruptedException if the node fails authentication or is not the one the branch names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[] node(byte[] parent, int index) {
+        var hit = cachedNode(parent, index);
+        return hit != null ? hit : read(TreeNodes.childRef(parent, index), NODE, true);
+    }
+
+    /// {@return the node child `index` of the branch `parent` names if the cache holds it, or `null`}
+    byte[] cachedNode(byte[] parent, int index) {
+        var entry = TreeNodes.entry(parent, index);
+        var key = PageCache.dataKey(TreeNodes.childPage(parent, entry), TreeNodes.childSlot(parent, entry));
+        var hit = cache.get(key, TreeNodes.childNonceHigh(parent, entry), TreeNodes.childNonceLow(parent, entry), 1);
+        return hit != null && kindMatches(hit[PageFormat.KIND], NODE) ? hit : null;
     }
 
     private static boolean kindMatches(byte actual, byte expected) {
