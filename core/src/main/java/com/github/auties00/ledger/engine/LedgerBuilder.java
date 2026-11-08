@@ -42,6 +42,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private final Map<String, Long> largeValuesByKeyspace;
     // Null for the mode the system property names
     private WriteThrough.Mode writeThrough;
+    // Null to make one from the mode
+    private WriteThrough writeThroughWay;
 
     /// Creates a builder with the default options.
     public LedgerBuilder() {
@@ -70,6 +72,13 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     /// one that would write through.
     LedgerBuilder writeThrough(WriteThrough.Mode mode) {
         this.writeThrough = Objects.requireNonNull(mode, "mode");
+        return this;
+    }
+
+    /// Sets the way the log starts writing groups through, in place of the one a mode gives, so tests can start from
+    /// a way their platform would not choose and from what a device reports. It serves one build.
+    LedgerBuilder writeThrough(WriteThrough way) {
+        this.writeThroughWay = Objects.requireNonNull(way, "way");
         return this;
     }
 
@@ -295,7 +304,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                 pages.force();
                 Durability.forceDirectory(logDirectory);
             }
-            var through = WriteThrough.of(writeThrough != null ? writeThrough : WriteThrough.Mode.fromProperty(), logDirectory);
+            var through = writeThroughWay != null ? writeThroughWay
+                    : WriteThrough.of(writeThrough != null ? writeThrough : WriteThrough.Mode.fromProperty(), logDirectory);
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
                     segmentSize, pool.executor(), commitWindow, empty, through);
             var deltaTable = superblock == null ? null : superblock.deltaTable();
