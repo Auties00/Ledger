@@ -49,6 +49,10 @@ public final class ArrayWriteBatch implements WriteBatch {
     private static final int OWN_BYTES = CHUNK_BYTES / 2;
     /// The bytes besides the values the store keeps that a batch may hold and still keep them on its own array.
     private static final int SLACK = 64;
+    /// The most writes of a batch whose values a [ValueSlab] takes, which fits the mask of the writes it took. A larger
+    /// batch fills its own chunks in one go, and the slab's would come on top of what a history sync's batches take
+    /// already.
+    private static final int SLAB_WRITES = 16;
     // No write has a home: the store copies every value it keeps
     private static final byte HOMES_NONE = 0;
     // Every write's home is the batch's own view
@@ -57,6 +61,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     private static final byte HOMES_CHUNKS = 2;
     // A paged write's home is the home of its chunk of the rope, a resident one has none
     private static final byte HOMES_ROPE = 3;
+    // A paged write's home is in perWriteHomes, at the offset the high half of its key's length holds; a resident one
+    // has none
+    private static final byte HOMES_PER_WRITE = 4;
 
     /// A write of a value under a key.
     public static final byte PUT = 0;
@@ -95,12 +102,16 @@ public final class ArrayWriteBatch implements WriteBatch {
     private byte homesMode;
     // In HOMES_CHUNKS, the read-only segment the values of the paged writes were copied into
     private MemorySegment packedHome;
+    // In HOMES_PER_WRITE, the read-only segment the value of each paged write was copied into: a slab's chunks, more than
+    // one of them or beside the array of the values it did not take
+    private MemorySegment[] perWriteHomes;
 
     private byte[] kinds;
     private Keyspace<?, ?>[] targets;
     private Object[] values;
     // Per write: first offset and length, then second offset and length (value, or upper bound of a range). Only the low
-    // half of the first length is the length: in HOMES_CHUNKS the high half is where the write's value is in packedHome
+    // half of the first length is the length: in HOMES_CHUNKS and HOMES_PER_WRITE the high half is where the write's
+    // value is in its home
     private long[] spans;
     // The array of each value of OWN_BYTES or more, or null before the first
     private byte[][] owns;
@@ -575,6 +586,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         leaveRope();
         // What a commit that failed prepared
         packedHome = null;
+        perWriteHomes = null;
         homesMode = HOMES_NONE;
         if (exposed) {
             dropData();
@@ -711,17 +723,28 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// it and no read needs it, and with it whatever array the value is part of. A batch that holds little but those
     /// values, at most [#SLACK] bytes or a sixteenth besides, keeps them on its own array, [compacted][#compact()];
     /// any other has them copied, alone, into arrays below [#CHUNK_BYTES], and its own array goes back to the pool
-    /// once the commit [ends][#finish()]. On the batch's array, a message committed beside a session of 1.5 KiB would
-    /// keep the session's bytes, which the store holds a copy of already, until the next checkpoint. A value on an array
-    /// of its own stays there and counts for none of this. A batch on a rope has its paged values alone on their chunks
-    /// already, which it hands over as they are, but for one that leaves more than [#SLACK] bytes or a sixteenth unused,
+    /// once the commit [ends][#finish()]. The small values of a small batch go to a [ValueSlab] while it takes them, and
+    /// the batch's array goes back the same way. On the batch's array, a message committed beside a session of 1.5 KiB
+    /// would keep the session's bytes, which the store holds a copy of already, until the next checkpoint. A value on an
+    /// array of its own stays there and counts for none of this. A batch on a rope has its paged values alone on their
+    /// chunks already, which it hands over as they are, but for one that leaves more than [#SLACK] bytes or a sixteenth unused,
     /// copied to an array of its bytes.
     ///
     /// A commit that fails prepares again when it is retried: a prepare writes nothing a former one exposed.
     ///
     /// @param copies whether the store copies every value it keeps, as a store in memory does, so no write has a home
     void prepare(boolean copies) {
+        prepare(copies, null, Map.of());
+    }
+
+    /// Does what [#prepare(boolean)] does, with the chunks of `slab` for the values it takes.
+    ///
+    /// @param copies whether the store copies every value it keeps, as a store in memory does, so no write has a home
+    /// @param slab the store's chunks of values, or `null` if it has none
+    /// @param states the store's key spaces by name
+    void prepare(boolean copies, ValueSlab slab, Map<String, KeyspaceState> states) {
         packedHome = null;
+        perWriteHomes = null;
         homesMode = HOMES_NONE;
         if (copies) {
             return;
@@ -731,6 +754,9 @@ public final class ArrayWriteBatch implements WriteBatch {
             return;
         }
         var paged = pagedValueBytes;
+        if (paged > 0 && size <= SLAB_WRITES && slab != null && !slab.off() && placeOnSlab(slab, states)) {
+            return;
+        }
         // A batch of resident writes alone keeps them on its array as before, where the store's rule for resident
         // values finds it small enough; any other copies them, so the paged values' array holds none
         var kept = paged > 0 ? paged : residentValueBytes;
@@ -775,7 +801,81 @@ public final class ArrayWriteBatch implements WriteBatch {
         }
     }
 
-    // Whether write `index` puts a value the store keeps on a chunk, in HOMES_CHUNKS and HOMES_ROPE
+    /// Gives `slab` the paged values it may take if it is accepting them, and counts them toward its rate either way:
+    /// those that no unit of the file of large values holds too, of a key space that does not overwrite or remove most
+    /// of what it writes.
+    ///
+    /// A batch whose paged values all landed on one chunk has that chunk for their home, as any batch has the one array
+    /// it packs them into, with nothing allocated for it. Any other, which a chunk filling up in the middle of the batch
+    /// or a value the slab declined makes, has a home per write, and the values the slab did not take go on an array of
+    /// their bytes.
+    ///
+    /// @return whether it took any, so every paged write has its home
+    private boolean placeOnSlab(ValueSlab slab, Map<String, KeyspaceState> states) {
+        var accepting = slab.accepting();
+        var eligible = 0L;
+        var placedBytes = 0L;
+        var placed = 0;
+        var declined = false;
+        MemorySegment first = null;
+        MemorySegment[] several = null;
+        for (var i = 0; i < size; i++) {
+            if (!packed(i)) {
+                continue;
+            }
+            var length = (int) spans[i * 4 + 3];
+            var state = states.get(targets[i].name());
+            if (length == 0 || length >= state.largeValues || !state.overwrites.worthwhile()) {
+                declined = true;
+                continue;
+            }
+            eligible += length;
+            var home = accepting ? slab.place(data, (int) spans[i * 4 + 2], length, spans, i * 4 + 1) : null;
+            if (home == null) {
+                declined = true;
+                continue;
+            }
+            placed |= 1 << i;
+            placedBytes += length;
+            if (first == null) {
+                first = home;
+            } else if (several == null && home != first) {
+                several = new MemorySegment[size];
+            }
+            if (several != null) {
+                several[i] = home;
+            }
+        }
+        slab.note(eligible);
+        if (first == null) {
+            return false;
+        }
+        if (several == null && !declined) {
+            packedHome = first;
+            homesMode = HOMES_CHUNKS;
+            return true;
+        }
+        perWriteHomes = several != null ? several : new MemorySegment[size];
+        homesMode = HOMES_PER_WRITE;
+        Packer packer = null;
+        for (var i = 0; i < size; i++) {
+            if (!packed(i)) {
+                continue;
+            }
+            if ((placed >>> i & 1) == 0) {
+                if (packer == null) {
+                    packer = new Packer((int) (pagedValueBytes - placedBytes));
+                }
+                packer.pack(i);
+                perWriteHomes[i] = packedHome;
+            } else if (perWriteHomes[i] == null) {
+                perWriteHomes[i] = first;
+            }
+        }
+        return true;
+    }
+
+    // Whether write `index` puts a value the store keeps on a chunk, in HOMES_CHUNKS, HOMES_PER_WRITE and HOMES_ROPE
     private boolean packed(int index) {
         return kinds[index] == PUT && spans[index * 4 + 2] != OWN && targets[index].residency() == Keyspace.Residency.PAGED;
     }
@@ -819,6 +919,7 @@ public final class ArrayWriteBatch implements WriteBatch {
             case HOMES_OWN -> spans[index * 4 + 2] == OWN ? null : view;
             case HOMES_CHUNKS -> packed(index) ? packedHome : null;
             case HOMES_ROPE -> packed(index) ? chunks[(int) (spans[index * 4 + 2] >>> 32)].home : null;
+            case HOMES_PER_WRITE -> packed(index) ? perWriteHomes[index] : null;
             default -> null;
         };
     }
@@ -830,7 +931,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         Objects.checkIndex(index, size);
         return switch (homesMode) {
             case HOMES_OWN -> spans[index * 4 + 2] == OWN ? 0 : Math.toIntExact(spans[index * 4 + 2]);
-            case HOMES_CHUNKS -> packed(index) ? (int) (spans[index * 4 + 1] >>> 32) : 0;
+            case HOMES_CHUNKS, HOMES_PER_WRITE -> packed(index) ? (int) (spans[index * 4 + 1] >>> 32) : 0;
             case HOMES_ROPE -> packed(index) ? (int) spans[index * 4 + 2] : 0;
             default -> 0;
         };
