@@ -1,5 +1,7 @@
 package com.github.auties00.ledger.engine;
 
+import com.github.auties00.ledger.LedgerCorruptedException;
+
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -110,16 +112,14 @@ final class TreeSearch {
     ///
     /// @param cached whether a blob read from the file goes to the cache
     /// @param referenced whether a blob the cache takes counts as read, rather than as the first it evicts
+    /// @throws LedgerCorruptedException if the leaf records a value longer than its blob's content
     static MemorySegment value(PageFile pages, byte[] unit, int entry, boolean cached, boolean referenced) {
         if (TreeNodes.isInline(unit, entry)) {
             return TreeNodes.inlineValue(unit, entry);
         }
-        if (TreeNodes.isExternal(unit, entry)) {
-            var external = pages.blobs().read(TreeNodes.blobRef(unit, entry), cached, referenced);
-            return MemorySegment.ofArray(external).asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry)).asReadOnly();
-        }
-        var blob = pages.read(TreeNodes.blobRef(unit, entry), PageFormat.VALUE, cached, referenced);
-        return MemorySegment.ofArray(blob).asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry)).asReadOnly();
+        return MemorySegment.ofArray(blob(pages, unit, entry, cached, referenced))
+                .asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry))
+                .asReadOnly();
     }
 
     /// {@return the value of leaf entry `entry` of `unit` in a new array, read from its blob if it has one, which goes
@@ -127,14 +127,31 @@ final class TreeSearch {
     ///
     /// It copies from the array that holds the value, so the new array is not zeroed first, as a copy of the segment
     /// [#value(PageFile, byte\[\], int)] returns would have it.
+    ///
+    /// @throws LedgerCorruptedException if the leaf records a value longer than its blob's content
     static byte[] valueBytes(PageFile pages, byte[] unit, int entry) {
         if (TreeNodes.isInline(unit, entry)) {
             return TreeNodes.inlineValueBytes(unit, entry);
         }
-        var holder = TreeNodes.isExternal(unit, entry)
-                ? pages.blobs().read(TreeNodes.blobRef(unit, entry), true, true)
-                : pages.read(TreeNodes.blobRef(unit, entry), PageFormat.VALUE, true, true);
-        return Segments.toBytes(holder, PageFormat.HEADER, TreeNodes.blobLength(unit, entry));
+        return Segments.toBytes(blob(pages, unit, entry, true, true), PageFormat.HEADER, TreeNodes.blobLength(unit, entry));
+    }
+
+    /// {@return the array of the blob of leaf entry `entry` of `unit`, which has one, with the value after its header}
+    ///
+    /// @param cached whether a blob read from the file goes to the cache
+    /// @param referenced whether a blob the cache takes counts as read, rather than as the first it evicts
+    /// @throws LedgerCorruptedException if the leaf records a value longer than the blob's content
+    private static byte[] blob(PageFile pages, byte[] unit, int entry, boolean cached, boolean referenced) {
+        var ref = TreeNodes.blobRef(unit, entry);
+        var blob = TreeNodes.isExternal(unit, entry) ? pages.blobs().read(ref, cached, referenced)
+                : pages.read(ref, PageFormat.VALUE, cached, referenced);
+        var length = TreeNodes.blobLength(unit, entry);
+        // The cache may hold the blob's header and content alone, which a longer value would read past
+        if (length > Bytes.i32(blob, PageFormat.LENGTH)) {
+            throw new LedgerCorruptedException("A leaf records a value of " + length + " bytes in a unit holding "
+                    + Bytes.i32(blob, PageFormat.LENGTH) + ", at page " + ref.page(), null);
+        }
+        return blob;
     }
 
     /// {@return the entries of the tree under `root` from `from`, included, to `to`, excluded, either `null` for no

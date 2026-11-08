@@ -409,8 +409,8 @@ final class TreeUpdate {
             dropRecord(ref);
         }
         var record = packer.append(base, changes, size);
-        var leaf = new byte[PageFormat.SIZE];
-        TreeNodes.deltaHeader(leaf, base, TreeNodes.writeLeaf(leaf, merged, 0, merged.size()));
+        var leaf = TreeNodes.writeLeaf(merged, 0, merged.size(), fill);
+        TreeNodes.deltaHeader(leaf, base, fill);
         pages.cache().put(record, leaf, false);
         return List.of(new Child(merged.getFirst().key(), record, merged.size(), blobs, 0, fill));
     }
@@ -596,7 +596,8 @@ final class TreeUpdate {
         }
         var unitPages = PageFormat.pagesFor(length);
         var page = allocate(unitPages);
-        var unit = new byte[unitPages * PageFormat.SIZE];
+        // The header and the value: the writer seals the padding as zeros, and the page cache holds no more than this
+        var unit = new byte[PageFormat.HEADER + (int) length];
         MemorySegment.copy(value, 0, MemorySegment.ofArray(unit), PageFormat.HEADER, length);
         var ref = writer.write(PageFormat.VALUE, 0, page, unitPages, unit, (int) length, true);
         return new LeafEntry(key, null, ref, (int) length);
@@ -617,8 +618,8 @@ final class TreeUpdate {
         var out = new ArrayList<Child>();
         for (var run : TreeNodes.split(sizes, sizes.length)) {
             var page = allocate(1);
-            var unit = new byte[PageFormat.SIZE];
-            var length = TreeNodes.writeLeaf(unit, entries, run[0], run[1]);
+            var length = TreeNodes.contentLength(sizes, run[0], run[1]);
+            var unit = TreeNodes.writeLeaf(entries, run[0], run[1], length);
             var blobs = false;
             for (var i = run[0]; i < run[1]; i++) {
                 blobs |= entries.get(i).blob() != null;
@@ -638,8 +639,8 @@ final class TreeUpdate {
         var out = new ArrayList<Child>();
         for (var run : TreeNodes.split(sizes, sizes.length)) {
             var page = allocate(1);
-            var unit = new byte[PageFormat.SIZE];
-            var length = TreeNodes.writeBranch(unit, children, run[0], run[1]);
+            var length = TreeNodes.contentLength(sizes, run[0], run[1]);
+            var unit = TreeNodes.writeBranch(children, run[0], run[1], length);
             var count = 0L;
             var blobs = false;
             for (var i = run[0]; i < run[1]; i++) {

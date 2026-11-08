@@ -157,7 +157,8 @@ final class TreeCursor {
         if (admit()) {
             return TreeSearch.value(pages, leaf, entry, true);
         }
-        var bytes = (long) PageFormat.pagesFor(TreeNodes.blobLength(leaf, entry)) * PageFormat.SIZE;
+        var length = TreeNodes.blobLength(leaf, entry);
+        var bytes = PageFormat.cachedLength(PageFormat.pagesFor(length), length);
         return TreeSearch.value(pages, leaf, entry, pages.cache().hasRoom(bytes), false);
     }
 
