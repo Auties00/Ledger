@@ -5,7 +5,6 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
-import java.lang.foreign.MemorySegment;
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -61,36 +60,37 @@ final class PageCipher {
         void write(byte[] bytes, int length) throws IOException;
     }
 
-    /// Seals the unit of `pages` pages whose header is `header` and whose content is `content`, passing it to `out` a
-    /// part at a time through `buffer`.
+    /// Seals the unit of `pages` pages whose header is `header` and whose content is the `contentLength` bytes of
+    /// `content` at `contentOffset`, passing it to `out` a part at a time through `buffer`.
     ///
     /// The unit is the one [#seal(byte\[\], int, byte\[\], int)] makes of the same header and content, but neither is
-    /// whole in memory: a value of megabytes is sealed through a buffer of its own size.
+    /// whole in memory: a value of megabytes is sealed through a buffer of its own size. The cipher reads each whole
+    /// slice of the content where it is; only the last part of the content and the padding after it are copied.
     ///
     /// @param header the unit's header, filled in, of [PageFormat#HEADER] bytes
     /// @param buffer the buffer the sealed bytes pass through, of at least 64 KiB
     /// @throws IOException if `out` fails
-    void seal(byte[] header, MemorySegment content, int pages, byte[] buffer, Output out) throws IOException {
+    void seal(byte[] header, byte[] content, int contentOffset, int contentLength, int pages, byte[] buffer, Output out) throws IOException {
         var tag = pages * PageFormat.SIZE - PageFormat.TAG;
-        var padding = tag - PageFormat.HEADER - content.byteSize();
+        var padding = tag - PageFormat.HEADER - (long) contentLength;
         if (padding < 0) {
             throw new IllegalArgumentException("A unit of " + pages + " pages holds at most " + PageFormat.capacity(pages) + " bytes");
         }
         System.arraycopy(header, 0, buffer, 0, PageFormat.HEADER);
         var used = PageFormat.HEADER;
-        var slice = new byte[Math.min(SLICE, buffer.length / 2)];
+        var total = contentLength + padding;
         if (key == null) {
             var crc = new CRC32C();
             crc.update(header, 0, PageFormat.HEADER);
-            for (var offset = 0L; offset < content.byteSize() + padding; ) {
+            for (var offset = 0L; offset < total; ) {
                 if (used == buffer.length) {
                     out.write(buffer, used);
                     used = 0;
                 }
-                var count = (int) Math.min(buffer.length - used, content.byteSize() + padding - offset);
-                var fromContent = (int) Math.max(0, Math.min(count, content.byteSize() - offset));
+                var count = (int) Math.min(buffer.length - used, total - offset);
+                var fromContent = (int) Math.max(0, Math.min(count, contentLength - offset));
                 if (fromContent > 0) {
-                    MemorySegment.copy(content, offset, MemorySegment.ofArray(buffer), used, fromContent);
+                    System.arraycopy(content, contentOffset + (int) offset, buffer, used, fromContent);
                 }
                 Arrays.fill(buffer, used + fromContent, used + count, (byte) 0);
                 crc.update(buffer, used, count);
@@ -110,19 +110,28 @@ final class PageCipher {
         try {
             cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, header, PageFormat.NONCE, 12));
             cipher.updateAAD(header, 0, PageFormat.HEADER);
-            for (var offset = 0L; offset < content.byteSize() + padding; ) {
-                var count = (int) Math.min(slice.length, content.byteSize() + padding - offset);
-                var fromContent = (int) Math.max(0, Math.min(count, content.byteSize() - offset));
-                if (fromContent > 0) {
-                    MemorySegment.copy(content, offset, MemorySegment.ofArray(slice), 0, fromContent);
-                }
-                Arrays.fill(slice, fromContent, count, (byte) 0);
+            var sliceLength = Math.min(SLICE, buffer.length / 2);
+            byte[] tail = null;
+            for (var offset = 0L; offset < total; ) {
+                var count = (int) Math.min(sliceLength, total - offset);
                 // The cipher may hold back a partial block, and gives it out with the next call
                 if (buffer.length - used < count + PageFormat.TAG) {
                     out.write(buffer, used);
                     used = 0;
                 }
-                used += cipher.update(slice, 0, count, buffer, used);
+                if (offset + count <= contentLength) {
+                    used += cipher.update(content, contentOffset + (int) offset, count, buffer, used);
+                } else {
+                    if (tail == null) {
+                        tail = new byte[count];
+                    }
+                    var fromContent = (int) Math.max(0, contentLength - offset);
+                    if (fromContent > 0) {
+                        System.arraycopy(content, contentOffset + (int) offset, tail, 0, fromContent);
+                    }
+                    Arrays.fill(tail, fromContent, count, (byte) 0);
+                    used += cipher.update(tail, 0, count, buffer, used);
+                }
                 offset += count;
             }
             if (buffer.length - used < 2 * PageFormat.TAG) {

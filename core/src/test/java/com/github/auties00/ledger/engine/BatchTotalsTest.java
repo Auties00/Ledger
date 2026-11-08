@@ -218,9 +218,12 @@ class BatchTotalsTest {
         private static void checkHomes(ArrayWriteBatch batch) {
             var paged = 0L;
             var resident = 0L;
+            var ownBytes = 0L;
             for (var i = 0; i < batch.size(); i++) {
                 if (batch.kind(i) == ArrayWriteBatch.PUT) {
-                    if (batch.keyspace(i).residency() == Keyspace.Residency.PAGED) {
+                    if (batch.ownValue(i) != null) {
+                        ownBytes += batch.valueBytes(i);
+                    } else if (batch.keyspace(i).residency() == Keyspace.Residency.PAGED) {
                         paged += batch.valueBytes(i);
                     } else {
                         resident += batch.valueBytes(i);
@@ -228,7 +231,7 @@ class BatchTotalsTest {
                 }
             }
             var kept = paged > 0 ? paged : resident;
-            var used = batch.encodedBytes();
+            var used = batch.encodedBytes() - ownBytes;
             // The rule of ArrayWriteBatch.prepare: no homes, the batch's own array (64 bytes of slack), or chunks
             var own = kept > 0 && used <= ArrayWriteBatch.CHUNK_BYTES && used - kept <= Math.max(64, used / 16);
             var chunks = kept > 0 && !own && paged > 0;
@@ -238,17 +241,20 @@ class BatchTotalsTest {
                 }
                 var home = batch.home(i);
                 var length = batch.valueBytes(i);
+                if (batch.ownValue(i) != null) {
+                    assertTrue(length >= ArrayWriteBatch.CHUNK_BYTES / 2, "a value of " + length + " bytes on an array of its own");
+                    assertEquals(length, batch.ownValue(i).length, "a value of half a chunk or more shares its array");
+                    assertNull(home, "write " + i + " has a home besides its array");
+                    continue;
+                }
+                assertTrue(length < ArrayWriteBatch.CHUNK_BYTES / 2, "a value of " + length + " bytes shares an array");
                 if (own) {
-                    assertSame(batch.view(), home, "write " + i + " not on the batch's array");
-                    assertEquals(batch.valueOffset(i), batch.homeOffset(i));
+                    assertSame(batch.viewForTests(), home, "write " + i + " not on the batch's array");
+                    assertEquals(batch.valueArrayOffset(i), batch.homeOffset(i));
                 } else if (chunks && batch.keyspace(i).residency() == Keyspace.Residency.PAGED) {
                     assertNotNull(home, "write " + i + " has no chunk");
-                    assertNotSame(batch.view(), home);
-                    if (length >= ArrayWriteBatch.CHUNK_BYTES / 2) {
-                        assertEquals(length, home.byteSize(), "a value of half a chunk or more shares its array");
-                    } else {
-                        assertTrue(home.byteSize() <= ArrayWriteBatch.CHUNK_BYTES, "a chunk of " + home.byteSize() + " bytes");
-                    }
+                    assertNotSame(batch.viewForTests(), home);
+                    assertTrue(home.byteSize() <= ArrayWriteBatch.CHUNK_BYTES, "a chunk of " + home.byteSize() + " bytes");
                 } else {
                     assertNull(home, "write " + i + " has a home");
                     continue;

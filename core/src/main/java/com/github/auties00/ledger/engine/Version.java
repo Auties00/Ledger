@@ -138,6 +138,11 @@ sealed class Version permits Version.External {
         };
     }
 
+    /// {@return the segment or array the value is on, `null` for a removal; for tests of what memory keeps}
+    Object sourceForTests() {
+        return source;
+    }
+
     /// {@return whether this version removes the key}
     boolean removes() {
         return source == null;
