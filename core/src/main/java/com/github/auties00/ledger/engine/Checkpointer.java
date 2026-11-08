@@ -493,14 +493,18 @@ final class Checkpointer implements IdleTicker.Watched {
                     ranges.add(new TreeUpdate.Range(removal.from(), removal.to()));
                 }
             }
+            // Counted here, on the trees their reads keep, the range removals up to the cut whose count is not known
+            // yet: one that fails fails the checkpoint with its own failure
+            var pendingRanges = state.ranges.correction(cut.sequence());
             var base = roots[state.id];
             var root = update.apply(base, ops, TreeUpdate.merge(ranges));
             // The update settled the blind writes up to the cut but those of keys it skipped, looked up here
             var blind = state.blind.correction(cut.sequence(), key -> base != null && TreeSearch.find(pages, base, key) != null);
             var count = root == null ? 0 : root.count();
-            if (count != keyspace.count() + blind) {
+            var expected = keyspace.count() + blind + pendingRanges;
+            if (count != expected) {
                 throw new IllegalStateException("The checkpoint of " + state.keyspace.name() + " holds " + count
-                        + " entries where the store counts " + (keyspace.count() + blind));
+                        + " entries where the store counts " + expected);
             }
             roots[state.id] = root;
         }

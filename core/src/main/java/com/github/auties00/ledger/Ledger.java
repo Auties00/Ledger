@@ -71,7 +71,8 @@ import java.util.function.Consumer;
 /// forces its log on the platform threads of its [IoPool], and writes the checkpoints it starts on its own on a
 /// platform thread of their own; a read of a page the cache does not hold reads the file on the calling thread. A
 /// commit writes its large values on the calling thread, and reads the pages of the trees its writes need, which
-/// the cache does not hold, on virtual threads of its own, before it waits for the writer.
+/// the cache does not hold, on virtual threads of its own, before it waits for the writer. The store counts the
+/// entries a batch's range removal takes away on a virtual thread of its own, after the commit.
 ///
 /// # Lifecycle
 /// A store holds an exclusive lock on its directory from [Options#build()] until [#close()]: one process, and one

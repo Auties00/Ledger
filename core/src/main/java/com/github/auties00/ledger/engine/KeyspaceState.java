@@ -53,10 +53,13 @@ final class KeyspaceState {
     private final ConcurrentLinkedQueue<Chain> leaving;
     // Copy-on-write: the writer publishes a new array, readers keep the one they loaded
     volatile RangeRemoval[] removals;
-    // The number of entries visible as of each commit sequence that changed it, leaving out the blind writes
+    // The number of entries visible as of each commit sequence that changed it, leaving out the blind writes and the
+    // range removals counted later
     final CountHistory counts;
     // The writes whose effect on the count the trees settle
     final BlindWrites blind;
+    // The range removals whose count is not known yet
+    final PendingRanges ranges;
     // The copies of the keys the chains hold
     private final KeySlab keys;
     // The chains written since the last checkpoint was cut, each listed once per cut; guarded by the publishing role
@@ -98,6 +101,7 @@ final class KeyspaceState {
         this.removals = RangeRemoval.NONE;
         this.counts = new CountHistory(0, 0);
         this.blind = new BlindWrites();
+        this.ranges = new PendingRanges();
         this.dirty = new ArrayList<>();
         this.keys = new KeySlab();
         this.ordering = new ReentrantLock();
@@ -452,7 +456,8 @@ final class KeyspaceState {
         return entries;
     }
 
-    /// {@return the number of entries a reader at `sequence` sees, leaving out the blind writes}
+    /// {@return the number of entries a reader at `sequence` sees, leaving out the blind writes and the range removals
+    /// counted later}
     long known(long sequence) {
         return counts.at(sequence);
     }
@@ -460,9 +465,11 @@ final class KeyspaceState {
     /// {@return the number of entries `point` sees}
     ///
     /// It looks up in the trees of `point` the keys of the blind writes up to its sequence whose effect is not known
-    /// yet, which reads the file for those of a tree larger than the page cache.
+    /// yet, which reads the file for those of a tree larger than the page cache, and counts the range removals up to
+    /// its sequence whose count is not known yet, which reads the nodes on the paths to their bounds.
     long count(ReadPoint point) {
         var sequence = point.bound() >>> Reads.OP_BITS;
-        return known(sequence) + blind.correction(sequence, key -> Reads.inTreeOnly(this, key, point));
+        return known(sequence) + blind.correction(sequence, key -> Reads.inTreeOnly(this, key, point))
+                + ranges.correction(sequence);
     }
 }
