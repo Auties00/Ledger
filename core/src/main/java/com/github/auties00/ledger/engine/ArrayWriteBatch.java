@@ -24,11 +24,14 @@ public final class ArrayWriteBatch implements WriteBatch {
     private static final MemorySegment EMPTY_MEMORY = MemorySegment.ofArray(EMPTY);
     /// The writes a new batch has room for: most batches hold one or two.
     private static final int INITIAL_WRITES = 2;
-    /// The most bytes of the arrays [#prepare(boolean)] copies values into: below half a region of the smallest the
+    /// The most bytes of the arrays [#prepare(boolean, ValueSlab, Map)] copies values into: below half a region of the smallest the
     /// G1 collector makes, 1 MiB, so none takes a region of its own, as an object of half a region or more does.
     static final int CHUNK_BYTES = 256 * 1024;
     /// The bytes besides the values the store keeps that a batch may hold and still keep them on its own array.
     private static final int SLACK = 64;
+    /// The most writes of a batch whose values a [ValueSlab] takes. A larger batch fills its own chunks in one go, and
+    /// the slab's would come on top of what a history sync's batches take already.
+    private static final int SLAB_WRITES = 16;
     // No write has a home: the store copies every value it keeps
     private static final byte HOMES_NONE = 0;
     // Every write's home is the batch's own view
@@ -316,15 +319,18 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// writes through the accessors.
     ///
     /// The store keeps the value of a write to a [Keyspace.Residency#PAGED] key space until checkpoints have written
-    /// it and no read needs it, and with it whatever array the value is part of. A batch that holds little but those
-    /// values, at most [#SLACK] bytes or a sixteenth besides, keeps them on its own array, [compacted][#compact()];
-    /// any other has them copied, alone, into arrays below [#CHUNK_BYTES], and its own array goes back to the pool
-    /// once the commit [ends][#finish()]. On the batch's array, a message committed beside a session of 1.5 KiB kept
-    /// the session's bytes, which the store held a copy of already, until the next checkpoint, and a batch of a
-    /// thousand messages one array of over 2 MiB, which the collector gives regions of its own.
+    /// it and no read needs it, and with it whatever array the value is part of. The values of a small batch go to
+    /// `slab` while it is hot. Otherwise, a batch that holds little but those values, at most [#SLACK] bytes or a
+    /// sixteenth besides, keeps them on its own array, [compacted][#compact()]; any other has them copied, alone, into
+    /// arrays below [#CHUNK_BYTES], and its own array goes back to the pool once the commit [ends][#finish()]. On the
+    /// batch's array, a message committed beside a session of 1.5 KiB kept the session's bytes, which the store held a
+    /// copy of already, until the next checkpoint, and a batch of a thousand messages one array of over 2 MiB, which
+    /// the collector gives regions of its own.
     ///
     /// @param copies whether the store copies every value it keeps, as a store in memory does, so no write has a home
-    void prepare(boolean copies) {
+    /// @param slab the store's chunks of values
+    /// @param states the store's key spaces by name
+    void prepare(boolean copies, ValueSlab slab, Map<String, KeyspaceState> states) {
         homes = null;
         homeOffsets = null;
         homesMode = HOMES_NONE;
@@ -341,6 +347,10 @@ public final class ArrayWriteBatch implements WriteBatch {
                     resident += spans[i * 4 + 3];
                 }
             }
+        }
+        if (paged > 0 && size <= SLAB_WRITES && !slab.off() && placeOnSlab(slab, states)) {
+            packChunks();
+            return;
         }
         // A batch of resident writes alone keeps them on its array as before, where the store's rule for resident
         // values finds it small enough; any other copies them, so the paged values' array holds none
@@ -359,17 +369,60 @@ public final class ArrayWriteBatch implements WriteBatch {
         homes = new MemorySegment[size];
         homeOffsets = new int[size];
         homesMode = HOMES_CHUNKS;
+        packChunks();
+    }
+
+    /// Gives `slab` the paged values it may take if it is hot, and counts them toward its rate either way: those below
+    /// half a chunk of this batch, that no unit of the file of large values holds too, of a key space that does not
+    /// overwrite most of what it writes.
+    ///
+    /// @return whether it took any, so the writes it took have their homes and the batch is in [#HOMES_CHUNKS]
+    private boolean placeOnSlab(ValueSlab slab, Map<String, KeyspaceState> states) {
+        var hot = slab.hot();
+        var eligible = 0L;
+        var placed = false;
+        for (var i = 0; i < size; i++) {
+            if (!packed(i)) {
+                continue;
+            }
+            var length = spans[i * 4 + 3];
+            var state = states.get(targets[i].name());
+            if (length == 0 || length >= CHUNK_BYTES / 2 || length >= state.largeValues || !state.overwrites.worthwhile()) {
+                continue;
+            }
+            eligible += length;
+            if (hot) {
+                if (homes == null) {
+                    homes = new MemorySegment[size];
+                    homeOffsets = new int[size];
+                }
+                placed |= slab.place(data, (int) spans[i * 4 + 2], (int) length, homes, homeOffsets, i);
+            }
+        }
+        slab.note(eligible);
+        if (placed) {
+            homesMode = HOMES_CHUNKS;
+            return true;
+        }
+        homes = null;
+        homeOffsets = null;
+        return false;
+    }
+
+    /// Copies the paged values that have no home yet into arrays below [#CHUNK_BYTES]; `homes` has a place for each
+    /// write.
+    private void packChunks() {
         var chunk = (byte[]) null;
         var chunkView = (MemorySegment) null;
         var fill = 0;
         var remaining = 0L;
         for (var i = 0; i < size; i++) {
-            if (packed(i) && spans[i * 4 + 3] < CHUNK_BYTES / 2) {
+            if (packed(i) && homes[i] == null && spans[i * 4 + 3] < CHUNK_BYTES / 2) {
                 remaining += spans[i * 4 + 3];
             }
         }
         for (var i = 0; i < size; i++) {
-            if (!packed(i)) {
+            if (!packed(i) || homes[i] != null) {
                 continue;
             }
             var offset = (int) spans[i * 4 + 2];

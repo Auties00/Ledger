@@ -60,6 +60,7 @@ final class Checkpointer implements IdleTicker.Watched {
     private final int loggedEpoch;
 
     private final LiveLedger ledger;
+    private final ValueSlab slab;
     private final PageFile pages;
     private final FreeSpace space;
     // The file of large values, or null
@@ -80,6 +81,10 @@ final class Checkpointer implements IdleTicker.Watched {
     private volatile long publishedBytes;
     // The log's estimate of the heap its commits held at the cut of the last published checkpoint
     private volatile long publishedHeap;
+    // The heap the slab's chunks took beside the values, by its estimate, at the cut of the last published checkpoint
+    private volatile long publishedSlack;
+    // The capacity of the slab's chunks no version written after the cut of the last published checkpoint can be on
+    private volatile long publishedChunks;
     // The heap the writes the trees lack may hold, by the log's estimate, before commits wait for a checkpoint
     private final long heapBudget;
     // Signalled whenever a checkpoint ends, for the commits that wait on one
@@ -108,6 +113,7 @@ final class Checkpointer implements IdleTicker.Watched {
                  long number, DeltaTable deltas, PageRef deltaTable, Consumer<? super LedgerException> failures,
                  int durableEpoch, int loggedEpoch, long heapBudget) {
         this.ledger = ledger;
+        this.slab = ledger.valueSlab();
         this.pages = pages;
         this.space = space;
         this.blobs = blobs;
@@ -157,10 +163,11 @@ final class Checkpointer implements IdleTicker.Watched {
         lock.unlock();
         OPEN.remove(this);
         IdleTicker.unwatch(this);
+        slab.close();
     }
 
     /// Starts a checkpoint if the store committed nothing since the last tick of the [IdleTicker] and the writes the
-    /// trees lack hold at least [#IDLE_BACKLOG] of heap.
+    /// trees lack hold at least [#IDLE_BACKLOG] of heap, whole chunks of the slab their values may be on included.
     ///
     /// Checkpoints otherwise start once every interval of log, so a store that wrote less than one and stopped kept
     /// those writes in memory, more than their bytes in the log, for as long as it stayed open.
@@ -169,7 +176,9 @@ final class Checkpointer implements IdleTicker.Watched {
         var appended = log.appendedBytes();
         var idle = appended == appendedAtTick;
         appendedAtTick = appended;
-        if (idle && !closed && stopped == null && backlogHeap() >= IDLE_BACKLOG) {
+        slab.tick(idle);
+        var logged = log.appendedHeap() - publishedHeap;
+        if (idle && !closed && stopped == null && logged > 0 && logged + slab.chunkBytes() - publishedChunks >= IDLE_BACKLOG) {
             start();
         }
     }
@@ -269,9 +278,10 @@ final class Checkpointer implements IdleTicker.Watched {
         return bytes > MAX_BACKLOG * every || processBacklogHeap() > heapBudget;
     }
 
-    /// {@return the heap the writes the trees of the store lack hold, by the log's estimate}
+    /// {@return the heap the writes the trees of the store lack hold, by the log's estimate and the slab's of what its
+    /// chunks take beside the values}
     private long backlogHeap() {
-        return log.appendedHeap() - publishedHeap;
+        return log.appendedHeap() - publishedHeap + slab.slackBytes() - publishedSlack;
     }
 
     /// {@return the heap the writes the trees of every open store of the process lack hold, by their logs' estimates}
@@ -307,6 +317,9 @@ final class Checkpointer implements IdleTicker.Watched {
             if (stopped != null) {
                 throw stopped;
             }
+            // Before the cut, so a write after it is never on a chunk these count as gone
+            var slackAtCut = slab.slackBytes();
+            var chunksAtCut = slab.retiredChunkBytes();
             var cut = ledger.cutCheckpoint(() -> closing ? log.nextOpenSegment() : log.currentSegment());
             if (cut == null) {
                 if (closing && !epochOnlyInLog()) {
@@ -393,6 +406,8 @@ final class Checkpointer implements IdleTicker.Watched {
             ledger.publish(cut, number, roots, catalog, freeList, blobFreeList, freed, update.freedExternal(), adopted);
             publishedBytes = cut.logBytes();
             publishedHeap = cut.logHeap();
+            publishedSlack = slackAtCut;
+            publishedChunks = chunksAtCut;
             signalProgress();
             ledger.pruneCut(cut);
             // While the store runs, as many as a checkpoint interval fills, so the log seldom writes into a new file

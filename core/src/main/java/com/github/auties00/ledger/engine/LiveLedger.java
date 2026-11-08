@@ -155,6 +155,8 @@ public final class LiveLedger implements Ledger {
     // The versions whose units of the file of large values no published checkpoint has taken; guarded by the
     // publishing role
     private final ArrayList<InFlight> inFlight;
+    // The chunks the values of the fastest commits of a store with pages share
+    private final ValueSlab valueSlab;
 
     /// Creates an empty store with `keyspaces`.
     ///
@@ -191,6 +193,7 @@ public final class LiveLedger implements Ledger {
         this.byId = new HashMap<>();
         this.resources = new AutoCloseable[0];
         this.inFlight = new ArrayList<>();
+        this.valueSlab = new ValueSlab();
     }
 
     /// Makes this store one in a directory, whose checkpoints are in `pages`; called before anything is recovered.
@@ -562,7 +565,7 @@ public final class LiveLedger implements Ledger {
         if (checkpointer != null) {
             checkpointer.throttle();
         }
-        writes.prepare(pages == null);
+        writes.prepare(pages == null, valueSlab, states);
         var units = writeUnits(writes);
         // Needed only to release the units of large values no log frame names
         var outcome = units == null ? null : new Applier[1];
@@ -1261,6 +1264,11 @@ public final class LiveLedger implements Ledger {
         close(false);
     }
 
+    /// {@return the chunks the values of the fastest commits of a store with pages share}
+    ValueSlab valueSlab() {
+        return valueSlab;
+    }
+
     /// {@return the file of large values, or `null` for a store in memory; for tests}
     BlobFile blobsForTests() {
         return blobs;
@@ -1355,12 +1363,15 @@ public final class LiveLedger implements Ledger {
             if (registered != sequence) {
                 throw new IllegalStateException("The latest sequence moved while the checkpoint held the publishing role");
             }
+            var bound = Reads.boundOf(sequence);
             var cuts = new ArrayList<KeyspaceCut>(states.size());
             for (var state : states.values()) {
                 var number = state.dirtyNumber();
                 cuts.add(new KeyspaceCut(state, state.cutDirty(), state.removals, state.known(sequence), number));
+                if (state.overwrites != null) {
+                    state.overwrites.cut(bound);
+                }
             }
-            var bound = Reads.boundOf(sequence);
             var superseded = new ArrayList<PageRef>();
             for (var unit : inFlight) {
                 if (unit.version().stamp <= bound && unit.version().replacedAt <= sequence) {
@@ -2043,6 +2054,9 @@ public final class LiveLedger implements Ledger {
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
             var length = Math.toIntExact(value.byteSize());
+            if (source != null && !state.resident && (sequence & ValueSlab.Overwrites.SAMPLE_MASK) == 0) {
+                state.overwrites.sample(head, length);
+            }
             Version version;
             if (state.resident && state.keyspace.values() == BuiltinCodecs.BYTES_VALUE) {
                 // A byte array is its own encoding: one copy of the store's serves the reads, which return the instance

@@ -59,6 +59,9 @@ final class KeyspaceState {
     final BlindWrites blind;
     // The copies of the keys the chains hold
     private final KeySlab keys;
+    /// What the commits say about whether the values may share a [ValueSlab]'s chunks; `null` in a resident key space,
+    /// whose values never do.
+    final ValueSlab.Overwrites overwrites;
     // The chains written since the last checkpoint was cut, each listed once per cut; guarded by the publishing role
     ArrayList<Chain> dirty;
     // The number of the cut `dirty` collects for, guarded by the publishing role
@@ -100,6 +103,7 @@ final class KeyspaceState {
         this.blind = new BlindWrites();
         this.dirty = new ArrayList<>();
         this.keys = new KeySlab();
+        this.overwrites = resident ? null : new ValueSlab.Overwrites();
         this.ordering = new ReentrantLock();
         this.droppedListed = new java.util.concurrent.atomic.AtomicInteger();
     }

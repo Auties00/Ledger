@@ -604,6 +604,7 @@ class CheckpointTest {
             try (var ledger = Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(MESSAGES)
                     .checkpointEvery(1L << 30).build()) {
                 var live = (LiveLedger) ledger;
+                live.valueSlab().forceColdForTests();
                 checkpointer = live.checkpointer();
                 // Ticked by the test alone: a tick of the process's ticker between two of these would move them
                 IdleTicker.unwatch(checkpointer);
