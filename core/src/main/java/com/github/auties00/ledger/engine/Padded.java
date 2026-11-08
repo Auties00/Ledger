@@ -123,6 +123,36 @@ final class Padded {
         }
     }
 
+    abstract static class CountFields extends Before {
+        volatile long count;
+    }
+
+    /// A count that many threads add to and one thread reads.
+    @SuppressWarnings("unused")
+    static final class Count extends CountFields {
+        private static final VarHandle COUNT;
+
+        static {
+            try {
+                COUNT = MethodHandles.lookup().findVarHandle(CountFields.class, "count", long.class);
+            } catch (ReflectiveOperationException exception) {
+                throw new ExceptionInInitializerError(exception);
+            }
+        }
+
+        long q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14, q15, q16;
+
+        /// Adds one, with a full fence.
+        void increment() {
+            COUNT.getAndAdd(this, 1L);
+        }
+
+        /// {@return the count}
+        long get() {
+            return count;
+        }
+    }
+
     abstract static class SequencedFields extends Before {
         /// The last commit given a sequence.
         PendingCommit last;
