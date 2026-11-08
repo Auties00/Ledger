@@ -25,10 +25,10 @@ import java.util.zip.CRC32C;
 /// A segment is prepared before the log needs it ([#prepare(long, long)]): a spare, or a new file, gets the segment's
 /// header with a fresh salt and a zeroed first frame block, is forced, and only then takes its name, so recovery never
 /// meets a segment half prepared, and finds one never written empty at once. A spare has its blocks already, and a new
-/// file can be written with zeros to its full length first, except on Windows: writing into either leaves a force no
-/// file size and no block allocation to record, which on ext4 halved the time of a durable commit and spared one force
-/// in a thousand a wait of tens of milliseconds for a journal commit, and lets the log write a group through to stable
-/// storage with no metadata to write beside it ([WriteThrough]). Once a checkpoint makes segments obsolete, they
+/// file can be written with zeros to its full length first ([#zeroFills(boolean)]): writing into either leaves a force
+/// no file size and no block allocation to record, which on ext4 halved the time of a durable commit and spared one
+/// force in a thousand a wait of tens of milliseconds for a journal commit, and lets the log write a group through to
+/// stable storage with no metadata to write beside it ([WriteThrough]). Once a checkpoint makes segments obsolete, they
 /// become spares ([#retireBefore(long, int)]) instead of being deleted.
 ///
 /// It is safe for concurrent use: the log writer prepares while a checkpoint retires.
@@ -43,8 +43,8 @@ final class LogFiles {
     private final StoreKeys keys;
     private final byte[] storeId;
     private final Object lock;
-    // Whether a new segment may be written with zeros first
-    private final boolean zeroFill;
+    // When a new segment may be written with zeros first
+    private final ZeroFill zeroFill;
 
     /// Creates the files of the log in `directory`.
     ///
@@ -54,7 +54,7 @@ final class LogFiles {
         this.keys = keys;
         this.storeId = storeId;
         this.lock = new Object();
-        this.zeroFill = zeroFill(System.getProperty("ledger.log.zeroFill", "auto"), directory);
+        this.zeroFill = ZeroFill.of(System.getProperty("ledger.log.zeroFill", "auto"), directory);
     }
 
     static String segmentName(long number) {
@@ -119,7 +119,8 @@ final class LogFiles {
 
     /// Prepares segment `number`, which must not exist, from a spare or a new file of `length` bytes.
     ///
-    /// @param zeros whether a new file is first written with zeros to its full length
+    /// @param zeros whether a new file is first written with zeros to its full length, which [#zeroFills(boolean)]
+    ///              allows
     /// @return the segment, durable under its name
     Prepared prepare(long number, long length, boolean zeros) throws IOException {
         synchronized (lock) {
@@ -150,7 +151,7 @@ final class LogFiles {
             start.putInt(LogWriter.HEADER_CRC_OFFSET, (int) crc.getValue());
             long valid;
             try (var channel = FileChannel.open(source, StandardOpenOption.WRITE)) {
-                if (fresh && zeros && zeroFill) {
+                if (fresh && zeros) {
                     fill(channel, start.capacity(), length);
                 }
                 // The header, and a first frame block of zeros that marks the segment as never written
@@ -167,22 +168,41 @@ final class LogFiles {
         }
     }
 
-    /// {@return whether a new segment of a log in `directory` may be written with zeros first, when the log writer asks
-    /// for them, by the value of `ledger.log.zeroFill`: `auto` everywhere but on the default file system of Windows,
-    /// `everywhere`, or `off` nowhere}
+    /// {@return whether a new segment may be written with zeros first when the log writer's rule asks for them}
     ///
-    /// Not on Windows, where forcing a growing file cost a durable commit no more than forcing one written with zeros
-    /// first, and the zeros made an ingest of a history a fifth slower. A file system that simulates failures takes the
-    /// zeros as the others do, so the tests on it run the same on every platform.
-    ///
-    /// @throws IllegalArgumentException if `value` is none of them
-    private static boolean zeroFill(String value, Path directory) {
-        return switch (value.trim().toLowerCase(Locale.ROOT)) {
-            case "", "auto" -> !WINDOWS || directory.getFileSystem() != FileSystems.getDefault();
-            case "everywhere" -> true;
-            case "off" -> false;
-            default -> throw new IllegalArgumentException("ledger.log.zeroFill must be auto, everywhere or off: " + value);
+    /// @param writesThrough whether the log writes its groups through, the only use the zeros have on Windows
+    boolean zeroFills(boolean writesThrough) {
+        return switch (zeroFill) {
+            case ALWAYS -> true;
+            case WHERE_WRITTEN_THROUGH -> writesThrough;
+            case NEVER -> false;
         };
+    }
+
+    /// When a new segment may be written with zeros first.
+    private enum ZeroFill {
+        ALWAYS,
+        WHERE_WRITTEN_THROUGH,
+        NEVER;
+
+        /// {@return the policy of a log in `directory` that the value of `ledger.log.zeroFill` names: `auto`, the
+        /// default, `everywhere`, or `off`}
+        ///
+        /// `auto` takes the zeros everywhere but on the default file system of Windows, where a store takes them only
+        /// while it writes groups through: forcing a growing file cost a durable commit no more there than forcing one
+        /// written with zeros first, but a group is written through only below the bytes a segment already has. A file
+        /// system that simulates failures takes the zeros as the others do, so the tests on it run the same on every
+        /// platform.
+        ///
+        /// @throws IllegalArgumentException if `value` is none of them
+        static ZeroFill of(String value, Path directory) {
+            return switch (value.trim().toLowerCase(Locale.ROOT)) {
+                case "", "auto" -> WINDOWS && directory.getFileSystem() == FileSystems.getDefault() ? WHERE_WRITTEN_THROUGH : ALWAYS;
+                case "everywhere" -> ALWAYS;
+                case "off" -> NEVER;
+                default -> throw new IllegalArgumentException("ledger.log.zeroFill must be auto, everywhere or off: " + value);
+            };
+        }
     }
 
     /// Writes zeros to `channel` from `from` to `to`, so the file has the blocks of its full length.
@@ -239,7 +259,7 @@ final class LogFiles {
     }
 
     /// The zeros a fill writes, a megabyte at a time, made with the first fill: none in a process that fills no
-    /// segment, as on Windows unless `ledger.log.zeroFill` is `everywhere`.
+    /// segment, as on Windows where no store writes its groups through.
     ///
     /// One buffer for the process rather than one per segment, which on the heap took a region of its own each time;
     /// direct, so the channel writes them without copying them first.

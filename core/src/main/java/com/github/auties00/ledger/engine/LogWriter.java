@@ -47,7 +47,8 @@ import java.util.zip.CRC32C;
 ///
 /// A new file is written with zeros first only while the commits wait for the forces and the log fills slower than
 /// [#ZEROED_RATE]: the zeros halve the time of a force on Linux, but double the bytes the device takes, which slowed an
-/// ingest of a history, whose commits do not wait, and 256 committers writing 100 MB a second, by a fifth.
+/// ingest of a history, whose commits do not wait, and 256 committers writing 100 MB a second, by a fifth. On Windows,
+/// where they spare a force nothing, only while the log writes groups through as well ([LogFiles#zeroFills(boolean)]).
 ///
 /// Where [WriteThrough] can, a group that one write holds and that lands below the bytes its segment already has is
 /// written through to stable storage instead, durable once the write returns, and not forced: one round trip to the
@@ -358,7 +359,8 @@ final class LogWriter {
     private void prepareNext() {
         var number = segmentNumber + 1;
         // Filled slower than the rate, by commits that waited for its forces
-        var zeros = (waited || waitedBefore) && lastFill >= 0 && lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE;
+        var zeros = (waited || waitedBefore) && lastFill >= 0 && lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE
+                && files.zeroFills(writeThrough.enabled());
         var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize, zeros && !closing));
         next = preparation;
         Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
@@ -1163,6 +1165,11 @@ final class LogWriter {
         return writtenThrough;
     }
 
+    /// {@return the way later segments are opened to write through, or `null` if their groups are forced, for tests}
+    WriteThrough.Kind writeThroughKind() {
+        return writeThrough.kind();
+    }
+
     /// Makes everything queued durable, then closes the segment.
     ///
     /// @throws LedgerIoException if the queued frames cannot be made durable
@@ -1242,13 +1249,13 @@ final class LogWriter {
 
     /// Forces the segment to stable storage; on macOS the JDK empties the drive's cache with `fcntl(F_FULLFSYNC)`.
     ///
-    /// A write through gives the same guarantee for the bytes it writes, with no force: on Linux `O_DSYNC` is the
-    /// guarantee of `fdatasync`, which flushes the device's cache or writes with forced unit access, as the force
-    /// does; on Windows a write through a handle opened with `FILE_FLAG_NO_BUFFERING` and `FILE_FLAG_WRITE_THROUGH`
-    /// also requests a write-through of the drive's cache, and the metadata it changes is written through with it.
-    /// Only [WriteThrough.Mode#DSYNC] asks for less on Windows, `FILE_FLAG_WRITE_THROUGH` alone; on macOS, whose
-    /// `O_DSYNC` leaves the bytes in the drive's cache, the groups of a store on the default file system are always
-    /// forced.
+    /// A write through replaces the force for the bytes it writes. On Linux `O_DSYNC` is the guarantee of `fdatasync`,
+    /// which flushes the device's cache or writes with forced unit access, as the force does. On Windows a write
+    /// through a handle opened with `FILE_FLAG_NO_BUFFERING` and `FILE_FLAG_WRITE_THROUGH` only requests a
+    /// write-through of the drive's cache, where this force asks the device to empty it, so [WriteThrough.Mode#AUTO]
+    /// replaces the force only on a device that reports that the request holds. [WriteThrough.Mode#DIRECT] and
+    /// [WriteThrough.Mode#DSYNC] ask for less there, as they say. On macOS, whose `O_DSYNC` leaves the bytes in the
+    /// drive's cache, the groups of a store on the default file system are always forced.
     ///
     /// An interrupt of a commit writing its own group that closes the channel meanwhile has the group written again
     /// through a new one, then forced: the interrupt may hide a failure of the force, after which the file system may

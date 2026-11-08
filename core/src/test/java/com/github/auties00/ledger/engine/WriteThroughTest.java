@@ -8,14 +8,17 @@ import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.testkit.ChangeInterceptor;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
+import com.sun.nio.file.ExtendedOpenOption;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
 import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.IOException;
@@ -25,10 +28,14 @@ import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
@@ -40,9 +47,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -65,6 +74,13 @@ class WriteThroughTest {
         return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(NAMES))
                 .segmentSize(SEGMENT)
                 .writeThrough(mode)
+                .build();
+    }
+
+    private static Ledger open(Path directory, WriteThrough way) {
+        return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(NAMES))
+                .segmentSize(SEGMENT)
+                .writeThrough(way)
                 .build();
     }
 
@@ -487,6 +503,101 @@ class WriteThroughTest {
             survivesPowerLoss(disk, model);
         }
 
+        @ParameterizedTest(name = "{0} refused")
+        @CsvSource({"1, DSYNC, true", "2, , false"})
+        @DisplayName("a probe refused moves the log down one way, O_DIRECT to O_DSYNC to forces, and it goes on down that way")
+        void downgrades(int refusals, WriteThrough.Kind expected, boolean writesThrough) throws Exception {
+            var disk = CrashFileSystem.create();
+            var seen = ConcurrentHashMap.<String>newKeySet();
+            var refused = new AtomicInteger();
+            var lastRefused = new AtomicReference<String>();
+            var model = new TreeMap<String, String>();
+            disk.intercept((path, kind) -> {
+                // The first force of a segment longer than two blocks is its probe, and the probe of the next way down
+                // follows on the same file before anything else is forced
+                if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log") && refused.get() < refusals
+                        && (seen.add(path.toString()) || path.toString().equals(lastRefused.get())) && Files.size(path) > LogWriter.KEPT_LENGTH) {
+                    refused.incrementAndGet();
+                    lastRefused.set(path.toString());
+                    throw new IOException("Invalid argument");
+                }
+            });
+            try (var ledger = open(disk.getPath("/store"), new WriteThrough(WriteThrough.Kind.DIRECT, null))) {
+                var log = log(ledger);
+                assertEquals(WriteThrough.Kind.DIRECT, log.writeThroughKind());
+                var commits = 0;
+                while (log.currentSegment() < 4) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                ledger.checkpoint();
+                var segment = log.currentSegment();
+                while (log.currentSegment() < segment + 4) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                assertEquals(refusals, refused.get(), "probes refused");
+                assertEquals(expected, log.writeThroughKind());
+                assertEquals(writesThrough, log.writtenThrough() > 0);
+            }
+            survivesPowerLoss(disk, model);
+        }
+
+        @Test
+        @DisplayName("a way nothing refuses stays the way the log writes through in as segments roll")
+        void keepsWay() throws Exception {
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, String>();
+            try (var ledger = open(disk.getPath("/store"), new WriteThrough(WriteThrough.Kind.DIRECT, null))) {
+                reachWriteThrough(ledger, model);
+                assertEquals(WriteThrough.Kind.DIRECT, log(ledger).writeThroughKind());
+            }
+            survivesPowerLoss(disk, model);
+        }
+
+        @Test
+        @DisplayName("a device that does not prove a write through holds has every group forced, and is asked once, only when a segment needs the answer")
+        void unproven() throws Exception {
+            var disk = CrashFileSystem.create();
+            var asked = new AtomicInteger();
+            var model = new TreeMap<String, String>();
+            try (var ledger = open(disk.getPath("/store"), new WriteThrough(WriteThrough.Kind.DSYNC, () -> {
+                asked.incrementAndGet();
+                return false;
+            }))) {
+                var log = log(ledger);
+                assertEquals(0, asked.get(), "the device was asked by opening a store");
+                var commits = 0;
+                while (log.currentSegment() < 4) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                ledger.checkpoint();
+                var segment = log.currentSegment();
+                while (log.currentSegment() < segment + 4) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                assertEquals(1, asked.get());
+                assertEquals(0, log.writtenThrough());
+                assertNull(log.writeThroughKind());
+            }
+            survivesPowerLoss(disk, model);
+        }
+
+        @Test
+        @DisplayName("a device that proves a write through holds has groups written through")
+        void proven() throws Exception {
+            var disk = CrashFileSystem.create();
+            var asked = new AtomicInteger();
+            var model = new TreeMap<String, String>();
+            try (var ledger = open(disk.getPath("/store"), new WriteThrough(WriteThrough.Kind.DSYNC, () -> {
+                asked.incrementAndGet();
+                return true;
+            }))) {
+                reachWriteThrough(ledger, model);
+                assertEquals(1, asked.get());
+                assertEquals(WriteThrough.Kind.DSYNC, log(ledger).writeThroughKind());
+            }
+            survivesPowerLoss(disk, model);
+        }
+
         @Test
         @DisplayName("recovers a prefix of the commits from the last one acknowledged durable, whichever force or write through the power fails at")
         void everyForce() throws Exception {
@@ -593,7 +704,7 @@ class WriteThroughTest {
             } finally {
                 ((LiveLedger) ledger).closeWithoutCheckpoint();
             }
-            if (expectsWriteThrough(mode)) {
+            if (expectsWriteThrough(mode, directory)) {
                 assertTrue(through > 0, "no group was written through");
             } else {
                 assertEquals(0, through);
@@ -614,7 +725,7 @@ class WriteThroughTest {
             Assumptions.assumeTrue(WriteThrough.class.getModule().isNativeAccessEnabled(), "the tests run without native access");
             var file = directory.resolve("segment");
             Files.write(file, new byte[16_384]);
-            var handle = WriteThrough.of(WriteThrough.Mode.AUTO, directory).open(file);
+            var handle = WriteThrough.of(WriteThrough.Mode.DIRECT, directory).open(file);
             try {
                 var field = handle.getClass().getDeclaredField("handle");
                 field.setAccessible(true);
@@ -646,16 +757,298 @@ class WriteThroughTest {
             assertEquals(0, written[12_288]);
         }
 
-        /// {@return whether this platform writes through in `mode` on the default file system}
-        private static boolean expectsWriteThrough(WriteThrough.Mode mode) {
+        @Test
+        @EnabledOnOs(OS.WINDOWS)
+        @DisplayName("on Windows the default mode writes through exactly where the device under the store proves it holds")
+        void windowsProof(@TempDir Path directory) {
+            Assumptions.assumeTrue(WriteThrough.class.getModule().isNativeAccessEnabled(), "the tests run without native access");
+            var cache = WriteThrough.WriteCache.of(directory);
+            // The answer of the runner's device says what the default arm of a benchmark there can show
+            System.out.println("The write cache of the device under " + directory + ": " + cache);
+            var proved = cache != null && cache.provesWriteThrough();
+            assertEquals(proved, WriteThrough.of(WriteThrough.Mode.AUTO, directory).enabled());
+            assertTrue(WriteThrough.of(WriteThrough.Mode.DIRECT, directory).enabled(), "direct does not ask the device");
+        }
+
+        @Test
+        @EnabledOnOs(OS.WINDOWS)
+        @DisplayName("on Windows a store that forces takes no zeros for its new segments")
+        void windowsForcesWithoutZeros(@TempDir Path directory) throws Exception {
+            var model = new TreeMap<String, String>();
+            try (var ledger = open(directory, new WriteThrough(null, null))) {
+                var log = log(ledger);
+                var commits = 0;
+                while (log.currentSegment() < 6) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                commit(ledger, model, "w" + commits);
+                var current = directory.resolve("log").resolve(LogWriter.segmentName(log.currentSegment()));
+                assertTrue(Files.size(current) < SEGMENT, "the segment was written with zeros");
+                assertEquals(0, log.writtenThrough());
+            }
+        }
+
+        @Test
+        @DisabledOnOs(OS.MAC)
+        @DisplayName("a store whose commits wait writes through into new segments written with zeros, before any checkpoint leaves a spare")
+        void freshSegments(@TempDir Path directory) throws Exception {
+            var model = new TreeMap<String, String>();
+            // Direct asks no device, so this runs whatever the device under the temporary directory reports
+            try (var ledger = open(directory, WriteThrough.Mode.DIRECT)) {
+                var log = log(ledger);
+                Assumptions.assumeTrue(log.writeThroughKind() != null, "the tests run without native access");
+                var commits = 0;
+                while (log.currentSegment() < 8) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                assertTrue(log.writtenThrough() > 0, "no group was written through");
+            }
+            try (var reopened = open(directory, WriteThrough.Mode.OFF)) {
+                assertEquals(model, contents(reopened));
+            }
+        }
+
+        @Test
+        @EnabledOnOs(OS.LINUX)
+        @DisplayName("on Linux the default mode opens a segment with O_DIRECT and O_DSYNC, and the way down with O_DSYNC alone")
+        void linuxHandles(@TempDir Path directory) throws Exception {
+            Assumptions.assumeTrue(acceptsDirect(directory), "the file system refuses O_DIRECT");
+            var file = directory.resolve("segment");
+            Files.write(file, new byte[16_384]);
+            var through = WriteThrough.of(WriteThrough.Mode.AUTO, directory);
+            assertEquals(WriteThrough.Kind.DIRECT, through.kind());
+            var handle = through.open(file);
+            try {
+                var flags = openFlags(file);
+                assertEquals(1, flags.size());
+                assertEquals(oDirect(), flags.getFirst() & oDirect(), "O_DIRECT");
+                assertEquals(O_DSYNC, flags.getFirst() & O_DSYNC, "O_DSYNC");
+            } finally {
+                handle.close();
+            }
+            through.downgrade();
+            assertEquals(WriteThrough.Kind.DSYNC, through.kind());
+            handle = through.open(file);
+            try {
+                var flags = openFlags(file);
+                assertEquals(1, flags.size());
+                assertEquals(0, flags.getFirst() & oDirect(), "O_DIRECT");
+                assertEquals(O_DSYNC, flags.getFirst() & O_DSYNC, "O_DSYNC");
+            } finally {
+                handle.close();
+            }
+        }
+
+        @Test
+        @EnabledOnOs(OS.LINUX)
+        @DisplayName("on Linux the default mode stays on O_DIRECT as a store rolls segments, and the segment it writes is open that way")
+        void linuxStore(@TempDir Path directory) throws Exception {
+            Assumptions.assumeTrue(acceptsDirect(directory), "the file system refuses O_DIRECT");
+            var model = new TreeMap<String, String>();
+            try (var ledger = open(directory, WriteThrough.Mode.AUTO)) {
+                var log = log(ledger);
+                var commits = reachWriteThrough(ledger, model);
+                var rolled = log.currentSegment();
+                while (log.currentSegment() < rolled + 3) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                assertEquals(WriteThrough.Kind.DIRECT, log.writeThroughKind(), "the log left O_DIRECT");
+                var checked = false;
+                for (var attempt = 0; attempt < 200 && !checked; attempt++) {
+                    var through = log.writtenThrough();
+                    var segment = log.currentSegment();
+                    commit(ledger, model, "w" + commits++);
+                    if (log.writtenThrough() > through && log.currentSegment() == segment) {
+                        var file = directory.resolve("log").resolve(LogWriter.segmentName(segment));
+                        checked = openFlags(file).stream().anyMatch(flags -> (flags & oDirect()) != 0 && (flags & O_DSYNC) != 0);
+                        assertTrue(checked, "the segment written through is not open with O_DIRECT and O_DSYNC");
+                    }
+                }
+                assertTrue(checked, "no group was written through inside a segment");
+            }
+            try (var reopened = open(directory, WriteThrough.Mode.OFF)) {
+                assertEquals(model, contents(reopened));
+            }
+        }
+
+        // The octal values of <fcntl.h>, as /proc/<pid>/fdinfo prints them
+        private static final long O_DSYNC = 0_10000;
+
+        private static long oDirect() {
+            return System.getProperty("os.arch", "").equals("aarch64") ? 0_200000 : 0_40000;
+        }
+
+        /// {@return whether a file in `directory` takes an aligned write with `O_DIRECT`}
+        private static boolean acceptsDirect(Path directory) {
+            var file = directory.resolve("direct-probe");
+            try {
+                Files.write(file, new byte[8_192]);
+                try (var channel = FileChannel.open(file, StandardOpenOption.WRITE, StandardOpenOption.DSYNC, ExtendedOpenOption.DIRECT)) {
+                    var block = ByteBuffer.allocateDirect(2 * LogWriter.ALIGNMENT).alignedSlice(LogWriter.ALIGNMENT).limit(LogWriter.ALIGNMENT);
+                    channel.write(block, 0);
+                }
+                Files.delete(file);
+                return true;
+            } catch (IOException | UnsupportedOperationException _) {
+                return false;
+            }
+        }
+
+        /// {@return the flags this process holds `file` open with, one for each descriptor}
+        private static List<Long> openFlags(Path file) throws IOException {
+            var target = file.toRealPath();
+            var flags = new ArrayList<Long>();
+            try (var descriptors = Files.list(Path.of("/proc/self/fd"))) {
+                for (var descriptor : descriptors.toList()) {
+                    Path link;
+                    try {
+                        link = Files.readSymbolicLink(descriptor);
+                    } catch (IOException _) {
+                        // The descriptor of the listing itself, or one closed meanwhile
+                        continue;
+                    }
+                    if (link.equals(target)) {
+                        for (var line : Files.readAllLines(Path.of("/proc/self/fdinfo").resolve(descriptor.getFileName()))) {
+                            if (line.startsWith("flags:")) {
+                                flags.add(Long.parseLong(line.substring("flags:".length()).trim(), 8));
+                            }
+                        }
+                    }
+                }
+            }
+            return flags;
+        }
+
+        /// {@return whether this platform writes through in `mode` on the default file system, in `directory`}
+        private static boolean expectsWriteThrough(WriteThrough.Mode mode, Path directory) {
             var os = System.getProperty("os.name", "");
             if (mode == WriteThrough.Mode.OFF || os.startsWith("Mac")) {
                 return false;
             }
             if (os.startsWith("Windows")) {
-                return mode == WriteThrough.Mode.DSYNC || WriteThrough.class.getModule().isNativeAccessEnabled();
+                if (mode == WriteThrough.Mode.DSYNC) {
+                    return true;
+                }
+                var nativeAccess = WriteThrough.class.getModule().isNativeAccessEnabled();
+                return nativeAccess && (mode == WriteThrough.Mode.DIRECT || WriteThrough.WriteCache.proves(directory));
             }
             return os.equals("Linux") || mode != WriteThrough.Mode.AUTO;
+        }
+    }
+
+    @Nested
+    @DisplayName("what a Windows device reports")
+    class Reports {
+        @ParameterizedTest(name = "cache {0}, write through {1}, non-volatile {2}, {3} bytes: {4}")
+        @CsvSource({
+                // Unknown, unknown, volatile
+                "0, 0, false, 28, false",
+                // A volatile cache on, forced unit access unknown or unsupported
+                "2, 0, false, 28, false",
+                "2, 1, false, 28, false",
+                // Forced unit access supported
+                "2, 2, false, 28, true",
+                "0, 2, false, 28, true",
+                // The cache off
+                "1, 0, false, 28, true",
+                "1, 1, false, 28, true",
+                // The cache non-volatile
+                "2, 1, true, 28, true",
+                // A structure cut before the non-volatile flag proves nothing with it
+                "2, 1, true, 26, false",
+                "2, 2, false, 24, true",
+                // Too short to say anything
+                "1, 2, true, 23, false",
+                "1, 2, true, 0, false"
+        })
+        @DisplayName("proves a write through holds only for forced unit access, a cache off or a non-volatile cache")
+        void proves(int enabled, int writeThrough, boolean nonVolatile, int returned, boolean expected) {
+            try (var arena = Arena.ofConfined()) {
+                var property = arena.allocate(28, Integer.BYTES);
+                property.set(ValueLayout.JAVA_INT, 12, enabled);
+                property.set(ValueLayout.JAVA_INT, 20, writeThrough);
+                property.set(ValueLayout.JAVA_BYTE, 26, (byte) (nonVolatile ? 1 : 0));
+                var cache = WriteThrough.WriteCache.parse(property, returned);
+                assertEquals(expected, cache != null && cache.provesWriteThrough());
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("the ways down")
+    class Ways {
+        @Test
+        @DisplayName("go from O_DIRECT to O_DSYNC to forces, and open nothing after the last")
+        void direct() {
+            var through = new WriteThrough(WriteThrough.Kind.DIRECT, null);
+            assertEquals(WriteThrough.Kind.DIRECT, through.kind());
+            through.downgrade();
+            assertEquals(WriteThrough.Kind.DSYNC, through.kind());
+            assertTrue(through.enabled());
+            through.downgrade();
+            assertNull(through.kind());
+            assertFalse(through.enabled());
+            assertThrows(IllegalStateException.class, () -> through.open(Path.of("segment")));
+        }
+
+        @Test
+        @DisplayName("go from unbuffered on Windows straight to forces: nothing below it writes through the drive's cache")
+        void unbuffered() {
+            var through = new WriteThrough(WriteThrough.Kind.UNBUFFERED, null);
+            through.downgrade();
+            assertNull(through.kind());
+            assertFalse(through.enabled());
+        }
+
+        @Test
+        @DisplayName("are given up unasked when the proof answers no, and the proof is asked once")
+        void proof() {
+            var asked = new AtomicInteger();
+            var through = new WriteThrough(WriteThrough.Kind.UNBUFFERED, () -> {
+                asked.incrementAndGet();
+                return false;
+            });
+            assertEquals(0, asked.get());
+            assertFalse(through.enabled());
+            assertFalse(through.enabled());
+            assertEquals(1, asked.get());
+            assertThrows(IllegalStateException.class, () -> through.open(Path.of("segment")));
+        }
+    }
+
+    @Nested
+    @DisplayName("the zeros of a new segment")
+    class Zeros {
+        private static boolean zeroFills(String value, Path directory, boolean writesThrough) {
+            var previous = System.getProperty("ledger.log.zeroFill");
+            try {
+                if (value == null) {
+                    System.clearProperty("ledger.log.zeroFill");
+                } else {
+                    System.setProperty("ledger.log.zeroFill", value);
+                }
+                return new LogFiles(directory, null, null).zeroFills(writesThrough);
+            } finally {
+                if (previous == null) {
+                    System.clearProperty("ledger.log.zeroFill");
+                } else {
+                    System.setProperty("ledger.log.zeroFill", previous);
+                }
+            }
+        }
+
+        @ParameterizedTest(name = "writes through: {0}")
+        @CsvSource({"true", "false"})
+        @DisplayName("follow ledger.log.zeroFill, and by default on Windows only a log that writes through")
+        void policy(boolean writesThrough, @TempDir Path directory) throws Exception {
+            var windows = System.getProperty("os.name", "").startsWith("Windows");
+            var expected = !windows || writesThrough;
+            assertEquals(expected, zeroFills(null, directory, writesThrough));
+            assertEquals(expected, zeroFills("auto", directory, writesThrough));
+            assertTrue(zeroFills("everywhere", directory, writesThrough));
+            assertFalse(zeroFills("off", directory, writesThrough));
+            assertTrue(zeroFills(null, CrashFileSystem.create().getPath("/store"), writesThrough), "a simulated file system runs the same everywhere");
+            assertThrows(IllegalArgumentException.class, () -> zeroFills("always", directory, writesThrough));
         }
     }
 
