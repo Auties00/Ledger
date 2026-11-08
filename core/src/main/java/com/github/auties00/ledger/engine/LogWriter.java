@@ -35,11 +35,11 @@ import java.util.zip.CRC32C;
 /// next group, so concurrent commits share forces. Each group is padded with zeros to a multiple of [#ALIGNMENT], where
 /// the next one starts, so the pages of acknowledged frames are never written again.
 ///
-/// Segments come from [LogFiles] prepared: once a segment takes its first group, the next one is prepared on a thread
-/// of its own, so a rollover only forces the full segment and switches to the next, and no file is created or renamed
-/// on the way to a force. The first one is prepared the same way while the store opens, and the first group waits for
-/// it: forcing a new file and its directory took most of an open on Windows and macOS. A prepared file may hold the
-/// frames of an earlier use, which every frame header tells apart by the tag of its segment's salt.
+/// Segments come from [LogFiles] prepared, on a thread of their own, so a rollover only forces the full segment and
+/// switches to the next, and no file is created or renamed on the way to a force. The first one is prepared the same
+/// way while the store opens, and the first group waits for it: forcing a new file and its directory took most of an
+/// open on Windows and macOS. A prepared file may hold the frames of an earlier use, which every frame header tells
+/// apart by the tag of its segment's salt.
 ///
 /// A close keeps the segment prepared after the current one, cut to its first two blocks, and the next open writes
 /// into it, as it does into any segment recovery finds prepared and never written: the first durable commit after an
@@ -48,6 +48,14 @@ import java.util.zip.CRC32C;
 /// A new file is written with zeros first only while the commits wait for the forces and the log fills slower than
 /// [#ZEROED_RATE]: the zeros halve the time of a force on Linux, but double the bytes the device takes, which slowed an
 /// ingest of a history, whose commits do not wait, and 256 committers writing 100 MB a second, by a fifth.
+///
+/// The first group of a segment decides that for the next one, and only zeros, which take as long as the segment takes
+/// to fill, start preparing it at that group. Any other preparation starts once a quarter of the segment is written, so
+/// the first commits after an open neither wait for its thread to start between two forces nor force beside the two
+/// journal commits its file and its directory take. A close prepares the segment it keeps if none started; a crash
+/// before the late start leaves none, and the first group of the next open waits for one, as a new store's does. A
+/// group that crosses the late start starts the preparation before its force, so a crash can leave the next segment
+/// under its name after a first group that never became durable, and the next open writes into that one.
 ///
 /// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames. Each use of it, the writing of one
 /// open, draws a random tag, and the key of the use derives from the segment's number, a random salt of its own and
@@ -119,6 +127,9 @@ final class LogWriter {
     static final int COMMIT_HEAP = 128;
     /// The bytes a second of log below which a new segment is written with zeros first, if the commits wait for it.
     private static final long ZEROED_RATE = 64L << 20;
+    /// One over the part of a segment written before the next one is prepared, if that one takes no zeros: the other
+    /// three quarters leave a preparation far more time than it takes at the rate of any log.
+    private static final int LATE_PREPARATION = 4;
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
@@ -151,11 +162,15 @@ final class LogWriter {
     // Where the frames of the last group start, for tests
     private volatile long groupStart;
     // The preparation of the segment after the current one, run on a thread of its own, or by whichever of the flush
-    // task and a close needs it first
+    // task and a close needs it first; null until the current segment starts it
     private FutureTask<LogFiles.Prepared> next;
     // When the current segment opened, and how long the one before it took to fill, or -1; owned by the flush task
     private long segmentOpened;
     private long lastFill = -1;
+    // Whether a group of the current segment decided if the next one takes zeros, and what it decided: a wait for a
+    // force after that must not start a fill the late start leaves too little time for; owned by the flush task
+    private boolean zerosDecided;
+    private boolean zerosNext;
     // Whether a commit waited for a force since the segment before the current one opened
     private volatile boolean waited;
     private boolean waitedBefore;
@@ -262,7 +277,7 @@ final class LogWriter {
             ready.run();
             this.next = ready;
         } else {
-            prepareNext();
+            prepareNext(false);
         }
     }
 
@@ -279,6 +294,7 @@ final class LogWriter {
         segmentOpened = now;
         waitedBefore = waited;
         waited = false;
+        zerosDecided = false;
         this.channel = FileChannel.open(segment.path(), StandardOpenOption.READ, StandardOpenOption.WRITE);
         this.segmentPath = segment.path();
         this.segmentNumber = segment.number();
@@ -295,19 +311,48 @@ final class LogWriter {
     ///
     /// Not on the store's pool: creating and forcing a file costs tens of milliseconds on Windows, and a flush queued
     /// behind it would make every commit waiting on that flush wait as long.
-    private void prepareNext() {
+    ///
+    /// @param zeros whether a new file is first written with zeros to its full length, unless a close began by then
+    private void prepareNext(boolean zeros) {
         var number = segmentNumber + 1;
-        // Filled slower than the rate, by commits that waited for its forces
-        var zeros = (waited || waitedBefore) && lastFill >= 0 && lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE;
         var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize, zeros && !closing));
         next = preparation;
         Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
     }
 
+    /// {@return whether the segment after the current one is written with zeros first}
+    ///
+    /// Decided once for each segment, by the first group to end in it or to cross its late start: the current segment
+    /// follows one filled slower than [#ZEROED_RATE] by commits that waited for its forces, on a file system that takes
+    /// zeros. The first segment an open writes has no earlier fill to judge by, so the one after it takes none.
+    private boolean zerosNext() {
+        if (!zerosDecided) {
+            zerosDecided = true;
+            zerosNext = LogFiles.ZERO_FILL && (waited || waitedBefore) && lastFill >= 0
+                    && lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE;
+        }
+        return zerosNext;
+    }
+
+    /// {@return whether `bytes` of frames in the current segment start the next one's preparation, whatever
+    /// [#zerosNext()] decides}
+    private boolean pastLateStart(long bytes) {
+        return bytes >= segmentSize / LATE_PREPARATION;
+    }
+
+    /// Starts the next segment's preparation if the current segment reaches its late start with a frame of
+    /// `sealedLength` sealed bytes, before the rollover that frame may cause: a group or a frame that crosses the whole
+    /// segment finds the preparation under way, rather than running it on the flush's thread.
+    private void prepareBeside(int sealedLength) {
+        if (next == null && pastLateStart(position + used + FRAME_HEADER + sealedLength - SEGMENT_HEADER)) {
+            prepareNext(zerosNext());
+        }
+    }
+
     /// Switches to the prepared segment after the current one, preparing it here if its thread has not.
     private void rollover() throws IOException {
         if (next == null) {
-            prepareNext();
+            prepareNext(false);
         }
         var preparation = next;
         // Runs it on this thread unless it started elsewhere, so a rollover never waits on a thread yet to start
@@ -647,6 +692,7 @@ final class LogWriter {
             var bodyLength = frame.body().size();
             bodies += bodyLength;
             var sealedLength = bodyLength + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
+            prepareBeside(sealedLength);
             if (position + used + FRAME_HEADER + sealedLength > segmentSize && position + used > SEGMENT_HEADER) {
                 drain();
                 if (unitForce != null) {
@@ -659,6 +705,7 @@ final class LogWriter {
                 rollover();
                 start = position;
                 groupStart = true;
+                prepareBeside(sealedLength);
             }
             seal(frame, sealedLength, groupStart);
             groupStart = false;
@@ -678,8 +725,9 @@ final class LogWriter {
         }
         this.groupStart = start;
         groupEnd = end;
-        if (next == null) {
-            prepareNext();
+        // Before the group is published: a close that follows it reads what this leaves
+        if (next == null && (zerosNext() || pastLateStart(position - SEGMENT_HEADER))) {
+            prepareNext(zerosNext());
         }
         return bodies;
     }
@@ -1021,7 +1069,10 @@ final class LogWriter {
         return forces;
     }
 
-    /// Makes everything queued durable, then closes the segment.
+    /// Makes everything queued durable, closes the segment and keeps a prepared one for the next open.
+    ///
+    /// A segment too little written to have started the next one's preparation has the caller pay for it: one file
+    /// created and forced, one rename and one force of the directory, tens of milliseconds on Windows.
     ///
     /// @throws LedgerIoException if the queued frames cannot be made durable
     void close() {
@@ -1064,11 +1115,17 @@ final class LogWriter {
     /// closed store, nor in the cache of a copy of it.
     ///
     /// A preparation its thread has not started runs here, as a rollover runs it; one that has is waited for, by an
-    /// interrupted thread too, so no file of the store changes once it is closed.
+    /// interrupted thread too, so no file of the store changes once it is closed. A segment too little written to have
+    /// started one prepares it here, without a thread of its own that would only race this one, unless the writer
+    /// stopped: a device that failed takes no new file, and the next open prepares one anyway.
     private void keepNext() {
         var preparation = next;
         if (preparation == null) {
-            return;
+            if (failure != null || channel == null) {
+                return;
+            }
+            var number = segmentNumber + 1;
+            preparation = new FutureTask<>(() -> files.prepare(number, segmentSize, false));
         }
         // A file operation would close its channel on an interrupted thread
         var interrupted = Thread.interrupted();

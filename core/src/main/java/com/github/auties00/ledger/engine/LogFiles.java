@@ -36,7 +36,7 @@ final class LogFiles {
     private static final SecureRandom SALTS = new SecureRandom();
     // Not on Windows, where forcing a growing file cost a durable commit no more than forcing one written with zeros
     // first, and the zeros made an ingest of a history a fifth slower
-    private static final boolean ZERO_FILL = !System.getProperty("os.name", "").startsWith("Windows");
+    static final boolean ZERO_FILL = !System.getProperty("os.name", "").startsWith("Windows");
 
     private final Path directory;
     private final StoreKeys keys;

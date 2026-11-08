@@ -33,6 +33,10 @@ import java.util.zip.CRC32C;
 /// nothing past a damaged header is a crash during its creation, or a segment a close kept, and is deleted. Any other
 /// segment whose header is damaged, or names another store, another number or another encryption, is refused.
 ///
+/// A first group that crosses the late start of its segment starts preparing the next one before its force ([LogWriter]),
+/// so a segment torn or never written in its first group may be followed by one prepared and never written. Only the
+/// last of those is written into; the others hold nothing and retire with the next checkpoint.
+///
 /// The commits recovery replays may be in the cache of a process that stopped before forcing them: the last segment
 /// that holds frames is forced before any commit follows them ([Result#lastWritten()]).
 ///

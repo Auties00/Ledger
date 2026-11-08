@@ -782,7 +782,7 @@ class DurableLedgerTest {
                 crash(crashed);
             }
             // What a crash right after preparing the next segment leaves: the segment at its full length, not the one
-            // a close cuts to two blocks
+            // this close prepared and cut to two blocks
             Files.delete(directory.resolve("log").resolve(LogWriter.segmentName(number + 1)));
             var opened = StoreHeader.openOrCreate(directory, EncryptionSpec.key(KEY));
             new LogFiles(directory.resolve("log"), opened.keys(), opened.header().storeId()).prepare(number + 1, 16 << 20, true);

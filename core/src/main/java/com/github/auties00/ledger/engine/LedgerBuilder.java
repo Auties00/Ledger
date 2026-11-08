@@ -273,7 +273,9 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                 // Kept by the last close, or prepared by a crashed open and never written: the writer writes into it
                 first = empty.number();
             }
-            if (recovered.lastWritten() != null || crashed) {
+            // A close leaves one segment, whose name it forced; several with no frame in any are a first group cut short
+            // beside the preparation it started
+            if (recovered.lastWritten() != null || crashed || files.segments().size() > 1) {
                 // What a process that stopped left in the cache, durable before a commit follows it: the commits it
                 // replayed, their units, and the name of a segment it prepared, which this open may write into
                 if (recovered.lastWritten() != null) {
