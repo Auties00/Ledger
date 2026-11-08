@@ -614,7 +614,7 @@ public final class LiveLedger implements Ledger {
                         case ArrayWriteBatch.PUT -> {
                             var value = writes.value(i);
                             var decoded = state.resident ? residentValue(state, writes.decodedValue(i), value) : null;
-                            applier.put(state, applier.claim(state, writes.key(i)), writes.key(i), value, writes.home(i), writes.homeOffset(i), decoded,
+                            applier.put(state, applier.claim(state, writes.key(i)), writes.key(i), value, writes.ownValue(i), writes.home(i), writes.homeOffset(i), decoded,
                                     hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree), units == null ? null : units[i]);
                         }
                         case ArrayWriteBatch.DELETE ->
@@ -844,7 +844,7 @@ public final class LiveLedger implements Ledger {
                 }
                 var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(i, tree);
                 if (writes.kind(i) == ArrayWriteBatch.PUT) {
-                    applier.put(pending.states[i], pending.chains[i], writes.key(i), writes.value(i), writes.home(i), writes.homeOffset(i),
+                    applier.put(pending.states[i], pending.chains[i], writes.key(i), writes.value(i), writes.ownValue(i), writes.home(i), writes.homeOffset(i),
                             pending.decoded == null ? null : pending.decoded[i], inTree, pending.units == null ? null : pending.units[i]);
                 } else {
                     applier.delete(pending.states[i], pending.chains[i], writes.key(i), inTree);
@@ -1126,14 +1126,14 @@ public final class LiveLedger implements Ledger {
                 if (writes.kind(i) != ArrayWriteBatch.PUT) {
                     continue;
                 }
-                var value = writes.value(i);
-                if (value.byteSize() < states.get(writes.keyspace(i).name()).largeValues) {
+                var length = writes.valueBytes(i);
+                if (length < states.get(writes.keyspace(i).name()).largeValues) {
                     continue;
                 }
                 if (units == null) {
                     units = new PageRef[writes.size()];
                 }
-                units[i] = blobs.write(value);
+                units[i] = blobs.write(writes.valueArray(i), writes.valueArrayOffset(i), (int) length);
             }
             return units;
         } catch (RuntimeException | Error throwable) {
@@ -2017,7 +2017,7 @@ public final class LiveLedger implements Ledger {
         /// @param external the unit of the file of large values that holds `value` too, or `null`
         void put(KeyspaceState state, MemorySegment key, MemorySegment value, Object decoded, byte inTree, PageRef external) {
             // Usually opened already by the commit's prefetch
-            put(state, claim(state, key), key, value, null, 0, decoded, inTree, external);
+            put(state, claim(state, key), key, value, null, null, 0, decoded, inTree, external);
         }
 
         /// {@return the chain of `key`, claimed for a write of an operation that runs alone}
@@ -2034,21 +2034,25 @@ public final class LiveLedger implements Ledger {
 
         /// Applies a put of `key`, whose chain is `chain`, in the order and without the race the caller ensures.
         ///
+        /// @param own the array that holds `value` alone, which no one writes and the version keeps in its place, or `null`
         /// @param source the read-only segment `value` is part of, which the version keeps in its place, or `null` for a
         ///               value of its own
         /// @param offset where `value` starts in `source`
-        void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, MemorySegment source, int offset,
+        void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, byte[] own, MemorySegment source, int offset,
                  Object decoded, byte inTree, PageRef external) {
             var stamp = nextStamp();
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
             var length = Math.toIntExact(value.byteSize());
             Version version;
-            if (state.resident && state.keyspace.values() == BuiltinCodecs.BYTES_VALUE) {
+            var bytes = state.resident && state.keyspace.values() == BuiltinCodecs.BYTES_VALUE;
+            if (own != null) {
+                version = Version.ofOwn(stamp, own, bytes ? own : decoded, head, external);
+            } else if (bytes) {
                 // A byte array is its own encoding: one copy of the store's serves the reads, which return the instance
                 // the store holds, and the checkpoints, where the caller's array and a copy of it served them apart
-                var own = Segments.toBytes(value);
-                version = Version.ofOwn(stamp, own, own, head, external);
+                var copy = Segments.toBytes(value);
+                version = Version.ofOwn(stamp, copy, copy, head, external);
             } else if (state.resident && (source == null || source.byteSize() > 2L * length + RESIDENT_SLACK)) {
                 // A resident version lives as long as its key does: on a value of its own, not on the array of the
                 // batch or the log frame it came in, which a session written beside ten messages held 12 times over

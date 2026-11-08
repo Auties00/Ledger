@@ -252,7 +252,7 @@ class LargeValuesTest {
                 try {
                     // What a commit that failed after writing its units, or one a crash cut off, leaves
                     used = ledger.blobsForTests().epoch();
-                    var unit = ledger.blobsForTests().write(java.lang.foreign.MemorySegment.ofArray(value(2, 5_000)));
+                    var unit = ledger.blobsForTests().write(value(2, 5_000), 0, 5_000);
                     ledger.blobsForTests().release(unit);
                 } finally {
                     if (round == 0) {
