@@ -152,6 +152,9 @@ public final class LiveLedger implements Ledger {
     private BlobFile blobs;
     // The threshold of the key spaces the store finds in its catalog without being opened with them
     private long largeValues = Long.MAX_VALUE;
+    // The smallest threshold of a key space of the store: a batch whose values are all smaller writes none to the
+    // file of large values
+    private long minLargeValues = Long.MAX_VALUE;
     // The versions whose units of the file of large values no published checkpoint has taken; guarded by the
     // publishing role
     private final ArrayList<InFlight> inFlight;
@@ -207,9 +210,12 @@ public final class LiveLedger implements Ledger {
     void useBlobs(BlobFile blobs, long threshold, Map<String, Long> overrides) {
         this.blobs = blobs;
         this.largeValues = threshold;
+        var smallest = Long.MAX_VALUE;
         for (var state : states.values()) {
             state.largeValues = overrides.getOrDefault(state.keyspace.name(), threshold);
+            smallest = Math.min(smallest, state.largeValues);
         }
+        this.minLargeValues = smallest;
     }
 
     /// Records that the store knows the key space `name` as `id`.
@@ -225,6 +231,7 @@ public final class LiveLedger implements Ledger {
             }
             state = new KeyspaceState(Keyspace.paged(name, KeyCodec.bytes(), ValueCodec.bytes()));
             state.largeValues = largeValues;
+            minLargeValues = Math.min(minLargeValues, largeValues);
             state.lazy = true;
             states.put(name, state);
             sweepOrder = List.copyOf(states.values());
@@ -568,7 +575,7 @@ public final class LiveLedger implements Ledger {
         var outcome = units == null ? null : new Applier[1];
         Commit commit;
         try {
-            commit = rangeRemoval(writes) ? commitAlone(writes, units, outcome) : commitPipelined(writes, units, outcome);
+            commit = writes.removesRanges() ? commitAlone(writes, units, outcome) : commitPipelined(writes, units, outcome);
         } finally {
             if (outcome != null && (outcome[0] == null || !outcome[0].logged())) {
                 // No log frame names them
@@ -583,22 +590,12 @@ public final class LiveLedger implements Ledger {
         return commit;
     }
 
-    /// {@return whether `writes` holds a range removal}
-    private static boolean rangeRemoval(ArrayWriteBatch writes) {
-        for (var i = 0; i < writes.size(); i++) {
-            if (writes.kind(i) == ArrayWriteBatch.DELETE_RANGE) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     /// Commits `writes`, which holds a range removal, as an exclusive operation: the removal counts the keys it
     /// removes, which needs every commit before it applied and none after it started.
     ///
     /// @param outcome receives the writes as applied, or `null`
     private Commit commitAlone(ArrayWriteBatch writes, PageRef[] units, Applier[] outcome) {
-        var hints = prefetch(writes, null, null);
+        var hints = prefetch(writes);
         enterExclusive();
         try {
             ensureOpen();
@@ -608,21 +605,9 @@ public final class LiveLedger implements Ledger {
                 outcome[0] = applier;
             }
             try {
-                for (var i = 0; i < writes.size(); i++) {
-                    var state = states.get(writes.keyspace(i).name());
-                    switch (writes.kind(i)) {
-                        case ArrayWriteBatch.PUT -> {
-                            var value = writes.value(i);
-                            var decoded = state.resident ? residentValue(state, writes.decodedValue(i), value) : null;
-                            applier.put(state, applier.claim(state, writes.key(i)), writes.key(i), value, writes.home(i), writes.homeOffset(i), decoded,
-                                    hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree), units == null ? null : units[i]);
-                        }
-                        case ArrayWriteBatch.DELETE ->
-                                applier.delete(state, writes.key(i), hints == null ? TreeSearch.UNKNOWN : hints.of(i, tree));
-                        // The removal keeps its bounds until a checkpoint, and the batch's array may go back to the pool
-                        case ArrayWriteBatch.DELETE_RANGE -> applier.deleteRange(state, ownCopy(writes.key(i)), ownCopy(writes.value(i)));
-                        default -> throw new IllegalStateException("Unknown write kind " + writes.kind(i));
-                    }
+                var size = writes.size();
+                for (var i = 0; i < size; i++) {
+                    applyAlone(writes, i, applier, hints, units);
                 }
             } catch (RuntimeException | Error throwable) {
                 // A resident value whose decoder throws, or a tree that cannot be read, stops the batch
@@ -639,6 +624,27 @@ public final class LiveLedger implements Ledger {
         }
     }
 
+    /// Applies write `index` of `writes`, a batch that runs alone, holding both roles.
+    ///
+    /// @param hints what the lookups before the batch's turn found, or `null`
+    /// @param units the unit of the file of large values of each put, or `null`
+    private void applyAlone(ArrayWriteBatch writes, int index, Applier applier, Hints hints, PageRef[] units) {
+        var state = states.get(writes.keyspace(index).name());
+        switch (writes.kind(index)) {
+            case ArrayWriteBatch.PUT -> {
+                var value = writes.value(index);
+                var decoded = state.resident ? residentValue(state, writes.decodedValue(index), value) : null;
+                applier.put(state, applier.claim(state, writes.key(index)), writes.key(index), value, writes.home(index), writes.homeOffset(index), decoded,
+                        hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree), units == null ? null : units[index]);
+            }
+            case ArrayWriteBatch.DELETE ->
+                    applier.delete(state, writes.key(index), hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree));
+            // The removal keeps its bounds until a checkpoint, and the batch's array may go back to the pool
+            case ArrayWriteBatch.DELETE_RANGE -> applier.deleteRange(state, ownCopy(writes.key(index)), ownCopy(writes.value(index)));
+            default -> throw new IllegalStateException("Unknown write kind " + writes.kind(index));
+        }
+    }
+
     /// Commits `writes` through the pipeline: prepared here, given a sequence in the order commits arrive, applied
     /// here once the commits before it that write the same keys have, and published in the order of the sequences.
     ///
@@ -650,17 +656,15 @@ public final class LiveLedger implements Ledger {
         var size = writes.size();
         var chains = new Chain[size];
         var keyspaceStates = new KeyspaceState[size];
-        var hints = prefetch(writes, chains, keyspaceStates);
-        Object[] decoded = null;
+        // Only a batch that puts to a resident key space has values to decode
+        var decoded = writes.residentPuts() > 0 ? new Object[size] : null;
+        var trees = pages == null ? null : tree;
+        var found = trees == null ? null : new byte[size];
         for (var i = 0; i < size; i++) {
-            if (writes.kind(i) == ArrayWriteBatch.PUT && keyspaceStates[i].resident) {
-                if (decoded == null) {
-                    decoded = new Object[size];
-                }
-                // A decoder that throws stops the batch before it has a sequence
-                decoded[i] = residentValue(keyspaceStates[i], writes.decodedValue(i), writes.value(i));
-            }
+            // A decoder that throws stops the batch before it has a sequence
+            openWrite(writes, i, chains, keyspaceStates, found, decoded);
         }
+        var hints = found == null ? null : new Hints(trees, found);
         var pending = new PendingCommit(writes, chains, keyspaceStates, decoded, units, hints);
         if (arrivalTail.commit == arrivalCursor.commit && !sequencingWanted.held() && sequencing.tryAcquireBriefly()) {
             // No commit arrived before this one: it takes its sequence without the queue, and lets the role go with
@@ -698,6 +702,34 @@ public final class LiveLedger implements Ledger {
         writes.finish();
         pruneWritten(pending.applier.touched);
         return ticket(pending.sequence);
+    }
+
+    /// Prepares write `index` of a commit of the pipeline before the commit is given a sequence: opens the chain of
+    /// its key, records its key space, and decodes the value it puts to a resident key space.
+    ///
+    /// The commit writes blind: a write of a paged key space whose key memory holds no version does not look the key
+    /// up, and the checkpoint that takes it settles what it does to the count ([BlindWrites]). With a tree larger than
+    /// the page cache the lookup would read the file, and every later commit on the key would wait for the read.
+    ///
+    /// Opening the chains here grows the ordered map of the key space, which a new key costs a walk down, outside the
+    /// lock; commits that run at once insert their keys at once.
+    ///
+    /// @param chains receives the chain of the write's key
+    /// @param keyspaceStates receives the key space of the write
+    /// @param found receives, for a write of a paged key space, that it is blind; `null` if the store has no trees
+    /// @param decoded receives the decoded value of a put to a resident key space; `null` if the batch has none
+    private void openWrite(ArrayWriteBatch writes, int index, Chain[] chains, KeyspaceState[] keyspaceStates,
+                           byte[] found, Object[] decoded) {
+        var state = states.get(writes.keyspace(index).name());
+        chains[index] = state.open(writes.key(index));
+        keyspaceStates[index] = state;
+        if (state.resident) {
+            if (decoded != null && writes.kind(index) == ArrayWriteBatch.PUT) {
+                decoded[index] = residentValue(state, writes.decodedValue(index), writes.value(index));
+            }
+        } else if (found != null) {
+            found[index] = TreeSearch.BLIND;
+        }
     }
 
     /// Waits until `pending` has a sequence, giving the arrived commits their sequences whenever no other thread does.
@@ -801,23 +833,9 @@ public final class LiveLedger implements Ledger {
             return false;
         }
         var sequence = sequenced.next;
-        var chains = pending.chains;
-        var predecessors = new PendingCommit[chains.length];
-        for (var i = 0; i < chains.length; i++) {
-            var chain = chains[i];
-            if (chain == null) {
-                continue;
-            }
-            while (true) {
-                var previous = chain.claim(pending, sequence);
-                if (previous != Chain.DROPPED_WRITER) {
-                    predecessors[i] = previous instanceof PendingCommit commit && commit != pending ? commit : null;
-                    break;
-                }
-                // Dropped since the commit opened it: the key gets a chain of its own
-                chain = pending.states[i].open(pending.writes.key(i));
-                chains[i] = chain;
-            }
+        var predecessors = new PendingCommit[pending.chains.length];
+        for (var i = 0; i < predecessors.length; i++) {
+            predecessors[i] = claimWrite(pending, i, sequence);
         }
         pending.predecessors = predecessors;
         pending.sequence = sequence;
@@ -826,6 +844,26 @@ public final class LiveLedger implements Ledger {
         sequenced.last = pending;
         pending.advanceLazily(PendingCommit.SEQUENCED);
         return true;
+    }
+
+    /// Claims the chain of the key of write `index` of `pending` for its write at `sequence`, holding the sequencing
+    /// role; a chain dropped since the commit opened it gives way to a new one, which the commit then writes.
+    ///
+    /// @return the commit of the pipeline given a write of the key before, which applies its write first, or `null`
+    private static PendingCommit claimWrite(PendingCommit pending, int index, long sequence) {
+        var chain = pending.chains[index];
+        if (chain == null) {
+            return null;
+        }
+        while (true) {
+            var previous = chain.claim(pending, sequence);
+            if (previous != Chain.DROPPED_WRITER) {
+                return previous instanceof PendingCommit commit && commit != pending ? commit : null;
+            }
+            // Dropped since the commit opened it: the key gets a chain of its own
+            chain = pending.states[index].open(pending.writes.key(index));
+            pending.chains[index] = chain;
+        }
     }
 
     /// Applies the writes of `pending` to their chains, each once the commit before it on the same key has.
@@ -837,18 +875,9 @@ public final class LiveLedger implements Ledger {
         var applier = new Applier(pending.sequence, log != null, pending.writes.size(),
                 log == null ? 0 : FrameBody.capacityFor(pending.writes, pending.units));
         try {
-            for (var i = 0; i < writes.size(); i++) {
-                var predecessor = pending.predecessors[i];
-                if (predecessor != null) {
-                    predecessor.awaitApplied();
-                }
-                var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(i, tree);
-                if (writes.kind(i) == ArrayWriteBatch.PUT) {
-                    applier.put(pending.states[i], pending.chains[i], writes.key(i), writes.value(i), writes.home(i), writes.homeOffset(i),
-                            pending.decoded == null ? null : pending.decoded[i], inTree, pending.units == null ? null : pending.units[i]);
-                } else {
-                    applier.delete(pending.states[i], pending.chains[i], writes.key(i), inTree);
-                }
+            var size = writes.size();
+            for (var i = 0; i < size; i++) {
+                applyWrite(pending, applier, i);
             }
         } catch (Throwable failure) {
             applier.rollback();
@@ -858,6 +887,23 @@ public final class LiveLedger implements Ledger {
         // Read by the publisher on the commit's own line, so it reads the applier only when there is work in it
         pending.light = pending.failure == null && applier.light();
         pending.advanceApplied();
+    }
+
+    /// Applies write `index` of `pending` to its chain once the commit before it on the same key has.
+    private void applyWrite(PendingCommit pending, Applier applier, int index) {
+        var predecessor = pending.predecessors[index];
+        if (predecessor != null) {
+            predecessor.awaitApplied();
+        }
+        var writes = pending.writes;
+        var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(index, tree);
+        if (writes.kind(index) == ArrayWriteBatch.PUT) {
+            applier.put(pending.states[index], pending.chains[index], writes.key(index), writes.value(index),
+                    writes.home(index), writes.homeOffset(index), pending.decoded == null ? null : pending.decoded[index],
+                    inTree, pending.units == null ? null : pending.units[index]);
+        } else {
+            applier.delete(pending.states[index], pending.chains[index], writes.key(index), inTree);
+        }
     }
 
     /// Publishes the applied commits after the last published one, in order, unless another thread holds the role.
@@ -1117,7 +1163,7 @@ public final class LiveLedger implements Ledger {
     ///
     /// @return the unit of each write, `null` for one without; or `null` if no write has one
     private PageRef[] writeUnits(ArrayWriteBatch writes) {
-        if (blobs == null) {
+        if (blobs == null || writes.largestValueBytes() < minLargeValues) {
             return null;
         }
         PageRef[] units = null;
@@ -1464,13 +1510,8 @@ public final class LiveLedger implements Ledger {
         }
     }
 
-    /// Prepares the writes of `writes` before the commit is given a sequence: opens the chain of every key the batch
-    /// puts, and says how each write learns whether its key existed.
-    ///
-    /// A commit of the pipeline (`chains` given) writes blind: a write of a paged key space whose key memory holds no
-    /// version does not look the key up, and the checkpoint that takes it settles what it does to the count
-    /// ([BlindWrites]). With a tree larger than the page cache the lookup would read the file, and every later commit
-    /// on the key would wait for the read.
+    /// Prepares the writes of `writes`, a batch that runs alone, before its turn: opens the chain of every key the
+    /// batch puts, and says how each write learns whether its key existed.
     ///
     /// An operation that runs alone counts exactly as it applies, so here its lookups run before its turn, those that
     /// reach the file on up to [#PREFETCH_THREADS] threads at once, and what they found serves the writes as long as
@@ -1480,57 +1521,28 @@ public final class LiveLedger implements Ledger {
     /// is not the one its parent records, and the lookup leaves its write to the writer. A lookup that succeeds read
     /// the trees as they were, and its answer is used only while they are still the latest.
     ///
-    /// Opening the chains here grows the ordered map of the key space, which a new key costs a walk down, outside the
-    /// lock; commits that run at once insert their keys at once.
+    /// Opening the chains here grows the ordered map of the key space, which a new key costs a walk down, before the
+    /// turn.
     ///
     /// @return how each write learns whether its key existed, or `null` if the store has no trees
-    ///
-    /// @param chains receives the chain of each put and removal, opened for the pipeline, or `null`
-    /// @param keyspaceStates receives the key space of each write when `chains` does, or `null`
-    private Hints prefetch(ArrayWriteBatch writes, Chain[] chains, KeyspaceState[] keyspaceStates) {
+    private Hints prefetch(ArrayWriteBatch writes) {
         var trees = pages == null ? null : tree;
         try {
-            var point = trees == null || chains != null ? null : new ReadPoint(Reads.boundOf(latest()), trees, pages);
-            var found = trees == null ? null : new byte[writes.size()];
+            var point = trees == null ? null : new ReadPoint(Reads.boundOf(latest()), trees, pages);
+            var size = writes.size();
+            var found = trees == null ? null : new byte[size];
             int[] missing = null;
             var misses = 0;
-            for (var i = 0; i < writes.size(); i++) {
-                var kind = writes.kind(i);
-                if (kind != ArrayWriteBatch.PUT && kind != ArrayWriteBatch.DELETE) {
+            for (var i = 0; i < size; i++) {
+                if (!prefetchWrite(writes, i, point, found)) {
                     continue;
                 }
-                var state = states.get(writes.keyspace(i).name());
-                var key = writes.key(i);
-                var chain = chains != null || kind == ArrayWriteBatch.PUT ? state.open(key) : state.chain(key);
-                if (chains != null) {
-                    chains[i] = chain;
-                    keyspaceStates[i] = state;
+                if (missing == null) {
+                    missing = new int[16];
+                } else if (misses == missing.length) {
+                    missing = Arrays.copyOf(missing, misses * 2);
                 }
-                if (found == null) {
-                    continue;
-                }
-                if (chains != null) {
-                    if (!state.resident) {
-                        found[i] = TreeSearch.BLIND;
-                    }
-                    continue;
-                }
-                if (chain != null && chain.head != null) {
-                    continue;
-                }
-                var root = point.root(state);
-                if (root == null) {
-                    continue;
-                }
-                found[i] = TreeSearch.lookupCached(pages, root, key);
-                if (found[i] == TreeSearch.UNKNOWN) {
-                    if (missing == null) {
-                        missing = new int[16];
-                    } else if (misses == missing.length) {
-                        missing = Arrays.copyOf(missing, misses * 2);
-                    }
-                    missing[misses++] = i;
-                }
+                missing[misses++] = i;
             }
             if (misses == 1) {
                 lookUp(writes, point, found, missing, 1, 0, 1);
@@ -1553,6 +1565,31 @@ public final class LiveLedger implements Ledger {
             Thread.currentThread().interrupt();
             return null;
         }
+    }
+
+    /// Opens the chain of the key of write `index` if it puts, and looks the key up in the pages of the trees of
+    /// `point` the cache holds, unless its chain holds a version, recording in `found` what the lookup found.
+    ///
+    /// @param point the latest trees, or `null` if the store has none
+    /// @param found receives what the lookup found, or `null` if the store has no trees
+    /// @return whether the lookup has to read the file
+    private boolean prefetchWrite(ArrayWriteBatch writes, int index, ReadPoint point, byte[] found) {
+        var kind = writes.kind(index);
+        if (kind != ArrayWriteBatch.PUT && kind != ArrayWriteBatch.DELETE) {
+            return false;
+        }
+        var state = states.get(writes.keyspace(index).name());
+        var key = writes.key(index);
+        var chain = kind == ArrayWriteBatch.PUT ? state.open(key) : state.chain(key);
+        if (found == null || chain != null && chain.head != null) {
+            return false;
+        }
+        var root = point.root(state);
+        if (root == null) {
+            return false;
+        }
+        found[index] = TreeSearch.lookupCached(pages, root, key);
+        return found[index] == TreeSearch.UNKNOWN;
     }
 
     /// Looks up the keys of every `step`-th write of `missing` from `first` in the trees of `point`, reading the file,
@@ -1808,11 +1845,18 @@ public final class LiveLedger implements Ledger {
             bounds = bounds(scan.active());
             cutBound = Reads.boundOf(floor(scan.oldest()));
         }
-        for (var i = 0; i < touched.size(); i++) {
-            var write = touched.get(i);
-            if (prune(write.state(), write.chain(), write.version(), bounds, cutBound)) {
-                requestSweep();
-            }
+        var size = touched.size();
+        for (var i = 0; i < size; i++) {
+            pruneTouched(touched, i, bounds, cutBound);
+        }
+    }
+
+    /// Prunes the chain of write `index` of `touched`, the writes of a published commit, and asks for a sweep if the
+    /// prune leaves a chain a later one may shorten.
+    private void pruneTouched(List<Touched> touched, int index, long[] bounds, long cutBound) {
+        var write = touched.get(index);
+        if (prune(write.state(), write.chain(), write.version(), bounds, cutBound)) {
+            requestSweep();
         }
     }
 
@@ -2229,24 +2273,33 @@ public final class LiveLedger implements Ledger {
         /// Publishes what the commit adds to the units in flight, the keys the next checkpoint writes and the counts.
         private void publishCounted() {
             if (externals != 0 || pages != null) {
-                for (var write : touched) {
-                    if (write.version() == null) {
-                        continue;
-                    }
-                    if (write.version() instanceof Version.External external) {
-                        inFlight.add(new InFlight(write.state(), write.chain(), external));
-                    }
-                    if (pages != null) {
-                        write.state().markDirty(write.chain());
-                    }
-                    if (write.blind()) {
-                        write.state().blind.add(write.chain(), sequence, write.version().removes());
-                    }
+                var size = touched.size();
+                for (var i = 0; i < size; i++) {
+                    publishTouched(i);
                 }
             }
             for (var i = 0; i < deltaCount; i++) {
                 var state = deltaStates[i];
                 state.counts.append(sequence, state.counts.last() + deltas[i]);
+            }
+        }
+
+        /// Publishes what the commit's write `index` adds to the units in flight, the keys the next checkpoint writes
+        /// and the blind writes.
+        private void publishTouched(int index) {
+            var write = touched.get(index);
+            var version = write.version();
+            if (version == null) {
+                return;
+            }
+            if (version instanceof Version.External external) {
+                inFlight.add(new InFlight(write.state(), write.chain(), external));
+            }
+            if (pages != null) {
+                write.state().markDirty(write.chain());
+            }
+            if (write.blind()) {
+                write.state().blind.add(write.chain(), sequence, version.removes());
             }
         }
 

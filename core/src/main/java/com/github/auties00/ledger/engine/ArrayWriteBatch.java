@@ -18,6 +18,13 @@ import java.util.Objects;
 ///
 /// A range removal stores its bounds, each encoded or absent; the store reads them back through the accessors of
 /// this class when it applies the batch, then starts it again with [#finish()].
+///
+/// The batch keeps, as it records each write, what the store would otherwise sum over the whole batch at each commit:
+/// whether it removes a range, the bytes of the values it puts by residency, its puts to resident key spaces and its
+/// largest value. A pass over the writes would be a loop of a method called once a commit, which the JIT compiles
+/// only after tens of thousands of iterations, so a process making a few large commits would run it interpreted; kept
+/// as the writes come, the totals cost a few instructions of a method the JIT compiles within the first thousands of
+/// writes.
 public final class ArrayWriteBatch implements WriteBatch {
     private static final int INITIAL_CAPACITY = 4_096;
     private static final byte[] EMPTY = new byte[0];
@@ -67,6 +74,16 @@ public final class ArrayWriteBatch implements WriteBatch {
     // Per write: first offset and length, then second offset and length (value, or upper bound of a range)
     private long[] spans;
     private int size;
+    // The totals of the writes, written only by add() and clear(): whether a write removes a range
+    private boolean removesRanges;
+    // The bytes of the values put to paged key spaces, and of those below half a chunk, which prepare packs together
+    private long pagedValueBytes;
+    private long packedValueBytes;
+    // The bytes of the values put to resident key spaces, and the number of those puts
+    private long residentValueBytes;
+    private int residentPuts;
+    // The bytes of the largest value put
+    private long largestValueBytes;
 
     /// Creates an empty batch for a store.
     ///
@@ -204,6 +221,24 @@ public final class ArrayWriteBatch implements WriteBatch {
         spans[size * 4 + 2] = secondOffset;
         spans[size * 4 + 3] = secondLength;
         size++;
+        // After the write is recorded, so arrays that fail to grow leave the totals those of the writes
+        if (kind == PUT) {
+            if (keyspace.residency() == Keyspace.Residency.PAGED) {
+                pagedValueBytes += secondLength;
+                if (secondLength < CHUNK_BYTES / 2) {
+                    packedValueBytes += secondLength;
+                }
+            } else {
+                residentValueBytes += secondLength;
+                residentPuts++;
+            }
+            // Without a branch: only the first puts of a batch raise it, and the JIT would leave the raise out of the
+            // code it compiles from the puts after them
+            largestValueBytes = Math.max(largestValueBytes, secondLength);
+        } else if (kind == DELETE_RANGE) {
+            // The second span of a range removal is its upper bound, not a value
+            removesRanges = true;
+        }
     }
 
     @Override
@@ -222,6 +257,12 @@ public final class ArrayWriteBatch implements WriteBatch {
         Arrays.fill(values, 0, size, null);
         size = 0;
         used = 0;
+        removesRanges = false;
+        pagedValueBytes = 0;
+        packedValueBytes = 0;
+        residentValueBytes = 0;
+        residentPuts = 0;
+        largestValueBytes = 0;
     }
 
     /// {@return the kind of write `index`: [#PUT], [#DELETE] or [#DELETE_RANGE]}
@@ -253,28 +294,28 @@ public final class ArrayWriteBatch implements WriteBatch {
         return span(index, 2);
     }
 
-    /// {@return the bytes of the key, or lower bound, of write `index`, and of its value, or upper bound, 0 for those it
-    /// has not}
-    ///
-    /// @param index the write
-    long spanBytes(int index) {
-        Objects.checkIndex(index, size);
-        var bytes = 0L;
-        if (spans[index * 4] != ABSENT) {
-            bytes += spans[index * 4 + 1];
-        }
-        if (spans[index * 4 + 2] != ABSENT) {
-            bytes += spans[index * 4 + 3];
-        }
-        return bytes;
-    }
-
     /// {@return the bytes of the value of write `index`, 0 if it has none}
     ///
     /// @param index the write
     long valueBytes(int index) {
         Objects.checkIndex(index, size);
         return spans[index * 4 + 2] == ABSENT ? 0 : spans[index * 4 + 3];
+    }
+
+    /// {@return whether a write of the batch removes a range}
+    boolean removesRanges() {
+        return removesRanges;
+    }
+
+    /// {@return the writes of the batch that put a value to a [Keyspace.Residency#RESIDENT] key space, whether the
+    /// batch holds the value decoded or only encoded}
+    int residentPuts() {
+        return residentPuts;
+    }
+
+    /// {@return the bytes of the largest value the batch puts, 0 if it puts none}
+    long largestValueBytes() {
+        return largestValueBytes;
     }
 
     /// {@return the read-only segment of the array every key and value of the batch is part of}
@@ -331,20 +372,10 @@ public final class ArrayWriteBatch implements WriteBatch {
         if (copies) {
             return;
         }
-        var paged = 0L;
-        var resident = 0L;
-        for (var i = 0; i < size; i++) {
-            if (kinds[i] == PUT) {
-                if (targets[i].residency() == Keyspace.Residency.PAGED) {
-                    paged += spans[i * 4 + 3];
-                } else {
-                    resident += spans[i * 4 + 3];
-                }
-            }
-        }
+        var paged = pagedValueBytes;
         // A batch of resident writes alone keeps them on its array as before, where the store's rule for resident
         // values finds it small enough; any other copies them, so the paged values' array holds none
-        var kept = paged > 0 ? paged : resident;
+        var kept = paged > 0 ? paged : residentValueBytes;
         if (kept == 0) {
             return;
         }
@@ -359,44 +390,68 @@ public final class ArrayWriteBatch implements WriteBatch {
         homes = new MemorySegment[size];
         homeOffsets = new int[size];
         homesMode = HOMES_CHUNKS;
-        var chunk = (byte[]) null;
-        var chunkView = (MemorySegment) null;
-        var fill = 0;
-        var remaining = 0L;
+        // The packer counts down a copy of the total: a commit that fails before it finishes the batch leaves the
+        // batch's writes, and committing it again prepares them again
+        var packer = new Packer(packedValueBytes);
         for (var i = 0; i < size; i++) {
-            if (packed(i) && spans[i * 4 + 3] < CHUNK_BYTES / 2) {
-                remaining += spans[i * 4 + 3];
-            }
-        }
-        for (var i = 0; i < size; i++) {
-            if (!packed(i)) {
-                continue;
-            }
-            var offset = (int) spans[i * 4 + 2];
-            var length = (int) spans[i * 4 + 3];
-            if (length >= CHUNK_BYTES / 2) {
-                // A value of half a chunk or more gets an array of its own, which no other value shares
-                var own = Arrays.copyOfRange(data, offset, offset + length);
-                homes[i] = MemorySegment.ofArray(own).asReadOnly();
-                continue;
-            }
-            if (chunk == null || fill + length > chunk.length) {
-                // Every chunk but the last is more than half full, so they waste at most a value's bytes each
-                chunk = new byte[(int) Math.min(CHUNK_BYTES, remaining)];
-                chunkView = MemorySegment.ofArray(chunk).asReadOnly();
-                fill = 0;
-            }
-            System.arraycopy(data, offset, chunk, fill, length);
-            homes[i] = chunkView;
-            homeOffsets[i] = fill;
-            fill += length;
-            remaining -= length;
+            packer.pack(i);
         }
     }
 
     // Whether write `index` puts a value the store keeps on a chunk in HOMES_CHUNKS
     private boolean packed(int index) {
         return kinds[index] == PUT && targets[index].residency() == Keyspace.Residency.PAGED;
+    }
+
+    /// The chunks [#prepare(boolean)] copies the values of paged key spaces into, in the order of the writes.
+    ///
+    /// A value of half a chunk or more gets an array of its own; the others fill chunks of [#CHUNK_BYTES], the last
+    /// no larger than the values left for it. Each write is packed by a call of its own, which the JIT compiles once
+    /// a few thousand writes have made it, as it would not compile the loop of a method called once a commit through
+    /// the first large commits of a process.
+    private final class Packer {
+        // The bytes of the values below half a chunk not packed yet
+        private long remaining;
+        private byte[] chunk;
+        private MemorySegment chunkView;
+        private int fill;
+
+        Packer(long remaining) {
+            this.remaining = remaining;
+            // Every value below half a chunk fits the first one, which is as large as all of them or a whole chunk
+            startChunk();
+        }
+
+        // Starts a chunk as large as the values left for it, at most a whole one
+        private void startChunk() {
+            chunk = new byte[(int) Math.min(CHUNK_BYTES, remaining)];
+            chunkView = MemorySegment.ofArray(chunk).asReadOnly();
+            fill = 0;
+        }
+
+        /// Gives write `index` its home, if it puts a value to a paged key space.
+        void pack(int index) {
+            if (!packed(index)) {
+                return;
+            }
+            var offset = (int) spans[index * 4 + 2];
+            var length = (int) spans[index * 4 + 3];
+            if (length >= CHUNK_BYTES / 2) {
+                // A value of half a chunk or more gets an array of its own, which no other value shares
+                var own = Arrays.copyOfRange(data, offset, offset + length);
+                homes[index] = MemorySegment.ofArray(own).asReadOnly();
+                return;
+            }
+            if (fill + length > chunk.length) {
+                // Every chunk but the last is more than half full, so they waste at most a value's bytes each
+                startChunk();
+            }
+            System.arraycopy(data, offset, chunk, fill, length);
+            homes[index] = chunkView;
+            homeOffsets[index] = fill;
+            fill += length;
+            remaining -= length;
+        }
     }
 
     /// {@return the read-only segment the store's version of the value of write `index` slices, or `null` if the store
