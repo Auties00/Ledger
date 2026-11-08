@@ -6,9 +6,12 @@ import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.Map;
 import java.util.NavigableMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 
@@ -32,6 +35,17 @@ import java.util.function.LongSupplier;
 /// key and a 24-byte value, and an open walked down it for every entry it loaded. The sweep reaches its chains through
 /// the index instead ([#next(ChainIndex.Cursor)]).
 ///
+/// The first descending scan of such a key space links each chain of the ordered map to the one below it
+/// ([Chain#below()]), and the key space keeps the links from then on, so a descending scan steps from one chain to the
+/// next with a load and a comparison of keys ([#walk]): the map's descending iterator has no links back, and finds each
+/// next chain again from the top of the map, a comparison of keys for each of its levels, each a miss on a key's bytes,
+/// half the time of a chat's newest page beside a thousand buffered messages. Chains enter the map, and their links
+/// change, under one lock; a chain that enters links the one below it before the map publishes it, then the one above
+/// links it. Chains leave the map without the lock: one that left stays on the links, emptied, until a repair points the
+/// link above past it and clears its own, which a commit runs once a thousand left and a checkpoint runs at its end; a
+/// scan that steps onto it reads the tree for its key, as for an empty chain still in the map, and one that finds its
+/// link cleared asks the map for the next chain.
+///
 /// Readers use it concurrently with the commits. Commits create chains before they are given a sequence; everything
 /// else changes only under it.
 final class KeyspaceState {
@@ -40,6 +54,22 @@ final class KeyspaceState {
     /// The dropped chains the list may hold, at least, before a commit sweeps them off it; past it, as many as memory
     /// holds chains, so a sweep's steps stay within twice the drops.
     private static final int LISTED_DROPS = 4_096;
+    /// The chains one hold of the links lock links one at a time as it orders them, at least; past it, or an eighth
+    /// of the map, the rest go in unlinked and one walk up the map links them all before the hold ends: a chain linked
+    /// alone takes one more walk down the map than a chain not linked, to the chain above, about 35 comparisons of keys
+    /// at 200,000 chains, where the walk up the map costs each chain it holds about two misses.
+    private static final int LINKED_ORDERS = 1_024;
+    /// The chains that left the ordered map, still on the links, past which a commit points the links past them, and
+    /// the most one commit does: what they keep reachable until then stays within a thousand chains and their keys.
+    private static final int LEFT_REPAIRS = 1_024;
+    /// How many walks of the map, each down its levels, a repair of the link above a chain that left costs, against
+    /// one step of a walk up the map that relinks it whole.
+    private static final int RELINK_RATIO = 32;
+    // The states of the links: no chain is linked, as before the first descending scan; some chains of the map are not
+    // linked, while a hold of the links lock orders many chains or links the map the first time; every chain is linked
+    private static final int UNLINKED = 0;
+    private static final int RELINKING = 1;
+    private static final int LINKED = 2;
 
     final Keyspace<?, ?> keyspace;
     final boolean resident;
@@ -67,16 +97,30 @@ final class KeyspaceState {
     long largeValues = Long.MAX_VALUE;
     // Whether the key space orders its chains lazily, set while the store opens, before any chain is opened
     boolean lazy;
-    // The chains opened and not yet ordered, newest first, linked through Chain.nextUnordered
+    // The chains opened and not yet ordered, newest first, linked through Chain.link
     @SuppressWarnings("unused")
     private volatile Chain unordered;
     // Held while the listed chains are ordered or pruned, so a read of a range that finds the list empty waits for
     // the chains another thread took from it
     private final ReentrantLock ordering;
     // The chains dropped while listed since the list was last pruned, which only a prune of the list lets go of
-    private final java.util.concurrent.atomic.AtomicInteger droppedListed;
+    private final AtomicInteger droppedListed;
     // The dropped chains listed past which a commit sweeps them off, as of the last prune of the list
     private volatile int listedDropsLimit = LISTED_DROPS;
+    // Held, in a key space that orders lazily, while chains enter the ordered map and while the links between its
+    // chains change; taken after `ordering`, or alone by a repair of the links, which a read of a range that finds the
+    // list empty does not wait for
+    private final ReentrantLock linking;
+    // UNLINKED, RELINKING or LINKED; written holding `linking`
+    private volatile int links;
+    // The chains the hold of `linking` may still link one at a time as it orders them; guarded by it
+    private int linkedOrders;
+    // The chains that left the ordered map, linked, since a repair last pointed the links past them
+    private final ConcurrentLinkedQueue<Chain> left;
+    // The chains `left` holds, about
+    private final AtomicInteger leftCount;
+    // Whether so many chains left the map at once, unlisted, that the next repair relinks the map
+    private volatile boolean relinkWanted;
 
     private static final VarHandle UNORDERED;
 
@@ -101,7 +145,10 @@ final class KeyspaceState {
         this.dirty = new ArrayList<>();
         this.keys = new KeySlab();
         this.ordering = new ReentrantLock();
-        this.droppedListed = new java.util.concurrent.atomic.AtomicInteger();
+        this.droppedListed = new AtomicInteger();
+        this.linking = new ReentrantLock();
+        this.left = new ConcurrentLinkedQueue<>();
+        this.leftCount = new AtomicInteger();
     }
 
     /// {@return the chain of `key`, or `null` if memory holds none}
@@ -167,15 +214,15 @@ final class KeyspaceState {
     private void list(Chain chain) {
         while (true) {
             var head = unordered;
-            chain.nextUnordered = head;
+            chain.link = head;
             if (UNORDERED.compareAndSet(this, head, chain)) {
                 return;
             }
         }
     }
 
-    /// Orders every listed chain that is not dropped, so the ordered map holds every chain a read of a range may need;
-    /// safe for concurrent use.
+    /// Orders every listed chain that is not dropped, so the ordered map holds every chain a read of a range may need,
+    /// linked if the key space links its chains; safe for concurrent use.
     private void orderListed() {
         // Both read in this order: a thread that takes the list holds the lock until it ordered what it took
         if (unordered == null && !ordering.isLocked()) {
@@ -185,11 +232,20 @@ final class KeyspaceState {
         try {
             resetDropped();
             var chain = (Chain) UNORDERED.getAndSet(this, null);
-            while (chain != null) {
-                var next = chain.nextUnordered;
-                chain.nextUnordered = null;
-                order(chain);
-                chain = next;
+            if (chain == null) {
+                return;
+            }
+            lockLinks();
+            try {
+                while (chain != null) {
+                    var next = chain.link;
+                    // Off the list before it is ordered, where its link points down the map
+                    chain.link = null;
+                    order(chain);
+                    chain = next;
+                }
+            } finally {
+                unlockLinks();
             }
         } finally {
             ordering.unlock();
@@ -201,33 +257,63 @@ final class KeyspaceState {
     /// there, shortens them; safe for concurrent use. A resident key space keeps the others listed: its sweep walks the
     /// index.
     ///
+    /// It then points the links past every chain that left the ordered map, or relinks the map if most of it left, as
+    /// after a checkpoint, under the links lock alone, which a read of a range that finds the list empty does not wait
+    /// for.
+    ///
     /// @param cut the number of the cut whose keys the prune went through, as [#markDirty] gave it to the chains
     void pruneListed(long cut) {
-        if (unordered == null) {
-            return;
+        if (unordered != null) {
+            ordering.lock();
+            try {
+                lockLinks();
+                try {
+                    unlinkListed(cut);
+                } finally {
+                    unlockLinks();
+                }
+            } finally {
+                ordering.unlock();
+            }
         }
-        ordering.lock();
-        try {
-            unlinkListed(cut);
-        } finally {
-            ordering.unlock();
+        if (links != UNLINKED && (relinkWanted || leftCount.get() > 0)) {
+            lockLinks();
+            try {
+                skipLeft(Integer.MAX_VALUE);
+            } finally {
+                unlockLinks();
+            }
         }
     }
 
-    /// Takes the dropped chains off the list once the commits dropped more of them than a sweep of it costs, unless
-    /// another thread holds the list; safe for concurrent use.
+    /// Takes the dropped chains off the list once the commits dropped more of them than a sweep of it costs, and points
+    /// the links past the chains that left the ordered map once a thousand did, a thousand at most, unless another
+    /// thread holds the list or the links; safe for concurrent use.
     ///
     /// Only a checkpoint's prune and a read of a range took them off before, so a key space whose commits removed keys
     /// memory did not hold kept a chain for each such commit, with its key's copy, until the next checkpoint: millions
-    /// of them, or for good while checkpoints failed.
+    /// of them, or for good while checkpoints failed. The links keep as long, unless repaired, the chains the commits
+    /// take out of the ordered map, once the sweep dropped them or a range removal emptied them.
     void unlinkDropped() {
-        if (droppedListed.get() < listedDropsLimit || !ordering.tryLock()) {
-            return;
+        if (droppedListed.get() >= listedDropsLimit && ordering.tryLock()) {
+            try {
+                if (tryLockLinks()) {
+                    try {
+                        unlinkListed(-1);
+                    } finally {
+                        unlockLinks();
+                    }
+                }
+            } finally {
+                ordering.unlock();
+            }
         }
-        try {
-            unlinkListed(-1);
-        } finally {
-            ordering.unlock();
+        if (leftCount.get() >= LEFT_REPAIRS && links == LINKED && tryLockLinks()) {
+            try {
+                skipLeft(LEFT_REPAIRS);
+            } finally {
+                unlockLinks();
+            }
         }
     }
 
@@ -239,51 +325,71 @@ final class KeyspaceState {
     }
 
     /// Unlinks from the list, in place, the chains that are dropped and, in a paged key space, those it orders, the
-    /// ones no commit wrote since `cut`; holding the ordering lock.
+    /// ones no commit wrote since `cut`; holding the ordering lock and the links lock.
     ///
     /// The list is never taken whole: a read of a range that finds it empty does not wait for the lock, so a list put
     /// back after a walk let a read that came during the walk miss every chain the walk kept, all of a resident key
-    /// space's. A chain leaves the list only once it is in the ordered map or dropped. Commits only push chains on the
-    /// head, and only holders of the lock unlink, so the links past the head change under this thread alone.
+    /// space's. A chain leaves the list only once it is dropped, or to enter the ordered map before the lock goes.
+    /// Commits only push chains on the head, and only holders of the lock unlink, so the links past the head change
+    /// under this thread alone.
     private void unlinkListed(long cut) {
         resetDropped();
         Chain previous = null;
         var chain = unordered;
         while (chain != null) {
-            var next = chain.nextUnordered;
-            var leaves = chain.dropped() || chain.released();
+            var next = chain.link;
+            var dropped = chain.dropped() || chain.released();
             // A plain read off the publishing role: a chain marked meanwhile is only ordered early
-            if (!leaves && !resident && chain.dirtyCut <= cut) {
-                order(chain);
-                leaves = true;
-            }
-            if (!leaves) {
+            var orders = !dropped && !resident && chain.dirtyCut <= cut;
+            if (!dropped && !orders) {
                 previous = chain;
             } else {
                 if (previous == null && !UNORDERED.compareAndSet(this, chain, next)) {
                     // A commit listed a chain before this one since the walk started: the link to unlink is its
                     previous = unordered;
-                    while (previous.nextUnordered != chain) {
-                        previous = previous.nextUnordered;
+                    while (previous.link != chain) {
+                        previous = previous.link;
                     }
                 }
                 if (previous != null) {
-                    previous.nextUnordered = next;
+                    previous.link = next;
                 }
-                chain.nextUnordered = null;
+                // Off the list before it is ordered, where its link points down the map
+                chain.link = null;
+                if (orders) {
+                    order(chain);
+                }
             }
             chain = next;
         }
     }
 
-    /// Inserts `chain` into the ordered map, in place of a dropped chain of the same key, unless it is dropped.
+    /// Inserts `chain` into the ordered map, in place of a dropped chain of the same key, unless it is dropped; in a
+    /// key space that orders lazily, holding the links lock.
+    ///
+    /// A chain the hold links links the chain below it before the map publishes it, so a scan that starts at it, as one
+    /// that came before the hold, and wants none of its chains, may, still walks every chain below; the chain above
+    /// links it after. Only removals run beside the writes the lock serialises, so a link set to the chain below a key
+    /// leads to the map's chain below, through chains that left meanwhile.
+    ///
+    /// One walk down the map finds the chain above, whose link gives the chain below as well
+    /// ([#below(MemorySegment, Chain)]), so a chain linked as it enters costs the scan that orders it one walk more than
+    /// a chain that does not, rather than one for each neighbour.
     private void order(Chain chain) {
+        var linked = lazy && linksEach();
         // Released counts as dropped on both sides: another thread may have used the chain, and a prune dropped it,
         // while this one was still inserting it; a later chain of the key then holds the place
         while (!chain.dropped() && !chain.released()) {
-            var previous = entries.putIfAbsent(chain.key(), chain);
+            var key = chain.key();
+            Chain above = null;
+            if (linked) {
+                var higher = entries.higherEntry(key);
+                above = higher == null ? null : higher.getValue();
+                chain.linkBelow(below(key, above));
+            }
+            var previous = entries.putIfAbsent(key, chain);
             if (previous == null || previous == chain) {
-                inserted(chain);
+                inserted(key, chain, above);
                 return;
             }
             // A chain being dropped is released before it is marked dropped
@@ -294,11 +400,202 @@ final class KeyspaceState {
                 }
                 throw new IllegalStateException("Two chains hold one key of " + keyspace.name());
             }
-            if (entries.replace(chain.key(), previous, chain)) {
-                inserted(chain);
+            if (entries.replace(key, previous, chain)) {
+                // The dropped chain left the map with the replace: the chain above links this one now
+                inserted(key, chain, above);
                 return;
             }
         }
+    }
+
+    /// Records that the ordered map holds `chain`, at `key`, and takes it out again if it was dropped meanwhile, unseen
+    /// by [#empty], which lists for removal only the chains it finds ordered; then points the link of the chain above
+    /// at it, or past it if it left.
+    ///
+    /// @param above the chain the map held right above `key` before the insert, or `null` if the hold does not link the
+    ///              chain or none is above it; no chain entered between them since, and if it left since, the chain
+    ///              above it reaches the one that entered through it
+    private void inserted(MemorySegment key, Chain chain, Chain above) {
+        chain.markOrdered();
+        var stays = !chain.dropped() || !entries.remove(key, chain);
+        if (above != null) {
+            if (stays) {
+                above.linkBelow(chain);
+            } else {
+                linkAbove(key);
+            }
+        }
+    }
+
+    /// {@return whether the chain the hold orders next links its neighbours as it enters the map, holding the links
+    /// lock}
+    ///
+    /// Past the chains a hold links one at a time, the others go in unlinked, scans stop walking the links, and the
+    /// hold relinks the whole map before it lets the lock go ([#unlockLinks()]).
+    private boolean linksEach() {
+        if (links != LINKED) {
+            return false;
+        }
+        if (linkedOrders > 0) {
+            linkedOrders--;
+            return true;
+        }
+        links = RELINKING;
+        return false;
+    }
+
+    /// {@return the chain the ordered map holds right below `key`, or [Chain#BOTTOM]}
+    private Chain below(MemorySegment key) {
+        var lower = entries.lowerEntry(key);
+        return lower == null ? Chain.BOTTOM : lower.getValue();
+    }
+
+    /// {@return what a chain entering the ordered map at `key` links as the one below it, holding the links lock: the
+    /// link of `above`, the chain the map held right above `key` or `null` for none, if it leads below `key`; otherwise
+    /// the chain the map holds right below `key`, or [Chain#BOTTOM]}
+    ///
+    /// Under the lock no chain enters the map and no repair clears a link, so the link of `above` leads to the chain the
+    /// map holds right below `above`, through chains that left. Its first step may stop short of that, at a chain that
+    /// left between `key` and `above`, or at a chain of `key` itself; one below `key` may be a chain that left, listed
+    /// for the repair that points the links past it, whose own link leads on down the map.
+    private Chain below(MemorySegment key, Chain above) {
+        if (above != null) {
+            var link = above.below();
+            if (link == Chain.BOTTOM || link != null && link.compareKey(key) < 0) {
+                return link;
+            }
+        }
+        return below(key);
+    }
+
+    /// Points the link of the chain the ordered map holds right above `key` at the chain the map holds below that
+    /// chain; holding the links lock.
+    private void linkAbove(MemorySegment key) {
+        var higher = entries.higherEntry(key);
+        if (higher != null) {
+            higher.getValue().linkBelow(below(higher.getKey()));
+        }
+    }
+
+    /// Takes the links lock, under which chains enter the ordered map and the links change, and sets how many chains
+    /// the hold links one at a time.
+    private void lockLinks() {
+        linking.lock();
+        linkedOrders = linkedOrders();
+    }
+
+    /// {@return whether it took the links lock, as [#lockLinks()] does, which another thread held otherwise}
+    private boolean tryLockLinks() {
+        if (!linking.tryLock()) {
+            return false;
+        }
+        linkedOrders = linkedOrders();
+        return true;
+    }
+
+    /// {@return the chains a hold of the links lock links one at a time, of a map whose chains are linked}
+    private int linkedOrders() {
+        return links == LINKED ? Math.max(LINKED_ORDERS, entries.size() / 8) : 0;
+    }
+
+    /// Relinks the ordered map if the hold left chains of it unlinked, or a relink failed, and lets the links lock go.
+    private void unlockLinks() {
+        try {
+            if (links == RELINKING) {
+                relink();
+            }
+        } finally {
+            linking.unlock();
+        }
+    }
+
+    /// {@return whether the chains of the ordered map are linked, which links them first unless another thread holds
+    /// the links lock}
+    ///
+    /// The first descending scan of the key space links them, in one walk up the map; from then on the chains that
+    /// enter link as they do.
+    private boolean linked() {
+        if (links == LINKED) {
+            return true;
+        }
+        if (!tryLockLinks()) {
+            return false;
+        }
+        try {
+            if (links != LINKED) {
+                relink();
+            }
+            return true;
+        } finally {
+            linking.unlock();
+        }
+    }
+
+    /// Links every chain of the ordered map to the one below it, in one walk up the map, holding the links lock.
+    ///
+    /// No chain enters the map meanwhile, so a scan walking the links beside it follows old links and new ones, and
+    /// either kind leads, through chains that left the map, to the next chain the map holds below. The chains that left
+    /// before the walk are on no link once it ends, so their list is cleared first, with their own links.
+    private void relink() {
+        if (links == UNLINKED) {
+            // From here on the chains that leave the map are listed, so none the walk links stays on the links unseen
+            links = RELINKING;
+        }
+        relinkWanted = false;
+        var cleared = 0;
+        Chain gone;
+        while ((gone = left.poll()) != null) {
+            gone.linkBelow(null);
+            cleared++;
+        }
+        leftCount.addAndGet(-cleared);
+        var below = Chain.BOTTOM;
+        for (var chain : entries.values()) {
+            chain.linkBelow(below);
+            below = chain;
+        }
+        links = LINKED;
+        // Those that left during the walk: it may have linked a chain to them, or passed them by with their old links
+        repairLeft(Integer.MAX_VALUE);
+    }
+
+    /// Points the links past the chains that left the ordered map, up to `limit` of them; holding the links lock. With
+    /// [Integer#MAX_VALUE], when so many left that one walk up the map costs less, it relinks the map instead.
+    private void skipLeft(int limit) {
+        if (links != LINKED) {
+            // Unlinked, no chain that left is listed; relinking, the hold relinks the map before it ends
+            return;
+        }
+        if (limit == Integer.MAX_VALUE && (relinkWanted || (long) leftCount.get() * RELINK_RATIO >= entries.size())) {
+            relink();
+            return;
+        }
+        repairLeft(limit);
+    }
+
+    /// Points the link of the chain above each chain that left the ordered map, up to `limit` of them, at the chain
+    /// the map holds below it, and clears the link of the chain that left; holding the links lock.
+    ///
+    /// A chain that left keeps its link until then, so the chains that left below it stay reachable through it, each
+    /// through the one above it: cleared, what the links keep stays within the chains that wait for a repair. A scan
+    /// standing on one that finds its link cleared asks the map.
+    private void repairLeft(int limit) {
+        var repaired = 0;
+        Chain chain;
+        while (repaired < limit && (chain = left.poll()) != null) {
+            repaired++;
+            var higher = entries.higherEntry(chain.key());
+            if (higher != null) {
+                var above = higher.getValue();
+                var link = above.below();
+                // A link to the chain that left, to one leaving, or none: it takes the chain the map holds below
+                if (link == chain || link == null || link != Chain.BOTTOM && link.dropped()) {
+                    above.linkBelow(below(higher.getKey()));
+                }
+            }
+            chain.linkBelow(null);
+        }
+        leftCount.addAndGet(-repaired);
     }
 
     /// Takes `chain` out of the index and empties it, unless a commit given a write of the key has yet to apply it;
@@ -343,36 +640,51 @@ final class KeyspaceState {
         }
     }
 
-    /// Records that the ordered map holds `chain`, and takes it out again if it was dropped meanwhile, unseen by
-    /// [#empty], which lists for removal only the chains it finds ordered.
-    private void inserted(Chain chain) {
-        chain.markOrdered();
-        if (chain.dropped()) {
-            entries.remove(chain.key(), chain);
-        }
-    }
-
     /// Takes up to `limit` of the dropped chains out of the ordered map; safe for concurrent use.
     ///
     /// A chain created since for the same key may have taken its place, and stays.
     void removeDropped(int limit) {
         Chain chain;
         for (var i = 0; i < limit && (chain = leaving.poll()) != null; i++) {
-            entries.remove(chain.key(), chain);
+            removeLinked(chain);
+        }
+    }
+
+    /// Takes `chain` out of the ordered map, and lists it among those the links may still reach if the key space links
+    /// its chains.
+    private void removeLinked(Chain chain) {
+        // Read after the removal, as a relink writes it before its walk: if the walk linked the chain, this sees it
+        if (entries.remove(chain.key(), chain) && links != UNLINKED) {
+            leftCount.incrementAndGet();
+            left.add(chain);
         }
     }
 
     /// Takes every chain the writer dropped out of the ordered map, on every processor when there are many, as there
     /// are after a checkpoint; safe for concurrent use.
+    ///
+    /// When they are most of the map, the next repair of the links relinks the map instead of the link above each.
     void removeDropped() {
         var chains = new ArrayList<Chain>();
         Chain chain;
         while ((chain = leaving.poll()) != null) {
             chains.add(chain);
         }
+        if (chains.isEmpty()) {
+            return;
+        }
+        var relinks = (long) chains.size() * RELINK_RATIO >= entries.size();
         // Each removal walks down the map, a few microseconds of cache misses at a million keys
         var stream = chains.size() < PARALLEL_REMOVALS ? chains.stream() : chains.parallelStream();
-        stream.forEach(dropped -> entries.remove(dropped.key(), dropped));
+        if (relinks) {
+            stream.forEach(dropped -> entries.remove(dropped.key(), dropped));
+            // Read after the removals, as for one chain
+            if (links != UNLINKED) {
+                relinkWanted = true;
+            }
+        } else {
+            stream.forEach(this::removeLinked);
+        }
     }
 
     /// Lists `chain` among the keys the next checkpoint writes, holding the publishing role.
@@ -440,6 +752,26 @@ final class KeyspaceState {
     /// It orders the listed chains first, so the map holds every chain a read of the range may need.
     NavigableMap<MemorySegment, Chain> slice(MemorySegment from, MemorySegment to) {
         orderListed();
+        return range(from, to);
+    }
+
+    /// {@return a walk over the chains between `from`, included, and `to`, excluded, either `null` for no bound, in
+    /// the order of their keys, or the reverse if `descending`}
+    ///
+    /// It orders the listed chains first, as [#slice] does. A descending walk of a key space that orders lazily steps
+    /// along the links of the chains, which it links first if no descending walk did; while another thread links them,
+    /// and for any other walk, it iterates the ordered map.
+    Walk walk(MemorySegment from, MemorySegment to, boolean descending) {
+        orderListed();
+        if (descending && lazy && linked()) {
+            return new Walk(entries, from, to);
+        }
+        var range = range(from, to);
+        return new Walk((descending ? range.descendingMap() : range).entrySet().iterator());
+    }
+
+    /// {@return the chains of the ordered map between `from`, included, and `to`, excluded, either `null` for no bound}
+    private NavigableMap<MemorySegment, Chain> range(MemorySegment from, MemorySegment to) {
         if (from != null && to != null) {
             return Segments.compare(from, to) >= 0 ? entries.subMap(from, true, from, false) : entries.subMap(from, true, to, false);
         }
@@ -464,5 +796,94 @@ final class KeyspaceState {
     long count(ReadPoint point) {
         var sequence = point.bound() >>> Reads.OP_BITS;
         return known(sequence) + blind.correction(sequence, key -> Reads.inTreeOnly(this, key, point));
+    }
+
+    /// The chains of a range in memory, one at a time, in the order of a scan.
+    ///
+    /// A walk along the links steps from a chain to the one it links ([Chain#below()]). As an iterator of the map does,
+    /// it returns every chain the map held when it started that does not leave meanwhile, and may miss the chains that
+    /// enter during the walk: those belong to commits after its reader's point, or replace dropped chains whose versions
+    /// the reader's tree holds. It may return chains that left the map, emptied, whose keys the reader reads from the
+    /// tree.
+    static final class Walk {
+        // The map the walk asks for the chain below one whose link does not lead down; null when it iterates it
+        private final ConcurrentSkipListMap<MemorySegment, Chain> entries;
+        // The map's entries, or null when the walk steps along the links
+        private final Iterator<Map.Entry<MemorySegment, Chain>> iterator;
+        // Where a walk along the links ends, or null for no bound
+        private final MemorySegment from;
+        private Chain chain;
+        private MemorySegment key;
+        // Whether the walk along the links returned the chain it starts at
+        private boolean started;
+
+        /// Makes a walk over the entries `iterator` returns.
+        Walk(Iterator<Map.Entry<MemorySegment, Chain>> iterator) {
+            this.entries = null;
+            this.iterator = iterator;
+            this.from = null;
+        }
+
+        /// Makes a walk down the linked chains of `entries` between `from`, included, and `to`, excluded, either `null`
+        /// for no bound.
+        Walk(ConcurrentSkipListMap<MemorySegment, Chain> entries, MemorySegment from, MemorySegment to) {
+            this.entries = entries;
+            this.iterator = null;
+            this.from = from;
+            var start = to == null ? entries.lastEntry() : entries.lowerEntry(to);
+            if (start != null && (from == null || Segments.compare(start.getKey(), from) >= 0)) {
+                this.chain = start.getValue();
+                this.key = start.getKey();
+            }
+        }
+
+        /// Moves to the next chain of the range.
+        ///
+        /// @return whether there is one, which [#chain()] and [#key()] then return
+        boolean next() {
+            if (iterator != null) {
+                if (!iterator.hasNext()) {
+                    chain = null;
+                    key = null;
+                    return false;
+                }
+                var entry = iterator.next();
+                chain = entry.getValue();
+                key = entry.getKey();
+                return true;
+            }
+            if (!started) {
+                started = true;
+                return chain != null;
+            }
+            if (chain == null) {
+                return false;
+            }
+            var below = chain.below();
+            // A chain not linked yet, one that left whose link a repair cleared, or, which no write makes, a link that
+            // does not lead down: the map gives the chain below, so the walk neither misses an entry nor returns one twice
+            if (below == null || below != Chain.BOTTOM && Chain.compareKeys(below, chain) >= 0) {
+                var lower = entries.lowerEntry(key);
+                below = lower == null ? Chain.BOTTOM : lower.getValue();
+            }
+            if (below == Chain.BOTTOM || from != null && below.compareKey(from) < 0) {
+                chain = null;
+                key = null;
+                return false;
+            }
+            chain = below;
+            key = below.key();
+            return true;
+        }
+
+        /// {@return the chain the walk is at}
+        Chain chain() {
+            return chain;
+        }
+
+        /// {@return the key of the chain the walk is at, read-only}
+        MemorySegment key() {
+            return key;
+        }
     }
 }

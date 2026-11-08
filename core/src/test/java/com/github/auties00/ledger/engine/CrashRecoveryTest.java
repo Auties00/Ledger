@@ -110,6 +110,10 @@ class CrashRecoveryTest {
             }
             for (var keyspace : KEYSPACES) {
                 assertEquals(recovered.get(keyspace.name()).size(), ledger.size(keyspace), keyspace.name() + " count");
+                // A descending scan walks the chains the recovery replayed along the links its first walk sets
+                var descending = new ArrayList<String>();
+                ledger.forEach(keyspace, KeyRange.<String>all().reversed(), (key, _) -> descending.add(key));
+                assertEquals(new ArrayList<>(recovered.get(keyspace.name()).descendingKeySet()), descending, keyspace.name() + " descending");
             }
             // The recovered store takes commits and checkpoints, a large value included
             var large = "v".repeat(10_000);

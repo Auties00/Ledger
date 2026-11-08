@@ -4,7 +4,10 @@ import com.github.auties00.ledger.Encryption;
 import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
+import com.github.auties00.ledger.LedgerException;
 import com.github.auties00.ledger.ValueCodec;
+import com.github.auties00.ledger.testkit.ChangeInterceptor;
+import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -15,6 +18,7 @@ import java.nio.file.Path;
 import java.util.HashSet;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// What memory a store keeps reachable: the arrays of the batches resident values came in, and how keys that differ
@@ -129,6 +133,95 @@ class MemoryRetentionTest {
             }
             ledger.commit(batch);
             assertEquals(200, head(ledger, MESSAGES, new byte[]{8, 0}).sourceBytesForTests());
+        }
+    }
+
+    @Test
+    @DisplayName("the chains the sweep drops after a checkpoint, which only commits take out of the ordered map, stay reachable through the links of a descending scan within a thousand")
+    void sweptChainsLeaveTheLinks(@TempDir Path directory) throws Exception {
+        try (var ledger = (LiveLedger) Ledger.builder().directory(directory).encryption(Encryption.key(new byte[32]))
+                .keyspace(SESSIONS).keyspace(MESSAGES).checkpointEvery(1L << 30).build()) {
+            var count = 8_000;
+            for (var batch = 0; batch < count / 1_000; batch++) {
+                var writes = ledger.newBatch();
+                for (var i = 0; i < 1_000; i++) {
+                    writes.put(MESSAGES, ByteBuffer.allocate(4).putInt(batch * 1_000 + i).array(), new byte[16]);
+                }
+                ledger.commit(writes).awaitDurable();
+            }
+            // Orders the chains and links them
+            assertEquals(count, ledger.forEach(MESSAGES, com.github.auties00.ledger.KeyRange.<byte[]>all().reversed(), (_, _) -> true));
+            var references = new java.util.ArrayList<java.lang.ref.WeakReference<Chain>>();
+            var state = ledger.state(MESSAGES);
+            for (var i = 0; i < count; i++) {
+                references.add(new java.lang.ref.WeakReference<>(state.chain(MemorySegment.ofArray(ByteBuffer.allocate(4).putInt(i).array()))));
+            }
+            // A reader of the tree before the checkpoint keeps every chain through its prune; the sweep drops them after
+            try (var _ = ledger.snapshot()) {
+                ledger.checkpoint();
+            }
+            for (var i = 0; i < 400; i++) {
+                ledger.commit(ledger.newBatch().put(SESSIONS, new byte[]{1}, new byte[]{(byte) i})).awaitDurable();
+            }
+            assertEquals(0, state.chains(), "the sweep left chains in memory");
+            var retained = references.size();
+            for (var attempt = 0; attempt < 10 && retained > 1_300; attempt++) {
+                System.gc();
+                Thread.sleep(20);
+                retained = 0;
+                for (var reference : references) {
+                    if (reference.get() != null) {
+                        retained++;
+                    }
+                }
+            }
+            assertTrue(retained <= 1_300, retained + " of the " + count + " chains the sweep dropped stayed reachable");
+            assertEquals(count, ledger.forEach(MESSAGES, com.github.auties00.ledger.KeyRange.<byte[]>all().reversed(), (_, _) -> true));
+        }
+    }
+
+    @Test
+    @DisplayName("while checkpoints fail, the chains a range removal empties, which only commits take out of the ordered map, stay on the links within a thousand")
+    void removedChainsLeaveTheLinksWhileCheckpointsFail() throws Exception {
+        var disk = CrashFileSystem.create();
+        var failing = new java.util.concurrent.atomic.AtomicBoolean(true);
+        disk.intercept((path, kind) -> {
+            if (failing.get() && kind == ChangeInterceptor.ChangeKind.WRITE && path.getFileName() != null
+                    && path.getFileName().toString().equals(PageFile.FILE)) {
+                throw new java.io.IOException("No space left on device");
+            }
+        });
+        var failures = new java.util.concurrent.ConcurrentLinkedQueue<LedgerException>();
+        try (var ledger = (LiveLedger) Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(new byte[32]))
+                .keyspace(SESSIONS).keyspace(MESSAGES).checkpointEvery(1L << 30).onBackgroundFailure(failures::add).build()) {
+            var count = 8_000;
+            for (var batch = 0; batch < count / 1_000; batch++) {
+                var writes = ledger.newBatch();
+                for (var i = 0; i < 1_000; i++) {
+                    writes.put(MESSAGES, ByteBuffer.allocate(4).putInt(batch * 1_000 + i).array(), new byte[16]);
+                }
+                ledger.commit(writes).awaitDurable();
+            }
+            var above = ByteBuffer.allocate(4).putInt(1_000_000).array();
+            ledger.commit(ledger.newBatch().put(MESSAGES, above, new byte[16])).awaitDurable();
+            // Orders the chains and links them
+            assertEquals(count + 1, ledger.forEach(MESSAGES, com.github.auties00.ledger.KeyRange.<byte[]>all().reversed(), (_, _) -> true));
+            var state = ledger.state(MESSAGES);
+            assertThrows(LedgerException.class, ledger::checkpoint);
+            ledger.commit(ledger.newBatch().deleteRange(MESSAGES, com.github.auties00.ledger.KeyRange.between(
+                    ByteBuffer.allocate(4).putInt(0).array(), ByteBuffer.allocate(4).putInt(count).array()))).awaitDurable();
+            for (var i = 0; i < 400; i++) {
+                ledger.commit(ledger.newBatch().put(SESSIONS, new byte[]{1}, new byte[]{(byte) i})).awaitDurable();
+            }
+            assertEquals(1, state.chains(), "the range removal left chains in memory");
+            // The failed checkpoint's keys hold the chains as well: what the links add is what they reach
+            var onLinks = 0;
+            for (var chain = state.chain(MemorySegment.ofArray(above)).below(); chain != null && chain != Chain.BOTTOM; chain = chain.below()) {
+                onLinks++;
+            }
+            assertTrue(onLinks <= 1_300, onLinks + " of the " + count + " chains the removal emptied stayed on the links");
+            assertEquals(1, ledger.forEach(MESSAGES, com.github.auties00.ledger.KeyRange.<byte[]>all().reversed(), (_, _) -> true));
+            failing.set(false);
         }
     }
 
