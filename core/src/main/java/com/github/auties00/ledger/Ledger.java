@@ -269,9 +269,11 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// write or count of a resident key space starts reading its entries into memory, in the order of their keys.
         /// Until then a read of an entry not in memory yet reads it from the store's files, as a read of a
         /// [paged][Keyspace.Residency#PAGED] key space does, and a write of one waits until it is in memory; a
-        /// range removal in the key space waits for every entry. An open after a crash whose log writes to a resident
-        /// key space reads that key space while it opens either way. Read at open, every entry is in memory once
-        /// [#build()] returns, which takes the time the reads take.
+        /// range removal in the key space waits for every entry. A scan reads the entries from memory as they reach
+        /// it: one that goes on past its first few leaves has the rest read as an open would, and waits for those
+        /// being read rather than read them too, so it costs about what the open would have cost. An open after a
+        /// crash whose log writes to a resident key space reads that key space while it opens either way. Read at
+        /// open, every entry is in memory once [#build()] returns, which takes the time the reads take.
         ///
         /// @param atOpen whether the open reads the entries of the resident key spaces
         /// @return these options

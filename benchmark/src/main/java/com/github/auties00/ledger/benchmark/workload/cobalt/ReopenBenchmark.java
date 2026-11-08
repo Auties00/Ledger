@@ -31,8 +31,10 @@ import java.util.concurrent.TimeUnit;
 /// Starting a client over a store that already holds a history.
 ///
 /// [#openAndShowFirstChat(Blackhole)] is the startup: it opens the store, reads the 100 sessions the first sends
-/// need and the newest page of the most active chat. [#footprint(MemoryCounters)] opens the store, reads 1,000
-/// pages of chats picked by activity, then records the memory the warm store holds; its time is not the point.
+/// need and the newest page of the most active chat. [#openAndListChats(Blackhole)] is the startup of a client that
+/// lists every chat and session first, which Ledger holds in memory: it scans both whole key spaces after the open.
+/// [#footprint(MemoryCounters)] opens the store, reads 1,000 pages of chats picked by activity, then records the
+/// memory the warm store holds; its time is not the point.
 ///
 /// The store's files were just copied, so they sit in the OS page cache: this is a warm start. A cold start needs
 /// the cache dropped between iterations, which takes administrator rights.
@@ -107,6 +109,28 @@ public class ReopenBenchmark {
             blackhole.consume(value);
             return true;
         });
+    }
+
+    /// Opens the store and reads every chat and every session.
+    ///
+    /// @param blackhole consumes what is read
+    /// @throws IOException if the engine fails to open or read, or returns fewer entries than the store holds
+    @Benchmark
+    @BenchmarkMode(Mode.SingleShotTime)
+    public void openAndListChats(Blackhole blackhole) throws IOException {
+        var engine = open();
+        var chats = engine.scan(Keyspace.CHATS, Corpus.chatStart(0), Corpus.chatEnd(corpus.chats() - 1), false, Integer.MAX_VALUE, (key, value) -> {
+            blackhole.consume(value);
+            return true;
+        });
+        // Every session's address starts with the same digit
+        var sessions = engine.scan(Keyspace.SESSIONS, new byte[]{'3'}, new byte[]{'4'}, false, Integer.MAX_VALUE, (key, value) -> {
+            blackhole.consume(value);
+            return true;
+        });
+        if (chats != corpus.chats() || sessions != Stores.SESSIONS) {
+            throw new IllegalStateException("The store returned " + chats + " chats and " + sessions + " sessions");
+        }
     }
 
     /// Opens the store, warms it with 1,000 chat pages and records the memory it holds.
