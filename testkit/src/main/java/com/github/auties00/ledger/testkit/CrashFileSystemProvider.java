@@ -94,7 +94,7 @@ final class CrashFileSystemProvider extends FileSystemProvider {
                 if (write) {
                     throw new IOException(key + " is a directory");
                 }
-                return new CrashFileChannel(fileSystem, key, null, true, false, false);
+                return new CrashFileChannel(fileSystem, key, null, true, false, false, false);
             }
             if (node == null) {
                 if (!write || !(options.contains(StandardOpenOption.CREATE) || options.contains(StandardOpenOption.CREATE_NEW))) {
@@ -110,7 +110,9 @@ final class CrashFileSystemProvider extends FileSystemProvider {
             if (write && options.contains(StandardOpenOption.TRUNCATE_EXISTING) && file.size > 0) {
                 disk.truncate(file, 0);
             }
-            return new CrashFileChannel(fileSystem, key, file, read, write, options.contains(StandardOpenOption.APPEND));
+            // Other options, such as the JDK's DIRECT, change nothing a loss of power keeps
+            var sync = options.contains(StandardOpenOption.DSYNC) || options.contains(StandardOpenOption.SYNC);
+            return new CrashFileChannel(fileSystem, key, file, read, write, options.contains(StandardOpenOption.APPEND), sync);
         }
     }
 

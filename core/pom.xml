@@ -37,7 +37,8 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
-                    <argLine>${ledger.test.jvm}</argLine>
+                    <!-- The tests run on the class path; native access lets a store on Windows write its log through unbuffered, which the tests then cover -->
+                    <argLine>--enable-native-access=ALL-UNNAMED ${ledger.test.jvm}</argLine>
                 </configuration>
             </plugin>
         </plugins>

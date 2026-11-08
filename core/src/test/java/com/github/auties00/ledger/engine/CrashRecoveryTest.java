@@ -8,6 +8,7 @@ import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -31,7 +32,8 @@ import static org.junit.jupiter.api.Assertions.fail;
 ///
 /// A dry run of each workload counts its file system changes and forces, so the stop lands anywhere in it, half the
 /// time at a force: in a commit, a checkpoint, a rollover, a close or an open. Half the workloads write their values of
-/// more than 4 KiB to the file of large values, whose force runs beside the log's.
+/// more than 4 KiB to the file of large values, whose force runs beside the log's, and half write the groups one write
+/// holds through, each write of which is a force of its own.
 class CrashRecoveryTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.utf8());
@@ -39,16 +41,18 @@ class CrashRecoveryTest {
     private static final List<Keyspace<String, String>> KEYSPACES = List.of(MESSAGES, CHATS);
 
     static Stream<Arguments> cases() {
-        return IntStream.range(0, 120).mapToObj(seed -> Arguments.of(seed, seed % 2 == 0, seed % 3 == 0 ? "process crash" : "power loss"));
+        // Half the workloads write the groups one write holds through, as a store writes them where it can
+        return IntStream.range(0, 120).mapToObj(seed -> Arguments.of(seed, seed % 2 == 0, seed % 3 == 0 ? "process crash" : "power loss",
+                seed / 4 % 2 == 0 ? WriteThrough.Mode.DSYNC : WriteThrough.Mode.OFF));
     }
 
-    @ParameterizedTest(name = "seed {0}, encrypted: {1}, {2}")
+    @ParameterizedTest(name = "seed {0}, encrypted: {1}, {2}, write through: {3}")
     @MethodSource("cases")
     @DisplayName("recovers a state between the last durable commit and the last visible one")
-    void recovers(int seed, boolean encrypted, String failure) throws Exception {
+    void recovers(int seed, boolean encrypted, String failure, WriteThrough.Mode writeThrough) throws Exception {
         var encryption = encrypted ? Encryption.key(KEY) : Encryption.none();
         var dry = CrashFileSystem.create();
-        new Workload(seed, encryption).run(dry.getPath("/store"));
+        new Workload(seed, encryption, writeThrough).run(dry.getPath("/store"));
         var disk = CrashFileSystem.create();
         var random = new Random(seed * 7919L + 1);
         if (random.nextBoolean()) {
@@ -57,30 +61,43 @@ class CrashRecoveryTest {
             // At a force, where the writes it would have made durable are at risk together
             disk.stopAtForce(random.nextLong(dry.forces() + 1));
         }
-        check(seed, encryption, disk, failure.equals("process crash"), random);
+        check(seed, encryption, writeThrough, disk, failure.equals("process crash"), random);
     }
 
-    @ParameterizedTest(name = "seed {0}")
+    @ParameterizedTest(name = "seed {0}, write through: {1}")
     @MethodSource("workloads")
-    @DisplayName("recovers whichever force of a workload the power fails at")
-    void everyForce(int seed) throws Exception {
+    @DisplayName("recovers whichever force of a workload the power fails at, a write through included")
+    void everyForce(int seed, WriteThrough.Mode writeThrough) throws Exception {
         var encryption = Encryption.key(KEY);
         var dry = CrashFileSystem.create();
-        new Workload(seed, encryption).run(dry.getPath("/store"));
+        new Workload(seed, encryption, writeThrough).run(dry.getPath("/store"));
         for (var force = 0; force <= dry.forces(); force++) {
             var disk = CrashFileSystem.create();
             disk.stopAtForce(force);
-            check(seed, encryption, disk, false, new Random(seed * 31L + force));
+            check(seed, encryption, writeThrough, disk, false, new Random(seed * 31L + force));
         }
     }
 
-    static IntStream workloads() {
-        return IntStream.range(1_000, 1_004);
+    @Test
+    @DisplayName("the workloads that write through do write groups through, so a stop can land on one")
+    void reachesWriteThrough() {
+        var reached = IntStream.range(0, 120).filter(seed -> {
+            var workload = new Workload(seed, Encryption.none(), WriteThrough.Mode.DSYNC);
+            workload.run(CrashFileSystem.create().getPath("/store"));
+            return workload.writtenThrough > 0;
+        }).count();
+        assertTrue(reached >= 12, () -> reached + " of 120 workloads wrote a group through");
+    }
+
+    static Stream<Arguments> workloads() {
+        return IntStream.range(1_000, 1_004).boxed()
+                .flatMap(seed -> Stream.of(Arguments.of(seed, WriteThrough.Mode.DSYNC), Arguments.of(seed, WriteThrough.Mode.OFF)));
     }
 
     /// Runs the workload of `seed` on `disk` until it stops, fails it, and checks what the store recovers.
-    private static void check(int seed, Encryption encryption, CrashFileSystem disk, boolean processCrash, Random random) throws Exception {
-        var workload = new Workload(seed, encryption);
+    private static void check(int seed, Encryption encryption, WriteThrough.Mode writeThrough, CrashFileSystem disk,
+                              boolean processCrash, Random random) throws Exception {
+        var workload = new Workload(seed, encryption, writeThrough);
         workload.run(disk.getPath("/store"));
         var largeValues = largeValues(seed);
         var survivor = processCrash ? disk.afterProcessCrash() : disk.afterPowerLoss(new Random(random.nextLong()));
@@ -88,14 +105,14 @@ class CrashRecoveryTest {
         var recoveryStop = random.nextInt(4) == 0 ? random.nextLong(40) : -1;
         if (recoveryStop >= 0) {
             survivor.stopAfter(recoveryStop);
-            try (var ledger = open(survivor.getPath("/store"), encryption, largeValues)) {
+            try (var ledger = open(survivor.getPath("/store"), encryption, largeValues, writeThrough)) {
                 ledger.checkpoint();
             } catch (RuntimeException _) {
                 // The recovery stopped where it was told to
             }
             survivor = survivor.afterPowerLoss(new Random(random.nextLong()));
         }
-        try (var ledger = open(survivor.getPath("/store"), encryption, largeValues)) {
+        try (var ledger = open(survivor.getPath("/store"), encryption, largeValues, writeThrough)) {
             var recovered = contents(ledger);
             var match = -1;
             for (var commit = workload.durable; commit <= workload.visible; commit++) {
@@ -117,17 +134,18 @@ class CrashRecoveryTest {
                     .put(MESSAGES, "large", large)).awaitDurable();
             ledger.checkpoint();
         }
-        try (var ledger = open(survivor.getPath("/store"), encryption, largeValues)) {
+        try (var ledger = open(survivor.getPath("/store"), encryption, largeValues, writeThrough)) {
             assertEquals("recovery", ledger.get(MESSAGES, "after").orElseThrow());
             assertEquals(10_000, ledger.get(MESSAGES, "large").orElseThrow().length());
         }
         CheckpointTest.verifyPages(survivor.getPath("/store"), encryption != Encryption.none());
     }
 
-    private static Ledger open(Path directory, Encryption encryption, long largeValues) {
+    private static Ledger open(Path directory, Encryption encryption, long largeValues, WriteThrough.Mode writeThrough) {
         return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(encryption).keyspace(MESSAGES).keyspace(CHATS)
                 .largeValues(largeValues))
                 .segmentSize(16_384)
+                .writeThrough(writeThrough)
                 .build();
     }
 
@@ -155,16 +173,20 @@ class CrashRecoveryTest {
         private final Random random;
         private final Encryption encryption;
         private final long largeValues;
+        private final WriteThrough.Mode writeThrough;
         // The state after each commit, from the empty store
+        // The groups the store wrote through, in the opens this workload closed
+        long writtenThrough;
         final List<Map<String, TreeMap<String, String>>> history;
         final Map<String, TreeMap<String, String>> state;
         int visible;
         int durable;
 
-        Workload(int seed, Encryption encryption) {
+        Workload(int seed, Encryption encryption, WriteThrough.Mode writeThrough) {
             this.random = new Random(seed);
             this.encryption = encryption;
             this.largeValues = largeValues(seed);
+            this.writeThrough = writeThrough;
             this.history = new ArrayList<>();
             this.state = new TreeMap<>();
             for (var keyspace : KEYSPACES) {
@@ -177,23 +199,23 @@ class CrashRecoveryTest {
         void run(Path directory) {
             Ledger ledger = null;
             try {
-                ledger = open(directory, encryption, largeValues);
+                ledger = open(directory, encryption, largeValues, writeThrough);
                 for (var step = 0; step < 70; step++) {
                     var choice = random.nextInt(25);
                     if (choice == 0) {
                         ledger.checkpoint();
                         durable = visible;
                     } else if (choice == 1) {
-                        ledger.close();
+                        close(ledger);
                         durable = visible;
-                        ledger = open(directory, encryption, largeValues);
+                        ledger = open(directory, encryption, largeValues, writeThrough);
                     } else if (choice < 6) {
                         transaction(ledger);
                     } else {
                         batch(ledger, choice < 9);
                     }
                 }
-                ledger.close();
+                close(ledger);
                 durable = visible;
             } catch (RuntimeException | InterruptedException failure) {
                 if (ledger != null) {
@@ -204,6 +226,11 @@ class CrashRecoveryTest {
                     }
                 }
             }
+        }
+
+        private void close(Ledger ledger) {
+            writtenThrough += ((LiveLedger) ledger).log().writtenThrough();
+            ledger.close();
         }
 
         private void batch(Ledger ledger, boolean awaitDurable) throws InterruptedException {

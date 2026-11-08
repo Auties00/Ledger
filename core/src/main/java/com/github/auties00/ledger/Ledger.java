@@ -58,6 +58,14 @@ import java.util.function.Consumer;
 /// On macOS a force empties the drive's cache too, so a durable commit survives a loss of power: the JDK forces a file
 /// with `fcntl(F_FULLFSYNC)` there.
 ///
+/// Where the platform can write through to stable storage with the guarantee of a force, the store writes the log
+/// that way and does not force it, one round trip to the device where a write and a force take two: on Linux with
+/// `O_DIRECT` and `O_DSYNC`, and on Windows with `FILE_FLAG_NO_BUFFERING` and `FILE_FLAG_WRITE_THROUGH` while this
+/// module has native access (`--enable-native-access`), the pair for which Windows documents a write-through of the
+/// drive's cache. The system property `ledger.log.writeThrough` set to `off` forces every write; set to `dsync`, it
+/// writes through with `FILE_FLAG_WRITE_THROUGH` alone on Windows, which Windows documents as writing through its own
+/// cache only, and with `O_DSYNC` alone elsewhere but on macOS.
+///
 /// # Memory
 /// The store keeps the bytes it encrypts, decrypts and writes on the Java heap, in arrays it recycles: the JDK's
 /// AES-GCM runs fastest on arrays, and recycling keeps the memory from becoming garbage. The page cache
@@ -71,7 +79,9 @@ import java.util.function.Consumer;
 /// forces its log on the platform threads of its [IoPool], and writes the checkpoints it starts on its own on a
 /// platform thread of their own; a read of a page the cache does not hold reads the file on the calling thread. A
 /// commit writes its large values on the calling thread, and reads the pages of the trees its writes need, which
-/// the cache does not hold, on virtual threads of its own, before it waits for the writer.
+/// the cache does not hold, on virtual threads of its own, before it waits for the writer. On Windows a commit whose
+/// thread writes its own group through to stable storage holds a virtual thread's carrier while the device takes the
+/// write, as the JDK lends a carrier only for its own blocking calls.
 ///
 /// # Lifecycle
 /// A store holds an exclusive lock on its directory from [Options#build()] until [#close()]: one process, and one

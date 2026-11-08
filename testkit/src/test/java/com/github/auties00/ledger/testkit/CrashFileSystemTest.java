@@ -163,6 +163,130 @@ class CrashFileSystemTest {
     }
 
     @Nested
+    @DisplayName("a channel opened with DSYNC")
+    class Dsync {
+        @Test
+        @DisplayName("makes each write durable once it returns, and leaves the unforced writes of other ranges at risk")
+        void durableAtReturn() throws IOException {
+            var fs = CrashFileSystem.create();
+            var file = fs.getPath("/file");
+            writeForced(file, new byte[4_096]);
+            forceDirectory(fs.getPath("/"));
+            var unforced = filled(1_024, (byte) 1);
+            var through = filled(1_024, (byte) 2);
+            try (var plain = FileChannel.open(file, StandardOpenOption.WRITE);
+                 var sync = FileChannel.open(file, StandardOpenOption.WRITE, StandardOpenOption.DSYNC)) {
+                plain.write(ByteBuffer.wrap(unforced), 0);
+                sync.write(ByteBuffer.wrap(through), 2_048);
+            }
+            var kept = new HashSet<Boolean>();
+            for (var seed = 0; seed < DRAWS; seed++) {
+                var bytes = Files.readAllBytes(fs.afterPowerLoss(new Random(seed)).getPath("/file"));
+                assertArrayEquals(through, java.util.Arrays.copyOfRange(bytes, 2_048, 3_072));
+                kept.add(bytes[0] == 1);
+            }
+            assertEquals(2, kept.size(), "the unforced write of another range survives some losses and not others");
+        }
+
+        @Test
+        @DisplayName("keeps its bytes over an unforced write it overlaps, which keeps its own bytes at risk")
+        void overlapping() throws IOException {
+            var fs = CrashFileSystem.create();
+            var file = fs.getPath("/file");
+            writeForced(file, new byte[4_096]);
+            forceDirectory(fs.getPath("/"));
+            var through = filled(1_024, (byte) 2);
+            try (var plain = FileChannel.open(file, StandardOpenOption.WRITE);
+                 var sync = FileChannel.open(file, StandardOpenOption.WRITE, StandardOpenOption.DSYNC)) {
+                plain.write(ByteBuffer.wrap(filled(2_048, (byte) 1)), 512);
+                sync.write(ByteBuffer.wrap(through), 1_024);
+            }
+            var edges = new HashSet<String>();
+            for (var seed = 0; seed < DRAWS; seed++) {
+                var bytes = Files.readAllBytes(fs.afterPowerLoss(new Random(seed)).getPath("/file"));
+                assertEquals(4_096, bytes.length);
+                assertArrayEquals(through, java.util.Arrays.copyOfRange(bytes, 1_024, 2_048));
+                edges.add(bytes[512] + "," + bytes[2_048]);
+            }
+            assertTrue(edges.size() > 1, () -> "the parts of the unforced write outside it: " + edges);
+        }
+
+        @Test
+        @DisplayName("grows the file durably when it writes past its end")
+        void grows() throws IOException {
+            var fs = CrashFileSystem.create();
+            var file = fs.getPath("/file");
+            writeForced(file, new byte[512]);
+            forceDirectory(fs.getPath("/"));
+            try (var sync = FileChannel.open(file, StandardOpenOption.WRITE, StandardOpenOption.DSYNC)) {
+                sync.write(ByteBuffer.wrap(filled(512, (byte) 3)), 1_024);
+            }
+            for (var seed = 0; seed < DRAWS; seed++) {
+                var bytes = Files.readAllBytes(fs.afterPowerLoss(new Random(seed)).getPath("/file"));
+                assertEquals(1_536, bytes.length);
+                assertEquals(3, bytes[1_024]);
+                assertEquals(3, bytes[1_535]);
+            }
+        }
+
+        @Test
+        @DisplayName("counts as a force for a stop at a force, which leaves the write to a loss of power")
+        void stopAtForce() throws IOException {
+            var fs = CrashFileSystem.create();
+            var file = fs.getPath("/file");
+            writeForced(file, new byte[1_024]);
+            forceDirectory(fs.getPath("/"));
+            var before = fs.forces();
+            try (var sync = FileChannel.open(file, StandardOpenOption.WRITE, StandardOpenOption.DSYNC)) {
+                sync.write(ByteBuffer.wrap(filled(512, (byte) 4)), 0);
+                assertEquals(before + 1, fs.forces());
+                fs.stopAtForce(0);
+                assertThrows(IOException.class, () -> sync.write(ByteBuffer.wrap(filled(512, (byte) 5)), 512));
+            }
+            var kept = new HashSet<Boolean>();
+            for (var seed = 0; seed < DRAWS; seed++) {
+                var bytes = Files.readAllBytes(fs.afterPowerLoss(new Random(seed)).getPath("/file"));
+                assertEquals(4, bytes[0]);
+                kept.add(bytes[512] == 5);
+            }
+            assertEquals(2, kept.size(), "the write the stop cut off survives some losses and not others");
+        }
+
+        @Test
+        @DisplayName("shows the interceptor a write and then a force, and an interrupt between them closes the channel")
+        void interrupted() throws Exception {
+            var fs = CrashFileSystem.create();
+            var file = fs.getPath("/file");
+            writeForced(file, new byte[1_024]);
+            var kinds = new java.util.ArrayList<ChangeInterceptor.ChangeKind>();
+            var writer = Thread.currentThread();
+            fs.intercept((_, kind) -> {
+                kinds.add(kind);
+                if (kind == ChangeInterceptor.ChangeKind.FORCE) {
+                    // From another thread, as only that closes a channel in the middle of an operation; not waited
+                    // for with a join, which the interrupt would end before it reached the channel
+                    var interrupter = Thread.ofPlatform().start(writer::interrupt);
+                    while (interrupter.isAlive()) {
+                        Thread.onSpinWait();
+                    }
+                }
+            });
+            try (var sync = FileChannel.open(file, StandardOpenOption.WRITE, StandardOpenOption.DSYNC)) {
+                assertThrows(java.nio.channels.ClosedByInterruptException.class, () -> sync.write(ByteBuffer.wrap(filled(512, (byte) 6)), 0));
+                assertFalse(sync.isOpen());
+            }
+            assertTrue(Thread.interrupted());
+            assertEquals(List.of(ChangeInterceptor.ChangeKind.WRITE, ChangeInterceptor.ChangeKind.FORCE), kinds);
+        }
+
+        private static byte[] filled(int length, byte value) {
+            var bytes = new byte[length];
+            java.util.Arrays.fill(bytes, value);
+            return bytes;
+        }
+    }
+
+    @Nested
     @DisplayName("stopping the process")
     class Stopping {
         @Test
