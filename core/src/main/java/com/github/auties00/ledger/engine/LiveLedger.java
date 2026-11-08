@@ -26,9 +26,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -43,7 +45,8 @@ import java.util.function.LongSupplier;
 /// applies its writes once the commits before it on the same keys have applied theirs, and the thread holding the
 /// publishing role publishes the applied commits in the order of their sequences by advancing [#latest]. Readers see
 /// a commit whole or not at all. Transactions and batches with a range removal run alone instead: they hold both roles
-/// once every commit given a sequence has published.
+/// once every commit given a sequence has published. A batch's range removal counts the entries it removes after the
+/// commit, on a thread of its own, against a read registered at the commit before ([PendingRanges]).
 ///
 /// After publishing, the publisher prunes the versions no reader can need any more, applies the range removals every
 /// reader has passed, and sweeps a few keys of the whole store; prunes and drops of chains happen only while holding
@@ -166,6 +169,11 @@ public final class LiveLedger implements Ledger {
     // The resident key spaces whose loaders have not put every entry in memory yet: while there is none, a commit
     // looks for no key to wait for
     private final AtomicInteger unloaded;
+    // Held shared by each count of a range removal that runs on a thread of its own, and exclusively by a close once its
+    // last checkpoint is done, so no such count reads the files as they close
+    private final ReentrantReadWriteLock rangeCountGate;
+    // Starts the counts of range removals that run on threads of their own
+    private volatile Executor rangeCounts;
 
     /// Creates an empty store with `keyspaces`.
     ///
@@ -203,6 +211,8 @@ public final class LiveLedger implements Ledger {
         this.resources = new AutoCloseable[0];
         this.inFlight = new ArrayList<>();
         this.unloaded = new AtomicInteger();
+        this.rangeCountGate = new ReentrantReadWriteLock();
+        this.rangeCounts = task -> Thread.ofVirtual().name("ledger-range-count").start(task);
     }
 
     /// Makes this store one in a directory, whose checkpoints are in `pages`; called before anything is recovered.
@@ -647,14 +657,22 @@ public final class LiveLedger implements Ledger {
     /// Commits `writes`, which holds a range removal, as an exclusive operation: the removal counts the keys it
     /// removes, which needs every commit before it applied and none after it started.
     ///
+    /// In a store in a directory, a removal of a paged key space with a tree counts them after the commit instead,
+    /// unless an earlier write of the batch wrote the key space ([PendingRanges]): the count reads the nodes of the tree
+    /// on the paths to the range's bounds, which the page cache holds none of after an open, and would make the commit
+    /// wait for those reads before its frame is queued. Each such count starts on a thread of its own once the commit
+    /// is published, beside the log's force.
+    ///
     /// @param outcome receives the writes as applied, or `null`
     private Commit commitAlone(ArrayWriteBatch writes, PageRef[] units, Applier[] outcome) {
         var hints = prefetch(writes);
+        Applier applier = null;
         enterExclusive();
         try {
             ensureOpen();
             checkHealthy();
-            var applier = new Applier(sequenced.next, log != null, writes.size(), log == null ? 0 : FrameBody.capacityFor(writes, units));
+            applier = new Applier(sequenced.next, log != null, writes.size(), log == null ? 0 : FrameBody.capacityFor(writes, units),
+                    pages != null && log != null);
             if (outcome != null) {
                 outcome[0] = applier;
             }
@@ -675,6 +693,9 @@ public final class LiveLedger implements Ledger {
             return ticket(sequence);
         } finally {
             exitExclusive();
+            if (applier != null) {
+                applier.countRangesLater();
+            }
         }
     }
 
@@ -1406,17 +1427,84 @@ public final class LiveLedger implements Ledger {
             if (checkpointer != null) {
                 checkpointer.close();
             }
-            HeapPool.leave(this);
-            for (var resource : resources) {
-                try {
-                    resource.close();
-                } catch (Exception exception) {
-                    // Everything is durable by now: a file, lock or pool that fails to close loses nothing
+            // Waits for the counts of range removals running on their own threads, which read the files; one that
+            // starts after finds the store closed. The final checkpoint counted those it needed itself
+            var gate = rangeCountGate.writeLock();
+            gate.lock();
+            try {
+                HeapPool.leave(this);
+                for (var resource : resources) {
+                    try {
+                        resource.close();
+                    } catch (Exception exception) {
+                        // Everything is durable by now: a file, lock or pool that fails to close loses nothing
+                    }
                 }
+            } finally {
+                gate.unlock();
             }
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    /// Makes `executor` start the counts of range removals that run on threads of their own; for tests that hold them
+    /// back, or run them at a chosen point.
+    void rangeCountsForTests(Executor executor) {
+        this.rangeCounts = executor;
+    }
+
+    /// Counts `removal` on a thread of its own; a count that does not start is left to the first count of its key
+    /// space, or the next checkpoint, that needs it.
+    private void startRangeCount(PendingRanges.Removal removal) {
+        try {
+            rangeCounts.execute(() -> countInBackground(removal));
+        } catch (Throwable _) {
+            // As under a limit of threads: the removal keeps its read, and the next count that needs it counts it
+        }
+    }
+
+    /// Counts `removal`, then maintains the store, whose removal and older trees the count's read held back; nothing
+    /// once the store is closing.
+    ///
+    /// A count that fails is left pending with its read, for the next count of the key space or the next checkpoint,
+    /// which count it again on their own threads and report what fails.
+    private void countInBackground(PendingRanges.Removal removal) {
+        var gate = rangeCountGate.readLock();
+        if (!gate.tryLock()) {
+            return;
+        }
+        try {
+            if (closed) {
+                return;
+            }
+            removal.settle();
+            maintainAfterCount();
+        } catch (Throwable _) {
+            // Reported by the count that tries again
+        } finally {
+            gate.unlock();
+        }
+    }
+
+    /// Maintains the store once the count of a range removal is known, unless another thread holds or wants the
+    /// publishing role: the read the count held kept the removal from applying, and older trees and their pages from
+    /// leaving, which a store that commits nothing more kept until its next commit.
+    private void maintainAfterCount() {
+        if (closed || publishingWanted.held() || !publishing.tryAcquire()) {
+            return;
+        }
+        try {
+            maintain(List.of());
+        } finally {
+            publishing.release();
+        }
+        // What applied while this thread held the role, whose committing threads may have parked for it
+        publishApplied();
+        for (var state : sweepOrder) {
+            state.removeDropped(COMMIT_REMOVALS);
+            state.unlinkDropped();
         }
     }
 
@@ -1440,7 +1528,8 @@ public final class LiveLedger implements Ledger {
     /// @param state the key space
     /// @param dirty the keys written
     /// @param removals the range removals as of the cut
-    /// @param count the entries as of the cut, leaving out the blind writes ([BlindWrites])
+    /// @param count the entries as of the cut, leaving out the blind writes ([BlindWrites]) and the range removals
+    ///              counted later ([PendingRanges])
     /// @param number the number of the cut in the key space, which [KeyspaceState#markDirty] gave the chains of `dirty`
     record KeyspaceCut(KeyspaceState state, List<Chain> dirty, RangeRemoval[] removals, long count, long number) {
     }
@@ -1861,7 +1950,7 @@ public final class LiveLedger implements Ledger {
         }
     }
 
-/// Prunes the chains `touched` wrote, applies the range removals every reader has passed, drops the counts no
+/// Prunes the chains `touched` wrote, applies the range removals every reader has passed, drops and folds the counts no
 /// reader needs and sweeps a few chains; holding the publishing role.
     private void maintain(List<Touched> touched) {
         // The latest sequence was stored with a release store: the scan must not miss a read that saw the one before
@@ -1887,6 +1976,7 @@ public final class LiveLedger implements Ledger {
             applyRemovals(state, bounds[bounds.length - 1], dropBound, latestSequence);
             state.counts.dropBelow(oldest);
             state.blind.fold(oldest);
+            state.ranges.fold(oldest);
         }
         sweep(bounds, cutBound, SWEEP_BUDGET);
     }
@@ -2044,6 +2134,12 @@ public final class LiveLedger implements Ledger {
         private int externals;
         // The versions in flight this commit replaced, which a rollback marks current again, or null before any
         private List<Version.External> replaced;
+        // Whether a range removal of a paged key space with a tree may count after the commit ([PendingRanges])
+        private final boolean deferredRanges;
+        // The range removals this commit counts after it is published, or null before any
+        private ArrayList<PendingRanges.Removal> deferred;
+        // Whether the publication of the commit listed them with their key spaces
+        private boolean deferredListed;
 
         Applier(long sequence, boolean journaled) {
             this(sequence, journaled, 4, 256);
@@ -2051,13 +2147,21 @@ public final class LiveLedger implements Ledger {
 
         /// Creates the applier of a commit of about `writes` writes, whose frame body takes about `frameBytes`.
         Applier(long sequence, boolean journaled, int writes, int frameBytes) {
+            this(sequence, journaled, writes, frameBytes, false);
+        }
+
+        /// Creates the applier of a commit of about `writes` writes, whose frame body takes about `frameBytes`.
+        ///
+        /// @param deferredRanges whether its range removals of paged key spaces with a tree may count after the
+        ///                       commit: only for a batch that runs alone in a store in a directory
+        Applier(long sequence, boolean journaled, int writes, int frameBytes, boolean deferredRanges) {
             this.sequence = sequence;
             // Most commits write one or two key spaces
             this.deltaStates = new KeyspaceState[2];
             this.deltas = new long[2];
             this.touched = new ArrayList<>(writes);
             this.frame = journaled ? new FrameBody(frameBytes) : null;
-
+            this.deferredRanges = deferredRanges;
         }
 
         /// {@return whether the commit's frame is queued in the log}
@@ -2115,11 +2219,12 @@ public final class LiveLedger implements Ledger {
         /// {@return the number of entries of `state` once this commit applies}
         ///
         /// It looks up the keys of the blind writes whose effect is not known yet, in the latest trees: the commits
-        /// before this one have published, as this one runs alone.
+        /// before this one have published, as this one runs alone. It counts the range removals of those commits whose
+        /// count is not known yet, in the trees their reads keep.
         long count(KeyspaceState state) {
             var point = writerPoint(Reads.stamp(sequence, op) - 1);
             var blind = state.blind.correction(sequence - 1, key -> Reads.inTreeOnly(state, key, point));
-            return state.counts.last() + blind + delta(state);
+            return state.counts.last() + blind + state.ranges.correction(sequence - 1) + delta(state);
         }
 
         private long nextStamp() {
@@ -2264,7 +2369,12 @@ public final class LiveLedger implements Ledger {
 
         void deleteRange(KeyspaceState state, MemorySegment from, MemorySegment to) {
             var stamp = nextStamp();
-            var removed = Reads.count(state, from, to, writerPoint(stamp - 1));
+            var removed = 0L;
+            if (countsLater(state)) {
+                deferCount(state, from, to, stamp);
+            } else {
+                removed = Reads.count(state, from, to, writerPoint(stamp - 1));
+            }
             var removals = state.removals;
             if (removalsBefore == null) {
                 removalsBefore = new IdentityHashMap<>(2);
@@ -2290,6 +2400,56 @@ public final class LiveLedger implements Ledger {
             if (frame != null) {
                 frame.deleteRange(state.id, from, to);
             }
+        }
+
+        /// {@return whether the range removal of `state` this commit applies next counts its entries after the commit}
+        ///
+        /// Only one of a paged key space with a tree does, as only its count reads pages. Nor does one of a key space an
+        /// earlier write of the commit wrote: the read it registers is at the commit before, so its count would miss
+        /// that write's version, which the commit's own count takes in.
+        private boolean countsLater(KeyspaceState state) {
+            if (!deferredRanges || state.resident) {
+                return false;
+            }
+            var trees = tree;
+            if (trees == null || trees.root(state.id) == null) {
+                return false;
+            }
+            for (var write : touched) {
+                if (write.state() == state) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /// Registers a read at the sequence before this commit's, and keeps the removal of `from` to `to` in `state`,
+        /// stamped `stamp`, to count against it once the commit is published.
+        ///
+        /// The commit runs alone, so the read is at the latest sequence: it keeps the trees the commit reads, the
+        /// versions in memory at or below their bound, none of `state` being above it, and the range removals of the
+        /// commit stamped before `stamp`, which it counts against as the commit would have.
+        private void deferCount(KeyspaceState state, MemorySegment from, MemorySegment to, long stamp) {
+            var registered = readers.register();
+            if (registered != sequence - 1) {
+                readers.unregister(registered);
+                throw new IllegalStateException("The latest sequence moved while a range removal ran alone");
+            }
+            if (deferred == null) {
+                deferred = new ArrayList<>(2);
+            }
+            deferred.add(new PendingRanges.Removal(sequence, state, from, to, writerPoint(stamp - 1), readers, registered));
+        }
+
+        /// Starts the counts of the range removals the published commit counts later, each on a thread of its own.
+        void countRangesLater() {
+            if (deferred == null || !deferredListed) {
+                return;
+            }
+            for (var removal : deferred) {
+                startRangeCount(removal);
+            }
+            deferred = null;
         }
 
         /// Makes the commit visible to every read that starts afterward, then maintains the store.
@@ -2352,7 +2512,8 @@ public final class LiveLedger implements Ledger {
             LATEST.setRelease(published, sequence);
         }
 
-        /// Publishes what the commit adds to the units in flight, the keys the next checkpoint writes and the counts.
+        /// Publishes what the commit adds to the units in flight, the keys the next checkpoint writes, the counts and the
+        /// range removals it counts later.
         private void publishCounted() {
             if (externals != 0 || pages != null) {
                 var size = touched.size();
@@ -2363,6 +2524,12 @@ public final class LiveLedger implements Ledger {
             for (var i = 0; i < deltaCount; i++) {
                 var state = deltaStates[i];
                 state.counts.append(sequence, state.counts.last() + deltas[i]);
+            }
+            if (deferred != null) {
+                for (var removal : deferred) {
+                    removal.state.ranges.add(removal);
+                }
+                deferredListed = true;
             }
         }
 
@@ -2414,6 +2581,12 @@ public final class LiveLedger implements Ledger {
             }
             for (var version : replaced == null ? List.<Version.External>of() : replaced) {
                 version.replacedAt = Long.MAX_VALUE;
+            }
+            if (deferred != null && !deferredListed) {
+                for (var removal : deferred) {
+                    removal.abandon();
+                }
+                deferred = null;
             }
         }
 

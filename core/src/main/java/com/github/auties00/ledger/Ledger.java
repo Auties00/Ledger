@@ -90,7 +90,8 @@ import java.util.function.Consumer;
 /// write, as the JDK lends a carrier only for its own blocking calls. The entries of a
 /// [resident][Keyspace.Residency#RESIDENT] key space are read into memory on virtual threads of the store's own, from
 /// the first use of the key space after the store opens, unless [Options#loadResidentAtOpen(boolean)] has the open
-/// read them.
+/// read them. The store counts the entries a batch's range removal takes away on a virtual thread of its own, after
+/// the commit.
 ///
 /// # Lifecycle
 /// A store holds an exclusive lock on its directory from [Options#build()] until [#close()]: one process, and one

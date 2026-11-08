@@ -107,10 +107,14 @@ public sealed interface View permits Ledger, Snapshot, Transaction {
     /// The count is exact. The store keeps it as it writes, except for a write of a key it holds no version of in
     /// memory, which does not read the file to learn whether the key existed: the next checkpoint learns it. Until
     /// then this looks up each such key, which may read the file after many of them; once a checkpoint has taken them,
-    /// it reads nothing.
+    /// it reads nothing. A range removal of a batch is counted after its commit, on a thread of the store's own; a
+    /// count that comes first counts the removal itself, which reads the pages on the paths to the range's bounds, or
+    /// waits for the thread counting it.
     ///
     /// @param keyspace the key space to count
     /// @throws IllegalArgumentException if this store was not opened with `keyspace`
+    /// @throws LedgerCorruptedException if a page the count reads fails authentication
+    /// @throws LedgerIoException if the file cannot be read
     /// @throws IllegalStateException if the store or view is closed
     long size(Keyspace<?, ?> keyspace);
 }
