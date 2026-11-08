@@ -57,11 +57,15 @@ public record Keyspace<K, V>(String name, Residency residency, KeyCodec<K> keys,
 
     /// Where a key space keeps its entries between reads.
     public enum Residency {
-        /// Every entry is held in memory, decoded, from the moment the store opens: a read costs no I/O and no
-        /// decoding, and returns the instance the store holds. That instance must not be modified: every read
-        /// returns it, and a byte array the store holds is also the value its next checkpoint writes, so a change
-        /// to one could reach the store's files without a commit. The store opens slower and uses memory in
-        /// proportion to the key space. For key spaces that are small and read often: sessions, chats, settings.
+        /// Every entry is held in memory, decoded: a read costs no I/O and no decoding, and returns the instance the
+        /// store holds. That instance must not be modified: every read returns it, and a byte array the store holds
+        /// is also the value its next checkpoint writes, so a change to one could reach the store's files without a
+        /// commit. The store reads the entries its files hold into memory from the first use of the key space after
+        /// it opens, in the order of their keys, or while it opens with
+        /// [Ledger.Options#loadResidentAtOpen(boolean)]; until an entry is in memory a read of it costs what a read
+        /// of a [#PAGED] entry costs and returns an instance of its own, and a write of it waits. The key space uses
+        /// memory in proportion to its entries. For key spaces that are small and read often: sessions, chats,
+        /// settings.
         RESIDENT,
         /// Entries are read from the store's files through the page cache and decoded on each read. For key spaces
         /// larger than memory should hold: messages, history.
