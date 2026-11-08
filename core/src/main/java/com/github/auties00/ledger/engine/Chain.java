@@ -33,6 +33,7 @@ final class Chain {
     private static final int BLIND = 1 << 26;
     private static final int SETTLED = 1 << 27;
     private static final int IN_TREE = 1 << 28;
+    private static final int LISTED = 1 << 29;
     /// What [#blindState()] returns for a chain whose key no commit wrote blind.
     static final byte NOT_BLIND = -1;
 
@@ -190,6 +191,20 @@ final class Chain {
     /// follows.
     void markOrdered() {
         SPAN.getAndBitwiseOr(this, ORDERED);
+    }
+
+    /// {@return whether a read of a range finds the chain: the ordered map holds it, or the list of the chains to order
+    /// holds it, or did until a thread ordered it}
+    ///
+    /// A commit attaches no version to a chain before this holds, so every committed version a scan may see is in the
+    /// map it walks, once it ordered the listed chains.
+    boolean reachable() {
+        return ((int) SPAN.getVolatile(this) & (ORDERED | LISTED)) != 0;
+    }
+
+    /// Records that the list of the chains to order holds the chain, once it does, with a volatile update.
+    void markListed() {
+        SPAN.getAndBitwiseOr(this, LISTED);
     }
 
     /// {@return whether the writer took the chain out of the maps, after which no version is attached to it again}

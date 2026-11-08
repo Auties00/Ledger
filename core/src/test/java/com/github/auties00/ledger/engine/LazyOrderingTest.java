@@ -15,6 +15,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The list of chains a key space orders lazily: what a read of a range sees beside a prune of the list, and the
@@ -76,6 +77,29 @@ class LazyOrderingTest {
         var slice = state.slice(null, null);
         pruner.join();
         assertEquals(chains, slice.size(), "the read of the range saw " + slice.size() + " of " + chains + " chains");
+    }
+
+    @Test
+    @DisplayName("a read of a range finds a chain a commit found in the index before the thread that created it listed it")
+    void chainNotListedYet() throws Exception {
+        var state = new KeyspaceState(MESSAGES);
+        state.lazy = true;
+        var key = Segments.encodeKey(KeyCodec.utf8(), "k");
+        // The creator is descheduled between its insert into the index and its push on the list
+        var created = new Chain(key, Segments.hash(key));
+        var index = KeyspaceState.class.getDeclaredField("index");
+        index.setAccessible(true);
+        ((ChainIndex) index.get(state)).putIfAbsent(created);
+        // Another commit opens the key, and could publish a version of it before the creator goes on
+        assertSame(created, state.open(key));
+        assertSame(created, state.slice(null, null).get(key));
+        // The creator goes on: the chain it lists is in the map already, and stays there once
+        var list = KeyspaceState.class.getDeclaredMethod("list", Chain.class);
+        list.setAccessible(true);
+        list.invoke(state, created);
+        assertEquals(1, state.slice(null, null).size());
+        assertSame(created, state.slice(null, null).get(key));
+        assertEquals(0, listed(state));
     }
 
     @Test

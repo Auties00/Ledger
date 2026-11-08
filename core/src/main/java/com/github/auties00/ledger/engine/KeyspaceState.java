@@ -138,6 +138,10 @@ final class KeyspaceState {
     /// Safe for concurrent use: commits call it for the keys they are about to write, so the ordered map, the costly
     /// one, grows before their turn. A chain dropped meanwhile is returned dropped; the sequencer, which finds it so
     /// when it gives the commit its writes, opens the key again.
+    ///
+    /// A read of a range finds the chain it returns. A chain enters the index before the thread that created it lists
+    /// or orders it, and a commit that finds it there may publish before that thread goes on, so one that finds it
+    /// neither listed nor ordered orders it itself.
     Chain open(MemorySegment key) {
         var hash = Segments.hash(key);
         var chain = index.get(key, hash);
@@ -157,7 +161,7 @@ final class KeyspaceState {
                 }
             }
         }
-        if (!lazy && !chain.ordered()) {
+        if (!chain.reachable()) {
             order(chain);
         }
         return chain;
@@ -169,6 +173,7 @@ final class KeyspaceState {
             var head = unordered;
             chain.nextUnordered = head;
             if (UNORDERED.compareAndSet(this, head, chain)) {
+                chain.markListed();
                 return;
             }
         }
@@ -276,7 +281,8 @@ final class KeyspaceState {
         }
     }
 
-    /// Inserts `chain` into the ordered map, in place of a dropped chain of the same key, unless it is dropped.
+    /// Inserts `chain` into the ordered map, in place of a dropped chain of the same key, unless it is dropped; safe for
+    /// concurrent use, and it does nothing to a chain already there.
     private void order(Chain chain) {
         // Released counts as dropped on both sides: another thread may have used the chain, and a prune dropped it,
         // while this one was still inserting it; a later chain of the key then holds the place
