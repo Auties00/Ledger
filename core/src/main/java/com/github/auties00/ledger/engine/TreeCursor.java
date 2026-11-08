@@ -13,7 +13,15 @@ import java.util.Arrays;
 /// evicts before any other. A long scan reads each unit once, so caching what it reads would only evict the units
 /// other reads use: the PostgreSQL buffer manager holds a large sequential scan to a small ring for the same reason. A
 /// cache with room evicts nothing to take them, and keeps a key space small enough to fit for the next scan.
-final class TreeCursor {
+///
+/// A run of misses past those leaves and blobs, with no room left in the cache, starts a [ScanAhead]: other threads read
+/// what the cursor comes to next, and the cursor applies the same rule to each unit they read when it comes to it. So
+/// what the cache holds does not depend on them, and a unit they did not read is the cursor's to read: every failure of a
+/// read still reaches the caller from this cursor, at the entry it belongs to.
+///
+/// A cursor belongs to one thread. Its caller must [#close()] it before the read that holds its pages back from reuse
+/// ends.
+final class TreeCursor implements AutoCloseable {
     /// The leaves and blobs a cursor adds to the page cache, enough for the pages of a chat a reader scrolls through.
     static final int ADMITTED = 64;
 
@@ -21,6 +29,7 @@ final class TreeCursor {
     private final MemorySegment from;
     private final MemorySegment to;
     private final boolean descending;
+    private final ScanAhead.Settings settings;
     private byte[][] path;
     private int[] indexes;
     private int depth;
@@ -29,18 +38,39 @@ final class TreeCursor {
     private int entry;
     private boolean started;
     private boolean exhausted;
-    // The leaves and blobs read so far, up to ADMITTED
+    // The leaves and blobs read so far, up to the settings' admitted
     private int admitted;
+    // The reader of what comes next, or null while the cursor reads alone
+    private ScanAhead ahead;
+    // What the reader fetched for the current leaf, or null
+    private ScanAhead.Fetched fetched;
+    // The leaves and blobs in a row that missed the cache
+    private int misses;
+    // The misses in a row that start a reader
+    private int missRun;
+    // The leaves in a row the reader found nothing to fetch for
+    private int idle;
 
     /// Creates a cursor over the entries of the tree under `root` from `from`, included, to `to`, excluded, either
     /// `null` for no bound.
     ///
     /// @param root the root, or `null` for an empty tree
     TreeCursor(PageFile pages, TreeRoot root, MemorySegment from, MemorySegment to, boolean descending) {
+        this(pages, root, from, to, descending, ScanAhead.Settings.DEFAULT);
+    }
+
+    /// Creates a cursor over the entries of the tree under `root` from `from`, included, to `to`, excluded, either
+    /// `null` for no bound.
+    ///
+    /// @param root the root, or `null` for an empty tree
+    /// @param settings when it reads ahead
+    TreeCursor(PageFile pages, TreeRoot root, MemorySegment from, MemorySegment to, boolean descending, ScanAhead.Settings settings) {
         this.pages = pages;
         this.from = from;
         this.to = to;
         this.descending = descending;
+        this.settings = settings;
+        this.missRun = settings.missRun();
         this.path = new byte[8][];
         this.indexes = new int[8];
         if (root == null) {
@@ -152,7 +182,21 @@ final class TreeCursor {
             return TreeSearch.value(pages, leaf, entry, true);
         }
         var bytes = (long) PageFormat.pagesFor(TreeNodes.blobLength(leaf, entry)) * PageFormat.SIZE;
-        return TreeSearch.value(pages, leaf, entry, pages.cache().hasRoom(bytes), false);
+        if (TreeNodes.isExternal(leaf, entry)) {
+            return TreeSearch.value(pages, leaf, entry, pages.cache().hasRoom(bytes), false);
+        }
+        var ref = TreeNodes.blobRef(leaf, entry);
+        var unit = fetched == null ? null : fetched.blob(index);
+        if (unit != null) {
+            return TreeSearch.blobValue(adopt(ref, PageFormat.VALUE, unit), leaf, entry);
+        }
+        unit = pages.cached(ref, PageFormat.VALUE);
+        if (unit != null) {
+            misses = 0;
+            return TreeSearch.blobValue(unit, leaf, entry);
+        }
+        misses++;
+        return TreeSearch.blobValue(pages.load(ref, PageFormat.VALUE, pages.cache().hasRoom(bytes), false), leaf, entry);
     }
 
     /// {@return child `index` of the branch `parent`, read through the cache}
@@ -163,15 +207,88 @@ final class TreeCursor {
         if (TreeNodes.level(parent) > 1 || admit()) {
             return pages.read(ref, PageFile.NODE, true);
         }
-        return pages.read(ref, PageFile.NODE, pages.cache().hasRoom(PageFormat.SIZE), false);
+        return readThrough(ref);
+    }
+
+    /// {@return the leaf `ref`, the next of the scan, past the ones the cursor adds to the cache in any case}
+    private byte[] readThrough(PageRef ref) {
+        fetched = null;
+        if (ahead != null) {
+            fetched = ahead.next(ref);
+            if (fetched == null) {
+                stopReadingAhead();
+            } else {
+                idle = fetched.isEmpty() ? idle + 1 : 0;
+                if (idle >= settings.idleRun()) {
+                    stopReadingAhead();
+                }
+                if (fetched.leaf() != null) {
+                    return adopt(ref, PageFile.NODE, fetched.leaf());
+                }
+            }
+        }
+        var unit = pages.cached(ref, PageFile.NODE);
+        if (unit != null) {
+            misses = 0;
+            return unit;
+        }
+        var room = pages.cache().hasRoom(PageFormat.SIZE);
+        unit = pages.load(ref, PageFile.NODE, room, false);
+        if (ahead == null && ++misses >= missRun && (!room || settings.withRoom())) {
+            misses = 0;
+            // The path ends at the branch that names this leaf, the one the reader goes on from
+            ahead = ScanAhead.start(pages, from, to, descending, path, indexes, depth, settings);
+        }
+        return unit;
+    }
+
+    /// {@return `unit`, the plaintext of the unit `ref` a reader fetched, or what the cache holds in its place, cached by
+    /// the rule of a unit the cursor reads}
+    private byte[] adopt(PageRef ref, byte kind, byte[] unit) {
+        var cache = pages.cache();
+        if (cache.hasRoom(unit.length)) {
+            var held = pages.cached(ref, kind);
+            if (held != null) {
+                return held;
+            }
+            cache.put(ref, unit, false);
+        }
+        return unit;
+    }
+
+    /// Ends the reader, and asks for a longer run of misses before the next: one that keeps finding the cache holds what
+    /// it would read costs the scan its threads each time. After a failure there is no next.
+    private void stopReadingAhead() {
+        var stopped = ahead;
+        ahead = null;
+        stopped.close();
+        misses = 0;
+        idle = 0;
+        missRun = stopped.failed() ? Integer.MAX_VALUE : Math.min(missRun, 1 << 20) * 2;
     }
 
     /// {@return whether the leaf or blob the cursor reads next goes to the cache}
     private boolean admit() {
-        if (admitted == ADMITTED) {
+        if (admitted >= settings.admitted()) {
             return false;
         }
         admitted++;
         return true;
+    }
+
+    /// {@return the reader of what comes next, or `null` while the cursor reads alone; for tests}
+    ScanAhead aheadForTests() {
+        return ahead;
+    }
+
+    /// Stops reading ahead and waits for the threads that did; calling this again does nothing, and the cursor reads on
+    /// alone if used after it.
+    @Override
+    public void close() {
+        if (ahead != null) {
+            ahead.close();
+            ahead = null;
+        }
+        missRun = Integer.MAX_VALUE;
     }
 }

@@ -256,56 +256,58 @@ final class Reads {
         var slice = state.slice(from, to);
         var memory = (descending ? slice.descendingMap() : slice).entrySet().iterator();
         var root = point.root(state);
-        var tree = root == null ? null : new TreeCursor(point.pages(), root, from, to, descending);
-        var inTree = tree != null && tree.next();
-        Map.Entry<MemorySegment, Chain> held = memory.hasNext() ? memory.next() : null;
-        var visited = 0L;
-        while (held != null || inTree) {
-            int order;
-            if (held == null) {
-                order = 1;
-            } else if (!inTree) {
-                order = -1;
-            } else {
-                // Where the key in memory sorts against the tree's, in the order of the scan
-                order = -tree.compareKey(held.getKey());
-                if (descending) {
-                    order = -order;
+        // Closed before the caller ends the read: what the cursor reads ahead are pages that read holds back from reuse
+        try (var tree = root == null ? null : new TreeCursor(point.pages(), root, from, to, descending)) {
+            var inTree = tree != null && tree.next();
+            Map.Entry<MemorySegment, Chain> held = memory.hasNext() ? memory.next() : null;
+            var visited = 0L;
+            while (held != null || inTree) {
+                int order;
+                if (held == null) {
+                    order = 1;
+                } else if (!inTree) {
+                    order = -1;
+                } else {
+                    // Where the key in memory sorts against the tree's, in the order of the scan
+                    order = -tree.compareKey(held.getKey());
+                    if (descending) {
+                        order = -order;
+                    }
                 }
-            }
-            if (order <= 0) {
-                var key = held.getKey();
-                var version = KeyspaceState.resolve(held.getValue().head, key, point.bound(), removals);
-                MemorySegment value = null;
-                Object decoded = null;
-                if (version != null && version != Version.HIDDEN) {
-                    value = version.value();
-                    decoded = version.decoded;
-                } else if (version == null && order == 0 && !hiddenSinceTree(key, point, removals)) {
-                    value = tree.value();
-                }
-                if (order == 0) {
+                if (order <= 0) {
+                    var key = held.getKey();
+                    var version = KeyspaceState.resolve(held.getValue().head, key, point.bound(), removals);
+                    MemorySegment value = null;
+                    Object decoded = null;
+                    if (version != null && version != Version.HIDDEN) {
+                        value = version.value();
+                        decoded = version.decoded;
+                    } else if (version == null && order == 0 && !hiddenSinceTree(key, point, removals)) {
+                        value = tree.value();
+                    }
+                    if (order == 0) {
+                        inTree = tree.next();
+                    }
+                    held = memory.hasNext() ? memory.next() : null;
+                    if (value != null) {
+                        visited++;
+                        if (!consumer.visit(key, value, decoded)) {
+                            break;
+                        }
+                    }
+                } else {
+                    var key = tree.key();
+                    if (!hiddenSinceTree(key, point, removals)) {
+                        visited++;
+                        if (!consumer.visit(key, tree.value(), null)) {
+                            break;
+                        }
+                    }
                     inTree = tree.next();
                 }
-                held = memory.hasNext() ? memory.next() : null;
-                if (value != null) {
-                    visited++;
-                    if (!consumer.visit(key, value, decoded)) {
-                        break;
-                    }
-                }
-            } else {
-                var key = tree.key();
-                if (!hiddenSinceTree(key, point, removals)) {
-                    visited++;
-                    if (!consumer.visit(key, tree.value(), null)) {
-                        break;
-                    }
-                }
-                inTree = tree.next();
             }
+            return visited;
         }
-        return visited;
     }
 
     /// Receives the entries of a scan.

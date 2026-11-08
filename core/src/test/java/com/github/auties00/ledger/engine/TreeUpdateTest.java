@@ -27,6 +27,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// freed page reused at once.
 class TreeUpdateTest {
     private static final java.util.Comparator<byte[]> UNSIGNED = Arrays::compareUnsigned;
+    // Reads ahead from the first leaf of every scan, so short ranges and delta records go through it too
+    private static final ScanAhead.Settings READ_AHEAD = new ScanAhead.Settings(0, 2, 0, Integer.MAX_VALUE, true);
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
@@ -123,11 +125,12 @@ class TreeUpdateTest {
             // A hot leaf, read before the scan
             var hot = segment("k000010".getBytes());
             assertTrue(TreeSearch.find(pages, root, hot) != null);
-            var cursor = new TreeCursor(pages, root, null, null, false);
             var scanned = 0;
-            while (cursor.next()) {
-                cursor.value();
-                scanned++;
+            try (var cursor = new TreeCursor(pages, root, null, null, false)) {
+                while (cursor.next()) {
+                    cursor.value();
+                    scanned++;
+                }
             }
             assertEquals(20_000, scanned);
             assertEquals(TreeSearch.FOUND, TreeSearch.lookupCached(pages, root, hot), "the scan evicted the hot leaf");
@@ -189,13 +192,18 @@ class TreeUpdateTest {
                     : to == null ? model.tailMap(from, true)
                     : model.subMap(from, true, to, false);
             var ordered = descending ? new ArrayList<>(expected.descendingMap().entrySet()) : new ArrayList<>(expected.entrySet());
-            var cursor = new TreeCursor(pages, root, from == null ? null : segment(from), to == null ? null : segment(to), descending);
-            for (var entry : ordered) {
-                assertTrue(cursor.next(), "the cursor ended early");
-                assertArrayEquals(entry.getKey(), bytes(cursor.key()));
-                assertArrayEquals(entry.getValue(), bytes(cursor.value()));
+            for (var settings : List.of(ScanAhead.Settings.DEFAULT, READ_AHEAD)) {
+                var low = from == null ? null : segment(from);
+                var high = to == null ? null : segment(to);
+                try (var cursor = new TreeCursor(pages, root, low, high, descending, settings)) {
+                    for (var entry : ordered) {
+                        assertTrue(cursor.next(), "the cursor ended early");
+                        assertArrayEquals(entry.getKey(), bytes(cursor.key()));
+                        assertArrayEquals(entry.getValue(), bytes(cursor.value()));
+                    }
+                    assertFalse(cursor.next(), "the cursor went past the range");
+                }
             }
-            assertFalse(cursor.next(), "the cursor went past the range");
         }
     }
 

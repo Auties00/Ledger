@@ -175,6 +175,17 @@ final class PageFile implements AutoCloseable {
         if (hit != null && kindMatches(hit[PageFormat.KIND], kind)) {
             return hit;
         }
+        return load(ref, kind, cached, referenced);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, from the file, for a read that found the cache does not hold it}
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    /// @param cached whether to keep the unit in the cache
+    /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
+    /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[] load(PageRef ref, byte kind, boolean cached, boolean referenced) {
         if (ref.isRecord()) {
             // The delta page and the base go to the cache as the entries it evicts first: the leaf they make is what a
             // read uses again, and holding all three filled the cache with each leaf twice
@@ -191,10 +202,7 @@ final class PageFile implements AutoCloseable {
         var sealed = pool.acquire(length);
         try {
             readFully(sealed, length, PageFormat.offset(ref.page()));
-            var plain = new byte[length];
-            if (!cipher.open(sealed, 0, ref.pages(), plain) || !ref.describes(plain) || !kindMatches(plain[PageFormat.KIND], kind)) {
-                throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
-            }
+            var plain = open(sealed, 0, ref, kind);
             if (cached) {
                 cache.put(ref, plain, referenced);
             }
@@ -298,16 +306,66 @@ final class PageFile implements AutoCloseable {
             readFully(sealed, length, PageFormat.offset(first));
             for (var index : indexes) {
                 var ref = refs.get(index);
-                var plain = new byte[ref.pages() * PageFormat.SIZE];
-                if (!cipher.open(sealed, (ref.page() - first) * PageFormat.SIZE, ref.pages(), plain) || !ref.describes(plain)
-                        || !kindMatches(plain[PageFormat.KIND], kind)) {
-                    throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
-                }
-                units[index] = plain;
+                units[index] = open(sealed, (ref.page() - first) * PageFormat.SIZE, ref, kind);
             }
         } finally {
             pool.release(sealed);
         }
+    }
+
+    /// Reads the units `refs` names into `units`, at the same indexes, from the file and without any effect on the cache,
+    /// units in consecutive pages with one call, up to [#RUN_PAGES] pages.
+    ///
+    /// A unit before the one that fails is in `units` when it throws. Between calls it stops if `stop` holds.
+    ///
+    /// @param refs the units, none of them delta records; a `null` skips that index
+    /// @param count how many of `refs` to read
+    /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
+    /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
+    /// @throws LedgerIoException if the file cannot be read
+    void readUncached(PageRef[] refs, int count, byte kind, byte[][] units, BooleanSupplier stop) {
+        var start = 0;
+        while (start < count && !stop.getAsBoolean()) {
+            var ref = refs[start];
+            if (ref == null) {
+                start++;
+                continue;
+            }
+            var low = ref.page();
+            var high = low + ref.pages();
+            var end = start + 1;
+            while (end < count && refs[end] != null && high - low + refs[end].pages() <= RUN_PAGES) {
+                var other = refs[end];
+                if (other.page() == high) {
+                    high += other.pages();
+                } else if (other.page() + other.pages() == low) {
+                    low = other.page();
+                } else {
+                    break;
+                }
+                end++;
+            }
+            var length = (high - low) * PageFormat.SIZE;
+            var sealed = pool.acquire(length);
+            try {
+                readFully(sealed, length, PageFormat.offset(low));
+                for (var i = start; i < end; i++) {
+                    units[i] = open(sealed, (refs[i].page() - low) * PageFormat.SIZE, refs[i], kind);
+                }
+            } finally {
+                pool.release(sealed);
+            }
+            start = end;
+        }
+    }
+
+    /// {@return the plaintext of the unit `ref` names, sealed at `offset` of `sealed`}
+    private byte[] open(byte[] sealed, int offset, PageRef ref, byte kind) {
+        var plain = new byte[ref.pages() * PageFormat.SIZE];
+        if (!cipher.open(sealed, offset, ref.pages(), plain) || !ref.describes(plain) || !kindMatches(plain[PageFormat.KIND], kind)) {
+            throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+        }
+        return plain;
     }
 
     /// {@return the plaintext of the unit `ref` names if the cache holds it, or `null`}
@@ -315,6 +373,14 @@ final class PageFile implements AutoCloseable {
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     byte[] cached(PageRef ref, byte kind) {
         var hit = cache.get(ref);
+        return hit != null && kindMatches(hit[PageFormat.KIND], kind) ? hit : null;
+    }
+
+    /// {@return the plaintext of the unit `ref` names if the cache holds it, or `null`, without counting as a read of it}
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    byte[] peek(PageRef ref, byte kind) {
+        var hit = cache.peek(ref);
         return hit != null && kindMatches(hit[PageFormat.KIND], kind) ? hit : null;
     }
 

@@ -104,7 +104,11 @@ final class TreeSearch {
             var external = pages.blobs().read(TreeNodes.blobRef(unit, entry), cached, referenced);
             return MemorySegment.ofArray(external).asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry)).asReadOnly();
         }
-        var blob = pages.read(TreeNodes.blobRef(unit, entry), PageFormat.VALUE, cached, referenced);
+        return blobValue(pages.read(TreeNodes.blobRef(unit, entry), PageFormat.VALUE, cached, referenced), unit, entry);
+    }
+
+    /// {@return the read-only value of leaf entry `entry` of `unit`, from `blob`, the plaintext of the blob it names}
+    static MemorySegment blobValue(byte[] blob, byte[] unit, int entry) {
         return MemorySegment.ofArray(blob).asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry)).asReadOnly();
     }
 

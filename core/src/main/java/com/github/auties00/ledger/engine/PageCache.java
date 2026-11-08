@@ -88,6 +88,17 @@ final class PageCache implements IdleTicker.Watched {
         return key(ref.isRecord() ? RECORDS + ref.slot() : DATA, ref.page());
     }
 
+    /// {@return the plaintext of the unit `ref` of the data file names if the cache holds it, or `null`, which counts as
+    /// no read of it: the clock and the idle ticker treat the entry as they would have}
+    byte[] peek(PageRef ref) {
+        var entry = entries.get(key(ref));
+        if (entry == null || entry.nonceHigh != ref.nonceHigh() || entry.nonceLow != ref.nonceLow()) {
+            return null;
+        }
+        var unit = entry.unit;
+        return unit == null || unit.length != ref.pages() * PageFormat.SIZE ? null : unit;
+    }
+
     /// {@return the plaintext of the unit `ref` names, at `key`, or `null` if the cache does not hold it}
     byte[] get(long key, PageRef ref) {
         var entry = entries.get(key);
@@ -214,6 +225,16 @@ final class PageCache implements IdleTicker.Watched {
     /// {@return the entries the clock holds, current or dropped, for tests that bound it}
     int clockLengthForTests() {
         return clock.size();
+    }
+
+    /// {@return the keys of the current entries, each with whether it counts as read, for tests that compare the state
+    /// of the clock}
+    Map<Long, Boolean> referencedForTests() {
+        var referenced = new java.util.TreeMap<Long, Boolean>();
+        for (var entry : entries.values()) {
+            referenced.put(entry.key, entry.referenced);
+        }
+        return referenced;
     }
 
     /// Drops every entry, so tests read units from the file.
