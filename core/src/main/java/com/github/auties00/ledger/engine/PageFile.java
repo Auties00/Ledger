@@ -154,7 +154,8 @@ final class PageFile implements AutoCloseable {
 
     /// {@return the plaintext of the unit `ref` names, from the cache or the file}
     ///
-    /// A delta record reads as the leaf it makes of its base ([DeltaLeaves]).
+    /// A delta record reads as the leaf it makes of its base ([DeltaLeaves]). A unit read for the cache may end with its
+    /// content ([PageFormat#cachedLength(int, int)]); one read past it holds its whole pages.
     ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     /// @param cached whether to keep the unit in the cache, and the units a delta record's leaf is made of
@@ -192,8 +193,13 @@ final class PageFile implements AutoCloseable {
         var sealed = pool.acquire(length);
         try {
             readFully(sealed, length, PageFormat.offset(ref.page()));
-            var plain = new byte[length];
-            if (!cipher.open(sealed, 0, ref.pages(), plain) || !ref.describes(plain) || !kindMatches(plain[PageFormat.KIND], kind)) {
+            // The header is the additional data of the tag and the open copies it as it is, so what it says holds once
+            // the unit authenticates: it is checked first, and tells the bytes to keep
+            var content = Bytes.i32(sealed, PageFormat.LENGTH);
+            var plain = ref.describes(sealed) && kindMatches(sealed[PageFormat.KIND], kind) && PageFormat.fits(ref.pages(), content)
+                    ? cipher.open(sealed, 0, ref.pages(), cached ? PageFormat.cachedLength(ref.pages(), content) : length, pool)
+                    : null;
+            if (plain == null) {
                 throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
             }
             if (cached) {
@@ -526,9 +532,13 @@ final class PageFile implements AutoCloseable {
 
         /// Queues `unit`, whose content is filled in, as the unit of `pages` pages at `page`.
         ///
-        /// The writer, and the page cache if `cached`, own `unit` from now on.
+        /// `unit` may end with its content, or anywhere up to the end of the unit: the unit is sealed as if zeros
+        /// followed it. The writer, and the page cache if `cached`, own `unit` from now on.
         ///
+        /// @param length the bytes of content
         /// @return the reference of the unit
+        /// @throws IllegalArgumentException if `unit` ends before its content or past the unit, or the content does not
+        ///                                  fit in the unit
         PageRef write(byte kind, int level, int page, int pages, byte[] unit, int length, boolean cached) throws IOException {
             synchronized (lock) {
                 return write(kind, level, page, pages, unit, length, cached, nextNonce());
@@ -540,6 +550,10 @@ final class PageFile implements AutoCloseable {
         ///
         /// @return the reference of the unit
         PageRef write(byte kind, int level, int page, int pages, byte[] unit, int length, boolean cached, int nonce) throws IOException {
+            if (!PageFormat.fits(pages, length) || unit.length < PageFormat.HEADER + length || unit.length > pages * PageFormat.SIZE) {
+                throw new IllegalArgumentException("A unit of " + pages + " pages cannot hold " + length + " bytes of content in "
+                        + unit.length + " bytes");
+            }
             synchronized (lock) {
                 var ref = new PageRef(page, pages, nonceHigh, nonce);
                 header(unit, kind, level, page, pages, length, ref.nonceHigh(), ref.nonceLow());

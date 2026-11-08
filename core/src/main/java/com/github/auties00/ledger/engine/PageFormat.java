@@ -25,6 +25,10 @@ package com.github.auties00.ledger.engine;
 /// fails authentication. The nonce of each unit is new (see [Checkpointer]), and whatever refers to a unit (a parent
 /// node, a leaf holding a large value, a superblock) records its nonce: a unit left over from an earlier checkpoint
 /// in the same pages fails the check even when it authenticates.
+///
+/// In memory, the array of a unit holds its header and content, and may end there or anywhere up to the end of the
+/// unit: no reader looks past the content, so a unit a checkpoint builds holds nothing more, and one the page cache
+/// reads holds what [#cachedLength(int, int)] keeps.
 final class PageFormat {
     static final int SIZE = 4_096;
     static final int HEADER = 32;
@@ -54,6 +58,9 @@ final class PageFormat {
     static final int PAGE = 8;
     static final int LENGTH = 12;
     static final int NONCE = 16;
+    /// The least padding a unit the page cache takes must have for the cache to keep it without the padding: below
+    /// it, copying the content out of the opened unit costs more than the memory it saves.
+    static final int TRIM_LEAST = 512;
 
     private PageFormat() {
     }
@@ -61,6 +68,23 @@ final class PageFormat {
     /// {@return the bytes of content a unit of `pages` pages holds}
     static int capacity(int pages) {
         return pages * SIZE - HEADER - TAG;
+    }
+
+    /// {@return whether a unit of `pages` pages holds `content` bytes of content}
+    static boolean fits(int pages, int content) {
+        return content >= 0 && content <= capacity(pages);
+    }
+
+    /// {@return the bytes the page cache keeps of a unit of `pages` pages with `content` bytes of content, which
+    /// [fit][#fits(int, int)] them: its header and content if that drops at least [#TRIM_LEAST] bytes and a sixteenth
+    /// of the unit, or the whole unit}
+    ///
+    /// The pages [#pagesFor(long)] gives pad a unit by less than a page and a tag, so one of more than 16 pages is kept
+    /// whole: dropping its padding would copy all its content to save a few kilobytes of it.
+    static int cachedLength(int pages, int content) {
+        var length = pages * SIZE;
+        var kept = HEADER + content;
+        return length - kept >= Math.max(TRIM_LEAST, length >> 4) ? kept : length;
     }
 
     /// {@return the pages of a unit holding `content` bytes}

@@ -283,10 +283,22 @@ final class TreeNodes {
         return children;
     }
 
-    /// Writes `entries` from `from` to `to` into `unit` as a leaf's content.
+    /// {@return the bytes of content of a node of the entries or children whose sizes, as [LeafEntry#size()] and
+    /// [Child#size()] give them, are those of `sizes` from `from` to `to`}
+    static int contentLength(int[] sizes, int from, int to) {
+        var content = 2;
+        for (var i = from; i < to; i++) {
+            content += sizes[i];
+        }
+        return content;
+    }
+
+    /// {@return a leaf of `entries` from `from` to `to`, its content filled in and its header left to fill, in an array
+    /// of its header and `content` bytes, the content [#contentLength(int\[\], int, int)] counts for them}
     ///
-    /// @return the bytes of content
-    static int writeLeaf(byte[] unit, List<LeafEntry> entries, int from, int to) {
+    /// @throws IllegalStateException if the entries take fewer than `content` bytes; more fail as they are written
+    static byte[] writeLeaf(List<LeafEntry> entries, int from, int to, int content) {
+        var unit = new byte[PageFormat.HEADER + content];
         var count = to - from;
         Bytes.u16(unit, PageFormat.HEADER, count);
         var position = PageFormat.HEADER + 2 + 2 * count;
@@ -294,7 +306,16 @@ final class TreeNodes {
             Bytes.u16(unit, PageFormat.HEADER + 2 + 2 * i, position);
             position = writeEntry(unit, position, entries.get(from + i));
         }
-        return position - PageFormat.HEADER;
+        filled(unit, position);
+        return unit;
+    }
+
+    /// Checks that a node written up to `position` fills `unit`, which the sizes of its entries or children gave.
+    private static void filled(byte[] unit, int position) {
+        if (position != unit.length) {
+            throw new IllegalStateException("A node of " + (unit.length - PageFormat.HEADER) + " bytes of content took "
+                    + (position - PageFormat.HEADER));
+        }
     }
 
     /// Writes `entry` at `position` of `unit`, in the form a leaf or a delta record holds it.
@@ -322,10 +343,12 @@ final class TreeNodes {
         return position + 5 + PageRef.BYTES;
     }
 
-    /// Writes `children` from `from` to `to` into `unit` as a branch's content.
+    /// {@return a branch of `children` from `from` to `to`, its content filled in and its header left to fill, in an
+    /// array of its header and `content` bytes, the content [#contentLength(int\[\], int, int)] counts for them}
     ///
-    /// @return the bytes of content
-    static int writeBranch(byte[] unit, List<Child> children, int from, int to) {
+    /// @throws IllegalStateException if the children take fewer than `content` bytes; more fail as they are written
+    static byte[] writeBranch(List<Child> children, int from, int to, int content) {
+        var unit = new byte[PageFormat.HEADER + content];
         var count = to - from;
         Bytes.u16(unit, PageFormat.HEADER, count);
         var position = PageFormat.HEADER + 2 + 2 * count;
@@ -347,7 +370,8 @@ final class TreeNodes {
                 position += 2;
             }
         }
-        return position - PageFormat.HEADER;
+        filled(unit, position);
+        return unit;
     }
 
     /// {@return the runs, as pairs of first and last index, that split items of `sizes` evenly into nodes of
