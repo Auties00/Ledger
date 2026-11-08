@@ -87,6 +87,13 @@ class TreeUpdateTest {
                 root = update.apply(root, ops, ranges);
                 deltas = update.finishDeltas(deltas);
                 writer.flush();
+                // What the update took is exactly what it kept: the pages a run of delta pages gave back are free, and
+                // an update that fails must not give them back again once something else took them
+                for (var unit : update.allocated()) {
+                    for (var page = unit.page(); page < unit.page() + unit.pages(); page++) {
+                        assertFalse(space.isUnused(page), "page " + page + " is listed as taken but free");
+                    }
+                }
                 for (var unit : update.freed()) {
                     space.release(unit.page(), unit.pages());
                 }

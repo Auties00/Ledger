@@ -1322,8 +1322,8 @@ public final class LiveLedger implements Ledger {
     /// @param maxId the highest key space id
     /// @param keyspaces what changed in each key space
     /// @param superseded the units of the file of large values whose versions commits at or below the cut replaced
-    ///                   before any checkpoint took them: no tree points to them, and no recovery from this checkpoint
-    ///                   on replays their commits
+    ///                   before any checkpoint took them, but those the checkpoint built before it frees or takes: no
+    ///                   tree points to them, and no recovery from this checkpoint on replays their commits
     record Cut(long sequence, long logStart, long logBytes, long logHeap, TreeVersion base, int maxId,
                List<KeyspaceCut> keyspaces, List<PageRef> superseded) {
     }
@@ -1341,12 +1341,19 @@ public final class LiveLedger implements Ledger {
     /// Cuts the writes of a checkpoint and registers a read at its sequence, which keeps the versions it needs until
     /// [ReaderTable#unregister(long)].
     ///
+    /// A checkpoint built while the one before it has not published updates the trees of that one, `built`, rather
+    /// than the latest published ones. Its publication will take the units of `taken` out of flight, so they are not
+    /// among the units this cut supersedes: one its trees took and a later commit replaced is freed by the trees of
+    /// this checkpoint, once its readers are gone, and one its commits superseded is freed by its publication.
+    ///
     /// @param logStart the first log segment a commit after the cut may be in
+    /// @param built the trees of a checkpoint built but maybe not published yet, or `null` to update the latest ones
+    /// @param taken the units of the file of large values the publication of `built` takes out of flight
     /// @return the cut, or `null` if no commit was made since the last checkpoint
-    Cut cutCheckpoint(LongSupplier logStart) {
+    Cut cutCheckpoint(LongSupplier logStart, TreeVersion built, Set<PageRef> taken) {
         enterPublishing();
         try {
-            var base = tree;
+            var base = built != null ? built : tree;
             var sequence = latest();
             if (sequence == (base == null ? 0 : base.sequence)) {
                 return null;
@@ -1363,7 +1370,8 @@ public final class LiveLedger implements Ledger {
             var bound = Reads.boundOf(sequence);
             var superseded = new ArrayList<PageRef>();
             for (var unit : inFlight) {
-                if (unit.version().stamp <= bound && unit.version().replacedAt <= sequence) {
+                if (unit.version().stamp <= bound && unit.version().replacedAt <= sequence
+                        && !taken.contains(unit.version().unit)) {
                     superseded.add(unit.version().unit);
                 }
             }

@@ -13,6 +13,12 @@ import java.util.List;
 /// published, until every reader is past it ([#releasePassed(long)]). Pages a checkpoint took and then gave up never
 /// reached a durable state, and are free at once.
 ///
+/// A checkpoint built while the one before it has not published ([Checkpointer]) lists as free the pages the one
+/// before frees, which stay in use until that one publishes. They are staged ([#stage(List)]) from the end of that
+/// one's build until its publication pends them ([#pend(long, List)]): no allocation takes a staged page, and every
+/// free list counts it free. Added to the free list of the later checkpoint alone, they would still be listed once
+/// pended, freed and taken again by it, so a page its trees use would be listed free.
+///
 /// It is safe for concurrent use: the writer releases pages while a checkpoint takes them.
 final class FreeSpace {
     private final Object lock;
@@ -25,6 +31,8 @@ final class FreeSpace {
     private int runCursor;
     private int pageCount;
     private final ArrayDeque<Pending> pending;
+    // The units checkpoints built but not published free, in use until they publish, as stage gave them
+    private final ArrayList<List<PageRef>> staged;
 
     /// Creates the free space of a file of `pageCount` pages whose free pages are the set bits of `free`.
     FreeSpace(int pageCount, BitSet free) {
@@ -33,6 +41,7 @@ final class FreeSpace {
         this.lowestFree = PageFormat.FIRST_UNIT_PAGE;
         this.pageCount = pageCount;
         this.pending = new ArrayDeque<>();
+        this.staged = new ArrayList<>(2);
     }
 
     /// {@return the first page of a run of `pages` free pages, which are no longer free}
@@ -131,13 +140,42 @@ final class FreeSpace {
         }
     }
 
-    /// Frees `units` once every reader is past `published`.
+    /// Frees `units` once every reader is past `published`, staged by [#stage(List)] until then if they were.
     void pend(long published, List<PageRef> units) {
         if (units.isEmpty()) {
             return;
         }
         synchronized (lock) {
+            removeStaged(units);
             pending.add(new Pending(published, units));
+        }
+    }
+
+    /// Counts `units`, which a checkpoint built but not yet published frees, as free in every free list from now on,
+    /// though they stay in use, until [#pend(long, List)] or [#unstage(List)] is given the same list.
+    void stage(List<PageRef> units) {
+        if (units.isEmpty()) {
+            return;
+        }
+        synchronized (lock) {
+            staged.add(units);
+        }
+    }
+
+    /// Stops counting `units` as free, as a checkpoint that will not publish leaves them in use.
+    void unstage(List<PageRef> units) {
+        synchronized (lock) {
+            removeStaged(units);
+        }
+    }
+
+    /// Takes `units`, the very list given to [#stage(List)], out of the staged units, if it is there.
+    private void removeStaged(List<PageRef> units) {
+        for (var i = 0; i < staged.size(); i++) {
+            if (staged.get(i) == units) {
+                staged.remove(i);
+                return;
+            }
         }
     }
 
@@ -186,7 +224,7 @@ final class FreeSpace {
     }
 
     /// {@return the runs of pages a store reopened at the checkpoint being written may use, as pairs of first page and
-    /// length: the free pages, the pending ones and `alsoFree`, since a reopened store has no reader}
+    /// length: the free pages, the pending ones, the staged ones and `alsoFree`, since a reopened store has no reader}
     ///
     /// @param alsoFree units the checkpoint frees
     List<int[]> durableRuns(List<PageRef> alsoFree) {
@@ -194,6 +232,11 @@ final class FreeSpace {
             var all = (BitSet) free.clone();
             for (var waiting : pending) {
                 for (var unit : waiting.units()) {
+                    all.set(unit.page(), unit.page() + unit.pages());
+                }
+            }
+            for (var units : staged) {
+                for (var unit : units) {
                     all.set(unit.page(), unit.page() + unit.pages());
                 }
             }

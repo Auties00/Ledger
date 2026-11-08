@@ -321,6 +321,17 @@ final class BlobFile implements AutoCloseable {
         space.pend(published, units);
     }
 
+    /// Counts `units`, which the trees of a checkpoint built but not yet published no longer point to, as free in
+    /// every free list from now on, as [FreeSpace#stage(List)] does.
+    void stage(List<PageRef> units) {
+        space.stage(units);
+    }
+
+    /// Stops counting `units` as free, as a checkpoint that will not publish leaves them in use.
+    void unstage(List<PageRef> units) {
+        space.unstage(units);
+    }
+
     /// Frees what [#pend] holds for checkpoints published before `oldestReader`.
     void releasePassed(long oldestReader) {
         space.releasePassed(oldestReader);
@@ -328,9 +339,10 @@ final class BlobFile implements AutoCloseable {
 
     /// {@return the pages of the file, and the runs of them a store reopened at the checkpoint being written may use}
     ///
-    /// They are the free and pending pages, `alsoFree`, and every unit no tree points to but those in `adopted`, the
-    /// ones the checkpoint's trees take: a unit in flight comes back with the commit recovery replays. Both are taken
-    /// at once, since commits keep writing units while the checkpoint runs: pages a later unit takes are free here.
+    /// They are the free, pending and staged pages, `alsoFree`, and every unit no published tree points to but those in
+    /// `adopted`, the ones the checkpoint's trees take or a checkpoint before it not published yet took: a unit in
+    /// flight comes back with the commit recovery replays. Both are taken at once, since commits keep writing units
+    /// while the checkpoint runs: pages a later unit takes are free here.
     Runs durableRuns(Collection<PageRef> adopted, List<PageRef> alsoFree) {
         synchronized (lock) {
             var free = new ArrayList<>(alsoFree);

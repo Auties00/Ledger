@@ -40,6 +40,8 @@ final class TreeUpdate {
     private final PageCounts records;
     // Fills the delta pages of this update's thread
     private final DeltaLeaves.Packer packer;
+    // Where allocated holds the run of pages the packer fills, or -1 before it takes one
+    private int runIndex;
 
     TreeUpdate(PageFile pages, PageFile.Writer writer, FreeSpace space) {
         this.pages = pages;
@@ -49,18 +51,26 @@ final class TreeUpdate {
         this.freedExternal = new ArrayList<>();
         this.allocated = new ArrayList<>();
         this.records = new PageCounts();
+        this.runIndex = -1;
         this.packer = new DeltaLeaves.Packer(writer, new DeltaLeaves.Packer.Space() {
             @Override
             public long take(int least, int most) {
                 var run = space.allocateRun(least, most);
-                // The whole run, though the packer gives some back: a page given back and taken again by another unit
-                // of the checkpoint goes back with it, if the checkpoint fails
+                runIndex = allocated.size();
                 allocated.add(new PageRef((int) (run >>> 32), (int) run, 0, 0));
                 return run;
             }
 
             @Override
             public void giveBack(int page, int pages) {
+                // The run keeps the pages the packer used, before those it gives back: a checkpoint that fails gives
+                // back what it took and no more, as the pages given back may be another checkpoint's by then
+                var run = allocated.get(runIndex);
+                if (page + pages != run.page() + run.pages() || pages >= run.pages()) {
+                    throw new IllegalStateException("A delta page run gives back pages " + page + " to " + (page + pages)
+                            + " of the run of " + run.pages() + " from " + run.page());
+                }
+                allocated.set(runIndex, new PageRef(run.page(), run.pages() - pages, 0, 0));
                 space.release(page, pages);
             }
         }, records::add);

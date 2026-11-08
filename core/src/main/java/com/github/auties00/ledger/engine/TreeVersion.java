@@ -5,12 +5,15 @@ package com.github.auties00.ledger.engine;
 /// A read at sequence `s` uses the newest published version whose sequence is at or below `s`, walking [#older] from
 /// the latest one it finds. Since a read may have found the version before this one just before this one was
 /// published, the writer keeps the older version, and its pages, until every read is past [#published].
+///
+/// The trees of a checkpoint built but not published yet are a version too, which only the next checkpoint reads, as
+/// the trees it updates; no read finds it, as it is not linked from the published ones.
 final class TreeVersion {
     /// The number of the checkpoint.
     final long number;
     /// The sequence of the last commit the trees hold.
     final long sequence;
-    /// The latest sequence when the version was published.
+    /// The latest sequence when the version was published, or [Long#MAX_VALUE] for one not published.
     final long published;
     /// The root of each key space's tree by id, `null` for an empty tree.
     private final TreeRoot[] roots;

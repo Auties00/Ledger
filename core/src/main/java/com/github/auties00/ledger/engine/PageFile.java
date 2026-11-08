@@ -27,7 +27,8 @@ import java.util.stream.IntStream;
 ///
 /// Reads run on the calling thread, each on a channel of its own from a small pool: Windows serializes positional
 /// reads on one channel, and an interrupt during a read closes the channel it ran on, which then is replaced. Writes run
-/// on the one thread that writes a checkpoint, through a [Writer].
+/// through the [Writer] of a checkpoint, on one channel whose position a lock guards: the writer of a checkpoint that
+/// forces its units may still be open while the next one writes its trees.
 final class PageFile implements AutoCloseable {
     static final String FILE = "ledger.data";
     private static final int READ_CHANNELS = 8;
@@ -40,9 +41,10 @@ final class PageFile implements AutoCloseable {
     // all at once before its superblock: forced at the end, the writes of a checkpoint that rewrites hundreds of
     // megabytes kept the device idle while it built them, then made it wait seconds for them
     private static final long FORCE_EVERY = 32L << 20;
-    // Not on Windows, where the forces beside the work made the checkpoints of the random overwrite benchmark slower
-    // (14% fewer overwrites a second on the same runner) where they made them faster on Linux (19% more)
-    private static final boolean FORCE_BESIDE = !System.getProperty("os.name", "").startsWith("Windows");
+    /// Whether a checkpoint forces its writes beside its work: not on Windows, where the forces beside the work made
+    /// the checkpoints of the random overwrite benchmark slower (14% fewer overwrites a second on the same runner)
+    /// where they made them faster on Linux (19% more).
+    static final boolean FORCE_BESIDE = !System.getProperty("os.name", "").startsWith("Windows");
     /// Marks a read that accepts a leaf or a branch.
     static final byte NODE = -1;
 
@@ -52,6 +54,9 @@ final class PageFile implements AutoCloseable {
     private final HeapPool pool;
     private final ArrayBlockingQueue<FileChannel> readers;
     private final FileChannel writer;
+    // Held across a move of the writer's position and the write from it, and across a truncation, which moves it too:
+    // the writers of two checkpoints, one forcing its units while the next builds its trees, share the channel
+    private final Object positionLock;
     // The file of large values, which leaves point into
     private volatile BlobFile blobs;
     private volatile boolean closed;
@@ -62,6 +67,7 @@ final class PageFile implements AutoCloseable {
         this.cache = cache;
         this.pool = pool;
         this.writer = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        this.positionLock = new Object();
         this.readers = new ArrayBlockingQueue<>(READ_CHANNELS);
         try {
             for (var i = 0; i < READ_CHANNELS; i++) {
@@ -429,7 +435,9 @@ final class PageFile implements AutoCloseable {
 
     /// Cuts the file to `pages` pages, every one past them being free.
     void truncate(int pages) throws IOException {
-        writer.truncate(PageFormat.offset(pages));
+        synchronized (positionLock) {
+            writer.truncate(PageFormat.offset(pages));
+        }
     }
 
     /// {@return the page cache}
@@ -701,9 +709,11 @@ final class PageFile implements AutoCloseable {
             for (var buffer : buffers) {
                 remaining += buffer.remaining();
             }
-            writer.position(position);
-            while (remaining > 0) {
-                remaining -= writer.write(buffers);
+            synchronized (positionLock) {
+                writer.position(position);
+                while (remaining > 0) {
+                    remaining -= writer.write(buffers);
+                }
             }
         }
 

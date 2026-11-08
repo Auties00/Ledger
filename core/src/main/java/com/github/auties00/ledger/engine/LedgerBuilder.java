@@ -37,6 +37,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private Duration commitWindow;
     private long segmentSize;
     private long checkpointHeap;
+    private Checkpointer.Overlap checkpointOverlap;
     private Consumer<? super LedgerException> backgroundFailures;
     private long largeValues;
     private final Map<String, Long> largeValuesByKeyspace;
@@ -50,6 +51,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         this.segmentSize = SEGMENT_SIZE;
         // The writes the trees lack may hold up to half the heap before commits wait for more than two intervals
         this.checkpointHeap = Runtime.getRuntime().maxMemory() / 2;
+        this.checkpointOverlap = Checkpointer.OVERLAP;
         this.backgroundFailures = _ -> {
         };
         this.largeValues = MIB;
@@ -67,6 +69,13 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     /// a checkpoint, by the logs' estimates, so tests can reach it without filling half the heap.
     LedgerBuilder checkpointHeap(long bytes) {
         this.checkpointHeap = bytes;
+        return this;
+    }
+
+    /// Sets when a checkpoint the store starts may build while the one before it is made durable, so tests can make
+    /// them overlap, or not, whatever the system.
+    LedgerBuilder checkpointOverlap(Checkpointer.Overlap overlap) {
+        this.checkpointOverlap = Objects.requireNonNull(overlap, "overlap");
         return this;
     }
 
@@ -290,9 +299,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var deltaTable = superblock == null ? null : superblock.deltaTable();
             var deltas = deltaTable == null ? DeltaTable.EMPTY
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));
-            var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
-                    superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures,
-                    superblock == null ? 0 : superblock.epoch(), epochs[0], checkpointHeap);
+            var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery, deltas, deltaTable,
+                    backgroundFailures, superblock == null ? 0 : superblock.epoch(), epochs[0], checkpointHeap, checkpointOverlap);
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
             } else {
