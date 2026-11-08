@@ -692,7 +692,8 @@ final class PageFile implements AutoCloseable {
         /// The units are sealed side by side into arrays of up to [#RUN_PAGES] pages, or of their own pages for a
         /// longer unit, and each run of consecutive pages in one array goes to the file with one write: a write of a
         /// buffer for each unit, gathered or not, is a system call for each unit on Windows. A unit leaves the queue
-        /// once its run is written.
+        /// once its run is written. The arrays go back to the pool unless a seal failed, which leaves them to the
+        /// collector.
         ///
         /// @return the index past the units written
         private int flushWindow(Staged[] entries, int from) throws IOException {
@@ -737,10 +738,17 @@ final class PageFile implements AutoCloseable {
                 }
                 runs[runCount] = count;
                 var indexes = IntStream.range(0, count);
-                (count < PARALLEL_SEALS ? indexes : indexes.parallel()).forEach(index -> {
-                    var entry = entries[from + index];
-                    cipher.seal(entry.unit(), entry.ref().pages(), arrays[index], offsets[index]);
-                });
+                try {
+                    (count < PARALLEL_SEALS ? indexes : indexes.parallel()).forEach(index -> {
+                        var entry = entries[from + index];
+                        cipher.seal(entry.unit(), entry.ref().pages(), arrays[index], offsets[index]);
+                    });
+                } catch (RuntimeException | Error exception) {
+                    // A parallel stream rethrows the first failure while its other tasks go on sealing into these
+                    // arrays, which the pool would hand to a user whose bytes those seals then overwrite
+                    slabs.clear();
+                    throw exception;
+                }
                 for (var run = 0; run < runCount; run++) {
                     var first = runs[run];
                     var end = runs[run + 1];

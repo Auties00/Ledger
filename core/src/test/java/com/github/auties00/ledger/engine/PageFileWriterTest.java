@@ -252,6 +252,11 @@ class PageFileWriterTest {
     @Nested
     @DisplayName("failures")
     class Failures {
+        private static final int SEAL_UNITS = 16;
+        private static final int SEAL_UNIT_PAGES = 16;
+        // The arrays a window of those units is sealed into
+        private static final int SEAL_SLAB = 256 << 10;
+
         @Test
         @DisplayName("a flush that fails ends every thread that queues, those waiting at twice the limit too, and nothing is written after it")
         void failedFlush() throws Exception {
@@ -307,6 +312,103 @@ class PageFileWriterTest {
                 writer.discard();
                 assertThrows(IllegalStateException.class, () -> queue(writer, space, new Random(), true));
                 assertEquals(1, attempts.get());
+            }
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("a seal that fails while others run gives the pool no array they still write, stays failed, and writes nothing")
+        void failedSeal(boolean encrypted) throws Exception {
+            var disk = CrashFileSystem.create();
+            var directory = Files.createDirectories(disk.getPath("/store"));
+            // Large enough to keep every array a window releases
+            var pool = new HeapPool(64 << 20, false);
+            try (var pages = PageFile.open(directory, cipher(encrypted), 1 << 20, pool)) {
+                var writes = new AtomicInteger();
+                disk.intercept((path, kind) -> {
+                    if (kind == ChangeInterceptor.ChangeKind.WRITE && dataFile(path)) {
+                        writes.incrementAndGet();
+                    }
+                });
+                // A stale seal lands within milliseconds of the flush throwing, in a fraction of the trials
+                var released = 0L;
+                for (var trial = 0; trial < 100; trial++) {
+                    var writer = pages.writerForTests(1_000 + trial, 1L << 30, 0);
+                    queueWindowWithShortUnit(writer);
+                    var pooled = pool.pooledBytesForTests();
+                    assertThrows(RuntimeException.class, writer::flush);
+                    released += pool.pooledBytesForTests() - pooled;
+
+                    var arrays = new byte[4][];
+                    for (var i = 0; i < arrays.length; i++) {
+                        arrays[i] = pool.acquire(SEAL_SLAB);
+                        Arrays.fill(arrays[i], (byte) 0x5A);
+                    }
+                    Thread.sleep(2);
+                    for (var array : arrays) {
+                        for (var value : array) {
+                            if (value != 0x5A) {
+                                fail("a seal wrote into an array the pool handed out, in trial " + trial);
+                            }
+                        }
+                    }
+
+                    assertThrows(IOException.class, writer::flush);
+                    assertThrows(IOException.class, writer::awaitForce);
+                    assertThrows(IOException.class, () -> writer.write(PageFormat.VALUE, 0, 100_000, 1, new byte[PageFormat.SIZE], 1, false));
+                    writer.discard();
+                    assertThrows(IllegalStateException.class, writer::flush);
+                }
+                assertEquals(0, released, "the pool took arrays that seals may still write");
+                assertEquals(0, writes.get(), "a window whose seal failed reached the file");
+
+                // The store goes on: the next checkpoint's writer seals and writes as usual
+                var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+                var writer = pages.writerForTests(5_000, LIMIT, 0);
+                var random = new Random(23);
+                var queued = new ArrayList<Queued>();
+                for (var i = 0; i < 200; i++) {
+                    queued.add(queue(writer, space, random, false));
+                }
+                writer.flush();
+                pages.cache().clearForTests();
+                for (var unit : queued) {
+                    assertHolds(unit, pages.read(unit.ref(), PageFormat.VALUE, false));
+                }
+            }
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("a write that fails gives the pool the arrays of its window, whose seals all ended")
+        void failedWriteReleases(boolean encrypted) throws Exception {
+            var disk = CrashFileSystem.create();
+            var directory = Files.createDirectories(disk.getPath("/store"));
+            var pool = new HeapPool(64 << 20, false);
+            try (var pages = PageFile.open(directory, cipher(encrypted), 1 << 20, pool)) {
+                disk.intercept((path, kind) -> {
+                    if (kind == ChangeInterceptor.ChangeKind.WRITE && dataFile(path)) {
+                        throw new IOException("No space left on device");
+                    }
+                });
+                var writer = pages.writerForTests(7, 1L << 30, 0);
+                for (var i = 0; i < SEAL_UNITS; i++) {
+                    writer.write(PageFormat.VALUE, 0, PageFormat.FIRST_UNIT_PAGE + i * SEAL_UNIT_PAGES, SEAL_UNIT_PAGES,
+                            new byte[SEAL_UNIT_PAGES * PageFormat.SIZE], 1, false);
+                }
+                var pooled = pool.pooledBytesForTests();
+                assertThrows(IOException.class, writer::flush);
+                assertEquals(pooled + 4L * SEAL_SLAB, pool.pooledBytesForTests());
+                writer.discard();
+            }
+        }
+
+        /// Queues one window that a flush seals in parallel: four arrays of [#SEAL_UNITS] units of
+        /// [#SEAL_UNIT_PAGES] pages, the first of which holds one page, so its seal throws.
+        private static void queueWindowWithShortUnit(PageFile.Writer writer) throws IOException {
+            for (var i = 0; i < SEAL_UNITS; i++) {
+                var length = i == 0 ? PageFormat.SIZE : SEAL_UNIT_PAGES * PageFormat.SIZE;
+                writer.write(PageFormat.VALUE, 0, PageFormat.FIRST_UNIT_PAGE + i * SEAL_UNIT_PAGES, SEAL_UNIT_PAGES, new byte[length], 1, false);
             }
         }
 
