@@ -1,5 +1,7 @@
 package com.github.auties00.ledger.engine;
 
+import com.github.auties00.ledger.LedgerCorruptedException;
+
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -96,16 +98,21 @@ final class TreeSearch {
     ///
     /// @param cached whether a blob read from the file goes to the cache
     /// @param referenced whether a blob the cache takes counts as read, rather than as the first it evicts
+    /// @throws LedgerCorruptedException if the leaf records a value longer than its blob's content
     static MemorySegment value(PageFile pages, byte[] unit, int entry, boolean cached, boolean referenced) {
         if (TreeNodes.isInline(unit, entry)) {
             return TreeNodes.inlineValue(unit, entry);
         }
-        if (TreeNodes.isExternal(unit, entry)) {
-            var external = pages.blobs().read(TreeNodes.blobRef(unit, entry), cached, referenced);
-            return MemorySegment.ofArray(external).asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry)).asReadOnly();
+        var ref = TreeNodes.blobRef(unit, entry);
+        var blob = TreeNodes.isExternal(unit, entry) ? pages.blobs().read(ref, cached, referenced)
+                : pages.read(ref, PageFormat.VALUE, cached, referenced);
+        var length = TreeNodes.blobLength(unit, entry);
+        // The cache may hold the blob's header and content alone, which a longer value would read past
+        if (length > Bytes.i32(blob, PageFormat.LENGTH)) {
+            throw new LedgerCorruptedException("A leaf records a value of " + length + " bytes in a unit holding "
+                    + Bytes.i32(blob, PageFormat.LENGTH) + ", at page " + ref.page(), null);
         }
-        var blob = pages.read(TreeNodes.blobRef(unit, entry), PageFormat.VALUE, cached, referenced);
-        return MemorySegment.ofArray(blob).asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry)).asReadOnly();
+        return MemorySegment.ofArray(blob).asSlice(PageFormat.HEADER, length).asReadOnly();
     }
 
     /// {@return the entries of the tree under `root` from `from`, included, to `to`, excluded, either `null` for no

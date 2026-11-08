@@ -198,6 +198,9 @@ final class BlobFile implements AutoCloseable {
 
     /// {@return the plaintext of the unit `ref` names, from the cache or the file}
     ///
+    /// A unit read for the cache may end with its content ([PageFormat#cachedLength(int, int)]); one read past it holds
+    /// its whole pages.
+    ///
     /// @param cached whether to keep the unit in the cache
     /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
@@ -207,7 +210,7 @@ final class BlobFile implements AutoCloseable {
         if (hit != null) {
             return hit;
         }
-        var plain = readUnit(ref);
+        var plain = readUnit(ref, cached);
         if (plain == null) {
             throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
         }
@@ -217,10 +220,18 @@ final class BlobFile implements AutoCloseable {
         return plain;
     }
 
-    /// {@return the plaintext of the unit `ref` names, or `null` if the file does not hold it whole}
+    /// {@return the plaintext of the unit `ref` names, its whole pages, or `null` if the file does not hold it whole}
     ///
     /// @throws LedgerIoException if the file cannot be read
     byte[] readUnit(PageRef ref) {
+        return readUnit(ref, false);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, or `null` if the file does not hold it whole}
+    ///
+    /// @param cached whether the unit is for the cache, and may end with its content
+    /// @throws LedgerIoException if the file cannot be read
+    private byte[] readUnit(PageRef ref, boolean cached) {
         var length = ref.pages() * PageFormat.SIZE;
         var sealed = pool.acquire(length);
         var through = takeChannel();
@@ -239,11 +250,13 @@ final class BlobFile implements AutoCloseable {
                     through = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
                 }
             }
-            var plain = new byte[length];
-            if (!cipher.open(sealed, 0, ref.pages(), plain) || !ref.describes(plain) || plain[PageFormat.KIND] != PageFormat.EXTERNAL) {
+            // The header is the additional data of the tag and the open copies it as it is, so what it says holds once
+            // the unit authenticates: it is checked first, and tells the bytes to keep
+            var content = Bytes.i32(sealed, PageFormat.LENGTH);
+            if (!ref.describes(sealed) || sealed[PageFormat.KIND] != PageFormat.EXTERNAL || !PageFormat.fits(ref.pages(), content)) {
                 return null;
             }
-            return plain;
+            return cipher.open(sealed, 0, ref.pages(), cached ? PageFormat.cachedLength(ref.pages(), content) : length, pool);
         } catch (IOException exception) {
             throw new LedgerIoException(path + " could not be read", exception);
         } finally {

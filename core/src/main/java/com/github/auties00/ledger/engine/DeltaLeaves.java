@@ -54,7 +54,8 @@ final class DeltaLeaves {
         byte[] read(PageRef ref, byte kind);
     }
 
-    /// {@return the leaf the delta record `ref` makes of its base, as a leaf unit whose header names the base}
+    /// {@return the leaf the delta record `ref` makes of its base, as a leaf unit whose header names the base, in an
+    /// array of its header and content}
     ///
     /// @throws LedgerCorruptedException if the page does not hold the record, or the leaf would not fit in a page
     static byte[] materialize(PageRef ref, Source source) {
@@ -72,9 +73,9 @@ final class DeltaLeaves {
         if (size > TreeNodes.CAPACITY) {
             throw new LedgerCorruptedException("A delta record at page " + ref.page() + " makes a leaf too large", null);
         }
-        var unit = new byte[PageFormat.SIZE];
-        var length = TreeNodes.writeLeaf(unit, entries, 0, entries.size());
-        TreeNodes.deltaHeader(unit, base, length);
+        // The count of the entries, then their offsets and the entries themselves, which size() counts together
+        var unit = TreeNodes.writeLeaf(entries, 0, entries.size(), 2 + size);
+        TreeNodes.deltaHeader(unit, base, 2 + size);
         return unit;
     }
 

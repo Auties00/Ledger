@@ -28,6 +28,31 @@ class PageCacheTest {
     }
 
     @Test
+    @DisplayName("finds a unit only under the pages it was cached with, whatever the length of its array")
+    void lookupsByPages() {
+        var cache = PageCache.isolated(LIMIT);
+        // A unit of two pages kept without its padding
+        var unit = new byte[PageFormat.HEADER + 2_500];
+        cache.put(new PageRef(5, 2, 1, 1), unit, false);
+        assertSame(unit, cache.get(new PageRef(5, 2, 1, 1)));
+        assertNull(cache.get(new PageRef(5, 1, 1, 1)), "a unit of one page at the same page and nonce");
+        assertNull(cache.get(new PageRef(5, 3, 1, 1)), "a unit of three pages at the same page and nonce");
+    }
+
+    @Test
+    @DisplayName("counts the bytes of the arrays it holds, not of their units' pages")
+    void countsArrays() {
+        var cache = PageCache.isolated(LIMIT);
+        cache.put(new PageRef(5, 1, 1, 1), new byte[PageFormat.HEADER + 2_500], false);
+        cache.put(new PageRef(9, 3, 1, 2), new byte[PageFormat.HEADER + 9_000], false);
+        assertEquals(2L * PageFormat.HEADER + 11_500, cache.size());
+        cache.remove(5);
+        assertEquals(PageFormat.HEADER + 9_000, cache.size());
+        cache.put(new PageRef(9, 3, 1, 3), new byte[3 * PageFormat.SIZE], false);
+        assertEquals(3 * PageFormat.SIZE, cache.size(), "the replaced entry still counts");
+    }
+
+    @Test
     @DisplayName("evicts at a tick of the idle ticker the entries no read used since the tick before, however far below its limit")
     void idleEviction() {
         var cache = PageCache.isolated(LIMIT);

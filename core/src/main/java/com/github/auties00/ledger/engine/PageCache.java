@@ -17,11 +17,12 @@ import java.util.concurrent.atomic.AtomicLong;
 /// most. So one busy store may use the whole limit while the others are idle, and a store that starts reading takes
 /// back its share. A limit of each store's own let a process of many stores keep many limits of pages.
 ///
-/// An entry holds the plaintext of the unit and is never written again, so a reader keeps using an array the cache has
-/// evicted: the array goes to the collector, not back to a pool, and no read pins anything. An entry is found only
-/// under the nonce its unit was sealed with ([PageRef]), so a page a later checkpoint reused never returns the unit it
-/// held before. An entry the cache drops lets go of its array at once, though the clock reaches it later: the memory
-/// the cache keeps reachable stays within its limit.
+/// An entry holds the plaintext of the unit, which may end with its content ([PageFormat#cachedLength(int, int)]), and
+/// is never written again, so a reader keeps using an array the cache has evicted: the array goes to the collector, not
+/// back to a pool, and no read pins anything. The limit counts the bytes of the arrays, not of the units' pages. An
+/// entry is found only under the nonce and the pages its unit was sealed with ([PageRef]), so a page a later checkpoint
+/// reused never returns the unit it held before. An entry the cache drops lets go of its array at once, though the
+/// clock reaches it later: the memory the cache keeps reachable stays within its limit.
 ///
 /// An entry no read used for a whole period of the [IdleTicker] leaves at its next tick, however full the caches are:
 /// the clock evicts only past the limit, so a store that stopped reading kept a limit of pages, mostly the ones its last
@@ -91,11 +92,11 @@ final class PageCache implements IdleTicker.Watched {
     /// {@return the plaintext of the unit `ref` names, at `key`, or `null` if the cache does not hold it}
     byte[] get(long key, PageRef ref) {
         var entry = entries.get(key);
-        if (entry == null || entry.nonceHigh != ref.nonceHigh() || entry.nonceLow != ref.nonceLow()) {
+        if (entry == null || entry.nonceHigh != ref.nonceHigh() || entry.nonceLow != ref.nonceLow() || entry.pages != ref.pages()) {
             return null;
         }
         var unit = entry.unit;
-        if (unit == null || unit.length != ref.pages() * PageFormat.SIZE) {
+        if (unit == null) {
             return null;
         }
         // Written only when they change: a volatile store on every hit made the readers of one page, the root
@@ -129,7 +130,7 @@ final class PageCache implements IdleTicker.Watched {
         if (closed) {
             return;
         }
-        var entry = new Entry(key, ref.nonceHigh(), ref.nonceLow(), unit);
+        var entry = new Entry(key, ref, unit);
         entry.referenced = referenced;
         account(unit.length);
         var previous = entries.put(key, entry);
@@ -399,6 +400,8 @@ final class PageCache implements IdleTicker.Watched {
         final long key;
         final long nonceHigh;
         final int nonceLow;
+        // The pages of the unit, which its array may be shorter than
+        final int pages;
         final int length;
         // The plaintext, or null once the cache dropped the entry
         volatile byte[] unit;
@@ -407,10 +410,11 @@ final class PageCache implements IdleTicker.Watched {
         // stale read only delays an eviction by a tick or evicts an entry just read, which the next read caches again
         boolean idle;
 
-        Entry(long key, long nonceHigh, int nonceLow, byte[] unit) {
+        Entry(long key, PageRef ref, byte[] unit) {
             this.key = key;
-            this.nonceHigh = nonceHigh;
-            this.nonceLow = nonceLow;
+            this.nonceHigh = ref.nonceHigh();
+            this.nonceLow = ref.nonceLow();
+            this.pages = ref.pages();
             this.length = unit.length;
             this.unit = unit;
         }
