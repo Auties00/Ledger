@@ -190,7 +190,7 @@ class LogRunTest {
             this.files = new LogFiles(directory, keys, STORE_ID);
             var empty = mode == WriteThrough.Mode.OFF ? null : files.prepare(1, segmentSize, true, true, () -> false);
             this.writer = new LogWriter(files, keys, STORE_ID, 1, 0, segmentSize, Runnable::run, Duration.ZERO, empty,
-                    WriteThrough.of(mode, directory));
+                    WriteThrough.of(mode, directory), HeapPool.process(), LogWriter.AHEAD_FROM);
             this.bodies = new ArrayList<>();
         }
 

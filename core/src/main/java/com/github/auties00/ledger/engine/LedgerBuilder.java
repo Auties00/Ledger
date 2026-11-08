@@ -36,6 +36,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private long checkpointEvery;
     private Duration commitWindow;
     private long segmentSize;
+    private long sealAheadFrom;
     private long checkpointHeap;
     private Consumer<? super LedgerException> backgroundFailures;
     private long largeValues;
@@ -53,6 +54,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         this.checkpointEvery = defaultCheckpointEvery();
         this.commitWindow = Duration.ZERO;
         this.segmentSize = SEGMENT_SIZE;
+        this.sealAheadFrom = LogWriter.AHEAD_FROM;
         // The writes the trees lack may hold up to half the heap before commits wait for more than two intervals
         this.checkpointHeap = Runtime.getRuntime().maxMemory() / 2;
         this.backgroundFailures = _ -> {
@@ -65,6 +67,13 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     /// 64 MiB.
     LedgerBuilder segmentSize(long bytes) {
         this.segmentSize = bytes;
+        return this;
+    }
+
+    /// Sets the bytes of frames queued behind a group from which the log forces it on a thread of its own while it seals
+    /// them, so tests seal ahead with small commits.
+    LedgerBuilder sealAheadFrom(long bytes) {
+        this.sealAheadFrom = bytes;
         return this;
     }
 
@@ -321,7 +330,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var through = writeThroughWay != null ? writeThroughWay
                     : WriteThrough.of(writeThrough != null ? writeThrough : WriteThrough.Mode.fromProperty(), logDirectory);
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
-                    segmentSize, pool.executor(), commitWindow, empty, through);
+                    segmentSize, pool.executor(), commitWindow, empty, through, heap, sealAheadFrom);
             var deltaTable = superblock == null ? null : superblock.deltaTable();
             var deltas = deltaTable == null ? DeltaTable.EMPTY
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));
