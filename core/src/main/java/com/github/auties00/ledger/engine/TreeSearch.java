@@ -31,7 +31,7 @@ final class TreeSearch {
     static byte lookupCached(PageFile pages, TreeRoot root, MemorySegment key) {
         var unit = pages.cached(root.ref(), PageFile.NODE);
         while (unit != null && !TreeNodes.isLeaf(unit)) {
-            unit = pages.cached(TreeNodes.childRef(unit, TreeNodes.childFor(unit, key)), PageFile.NODE);
+            unit = pages.cachedNode(unit, TreeNodes.childFor(unit, key));
         }
         if (unit == null) {
             return UNKNOWN;
@@ -43,7 +43,7 @@ final class TreeSearch {
     static Hit find(PageFile pages, TreeRoot root, MemorySegment key) {
         var unit = pages.read(root.ref(), PageFile.NODE, true);
         while (!TreeNodes.isLeaf(unit)) {
-            unit = pages.read(TreeNodes.childRef(unit, TreeNodes.childFor(unit, key)), PageFile.NODE, true);
+            unit = pages.node(unit, TreeNodes.childFor(unit, key));
         }
         var entry = entryOf(unit, key);
         return entry == -1 ? null : new Hit(unit, entry);

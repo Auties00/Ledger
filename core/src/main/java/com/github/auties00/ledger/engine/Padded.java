@@ -135,4 +135,22 @@ final class Padded {
     static final class Sequenced extends SequencedFields {
         long q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14, q15, q16;
     }
+
+    abstract static class ClockFields extends Before {
+        /// The entries of the table.
+        int live;
+        /// The slots whose entry left and that no entry reused.
+        int tombstones;
+        /// The slot of the entry the clock reaches first, or -1.
+        int oldest = -1;
+        /// The slot of the entry the clock reaches last, or -1.
+        int newest = -1;
+    }
+
+    /// What every put and eviction of a page cache writes, guarded by the cache's lock, away from the fields of its table
+    /// that every read of the cache reads.
+    @SuppressWarnings("unused")
+    static final class Clock extends ClockFields {
+        long q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14, q15, q16;
+    }
 }

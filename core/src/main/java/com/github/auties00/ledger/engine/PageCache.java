@@ -1,12 +1,11 @@
 package com.github.auties00.ledger.engine;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.lang.ref.Cleaner;
 import java.lang.ref.WeakReference;
 import java.util.Map;
 import java.util.WeakHashMap;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /// The opened units of the store's files, by file and first page, within a limit of bytes it shares with the caches of
@@ -20,36 +19,60 @@ import java.util.concurrent.atomic.AtomicLong;
 /// An entry holds the plaintext of the unit and is never written again, so a reader keeps using an array the cache has
 /// evicted: the array goes to the collector, not back to a pool, and no read pins anything. An entry is found only
 /// under the nonce its unit was sealed with ([PageRef]), so a page a later checkpoint reused never returns the unit it
-/// held before. An entry the cache drops lets go of its array at once, though the clock reaches it later: the memory
-/// the cache keeps reachable stays within its limit.
+/// held before. An entry the cache drops lets go of its array at once: the memory the cache keeps reachable stays
+/// within its limit.
 ///
 /// An entry no read used for a whole period of the [IdleTicker] leaves at its next tick, however full the caches are:
 /// the clock evicts only past the limit, so a store that stopped reading kept a limit of pages, mostly the ones its last
 /// checkpoint wrote and no one read, for as long as it stayed open.
+///
+/// The entries live in the parallel arrays of an open-addressing [Table], so a read finds a unit with one probe of
+/// primitive slots instead of walking a map's node, boxed key and entry, and allocates nothing. Reads take no lock:
+/// each validates the slot it read against the slot's array, as a sequence lock validates against its stamp, and a read
+/// that races a writer only misses, which costs a read of the file. Whatever changes the cache holds its lock, and the
+/// eviction of another cache's entries happens outside it, so no thread holds the locks of two caches.
+///
+/// The clock passes the entries in the order they came, as a list through the slots rather than in the order of the
+/// slots: a unit a checkpoint wrote and no one read yet waits its turn behind the older ones, wherever its key hashes,
+/// and is not the next to go because it landed just ahead of the hand.
 final class PageCache implements IdleTicker.Watched {
-    /// The dropped entries the clock may hold beyond the current ones before a sweep takes them out.
-    private static final int SLACK = 64;
     /// The file of the trees, `ledger.data`.
     static final int DATA = 0;
     /// The file of the values written at commit, `ledger.blobs`.
     static final int BLOBS = 1;
     /// The first of the keys of the leaves delta records make, one per slot of a delta page of `ledger.data`.
     private static final int RECORDS = 2;
+    /// The slots of a new table, and the fewest a table shrinks to.
+    private static final int MIN_CAPACITY = 64;
+    /// The most slots of a table, as three longs per slot must fit an array. At half of them, 2^28 entries of at least a
+    /// page each, a terabyte of heap, the cache evicts rather than grow.
+    private static final int MAX_CAPACITY = 1 << 29;
+    /// The key of a slot no entry used since its table was built. Page 0 of the data file is a superblock, which the
+    /// cache never holds.
+    private static final long EMPTY = 0;
+    /// The key of a slot whose entry left, which a probe passes over; it would be a page of file `0xFFFFFFFF`.
+    private static final long TOMBSTONE = -1;
+    /// The flag of an entry a read used since the clock last passed it.
+    private static final byte REFERENCED = 1;
+    /// The flag a tick of the idle ticker sets and a read clears: a tick that finds it set evicts the entry.
+    private static final byte IDLE = 2;
+    /// 2^64 over the golden ratio: multiplying by it spreads the consecutive pages of a file evenly over the slots.
+    private static final long HASH = 0x9E3779B97F4A7C15L;
+    private static final VarHandle META = MethodHandles.arrayElementVarHandle(long[].class);
+    private static final VarHandle UNITS = MethodHandles.arrayElementVarHandle(byte[][].class);
 
-    private final ConcurrentHashMap<Long, Entry> entries;
-    // The entries in eviction order, current or dropped
-    private final ConcurrentLinkedQueue<Entry> clock;
-    // The entries in the clock, which may briefly differ from its length while threads race
-    private final AtomicInteger clockSize;
+    // Guards the changes to the table and to closed
+    private final Object lock;
+    // Replaced whole by a rebuild, which leaves the old one as it was for the readers still on it
+    private volatile Table table;
     private final AtomicLong bytes;
     private final Budget budget;
     // Set once the store closes: a read that ends after it caches nothing, or its bytes would stay in the budget
-    private volatile boolean closed;
+    private boolean closed;
 
     private PageCache(Budget budget) {
-        this.entries = new ConcurrentHashMap<>();
-        this.clock = new ConcurrentLinkedQueue<>();
-        this.clockSize = new AtomicInteger();
+        this.lock = new Object();
+        this.table = new Table(MIN_CAPACITY);
         this.bytes = new AtomicLong();
         this.budget = budget;
     }
@@ -77,75 +100,159 @@ final class PageCache implements IdleTicker.Watched {
         return (long) file << 32 | (page & 0xFFFF_FFFFL);
     }
 
+    /// {@return the key of the unit at page `page` of the data file, or of the leaf delta record `slot` of it makes}
+    ///
+    /// @param slot the record of the delta page, from 0, or -1 for the unit itself
+    static long dataKey(int page, int slot) {
+        return key(slot >= 0 ? RECORDS + slot : DATA, page);
+    }
+
     /// {@return the plaintext of the unit `ref` of the data file names, or of the leaf its delta record makes, or
     /// `null` if the cache does not hold it}
     byte[] get(PageRef ref) {
-        return get(key(ref), ref);
-    }
-
-    /// {@return the key of the unit `ref` of the data file names, or of the leaf its delta record makes}
-    private static long key(PageRef ref) {
-        return key(ref.isRecord() ? RECORDS + ref.slot() : DATA, ref.page());
+        return get(dataKey(ref.page(), ref.slot()), ref);
     }
 
     /// {@return the plaintext of the unit `ref` names, at `key`, or `null` if the cache does not hold it}
     byte[] get(long key, PageRef ref) {
-        var entry = entries.get(key);
-        if (entry == null || entry.nonceHigh != ref.nonceHigh() || entry.nonceLow != ref.nonceLow()) {
+        return get(key, ref.nonceHigh(), ref.nonceLow(), ref.pages());
+    }
+
+    /// {@return the plaintext of the unit of `pages` pages sealed under the nonce `nonceHigh` and `nonceLow`, at `key`,
+    /// or `null` if the cache does not hold it}
+    ///
+    /// It takes no lock and allocates nothing; a put, removal or rebuild it races makes it return `null` at worst.
+    byte[] get(long key, long nonceHigh, int nonceLow, int pages) {
+        var table = this.table;
+        var slot = table.find(key);
+        if (slot < 0) {
             return null;
         }
-        var unit = entry.unit;
-        if (unit == null || unit.length != ref.pages() * PageFormat.SIZE) {
-            return null;
-        }
-        // Written only when they change: a volatile store on every hit made the readers of one page, the root
-        // first, take its entry's line from each other
-        if (!entry.referenced) {
-            entry.referenced = true;
-        }
-        if (entry.idle) {
-            entry.idle = false;
+        var unit = table.unit(slot, key, nonceHigh, nonceLow, pages);
+        if (unit != null) {
+            // Written only when it changes: a store on every hit made the readers of one page, the root first, take
+            // the line of its flag from each other. One that lands on a slot refilled meanwhile only gives its new
+            // entry one more pass of the clock
+            var flags = table.flags;
+            if (flags[slot] != REFERENCED) {
+                flags[slot] = REFERENCED;
+            }
         }
         return unit;
+    }
+
+    /// {@return the plaintext of the unit `ref` of the data file names, or of the leaf its delta record makes, or
+    /// `null` if the cache does not hold it, without counting as a read of the entry}
+    byte[] peek(PageRef ref) {
+        var key = dataKey(ref.page(), ref.slot());
+        var table = this.table;
+        var slot = table.find(key);
+        return slot < 0 ? null : table.unit(slot, key, ref.nonceHigh(), ref.nonceLow(), ref.pages());
     }
 
     /// Caches `unit`, the plaintext of the unit `ref` of the data file names, replacing whatever the cache held for its
     /// page.
     ///
+    /// @param unit an array as [#put(long, PageRef, byte\[\], boolean)] requires
     /// @param referenced whether the unit counts as read, rather than written and maybe never read
     void put(PageRef ref, byte[] unit, boolean referenced) {
-        put(key(ref), ref, unit, referenced);
+        put(dataKey(ref.page(), ref.slot()), ref, unit, referenced);
     }
 
     /// Caches `unit`, the plaintext of the unit `ref` names, at `key`, replacing whatever the cache held there.
     ///
+    /// @param key a key of [#key(int, int)] or [#dataKey(int, int)], never that of page 0 of the data file
+    /// @param unit an array the cache never held under another key or nonce and never will, whose content no one writes
+    ///             again. A reader tells that a slot changed under it by the slot's array, so an array cached again under
+    ///             other metadata could pass as the unit of a nonce it does not hold
     /// @param referenced whether the unit counts as read, rather than written and maybe never read
+    /// @throws IllegalArgumentException if `key` is one the slots keep for themselves
     void put(long key, PageRef ref, byte[] unit, boolean referenced) {
+        if (key == EMPTY || key == TOMBSTONE) {
+            throw new IllegalArgumentException("The page cache holds no unit at key " + key);
+        }
         if (unit.length > budget.limit() / 4) {
             // A unit this large would evict most of the cache for one read; what the page held is out of date
             remove(key);
             return;
         }
-        if (closed) {
-            return;
-        }
-        var entry = new Entry(key, ref.nonceHigh(), ref.nonceLow(), unit);
-        entry.referenced = referenced;
-        account(unit.length);
-        var previous = entries.put(key, entry);
-        if (previous != null) {
-            drop(previous);
-        }
-        if (closed) {
-            // The close may have looked at the entries before this one went in
-            if (entries.remove(key, entry)) {
-                drop(entry);
+        synchronized (lock) {
+            if (closed) {
+                return;
             }
-            return;
+            fill(key, ref, unit, referenced);
         }
-        clock.offer(entry);
-        clockSize.incrementAndGet();
         evict();
+    }
+
+    /// Stores `unit` at `key`, in the slot that holds the key or a free one, as the newest entry of the clock.
+    private void fill(long key, PageRef ref, byte[] unit, boolean referenced) {
+        var table = this.table;
+        var slot = table.find(key);
+        if (slot >= 0) {
+            drain(table, slot);
+        } else {
+            table = roomFor(table);
+            slot = table.vacancy(key);
+            if (table.meta[3 * slot] == TOMBSTONE) {
+                table.clock.tombstones--;
+            }
+        }
+        // The null first, then the metadata, then the unit: a reader that read the old array and any of the new
+        // metadata reads the array again after it and finds it gone
+        UNITS.setRelease(table.units, slot, null);
+        VarHandle.storeStoreFence();
+        META.setOpaque(table.meta, 3 * slot + 1, ref.nonceHigh());
+        META.setOpaque(table.meta, 3 * slot + 2, identity(ref.nonceLow(), ref.pages()));
+        META.setOpaque(table.meta, 3 * slot, key);
+        table.flags[slot] = referenced ? REFERENCED : 0;
+        UNITS.setRelease(table.units, slot, unit);
+        table.append(slot);
+        table.clock.live++;
+        account(unit.length);
+    }
+
+    /// Takes the entry of `slot` out of the clock and the accounts, leaving its array and metadata to the caller.
+    private void drain(Table table, int slot) {
+        table.unlink(slot);
+        table.clock.live--;
+        account(-table.units[slot].length);
+    }
+
+    /// {@return the table to add an entry to: `table`, or one that replaces it, larger if the entries would pass half of
+    /// its slots and of the same size if the slots of departed entries took the room}
+    private Table roomFor(Table table) {
+        var clock = table.clock;
+        var capacity = table.capacity();
+        if (clock.live + 1 > capacity / 2) {
+            if (capacity < MAX_CAPACITY) {
+                return rebuild(table, capacity * 2);
+            }
+            evictFrom(table);
+        }
+        // Three quarters at most in use or gone: the slots a probe passes over cost every read that crosses them
+        return clock.live + clock.tombstones + 1 > capacity - capacity / 4 ? rebuild(table, capacity) : table;
+    }
+
+    /// Publishes a table of `capacity` slots with the entries of `old`, in the clock's order.
+    ///
+    /// A reader still on `old` finds what it held, which is correct for the nonce it asks for.
+    ///
+    /// @return the new table
+    private Table rebuild(Table old, int capacity) {
+        var table = new Table(capacity);
+        for (var slot = old.clock.oldest; slot != -1; slot = old.next(slot)) {
+            var at = table.vacancy(old.meta[3 * slot]);
+            table.meta[3 * at] = old.meta[3 * slot];
+            table.meta[3 * at + 1] = old.meta[3 * slot + 1];
+            table.meta[3 * at + 2] = old.meta[3 * slot + 2];
+            table.units[at] = old.units[slot];
+            table.flags[at] = old.flags[slot];
+            table.append(at);
+            table.clock.live++;
+        }
+        this.table = table;
+        return table;
     }
 
     /// Drops whatever the cache holds for page `page` of the data file.
@@ -155,16 +262,24 @@ final class PageCache implements IdleTicker.Watched {
 
     /// Drops whatever the cache holds at `key`.
     void remove(long key) {
-        var previous = entries.remove(key);
-        if (previous != null) {
-            drop(previous);
+        synchronized (lock) {
+            var table = this.table;
+            var slot = table.find(key);
+            if (slot >= 0 && key != EMPTY) {
+                drop(table, slot);
+            }
         }
     }
 
-    /// Accounts for `entry`, which this thread took out of the map, and lets go of its array.
-    private void drop(Entry entry) {
-        account(-entry.length);
-        entry.unit = null;
+    /// Takes the entry of `slot` out of the table and the accounts, and lets go of its array.
+    private void drop(Table table, int slot) {
+        drain(table, slot);
+        // The null before the key, so a reader that saw the slot change finds its array gone. The slot never goes back
+        // to empty, or a probe would stop before the keys past it
+        UNITS.setRelease(table.units, slot, null);
+        VarHandle.storeStoreFence();
+        META.setOpaque(table.meta, 3 * slot, TOMBSTONE);
+        table.clock.tombstones++;
     }
 
     private void account(long delta) {
@@ -174,30 +289,45 @@ final class PageCache implements IdleTicker.Watched {
 
     /// Drops every entry and leaves the budget, as the store closes; a read that ends after it caches nothing.
     void close() {
-        closed = true;
+        synchronized (lock) {
+            closed = true;
+            dropAll();
+        }
         budget.leave(this);
         IdleTicker.unwatch(this);
-        for (var entry : entries.values()) {
-            if (entries.remove(entry.key, entry)) {
-                drop(entry);
-            }
-        }
-        clock.clear();
-        clockSize.set(0);
+    }
+
+    /// Replaces the table with an empty one and gives back the bytes of its entries.
+    private void dropAll() {
+        account(-bytes.get());
+        this.table = new Table(MIN_CAPACITY);
     }
 
     /// Evicts the entries no read used since the last tick, and marks the others to be evicted at the next unless a read
-    /// uses them; then takes the dropped entries out of the clock.
+    /// uses them; then shrinks a table that fewer than a sixteenth of its slots use.
     @Override
     public void tick() {
-        for (var entry : entries.values()) {
-            if (!entry.idle) {
-                entry.idle = true;
-            } else if (entries.remove(entry.key, entry)) {
-                drop(entry);
+        synchronized (lock) {
+            var table = this.table;
+            var units = table.units;
+            var flags = table.flags;
+            for (var slot = 0; slot < units.length; slot++) {
+                if (units[slot] == null) {
+                    continue;
+                }
+                var state = flags[slot];
+                if ((state & IDLE) == 0) {
+                    flags[slot] = (byte) (state | IDLE);
+                } else {
+                    drop(table, slot);
+                }
+            }
+            var live = table.clock.live;
+            if (table.capacity() > MIN_CAPACITY && live < table.capacity() / 16) {
+                // At least four slots an entry, so it takes many puts to grow the table again
+                rebuild(table, Math.max(MIN_CAPACITY, Integer.highestOneBit(Math.max(live, 1) * 8 - 1)));
             }
         }
-        compact();
     }
 
     /// {@return the bytes the cache holds}
@@ -211,27 +341,41 @@ final class PageCache implements IdleTicker.Watched {
         return budget.total.get() + bytes <= budget.limit();
     }
 
-    /// {@return the entries the clock holds, current or dropped, for tests that bound it}
+    /// {@return the entries the clock holds, for tests that bound it}
     int clockLengthForTests() {
-        return clock.size();
+        synchronized (lock) {
+            var length = 0;
+            var table = this.table;
+            for (var slot = table.clock.oldest; slot != -1; slot = table.next(slot)) {
+                length++;
+            }
+            return length;
+        }
+    }
+
+    /// {@return the slots of the table, for tests that bound it}
+    int capacityForTests() {
+        return table.capacity();
+    }
+
+    /// {@return the slots whose entry left and that no entry reused, for tests that bound them}
+    int tombstonesForTests() {
+        synchronized (lock) {
+            return table.clock.tombstones;
+        }
     }
 
     /// Drops every entry, so tests read units from the file.
     void clearForTests() {
-        for (var entry : entries.values()) {
-            if (entries.remove(entry.key, entry)) {
-                drop(entry);
-            }
+        synchronized (lock) {
+            dropAll();
         }
-        clock.clear();
-        clockSize.set(0);
     }
 
-    /// Evicts entries while the caches of the budget hold more than its limit, from this cache while it holds more
-    /// than its share and from the one that holds the most otherwise, and takes dropped entries out of the clock once
-    /// they outnumber the current ones.
+    /// Evicts entries while the caches of the budget hold more than its limit, from this cache while it holds more than
+    /// its share and from the one that holds the most otherwise.
     ///
-    /// Each dropped entry costs one step of a later sweep, so the work stays proportional to the puts.
+    /// It holds no lock between evictions: two caches evicting from each other would otherwise wait for each other.
     private void evict() {
         while (budget.over()) {
             var target = bytes.get() > budget.share() ? this : budget.largest();
@@ -239,51 +383,172 @@ final class PageCache implements IdleTicker.Watched {
                 break;
             }
         }
-        compact();
     }
 
     /// Evicts the next entry the clock finds unreferenced, giving each referenced one another pass.
     ///
-    /// @return whether it evicted one; `false` if the clock holds none it could
+    /// @return whether it evicted one; `false` if the cache holds none
     private boolean evictOne() {
-        // Every entry gets one more pass when referenced, so twice the clock bounds the sweep
-        var steps = 2 * clockSize.get() + 1;
+        synchronized (lock) {
+            return evictFrom(table);
+        }
+    }
+
+    /// Evicts the next entry of `table`, the current one, the clock finds unreferenced.
+    private boolean evictFrom(Table table) {
+        // Every entry gets one more pass when referenced, so twice the entries bound the sweep
+        var steps = 2 * (long) table.clock.live + 1;
+        var flags = table.flags;
         while (steps-- > 0) {
-            var entry = clock.poll();
-            if (entry == null) {
+            var slot = table.clock.oldest;
+            if (slot == -1) {
                 return false;
             }
-            clockSize.decrementAndGet();
-            if (entries.get(entry.key) != entry) {
-                // Replaced or removed already
-                continue;
+            var state = flags[slot];
+            if ((state & REFERENCED) == 0) {
+                drop(table, slot);
+                return true;
             }
-            if (!entry.referenced) {
-                if (entries.remove(entry.key, entry)) {
-                    drop(entry);
-                    return true;
-                }
-                continue;
-            }
-            entry.referenced = false;
-            clock.offer(entry);
-            clockSize.incrementAndGet();
+            flags[slot] = (byte) (state & ~REFERENCED);
+            table.unlink(slot);
+            table.append(slot);
         }
         return false;
     }
 
-    /// Takes dropped entries out of the clock once they outnumber the current ones.
-    private void compact() {
-        var steps = 2 * clockSize.get() + 1;
-        while (steps-- > 0 && clockSize.get() > 2 * entries.size() + SLACK) {
-            var entry = clock.poll();
-            if (entry == null) {
-                return;
+    /// {@return the third long of a slot's metadata}
+    private static long identity(int nonceLow, int pages) {
+        return (long) nonceLow << 32 | (pages & 0xFFFF_FFFFL);
+    }
+
+    /// The slots of a cache, in arrays indexed by the hash of the key, probed linearly.
+    ///
+    /// A slot starts [#EMPTY], which ends a probe, and in a published table never goes back to it: a slot whose entry
+    /// left holds [#TOMBSTONE] until a later entry reuses it, and a rebuild clears them by publishing a new table.
+    /// Readers read the fields of the table and the slots; the fields that change at every put are in a [Padded.Clock]
+    /// away from them. Everything but [#find(long)] and [#unit(int, long, long, int, int)] runs under the lock of the
+    /// cache, or on a table not published yet.
+    private static final class Table {
+        // Three longs per slot: the key, the first 8 bytes of the nonce, and the last 4 with the unit's pages
+        final long[] meta;
+        // The plaintext of each slot, or null when the slot holds no entry or a writer is changing it
+        final byte[][] units;
+        // REFERENCED and IDLE per slot, apart from the metadata so that a read that sets them dirties no line of it
+        final byte[] flags;
+        // Two ints per slot: the next newer and the next older entry of the clock, or -1
+        final int[] links;
+        final int mask;
+        final int shift;
+        final Padded.Clock clock;
+
+        Table(int capacity) {
+            this.meta = new long[3 * capacity];
+            this.units = new byte[capacity][];
+            this.flags = new byte[capacity];
+            this.links = new int[2 * capacity];
+            this.mask = capacity - 1;
+            this.shift = Long.numberOfLeadingZeros(capacity - 1L);
+            this.clock = new Padded.Clock();
+        }
+
+        int capacity() {
+            return mask + 1;
+        }
+
+        /// {@return the slot that holds `key`, or -1; a slot a writer is changing fails [#unit(int, long, long, int, int)]}
+        int find(long key) {
+            var meta = this.meta;
+            var mask = this.mask;
+            var slot = (int) (key * HASH >>> shift);
+            for (var probes = 0; probes <= mask; probes++) {
+                var found = (long) META.getOpaque(meta, 3 * slot);
+                if (found == key) {
+                    return slot;
+                }
+                if (found == EMPTY) {
+                    return -1;
+                }
+                slot = (slot + 1) & mask;
             }
-            clockSize.decrementAndGet();
-            if (entries.get(entry.key) == entry) {
-                clock.offer(entry);
-                clockSize.incrementAndGet();
+            return -1;
+        }
+
+        /// {@return the array of `slot` if it holds the unit the arguments name, or `null`}
+        ///
+        /// The array is read first and again after the metadata: a writer takes it out before it changes the metadata
+        /// and puts the new one in after, and no array is ever cached under two identities, so an array read the same
+        /// both times held the metadata read between them.
+        ///
+        /// The leaf of a delta record has the header of its base leaf, so the metadata alone speaks for it; any other
+        /// unit also has its header compared, which leaves such a hit correct whatever the slot's race.
+        byte[] unit(int slot, long key, long nonceHigh, int nonceLow, int pages) {
+            var units = this.units;
+            var meta = this.meta;
+            var unit = (byte[]) UNITS.getAcquire(units, slot);
+            if (unit == null) {
+                return null;
+            }
+            var at = 3 * slot;
+            var same = (long) META.getOpaque(meta, at) == key
+                    & (long) META.getOpaque(meta, at + 1) == nonceHigh
+                    & (long) META.getOpaque(meta, at + 2) == identity(nonceLow, pages);
+            VarHandle.loadLoadFence();
+            if (!same || (byte[]) UNITS.getOpaque(units, slot) != unit) {
+                return null;
+            }
+            return key >>> 32 >= RECORDS || describes(unit, (int) key, nonceHigh, nonceLow, pages) ? unit : null;
+        }
+
+        private static boolean describes(byte[] unit, int page, long nonceHigh, int nonceLow, int pages) {
+            return Bytes.i32(unit, PageFormat.PAGE) == page
+                    && Bytes.i64(unit, PageFormat.NONCE) == nonceHigh
+                    && Bytes.i32(unit, PageFormat.NONCE + 8) == nonceLow
+                    && Bytes.i32(unit, PageFormat.PAGES) == pages;
+        }
+
+        /// {@return the first slot on the probe of `key`, which the table does not hold, that an entry may take}
+        int vacancy(long key) {
+            var slot = (int) (key * HASH >>> shift);
+            while (true) {
+                var found = meta[3 * slot];
+                if (found == EMPTY || found == TOMBSTONE) {
+                    return slot;
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
+
+        /// {@return the next newer entry of the clock after `slot`, or -1}
+        int next(int slot) {
+            return links[2 * slot];
+        }
+
+        /// Makes `slot` the newest entry of the clock.
+        void append(int slot) {
+            var newest = clock.newest;
+            links[2 * slot] = -1;
+            links[2 * slot + 1] = newest;
+            if (newest == -1) {
+                clock.oldest = slot;
+            } else {
+                links[2 * newest] = slot;
+            }
+            clock.newest = slot;
+        }
+
+        /// Takes `slot` out of the clock.
+        void unlink(int slot) {
+            var next = links[2 * slot];
+            var previous = links[2 * slot + 1];
+            if (previous == -1) {
+                clock.oldest = next;
+            } else {
+                links[2 * previous] = next;
+            }
+            if (next == -1) {
+                clock.newest = previous;
+            } else {
+                links[2 * next + 1] = previous;
             }
         }
     }
@@ -392,27 +657,6 @@ final class PageCache implements IdleTicker.Watched {
                 }
             }
             return largest;
-        }
-    }
-
-    private static final class Entry {
-        final long key;
-        final long nonceHigh;
-        final int nonceLow;
-        final int length;
-        // The plaintext, or null once the cache dropped the entry
-        volatile byte[] unit;
-        volatile boolean referenced;
-        // Set by a tick of the idle ticker, cleared by a read: a tick that finds it set evicts the entry. Plain, as a
-        // stale read only delays an eviction by a tick or evicts an entry just read, which the next read caches again
-        boolean idle;
-
-        Entry(long key, long nonceHigh, int nonceLow, byte[] unit) {
-            this.key = key;
-            this.nonceHigh = nonceHigh;
-            this.nonceLow = nonceLow;
-            this.length = unit.length;
-            this.unit = unit;
         }
     }
 }
