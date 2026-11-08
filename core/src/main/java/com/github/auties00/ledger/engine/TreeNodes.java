@@ -41,6 +41,12 @@ final class TreeNodes {
     static final int MAX_ENTRY = CAPACITY / 2;
     /// The fill below which a node a checkpoint rewrote merges with a neighbour.
     static final int MIN_FILL = CAPACITY / 4;
+    /// The fill to split leaves to that nothing is expected to grow, in sixteenths of [#CAPACITY].
+    static final int TARGET_FULL = 16;
+    /// The fill to split leaves to whose entries may grow a little, in sixteenths of [#CAPACITY].
+    static final int TARGET_NEAR_FULL = 15;
+    /// The fill to split leaves to that take new keys among their old ones, in sixteenths of [#CAPACITY].
+    static final int TARGET_ROOMY = 14;
     private static final int BRANCH_FIXED = 4 + 8 + 4 + 8 + 1 + 2;
     private static final byte INLINE = 0;
     private static final byte BLOB = 1;
@@ -433,7 +439,43 @@ final class TreeNodes {
         for (var i = 0; i < count; i++) {
             total += sizes[i];
         }
-        var remainingPages = Math.max(1, (int) ((total + CAPACITY - 1) / CAPACITY));
+        return spread(sizes, count, total, (int) ((total + CAPACITY - 1) / CAPACITY));
+    }
+
+    /// {@return the runs, as pairs of first and last index, that split items of `sizes` evenly into the nodes
+    /// [#nodesFor(int\[\], int, int)] counts}
+    ///
+    /// @param target the sixteenths of [#CAPACITY] to fill a node to on average
+    static List<int[]> split(int[] sizes, int count, int target) {
+        var total = 0L;
+        for (var i = 0; i < count; i++) {
+            total += sizes[i];
+        }
+        return spread(sizes, count, total, nodesFor(sizes, count, target));
+    }
+
+    /// {@return the nodes that hold items of `sizes` at `target` sixteenths of [#CAPACITY] on average, and at least as
+    /// many as filling each to its capacity in turn takes, so that an even spread leaves no small node at the end}
+    static int nodesFor(int[] sizes, int count, int target) {
+        var total = 0L;
+        var greedy = 0;
+        var fill = 0L;
+        for (var i = 0; i < count; i++) {
+            total += sizes[i];
+            if (i == 0 || fill + sizes[i] > CAPACITY) {
+                greedy++;
+                fill = 0;
+            }
+            fill += sizes[i];
+        }
+        var divisor = (long) target * CAPACITY;
+        return Math.max(greedy, Math.toIntExact((TARGET_FULL * total + divisor - 1) / divisor));
+    }
+
+    /// {@return the runs that spread items of `sizes`, `total` bytes, evenly over `pages` nodes, past which it goes on
+    /// only if entries too large for the room left stop nodes short of their share; no node passes [#CAPACITY]}
+    private static List<int[]> spread(int[] sizes, int count, long total, int pages) {
+        var remainingPages = Math.max(1, pages);
         var remaining = total;
         var runs = new ArrayList<int[]>(remainingPages);
         var index = 0;
