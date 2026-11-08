@@ -61,12 +61,12 @@ class LazyListStressTest {
         entries.set(state, hooked);
         state.pruneListed(0);
         var listed = new ArrayList<Chain>();
-        for (var chain = head(state); chain != null; chain = chain.nextUnordered) {
+        for (var chain = head(state); chain != null; chain = chain.link) {
             listed.add(chain);
         }
         assertEquals(java.util.List.of(pushed[1], pushed[0]), listed);
         assertTrue(hooked.get(head.key()) == head);
-        assertTrue(head.nextUnordered == null && dropped.nextUnordered == null);
+        assertTrue(head.link == null && dropped.link == null);
     }
 
     @ParameterizedTest
@@ -164,7 +164,7 @@ class LazyListStressTest {
         Set<Chain> listed = Collections.newSetFromMap(new IdentityHashMap<>());
         var droppedInList = 0;
         var steps = 0;
-        for (var chain = head(state); chain != null; chain = chain.nextUnordered) {
+        for (var chain = head(state); chain != null; chain = chain.link) {
             assertTrue(++steps <= pushers * perPusher, "cycle in the list");
             assertTrue(listed.add(chain), "a chain listed twice");
             if (chain.released()) {
@@ -183,7 +183,7 @@ class LazyListStressTest {
         assertTrue(droppedListed(state) >= droppedInList,
                 "counter " + droppedListed(state) + " below the " + droppedInList + " dropped chains listed");
         state.pruneListed(-1);
-        for (var chain = head(state); chain != null; chain = chain.nextUnordered) {
+        for (var chain = head(state); chain != null; chain = chain.link) {
             assertTrue(!chain.released(), "a dropped chain stayed listed after a prune");
         }
     }

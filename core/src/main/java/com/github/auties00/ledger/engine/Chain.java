@@ -52,9 +52,13 @@ final class Chain {
     final int hash;
     /// The newest version, or `null` before the writer attaches the first one and once it drops the chain.
     volatile Version head;
-    /// The next of the chains a key space lists for a read of a range to order, or `null`; written before the chain
-    /// is listed, and by the thread that takes the list.
-    Chain nextUnordered;
+    /// While a key space lists the chain for a read of a range to order, the next chain listed, or `null`; written
+    /// before the chain is listed, and by the thread that takes it off the list. Once the chain is ordered in a key
+    /// space that links its chains, the chain below it in the ordered map, read through [#below()].
+    ///
+    /// A chain leaves the list before it is ordered, and is never listed again, so the two uses never meet: one field
+    /// keeps the chain at 48 bytes.
+    Chain link;
     /// The sequence of the last write claimed, 0 before any, or [#DROPPED]; only grows.
     @SuppressWarnings("unused")
     private volatile long claimed;
@@ -71,6 +75,7 @@ final class Chain {
     private static final VarHandle LAST_WRITER;
     private static final VarHandle HEAD;
     private static final VarHandle SPAN;
+    private static final VarHandle LINK;
 
     static {
         if (LENGTH_BITS + OFFSET_BITS > Integer.numberOfTrailingZeros(ORDERED)) {
@@ -82,10 +87,16 @@ final class Chain {
             CLAIMED = lookup.findVarHandle(Chain.class, "claimed", long.class);
             LAST_WRITER = lookup.findVarHandle(Chain.class, "lastWriter", PendingCommit.class);
             HEAD = lookup.findVarHandle(Chain.class, "head", Version.class);
+            LINK = lookup.findVarHandle(Chain.class, "link", Chain.class);
         } catch (ReflectiveOperationException exception) {
             throw new ExceptionInInitializerError(exception);
         }
     }
+
+    /// What the link of the lowest chain of an ordered map holds: no chain is below it.
+    ///
+    /// A `null` link is a chain not linked yet, whose reader asks the map for the chain below.
+    static final Chain BOTTOM = new Chain(MemorySegment.ofArray(new byte[0]).asReadOnly(), 0);
 
     /// Makes `version` the newest version, with a release store, which publishes it to the readers that load
     /// [#head] after.
@@ -190,6 +201,21 @@ final class Chain {
     /// follows.
     void markOrdered() {
         SPAN.getAndBitwiseOr(this, ORDERED);
+    }
+
+    /// {@return the chain below this one in the ordered map, [#BOTTOM] if none is, or `null` if the key space did not
+    /// link it, or the chain left the map and a repair let go of its link}
+    ///
+    /// An acquire load, which sees the link of the chain returned as it was when this link was set to it. The chain
+    /// returned may have left the map since: its own link leads on down it.
+    Chain below() {
+        return (Chain) LINK.getAcquire(this);
+    }
+
+    /// Links `chain`, [#BOTTOM] for none or `null` to clear the link, as the one below this chain in the ordered map,
+    /// with a release store, which publishes the link of `chain` to the readers that load this one after.
+    void linkBelow(Chain chain) {
+        LINK.setRelease(this, chain);
     }
 
     /// {@return whether the writer took the chain out of the maps, after which no version is attached to it again}
