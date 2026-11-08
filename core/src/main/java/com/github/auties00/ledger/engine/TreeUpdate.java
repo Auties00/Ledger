@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.RecursiveTask;
@@ -21,6 +22,12 @@ import java.util.concurrent.RecursiveTask;
 ///
 /// A leaf below the root that the writes change by a little is written as a delta record of what changed since its
 /// base leaf ([DeltaLeaves]); one that changes more, splits, or falls under a quarter full is written whole.
+///
+/// Sibling leaves written whole next to each other split together: a leaf that splits alone leaves two half-full
+/// leaves, and one whose entries are only overwritten keeps its fill forever, so every checkpoint that rewrites it
+/// reads, seals and forces its slack. How full the run's leaves end up depends on how the writes reached them
+/// ([#target(List)]), and a run that would keep its number of leaves keeps its boundaries
+/// ([#splitsTogether(List, int\[\], int)]). A leaf written whole with no such neighbour splits on its own.
 ///
 /// The units of the old tree the update replaces go to [#freed()]; the pages it takes go to [#allocated()], so a
 /// checkpoint that fails gives them back. The delta records it writes and those it drops are counted by page, which
@@ -192,15 +199,20 @@ final class TreeUpdate {
             if (merged == null) {
                 return null;
             }
-            result = writeLeaves(merged);
+            result = writeLeaves(merged.entries());
         } else {
             var unit = read(root.ref(), PageFile.NODE, true);
             var node = new Child(null, root.ref(), root.count(), root.blobs(), TreeNodes.level(unit), -1);
-            var replaced = update(node, unit, null, null, ops, 0, ops.size(), removals, 0, removals.size(), true);
-            if (replaced == null) {
-                return root;
+            switch (update(node, unit, null, null, ops, 0, ops.size(), removals, 0, removals.size(), true)) {
+                case null -> {
+                    return root;
+                }
+                case Written written -> result = new ArrayList<>(written.nodes());
+                case Rewrite rewrite -> {
+                    retire(rewrite.ref(), rewrite.base());
+                    result = writeLeaves(rewrite.merged());
+                }
             }
-            result = new ArrayList<>(replaced);
         }
         mergeUnderfull(result);
         while (result.size() > 1) {
@@ -228,10 +240,13 @@ final class TreeUpdate {
         return new TreeRoot(top.ref(), top.count(), top.blobs());
     }
 
-    /// {@return the nodes that replace `node`, or `null` if the writes change nothing under it}
+    /// {@return what replaces `node`, or `null` if the writes change nothing under it}
+    ///
+    /// A leaf to write whole comes back unwritten, for the caller to write and give up: only a leaf does, as a branch
+    /// writes those among its children itself.
     ///
     /// @param root whether `node` is the root, which is never a delta record
-    private List<Child> update(Child node, byte[] unit, MemorySegment low, MemorySegment high, List<Op> ops,
+    private Replacement update(Child node, byte[] unit, MemorySegment low, MemorySegment high, List<Op> ops,
                                int opFrom, int opTo, List<Range> removals, int remFrom, int remTo, boolean root) throws IOException {
         if (TreeNodes.isLeaf(unit)) {
             var entries = TreeNodes.leafEntries(unit);
@@ -241,13 +256,16 @@ final class TreeUpdate {
             }
             var base = TreeNodes.base(unit, node.ref());
             if (!root) {
-                var delta = writeDelta(node.ref(), base, entries, merged);
+                var delta = writeDelta(node.ref(), base, entries, merged.entries());
                 if (delta != null) {
-                    return delta.isEmpty() ? null : delta;
+                    return delta.isEmpty() ? null : new Written(delta);
                 }
             }
-            retire(node.ref(), base);
-            return writeLeaves(merged);
+            var size = 2;
+            for (var entry : merged.entries()) {
+                size += entry.size();
+            }
+            return new Rewrite(node.ref(), base, merged.entries(), merged.inserted(), merged.gaps(), size != Bytes.i32(unit, PageFormat.LENGTH));
         }
         var children = TreeNodes.children(unit);
         // What each child takes: none of the writes, a removal of all of it, or a share of them
@@ -286,42 +304,113 @@ final class TreeUpdate {
             }
             op = opEnd;
         }
-        var replacements = updates > 1 && opTo - opFrom >= PARALLEL_OPS
-                ? updateInParallel(children, plans, ops, removals)
-                : updateInTurn(children, plans, ops, removals);
+        var replacements = updates > 1 && opTo - opFrom >= PARALLEL_OPS ? updateInParallel(children, plans, ops, removals) : null;
         var out = new ArrayList<Child>(children.size() + 4);
+        // The leaves to write whole since the last child that stays or takes a delta record, written as soon as that
+        // child comes; the children of a branch hold their keys in order, and a dropped child leaves its neighbours
+        // next to each other
+        var run = new ArrayList<Rewrite>();
         var changed = false;
         for (var i = 0; i < children.size(); i++) {
             var child = children.get(i);
-            if (plans[i] == Plan.DROP) {
+            var plan = plans[i];
+            if (plan == Plan.DROP) {
                 drop(child);
                 changed = true;
-            } else if (replacements[i] == null) {
-                out.add(child);
-            } else {
-                out.addAll(replacements[i]);
+                continue;
+            }
+            var replacement = replacements != null ? replacements[i] : plan == null ? null : update(child, ops, removals, plan);
+            if (replacement instanceof Rewrite rewrite) {
+                run.add(rewrite);
                 changed = true;
+                continue;
+            }
+            writeRun(run, out);
+            if (replacement instanceof Written written) {
+                out.addAll(written.nodes());
+                changed = true;
+            } else {
+                out.add(child);
             }
         }
+        writeRun(run, out);
         if (!changed) {
             return null;
         }
         mergeUnderfull(out);
         freed.add(node.ref());
-        return out.isEmpty() ? List.of() : writeBranches(out);
+        return new Written(out.isEmpty() ? List.of() : writeBranches(out));
     }
 
-    /// {@return what replaces each child that `plans` gives a share of the writes to, `null` where nothing does}
-    @SuppressWarnings("unchecked")
-    private List<Child>[] updateInTurn(List<Child> children, Plan[] plans, List<Op> ops, List<Range> removals) throws IOException {
-        var replacements = (List<Child>[]) new List<?>[children.size()];
-        for (var i = 0; i < children.size(); i++) {
-            var plan = plans[i];
-            if (plan != null && plan != Plan.DROP) {
-                replacements[i] = update(children.get(i), ops, removals, plan);
+    /// Writes the leaves of `run`, next to each other under one branch, to `out`, gives up the units they replace and
+    /// empties `run`.
+    private void writeRun(List<Rewrite> run, List<Child> out) throws IOException {
+        for (var rewrite : run) {
+            retire(rewrite.ref(), rewrite.base());
+        }
+        if (run.size() > 1) {
+            var entries = new ArrayList<LeafEntry>();
+            for (var rewrite : run) {
+                entries.addAll(rewrite.merged());
+            }
+            var sizes = sizes(entries);
+            var target = target(run);
+            if (splitsTogether(run, sizes, target)) {
+                out.addAll(writeLeaves(entries, sizes, TreeNodes.split(sizes, sizes.length, target)));
+                run.clear();
+                return;
             }
         }
-        return replacements;
+        for (var rewrite : run) {
+            out.addAll(writeLeaves(rewrite.merged()));
+        }
+        run.clear();
+    }
+
+    /// {@return the sixteenths of a leaf to fill the leaves of `run` to}
+    ///
+    /// New keys scattered over the run, as random ids, keep coming, so its leaves keep room for the next checkpoint's
+    /// as delta records: a full leaf takes none, and the first splits it in two halves. New keys in blocks, as the
+    /// messages a chat appends, are followed by more past them rather than among them, so their leaves are left full.
+    /// At most two new keys a gap, over two gaps or more, tells the first from the second. Entries changed in place
+    /// that take the bytes they took have no reason to grow; any other change may grow a little.
+    private static int target(List<Rewrite> run) {
+        var inserted = 0;
+        var gaps = 0;
+        var resized = false;
+        for (var rewrite : run) {
+            inserted += rewrite.inserted();
+            gaps += rewrite.gaps();
+            resized |= rewrite.resized();
+        }
+        if (gaps >= 2 && inserted <= 2 * gaps) {
+            return TreeNodes.TARGET_ROOMY;
+        }
+        return (gaps > 0 ? inserted > 2 * gaps : !resized) ? TreeNodes.TARGET_FULL : TreeNodes.TARGET_NEAR_FULL;
+    }
+
+    /// {@return whether the leaves of `run`, whose entries take `sizes` in order, split together to `target` rather
+    /// than each on its own}
+    ///
+    /// They do if that saves a leaf. If it takes more they do only once the leaves on their own would be fuller than
+    /// [TreeNodes#TARGET_NEAR_FULL]: a few leaves round up to a leaf more than their fill asks for, which would halve
+    /// their room for nothing. Otherwise the boundaries stay, as moving them would gain nothing.
+    private static boolean splitsTogether(List<Rewrite> run, int[] sizes, int target) {
+        var alone = 0;
+        var total = 0L;
+        var from = 0;
+        for (var rewrite : run) {
+            var to = from + rewrite.merged().size();
+            var size = 0L;
+            for (var i = from; i < to; i++) {
+                size += sizes[i];
+            }
+            alone += size == 0 ? 0 : size <= TreeNodes.CAPACITY ? 1 : TreeNodes.split(Arrays.copyOfRange(sizes, from, to), to - from).size();
+            total += size;
+            from = to;
+        }
+        var together = TreeNodes.nodesFor(sizes, sizes.length, target);
+        return together < alone || (together > alone && TreeNodes.TARGET_FULL * total > TreeNodes.TARGET_NEAR_FULL * (long) TreeNodes.CAPACITY * alone);
     }
 
     /// Updates, on every processor, each child that `plans` gives a share of the writes to.
@@ -331,9 +420,8 @@ final class TreeUpdate {
     /// would otherwise rewrite them on one processor.
     ///
     /// @return what replaces each child, `null` where nothing does
-    @SuppressWarnings("unchecked")
-    private List<Child>[] updateInParallel(List<Child> children, Plan[] plans, List<Op> ops, List<Range> removals) throws IOException {
-        var replacements = (List<Child>[]) new List<?>[children.size()];
+    private Replacement[] updateInParallel(List<Child> children, Plan[] plans, List<Op> ops, List<Range> removals) throws IOException {
+        var replacements = new Replacement[children.size()];
         var tasks = new ArrayList<Subtree>();
         for (var i = 0; i < children.size(); i++) {
             var plan = plans[i];
@@ -360,8 +448,8 @@ final class TreeUpdate {
         return replacements;
     }
 
-    /// {@return the nodes that replace `child`, or `null` if the writes `plan` gives it change nothing under it}
-    private List<Child> update(Child child, List<Op> ops, List<Range> removals, Plan plan) throws IOException {
+    /// {@return what replaces `child`, or `null` if the writes `plan` gives it change nothing under it}
+    private Replacement update(Child child, List<Op> ops, List<Range> removals, Plan plan) throws IOException {
         var unit = read(child.ref(), PageFile.NODE, true);
         return update(child, unit, plan.low(), plan.high(), ops, plan.opFrom(), plan.opTo(), removals, plan.remFrom(), plan.remTo(), false);
     }
@@ -445,8 +533,41 @@ final class TreeUpdate {
         static final Plan DROP = new Plan(null, null, 0, 0, 0, 0);
     }
 
+    /// What replaces a node of the tree.
+    private sealed interface Replacement {
+    }
+
+    /// Nodes written already.
+    ///
+    /// @param nodes the nodes, in key order; empty if none of the node's entries is left
+    private record Written(List<Child> nodes) implements Replacement {
+    }
+
+    /// A leaf to write whole, together with the sibling leaves next to it to write whole.
+    ///
+    /// It holds its units until then, so that the leaf a task of [#updateInParallel] updated gives them up in the
+    /// update of the branch above, once.
+    ///
+    /// @param ref the leaf
+    /// @param base the leaf `ref` is made from
+    /// @param merged the entries after the writes, views of the old leaf and of the writes, which stay as they are
+    ///               while the checkpoint reads and writes other units
+    /// @param inserted the keys the writes added
+    /// @param gaps the places between two old keys that new keys landed in, the one past the last old key included
+    /// @param resized whether the entries take other bytes than the leaf's did
+    private record Rewrite(PageRef ref, PageRef base, List<LeafEntry> merged, int inserted, int gaps, boolean resized) implements Replacement {
+    }
+
+    /// The entries of a leaf after the writes that change it.
+    ///
+    /// @param entries the entries
+    /// @param inserted the keys the writes added
+    /// @param gaps the places between two old keys that new keys landed in, the one past the last old key included
+    private record Merged(List<LeafEntry> entries, int inserted, int gaps) {
+    }
+
     /// The update of one subtree, run on a processor of its own.
-    private static final class Subtree extends RecursiveTask<List<Child>> {
+    private static final class Subtree extends RecursiveTask<Replacement> {
         private final int index;
         private final TreeUpdate update;
         private final Child child;
@@ -464,7 +585,7 @@ final class TreeUpdate {
         }
 
         @Override
-        protected List<Child> compute() {
+        protected Replacement compute() {
             try {
                 var replacement = update.update(child, ops, removals, plan);
                 // The records of the subtree end its own pages, so the branch above reads them back from the writer
@@ -527,20 +648,27 @@ final class TreeUpdate {
     }
 
     /// {@return the entries of a leaf after the writes that reach it, or `null` if they change none}
-    private List<LeafEntry> merge(List<LeafEntry> entries, List<Op> ops, int opFrom, int opTo, List<Range> removals,
-                                  int remFrom, int remTo) throws IOException {
+    private Merged merge(List<LeafEntry> entries, List<Op> ops, int opFrom, int opTo, List<Range> removals,
+                         int remFrom, int remTo) throws IOException {
         var out = new ArrayList<LeafEntry>(entries.size() + (opTo - opFrom));
         var changed = false;
+        var inserted = 0;
+        var gaps = 0;
         var op = opFrom;
         var rem = remFrom;
         for (var entry : entries) {
+            var before = inserted;
             while (op < opTo && ops.get(op).compareKey(entry.key()) < 0) {
                 var put = ops.get(op++);
                 put.settle(false);
                 if (!put.removes()) {
                     out.add(entry(put));
                     changed = true;
+                    inserted++;
                 }
+            }
+            if (inserted != before) {
+                gaps++;
             }
             if (op < opTo && ops.get(op).compareKey(entry.key()) == 0) {
                 // The key's state as of the checkpoint, which already takes the removals into account
@@ -566,15 +694,20 @@ final class TreeUpdate {
             }
             out.add(entry);
         }
+        var before = inserted;
         while (op < opTo) {
             var put = ops.get(op++);
             put.settle(false);
             if (!put.removes()) {
                 out.add(entry(put));
                 changed = true;
+                inserted++;
             }
         }
-        return changed ? out : null;
+        if (inserted != before) {
+            gaps++;
+        }
+        return changed ? new Merged(out, inserted, gaps) : null;
     }
 
     private void release(LeafEntry entry) {
@@ -610,13 +743,24 @@ final class TreeUpdate {
         return page;
     }
 
-    private List<Child> writeLeaves(List<LeafEntry> entries) throws IOException {
+    private static int[] sizes(List<LeafEntry> entries) {
         var sizes = new int[entries.size()];
         for (var i = 0; i < sizes.length; i++) {
             sizes[i] = entries.get(i).size();
         }
-        var out = new ArrayList<Child>();
-        for (var run : TreeNodes.split(sizes, sizes.length)) {
+        return sizes;
+    }
+
+    private List<Child> writeLeaves(List<LeafEntry> entries) throws IOException {
+        var sizes = sizes(entries);
+        return writeLeaves(entries, sizes, TreeNodes.split(sizes, sizes.length));
+    }
+
+    /// {@return the leaves written of `entries`, which take `sizes`, one per run of `runs`, pairs of first and last
+    /// index}
+    private List<Child> writeLeaves(List<LeafEntry> entries, int[] sizes, List<int[]> runs) throws IOException {
+        var out = new ArrayList<Child>(runs.size());
+        for (var run : runs) {
             var page = allocate(1);
             var length = TreeNodes.contentLength(sizes, run[0], run[1]);
             var unit = TreeNodes.writeLeaf(entries, run[0], run[1], length);
