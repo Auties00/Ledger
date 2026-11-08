@@ -1373,6 +1373,16 @@ public final class LiveLedger implements Ledger {
         }
     }
 
+    /// {@return about how many chains were written since the last cut: it reads them off the publishing role, on the
+    /// log's flush task}
+    long dirtyChains() {
+        var chains = 0L;
+        for (var state : sweepOrder) {
+            chains += state.dirtyCount();
+        }
+        return chains;
+    }
+
     /// Gives a checkpoint that failed its keys back, so the next one writes them.
     void restoreCut(Cut cut) {
         enterPublishing();

@@ -30,6 +30,13 @@ import java.util.concurrent.locks.ReentrantLock;
 /// the last; [Ledger#checkpoint()][com.github.auties00.ledger.Ledger#checkpoint()] and
 /// [Ledger#close()][com.github.auties00.ledger.Ledger#close()] run one on the caller's thread. One runs at a time.
 ///
+/// Small durable commits take a block of log each and count a fraction of it toward the interval, so an interval fills
+/// many more segments than its bytes. The segments a checkpoint makes obsolete become spares, as many as an interval
+/// fills at the last one's rate, so the log writes into files that need no zeros and no block allocation. Where the
+/// spares run out before the interval ends and a checkpoint would write little, as with commits that keep rewriting a
+/// few keys, the log asks for one at once rather than write a new file with zeros, which holds every force of the log
+/// for longer than a whole such checkpoint holds any.
+///
 /// Every unit of a checkpoint is sealed under a nonce made of 8 random bytes drawn for the checkpoint and a counter,
 /// so no nonce repeats under the store's key, even across a checkpoint that a crash cut short.
 ///
@@ -42,6 +49,12 @@ final class Checkpointer implements IdleTicker.Watched {
     /// for it ([LogWriter#nextOpenSegment()]), so a spare saves it nothing, and forcing a spare that a copy of the store
     /// left in the OS cache held the first durable commit after the open for tens of milliseconds.
     private static final int SPARES = 0;
+    /// The most obsolete segments a running store keeps.
+    private static final int MAX_SPARES = 64;
+    /// The bytes a checkpoint writes for a key written since the last one, as the log's request for one estimates them:
+    /// a page, and as much again for the nodes above the leaves and for leaves that split. Values larger than that take
+    /// the same blocks of log as they count, so the spares run out only about as the interval ends anyway.
+    private static final int CHECKPOINT_BYTES_PER_KEY = 2 * PageFormat.SIZE;
     /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint, whatever the heap.
     private static final int MAX_BACKLOG = 6;
     /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint, if the writes behind it
@@ -74,6 +87,15 @@ final class Checkpointer implements IdleTicker.Watched {
     private long number;
     // The log's queued bytes at the last cut
     private volatile long cutBytes;
+    // The first segment of the log a commit the trees lack may be in, as of the last retirement that succeeded
+    private volatile long lastLogStart;
+    // The segments a whole interval fills at the rate of the last one that said, or 0; guarded by the lock
+    private long intervalSegments;
+    // Whether the log asked for a checkpoint, which the next commit starts: the log's flush task may be a commit's own
+    // thread, which must not run a listener over a refused thread while the commits behind it wait for its group
+    private volatile boolean checkpointRequested;
+    // Whether the log asks for a checkpoint when it would otherwise write a new file with zeros
+    private final boolean checkpointForSpares;
     private volatile RuntimeException lastFailure;
     private final Consumer<? super LedgerException> failures;
     // The log's queued bytes at the cut of the last published checkpoint
@@ -104,9 +126,11 @@ final class Checkpointer implements IdleTicker.Watched {
     /// @param failures receives the failures of the checkpoints started on their own threads
     /// @param durableEpoch the epoch of the file of large values the last superblock records
     /// @param loggedEpoch the highest epoch recovery found, in the superblock or in the log, which units may take
+    /// @param logStart the first segment of the log the trees may lack commits of
+    /// @param checkpointForSpares whether the log asks for a checkpoint when it would write a new file with zeros
     Checkpointer(LiveLedger ledger, PageFile pages, FreeSpace space, BlobFile blobs, LogWriter log, LogFiles files, long every,
                  long number, DeltaTable deltas, PageRef deltaTable, Consumer<? super LedgerException> failures,
-                 int durableEpoch, int loggedEpoch, long heapBudget) {
+                 int durableEpoch, int loggedEpoch, long heapBudget, long logStart, boolean checkpointForSpares) {
         this.ledger = ledger;
         this.pages = pages;
         this.space = space;
@@ -126,6 +150,8 @@ final class Checkpointer implements IdleTicker.Watched {
         this.heapBudget = heapBudget;
         this.progressLock = new ReentrantLock();
         this.progress = progressLock.newCondition();
+        this.lastLogStart = logStart;
+        this.checkpointForSpares = checkpointForSpares;
     }
 
     /// Starts counting the store's writes toward the heap budget of the process, those the open replayed included:
@@ -138,6 +164,9 @@ final class Checkpointer implements IdleTicker.Watched {
         publishedBytes = -replayedBytes;
         publishedHeap = -replayedHeap;
         appendedAtTick = log.appendedBytes();
+        if (checkpointForSpares) {
+            log.useCheckpointForSpares(this::requestForSpares);
+        }
         OPEN.add(this);
         IdleTicker.watch(this);
     }
@@ -174,11 +203,36 @@ final class Checkpointer implements IdleTicker.Watched {
         }
     }
 
-    /// Starts a checkpoint on a thread of its own if the log has grown enough since the last, and none is running.
+    /// Starts a checkpoint on a thread of its own if the log has grown enough since the last or asked for one, and none
+    /// is running.
     void maybeStart() {
-        if (log.appendedBytes() - cutBytes >= every) {
+        if (checkpointRequested || log.appendedBytes() - cutBytes >= every) {
+            checkpointRequested = false;
             start();
         }
+    }
+
+    /// {@return whether a checkpoint running, or requested here, will retire segments for the log to prepare the next
+    /// one from}
+    ///
+    /// Called by the log's flush task, which only asks: the next commit starts the checkpoint. It refuses unless the
+    /// segments an interval's bytes would fill passed since the last retirement, which keeps a store that reopened
+    /// without spares from checkpointing after its first few segments, and unless the keys written since the last cut
+    /// make a checkpoint that writes little: one that wrote much would hold the forces of the log back longer than a new
+    /// file does.
+    private boolean requestForSpares() {
+        if (closed || stopped != null || lastFailure != null
+                || log.currentSegment() - lastLogStart < every / log.segmentSize() + 1) {
+            return false;
+        }
+        if (scheduled.get()) {
+            return true;
+        }
+        if (ledger.dirtyChains() * CHECKPOINT_BYTES_PER_KEY > log.segmentSize()) {
+            return false;
+        }
+        checkpointRequested = true;
+        return true;
     }
 
     /// Starts a checkpoint on a thread of its own, unless one is running; a thread the system refuses is reported as a
@@ -195,6 +249,7 @@ final class Checkpointer implements IdleTicker.Watched {
             var failure = new LedgerIoException("A checkpoint could not start its thread", new IOException(refused));
             lastFailure = failure;
             scheduled.set(false);
+            log.checkpointEnded();
             signalProgress();
             report(failure);
         }
@@ -308,6 +363,7 @@ final class Checkpointer implements IdleTicker.Watched {
                 throw stopped;
             }
             var cut = ledger.cutCheckpoint(() -> closing ? log.nextOpenSegment() : log.currentSegment());
+            checkpointRequested = false;
             if (cut == null) {
                 if (closing && !epochOnlyInLog()) {
                     // The trees hold every commit, so the segments hold nothing a reopen needs but the one kept for it
@@ -391,12 +447,12 @@ final class Checkpointer implements IdleTicker.Watched {
                 ledger.readers().unregister(cut.sequence());
             }
             ledger.publish(cut, number, roots, catalog, freeList, blobFreeList, freed, update.freedExternal(), adopted);
+            var countedBytes = cut.logBytes() - publishedBytes;
             publishedBytes = cut.logBytes();
             publishedHeap = cut.logHeap();
             signalProgress();
             ledger.pruneCut(cut);
-            // While the store runs, as many as a checkpoint interval fills, so the log seldom writes into a new file
-            retire(cut.logStart(), closing ? SPARES : (int) Math.min(64, every / log.segmentSize() + 1));
+            retire(cut.logStart(), closing ? SPARES : sparesToKeep(cut.logStart(), countedBytes));
             try {
                 var end = space.trim();
                 if (end > 0) {
@@ -409,8 +465,24 @@ final class Checkpointer implements IdleTicker.Watched {
                 // The checkpoint is durable; trailing free pages wait for the next one
             }
         } finally {
+            log.checkpointEnded();
             lock.unlock();
         }
+    }
+
+    /// {@return how many obsolete segments to keep once a checkpoint cut at `logStart`, `countedBytes` of log after the
+    /// last: as many as an interval fills, so the log seldom writes into a new file}
+    ///
+    /// The segments follow from those the last checkpoint's log filled, not from the interval's bytes, which leave out
+    /// the padding of a group: a commit of 1.6 KiB takes 4 KiB of log. They are scaled up to a whole interval, so a
+    /// checkpoint the log asked for early keeps them too. A checkpoint a segment or less after the last says too little
+    /// of the rate and changes nothing.
+    private int sparesToKeep(long logStart, long countedBytes) {
+        var consumed = logStart - lastLogStart;
+        if (consumed >= 2 && countedBytes > 0) {
+            intervalSegments = (long) Math.ceil((double) consumed * every / countedBytes);
+        }
+        return (int) Math.min(MAX_SPARES, Math.max(every / log.segmentSize(), intervalSegments) + 1);
     }
 
     /// {@return whether an epoch of the file of large values that units may have taken is recorded only by the log}
@@ -430,6 +502,7 @@ final class Checkpointer implements IdleTicker.Watched {
     private void retire(long first, int spares) {
         try {
             files.retireBefore(first, spares);
+            lastLogStart = first;
         } catch (IOException exception) {
             // Obsolete segments wait for the next checkpoint
         }

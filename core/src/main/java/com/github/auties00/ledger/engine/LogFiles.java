@@ -26,7 +26,8 @@ import java.util.zip.CRC32C;
 /// file can be written with zeros to its full length first, except on Windows: writing into either leaves a force no
 /// file size and no block allocation to record, which on ext4 halved the time of a durable commit and spared one force
 /// in a thousand a wait of tens of milliseconds for a journal commit. Once a checkpoint makes segments obsolete, they become spares ([#retireBefore(long, int)]) instead of
-/// being deleted.
+/// being deleted. A spare stays in the log directory until a preparation takes it or a close deletes it, and recovery
+/// never reads one.
 ///
 /// It is safe for concurrent use: the log writer prepares while a checkpoint retires.
 final class LogFiles {
@@ -42,6 +43,11 @@ final class LogFiles {
     private final StoreKeys keys;
     private final byte[] storeId;
     private final Object lock;
+    // The spares the last preparation or retirement left, written holding the lock and read without it: a preparation
+    // holds the lock for as long as its zeros take to write, which a flush that asks must not wait for
+    private volatile int spareCount;
+    // The new files prepared so far, for tests
+    private volatile long freshFiles;
 
     /// Creates the files of the log in `directory`.
     LogFiles(Path directory, StoreKeys keys, byte[] storeId) {
@@ -101,6 +107,19 @@ final class LogFiles {
         return spares;
     }
 
+    /// {@return whether the last preparation or retirement left a spare, without waiting for a running one}
+    ///
+    /// It only tells whether a preparation would write a new file: [#prepare(long, long, boolean)] lists the directory
+    /// to find what it takes.
+    boolean hasSpare() {
+        return spareCount > 0;
+    }
+
+    /// {@return the new files prepared so far}
+    long freshFiles() {
+        return freshFiles;
+    }
+
     /// A segment ready to be written.
     ///
     /// @param number its number
@@ -121,7 +140,9 @@ final class LogFiles {
             // file systems and cost a slow allocation on NTFS, while a spare has its blocks already
             Path source;
             var fresh = spares.isEmpty();
+            spareCount = fresh ? 0 : spares.size() - 1;
             if (fresh) {
+                freshFiles++;
                 source = directory.resolve("%016x".formatted(number) + PREPARING);
                 Files.deleteIfExists(source);
                 Files.createFile(source);
@@ -190,6 +211,7 @@ final class LogFiles {
             for (var i = keep; i < spares.size(); i++) {
                 Files.deleteIfExists(spares.get(i));
             }
+            spareCount = Math.min(keep, spares.size());
         }
     }
 

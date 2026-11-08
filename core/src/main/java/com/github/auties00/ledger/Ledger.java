@@ -219,6 +219,11 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// hold a megabyte of the heap, so an idle store does not keep them in memory. The default is a sixteenth of
         /// the heap's maximum size ([Runtime#maxMemory()]), between 64 MiB and 512 MiB: 256 MiB for a heap of 4 GiB.
         ///
+        /// The interval counts the bytes of commits, while each durable commit takes at least 4 KiB of log files. While
+        /// it runs, a store keeps the log files of an interval for reuse, up to 1 GiB, and a close deletes them. Except
+        /// on Windows, a store whose durable commits keep rewriting few keys also checkpoints as soon as these files run
+        /// out, at most once every `logBytes` of log files, rather than create a new one.
+        ///
         /// @param logBytes the log growth between checkpoints, at least 1 MiB
         /// @return these options
         /// @throws IllegalArgumentException if `logBytes` is below 1 MiB

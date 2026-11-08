@@ -37,6 +37,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private Duration commitWindow;
     private long segmentSize;
     private long checkpointHeap;
+    private boolean checkpointForSpares;
     private Consumer<? super LedgerException> backgroundFailures;
     private long largeValues;
     private final Map<String, Long> largeValuesByKeyspace;
@@ -50,6 +51,9 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         this.segmentSize = SEGMENT_SIZE;
         // The writes the trees lack may hold up to half the heap before commits wait for more than two intervals
         this.checkpointHeap = Runtime.getRuntime().maxMemory() / 2;
+        // Not on Windows, where a new segment took 13 ms and writes no zeros, and a force of the data file beside the
+        // log's waits on the same flush of the drive
+        this.checkpointForSpares = !System.getProperty("os.name", "").startsWith("Windows");
         this.backgroundFailures = _ -> {
         };
         this.largeValues = MIB;
@@ -67,6 +71,13 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     /// a checkpoint, by the logs' estimates, so tests can reach it without filling half the heap.
     LedgerBuilder checkpointHeap(long bytes) {
         this.checkpointHeap = bytes;
+        return this;
+    }
+
+    /// Sets whether the log asks for a checkpoint rather than write a new segment with zeros, so tests cover it on any
+    /// system.
+    LedgerBuilder checkpointForSpares(boolean enabled) {
+        this.checkpointForSpares = enabled;
         return this;
     }
 
@@ -292,7 +303,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));
             var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
                     superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures,
-                    superblock == null ? 0 : superblock.epoch(), epochs[0], checkpointHeap);
+                    superblock == null ? 0 : superblock.epoch(), epochs[0], checkpointHeap, Math.max(firstSegment, 1), checkpointForSpares);
             if (ownedPool != null) {
                 ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
             } else {

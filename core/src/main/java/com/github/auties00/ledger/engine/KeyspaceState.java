@@ -383,6 +383,11 @@ final class KeyspaceState {
         }
     }
 
+    /// {@return the chains written since the last cut; an estimate, off the publishing role}
+    int dirtyCount() {
+        return dirty.size();
+    }
+
     /// {@return the number [#markDirty] gives the chains it lists, the cut's that [#cutDirty()] takes next}
     ///
     /// Called holding the publishing role.

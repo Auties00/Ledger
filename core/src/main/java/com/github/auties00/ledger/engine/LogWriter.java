@@ -22,9 +22,11 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 import java.util.zip.CRC32C;
 
 /// Appends frames to the log and makes them durable in groups.
@@ -40,6 +42,13 @@ import java.util.zip.CRC32C;
 /// on the way to a force. The first one is prepared the same way while the store opens, and the first group waits for
 /// it: forcing a new file and its directory took most of an open on Windows and macOS. A prepared file may hold the
 /// frames of an earlier use, which every frame header tells apart by the tag of its segment's salt.
+///
+/// Where a preparation would write a new file with zeros, which holds every force of the log behind its own for tens of
+/// milliseconds on ext4, the store may offer a checkpoint instead ([#useCheckpointForSpares(BooleanSupplier)]), whose
+/// retirement leaves spares that need no zeros. The preparation then waits for that checkpoint to end, for half the
+/// segment to fill, or until the rest of it would fill within the time zeros take; a close or a rollover that finds it
+/// waiting prepares without zeros. Nothing depends on the next segment being prepared: a crash meanwhile leaves the
+/// same files as one just after a rollover.
 ///
 /// A close keeps the segment prepared after the current one, cut to its first two blocks, and the next open writes
 /// into it, as it does into any segment recovery finds prepared and never written: the first durable commit after an
@@ -119,6 +128,9 @@ final class LogWriter {
     static final int COMMIT_HEAP = 128;
     /// The bytes a second of log below which a new segment is written with zeros first, if the commits wait for it.
     private static final long ZEROED_RATE = 64L << 20;
+    /// The bytes a second that give a preparation twice the time its zeros take: 16 MiB took up to 88 ms on ext4. A
+    /// preparation that waits starts once the rest of the segment would fill in less time than a segment takes at it.
+    private static final long PREPARATION_RATE = 100L << 20;
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
@@ -156,6 +168,18 @@ final class LogWriter {
     // When the current segment opened, and how long the one before it took to fill, or -1; owned by the flush task
     private long segmentOpened;
     private long lastFill = -1;
+    // Asked before a new file is written with zeros whether a checkpoint will leave spares instead, or null; it runs on
+    // the flush task
+    private volatile BooleanSupplier checkpointForSpares;
+    // Whether the preparation of the next segment waits for a checkpoint to leave spares; written by the flush task,
+    // and by a close once the flush task has nothing left to write
+    private volatile boolean deferring;
+    // The checkpoints that had ended when the preparation began to wait; owned by the flush task
+    private long deferredAt;
+    // The preparations that waited so far; written by the flush task only
+    private volatile long deferrals;
+    // The checkpoints that ended so far, however they ended
+    private final AtomicLong checkpointsEnded;
     // Whether a commit waited for a force since the segment before the current one opened
     private volatile boolean waited;
     private boolean waitedBefore;
@@ -250,6 +274,7 @@ final class LogWriter {
         this.scheduled = new AtomicBoolean();
         this.running = new AtomicBoolean();
         this.waiters = new ConcurrentLinkedQueue<>();
+        this.checkpointsEnded = new AtomicLong();
         this.durabilityLock = new ReentrantLock();
         this.durabilityChanged = durabilityLock.newCondition();
         this.durable = durable;
@@ -289,6 +314,7 @@ final class LogWriter {
         this.useTag = TAGS.nextLong();
         this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt(), useTag) : null;
         this.next = null;
+        this.deferring = false;
     }
 
     /// Prepares the segment after the current one on a platform thread of its own.
@@ -296,18 +322,106 @@ final class LogWriter {
     /// Not on the store's pool: creating and forcing a file costs tens of milliseconds on Windows, and a flush queued
     /// behind it would make every commit waiting on that flush wait as long.
     private void prepareNext() {
-        var number = segmentNumber + 1;
-        // Filled slower than the rate, by commits that waited for its forces
-        var zeros = (waited || waitedBefore) && lastFill >= 0 && lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE;
-        var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize, zeros && !closing));
+        var preparation = newPreparation(zerosWanted() && !closing);
         next = preparation;
+        deferring = false;
         Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
     }
 
+    /// {@return a preparation of the segment after the current one, not started}
+    private FutureTask<LogFiles.Prepared> newPreparation(boolean zeros) {
+        var number = segmentNumber + 1;
+        return new FutureTask<>(() -> files.prepare(number, segmentSize, zeros));
+    }
+
+    /// {@return whether a new file would be written with zeros: the last segment filled slower than [#ZEROED_RATE], by
+    /// commits that waited for its forces}
+    private boolean zerosWanted() {
+        return (waited || waitedBefore) && lastFill >= 0 && lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE;
+    }
+
+    /// Prepares the segment after the current one, once a group has gone into the current one, unless that would write
+    /// a new file with zeros and a checkpoint will leave spares instead, which it then waits for.
+    ///
+    /// Only where zeros would be written: a preparation that writes none costs a log that fills fast nothing, and one
+    /// started half a segment late held an ingest of a history back at each rollover, to about 0.6 of its speed.
+    private void prepareOrDefer() {
+        if (!deferring) {
+            var ended = checkpointsEnded.get();
+            if (closing || !zerosWanted() || files.hasSpare() || !checkpointWillLeaveSpares()) {
+                prepareNext();
+                return;
+            }
+            deferring = true;
+            deferredAt = ended;
+            deferrals++;
+        }
+        if (checkpointsEnded.get() != deferredAt || position - SEGMENT_HEADER >= (segmentSize - SEGMENT_HEADER) / 2
+                || restFillsBeforeZeros()) {
+            prepareNext();
+        }
+    }
+
+    /// {@return whether a checkpoint running or about to start will leave spares; never throws, as a failure of the
+    /// flush task stops the log, which a checkpoint that could not start must not do}
+    private boolean checkpointWillLeaveSpares() {
+        var source = checkpointForSpares;
+        if (source == null) {
+            return false;
+        }
+        try {
+            return source.getAsBoolean();
+        } catch (Throwable _) {
+            return false;
+        }
+    }
+
+    /// {@return whether the rest of the current segment, at the rate it filled so far, would fill before a preparation
+    /// that starts now wrote its zeros}
+    private boolean restFillsBeforeZeros() {
+        var rest = (double) (System.nanoTime() - segmentOpened) / (position - SEGMENT_HEADER) * (segmentSize - position);
+        return rest < (double) segmentSize * 1_000_000_000L / PREPARATION_RATE;
+    }
+
+    /// Makes `source` what the flush task asks, before a new file is written with zeros, whether a checkpoint will leave
+    /// spares; it must not block, nor run any code of the store's user.
+    void useCheckpointForSpares(BooleanSupplier source) {
+        this.checkpointForSpares = source;
+    }
+
+    /// Tells the writer a checkpoint ended, whether it retired segments or failed, so a preparation that waits for one
+    /// starts.
+    void checkpointEnded() {
+        checkpointsEnded.incrementAndGet();
+    }
+
+    /// {@return whether the preparation of the next segment is waiting for a checkpoint}
+    boolean deferring() {
+        return deferring;
+    }
+
+    /// {@return the preparations that waited for a checkpoint so far}
+    long deferrals() {
+        return deferrals;
+    }
+
+    /// {@return the checkpoints that ended so far, however they ended}
+    long checkpointsEnded() {
+        return checkpointsEnded.get();
+    }
+
+    /// {@return the new files the log prepared so far}
+    long freshFiles() {
+        return files.freshFiles();
+    }
+
     /// Switches to the prepared segment after the current one, preparing it here if its thread has not.
+    ///
+    /// One no thread began to prepare, as after a group that outran a preparation waiting for a checkpoint, writes no
+    /// zeros: the commits of the group wait for this thread.
     private void rollover() throws IOException {
         if (next == null) {
-            prepareNext();
+            next = newPreparation(false);
         }
         var preparation = next;
         // Runs it on this thread unless it started elsewhere, so a rollover never waits on a thread yet to start
@@ -679,7 +793,7 @@ final class LogWriter {
         this.groupStart = start;
         groupEnd = end;
         if (next == null) {
-            prepareNext();
+            prepareOrDefer();
         }
         return bodies;
     }
@@ -1064,11 +1178,17 @@ final class LogWriter {
     /// closed store, nor in the cache of a copy of it.
     ///
     /// A preparation its thread has not started runs here, as a rollover runs it; one that has is waited for, by an
-    /// interrupted thread too, so no file of the store changes once it is closed.
+    /// interrupted thread too, so no file of the store changes once it is closed. One that was waiting for a checkpoint
+    /// runs here too, so a close leaves the same files whether it was.
     private void keepNext() {
         var preparation = next;
         if (preparation == null) {
-            return;
+            if (channel == null || failure != null) {
+                return;
+            }
+            preparation = newPreparation(false);
+            next = preparation;
+            deferring = false;
         }
         // A file operation would close its channel on an interrupted thread
         var interrupted = Thread.interrupted();
