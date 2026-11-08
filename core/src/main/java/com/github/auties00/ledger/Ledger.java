@@ -58,13 +58,19 @@ import java.util.function.Consumer;
 /// On macOS a force empties the drive's cache too, so a durable commit survives a loss of power: the JDK forces a file
 /// with `fcntl(F_FULLFSYNC)` there.
 ///
-/// Where the platform can write through to stable storage with the guarantee of a force, the store writes the log
-/// that way and does not force it, one round trip to the device where a write and a force take two: on Linux with
-/// `O_DIRECT` and `O_DSYNC`, and on Windows with `FILE_FLAG_NO_BUFFERING` and `FILE_FLAG_WRITE_THROUGH` while this
-/// module has native access (`--enable-native-access`), the pair for which Windows documents a write-through of the
-/// drive's cache. The system property `ledger.log.writeThrough` set to `off` forces every write; set to `dsync`, it
-/// writes through with `FILE_FLAG_WRITE_THROUGH` alone on Windows, which Windows documents as writing through its own
-/// cache only, and with `O_DSYNC` alone elsewhere but on macOS.
+/// Where a write through to stable storage holds what a force holds, the store writes the log that way and does not
+/// force it, one round trip to the device where a write and a force take two: on Linux with `O_DIRECT` and `O_DSYNC`,
+/// whose guarantee is that of `fdatasync`; and on Windows with `FILE_FLAG_NO_BUFFERING` and `FILE_FLAG_WRITE_THROUGH`,
+/// while this module has native access (`--enable-native-access`) and the device under the store reports that it
+/// supports forced unit access, that its write cache is off, or that the cache is non-volatile. Windows only requests
+/// the write-through of the drive's cache and warns that not all hardware supports it, so on a device that reports
+/// anything else, or nothing, the store forces the log, which asks the device to empty its cache.
+///
+/// The system property `ledger.log.writeThrough` set to `off` forces every write. Set to `direct`, it writes through
+/// on Windows without asking the device, so a loss of power can take a durable commit from a device with a volatile
+/// cache that ignores the request. Set to `dsync`, it writes through with `FILE_FLAG_WRITE_THROUGH` alone on Windows,
+/// which Windows documents as writing through its own cache only, with the same risk, and with `O_DSYNC` alone
+/// elsewhere but on macOS.
 ///
 /// # Memory
 /// The store keeps the bytes it encrypts, decrypts and writes on the Java heap, in arrays it recycles: the JDK's
