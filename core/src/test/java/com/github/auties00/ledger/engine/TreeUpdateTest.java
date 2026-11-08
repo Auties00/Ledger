@@ -99,6 +99,7 @@ class TreeUpdateTest {
                     pages.cache().clearForTests();
                 }
                 verify(pages, root, model, random, keys);
+                verifyNodes(pages, root);
                 records = Math.max(records, verifyPages(pages, space, root, deltas));
                 if (root != null) {
                     deepest = Math.max(deepest, TreeNodes.level(pages.read(root.ref(), PageFile.NODE, true)));
@@ -182,6 +183,51 @@ class TreeUpdateTest {
                 workers.shutdownNow();
             }
         }
+    }
+
+    /// Checks what each branch records of its children against the nodes themselves, and each node against its limits.
+    static void verifyNodes(PageFile pages, TreeRoot root) {
+        if (root != null) {
+            var subtree = verifyNode(pages, root.ref());
+            assertEquals(root.count(), subtree.count(), "the root counts wrong");
+            assertEquals(root.blobs(), subtree.blobs(), "the root flags its blobs wrong");
+        }
+    }
+
+    private static Subtree verifyNode(PageFile pages, PageRef ref) {
+        var unit = pages.read(ref, PageFile.NODE, false);
+        assertTrue(Bytes.i32(unit, PageFormat.LENGTH) - 2 <= TreeNodes.CAPACITY, "a node passes its capacity");
+        assertTrue(TreeNodes.count(unit) > 0, "a node is empty");
+        if (TreeNodes.isLeaf(unit)) {
+            var blobs = false;
+            byte[] previous = null;
+            for (var entry : TreeNodes.leafEntries(unit)) {
+                blobs |= entry.blob() != null;
+                var key = bytes(entry.key());
+                assertTrue(previous == null || UNSIGNED.compare(previous, key) < 0, "a leaf is out of order");
+                previous = key;
+            }
+            return new Subtree(bytes(TreeNodes.leafKey(unit, TreeNodes.entry(unit, 0))), TreeNodes.count(unit), blobs);
+        }
+        var count = 0L;
+        var blobs = false;
+        byte[] first = null;
+        byte[] previous = null;
+        for (var child : TreeNodes.children(unit)) {
+            var subtree = verifyNode(pages, child.ref());
+            assertArrayEquals(subtree.firstKey(), bytes(child.firstKey()), "a branch names the wrong first key");
+            assertEquals(subtree.count(), child.count(), "a branch counts a child wrong");
+            assertEquals(subtree.blobs(), child.blobs(), "a branch flags a child's blobs wrong");
+            assertTrue(previous == null || UNSIGNED.compare(previous, subtree.firstKey()) < 0, "a branch is out of order");
+            first = first == null ? subtree.firstKey() : first;
+            previous = subtree.firstKey();
+            count += subtree.count();
+            blobs |= subtree.blobs();
+        }
+        return new Subtree(first, count, blobs);
+    }
+
+    private record Subtree(byte[] firstKey, long count, boolean blobs) {
     }
 
     private static byte[] value(Random random) {
