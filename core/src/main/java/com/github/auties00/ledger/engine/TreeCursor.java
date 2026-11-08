@@ -169,11 +169,14 @@ final class TreeCursor {
     ///
     /// Branches are always cached: a scan reads one for every few hundred leaves, and every read starts from them.
     private byte[] child(byte[] parent, int index) {
-        var ref = TreeNodes.childRef(parent, index);
         if (TreeNodes.level(parent) > 1 || admit()) {
-            return pages.read(ref, PageFile.NODE, true);
+            return pages.node(parent, index);
         }
-        return pages.read(ref, PageFile.NODE, pages.cache().hasRoom(PageFormat.SIZE), false);
+        var hit = pages.cachedNode(parent, index);
+        if (hit != null) {
+            return hit;
+        }
+        return pages.read(TreeNodes.childRef(parent, index), PageFile.NODE, pages.cache().hasRoom(PageFormat.SIZE), false);
     }
 
     /// {@return whether the leaf or blob the cursor reads next goes to the cache}
