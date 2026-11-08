@@ -27,6 +27,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private static final String LOG_DIRECTORY = "log";
     // A running store keeps one obsolete segment of this length as a spare; a closed one keeps no log
     private static final long SEGMENT_SIZE = 16 * MIB;
+    // Long enough that a log filling at full speed forces about as often as its rollovers do
+    private static final Duration DURABILITY_DELAY = Duration.ofMillis(100);
 
     private Path directory;
     private Encryption encryption;
@@ -35,6 +37,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private long pageCache;
     private long checkpointEvery;
     private Duration commitWindow;
+    private Duration durabilityDelay;
     private long segmentSize;
     private long checkpointHeap;
     private Consumer<? super LedgerException> backgroundFailures;
@@ -47,6 +50,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         this.pageCache = defaultPageCache();
         this.checkpointEvery = defaultCheckpointEvery();
         this.commitWindow = Duration.ZERO;
+        this.durabilityDelay = DURABILITY_DELAY;
         this.segmentSize = SEGMENT_SIZE;
         // The writes the trees lack may hold up to half the heap before commits wait for more than two intervals
         this.checkpointHeap = Runtime.getRuntime().maxMemory() / 2;
@@ -163,6 +167,16 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             throw new IllegalArgumentException("The commit window is from zero to one second: " + window);
         }
         this.commitWindow = window;
+        return this;
+    }
+
+    @Override
+    public Ledger.Options durabilityDelay(Duration delay) {
+        Objects.requireNonNull(delay, "delay");
+        if (delay.isNegative() || delay.compareTo(Duration.ofMinutes(1)) > 0) {
+            throw new IllegalArgumentException("The durability delay is from zero to one minute: " + delay);
+        }
+        this.durabilityDelay = delay;
         return this;
     }
 
@@ -286,7 +300,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                 Durability.forceDirectory(logDirectory);
             }
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
-                    segmentSize, pool.executor(), commitWindow, empty);
+                    segmentSize, pool.executor(), commitWindow, durabilityDelay, empty);
             var deltaTable = superblock == null ? null : superblock.deltaTable();
             var deltas = deltaTable == null ? DeltaTable.EMPTY
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));

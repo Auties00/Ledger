@@ -16,11 +16,13 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.LockSupport;
@@ -30,16 +32,31 @@ import java.util.zip.CRC32C;
 /// Appends frames to the log and makes them durable in groups.
 ///
 /// Commits queue their frames in order, holding the store's publishing role. One flush task at a time, on the store's
-/// [com.github.auties00.ledger.IoPool], takes everything queued, seals the frames, writes them with one call, forces
-/// the segment once and wakes the commits waiting for any of them: commits that arrive while a force runs make the
-/// next group, so concurrent commits share forces. Each group is padded with zeros to a multiple of [#ALIGNMENT], where
-/// the next one starts, so the pages of acknowledged frames are never written again.
+/// [com.github.auties00.ledger.IoPool], takes everything queued, seals the frames and writes them with one call, so a
+/// crash of the process keeps them. It then forces the segment only if something needs the frames on stable storage: a
+/// commit waiting for one of them, a wait for a frame, a close, a commit that writes its group itself, frames whose
+/// commits wrote to the file of large values, a rollover, or [#LAZY_BYTES] bytes not forced. Otherwise the frames wait
+/// for one of those, for at most the delay the store was opened with, counted from the first of them: a flush that
+/// stays busy forces them itself once the delay is over, and with no flush running a timer has a thread of the pool do
+/// it, as soon as the pool has one free. A force wakes the commits waiting for any of them: commits that arrive while a
+/// force runs make the next group, so concurrent commits share forces.
 ///
-/// Segments come from [LogFiles] prepared: once a segment takes its first group, the next one is prepared on a thread
-/// of its own, so a rollover only forces the full segment and switches to the next, and no file is created or renamed
-/// on the way to a force. The first one is prepared the same way while the store opens, and the first group waits for
-/// it: forcing a new file and its directory took most of an open on Windows and macOS. A prepared file may hold the
-/// frames of an earlier use, which every frame header tells apart by the tag of its segment's salt.
+/// A force first pads the frames with zeros to a multiple of [#ALIGNMENT], where the next frame starts and takes the
+/// flag of the first frame after a force, so the pages of acknowledged frames are never written again and such a frame
+/// always starts a block. Frames written without a force are followed at once by the next ones, without the flag, and
+/// recovery reads them as one group: a group is everything written between two forces, however many passes wrote it. A
+/// loss of power may tear any of it, none of which anyone was told is durable.
+///
+/// A flush tells apart what it wrote from what a force made durable. A commit that comes to wait for a frame already
+/// written adds itself to the commits waiting, then reads [#writtenSequence]; a flush publishes that, then looks for
+/// the commits waiting. One of the two sees the other, so no commit waits out the delay.
+///
+/// Segments come from [LogFiles] prepared: once a force makes the first frames of a segment durable, or a part of it
+/// ([#PREPARE_DIVISOR]) is written with no force, the next one is prepared on a thread of its own, so a rollover only
+/// forces the full segment and switches to the next, and no file is created or renamed on the way to a force. The first
+/// one is prepared the same way while the store opens, and the first frames wait for it: forcing a new file and its
+/// directory took most of an open on Windows and macOS. A prepared file may hold the frames of an earlier use, which
+/// every frame header tells apart by the tag of its segment's salt.
 ///
 /// A close keeps the segment prepared after the current one, cut to its first two blocks, and the next open writes
 /// into it, as it does into any segment recovery finds prepared and never written: the first durable commit after an
@@ -53,9 +70,10 @@ import java.util.zip.CRC32C;
 /// open, draws a random tag, and the key of the use derives from the segment's number, a random salt of its own and
 /// that tag: the offset of a frame is a unique nonce under its key, even where an open writes into a segment that an
 /// earlier one began to write and crashed before any of it was durable, whose bytes a copy-on-write file system may
-/// keep, and even if a segment number were ever used twice. A use writes past its first group only once a force made
-/// that group durable, after which no open writes into the segment again, so at most one use of a segment has frames
-/// past its first group:
+/// keep, and even if a segment number were ever used twice. The first group of a use is everything it writes before
+/// its first force. A use writes past it only once that force made it durable, after which no open writes into the
+/// segment again, so at most one use of a segment has frames past its first group; of the first group of an earlier
+/// use, a loss of power leaves frames with no flag, the flag being on its first frame, which the later use writes over:
 ///
 /// ```text
 /// segment header   0  "LGSEGMNT"
@@ -68,7 +86,7 @@ import java.util.zip.CRC32C;
 /// frame header     0  magic "LGF1"
 ///                  4  length of the sealed body
 ///                  8  commit sequence
-///                 16  frame type, flags (1: first frame after a force)
+///                 16  frame type, flags (1: first frame after a completed force, at a multiple of the alignment)
 ///                 20  tag of the segment: the first 8 bytes of its salt
 ///                 28  tag of the use: 8 random bytes the writer drew when it began writing the segment
 ///                 36  CRC-32C of bytes 0 to 35
@@ -108,6 +126,14 @@ final class LogWriter {
     private static final int SLICE = 64 << 10;
     /// The bytes of frame bodies the queue holds before commits wait for the device.
     private static final long QUEUE_LIMIT = 64L << 20;
+    /// The bytes of frames written and not forced at which a flush forces them whatever the delay: a default segment,
+    /// because a log filling at full speed already forces at its rollovers, and a smaller bound would force more often.
+    private static final long LAZY_BYTES = 16L << 20;
+    /// The part of a segment, as a divisor of its size, written with no force at which the next one starts to be
+    /// prepared. Not at the first frames, whose force may be about to run: a preparation forces a file and its directory
+    /// beside it, which on ext4 commit the same journal. A log filling at full speed, which forces at its rollovers only,
+    /// still has most of the time the segment takes to fill.
+    private static final int PREPARE_DIVISOR = 4;
     /// The heap a write takes in memory beside its bytes until a checkpoint takes it, as [#appendedHeap()] estimates
     /// it: its chain, its version, its slot of the hash index and its key's copy, about 110 bytes, and a share of its
     /// batch's array.
@@ -125,6 +151,8 @@ final class LogWriter {
     private final long segmentSize;
     private final Executor executor;
     private final long commitWindowNanos;
+    // How long frames may stay written and not forced, or 0 if every group is forced
+    private final long lazyNanos;
 
     // Owned by the flush task; null until the first group opens the first segment
     private FileChannel channel;
@@ -133,13 +161,21 @@ final class LogWriter {
     // Whether an interrupt closed the channel or cut a wait short during the flush, which then gives the interrupt
     // back to its thread
     private boolean interruptedWrite;
-    // Whether the flush running is a commit's, for its own group, which one drain writes whole
+    // Whether the flush running is a commit's, for its own group, which one drain writes whole after the bytes the
+    // output already holds
     private boolean leading;
-    // Where the last drain wrote, and how many bytes, which the output still holds until the next group is sealed
-    private long lastDrainStart;
-    private int lastDrainLength;
     private long segmentNumber;
+    // Where the next drain writes
     private long position;
+    // The end of what the last force of the segment made durable: the frame written here takes the flag of the first
+    // frame after a force
+    private long forcedPosition;
+    // Whether the frames written or in the output are padded, after which only a force may follow
+    private boolean padded;
+    // The force of the file of large values the group being written started, or null
+    private FutureTask<Void> unitForce;
+    // Whether the frames written since the last force have the time of the first one recorded
+    private boolean delaying;
     private SecretKeySpec segmentKey;
     private long segmentTag;
     // The tag of this writer's use of the segment
@@ -164,8 +200,10 @@ final class LogWriter {
     // The buffer frames are sealed into and written from, a slice at a time whatever their size; it grows up to OUTPUT
     // while a group needs more, so a group that fits is written with one call
     private byte[] output;
-    // The bytes of output not written yet
+    // The bytes of output in use: those a drain wrote, then those not written yet
     private int used;
+    // The bytes at the start of the output a drain wrote and no force made durable, up to position
+    private int retained;
     // The groups in a row written since one needed more than half of MIN_OUTPUT
     private int smallGroups;
     // The emptied queue, which the next swap reuses
@@ -176,10 +214,10 @@ final class LogWriter {
     private volatile long currentSegment;
 
     private final ReentrantLock queueLock;
-    // Signalled when a group is durable, for the commits waiting on a full queue
+    // Signalled when a group is written, for the commits waiting on a full queue
     private final Condition queueDrained;
     private ArrayList<Queued> queue;
-    // The bytes of the frame bodies queued and not durable yet
+    // The bytes of the frame bodies queued and not written yet
     private long pendingBytes;
     private volatile long lastQueued;
     // Frames queued since the writer opened; a catalog frame carries a sequence already durable, so close() waits on
@@ -211,7 +249,22 @@ final class LogWriter {
     private final ReentrantLock durabilityLock;
     private final Condition durabilityChanged;
     private volatile long durable;
-    private long written;
+    // The frames a force made durable since the writer opened; written under the durability lock
+    private volatile long durableFrames;
+    // The last sequence and the number of the last frame written to the file, forced or not; written holding running
+    private volatile long writtenSequence;
+    private volatile long writtenFrames;
+    // The last sequence a force started on covers; written holding running
+    private volatile long forcingSequence;
+    // Whether a thread wants what is written forced; set under the queue lock, so a flush that stops either sees it or
+    // leaves scheduled for that thread to set
+    private volatile boolean forceRequested;
+    // The most frames a thread waits to see durable; written under the queue lock
+    private volatile long wantedFrames;
+    // Whether a delayed force is on its way; at most one is
+    private final AtomicBoolean timerArmed;
+    // When the first frame not forced was written, as System.nanoTime() tells
+    private volatile long unforcedSince;
     private volatile LedgerIoException failure;
 
     /// Prepares a segment to write frames to.
@@ -225,17 +278,20 @@ final class LogWriter {
     /// @param segmentSize the size past which a new segment starts
     /// @param executor runs the flush task on platform threads
     /// @param commitWindow how long a flush waits for more commits before it starts
+    /// @param durabilityDelay how long frames no commit waits for may stay written and not forced, or zero to force
+    ///                        every group as soon as it is written
     /// @param empty the segment numbered `firstSegment`, which recovery found prepared and never written, to write
     ///              first; or `null`, to prepare one
     /// @throws IOException if the segment cannot be prepared
     LogWriter(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long durable, long segmentSize,
-              Executor executor, Duration commitWindow, LogFiles.Prepared empty) throws IOException {
+              Executor executor, Duration commitWindow, Duration durabilityDelay, LogFiles.Prepared empty) throws IOException {
         this.files = files;
         this.keys = keys;
         this.storeId = storeId;
         this.segmentSize = segmentSize;
         this.executor = executor;
         this.commitWindowNanos = commitWindow.toNanos();
+        this.lazyNanos = durabilityDelay.toNanos();
         try {
             this.cipher = keys.encrypted() ? Cipher.getInstance("AES/GCM/NoPadding") : null;
         } catch (GeneralSecurityException exception) {
@@ -253,6 +309,9 @@ final class LogWriter {
         this.durabilityLock = new ReentrantLock();
         this.durabilityChanged = durabilityLock.newCondition();
         this.durable = durable;
+        this.writtenSequence = durable;
+        this.forcingSequence = durable;
+        this.timerArmed = new AtomicBoolean();
         this.lastQueued = durable;
         // The first group switches to it, as a rollover does
         this.segmentNumber = firstSegment - 1;
@@ -284,6 +343,7 @@ final class LogWriter {
         this.segmentNumber = segment.number();
         this.currentSegment = segment.number();
         this.position = SEGMENT_HEADER;
+        this.forcedPosition = SEGMENT_HEADER;
         this.groupEnd = SEGMENT_HEADER;
         this.segmentTag = ByteBuffer.wrap(segment.salt()).getLong();
         this.useTag = TAGS.nextLong();
@@ -328,7 +388,7 @@ final class LogWriter {
     /// Queues a frame holding the first `body.size()` bytes of `body`, which the writer owns from now on.
     ///
     /// Called holding the store's publishing role, so frames queue in the order of their sequences. While the queue holds
-    /// more than [#QUEUE_LIMIT] bytes not durable yet, it waits for the device, which holds back every commit behind
+    /// more than [#QUEUE_LIMIT] bytes not written yet, it waits for the device, which holds back every commit behind
     /// it: memory stays bounded when commits come faster than the device takes them. A frame larger than the limit
     /// waits for the queue to empty.
     ///
@@ -467,15 +527,91 @@ final class LogWriter {
     ///
     /// @throws LedgerIoException if the writer stops first
     void awaitFrames(long frames) {
+        if (durableFrames < frames) {
+            wantFrames(frames);
+        }
         durabilityLock.lock();
         try {
-            while (written < frames) {
+            while (durableFrames < frames) {
                 checkHealthy();
                 durabilityChanged.awaitUninterruptibly();
             }
         } finally {
             durabilityLock.unlock();
         }
+    }
+
+    /// Has flushes force what they write until the first `frames` frames queued are durable.
+    private void wantFrames(long frames) {
+        queueLock.lock();
+        try {
+            wantedFrames = Math.max(wantedFrames, frames);
+        } finally {
+            queueLock.unlock();
+        }
+        schedule();
+    }
+
+    /// Has a flush on the pool force what is written: the thread asking may be interrupted, a thread of the pool is not.
+    private void requestForce() {
+        markForceRequested();
+        schedule();
+    }
+
+    private void markForceRequested() {
+        queueLock.lock();
+        try {
+            forceRequested = true;
+        } finally {
+            queueLock.unlock();
+        }
+    }
+
+    /// Starts a flush on the pool unless one is due to look at the queue and the requests again.
+    private void schedule() {
+        if (scheduled.compareAndSet(false, true)) {
+            try {
+                executor.execute(this::flush);
+            } catch (RejectedExecutionException exception) {
+                stop(new IOException("The log's pool refused a flush: it was closed with the store open", exception));
+            }
+        }
+    }
+
+    /// Records that the frames written have started to wait for a force, and arms one for the end of the delay, unless
+    /// one is on its way, which finds the time they have left when it runs.
+    private void delay() {
+        if (!delaying) {
+            delaying = true;
+            unforcedSince = System.nanoTime();
+            armTimer(lazyNanos);
+        }
+    }
+
+    private void armTimer(long nanos) {
+        if (timerArmed.compareAndSet(false, true)) {
+            CompletableFuture.delayedExecutor(nanos, TimeUnit.NANOSECONDS, executor).execute(this::delayedForce);
+        }
+    }
+
+    /// Forces the frames that waited out the delay, on a thread of the pool, unless every frame written is durable or
+    /// the writer has stopped: past those two, a closed writer has no channel to force.
+    ///
+    /// For a flush that has stopped: one still running holds this task back, on a pool of one thread, and looks at the
+    /// delay itself ([#forceNeeded(long)]).
+    private void delayedForce() {
+        // Before it reads what is written: a flush that wrote frames and found the timer armed leaves them to this force
+        timerArmed.set(false);
+        if (writtenFrames <= durableFrames || failure != null) {
+            return;
+        }
+        var left = unforcedSince + lazyNanos - System.nanoTime();
+        if (left > 0) {
+            armTimer(left);
+            return;
+        }
+        markForceRequested();
+        flush();
     }
 
     /// Throws if the writer has stopped after a failed write.
@@ -492,12 +628,13 @@ final class LogWriter {
         flush(Long.MAX_VALUE);
     }
 
-    /// Writes the queued groups until the queue is empty, or until the commit at `until` is durable, for a commit that
-    /// waits for its group on its own thread rather than for a thread of the pool to wake, then for its own to be woken.
+    /// Writes the queued groups, and forces what something needs forced, until the queue is empty, or until the commit
+    /// at `until` is durable, for a commit that waits for its group on its own thread rather than for a thread of the
+    /// pool to wake, then for its own to be woken.
     ///
-    /// One flush writes at a time: another returns at once, and the one that writes looks at the queue again once it
-    /// stops, so the frames of a commit whose flush returned are never left behind. A flush for a commit hands what is
-    /// queued after its group to the pool.
+    /// One flush writes at a time: another returns at once, and the one that writes looks at the queue and the requests
+    /// for a force again once it stops, so the frames of a commit whose flush returned are never left behind, and no
+    /// request is. A flush for a commit hands what is queued after its group to the pool.
     private void flush(long until) {
         while (running.compareAndSet(false, true)) {
             try {
@@ -505,17 +642,17 @@ final class LogWriter {
             } finally {
                 running.set(false);
             }
-            boolean empty;
+            boolean idle;
             queueLock.lock();
             try {
-                empty = queue.isEmpty();
-                if (empty) {
+                idle = queue.isEmpty() && !forceRequested && wantedFrames <= durableFrames;
+                if (idle) {
                     scheduled.set(false);
                 }
             } finally {
                 queueLock.unlock();
             }
-            if (empty || failure != null) {
+            if (idle || failure != null) {
                 return;
             }
             if (until != Long.MAX_VALUE) {
@@ -545,13 +682,20 @@ final class LogWriter {
         return commitWindowNanos == 0 && waiters.isEmpty() && lastQueued == sequence && durable < sequence;
     }
 
+    /// {@return whether the output holds everything written and not forced, with room for its padding, so a force an
+    /// interrupt cuts off can write it all again}
+    private boolean canRewriteUnforced() {
+        return position - retained == forcedPosition && retained + ALIGNMENT <= OUTPUT;
+    }
+
     /// {@return whether `frames` seal into the output and the current segment, so the group is written with one call
-    /// that a write cut off by an interrupt repeats, with no rollover to prepare a segment on the caller's thread}
+    /// that a write cut off by an interrupt repeats, with no rollover to prepare a segment on the caller's thread, and
+    /// a force cut off too can write them again along with what was written before them}
     private boolean fitsOneWrite(List<Queued> frames) {
-        if (channel == null) {
+        if (channel == null || !canRewriteUnforced()) {
             return false;
         }
-        var bytes = 0L;
+        var bytes = (long) retained;
         for (var frame : frames) {
             bytes += FRAME_HEADER + frame.body().size() + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
             if (bytes > OUTPUT - ALIGNMENT) {
@@ -561,7 +705,8 @@ final class LogWriter {
         return position + bytes + ALIGNMENT <= segmentSize;
     }
 
-    /// Writes the queued groups until the queue is empty or the commit at `until` is durable, holding [#running].
+    /// Writes the queued groups, and forces what something needs forced, until the queue is empty and no force is due
+    /// or the commit at `until` is durable, holding [#running].
     private void flushGroups(long until) {
         leading = until != Long.MAX_VALUE;
         try {
@@ -571,35 +716,51 @@ final class LogWriter {
                 if (commitWindowNanos > 0) {
                     LockSupport.parkNanos(commitWindowNanos);
                 }
-                ArrayList<Queued> group;
-                long sequence;
-                long frames;
-                boolean units;
+                ArrayList<Queued> group = null;
+                var sequence = 0L;
+                var frames = 0L;
+                var units = false;
                 queueLock.lock();
                 try {
-                    if (queue.isEmpty() || (until != Long.MAX_VALUE && (lastQueued > until || !fitsOneWrite(queue)))) {
-                        return;
+                    if (!queue.isEmpty()) {
+                        if (leading && (lastQueued > until || !fitsOneWrite(queue))) {
+                            return;
+                        }
+                        group = queue;
+                        sequence = lastQueued;
+                        frames = appended;
+                        units = queuedUnits;
+                        queuedUnits = false;
+                        queue = flushing;
                     }
-                    group = queue;
-                    sequence = lastQueued;
-                    frames = appended;
-                    units = queuedUnits;
-                    queuedUnits = false;
-                    queue = flushing;
                 } finally {
                     queueLock.unlock();
                 }
-                var bodies = write(group, units);
-                group.clear();
-                flushing = group;
-                queueLock.lock();
-                try {
-                    pendingBytes -= bodies;
-                    queueDrained.signalAll();
-                } finally {
-                    queueLock.unlock();
+                if (group != null) {
+                    var bodies = write(group, sequence, frames, units);
+                    group.clear();
+                    flushing = group;
+                    queueLock.lock();
+                    try {
+                        pendingBytes -= bodies;
+                        queueDrained.signalAll();
+                    } finally {
+                        queueLock.unlock();
+                    }
+                    writtenFrames = frames;
+                    writtenSequence = sequence;
                 }
-                publish(sequence, frames);
+                if (forceDue()) {
+                    forceWritten();
+                } else if (group != null) {
+                    delay();
+                } else {
+                    if (position == forcedPosition) {
+                        // A request made before this is met: it asked for what was written then
+                        forceRequested = false;
+                    }
+                    return;
+                }
             }
         } catch (IOException exception) {
             stop(exception);
@@ -624,30 +785,34 @@ final class LogWriter {
         channel = FileChannel.open(segmentPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
     }
 
-    /// Seals and writes `group`, then forces it, and the file of large values if `units`.
+    /// Seals and writes `group`, whose last sequence is `sequence` and whose last frame is the `frames`-th queued, padded
+    /// if a force is known to follow, and starts the force of the file of large values if `units`.
     ///
     /// The commits of the group wrote their units before they queued their frames, so one force of that file, run
     /// beside the segment's, makes them all durable. A rollover waits for it before it forces the segment: the first
-    /// frame of a group in the next segment then means, as it always does, that everything before it is durable.
+    /// frame of a group in the next segment then means, as it always does, that everything before it is durable. The
+    /// frames of the full segment are durable from that force on, whether or not anything forces those after them.
     ///
     /// @return the bytes of the frame bodies written
-    private long write(List<Queued> group, boolean units) throws IOException {
+    private long write(List<Queued> group, long sequence, long frames, boolean units) throws IOException {
         if (channel == null) {
             rollover();
         }
-        // Between groups: the last drain's bytes, which an interrupted force writes again, are durable by now
-        if (smallGroups >= SHRINK_AFTER && output.length > MIN_OUTPUT) {
+        // The output holds nothing an interrupted force would write again
+        if (smallGroups >= SHRINK_AFTER && output.length > MIN_OUTPUT && used == 0) {
             output = new byte[MIN_OUTPUT];
         }
-        var unitForce = units ? forceUnits() : null;
+        unitForce = units ? forceUnits() : null;
         var start = position;
-        var groupStart = true;
+        var groupStart = position == forcedPosition;
         var bodies = 0L;
+        var sealedSequence = writtenSequence;
+        var sealedFrames = frames - group.size();
         for (var frame : group) {
             var bodyLength = frame.body().size();
             bodies += bodyLength;
             var sealedLength = bodyLength + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
-            if (position + used + FRAME_HEADER + sealedLength > segmentSize && position + used > SEGMENT_HEADER) {
+            if (writeEnd() + FRAME_HEADER + sealedLength > segmentSize && writeEnd() > SEGMENT_HEADER) {
                 drain();
                 if (unitForce != null) {
                     await(unitForce);
@@ -655,6 +820,7 @@ final class LogWriter {
                 }
                 force();
                 forces++;
+                publish(sealedSequence, sealedFrames);
                 closeSegment();
                 rollover();
                 start = position;
@@ -662,26 +828,102 @@ final class LogWriter {
             }
             seal(frame, sealedLength, groupStart);
             groupStart = false;
+            sealedSequence = frame.sequence();
+            sealedFrames++;
+            if (next == null && writeEnd() - SEGMENT_HEADER >= segmentSize / PREPARE_DIVISOR) {
+                prepareNext();
+            }
         }
-        // Zeros to the next block, where the next group starts: a reused file holds older bytes there
-        var end = position + used;
+        var end = writeEnd();
+        // In one write with the frames when the force is known already, a commit that came to wait since then costing a
+        // write of its own
+        if (leading || forceNeeded(sequence)) {
+            pad();
+        }
+        smallGroups = writeEnd() - start <= MIN_OUTPUT / 2 ? smallGroups + 1 : 0;
+        drain();
+        this.groupStart = start;
+        groupEnd = end;
+        return bodies;
+    }
+
+    /// {@return where the bytes in the output not written yet end}
+    private long writeEnd() {
+        return position + used - retained;
+    }
+
+    /// Adds zeros up to the next block to the output, where the frame after a force starts: a reused file holds older
+    /// bytes there. Only a force may follow them.
+    private void pad() throws IOException {
+        var end = writeEnd();
         var padding = (int) ((end + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT - end);
         room(padding);
         Arrays.fill(output, used, used + padding, (byte) 0);
         used += padding;
-        smallGroups = position + used - start <= MIN_OUTPUT / 2 ? smallGroups + 1 : 0;
-        drain();
+        padded = true;
+    }
+
+    /// {@return whether something needs the frames up to `sequence`, or the ones written before them, forced now}
+    ///
+    /// The frames of commits that wrote units are, so that a commit whose units the file lacks is one no one was told
+    /// of. Frames past the delay are, whatever else this flush has to write: commits that keep coming keep it running,
+    /// and on a pool of one thread the delayed force waits for it to stop.
+    private boolean forceNeeded(long sequence) {
+        return lazyNanos == 0
+                || closing
+                || forceRequested
+                || unitForce != null
+                || writeEnd() - forcedPosition >= LAZY_BYTES
+                || wantedFrames > durableFrames
+                || waitedFor(sequence)
+                || (delaying && System.nanoTime() - unforcedSince >= lazyNanos);
+    }
+
+    /// {@return whether a commit at or below `sequence` not durable yet waits}
+    private boolean waitedFor(long sequence) {
+        for (var waiter : waiters) {
+            if (waiter.sequence <= sequence && waiter.sequence > durable) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// {@return whether this flush forces what is written now}
+    ///
+    /// Read after the flush publishes what it wrote, so a commit that came to wait while it wrote is found, or finds
+    /// the frames written itself and requests the force.
+    private boolean forceDue() {
+        if (padded) {
+            return true;
+        }
+        if (position == forcedPosition) {
+            return false;
+        }
+        return leading ? canRewriteUnforced() : forceNeeded(writtenSequence);
+    }
+
+    /// Pads and forces what is written, the file of large values with it if the group started that force, and publishes
+    /// it as durable.
+    private void forceWritten() throws IOException {
+        if (!padded) {
+            pad();
+            drain();
+        }
+        var sequence = writtenSequence;
+        var frames = writtenFrames;
+        forcingSequence = sequence;
+        forceRequested = false;
         force();
         forces++;
         if (unitForce != null) {
             await(unitForce);
+            unitForce = null;
         }
-        this.groupStart = start;
-        groupEnd = end;
         if (next == null) {
             prepareNext();
         }
-        return bodies;
+        publish(sequence, frames);
     }
 
     /// Seals `frame` into the output, writing the output out whenever it fills.
@@ -691,7 +933,7 @@ final class LogWriter {
     private void seal(Queued frame, int sealedLength, boolean groupStart) throws IOException {
         room(FRAME_HEADER);
         var at = used;
-        var frameOffset = position + used;
+        var frameOffset = writeEnd();
         var header = ByteBuffer.wrap(output, at, FRAME_HEADER);
         header.putInt(MAGIC).putInt(sealedLength).putLong(frame.sequence()).put(frame.type()).put(groupStart ? GROUP_START : 0)
                 .putShort((short) 0).putLong(segmentTag).putLong(useTag);
@@ -766,35 +1008,48 @@ final class LogWriter {
         }
     }
 
-    /// Makes room for `bytes` more in the output: grows it while it is smaller than [#OUTPUT], else writes it out.
+    /// Makes room for `bytes` more in the output: gives up the bytes written already unless a commit forcing its own
+    /// group may need them, then grows it while it is smaller than [#OUTPUT], else writes it out.
+    ///
+    /// The bytes written are worth no more memory than the output has: only a commit forcing its own group needs them,
+    /// and without them it leaves the force to the pool.
     private void room(int bytes) throws IOException {
-        if (used + bytes > output.length) {
-            if (output.length < OUTPUT) {
-                var grown = Math.min(OUTPUT, Math.max(2 * output.length, used + bytes));
-                // The bytes not written yet stay where they are
-                output = Arrays.copyOf(output, grown);
-                if (used + bytes <= grown) {
-                    return;
-                }
-            }
-            drain();
+        if (used + bytes <= output.length) {
+            return;
         }
+        if (retained > 0 && !leading) {
+            System.arraycopy(output, retained, output, 0, used - retained);
+            used -= retained;
+            retained = 0;
+            if (used + bytes <= output.length) {
+                return;
+            }
+        }
+        if (output.length < OUTPUT) {
+            var grown = Math.min(OUTPUT, Math.max(2 * output.length, used + bytes));
+            // The bytes not written yet stay where they are
+            output = Arrays.copyOf(output, grown);
+            if (used + bytes <= grown) {
+                return;
+            }
+        }
+        drain();
+        used = 0;
+        retained = 0;
     }
 
-    /// Writes the bytes of the output.
+    /// Writes the bytes of the output not written yet, which it keeps until a force or [#room(int)] gives them up.
     ///
     /// An interrupt that closes the channel meanwhile has the bytes written again, the same bytes at the same offsets.
     private void drain() throws IOException {
         var start = position;
-        lastDrainStart = start;
-        lastDrainLength = used;
         while (true) {
             try {
-                var buffer = ByteBuffer.wrap(output, 0, used);
+                var buffer = ByteBuffer.wrap(output, retained, used - retained);
                 while (buffer.hasRemaining()) {
                     position += channel.write(buffer, position);
                 }
-                used = 0;
+                retained = used;
                 return;
             } catch (ClosedByInterruptException _) {
                 position = start;
@@ -857,7 +1112,7 @@ final class LogWriter {
         durable = sequence;
         durabilityLock.lock();
         try {
-            written = frames;
+            durableFrames = frames;
             durabilityChanged.signalAll();
         } finally {
             durabilityLock.unlock();
@@ -896,6 +1151,8 @@ final class LogWriter {
 
     /// {@return whether the commit at `sequence` is durable}
     ///
+    /// Asking does not hurry it: with no thread waiting it may stay false for the delay the store was opened with.
+    ///
     /// @throws LedgerIoException if the writer stopped before it was
     boolean isDurable(long sequence) {
         if (durable >= sequence) {
@@ -925,7 +1182,9 @@ final class LogWriter {
     /// Parks the caller until the commit at `sequence` is durable, or `timeout` nanoseconds pass if it is not negative.
     ///
     /// A force wakes exactly the commits it made durable, each of which only reads [#durable]: no lock is handed from
-    /// one waiter to the next, which with hundreds of waiters would cost more than the force.
+    /// one waiter to the next, which with hundreds of waiters would cost more than the force. A commit written already
+    /// and left unforced that cannot force it itself requests the force of a flush on the pool, with or without a
+    /// timeout, which the delay might outlast.
     private boolean await(long sequence, long timeout) throws InterruptedException {
         if (durable >= sequence) {
             return true;
@@ -943,6 +1202,11 @@ final class LogWriter {
         var waiter = new Waiter(Thread.currentThread(), sequence);
         waiters.add(waiter);
         try {
+            // After it is in the list: a flush that published these frames before it was finds them here, and one that
+            // publishes them after finds it. A force started after they were written makes them durable and wakes it
+            if (writtenSequence >= sequence && forcingSequence < sequence && durable < sequence) {
+                requestForce();
+            }
             var deadline = timeout < 0 ? 0 : System.nanoTime() + timeout;
             while (durable < sequence) {
                 checkHealthy();
@@ -1006,12 +1270,12 @@ final class LogWriter {
         return 13 + bodyBytes + unitBytes + (long) writes * WRITE_HEAP + (writes > 0 ? COMMIT_HEAP : 0);
     }
 
-    /// {@return the offset in the current segment where the frames of the last group end, before their padding}
+    /// {@return the offset in the current segment where the frames of the last pass of a flush end, before any padding}
     long groupEnd() {
         return groupEnd;
     }
 
-    /// {@return the offset in the current segment where the frames of the last group start, a block boundary}
+    /// {@return the offset in the current segment where the frames of the last pass of a flush start}
     long groupStart() {
         return groupStart;
     }
@@ -1019,6 +1283,11 @@ final class LogWriter {
     /// {@return the forces made so far}
     long forces() {
         return forces;
+    }
+
+    /// {@return the last sequence written to the file, forced or not}
+    long writtenSequence() {
+        return writtenSequence;
     }
 
     /// Makes everything queued durable, then closes the segment.
@@ -1037,9 +1306,12 @@ final class LogWriter {
             queueLock.unlock();
         }
         try {
+            if (durableFrames < frames) {
+                wantFrames(frames);
+            }
             durabilityLock.lock();
             try {
-                while (written < frames) {
+                while (durableFrames < frames) {
                     checkHealthy();
                     durabilityChanged.awaitUninterruptibly();
                 }
@@ -1100,31 +1372,37 @@ final class LogWriter {
 
     /// Forces the segment to stable storage; on macOS the JDK empties the drive's cache with `fcntl(F_FULLFSYNC)`.
     ///
-    /// An interrupt of a commit writing its own group that closes the channel meanwhile has the group written again
-    /// through a new one, then forced: the interrupt may hide a failure of the force, after which the file system may
-    /// report the next force a success with the group not on disk, so the pages are made dirty again first. A group of
-    /// the pool's flush, which one write may not hold, fails as any failed force does.
+    /// An interrupt of a commit writing its own group that closes the channel meanwhile has everything since the last
+    /// force written again through a new one, then forced: the interrupt may hide a failure of the force, after which
+    /// the file system may report the next force a success with the bytes not on disk, so the pages are made dirty again
+    /// first. A flush of the pool, whose bytes the output may not hold, fails as any failed force does.
     private void force() throws IOException {
         while (true) {
             try {
                 channel.force(false);
+                forcedPosition = position;
+                used = 0;
+                retained = 0;
+                padded = false;
+                delaying = false;
                 return;
             } catch (ClosedByInterruptException exception) {
                 if (!leading) {
                     throw exception;
                 }
                 reopen();
-                rewriteLastDrain();
+                rewriteUnforced();
             }
         }
     }
 
-    /// Writes the bytes of the last drain again, where it wrote them; they are still in the output.
-    private void rewriteLastDrain() throws IOException {
+    /// Writes everything since the last force again, where it was written: a commit forcing its own group holds it all
+    /// in the output ([#canRewriteUnforced()]).
+    private void rewriteUnforced() throws IOException {
         while (true) {
             try {
-                var buffer = ByteBuffer.wrap(output, 0, lastDrainLength);
-                var at = lastDrainStart;
+                var buffer = ByteBuffer.wrap(output, 0, retained);
+                var at = forcedPosition;
                 while (buffer.hasRemaining()) {
                     at += channel.write(buffer, at);
                 }

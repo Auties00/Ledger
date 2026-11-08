@@ -28,10 +28,19 @@ import java.util.zip.CRC32C;
 /// recovery refuses the log rather than drop it. The search for such a group takes the first frame of a group of any
 /// use of the segment: at most one use writes past its first group ([LogWriter]).
 ///
-/// A segment whose first frame header is all zeros was prepared and never written, unless such a group follows, and
-/// the next open writes into it. A segment's header is forced before it takes its name, so a last segment holding
-/// nothing past a damaged header is a crash during its creation, or a segment a close kept, and is deleted. Any other
-/// segment whose header is damaged, or names another store, another number or another encryption, is refused.
+/// A group is everything written between two forces, in any number of passes of the writer. Only its first frame takes
+/// the flag, and it always starts a block, because only a frame written right after a force completed does: the frames
+/// after it may start anywhere, and damage among those, which can span every byte since the force, ends the segment
+/// like any torn tail, with no flagged frame past it. A frame after padding must take the flag, so a loss of power that
+/// zeroes the sectors up to a block boundary ends the segment too, where a frame without it follows.
+///
+/// A segment whose first frame header is all zeros was prepared and never written, or a loss of power took the first
+/// block of a first group no force completed, unless such a group follows. The last segment, if it is such a one, is
+/// the one the next open writes into, as a use of its own whose frames carry another tag than whatever that group left;
+/// an earlier one holds nothing to replay and stays so. A segment's header is forced before it takes its name, so a last
+/// segment holding nothing past a damaged header is a crash during its creation, or a segment a close kept, and is
+/// deleted. Any other segment whose header is damaged, or names another store, another number or another encryption, is
+/// refused.
 ///
 /// The commits recovery replays may be in the cache of a process that stopped before forcing them: the last segment
 /// that holds frames is forced before any commit follows them ([Result#lastWritten()]).
@@ -66,7 +75,8 @@ final class LogRecovery {
     ///
     /// @param lastSequence the sequence of the last commit replayed, or the checkpoint's
     /// @param lastSegment the number of the last segment, or 0 if there was none
-    /// @param empty the last segment if it was prepared and never written, which the next writer writes into; or `null`
+    /// @param empty the last segment if its first frame was never written or never reached the disk, which the next
+    ///              writer writes into; or `null`
     /// @param lastWritten the last segment that holds a frame, or `null` if none does
     record Result(long lastSequence, long lastSegment, LogFiles.Prepared empty, Path lastWritten) {
     }
@@ -110,8 +120,8 @@ final class LogRecovery {
                 var frame = new byte[LogWriter.FRAME_HEADER];
                 long position = LogWriter.SEGMENT_HEADER;
                 if (!reader.read(position, frame, 0, LogWriter.FRAME_HEADER) || isZero(frame, 0, LogWriter.FRAME_HEADER)) {
-                    // Prepared and never written, unless damage zeroed the first frame before groups a later force made
-                    // durable, whose first frames may carry the sequence of the commit before them
+                    // Nothing durable, unless damage zeroed the first frame before groups a later force made durable,
+                    // whose first frames may carry the sequence of the commit before them
                     checkNoLaterGroup(reader, position, Long.MIN_VALUE, tag, crc, path);
                     empty = new LogFiles.Prepared(number, path, salt);
                     continue;
