@@ -94,7 +94,9 @@ public non-sealed interface Ledger extends View, AutoCloseable {
     ///
     /// @param batch the writes to apply
     /// @return the commit, to wait on for durability
-    /// @throws IllegalArgumentException if another store created `batch`
+    /// @throws IllegalArgumentException if another store created `batch`, or the store has a log and `batch` takes more
+    ///                                  of it than one commit may, a little under 2 GiB with its large values aside;
+    ///                                  none of its writes apply
     /// @throws LedgerIoException if the store has stopped after a failed write
     /// @throws IllegalStateException if the store is closed
     Commit commit(WriteBatch batch);

@@ -3,8 +3,10 @@ package com.github.auties00.ledger.engine;
 import com.github.auties00.ledger.Commit;
 import com.github.auties00.ledger.Encryption;
 import com.github.auties00.ledger.KeyCodec;
+import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
+import com.github.auties00.ledger.Transaction;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.testkit.ChangeInterceptor;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
@@ -41,6 +43,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -48,6 +51,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Frame bodies that refer to the arrays the store's versions keep instead of copying their values: the bytes the log
@@ -220,6 +224,49 @@ class FrameReferencesTest {
             }
             assertTrue(scribbled > 0);
             assertArrayEquals(expected, gather(body));
+        }
+
+        @Test
+        @DisplayName("of the longest a value may make it holds that value, and not a byte more")
+        void limit() {
+            var key = utf8("k");
+            var longest = FrameBody.MAX_BYTES - FrameBody.WRITE_FIELDS - 1;
+            assertThrows(IllegalArgumentException.class, () -> new FrameBody().put(0, key, new byte[0], 0, longest + 1));
+            var body = new FrameBody();
+            body.put(0, key, new byte[0], 0, longest);
+            assertTrue(body.size() > longest);
+            assertTrue(body.size() <= FrameBody.MAX_BYTES, "holds " + body.size());
+        }
+
+        static Stream<Arguments> writes() {
+            var key = utf8("k".repeat(50));
+            var inline = MemorySegment.ofArray(new byte[50]);
+            return Stream.of(
+                    Arguments.of("a put it refers to", (Consumer<FrameBody>) body -> body.put(0, key, new byte[0], 0, 1_000)),
+                    Arguments.of("a put of an array it copies", (Consumer<FrameBody>) body -> body.put(0, key, new byte[50], 0, 50)),
+                    Arguments.of("a put of a segment", (Consumer<FrameBody>) body -> body.put(0, key, inline)),
+                    Arguments.of("a put of a large value", (Consumer<FrameBody>) body -> body.putExternal(0, key, 1L << 40, new PageRef(0, 1, 0L, 0))),
+                    Arguments.of("a removal", (Consumer<FrameBody>) body -> body.delete(0, key)),
+                    Arguments.of("a range removal", (Consumer<FrameBody>) body -> body.deleteRange(0, key, key)),
+                    Arguments.of("a name", (Consumer<FrameBody>) body -> body.catalog(0, "k".repeat(50))));
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @MethodSource("writes")
+        @DisplayName("that a write would take past its limit throws and stays as it was, its length never wrapping")
+        void past(String ignored, Consumer<FrameBody> write) {
+            var body = new FrameBody();
+            // Room for a few dozen bytes of keys and values
+            body.put(0, utf8("k"), new byte[0], 0, FrameBody.MAX_BYTES - 2 * FrameBody.WRITE_FIELDS - 1 - 10);
+            var size = body.size();
+            var pieces = body.pieces();
+            assertThrows(IllegalArgumentException.class, () -> write.accept(body));
+            assertEquals(size, body.size());
+            assertEquals(pieces, body.pieces());
+            body.delete(0, utf8("0123456789"));
+            assertTrue(body.size() > size);
+            assertTrue(body.size() <= FrameBody.MAX_BYTES, "holds " + body.size());
+            assertThrows(IllegalArgumentException.class, () -> body.delete(0, utf8("0123456789".repeat(4))));
         }
     }
 
@@ -588,6 +635,255 @@ class FrameReferencesTest {
             }
             try (var ledger = open(survivor.getPath("/store"), encrypted, 1L << 20)) {
                 assertArrayEquals(committed, ledger.get(SESSIONS, "session").orElseThrow());
+            }
+        }
+
+        // Reads a private field of the engine: a commit's frame is nowhere else to see before the log writes it
+        private static Object field(Class<?> owner, Object instance, String name) throws ReflectiveOperationException {
+            var field = owner.getDeclaredField(name);
+            field.setAccessible(true);
+            return field.get(instance);
+        }
+
+        private static LiveLedger.Applier applier(Transaction transaction) throws ReflectiveOperationException {
+            return (LiveLedger.Applier) field(LiveTransaction.class, transaction, "applier");
+        }
+
+        private static FrameBody frame(Transaction transaction) throws ReflectiveOperationException {
+            return (FrameBody) field(LiveLedger.Applier.class, applier(transaction), "frame");
+        }
+
+        // Makes the frame of `transaction` claim to be so long that only `room` more bytes of keys and values fit
+        private static void fill(Transaction transaction, int room) throws ReflectiveOperationException {
+            var frame = frame(transaction);
+            var key = utf8("filler");
+            frame.put(1, key, new byte[0], 0, FrameBody.MAX_BYTES - 2 * FrameBody.WRITE_FIELDS - frame.size() - (int) key.byteSize() - room);
+        }
+
+        // The frames queued and not taken by the log writer yet, whose latest is that of the latest commit
+        private static List<FrameBody> queued(Ledger ledger) throws ReflectiveOperationException {
+            var log = field(LiveLedger.class, ledger, "log");
+            var body = Class.forName(LogWriter.class.getName() + "$Queued").getDeclaredMethod("body");
+            body.setAccessible(true);
+            var lock = (java.util.concurrent.locks.ReentrantLock) field(LogWriter.class, log, "queueLock");
+            var bodies = new ArrayList<FrameBody>();
+            lock.lock();
+            try {
+                for (var frame : (List<?>) field(LogWriter.class, log, "queue")) {
+                    bodies.add((FrameBody) body.invoke(frame));
+                }
+            } finally {
+                lock.unlock();
+            }
+            return bodies;
+        }
+
+        private static void assertFrame(FrameBody frame, String name, int pieces, int maxCopied, int size) {
+            assertEquals(pieces, frame.pieces(), name + ": pieces");
+            assertTrue(frame.pieceArray(0).length <= maxCopied, name + ": copies on an array of " + frame.pieceArray(0).length + " bytes");
+            assertTrue(frame.size() >= size, name + ": holds " + frame.size() + " bytes");
+        }
+
+        @Test
+        @DisplayName("refers from the frames of its commits to the values its versions keep, whichever way a commit reached them")
+        void refers() throws Exception {
+            var random = new Random(13);
+            var disk = CrashFileSystem.create();
+            try (var ledger = open(disk.getPath("/store"), true, 1L << 20)) {
+                ledger.awaitDurable();
+                var reached = new CountDownLatch(1);
+                var open = stallLog(disk, reached);
+                Commit last;
+                try {
+                    // Parks the writer at a write of the log: every frame after this one stays queued
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "first", new byte[300]));
+                    assertTrue(reached.await(2, TimeUnit.MINUTES));
+
+                    // A single value: the version keeps the batch's own array
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "own", pattern(random, 4_000)));
+                    assertFrame(queued(ledger).getLast(), "own array", 3, 256, 4_000);
+
+                    // At the threshold, and just under it
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "at", pattern(random, FrameBody.MIN_REFERENCED)));
+                    assertFrame(queued(ledger).getLast(), "at the threshold", 3, 256, FrameBody.MIN_REFERENCED);
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "under", pattern(random, FrameBody.MIN_REFERENCED - 1)));
+                    assertFrame(queued(ledger).getLast(), "under the threshold", 1, 1_024, FrameBody.MIN_REFERENCED - 1);
+
+                    // Enough beside the messages to send them to chunks; a resident byte array is always copied
+                    var chunks = ledger.newBatch();
+                    for (var i = 0; i < 10; i++) {
+                        chunks.put(MESSAGES, "chunk" + i, pattern(random, 1_400));
+                    }
+                    chunks.put(SESSIONS, "session", pattern(random, 30_000));
+                    ledger.commit(chunks);
+                    assertFrame(queued(ledger).getLast(), "chunks", 21, 32_000, 44_000);
+
+                    // A value of half a chunk or more gets an array of its own
+                    var own = ledger.newBatch();
+                    own.put(MESSAGES, "large", pattern(random, 200_000));
+                    own.put(SESSIONS, "beside", pattern(random, 30_000));
+                    ledger.commit(own);
+                    assertFrame(queued(ledger).getLast(), "array of its own", 3, 32_000, 230_000);
+
+                    // A resident key space with its own codec, on a value of its own, and on the batch's array
+                    ledger.commit(ledger.newBatch().put(NOTES, "note", pattern(random, 4_000)));
+                    assertFrame(queued(ledger).getLast(), "resident", 3, 256, 4_000);
+                    var notes = ledger.newBatch();
+                    notes.put(NOTES, "note1", pattern(random, 1_000));
+                    notes.put(MESSAGES, "beside", pattern(random, 30_000));
+                    ledger.commit(notes);
+                    assertFrame(queued(ledger).getLast(), "resident beside a message", 5, 256, 31_000);
+
+                    ledger.commit(ledger.newBatch().put(SESSIONS, "copied", pattern(random, 4_000)));
+                    assertFrame(queued(ledger).getLast(), "resident byte array", 1, 8_192, 4_000);
+
+                    // A commit that runs alone
+                    var alone = ledger.newBatch();
+                    alone.put(MESSAGES, "alone", pattern(random, 4_000));
+                    alone.deleteRange(NOTES, KeyRange.atLeast("z"));
+                    ledger.commit(alone);
+                    assertFrame(queued(ledger).getLast(), "alone", 3, 256, 4_000);
+
+                    // A transaction: each of its values on an array of its own, but for a resident byte array
+                    var messageValue = pattern(random, 4_000);
+                    var encodedValue = pattern(random, 4_000);
+                    var noteValue = pattern(random, 4_000);
+                    var sessionValue = pattern(random, 200);
+                    last = ledger.update(transaction -> {
+                        transaction.put(MESSAGES, "transaction", messageValue);
+                        transaction.putEncoded(MESSAGES, utf8("encoded"), MemorySegment.ofArray(encodedValue));
+                        transaction.put(NOTES, "transaction", noteValue);
+                        transaction.put(SESSIONS, "transaction", sessionValue);
+                    });
+                    assertFrame(queued(ledger).getLast(), "transaction", 7, 512, 12_200);
+                } finally {
+                    open.countDown();
+                }
+                last.awaitDurable();
+            }
+        }
+
+        // A write a transaction makes once its frame has little room left, far more than it holds beside its key
+        static Stream<Arguments> oversized() {
+            var longKey = "k".repeat(100);
+            var writes = List.<Arguments>of(
+                    Arguments.of("a value it would refer to", (Consumer<Transaction>) transaction -> transaction.put(MESSAGES, "over", new byte[1_000])),
+                    Arguments.of("a value it would copy", (Consumer<Transaction>) transaction -> transaction.put(MESSAGES, "over", new byte[100])),
+                    Arguments.of("an encoded value", (Consumer<Transaction>) transaction -> transaction.putEncoded(MESSAGES, utf8("over"), MemorySegment.ofArray(new byte[100]))),
+                    Arguments.of("a resident byte array", (Consumer<Transaction>) transaction -> transaction.put(SESSIONS, "over", new byte[100])),
+                    Arguments.of("a removal", (Consumer<Transaction>) transaction -> transaction.delete(MESSAGES, longKey)),
+                    Arguments.of("a range removal", (Consumer<Transaction>) transaction -> transaction.deleteRange(MESSAGES, KeyRange.atLeast(longKey))));
+            return writes.stream().flatMap(write -> Stream.of(true, false).map(encrypted -> Arguments.of(write.get()[0], write.get()[1], encrypted)));
+        }
+
+        @ParameterizedTest(name = "{0}, encrypted: {2}")
+        @MethodSource("oversized")
+        @DisplayName("takes back a transaction whose write its frame has no room for, and goes on healthy")
+        void oversizedTransaction(String ignored, Consumer<Transaction> write, boolean encrypted) throws Exception {
+            var disk = CrashFileSystem.create();
+            var directory = disk.getPath("/store");
+            var random = new Random(17);
+            var before = pattern(random, 3_000);
+            var after = pattern(random, 3_000);
+            var longKey = "k".repeat(100);
+            CrashFileSystem survivor;
+            try (var ledger = open(directory, encrypted, 1L << 20)) {
+                ledger.commit(ledger.newBatch().put(MESSAGES, "before", before).put(MESSAGES, longKey, before)).awaitDurable();
+                assertThrows(IllegalArgumentException.class, () -> ledger.update(transaction -> {
+                    transaction.put(MESSAGES, "rolled back", new byte[300]);
+                    transaction.put(NOTES, "rolled back", new byte[300]);
+                    try {
+                        fill(transaction, 20);
+                    } catch (ReflectiveOperationException exception) {
+                        throw new AssertionError(exception);
+                    }
+                    write.accept(transaction);
+                }));
+                assertTrue(ledger.get(MESSAGES, "rolled back").isEmpty());
+                assertTrue(ledger.get(NOTES, "rolled back").isEmpty());
+                assertArrayEquals(before, ledger.get(MESSAGES, "before").orElseThrow());
+                assertEquals(2, ledger.size(MESSAGES));
+                assertEquals(0, ledger.size(NOTES));
+                ledger.commit(ledger.newBatch().put(MESSAGES, "after", after)).awaitDurable();
+                assertEquals(3, ledger.size(MESSAGES));
+                survivor = disk.afterPowerLoss(new Random(19));
+            }
+            try (var ledger = open(survivor.getPath("/store"), encrypted, 1L << 20)) {
+                assertArrayEquals(before, ledger.get(MESSAGES, "before").orElseThrow());
+                assertArrayEquals(after, ledger.get(MESSAGES, "after").orElseThrow());
+                assertArrayEquals(before, ledger.get(MESSAGES, longKey).orElseThrow());
+                assertTrue(ledger.get(MESSAGES, "rolled back").isEmpty());
+                assertEquals(3, ledger.size(MESSAGES));
+            }
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("takes back the write a commit's frame finds no room for once the version is attached, as a batch's thread does")
+        void oversizedCommit(boolean encrypted) throws Exception {
+            var disk = CrashFileSystem.create();
+            var directory = disk.getPath("/store");
+            var before = pattern(new Random(23), 3_000);
+            CrashFileSystem survivor;
+            try (var ledger = open(directory, encrypted, 1L << 20)) {
+                ledger.commit(ledger.newBatch().put(MESSAGES, "replaced", before)).awaitDurable();
+                var live = (LiveLedger) ledger;
+                // A batch needs 2 GiB of values to get here: this is what its commit calls, in the failing order
+                assertThrows(IllegalArgumentException.class, () -> ledger.update(transaction -> {
+                    try {
+                        fill(transaction, 20);
+                        var applier = applier(transaction);
+                        var state = live.state(MESSAGES);
+                        // The first fits and replaces a value, the second finds no room once its version is attached
+                        for (var length : List.of(20, 1_000)) {
+                            var encoded = utf8(length == 20 ? "replaced" : "new");
+                            var value = new byte[length];
+                            applier.put(state, applier.claim(state, encoded), encoded, MemorySegment.ofArray(value).asReadOnly(), null, value, 0, null, TreeSearch.UNKNOWN, null);
+                        }
+                    } catch (ReflectiveOperationException exception) {
+                        throw new AssertionError(exception);
+                    }
+                }));
+                assertArrayEquals(before, ledger.get(MESSAGES, "replaced").orElseThrow());
+                assertTrue(ledger.get(MESSAGES, "new").isEmpty());
+                assertEquals(1, ledger.size(MESSAGES));
+                ledger.commit(ledger.newBatch().put(MESSAGES, "after", before)).awaitDurable();
+                survivor = disk.afterProcessCrash();
+            }
+            try (var ledger = open(survivor.getPath("/store"), encrypted, 1L << 20)) {
+                assertArrayEquals(before, ledger.get(MESSAGES, "replaced").orElseThrow());
+                assertArrayEquals(before, ledger.get(MESSAGES, "after").orElseThrow());
+                assertEquals(2, ledger.size(MESSAGES));
+            }
+        }
+
+        @Test
+        @DisplayName("lets a transaction catch a write its frame has no room for, and find nothing of that write")
+        void caughtInTransaction() {
+            var disk = CrashFileSystem.create();
+            try (var ledger = open(disk.getPath("/store"), true, 1L << 20)) {
+                ledger.commit(ledger.newBatch().put(MESSAGES, "kept", new byte[300]).put(MESSAGES, "other", new byte[300]));
+                assertThrows(IllegalStateException.class, () -> ledger.update(transaction -> {
+                    try {
+                        fill(transaction, 20);
+                        var size = frame(transaction).size();
+                        var pieces = frame(transaction).pieces();
+                        assertThrows(IllegalArgumentException.class, () -> transaction.put(MESSAGES, "over", new byte[1_000]));
+                        assertTrue(transaction.get(MESSAGES, "over").isEmpty());
+                        assertThrows(IllegalArgumentException.class, () -> transaction.delete(MESSAGES, "k".repeat(100)));
+                        assertThrows(IllegalArgumentException.class, () -> transaction.deleteRange(MESSAGES, KeyRange.atLeast("k".repeat(100))));
+                        assertTrue(transaction.get(MESSAGES, "kept").isPresent());
+                        assertEquals(size, frame(transaction).size());
+                        assertEquals(pieces, frame(transaction).pieces());
+                        // The filler is no value a writer could read, so this frame must not reach the log
+                        transaction.delete(MESSAGES, "other");
+                        assertTrue(transaction.get(MESSAGES, "other").isEmpty());
+                    } catch (ReflectiveOperationException exception) {
+                        throw new AssertionError(exception);
+                    }
+                    throw new IllegalStateException("taken back");
+                }));
+                assertEquals(2, ledger.size(MESSAGES));
             }
         }
     }

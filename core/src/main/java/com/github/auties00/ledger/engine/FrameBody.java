@@ -28,6 +28,10 @@ import java.util.Arrays;
 /// their own. The log writer reads the [pieces][#pieces()] in order and writes the bytes the format above says, with
 /// no trace of where they were. A referenced array is one no one writes and the pool of the store never hands out, so
 /// a frame may stay queued while the batch it came from starts again on another array.
+///
+/// A body is at most [#MAX_BYTES] long: a write that would pass it throws before it changes the body, on the thread
+/// that commits, which takes its commit back. Only the log writer would find out otherwise, past the commit's return,
+/// when all it can do is stop the store.
 final class FrameBody {
     /// A frame holding a commit.
     static final byte COMMIT = 1;
@@ -47,6 +51,12 @@ final class FrameBody {
     /// The shortest value a body refers to rather than copies: a reference takes 16 bytes of the body's tables, and a
     /// piece more for the writer to gather.
     static final int MIN_REFERENCED = 256;
+    /// The longest body: the longest whose frame AES-GCM can seal and recovery can read into one array, which the JVM
+    /// limits to a few bytes under 2 GiB, with the frame's header and its tag or checksum.
+    static final int MAX_BYTES = Integer.MAX_VALUE - 8 - LogWriter.FRAME_HEADER - Math.max(LogWriter.TAG_BYTES, Integer.BYTES);
+    /// The most a write takes beside its keys and value, which [#checkRoom(long)] counts: a kind and three numbers of up
+    /// to ten bytes.
+    static final int WRITE_FIELDS = 1 + 3 * 10;
 
     // The bytes the body holds itself
     private byte[] data;
@@ -137,12 +147,26 @@ final class FrameBody {
         return (reference == references ? used : spans[reference * SPAN_FIELDS]) - pieceOffset(piece);
     }
 
-    /// {@return the length of the body, the values it refers to included}
+    /// {@return the length of the body, the values it refers to included, at most [#MAX_BYTES]}
     int size() {
         return used + referencedBytes;
     }
 
+    /// Checks that a write of `payload` bytes of keys and values fits in the body, which it leaves as it was if not.
+    ///
+    /// @throws IllegalArgumentException if the write could take the body past [#MAX_BYTES]
+    void checkRoom(long payload) {
+        // The body is within the limit, so this subtraction cannot overflow
+        if (payload > MAX_BYTES - WRITE_FIELDS - referencedBytes - used) {
+            throw new IllegalArgumentException("A commit takes at most " + MAX_BYTES + " bytes of the log, large values aside");
+        }
+    }
+
+    /// Records a put, copying its value.
+    ///
+    /// @throws IllegalArgumentException as [#checkRoom(long)] does
     void put(int keyspace, MemorySegment key, MemorySegment value) {
+        checkRoom(key.byteSize() + value.byteSize());
         writeByte(PUT);
         writeVarInt(keyspace);
         writeSegment(key);
@@ -153,8 +177,9 @@ final class FrameBody {
     /// [#MIN_REFERENCED].
     ///
     /// @param array an array no one writes from now on and the store's pool never hands out
-    /// @throws ArithmeticException if the body would exceed 2 GiB, which no frame can hold
+    /// @throws IllegalArgumentException as [#checkRoom(long)] does
     void put(int keyspace, MemorySegment key, byte[] array, int offset, int length) {
+        checkRoom(key.byteSize() + length);
         writeByte(PUT);
         writeVarInt(keyspace);
         writeSegment(key);
@@ -165,8 +190,7 @@ final class FrameBody {
             used += length;
             return;
         }
-        referencedBytes = Math.addExact(referencedBytes, length);
-        Math.addExact(used, referencedBytes);
+        referencedBytes += length;
         if (referenced == null) {
             referenced = new byte[INITIAL_REFERENCES][];
             spans = new int[INITIAL_REFERENCES * SPAN_FIELDS];
@@ -183,7 +207,10 @@ final class FrameBody {
     }
 
     /// Records a put whose value is the unit `ref` of [BlobFile], holding `length` bytes.
+    ///
+    /// @throws IllegalArgumentException as [#checkRoom(long)] does
     void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
+        checkRoom(key.byteSize() + PageRef.BYTES);
         writeByte(EXTERNAL);
         writeVarInt(keyspace);
         writeSegment(key);
@@ -212,26 +239,43 @@ final class FrameBody {
         return (int) epoch;
     }
 
+    /// Records a removal of `key`.
+    ///
+    /// @throws IllegalArgumentException as [#checkRoom(long)] does
     void delete(int keyspace, MemorySegment key) {
+        checkRoom(key.byteSize());
         writeByte(DELETE);
         writeVarInt(keyspace);
         writeSegment(key);
     }
 
+    /// Records a removal of a range, with `null` for an absent bound.
+    ///
+    /// @throws IllegalArgumentException as [#checkRoom(long)] does
     void deleteRange(int keyspace, MemorySegment from, MemorySegment to) {
+        checkRoom(boundBytes(from) + boundBytes(to));
         writeByte(RANGE);
         writeVarInt(keyspace);
         writeOptional(from);
         writeOptional(to);
     }
 
+    /// Records the name of a key space.
+    ///
+    /// @throws IllegalArgumentException as [#checkRoom(long)] does
     void catalog(int keyspace, String name) {
-        writeVarInt(keyspace);
         var bytes = name.getBytes(StandardCharsets.UTF_8);
+        checkRoom(bytes.length);
+        writeVarInt(keyspace);
         writeVarInt(bytes.length);
         ensure(bytes.length);
         System.arraycopy(bytes, 0, data, used, bytes.length);
         used += bytes.length;
+    }
+
+    /// {@return the bytes of `bound`, or 0 if it is `null`}
+    static long boundBytes(MemorySegment bound) {
+        return bound == null ? 0 : bound.byteSize();
     }
 
     private void writeOptional(MemorySegment bound) {
@@ -264,9 +308,10 @@ final class FrameBody {
         data[used++] = (byte) value;
     }
 
+    /// Makes room in the array for `extra` more bytes, which [#checkRoom(long)] has allowed.
     private void ensure(int extra) {
         if (used + extra > data.length) {
-            data = Arrays.copyOf(data, Math.max(used + extra, data.length * 2));
+            data = Arrays.copyOf(data, (int) Math.min(Math.max(used + extra, data.length * 2L), MAX_BYTES));
         }
     }
 

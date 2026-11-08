@@ -2022,7 +2022,11 @@ public final class LiveLedger implements Ledger {
 
         /// Applies a put of `key` whose value is the whole of `value`, an array of its own that no one writes from now
         /// on, so the commit's frame may refer to it.
+        ///
+        /// @throws IllegalArgumentException if the frame has no room for it, and nothing changed: a transaction may catch
+        ///                                  this and go on
         void putOwn(KeyspaceState state, MemorySegment key, byte[] value, Object decoded) {
+            checkFrame(key.byteSize() + value.length);
             put(state, claim(state, key), key, MemorySegment.ofArray(value).asReadOnly(), null, value, 0, decoded, TreeSearch.UNKNOWN, null);
         }
 
@@ -2045,6 +2049,8 @@ public final class LiveLedger implements Ledger {
         /// @param array the array `value` lies in at `offset`, which no one writes from now on and the store's pool never
         ///              hands out, so the commit's frame may refer to it; or `null` if `value` may be on any other memory
         /// @param offset where `value` starts in `source`, and in `array` if there is one
+        /// @throws IllegalArgumentException if the commit's frame has no room for the write; the version stays attached,
+        ///                                  so the caller takes the commit back
         void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, MemorySegment source, byte[] array, int offset,
                  Object decoded, byte inTree, PageRef external) {
             var stamp = nextStamp();
@@ -2109,7 +2115,9 @@ public final class LiveLedger implements Ledger {
         /// Applies a removal of `key`.
         ///
         /// @param inTree whether the latest tree holds `key`, as [Hints] give it, or [TreeSearch#UNKNOWN]
+        /// @throws IllegalArgumentException if the commit's frame has no room for it, and nothing changed
         void delete(KeyspaceState state, MemorySegment key, byte inTree) {
+            checkFrame(key.byteSize());
             var chain = state.chain(key);
             if (chain == null || !chain.ordered()) {
                 var head = chain == null ? null : chain.head;
@@ -2126,6 +2134,9 @@ public final class LiveLedger implements Ledger {
         }
 
         /// Applies a removal of `key`, whose chain is `chain`, in the order and without the race the caller ensures.
+        ///
+        /// @throws IllegalArgumentException if the commit's frame has no room for it; the removal stays attached, so the
+        ///                                  caller takes the commit back
         void delete(KeyspaceState state, Chain chain, MemorySegment key, byte inTree) {
             var stamp = nextStamp();
             var head = chain.head;
@@ -2153,7 +2164,11 @@ public final class LiveLedger implements Ledger {
             }
         }
 
+        /// Applies a removal of the keys from `from` to `to`, with `null` for an absent bound.
+        ///
+        /// @throws IllegalArgumentException if the commit's frame has no room for it, and nothing changed
         void deleteRange(KeyspaceState state, MemorySegment from, MemorySegment to) {
+            checkFrame(FrameBody.boundBytes(from) + FrameBody.boundBytes(to));
             var stamp = nextStamp();
             var removed = Reads.count(state, from, to, writerPoint(stamp - 1));
             var removals = state.removals;
@@ -2180,6 +2195,13 @@ public final class LiveLedger implements Ledger {
             }
             if (frame != null) {
                 frame.deleteRange(state.id, from, to);
+            }
+        }
+
+        /// Checks that a write of `payload` bytes of keys and values fits in the commit's frame, if it has one.
+        private void checkFrame(long payload) {
+            if (frame != null) {
+                frame.checkRoom(payload);
             }
         }
 
