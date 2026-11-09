@@ -56,9 +56,10 @@ import java.util.zip.CRC32C;
 ///
 /// Where [WriteThrough] can, a group that one write holds and that lands below the bytes its segment already has is
 /// written through to stable storage instead, durable once the write returns, and not forced: one round trip to the
-/// device where a write and a force take two. The segment is opened a second time for it. A group of several writes,
-/// one that rolls over, or one that would grow the file is written into the cache and forced as before, so an ingest
-/// keeps the bandwidth of the cache, and a file system that refuses the writes through moves the writer to forces.
+/// device where a write and a force take two. The first such group opens the segment a second time for it, so a segment
+/// with none costs nothing. A group of several writes, one that rolls over, or one that would grow the file is written
+/// into the cache and forced as before, so an ingest keeps the bandwidth of the cache, and a file system that refuses
+/// the writes through moves the writer to forces.
 ///
 /// A store just opened has such bytes only in the first block of its first segment, which its first group takes when
 /// one block holds it. The next segment is prepared without zeros, and written with them on a thread of its own once
@@ -180,10 +181,12 @@ final class LogWriter {
 
     // Owned by the flush task; null until the first group opens the first segment
     private FileChannel channel;
-    // The current segment opened to write through, or null where its groups are forced
+    // The current segment opened to write through, or null until its first group that can be
     private WriteThrough.Handle throughFile;
-    // Whether no write yet tried the way throughFile was opened in, so a failure of its first write moves one way down
-    private boolean unprobed;
+    // Whether groups of the current segment may be written through, once one fits the bytes it has
+    private boolean throughWanted;
+    // Whether a write succeeded in the way segments are opened in now; until one does, a failure moves one way down
+    private boolean wayProven;
     // The bytes the current segment had when it was prepared, below which a write changes neither its size nor the
     // length of its data
     private long valid;
@@ -364,43 +367,25 @@ final class LogWriter {
         this.useTag = TAGS.nextLong();
         this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt(), useTag) : null;
         this.next = null;
-        this.unprobed = false;
-        // A segment of its header and first block holds at most one group through, which a probe would cost. That group
-        // is worth a handle only as the first of a store just opened, which may commit once, and it probes the way itself
-        if (valid > KEPT_LENGTH) {
-            this.throughFile = openThrough(true);
-        } else if (first && segment.nameDurable()) {
-            this.throughFile = openThrough(false);
-            this.unprobed = throughFile != null;
-        } else {
-            this.throughFile = null;
-        }
+        this.throughFile = null;
+        // A segment of its header and first block holds at most one group through, which is worth a handle only as the
+        // first of a store just opened, which may commit once
+        this.throughWanted = valid > KEPT_LENGTH || (first && segment.nameDurable());
     }
 
     /// {@return the current segment opened to write through, or `null` if [#writeThrough] has no way left}
     ///
-    /// Each way is probed with a write of zeros over the segment's first frame block, which a prepared segment holds
-    /// already, so a file system that opens the file that way but refuses its writes, as some refuse the alignment
-    /// of `O_DIRECT` at the write and not at the open, moves the writer to the next way down before a group needs it.
-    /// An interrupt that cuts the probe short has it run again, and is given back to a commit's thread when the flush
-    /// ends.
-    ///
-    /// @param probe whether to write the probe, which a handle whose first write is a group's goes without
-    private WriteThrough.Handle openThrough(boolean probe) {
+    /// A way that refuses the open moves the writer to the next one down; one that refuses the write, as some file
+    /// systems refuse the alignment of `O_DIRECT` at the write and not at the open, does so at the group's own
+    /// ([#writeThrough()]).
+    private WriteThrough.Handle openThrough() {
         while (writeThrough.enabled()) {
-            WriteThrough.Handle handle = null;
             try {
-                handle = writeThrough.open(segmentPath);
-                if (probe) {
-                    handle.write(new byte[ALIGNMENT], ALIGNMENT, output.length, SEGMENT_HEADER);
-                }
-                return handle;
-            } catch (ClosedByInterruptException _) {
-                interruptedWrite |= Thread.interrupted();
+                return writeThrough.open(segmentPath);
             } catch (IOException | RuntimeException | LinkageError _) {
                 writeThrough.downgrade();
+                wayProven = false;
             }
-            closeQuietly(handle);
         }
         return null;
     }
@@ -474,7 +459,7 @@ final class LogWriter {
     /// Everything written to the current segment is durable at that point, so no force goes with the move. Only a next
     /// segment of at least half the full size counts, so a short spare left by an earlier move is never moved to.
     private boolean rollsEarly() {
-        if ((throughFile != null && position + ALIGNMENT <= valid) || !(waited || waitedBefore) || writeThrough.kind() == null) {
+        if ((throughWanted && position + ALIGNMENT <= valid) || !(waited || waitedBefore) || writeThrough.kind() == null) {
             return false;
         }
         var preparation = next;
@@ -756,13 +741,14 @@ final class LogWriter {
     }
 
     /// {@return whether `group` is written through: it seals into one write, which starts where everything before it
-    /// is durable and ends, padded, within the bytes the segment had when it was prepared}
+    /// is durable and ends, padded, within the bytes the segment had when it was prepared; the first that does opens the
+    /// segment for it, if a way is left}
     ///
     /// Within those bytes a write changes neither the size of the file nor the length of its data, so it needs no
     /// metadata written with it: the one write with forced unit access that makes a write through cheaper than a
     /// write and a force.
     private boolean writesThrough(List<Queued> group) {
-        if (throughFile == null || position != forcedPosition) {
+        if (!throughWanted || position != forcedPosition) {
             return false;
         }
         var bytes = sealedBytes(group);
@@ -770,7 +756,14 @@ final class LogWriter {
             return false;
         }
         var end = (position + bytes + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT;
-        return end <= valid && position + bytes + ALIGNMENT <= segmentSize;
+        if (end > valid || position + bytes + ALIGNMENT > segmentSize) {
+            return false;
+        }
+        if (throughFile == null) {
+            throughFile = openThrough();
+            throughWanted = throughFile != null;
+        }
+        return throughWanted;
     }
 
     /// Writes the queued groups until the queue is empty or the commit at `until` is durable, holding [#running].
@@ -843,6 +836,7 @@ final class LogWriter {
                 throughFile = writeThrough.open(segmentPath);
             } catch (IOException | RuntimeException | LinkageError _) {
                 throughFile = null;
+                throughWanted = false;
             }
         }
     }
@@ -1151,8 +1145,9 @@ final class LogWriter {
     /// the same offsets, as [#drain()] does. A write through that fails otherwise, as one a file system refuses the
     /// alignment of does, moves the writer to forces: the group is written again into the cache and forced, which
     /// makes each of its pages dirty again whatever the failed write left on the device, so a force that succeeds
-    /// makes the group durable, and one that fails stops the writer as it always does. The first write of a handle no
-    /// probe tried moves one way down first, as a probe that failed would.
+    /// makes the group durable, and one that fails stops the writer as it always does. Until a write has succeeded in
+    /// a way, a failure moves the writer one way down instead, and the next way writes the same bytes at the same
+    /// offsets.
     private void writeThrough() throws IOException {
         var start = position;
         lastDrainStart = start;
@@ -1164,23 +1159,23 @@ final class LogWriter {
                 used = 0;
                 forcedPosition = position;
                 writtenThrough++;
-                unprobed = false;
+                wayProven = true;
                 return;
             } catch (ClosedByInterruptException _) {
                 reopen();
             } catch (IOException _) {
-                if (!unprobed) {
+                if (wayProven) {
                     break;
                 }
-                unprobed = false;
                 writeThrough.downgrade();
                 closeQuietly(throughFile);
-                throughFile = openThrough(true);
+                throughFile = openThrough();
             }
         }
         writeThrough.disable();
         closeQuietly(throughFile);
         throughFile = null;
+        throughWanted = false;
         drain();
         force();
     }

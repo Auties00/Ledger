@@ -54,7 +54,8 @@ import java.util.function.LongFunction;
 /// default, `off`, `dsync` or `direct`.
 ///
 /// A way that fails moves the writer to the next one down, `O_DSYNC` after `O_DIRECT`, and from the last to forces; a
-/// buffer or a handle the native memory has no room for is such a failure, since a force needs neither.
+/// buffer or a handle the native memory has no room for is such a failure, since a force needs neither. The first group
+/// written through a way is what tries it, with no durable write of its own first: a group it refuses is written again.
 /// Only the flush that holds the log writer writes through an instance, so one thread at a time; its buffer, aligned to
 /// [LogWriter#ALIGNMENT] as `O_DIRECT` and `FILE_FLAG_NO_BUFFERING` need, serves every segment of the writer. The thread
 /// preparing a segment may ask which way is left beside it, so the round trip of asking the device holds no commit up.
@@ -113,6 +114,8 @@ final class WriteThrough {
     // The buffer a group is copied into before it is written, aligned to LogWriter.ALIGNMENT, and a view of it
     private MemorySegment buffer;
     private ByteBuffer bufferView;
+    // The handles opened, for tests; written by the flush that holds the log writer
+    private volatile int opens;
     /// Allocates the buffer in place of the arena, by its size; for tests that refuse it.
     LongFunction<MemorySegment> allocatorForTests;
 
@@ -190,6 +193,11 @@ final class WriteThrough {
         }
     }
 
+    /// {@return the handles opened so far, for tests}
+    int opensForTests() {
+        return opens;
+    }
+
     /// Opens the segment at `path` to write through, the current way.
     ///
     /// @throws IOException if it cannot be opened that way, native memory for its handle included
@@ -198,6 +206,7 @@ final class WriteThrough {
         if (!enabled()) {
             throw new IllegalStateException("The log forces its groups");
         }
+        opens++;
         try {
             return switch (kind()) {
                 case UNBUFFERED -> UnbufferedHandle.open(path, this);

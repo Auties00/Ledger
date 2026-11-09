@@ -57,7 +57,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The log's writes through: a group that one write holds is durable once the write returns, with no force after
 /// it, on the file system that simulates failures and on the real one; an interrupt of the write has it written
-/// again, and a write or a probe the file system refuses leaves the store to forces.
+/// again, and a write the file system refuses moves the store down a way or leaves it to forces.
 ///
 /// The simulated file system makes the writes of a channel opened with `DSYNC` durable as they return, so a store
 /// there writes through only when asked for [WriteThrough.Mode#DSYNC]. Past the first group of an open a store writes
@@ -471,57 +471,32 @@ class WriteThroughTest {
             }
         }
 
-        @Test
-        @DisplayName("a probe the file system refuses leaves the store to forces before any group depends on it")
-        void refusedProbe() throws Exception {
-            var disk = CrashFileSystem.create();
-            var seen = ConcurrentHashMap.<String>newKeySet();
-            var refused = new AtomicInteger();
-            var model = new TreeMap<String, String>();
-            disk.intercept((path, kind) -> {
-                // Until one is refused, the first force of a segment longer than two blocks is the probe of its write
-                // through: a segment is forced under another name while it is prepared, and groups of a block each
-                // leave a new one at two blocks until its first force
-                if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log") && seen.add(path.toString())
-                        && refused.get() == 0 && Files.size(path) > LogWriter.KEPT_LENGTH) {
-                    refused.incrementAndGet();
-                    throw new IOException("Invalid argument");
-                }
-            });
-            try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC)) {
-                var log = log(ledger);
-                var commits = 0;
-                commit(ledger, model, "w" + commits++);
-                // The first block of the first segment, which no probe tried
-                var beforeProbe = log.writtenThrough();
-                while (log.currentSegment() < 4) {
-                    commit(ledger, model, "w" + commits++);
-                }
-                ledger.checkpoint();
-                var segment = log.currentSegment();
-                while (log.currentSegment() < segment + 4) {
-                    commit(ledger, model, "w" + commits++);
-                }
-                assertEquals(1, refused.get(), "no segment was probed");
-                assertEquals(beforeProbe, log.writtenThrough());
-            }
-            survivesPowerLoss(disk, model);
+        /// Commits a group of two blocks, which a store just opened cannot write through into the block its first
+        /// segment has, so the first group through comes later, in a segment with bytes for it.
+        private static void commitPastFirstBlock(Ledger ledger, Map<String, String> model) throws InterruptedException {
+            var value = "v".repeat(5_000);
+            ledger.commit(ledger.newBatch().put(NAMES, "past", value)).awaitDurable();
+            model.put("past", value);
+            assertEquals(0, log(ledger).writtenThrough());
         }
 
         @ParameterizedTest(name = "{0} refused")
         @CsvSource({"1, DSYNC, true", "2, , false"})
-        @DisplayName("a probe refused moves the log down one way, O_DIRECT to O_DSYNC to forces, and it goes on down that way")
+        @DisplayName("a first write through refused moves the log down one way, O_DIRECT to O_DSYNC to forces, with its group durable by the way that takes it")
         void downgrades(int refusals, WriteThrough.Kind expected, boolean writesThrough) throws Exception {
             var disk = CrashFileSystem.create();
             var seen = ConcurrentHashMap.<String>newKeySet();
+            var armed = new AtomicBoolean();
             var refused = new AtomicInteger();
             var lastRefused = new AtomicReference<String>();
             var model = new TreeMap<String, String>();
             disk.intercept((path, kind) -> {
-                // The first force of a segment longer than two blocks is its probe, and the probe of the next way down
-                // follows on the same file before anything else is forced
-                if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log") && refused.get() < refusals
-                        && (seen.add(path.toString()) || path.toString().equals(lastRefused.get())) && Files.size(path) > LogWriter.KEPT_LENGTH) {
+                // Past the first commit, the first force of a segment longer than two blocks is the first write through
+                // of a group, as a segment is forced under another name while it is prepared and groups of a block each
+                // leave a new one at two blocks until its first force; the next way down writes that group next
+                if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log")
+                        && (seen.add(path.toString()) || path.toString().equals(lastRefused.get()))
+                        && armed.get() && refused.get() < refusals && Files.size(path) > LogWriter.KEPT_LENGTH) {
                     refused.incrementAndGet();
                     lastRefused.set(path.toString());
                     throw new IOException("Invalid argument");
@@ -530,10 +505,9 @@ class WriteThroughTest {
             try (var ledger = open(disk.getPath("/store"), new WriteThrough(WriteThrough.Kind.DIRECT, null))) {
                 var log = log(ledger);
                 assertEquals(WriteThrough.Kind.DIRECT, log.writeThroughKind());
+                commitPastFirstBlock(ledger, model);
+                armed.set(true);
                 var commits = 0;
-                commit(ledger, model, "w" + commits++);
-                // The first block of the first segment, which no probe tried
-                var beforeProbe = log.writtenThrough();
                 while (log.currentSegment() < 4) {
                     commit(ledger, model, "w" + commits++);
                 }
@@ -542,9 +516,76 @@ class WriteThroughTest {
                 while (log.currentSegment() < segment + 4) {
                     commit(ledger, model, "w" + commits++);
                 }
-                assertEquals(refusals, refused.get(), "probes refused");
+                assertEquals(refusals, refused.get(), "first writes refused");
                 assertEquals(expected, log.writeThroughKind());
-                assertEquals(writesThrough, log.writtenThrough() > beforeProbe);
+                assertEquals(writesThrough, log.writtenThrough() > 0);
+            }
+            survivesPowerLoss(disk, model);
+        }
+
+        @Test
+        @DisplayName("a segment no group can be written through into takes no second handle, and the first group that can opens it")
+        void opensOnDemand() throws Exception {
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, String>();
+            var way = new WriteThrough(WriteThrough.Kind.DSYNC, null);
+            try (var ledger = open(disk.getPath("/store"), way)) {
+                var log = log(ledger);
+                commitPastFirstBlock(ledger, model);
+                var commits = 0;
+                // The first segment has no bytes past its first block, nor does the next, prepared without zeros
+                while (log.currentSegment() < 2) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                assertEquals(0, way.opensForTests());
+                while (log.writtenThrough() == 0) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                assertEquals(1, way.opensForTests());
+            }
+            survivesPowerLoss(disk, model);
+        }
+
+        @Test
+        @DisplayName("only groups reach a segment durably: a way is tried by the first group it writes, with no write of its own in any segment")
+        void noOtherWrites() throws Exception {
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, String>();
+            var forced = new AtomicInteger();
+            disk.intercept((path, kind) -> {
+                if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log")) {
+                    forced.incrementAndGet();
+                }
+            });
+            Ledger opened;
+            // No zeros, whose force of a segment under its name would count, so the spares of the checkpoint have the bytes
+            var previous = System.getProperty("ledger.log.zeroFill");
+            System.setProperty("ledger.log.zeroFill", "off");
+            try {
+                opened = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC);
+            } finally {
+                if (previous == null) {
+                    System.clearProperty("ledger.log.zeroFill");
+                } else {
+                    System.setProperty("ledger.log.zeroFill", previous);
+                }
+            }
+            try (var ledger = opened) {
+                var log = log(ledger);
+                var commits = 0;
+                while (log.currentSegment() < 8) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                ledger.checkpoint();
+                var segment = log.currentSegment();
+                var forces = log.forces();
+                var seen = forced.get();
+                var through = log.writtenThrough();
+                while (log.currentSegment() < segment + 4) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                assertTrue(log.writtenThrough() > through, "no group was written through");
+                assertEquals(log.forces() - forces, forced.get() - seen, "forces of the segments beside those of the groups");
             }
             survivesPowerLoss(disk, model);
         }
