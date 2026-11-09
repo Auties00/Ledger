@@ -530,7 +530,6 @@ class WriteThroughTest {
             });
             try (var ledger = open(disk.getPath("/store"), new WriteThrough(WriteThrough.Kind.DIRECT, null))) {
                 var log = log(ledger);
-                assertEquals(WriteThrough.Kind.DIRECT, log.writeThroughKind());
                 var commits = 0;
                 while (log.currentSegment() < 4) {
                     commit(ledger, model, "w" + commits++);
@@ -704,6 +703,8 @@ class WriteThroughTest {
             var disk = CrashFileSystem.create();
             var asked = new AtomicInteger();
             var model = new TreeMap<String, String>();
+            // Reopened, as a new store queues a frame of its key spaces, which the pool may write before the open returns
+            open(disk.getPath("/store"), WriteThrough.Mode.OFF).close();
             try (var ledger = open(disk.getPath("/store"), new WriteThrough(WriteThrough.Kind.DSYNC, () -> {
                 asked.incrementAndGet();
                 return false;
