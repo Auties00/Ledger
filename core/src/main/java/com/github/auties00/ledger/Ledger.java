@@ -120,6 +120,9 @@ public non-sealed interface Ledger extends View, AutoCloseable {
     /// @return the commit, to wait on for durability
     /// @throws IllegalArgumentException if another store created `batch`
     /// @throws LedgerIoException if the store has stopped after a failed write
+    /// @throws LedgerCorruptedException if `batch` writes an entry of a [resident][Keyspace.Residency#RESIDENT] key
+    ///                                  space that could not be read into memory: none of its writes apply, and the
+    ///                                  next write tries again
     /// @throws IllegalStateException if the store is closed
     Commit commit(WriteBatch batch);
 
@@ -135,6 +138,9 @@ public non-sealed interface Ledger extends View, AutoCloseable {
     /// @param transaction reads and writes the store; it must not keep the [Transaction] it receives
     /// @return the commit, to wait on for durability
     /// @throws LedgerIoException if the store has stopped after a failed write
+    /// @throws LedgerCorruptedException if `transaction` writes an entry of a [resident][Keyspace.Residency#RESIDENT]
+    ///                                  key space that could not be read into memory: none of its writes apply, and the
+    ///                                  next write tries again
     /// @throws IllegalStateException if the store is closed
     Commit update(Consumer<Transaction> transaction);
 
@@ -254,8 +260,9 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// The store goes on after such a failure, since its log still holds every commit, and its next checkpoint
         /// retries; until one succeeds the log grows and opening replays more of it. Reads of a resident key space
         /// whose entries could not be read into memory read them from the store's files, and the next write of an
-        /// entry not read yet tries again, throwing the failure if it repeats. A failure of the log itself stops the
-        /// store instead, and every later commit throws it. Without a listener, these failures are not reported.
+        /// entry not read yet tries again, throwing [LedgerCorruptedException] if it fails again. A failure of the log
+        /// itself stops the store instead, and every later commit throws it. Without a listener, these failures are not
+        /// reported.
         ///
         /// @param listener receives each failure on the thread that met it, and must not block for long
         /// @return these options
@@ -290,11 +297,13 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// write or count of a resident key space starts reading its entries into memory, in the order of their keys.
         /// Until then a read of an entry not in memory yet reads it from the store's files, as a read of a
         /// [paged][Keyspace.Residency#PAGED] key space does, and a write of one waits until it is in memory; a
-        /// range removal in the key space waits for every entry. A scan reads the entries from memory as they reach
-        /// it: one that goes on past its first few leaves has the rest read as an open would, and waits for those
-        /// being read rather than read them too, so it costs about what the open would have cost. An open after a
-        /// crash whose log writes to a resident key space reads that key space while it opens either way. Read at
-        /// open, every entry is in memory once [#build()] returns, which takes the time the reads take.
+        /// range removal in the key space waits for every entry. A write that waits for entries the store fails to read
+        /// throws [LedgerCorruptedException], the failure as its cause, and the next write tries again. A scan reads
+        /// the entries from memory as they reach it: one that goes on past its first few leaves has the rest read as an
+        /// open would, and waits for those being read rather than read them too, so it costs about what the open would
+        /// have cost. An open after a crash whose log writes to a resident key space reads that key space while it
+        /// opens either way. Read at open, every entry is in memory once [#build()] returns, which takes the time the
+        /// reads take.
         ///
         /// @param atOpen whether the open reads the entries of the resident key spaces
         /// @return these options

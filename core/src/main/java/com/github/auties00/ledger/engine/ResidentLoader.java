@@ -120,7 +120,9 @@ final class ResidentLoader {
     /// first, again if it failed.
     ///
     /// @throws IllegalStateException if the store closes meanwhile
-    /// @throws RuntimeException the failure of the load it waited for
+    /// @throws LedgerCorruptedException if the load it waited for failed, its failure as the cause: a new exception, so
+    ///                                  its frames are the caller's, and a codec's exception of any type is told apart
+    ///                                  from the one a closed store throws
     void await(MemorySegment key) {
         if (key == null ? complete : holds(key)) {
             return;
@@ -134,7 +136,7 @@ final class ResidentLoader {
                     throw new IllegalStateException("The store is closed");
                 }
                 if (status == FAILED && failedAttempt >= attempt) {
-                    throw failure;
+                    throw loadFailure(failure);
                 }
                 progress.awaitUninterruptibly();
             }
@@ -257,8 +259,7 @@ final class ResidentLoader {
             }
             status = FAILED;
             failedAttempt = attempts;
-            failure = failed instanceof RuntimeException runtime ? runtime
-                    : new LedgerCorruptedException("The entries of " + state.keyspace.name() + " could not be loaded", failed);
+            failure = failed instanceof RuntimeException runtime ? runtime : loadFailure(failed);
             return failure;
         } finally {
             progress.signalAll();
@@ -266,9 +267,12 @@ final class ResidentLoader {
         }
     }
 
+    private LedgerCorruptedException loadFailure(Throwable cause) {
+        return new LedgerCorruptedException("The entries of " + state.keyspace.name() + " could not be loaded", cause);
+    }
+
     private void report(RuntimeException failure) {
-        var reported = failure instanceof LedgerException known ? known
-                : new LedgerCorruptedException("The entries of " + state.keyspace.name() + " could not be loaded", failure);
+        var reported = failure instanceof LedgerException known ? known : loadFailure(failure);
         try {
             failures.accept(reported);
         } catch (RuntimeException _) {
