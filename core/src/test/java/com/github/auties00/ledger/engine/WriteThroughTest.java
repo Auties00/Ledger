@@ -1,6 +1,7 @@
 package com.github.auties00.ledger.engine;
 
 import com.github.auties00.ledger.Encryption;
+import com.github.auties00.ledger.IoPool;
 import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
@@ -43,11 +44,12 @@ import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -394,16 +396,18 @@ class WriteThroughTest {
                     interrupts.incrementAndGet();
                 }
             });
-            try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC)) {
+            var released = new CountDownLatch(1);
+            try (var pool = IoPool.create(1);
+                 var ledger = ((LedgerBuilder) Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(NAMES).ioPool(pool))
+                         .segmentSize(SEGMENT)
+                         .writeThrough(WriteThrough.Mode.DSYNC)
+                         .build()) {
                 var log = log(ledger);
                 var commits = reachWriteThrough(ledger, model);
-                var cutThrough = 0;
                 for (var i = 0; i < 60; i++) {
                     armed.set(true);
                     var key = "w" + commits++;
                     var value = "v".repeat(500) + key;
-                    var through = log.writtenThrough();
-                    var before = interrupts.get();
                     var commit = ledger.commit(ledger.newBatch().put(NAMES, key, value));
                     try {
                         commit.awaitDurable();
@@ -414,12 +418,33 @@ class WriteThroughTest {
                     assertTrue(commit.isDurable());
                     model.put(key, value);
                     Thread.interrupted();
-                    if (interrupts.get() > before && log.writtenThrough() > through) {
-                        cutThrough++;
-                    }
                 }
                 armed.set(false);
-                assertTrue(cutThrough > 0, "no interrupt cut a commit's own write through short");
+                // A group written through well inside its segment, so the next ones go through too, each in one write
+                while (true) {
+                    var before = log.writtenThrough();
+                    commit(ledger, model, "w" + commits++);
+                    if (log.writtenThrough() > before && log.groupEnd() < SEGMENT / 2) {
+                        break;
+                    }
+                }
+                // A commit writes its own group only if it starts the flush before the pool's thread does, which all the
+                // commits above can lose in a warm JVM
+                occupy(pool, released);
+                for (var i = 0; i < 4; i++) {
+                    armed.set(true);
+                    var key = "w" + commits++;
+                    var value = "v".repeat(500) + key;
+                    var through = log.writtenThrough();
+                    var before = interrupts.get();
+                    ledger.commit(ledger.newBatch().put(NAMES, key, value)).awaitDurable();
+                    model.put(key, value);
+                    Thread.interrupted();
+                    assertEquals(before + 1, interrupts.get(), "the commit left its group to the pool");
+                    assertEquals(through + 1, log.writtenThrough(), "the interrupt left the group to a force");
+                }
+                armed.set(false);
+                released.countDown();
                 var through = log.writtenThrough();
                 for (var i = 0; i < 20 && log.writtenThrough() == through; i++) {
                     commit(ledger, model, "w" + commits++);
@@ -431,6 +456,22 @@ class WriteThroughTest {
             try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC)) {
                 assertEquals(model, contents(ledger));
             }
+        }
+
+        /// Keeps the only thread of `pool` from any other task until `released` opens, and returns once it runs, with every
+        /// task queued before it done. The thread takes its next task after a minute at most, so a commit that left its
+        /// group to the pool fails an assertion rather than hanging the test.
+        private static void occupy(IoPool pool, CountDownLatch released) throws InterruptedException {
+            var occupied = new CountDownLatch(1);
+            ((PlatformIoPool) pool).executor().execute(() -> {
+                occupied.countDown();
+                try {
+                    released.await(1, TimeUnit.MINUTES);
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            occupied.await();
         }
 
         @Test
@@ -471,42 +512,25 @@ class WriteThroughTest {
             }
         }
 
-        /// Commits a group of two blocks, which a store just opened cannot write through into the block its first
-        /// segment has, so the first group through comes later, in a segment with bytes for it.
-        private static void commitPastFirstBlock(Ledger ledger, Map<String, String> model) throws InterruptedException {
-            var value = "v".repeat(5_000);
-            ledger.commit(ledger.newBatch().put(NAMES, "past", value)).awaitDurable();
-            model.put("past", value);
-            assertEquals(0, log(ledger).writtenThrough());
-        }
-
         @ParameterizedTest(name = "{0} refused")
         @CsvSource({"1, DSYNC, true", "2, , false"})
         @DisplayName("a first write through refused moves the log down one way, O_DIRECT to O_DSYNC to forces, with its group durable by the way that takes it")
         void downgrades(int refusals, WriteThrough.Kind expected, boolean writesThrough) throws Exception {
             var disk = CrashFileSystem.create();
-            var seen = ConcurrentHashMap.<String>newKeySet();
-            var armed = new AtomicBoolean();
             var refused = new AtomicInteger();
-            var lastRefused = new AtomicReference<String>();
             var model = new TreeMap<String, String>();
             disk.intercept((path, kind) -> {
-                // Past the first commit, the first force of a segment longer than two blocks is the first write through
-                // of a group, as a segment is forced under another name while it is prepared and groups of a block each
-                // leave a new one at two blocks until its first force; the next way down writes that group next
-                if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log")
-                        && (seen.add(path.toString()) || path.toString().equals(lastRefused.get()))
-                        && armed.get() && refused.get() < refusals && Files.size(path) > LogWriter.KEPT_LENGTH) {
+                // The first force of a segment under its name is the first group's write through, whichever frames it
+                // holds, as a segment is forced under another name while it is prepared; the next way down writes that
+                // group next
+                if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log") && refused.get() < refusals) {
                     refused.incrementAndGet();
-                    lastRefused.set(path.toString());
                     throw new IOException("Invalid argument");
                 }
             });
             try (var ledger = open(disk.getPath("/store"), new WriteThrough(WriteThrough.Kind.DIRECT, null))) {
                 var log = log(ledger);
                 assertEquals(WriteThrough.Kind.DIRECT, log.writeThroughKind());
-                commitPastFirstBlock(ledger, model);
-                armed.set(true);
                 var commits = 0;
                 while (log.currentSegment() < 4) {
                     commit(ledger, model, "w" + commits++);
@@ -531,19 +555,43 @@ class WriteThroughTest {
             var way = new WriteThrough(WriteThrough.Kind.DSYNC, null);
             try (var ledger = open(disk.getPath("/store"), way)) {
                 var log = log(ledger);
-                commitPastFirstBlock(ledger, model);
+                // Too long for the first block of the first segment, which a group of the frames of the open may have taken
+                var value = "v".repeat(5_000);
+                ledger.commit(ledger.newBatch().put(NAMES, "past", value)).awaitDurable();
+                model.put("past", value);
+                var opened = way.opensForTests();
+                var through = log.writtenThrough();
+                assertEquals(through, opened);
                 var commits = 0;
                 // The first segment has no bytes past its first block, nor does the next, prepared without zeros
                 while (log.currentSegment() < 2) {
                     commit(ledger, model, "w" + commits++);
                 }
-                assertEquals(0, way.opensForTests());
-                while (log.writtenThrough() == 0) {
-                    commit(ledger, model, "w" + commits++);
+                assertEquals(opened, way.opensForTests());
+                assertEquals(through, log.writtenThrough());
+                var segments = new HashSet<Long>();
+                while (log.currentSegment() < 6) {
+                    commitNoting(ledger, model, "w" + commits++, segments);
                 }
-                assertEquals(1, way.opensForTests());
+                ledger.checkpoint();
+                for (var i = 0; i < 200 && segments.size() < 2; i++) {
+                    commitNoting(ledger, model, "w" + commits++, segments);
+                }
+                assertFalse(segments.isEmpty(), "no group was written through");
+                assertEquals(opened + segments.size(), way.opensForTests());
             }
             survivesPowerLoss(disk, model);
+        }
+
+        /// Commits `key` and adds the segment its group went to `segments`, if it was
+        /// written through.
+        private static void commitNoting(Ledger ledger, Map<String, String> model, String key, Set<Long> segments) throws InterruptedException {
+            var log = log(ledger);
+            var through = log.writtenThrough();
+            commit(ledger, model, key);
+            if (log.writtenThrough() > through) {
+                segments.add(log.currentSegment());
+            }
         }
 
         @Test
