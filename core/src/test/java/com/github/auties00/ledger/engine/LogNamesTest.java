@@ -285,7 +285,7 @@ class LogNamesTest {
         }
 
         @Test
-        @DisplayName("moves the log one way down when the file system refuses the first write through, which no probe tried, and the group is still durable")
+        @DisplayName("moves the log one way down when the file system refuses the first write through, and the group is still durable")
         void firstWriteRefused() throws Exception {
             var disk = CrashFileSystem.create();
             var model = new TreeMap<String, String>();
