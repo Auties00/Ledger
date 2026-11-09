@@ -62,6 +62,12 @@ public final class LiveLedger implements Ledger {
     private static final int RESIDENT_SLACK = 64;
     private static final int READER_SLOTS = 256;
     private static final int SWEEP_BUDGET = 64;
+    /// The chains [#finishSweep()] prunes per hold of the publishing role: a commit that finds the role held waits for at
+    /// most this many, a few tens of microseconds.
+    private static final int SWEEP_CHUNK = 256;
+    /// The ends of a pass [#finishSweep()] goes to: the pass it finds under way began under older readers, and only the
+    /// next one is whole under those of now.
+    private static final int SWEEP_PASSES = 2;
     private static final int PRUNE_CHUNK = 1_024;
     /// The dropped chains a commit takes out of the ordered maps, more than the sweep and its own writes drop.
     private static final int COMMIT_REMOVALS = 256;
@@ -141,6 +147,8 @@ public final class LiveLedger implements Ledger {
     private boolean sweepPending;
     // Whether the sweep's current pass over the store found such a chain
     private boolean sweepFound;
+    // The passes the sweep has ended; guarded by the publishing role
+    private long sweepEnds;
     // The reader bounds and floor the current pass started under
     private long[] passBounds;
     private long passCutBound;
@@ -2000,6 +2008,70 @@ public final class LiveLedger implements Ledger {
         }
     }
 
+    /// {@return whether the sweep has chains to visit}
+    ///
+    /// A read without the publishing role: one that misses a chain just left is made again by the next tick.
+    boolean sweepWaiting() {
+        return sweepPending || sweepWanted.held();
+    }
+
+    /// Runs the sweep through a whole pass over the store, or until it has nothing left to do, on the caller's thread.
+    ///
+    /// A commit sweeps a few chains, so what a snapshot kept through a checkpoint stayed in memory long after it closed:
+    /// for hours on a store of a commit a second, for good on one with none, and every chain's value holds a whole chunk
+    /// of the [ValueSlab] for as long as one value on it is left. The role is taken only when no thread holds or wants it,
+    /// a few chains at a time, and while commits publish this thread sleeps between chunks, so they pay at most a small
+    /// share of its time; at most [#SWEEP_PASSES] pass ends a call, so a store whose readers change at every commit
+    /// never has it walk its chains all the time.
+    ///
+    /// @throws InterruptedException if the thread is interrupted while it sleeps
+    void finishSweep() throws InterruptedException {
+        var endsBefore = -1L;
+        var seen = latest();
+        while (!closed) {
+            if (publishingWanted.held() || !publishing.tryAcquire()) {
+                Thread.sleep(1);
+                continue;
+            }
+            boolean more;
+            try {
+                // After the role, which a close of the store holds as it marks it closed
+                if (closed) {
+                    return;
+                }
+                endsBefore = endsBefore < 0 ? sweepEnds : endsBefore;
+                // As in a maintenance: the scan must not miss a read that saw the latest sequence before
+                VarHandle.fullFence();
+                var scan = readers.scan();
+                var bounds = bounds(scan.active());
+                var cutBound = Reads.boundOf(floor(scan.oldest()));
+                sweep(bounds, cutBound, SWEEP_CHUNK);
+                more = sweepEnds - endsBefore < SWEEP_PASSES && (sweepPending
+                        ? sweptBounds == null || !sameReaders(bounds, cutBound, sweptBounds, sweptCutBound)
+                        : sweepWanted.held());
+            } finally {
+                publishing.release();
+            }
+            // What applied while this thread held the role, whose committing threads may have parked for it
+            publishApplied();
+            for (var state : sweepOrder) {
+                state.removeDropped(COMMIT_REMOVALS);
+                state.unlinkDropped();
+            }
+            if (!more) {
+                break;
+            }
+            var current = latest();
+            if (current != seen) {
+                seen = current;
+                Thread.sleep(1);
+            }
+        }
+        for (var state : sweepOrder) {
+            state.removeDropped();
+        }
+    }
+
     /// Prunes the chains a published commit wrote, on its committing thread, beside the other commits and the
     /// publisher.
     ///
@@ -2100,6 +2172,7 @@ public final class LiveLedger implements Ledger {
                 sweepCursor = null;
                 visitedKeyspaces++;
                 if (sweepIndex == 0) {
+                    sweepEnds++;
                     if (!sweepFound) {
                         sweepPending = false;
                         sweptBounds = null;
