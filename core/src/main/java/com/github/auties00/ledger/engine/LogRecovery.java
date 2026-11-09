@@ -30,7 +30,9 @@ import java.util.zip.CRC32C;
 /// use of the segment: at most one use writes past its first group ([LogWriter]).
 ///
 /// A segment whose first frame header is all zeros was prepared and never written, unless such a group follows, and
-/// the next open writes into it. A segment's header is forced before it takes its name, so a last segment holding
+/// the next open writes into it. Its name is known to be durable only if a close marked it ([LogWriter#KEPT_MARK]): a
+/// process may have stopped between its rename and the force of its directory, which the open then forces before a
+/// commit depends on it. A segment's header is forced before it takes its name, so a last segment holding
 /// nothing past a damaged header is a crash during its creation, or a segment a close kept, and is deleted. Any other
 /// segment whose header is damaged, or names another store, another number or another encryption, is refused.
 ///
@@ -68,7 +70,8 @@ final class LogRecovery {
     ///
     /// @param lastSequence the sequence of the last commit replayed, or the checkpoint's
     /// @param lastSegment the number of the last segment, or 0 if there was none
-    /// @param empty the last segment if it was prepared and never written, which the next writer writes into; or `null`
+    /// @param empty the last segment if it was prepared and never written, which the next writer writes into, with
+    ///              [LogFiles.Prepared#nameDurable()] telling whether a close marked it; or `null`
     /// @param lastWritten the last segment that holds a frame, or `null` if none does
     record Result(long lastSequence, long lastSegment, LogFiles.Prepared empty, Path lastWritten) {
     }
@@ -115,7 +118,9 @@ final class LogRecovery {
                     // Prepared and never written, unless damage zeroed the first frame before groups a later force made
                     // durable, whose first frames may carry the sequence of the commit before them
                     checkNoLaterGroup(reader, position, Long.MIN_VALUE, tag, crc, path);
-                    empty = new LogFiles.Prepared(number, path, salt, reader.size() / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT);
+                    var mark = new byte[1];
+                    var kept = reader.read(LogWriter.KEPT_MARK, mark, 0, 1) && mark[0] == LogWriter.KEPT_MARK_VALUE;
+                    empty = new LogFiles.Prepared(number, path, salt, reader.size() / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT, kept);
                     continue;
                 }
                 empty = null;

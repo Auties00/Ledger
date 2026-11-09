@@ -60,9 +60,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// again, and a write or a probe the file system refuses leaves the store to forces.
 ///
 /// The simulated file system makes the writes of a channel opened with `DSYNC` durable as they return, so a store
-/// there writes through only when asked for [WriteThrough.Mode#DSYNC]. A store writes through only into a segment
-/// that holds more than its first block, a spare or a segment written with zeros, so each test first fills segments,
-/// checkpoints to turn them into spares, and commits until the log writes into one.
+/// there writes through only when asked for [WriteThrough.Mode#DSYNC]. Past the first group of an open a store writes
+/// through only into a segment that holds more than its first block, a spare or a segment written with zeros, so each
+/// test first fills segments, checkpoints to turn them into spares, and commits until the log writes into one.
 class WriteThroughTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> NAMES = Keyspace.paged("names", KeyCodec.utf8(), ValueCodec.utf8());
@@ -491,6 +491,9 @@ class WriteThroughTest {
             try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC)) {
                 var log = log(ledger);
                 var commits = 0;
+                commit(ledger, model, "w" + commits++);
+                // The first block of the first segment, which no probe tried
+                var beforeProbe = log.writtenThrough();
                 while (log.currentSegment() < 4) {
                     commit(ledger, model, "w" + commits++);
                 }
@@ -500,7 +503,7 @@ class WriteThroughTest {
                     commit(ledger, model, "w" + commits++);
                 }
                 assertEquals(1, refused.get(), "no segment was probed");
-                assertEquals(0, log.writtenThrough());
+                assertEquals(beforeProbe, log.writtenThrough());
             }
             survivesPowerLoss(disk, model);
         }
@@ -528,6 +531,9 @@ class WriteThroughTest {
                 var log = log(ledger);
                 assertEquals(WriteThrough.Kind.DIRECT, log.writeThroughKind());
                 var commits = 0;
+                commit(ledger, model, "w" + commits++);
+                // The first block of the first segment, which no probe tried
+                var beforeProbe = log.writtenThrough();
                 while (log.currentSegment() < 4) {
                     commit(ledger, model, "w" + commits++);
                 }
@@ -538,7 +544,7 @@ class WriteThroughTest {
                 }
                 assertEquals(refusals, refused.get(), "probes refused");
                 assertEquals(expected, log.writeThroughKind());
-                assertEquals(writesThrough, log.writtenThrough() > 0);
+                assertEquals(writesThrough, log.writtenThrough() > beforeProbe);
             }
             survivesPowerLoss(disk, model);
         }

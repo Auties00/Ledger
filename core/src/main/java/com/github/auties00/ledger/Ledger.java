@@ -66,6 +66,10 @@ import java.util.function.Consumer;
 /// the write-through of the drive's cache and warns that not all hardware supports it, so on a device that reports
 /// anything else, or nothing, the store forces the log, which asks the device to empty its cache.
 ///
+/// A write through takes bytes the file of the log already has. A store just opened has them for its first commit, if
+/// a block holds it, and for the commits after it once a thread of its own, started by the first commit that waits for
+/// durability, has written the next file of the log with zeros: until then the store forces them.
+///
 /// The system property `ledger.log.writeThrough` set to `off` forces every write. Set to `direct`, it writes through
 /// on Windows without asking the device, so a loss of power can take a durable commit from a device with a volatile
 /// cache that ignores the request. Set to `dsync`, it writes through with `FILE_FLAG_WRITE_THROUGH` alone on Windows,

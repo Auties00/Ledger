@@ -310,7 +310,13 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                 }
                 blobs.force();
                 pages.force();
-                Durability.forceDirectory(logDirectory);
+                if (Durability.forceDirectory(logDirectory) && empty != null) {
+                    empty = empty.named();
+                }
+            } else if (empty != null && !empty.nameDurable() && Durability.forceDirectory(logDirectory)) {
+                // A segment no close marked, so a process may have stopped before it forced the name; the mark saves a
+                // clean open this force. Where a directory cannot be forced, the first group into it is forced instead
+                empty = empty.named();
             }
             var through = writeThroughWay != null ? writeThroughWay
                     : WriteThrough.of(writeThrough != null ? writeThrough : WriteThrough.Mode.fromProperty(), logDirectory);

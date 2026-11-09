@@ -78,6 +78,24 @@ class CrashRecoveryTest {
         }
     }
 
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("ntfsWorkloads")
+    @DisplayName("recovers whichever force of a workload the power fails at, on a file system that journals names as NTFS does")
+    void everyForceOnNtfs(int seed) throws Exception {
+        var encryption = Encryption.key(KEY);
+        var dry = CrashFileSystem.createNtfs();
+        new Workload(seed, encryption, WriteThrough.Mode.DSYNC).run(dry.getPath("/store"));
+        for (var force = 0; force <= dry.forces(); force++) {
+            var disk = CrashFileSystem.createNtfs();
+            disk.stopAtForce(force);
+            check(seed, encryption, WriteThrough.Mode.DSYNC, disk, false, new Random(seed * 31L + force));
+        }
+    }
+
+    static IntStream ntfsWorkloads() {
+        return IntStream.range(1_000, 1_002);
+    }
+
     @Test
     @DisplayName("the workloads that write through do write groups through, so a stop can land on one")
     void reachesWriteThrough() {
