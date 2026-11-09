@@ -5,6 +5,7 @@ import com.github.auties00.ledger.LedgerIoException;
 import com.github.auties00.ledger.engine.TreeNodes.Child;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -19,6 +20,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -26,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.concurrent.ForkJoinPool;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -33,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The copy-on-write tree on its own, against a sorted map: random rounds of writes and range removals, with every
@@ -198,6 +202,31 @@ class TreeUpdateTest {
                 verifyPages(pages, tree.space, tree.root, tree.deltas);
             }
             assertTrue(pages.batchedLeavesForTests() > 0, "no record's base was read with its siblings");
+        }
+    }
+
+    @Test
+    @DisplayName("subtrees updated in parallel at two levels of a tree, on as few workers as a machine of four processors has, finish while the writer flushes under its lock")
+    void parallelUpdatesBesideFlushes(@TempDir Path directory) throws Exception {
+        var random = new Random(23);
+        var cipher = new PageCipher(new SecretKeySpec(new byte[32], "AES"));
+        try (var pages = PageFile.open(directory, cipher, 1 << 20, new HeapPool(1 << 20));
+             var workers = new ForkJoinPool(3)) {
+            var tree = new Fixture(pages);
+            var keys = keys(200_000);
+            for (var round = 0; round < 12; round++) {
+                var states = new TreeMap<byte[], byte[]>(UNSIGNED);
+                for (var key : keys) {
+                    states.put(key, filler(random, 100));
+                }
+                var nonce = random.nextLong();
+                // A pool of its own, so a machine of many processors has only three workers to run into each other
+                assertTimeoutPreemptively(Duration.ofMinutes(2), () -> workers.submit(() -> {
+                    tree.apply(states, List.of(), nonce, null);
+                    return null;
+                }).get());
+            }
+            verify(pages, tree.root, tree.model, random, keys);
         }
     }
 
