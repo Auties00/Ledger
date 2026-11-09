@@ -9,6 +9,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
@@ -159,6 +160,121 @@ class CrashFileSystemTest {
             Files.write(fs.getPath("/x/file"), new byte[]{7, 8});
             var after = fs.afterProcessCrash();
             assertArrayEquals(new byte[]{7, 8}, Files.readAllBytes(after.getPath("/x/file")));
+        }
+
+        @Test
+        @DisplayName("a crash of the process leaves what no force made durable at risk from a later loss of power")
+        void processCrashKeepsCacheAtRisk() throws IOException {
+            var fs = CrashFileSystem.create();
+            var forced = fs.getPath("/forced");
+            writeForced(forced, new byte[]{1});
+            forceDirectory(fs.getPath("/"));
+            Files.write(fs.getPath("/cached"), new byte[]{2});
+            try (var channel = FileChannel.open(forced, StandardOpenOption.WRITE)) {
+                channel.write(ByteBuffer.wrap(new byte[]{3}), 0);
+            }
+            var crashed = fs.afterProcessCrash();
+            assertArrayEquals(new byte[]{3}, Files.readAllBytes(crashed.getPath("/forced")));
+            assertArrayEquals(new byte[]{2}, Files.readAllBytes(crashed.getPath("/cached")));
+            var lostName = false;
+            var lostWrite = false;
+            for (var seed = 0; seed < DRAWS; seed++) {
+                var after = crashed.afterPowerLoss(new Random(seed));
+                lostName |= !Files.exists(after.getPath("/cached"));
+                var contents = Files.readAllBytes(after.getPath("/forced"));
+                lostWrite |= contents[0] == 1;
+                assertTrue(contents[0] == 1 || contents[0] == 3);
+            }
+            assertTrue(lostName, "the entry no force made durable always survived");
+            assertTrue(lostWrite, "the write no force made durable always survived");
+        }
+
+        @Test
+        @DisplayName("a force after a crash of the process makes durable what the process left in the cache")
+        void forceAfterProcessCrash() throws IOException {
+            var fs = CrashFileSystem.create();
+            Files.write(fs.getPath("/file"), new byte[]{4});
+            var crashed = fs.afterProcessCrash();
+            forceDirectory(crashed.getPath("/"));
+            try (var channel = FileChannel.open(crashed.getPath("/file"), StandardOpenOption.WRITE)) {
+                channel.force(true);
+            }
+            for (var seed = 0; seed < DRAWS; seed++) {
+                assertArrayEquals(new byte[]{4}, Files.readAllBytes(crashed.afterPowerLoss(new Random(seed)).getPath("/file")));
+            }
+        }
+
+        @Test
+        @DisplayName("a rename, a deletion and a file renamed since it was forced survive a crash of the process as pending changes")
+        void processCrashKeepsPendingNames() throws IOException {
+            var fs = CrashFileSystem.create();
+            writeForced(fs.getPath("/gone"), new byte[]{1});
+            writeForced(fs.getPath("/old"), new byte[]{2});
+            forceDirectory(fs.getPath("/"));
+            Files.delete(fs.getPath("/gone"));
+            Files.move(fs.getPath("/old"), fs.getPath("/new"), StandardCopyOption.ATOMIC_MOVE);
+            var crashed = fs.afterProcessCrash();
+            assertFalse(Files.exists(crashed.getPath("/gone")));
+            assertTrue(Files.exists(crashed.getPath("/new")));
+            var keptOld = false;
+            var keptGone = false;
+            for (var seed = 0; seed < DRAWS; seed++) {
+                var after = crashed.afterPowerLoss(new Random(seed));
+                keptOld |= Files.exists(after.getPath("/old"));
+                keptGone |= Files.exists(after.getPath("/gone"));
+                assertTrue(Files.exists(after.getPath("/old")) ^ Files.exists(after.getPath("/new")));
+            }
+            assertTrue(keptOld);
+            assertTrue(keptGone);
+        }
+    }
+
+    @Nested
+    @DisplayName("a file system that journals names as NTFS does")
+    class Ntfs {
+        @Test
+        @DisplayName("refuses to open a directory")
+        void noDirectoryChannel() throws IOException {
+            var fs = CrashFileSystem.createNtfs();
+            Files.createDirectory(fs.getPath("/x"));
+            assertThrows(AccessDeniedException.class, () -> forceDirectory(fs.getPath("/x")));
+        }
+
+        @Test
+        @DisplayName("makes every name durable with a force of any file")
+        void forceFlushesNames() throws IOException {
+            var fs = CrashFileSystem.createNtfs();
+            Files.write(fs.getPath("/named"), new byte[]{1});
+            writeForced(fs.getPath("/other"), new byte[]{2});
+            for (var seed = 0; seed < DRAWS; seed++) {
+                assertTrue(Files.exists(fs.afterPowerLoss(new Random(seed)).getPath("/named")));
+            }
+        }
+
+        @Test
+        @DisplayName("makes no name durable with a write of a channel opened with DSYNC")
+        void dsyncLeavesNames() throws IOException {
+            var fs = CrashFileSystem.createNtfs();
+            writeForced(fs.getPath("/forced"), new byte[4_096]);
+            Files.move(fs.getPath("/forced"), fs.getPath("/renamed"), StandardCopyOption.ATOMIC_MOVE);
+            try (var channel = FileChannel.open(fs.getPath("/renamed"), StandardOpenOption.WRITE, StandardOpenOption.DSYNC)) {
+                channel.write(ByteBuffer.wrap(new byte[4_096]), 0);
+            }
+            var lost = false;
+            for (var seed = 0; seed < DRAWS; seed++) {
+                lost |= !Files.exists(fs.afterPowerLoss(new Random(seed)).getPath("/renamed"));
+            }
+            assertTrue(lost, "the write through made the rename durable");
+        }
+
+        @Test
+        @DisplayName("journals as NTFS does after a loss of power and after a crash of the process")
+        void keepsMode() throws IOException {
+            var fs = CrashFileSystem.createNtfs();
+            Files.createDirectory(fs.getPath("/x"));
+            writeForced(fs.getPath("/x/file"), new byte[]{1});
+            assertThrows(AccessDeniedException.class, () -> forceDirectory(fs.afterProcessCrash().getPath("/x")));
+            assertThrows(AccessDeniedException.class, () -> forceDirectory(fs.afterPowerLoss(new Random(1)).getPath("/x")));
         }
     }
 

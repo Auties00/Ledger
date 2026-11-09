@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.channels.FileChannel;
 import java.nio.channels.SeekableByteChannel;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.AccessMode;
 import java.nio.file.CopyOption;
 import java.nio.file.DirectoryStream;
@@ -93,6 +94,9 @@ final class CrashFileSystemProvider extends FileSystemProvider {
             if (node instanceof Disk.DirectoryNode) {
                 if (write) {
                     throw new IOException(key + " is a directory");
+                }
+                if (!disk.opensDirectories()) {
+                    throw new AccessDeniedException(key);
                 }
                 return new CrashFileChannel(fileSystem, key, null, true, false, false, false);
             }
