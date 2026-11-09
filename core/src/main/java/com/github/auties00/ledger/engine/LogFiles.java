@@ -26,8 +26,8 @@ import java.util.zip.CRC32C;
 /// A segment is prepared before the log needs it ([#prepare(long, long, boolean, boolean, BooleanSupplier)]): a spare,
 /// or a new file, gets the segment's header with a fresh salt and a zeroed first frame block, is forced, and only then
 /// takes its name, so recovery never meets a segment half prepared, and finds one never written empty at once. A spare
-/// has its blocks already, and a new file can be written with zeros to its full length first
-/// ([#zeroFills(boolean)]): writing into either leaves a force
+/// has its blocks already, and a new file can be written with zeros to its full length, first or once it is prepared
+/// ([#zeroFills(boolean)], [#fill(Prepared, long, BooleanSupplier)]): writing into either leaves a force
 /// no file size and no block allocation to record, which on ext4 halved the time of a durable commit and spared one
 /// force in a thousand a wait of tens of milliseconds for a journal commit, and lets the log write a group through to
 /// stable storage with no metadata to write beside it ([WriteThrough]). Once a checkpoint makes segments obsolete, they
@@ -187,6 +187,25 @@ final class LogFiles {
                 named = true;
             }
             return new Prepared(number, target, salt, valid, named);
+        }
+    }
+
+    /// Writes `segment`, prepared and not yet written by the log, with zeros to `length` bytes and forces it, without
+    /// changing its first block or its name.
+    ///
+    /// A crash meanwhile leaves a segment that recovery reads as never written at whatever length it reached.
+    ///
+    /// @param stop asked between the writes of the zeros: once it answers `true` the file stays as it is, for a store
+    ///             closing, which cuts it to its first two blocks
+    /// @return the segment at its new length, its name durable; or `segment`, if `stop` ended the zeros
+    Prepared fill(Prepared segment, long length, BooleanSupplier stop) throws IOException {
+        try (var channel = FileChannel.open(segment.path(), StandardOpenOption.WRITE)) {
+            if (!fill(channel, Math.max(channel.size(), LogWriter.KEPT_LENGTH), length, stop)) {
+                return segment;
+            }
+            channel.force(true);
+            return new Prepared(segment.number(), segment.path(), segment.salt(),
+                    channel.size() / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT, true);
         }
     }
 

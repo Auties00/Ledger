@@ -333,9 +333,9 @@ class LogNamesTest {
                 assertTrue(log.writtenThrough() > 0, "the first group took the first block");
                 var segment = log.currentSegment();
                 var commits = 0;
-                while (log.currentSegment() == segment && commits < 200) {
+                while (log.currentSegment() == segment && commits < 2_000) {
                     commit(ledger, model, "w" + commits++);
-                    Thread.sleep(5);
+                    Thread.sleep(1);
                 }
                 assertEquals(segment + 1, log.currentSegment(), "the log never moved to the next segment");
                 var through = log.writtenThrough();
@@ -373,6 +373,60 @@ class LogNamesTest {
         }
 
         @Test
+        @DisplayName("takes no zeros for its first commits, however soon they follow the open: a force beside them cost several times as long on Windows")
+        void firstCommitsTakeNoZeros() throws Exception {
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, String>();
+            try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC, LONG_SEGMENT)) {
+                commit(ledger, model, "before");
+            }
+            try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC, LONG_SEGMENT)) {
+                var log = log(ledger);
+                var segment = log.currentSegment();
+                commit(ledger, model, "first");
+                assertEquals(1, log.writtenThrough());
+                for (var index = 0; index < LogWriter.ZEROS_AFTER / 2; index++) {
+                    commit(ledger, model, "w" + index);
+                }
+                assertEquals(segment, log.currentSegment());
+                assertEquals(1, log.writtenThrough());
+                var next = disk.getPath("/store/log").resolve(LogWriter.segmentName(segment + 1));
+                // Prepared without zeros, on a thread of its own that may still be at it
+                while (!Files.exists(next)) {
+                    Thread.sleep(1);
+                }
+                assertEquals(LogWriter.KEPT_LENGTH, Files.size(next));
+            }
+        }
+
+        /// Commits until the zeros of the next segment count `reached` down.
+        private static void commitUntil(Ledger ledger, Map<String, String> model, CountDownLatch reached) throws Exception {
+            var commits = 0;
+            while (reached.getCount() > 0) {
+                assertTrue(commits < 2_000, "the next segment was never written with zeros");
+                commit(ledger, model, "w" + commits++);
+            }
+        }
+
+        /// Holds the write at index `at` to segment `next`, which only zeros and a close's mark write, until `release`.
+        ///
+        /// @return the writes to the segment so far
+        private static AtomicInteger holdZeros(CrashFileSystem disk, long next, int at, CountDownLatch reached, CountDownLatch release) {
+            var writes = new AtomicInteger();
+            disk.intercept((path, kind) -> {
+                if (kind == ChangeInterceptor.ChangeKind.WRITE && isSegment(path, next) && writes.getAndIncrement() == at) {
+                    reached.countDown();
+                    await(release);
+                }
+            });
+            return writes;
+        }
+
+        private static boolean isSegment(Path path, long number) {
+            return LogFiles.segmentNumber(path.getFileName().toString()) == number;
+        }
+
+        @Test
         @DisplayName("is closed without waiting for the zeros of a segment the close would cut off")
         void closeStopsFill() throws Exception {
             var disk = CrashFileSystem.create();
@@ -380,18 +434,12 @@ class LogNamesTest {
             try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC, LONG_SEGMENT)) {
                 commit(ledger, model, "before");
             }
-            var writing = new CountDownLatch(1);
+            var reached = new CountDownLatch(1);
             var release = new CountDownLatch(1);
-            var writes = new AtomicInteger();
-            disk.intercept((path, kind) -> {
-                if (kind == ChangeInterceptor.ChangeKind.WRITE && path.toString().endsWith(".prep") && writes.getAndIncrement() == 0) {
-                    writing.countDown();
-                    await(release);
-                }
-            });
             var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC, LONG_SEGMENT);
-            commit(ledger, model, "first");
-            await(writing);
+            var next = log(ledger).currentSegment() + 1;
+            var writes = holdZeros(disk, next, 0, reached, release);
+            commitUntil(ledger, model, reached);
             var closer = Thread.ofVirtual().start(ledger::close);
             // The close reached the preparation, so it told the zeros to stop
             while (closer.isAlive() && Arrays.stream(closer.getStackTrace()).noneMatch(frame -> frame.getMethodName().equals("keepNext"))) {
@@ -399,11 +447,107 @@ class LogNamesTest {
             }
             release.countDown();
             closer.join();
-            // The write of the zeros it was held at, and the first blocks
+            // The write of the zeros it was held at, and the close's mark
             assertEquals(2, writes.get());
+            assertEquals(LogWriter.KEPT_LENGTH, Files.size(disk.getPath("/store/log").resolve(LogWriter.segmentName(next))));
             try (var reopened = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC, LONG_SEGMENT)) {
                 assertEquals(model, contents(reopened));
             }
+        }
+
+        @ParameterizedTest(name = "journals names as NTFS does: {0}")
+        @ValueSource(booleans = {false, true})
+        @DisplayName("loses nothing to a loss of power during the zeros, and the next open writes into the segment at the length they reached")
+        void powerLossDuringFill(boolean ntfs) throws Exception {
+            var disk = ntfs ? CrashFileSystem.createNtfs() : CrashFileSystem.create();
+            var model = new TreeMap<String, String>();
+            try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC, LONG_SEGMENT)) {
+                commit(ledger, model, "before");
+            }
+            var reached = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC, LONG_SEGMENT);
+            try {
+                holdZeros(disk, log(ledger).currentSegment() + 1, 1, reached, release);
+                commitUntil(ledger, model, reached);
+                for (var seed = 0; seed < DRAWS; seed++) {
+                    var after = disk.afterPowerLoss(new Random(seed));
+                    var reopenedModel = new TreeMap<>(model);
+                    try (var reopened = open(after.getPath("/store"), WriteThrough.Mode.DSYNC, LONG_SEGMENT)) {
+                        assertEquals(reopenedModel, contents(reopened));
+                        commit(reopened, reopenedModel, "after");
+                        commit(reopened, reopenedModel, "after2");
+                        survivesPowerLoss(after, reopenedModel);
+                    }
+                }
+            } finally {
+                release.countDown();
+                ledger.close();
+            }
+        }
+
+        @Test
+        @DisplayName("keeps the segment it prepared when the zeros fail, and its commits go on")
+        void fillFails() throws Exception {
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, String>();
+            try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC, LONG_SEGMENT)) {
+                commit(ledger, model, "before");
+            }
+            var reached = new CountDownLatch(1);
+            try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC, LONG_SEGMENT)) {
+                var log = log(ledger);
+                var segment = log.currentSegment();
+                disk.intercept((path, kind) -> {
+                    if (kind == ChangeInterceptor.ChangeKind.WRITE && isSegment(path, segment + 1) && reached.getCount() > 0) {
+                        reached.countDown();
+                        throw new IOException("No space left");
+                    }
+                });
+                commitUntil(ledger, model, reached);
+                for (var index = 0; index < 20; index++) {
+                    commit(ledger, model, "x" + index);
+                }
+                assertEquals(segment, log.currentSegment(), "the log moved to a segment that has no zeros");
+                survivesPowerLoss(disk, model);
+            }
+            try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.DSYNC, LONG_SEGMENT)) {
+                assertEquals(model, contents(ledger));
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("a segment written with zeros once prepared")
+    class Filled {
+        @Test
+        @DisplayName("takes its full length with its header, salt, first block and name as they were")
+        void fill() throws Exception {
+            var directory = CrashFileSystem.create().getPath("/log");
+            var files = Spares.files(directory);
+            var prepared = files.prepare(2, SEGMENT, false, true, () -> false);
+            assertEquals(LogWriter.KEPT_LENGTH, prepared.valid());
+            var start = Files.readAllBytes(prepared.path());
+            var filled = files.fill(prepared, SEGMENT, () -> false);
+            assertEquals(SEGMENT, filled.valid());
+            assertTrue(filled.nameDurable());
+            assertEquals(prepared.path(), filled.path());
+            assertEquals(SEGMENT, Files.size(filled.path()));
+            var bytes = Files.readAllBytes(filled.path());
+            assertTrue(Arrays.equals(start, Arrays.copyOf(bytes, start.length)));
+            for (var index = start.length; index < bytes.length; index++) {
+                assertEquals(0, bytes[index]);
+            }
+        }
+
+        @Test
+        @DisplayName("stays as it was prepared when a close stops the zeros")
+        void stopped() throws Exception {
+            var directory = CrashFileSystem.create().getPath("/log");
+            var files = Spares.files(directory);
+            var prepared = files.prepare(2, SEGMENT, false, true, () -> false);
+            assertEquals(prepared, files.fill(prepared, SEGMENT, () -> true));
+            assertEquals(LogWriter.KEPT_LENGTH, Files.size(prepared.path()));
         }
     }
 
