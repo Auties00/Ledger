@@ -1,6 +1,7 @@
 package com.github.auties00.ledger.engine;
 
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.io.TempDir;
@@ -9,6 +10,7 @@ import javax.crypto.spec.SecretKeySpec;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -16,11 +18,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.concurrent.ForkJoinPool;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The copy-on-write tree on its own, against a sorted map: random rounds of writes and range removals, with every
@@ -133,6 +137,50 @@ class TreeUpdateTest {
             assertEquals(TreeSearch.FOUND, TreeSearch.lookupCached(pages, root, hot), "the scan evicted the hot leaf");
             var late = TreeSearch.lookupCached(pages, root, segment("k019990".getBytes()));
             assertEquals(cacheBytes > 16 << 20 ? TreeSearch.FOUND : TreeSearch.UNKNOWN, late);
+        }
+    }
+
+    @Test
+    @DisplayName("subtrees updated in parallel at two levels of a tree, on as few workers as a machine of four processors has, finish while the writer flushes under its lock")
+    void parallelUpdatesBesideFlushes(@TempDir Path directory) throws Exception {
+        var random = new Random(23);
+        var cipher = new PageCipher(new SecretKeySpec(new byte[32], "AES"));
+        try (var pages = PageFile.open(directory, cipher, 1 << 20, new HeapPool(1 << 20));
+             var workers = new ForkJoinPool(3)) {
+            try {
+                var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+                var model = new TreeMap<byte[], byte[]>(UNSIGNED);
+                var keys = new ArrayList<byte[]>();
+                for (var i = 0; i < 200_000; i++) {
+                    keys.add("k%07d".formatted(i).getBytes());
+                }
+                TreeRoot root = null;
+                var deltas = DeltaTable.EMPTY;
+                for (var round = 0; round < 12; round++) {
+                    var ops = new ArrayList<TreeUpdate.Op>();
+                    for (var key : keys) {
+                        var value = new byte[100];
+                        random.nextBytes(value);
+                        model.put(key, value);
+                        ops.add(new TreeUpdate.Op(segment(key), segment(value)));
+                    }
+                    var writer = pages.writer(random.nextLong());
+                    var update = new TreeUpdate(pages, writer, space);
+                    var before = root;
+                    // A pool of its own, so a machine of many processors has only three workers to run into each other
+                    root = assertTimeoutPreemptively(Duration.ofMinutes(2),
+                            () -> workers.submit(() -> update.apply(before, ops, List.of())).get());
+                    deltas = update.finishDeltas(deltas);
+                    writer.flush();
+                    for (var unit : update.freed()) {
+                        space.release(unit.page(), unit.pages());
+                    }
+                }
+                verify(pages, root, model, random, keys);
+            } finally {
+                // A close would wait for workers a failure of the timeout left stuck
+                workers.shutdownNow();
+            }
         }
     }
 
