@@ -378,6 +378,53 @@ class ValueSlabTest {
 
         @Test
         @Timeout(120)
+        @DisplayName("a tick that finds the slab cold behind a trickle checkpoints once the chunks made since the last cut, which the next interval of log would otherwise keep")
+        void trickleAfterBurst(@TempDir Path directory) throws Exception {
+            try (var ledger = measured(directory)) {
+                var slab = ledger.valueSlab();
+                var checkpointer = ledger.checkpointer();
+                IdleTicker.unwatch(checkpointer);
+                for (var window = 0; window < 6 && !slab.hot(); window++) {
+                    now.addAndGet(WINDOW);
+                    for (var i = 0; i < 1_280; i++) {
+                        commitFresh(ledger, 4_096);
+                    }
+                }
+                assertTrue(slab.hot());
+                commitFresh(ledger, 4_096);
+                ledger.checkpoint();
+                // On the chunk the checkpoint left on the stripe, which this value holds whole
+                commitFresh(ledger, 4_096);
+                assertTrue(slab.heldForTests() > 0);
+                var state = ledger.state(MESSAGES);
+
+                // Still hot: the commits may be fast, and a checkpoint would come by itself
+                commitFresh(ledger, 100);
+                checkpointer.tick();
+                assertTrue(slab.hot());
+                assertFalse(checkpointer.startedForTests());
+
+                now.addAndGet(30_000_000_000L);
+                commitFresh(ledger, 100);
+                checkpointer.tick();
+                assertFalse(slab.hot());
+                while (checkpointer.startedForTests() || state.chains() != 0) {
+                    Thread.sleep(1);
+                }
+                assertEquals(0, checkpointer.backlog());
+
+                for (var i = 0; i < 3; i++) {
+                    now.addAndGet(30_000_000_000L);
+                    commitFresh(ledger, 100);
+                    checkpointer.tick();
+                    assertFalse(checkpointer.startedForTests(), "a trickle checkpoints at every tick");
+                }
+                assertTrue(checkpointer.backlog() > 0);
+            }
+        }
+
+        @Test
+        @Timeout(120)
         @DisplayName("fast commits turn the slab hot, overwrites of a few keys turn it down for the key space, and checkpoints of other writes bring it back")
         void activates(@TempDir Path directory) throws Exception {
             try (var ledger = measured(directory)) {
