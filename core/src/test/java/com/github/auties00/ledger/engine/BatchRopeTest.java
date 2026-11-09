@@ -181,6 +181,44 @@ class BatchRopeTest {
         }
 
         @Test
+        @DisplayName("below a rope, copies paged values beside a resident one to one array, in order, and its accessors read the writes as they were, again after a second prepare and a move to a rope")
+        void packs() {
+            var batch = batch(pool());
+            batch.put(MESSAGES, new byte[]{1}, value(1, 3_000))
+                    .put(SESSIONS, new byte[]{2}, value(2, 9_000))
+                    .put(MESSAGES, new byte[]{3}, value(3, 2_000))
+                    .delete(MESSAGES, new byte[]{4})
+                    .deleteRange(MESSAGES, KeyRange.between(new byte[]{5}, new byte[]{6}));
+            for (var round = 0; round < 2; round++) {
+                batch.prepare(false);
+                var home = batch.home(0);
+                assertEquals(5_000, home.byteSize());
+                assertTrue(home.isReadOnly());
+                assertSame(home, batch.home(2));
+                assertNull(batch.home(1));
+                assertEquals(0, batch.homeOffset(1));
+                assertNull(batch.home(3));
+                assertEquals(0, batch.homeOffset(0));
+                assertEquals(3_000, batch.homeOffset(2));
+                assertArrayEquals(value(1, 3_000), bytes(home.asSlice(batch.homeOffset(0), 3_000)));
+                assertArrayEquals(value(3, 2_000), bytes(home.asSlice(batch.homeOffset(2), 2_000)));
+                assertArrayEquals(new byte[]{1}, bytes(batch.key(0)));
+                assertArrayEquals(new byte[]{3}, bytes(batch.key(2)));
+                assertArrayEquals(value(2, 9_000), bytes(batch.value(1)));
+                assertArrayEquals(new byte[]{5}, bytes(batch.key(4)));
+                assertArrayEquals(new byte[]{6}, bytes(batch.value(4)));
+            }
+            batch.put(SESSIONS, new byte[]{7}, new byte[CHUNK / 2 - 1]);
+            batch.put(SESSIONS, new byte[]{8}, new byte[CHUNK / 2 - 1]);
+            assertTrue(batch.chunksForTests() > 0);
+            assertArrayEquals(new byte[]{3}, bytes(batch.key(2)));
+            assertArrayEquals(value(3, 2_000), bytes(batch.value(2)));
+            batch.prepare(false);
+            assertArrayEquals(value(3, 2_000), bytes(batch.home(2).asSlice(batch.homeOffset(2), 2_000)));
+            assertNull(batch.home(1));
+        }
+
+        @Test
         @DisplayName("compacts nothing on a rope, whose writes keep their homes")
         void compacts() {
             var batch = batch(pool());
