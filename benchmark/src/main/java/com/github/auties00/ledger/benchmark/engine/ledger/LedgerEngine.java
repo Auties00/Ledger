@@ -55,6 +55,7 @@ public final class LedgerEngine implements Engine {
     /// @param residentAtOpen whether the open reads the resident key spaces whatever the store's default is
     /// @return the open engine
     public static LedgerEngine open(Path directory, EngineSettings settings, boolean encrypted, boolean residentAtOpen) {
+        com.github.auties00.ledger.benchmark.support.HangDump.arm();
         var keyspaces = new EnumMap<Keyspace, com.github.auties00.ledger.Keyspace<byte[], byte[]>>(Keyspace.class);
         var options = Ledger.builder()
                 .directory(directory)
