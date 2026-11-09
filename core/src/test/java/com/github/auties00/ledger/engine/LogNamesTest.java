@@ -611,15 +611,14 @@ class LogNamesTest {
                 commit(ledger, model, "w" + commits++);
             }
             ledger.checkpoint();
+            // Armed, a preparation still under way could stop on the flush thread, whose rollover runs one its thread
+            // has not started, or fail the rollover that waits for it: either stops the log, and the close below
+            awaitSettled(log);
             armed.set(true);
             var segment = log.currentSegment();
-            try {
-                // The first group of the next segment starts the preparation of the one after it
-                while (log.currentSegment() == segment && stopped.getCount() != 0) {
-                    commit(ledger, model, "w" + commits++);
-                }
-            } catch (RuntimeException _) {
-                // The preparation that stopped was the one this commit rolled over to
+            // The first group of the next segment starts the preparation of the one after it, which no commit waits for
+            while (log.currentSegment() == segment) {
+                commit(ledger, model, "w" + commits++);
             }
             await(stopped);
             var crashed = disk.afterProcessCrash();
@@ -627,6 +626,16 @@ class LogNamesTest {
             });
             ledger.close();
             return crashed;
+        }
+
+        private static void awaitSettled(LogWriter log) throws IOException, InterruptedException {
+            var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+            while (!log.nextSettled()) {
+                if (System.nanoTime() > deadline) {
+                    throw new IOException("Prepared for too long");
+                }
+                Thread.sleep(1);
+            }
         }
 
         @Test
