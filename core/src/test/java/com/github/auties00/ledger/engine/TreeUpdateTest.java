@@ -18,7 +18,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -142,8 +147,57 @@ class TreeUpdateTest {
     }
 
     @Test
-    @DisplayName("subtrees updated in parallel at two levels of a tree, on as few workers as a machine of four processors has, finish while the writer flushes under its lock")
-    void parallelUpdatesBesideFlushes(@TempDir Path directory) throws Exception {
+    @DisplayName("a flush on a worker of a fork-join pool seals on no other worker, whose tasks may be waiting for the lock the flush holds")
+    void sealsOffTheWorkers(@TempDir Path directory) throws Exception {
+        var helpers = ConcurrentHashMap.<Thread>newKeySet();
+        var helped = new CountDownLatch(1);
+        var waited = new AtomicBoolean();
+        var flusher = new AtomicReference<Thread>();
+        var cipher = new PageCipher(new SecretKeySpec(new byte[32], "AES")) {
+            @Override
+            void seal(byte[] plain, int pages, byte[] out, int offset) {
+                if (Thread.currentThread() == flusher.get()) {
+                    // The first seal of the flushing worker waits for another thread to seal, so a seal forked to its
+                    // deque is there for the idle workers to take
+                    if (waited.compareAndSet(false, true)) {
+                        try {
+                            helped.await(10, TimeUnit.SECONDS);
+                        } catch (InterruptedException exception) {
+                            throw new IllegalStateException(exception);
+                        }
+                    }
+                } else {
+                    helpers.add(Thread.currentThread());
+                    helped.countDown();
+                }
+                super.seal(plain, pages, out, offset);
+            }
+        };
+        try (var pages = PageFile.open(directory, cipher, 1 << 20, new HeapPool(1 << 20));
+             var workers = new ForkJoinPool(3)) {
+            var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+            var writer = pages.writer(1);
+            workers.submit(() -> {
+                flusher.set(Thread.currentThread());
+                // Past the units from which a flush seals on every processor
+                for (var i = 0; i < 256; i++) {
+                    writer.write(PageFormat.VALUE, 0, space.allocate(1), 1, new byte[PageFormat.HEADER + 100], 100, false);
+                }
+                writer.flush();
+                return null;
+            }).get();
+        }
+        if (Runtime.getRuntime().availableProcessors() > 1) {
+            assertFalse(helpers.isEmpty(), "no other thread sealed");
+        }
+        for (var helper : helpers) {
+            assertTrue(helper.isVirtual(), "sealed on " + helper);
+        }
+    }
+
+    @Test
+    @DisplayName("subtrees updated in parallel at two levels of a tree, on as few workers as a machine of four processors has, leave the tree equal to the model")
+    void parallelUpdatesOnFewWorkers(@TempDir Path directory) throws Exception {
         var random = new Random(23);
         var cipher = new PageCipher(new SecretKeySpec(new byte[32], "AES"));
         try (var pages = PageFile.open(directory, cipher, 1 << 20, new HeapPool(1 << 20));
