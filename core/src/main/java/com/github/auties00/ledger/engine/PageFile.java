@@ -20,7 +20,6 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
-import java.util.stream.IntStream;
 
 /// The data file of a store: its units, read through the page cache and verified against the reference that named
 /// them, and the superblocks.
@@ -622,13 +621,7 @@ final class PageFile implements AutoCloseable {
             var runStart = -1L;
             var runEnd = -1L;
             try {
-                var indexes = IntStream.range(0, entries.size());
-                (entries.size() < PARALLEL_SEALS ? indexes : indexes.parallel()).forEach(index -> {
-                    var entry = entries.get(index);
-                    var sealed = pool.acquire(entry.ref().pages() * PageFormat.SIZE);
-                    cipher.seal(entry.unit(), entry.ref().pages(), sealed, 0);
-                    sealedUnits[index] = sealed;
-                });
+                seal(entries, sealedUnits);
                 for (var index = 0; index < entries.size(); index++) {
                     var entry = entries.get(index);
                     var length = entry.ref().pages() * PageFormat.SIZE;
@@ -653,6 +646,62 @@ final class PageFile implements AutoCloseable {
                         pool.release(sealed);
                     }
                 }
+            }
+        }
+
+        /// Seals the staged units of `entries` into arrays of the pool, in `sealedUnits` by index, on every processor
+        /// from [#PARALLEL_SEALS] units; `sealedUnits` holds those it sealed if it throws.
+        ///
+        /// The caller holds the lock and waits for the seals, so they run on virtual threads and never in the common
+        /// pool, where the tasks of a parallel update wait for this same lock: a split of a seal forked to the deque of a
+        /// worker parked on a join, after the caller last looked there or above a task only a free worker can take from
+        /// its base, would never run, and the checkpoint with it.
+        private void seal(List<Staged> entries, byte[][] sealedUnits) {
+            var claimed = new AtomicInteger();
+            var failure = new AtomicReference<Throwable>();
+            Runnable sealer = () -> {
+                for (var i = claimed.getAndIncrement(); i < entries.size() && failure.get() == null; i = claimed.getAndIncrement()) {
+                    try {
+                        var entry = entries.get(i);
+                        var sealed = pool.acquire(entry.ref().pages() * PageFormat.SIZE);
+                        sealedUnits[i] = sealed;
+                        cipher.seal(entry.unit(), entry.ref().pages(), sealed, 0);
+                    } catch (Throwable throwable) {
+                        failure.compareAndSet(null, throwable);
+                    }
+                }
+            };
+            var started = new Thread[entries.size() < PARALLEL_SEALS ? 0 : Runtime.getRuntime().availableProcessors() - 1];
+            var count = 0;
+            try {
+                for (; count < started.length; count++) {
+                    started[count] = Thread.ofVirtual().name("ledger-seal").start(sealer);
+                }
+            } catch (Throwable throwable) {
+                // The threads started seal on and are joined; the caller's seals nothing more
+                failure.compareAndSet(null, throwable);
+            }
+            sealer.run();
+            var interrupted = false;
+            for (var i = 0; i < count; i++) {
+                while (true) {
+                    try {
+                        started[i].join();
+                        break;
+                    } catch (InterruptedException _) {
+                        interrupted = true;
+                    }
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            switch (failure.get()) {
+                case null -> {
+                }
+                case RuntimeException exception -> throw exception;
+                case Error error -> throw error;
+                case Throwable other -> throw new IllegalStateException(other);
             }
         }
 
