@@ -10,13 +10,20 @@ import com.github.auties00.ledger.testkit.ChangeInterceptor;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -180,6 +187,124 @@ class MemoryRetentionTest {
             assertTrue(retained <= 1_300, retained + " of the " + count + " chains the sweep dropped stayed reachable");
             assertEquals(count, ledger.forEach(MESSAGES, com.github.auties00.ledger.KeyRange.<byte[]>all().reversed(), (_, _) -> true));
         }
+    }
+
+    @ParameterizedTest(name = "hot slab: {0}")
+    @ValueSource(booleans = {false, true})
+    @Timeout(120)
+    @DisplayName("what a snapshot kept through a checkpoint stays for it, and a tick sweeps it off once it closed, with no commit to do so")
+    void tickSweepsAQuietStore(boolean hot, @TempDir Path directory) throws Exception {
+        try (var ledger = (LiveLedger) Ledger.builder().directory(directory).encryption(Encryption.key(new byte[32]))
+                .keyspace(SESSIONS).keyspace(MESSAGES).checkpointEvery(1L << 40).build()) {
+            var checkpointer = ledger.checkpointer();
+            IdleTicker.unwatch(checkpointer);
+            if (hot) {
+                ledger.valueSlab().forceHotForTests(1 << 20);
+            }
+            var count = 8_000;
+            for (var i = 0; i < count; i++) {
+                var durable = ledger.commit(ledger.newBatch().put(MESSAGES, ByteBuffer.allocate(4).putInt(i).array(), new byte[]{(byte) i}));
+                if (i == count - 1) {
+                    durable.awaitDurable();
+                }
+            }
+            var state = ledger.state(MESSAGES);
+            try (var snapshot = ledger.snapshot()) {
+                ledger.checkpoint();
+                checkpointer.tick();
+                while (checkpointer.sweepingForTests()) {
+                    Thread.sleep(1);
+                }
+                assertEquals(count, state.chains(), "the sweep dropped what the snapshot may read");
+                assertEquals(count, snapshot.size(MESSAGES));
+            }
+            checkpointer.tick();
+            while (state.chains() != 0) {
+                Thread.sleep(1);
+            }
+            for (var i = 0; i < count; i++) {
+                assertArrayEquals(new byte[]{(byte) i}, ledger.get(MESSAGES, ByteBuffer.allocate(4).putInt(i).array()).orElseThrow());
+            }
+        }
+    }
+
+    @Test
+    @Timeout(120)
+    @DisplayName("sweeps of the ticks beside commits, snapshots and checkpoints leave every snapshot reading what it first read, and every key as last written across a reopen")
+    void tickSweepsBesideCommits(@TempDir Path directory) throws Exception {
+        var keys = 1_000;
+        var writers = 3;
+        var stop = new AtomicBoolean();
+        var last = new int[writers][keys];
+        var failure = new AtomicReference<Throwable>();
+        var builder = Ledger.builder().directory(directory).encryption(Encryption.key(new byte[32]))
+                .keyspace(SESSIONS).keyspace(MESSAGES).checkpointEvery(1L << 40);
+        try (var ledger = (LiveLedger) builder.build()) {
+            var checkpointer = ledger.checkpointer();
+            IdleTicker.unwatch(checkpointer);
+            var threads = new ArrayList<Thread>();
+            for (var writer = 0; writer < writers; writer++) {
+                var number = writer;
+                threads.add(Thread.ofPlatform().start(() -> {
+                    try {
+                        for (var round = 1; !stop.get(); round++) {
+                            var key = round % keys;
+                            ledger.commit(ledger.newBatch().put(MESSAGES, sweepKey(number, key), ByteBuffer.allocate(4).putInt(round).array()));
+                            last[number][key] = round;
+                        }
+                    } catch (Throwable throwable) {
+                        failure.compareAndSet(null, throwable);
+                    }
+                }));
+            }
+            for (var reader = 0; reader < 2; reader++) {
+                threads.add(Thread.ofPlatform().start(() -> {
+                    try {
+                        var random = new java.util.Random(7);
+                        while (!stop.get()) {
+                            try (var snapshot = ledger.snapshot()) {
+                                var key = sweepKey(random.nextInt(writers), random.nextInt(keys));
+                                var first = snapshot.get(MESSAGES, key);
+                                var count = snapshot.size(MESSAGES);
+                                Thread.sleep(2);
+                                assertEquals(first.map(ByteBuffer::wrap), snapshot.get(MESSAGES, key).map(ByteBuffer::wrap));
+                                assertEquals(count, snapshot.size(MESSAGES));
+                            }
+                        }
+                    } catch (Throwable throwable) {
+                        failure.compareAndSet(null, throwable);
+                    }
+                }));
+            }
+            var deadline = System.nanoTime() + 3_000_000_000L;
+            for (var round = 0; System.nanoTime() < deadline && failure.get() == null; round++) {
+                checkpointer.tick();
+                Thread.sleep(2);
+                if (round % 50 == 49) {
+                    ledger.checkpoint();
+                }
+            }
+            stop.set(true);
+            for (var thread : threads) {
+                thread.join();
+            }
+            if (failure.get() != null) {
+                throw new AssertionError(failure.get());
+            }
+        }
+        try (var ledger = builder.build()) {
+            for (var writer = 0; writer < writers; writer++) {
+                for (var key = 0; key < keys; key++) {
+                    if (last[writer][key] != 0) {
+                        assertArrayEquals(ByteBuffer.allocate(4).putInt(last[writer][key]).array(), ledger.get(MESSAGES, sweepKey(writer, key)).orElseThrow());
+                    }
+                }
+            }
+        }
+    }
+
+    private static byte[] sweepKey(int writer, int key) {
+        return ByteBuffer.allocate(8).putInt(writer).putInt(key).array();
     }
 
     @Test

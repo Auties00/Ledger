@@ -71,6 +71,8 @@ final class Checkpointer implements IdleTicker.Watched {
     private final long every;
     private final ReentrantLock lock;
     private final AtomicBoolean scheduled;
+    // Whether a thread is finishing the sweep of the store
+    private final AtomicBoolean sweeping;
     private final SecureRandom random;
     // The number of the last durable checkpoint, guarded by the lock
     private long number;
@@ -126,6 +128,7 @@ final class Checkpointer implements IdleTicker.Watched {
         this.deltaTable = deltaTable;
         this.lock = new ReentrantLock();
         this.scheduled = new AtomicBoolean();
+        this.sweeping = new AtomicBoolean();
         this.random = new SecureRandom();
         this.failures = failures;
         this.durableEpoch = durableEpoch;
@@ -172,16 +175,48 @@ final class Checkpointer implements IdleTicker.Watched {
     ///
     /// Checkpoints otherwise start once every interval of log, so a store that wrote less than one and stopped kept
     /// those writes in memory, more than their bytes in the log, for as long as it stayed open.
+    ///
+    /// It also finishes, on a thread of its own, a sweep the commits have not, however busy the store: they sweep a few
+    /// chains each, and a store with none would never do so.
     @Override
     public void tick() {
         var appended = log.appendedBytes();
         var idle = appended == appendedAtTick;
         appendedAtTick = appended;
         slab.tick(idle);
+        if (!closed && ledger.sweepWaiting()) {
+            startSweep();
+        }
         var logged = log.appendedHeap() - publishedHeap;
         if (idle && !closed && stopped == null && logged > 0 && logged + slab.chunkBytes() - publishedChunks >= IDLE_BACKLOG) {
             start();
         }
+    }
+
+    /// Finishes the sweep of the store on a thread of its own, unless one is at it; a thread the system refuses waits for
+    /// the next tick, as the sweep is only a matter of memory.
+    private void startSweep() {
+        if (!sweeping.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            Thread.ofPlatform().daemon().name("ledger-sweep").start(() -> {
+                try {
+                    ledger.finishSweep();
+                } catch (InterruptedException | RuntimeException _) {
+                    // The commits and the next tick go on with the sweep
+                } finally {
+                    sweeping.set(false);
+                }
+            });
+        } catch (Throwable _) {
+            sweeping.set(false);
+        }
+    }
+
+    /// {@return whether a thread is finishing the sweep of the store; for tests}
+    boolean sweepingForTests() {
+        return sweeping.get();
     }
 
     /// Starts a checkpoint on a thread of its own if the log has grown enough since the last, and none is running.
