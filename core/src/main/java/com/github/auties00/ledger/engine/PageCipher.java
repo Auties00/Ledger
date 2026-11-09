@@ -13,8 +13,9 @@ import java.util.zip.CRC32C;
 /// Seals and opens the units of the store's files, as [PageFormat] lays them out: AES-256-GCM under the key of the
 /// file, or a CRC-32C for a store without encryption.
 ///
-/// It is safe for concurrent use: each call takes a cipher from a pool, since a cipher is not.
-final class PageCipher {
+/// It is safe for concurrent use: each call takes a cipher from a pool, since a cipher is not. It is left open to
+/// subclasses only for the tests that watch which threads seal.
+class PageCipher {
     /// The content a streamed unit passes to the cipher in one call: small enough to stay out of the way of the
     /// cipher's intrinsic, which a cold JVM reaches only through calls that are not too large.
     private static final int SLICE = 64 << 10;

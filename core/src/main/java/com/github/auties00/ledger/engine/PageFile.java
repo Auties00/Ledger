@@ -17,6 +17,7 @@ import java.util.TreeMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -675,52 +676,88 @@ final class PageFile implements AutoCloseable {
         /// pool, where the tasks of a parallel update wait for this same lock: a split of a seal forked to the deque of a
         /// worker parked on a join, after the caller last looked there or above a task only a free worker can take from
         /// its base, would never run, and the checkpoint with it.
+        ///
+        /// It waits for the units and not for the threads: an application's virtual threads may hold every carrier for
+        /// as long as they compute, and a thread that gets none took no unit, as this thread seals all those no other
+        /// took.
         private void seal(List<Staged> entries, byte[][] sealedUnits) {
-            var claimed = new AtomicInteger();
-            var failure = new AtomicReference<Throwable>();
-            Runnable sealer = () -> {
-                for (var i = claimed.getAndIncrement(); i < entries.size() && failure.get() == null; i = claimed.getAndIncrement()) {
-                    try {
-                        var entry = entries.get(i);
-                        var sealed = pool.acquire(entry.ref().pages() * PageFormat.SIZE);
-                        sealedUnits[i] = sealed;
-                        cipher.seal(entry.unit(), entry.ref().pages(), sealed, 0);
-                    } catch (Throwable throwable) {
-                        failure.compareAndSet(null, throwable);
-                    }
-                }
-            };
-            var started = new Thread[entries.size() < PARALLEL_SEALS ? 0 : Runtime.getRuntime().availableProcessors() - 1];
-            var count = 0;
+            var seals = new Seals(entries, sealedUnits);
             try {
-                for (; count < started.length; count++) {
-                    started[count] = Thread.ofVirtual().name("ledger-seal").start(sealer);
+                for (var i = entries.size() < PARALLEL_SEALS ? 0 : Runtime.getRuntime().availableProcessors() - 1; i > 0; i--) {
+                    Thread.ofVirtual().name("ledger-seal").start(seals);
                 }
             } catch (Throwable throwable) {
-                // The threads started seal on and are joined; the caller's seals nothing more
-                failure.compareAndSet(null, throwable);
+                // No thread seals anything more: the flush fails
+                seals.fail(throwable);
             }
-            sealer.run();
-            var interrupted = false;
-            for (var i = 0; i < count; i++) {
-                while (true) {
+            seals.run();
+            seals.await();
+        }
+
+        /// The seals of one window of a flush, which the threads that run it take a unit at a time.
+        ///
+        /// A thread that starts after every unit was taken ends at once and reads neither the units nor the arrays, which
+        /// a thread with no carrier would otherwise keep from the collector for as long as it waits for one.
+        private final class Seals implements Runnable {
+            private final int size;
+            private final AtomicInteger claimed;
+            private final AtomicInteger finished;
+            private final AtomicReference<Throwable> failure;
+            // Released once every unit is finished
+            private final Semaphore done;
+            // Read only by a thread that holds an unfinished unit; cleared once none does
+            private List<Staged> entries;
+            private byte[][] sealedUnits;
+
+            private Seals(List<Staged> entries, byte[][] sealedUnits) {
+                this.size = entries.size();
+                this.claimed = new AtomicInteger();
+                this.finished = new AtomicInteger();
+                this.failure = new AtomicReference<>();
+                this.done = new Semaphore(0);
+                this.entries = entries;
+                this.sealedUnits = sealedUnits;
+            }
+
+            /// Seals the units no thread took, until none is left; after a failure it only marks them finished.
+            @Override
+            public void run() {
+                for (var i = claimed.getAndIncrement(); i < size; i = claimed.getAndIncrement()) {
                     try {
-                        started[i].join();
-                        break;
-                    } catch (InterruptedException _) {
-                        interrupted = true;
+                        if (failure.get() == null) {
+                            var entry = entries.get(i);
+                            var sealed = pool.acquire(entry.ref().pages() * PageFormat.SIZE);
+                            sealedUnits[i] = sealed;
+                            cipher.seal(entry.unit(), entry.ref().pages(), sealed, 0);
+                        }
+                    } catch (Throwable throwable) {
+                        failure.compareAndSet(null, throwable);
+                    } finally {
+                        if (finished.incrementAndGet() == size) {
+                            done.release();
+                        }
                     }
                 }
             }
-            if (interrupted) {
-                Thread.currentThread().interrupt();
+
+            /// Makes the seals fail with `throwable`, unless they already did.
+            private void fail(Throwable throwable) {
+                failure.compareAndSet(null, throwable);
             }
-            switch (failure.get()) {
-                case null -> {
+
+            /// Waits until every unit is finished, whatever the interrupt status of the caller, and throws the failure
+            /// of the first that failed; only after [#run()] on the same thread, which leaves no unit to take.
+            private void await() {
+                done.acquireUninterruptibly();
+                entries = null;
+                sealedUnits = null;
+                switch (failure.get()) {
+                    case null -> {
+                    }
+                    case RuntimeException exception -> throw exception;
+                    case Error error -> throw error;
+                    case Throwable other -> throw new IllegalStateException(other);
                 }
-                case RuntimeException exception -> throw exception;
-                case Error error -> throw error;
-                case Throwable other -> throw new IllegalStateException(other);
             }
         }
 
@@ -762,6 +799,9 @@ final class PageFile implements AutoCloseable {
                 forcing = null;
             }
             if (running != null) {
+                // On this thread if its own has not started yet, which an application's virtual threads may keep from a
+                // carrier for as long as they compute; otherwise this returns at once
+                running.run();
                 await(running);
             }
         }
