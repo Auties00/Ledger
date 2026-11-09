@@ -74,11 +74,13 @@ class BuiltinCodecsTest {
         assertEquals(null, batch.value(1));
         assertEquals("b", new String(batch.value(2).toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8));
         var encoded = batch.encodedBytes();
-        var detached = batch.detach();
-        assertTrue(batch.isEmpty());
         // Below the pool's smallest array, the batch grew an array of its own by doubling from its first write
-        assertTrue(detached.length >= encoded && detached.length < 2 * encoded,
-                () -> detached.length + " bytes for " + encoded);
+        var array = batch.viewForTests().byteSize();
+        assertTrue(array >= encoded && array < 2 * encoded, () -> array + " bytes for " + encoded);
+        batch.prepare(false);
+        assertEquals(encoded, batch.home(0).byteSize());
+        batch.finish();
+        assertTrue(batch.isEmpty());
     }
 
     @Test

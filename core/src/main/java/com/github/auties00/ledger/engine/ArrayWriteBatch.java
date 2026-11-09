@@ -881,27 +881,4 @@ public final class ArrayWriteBatch implements WriteBatch {
         memory = MemorySegment.ofArray(data);
         view = memory.asReadOnly();
     }
-
-    /// Hands the array holding the encodings over to the store and starts the batch again, empty.
-    ///
-    /// The store reads the writes through the accessors, and [#encodedBytes()], first: the segments the accessors
-    /// returned stay valid, since the batch never writes the detached array again. That array never goes back to the
-    /// pool: the versions slicing it keep it until checkpoints have written them and no read needs them, and the
-    /// collector takes it then. The array the batch had before [#compact()] goes back to the pool at once, so a store
-    /// committing small batches takes their memory from the pool rather than from the collector; the batch takes an
-    /// array again with its next write.
-    ///
-    /// @return the array holding the encodings
-    /// @throws IllegalStateException if the encodings are not all on that array, as those of a value of half a chunk or
-    ///                               more and of a batch on a rope never are
-    public byte[] detach() {
-        if (ownBytes != 0 || chunks != null) {
-            throw new IllegalStateException("The encodings are not on one array");
-        }
-        var detached = data;
-        exposed = true;
-        dropData();
-        clear();
-        return detached;
-    }
 }

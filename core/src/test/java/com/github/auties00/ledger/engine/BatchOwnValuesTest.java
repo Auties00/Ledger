@@ -126,17 +126,19 @@ class BatchOwnValuesTest {
         }
 
         @Test
-        @DisplayName("refuses to detach encodings that are not on one array, and forgets its own values when cleared")
-        void detachAndClear() {
+        @DisplayName("forgets its own values when cleared, and a small value put after them has its home on the batch's array")
+        void homeAfterClear() {
             var batch = batch();
             batch.put(MESSAGES, new byte[]{1}, value(1, OWN));
-            assertThrows(IllegalStateException.class, batch::detach);
             batch.clear();
             assertEquals(0, batch.encodedBytes());
             assertTrue(batch.isEmpty());
             batch.put(MESSAGES, new byte[]{1}, new byte[3]);
             assertNull(batch.ownValue(0));
-            assertEquals(4, batch.detach().length);
+            batch.prepare(false);
+            assertEquals(4, batch.home(0).byteSize());
+            batch.finish();
+            assertTrue(batch.isEmpty());
         }
 
         @Test
