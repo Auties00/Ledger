@@ -532,7 +532,9 @@ final class PageCache implements IdleTicker.Watched {
         /// A unit of a file says what it is: its header, which never changes, names its page, nonce and pages, and a nonce
         /// is never used twice, so one that matches is the unit whatever the slot's race.
         ///
-        /// The leaf of a delta record has the header of its base leaf, so the slot's metadata speaks for it. Its array is
+        /// The leaf of a delta record has the header of its base leaf, so a read of the base refuses it by its origin: the
+        /// leaf can land in the slot the base just left, or share its tag, under a reader that found the slot by the base's
+        /// tag, and it holds other entries than the base. For a read of the leaf the slot's metadata speaks. Its array is
         /// read first and again after the metadata: a writer takes it out before it changes the metadata and puts the new
         /// one in after, and no array is ever cached under two identities, so an array read the same both times held the
         /// metadata read between them.
@@ -558,7 +560,8 @@ final class PageCache implements IdleTicker.Watched {
             return Bytes.i32(unit, PageFormat.PAGE) == page
                     && Bytes.i64(unit, PageFormat.NONCE) == nonceHigh
                     && Bytes.i32(unit, PageFormat.NONCE + 8) == nonceLow
-                    && Bytes.i32(unit, PageFormat.PAGES) == pages;
+                    && Bytes.i32(unit, PageFormat.PAGES) == pages
+                    && !TreeNodes.madeFromDelta(unit);
         }
 
         /// {@return the first slot on the probe of `key`, which the table does not hold, that an entry may take}
