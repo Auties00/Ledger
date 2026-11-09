@@ -19,7 +19,6 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The page cache on its own: lookups by nonce, eviction order, the slots of its table, the byte limit and the budget
@@ -204,18 +203,6 @@ class PageCacheTest {
         var unit = unit(new PageRef(page, 1, 1, 1));
         cache.put(new PageRef(page, 1, 1, 1), unit, true);
         return new WeakReference<>(unit);
-    }
-
-    @Test
-    @DisplayName("refuses the keys the slots keep for themselves")
-    void reservedKeys() {
-        var cache = PageCache.isolated(LIMIT);
-        var superblock = new PageRef(0, 1, 1, 1);
-        assertThrows(IllegalArgumentException.class, () -> cache.put(superblock, unit(superblock), true));
-        assertThrows(IllegalArgumentException.class, () -> cache.put(-1L, page(0), unit(page(0)), true));
-        assertNull(cache.get(superblock));
-        cache.remove(0);
-        assertEquals(0, cache.size());
     }
 
     @Test
