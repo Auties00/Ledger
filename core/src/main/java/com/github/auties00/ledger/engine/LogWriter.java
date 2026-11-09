@@ -49,10 +49,10 @@ import java.util.zip.CRC32C;
 /// for it; an open that finds a segment no close marked forces its name before a commit depends on it.
 ///
 /// A new file is written with zeros first only while the commits wait for the forces and the log fills slower than
-/// [#ZEROED_RATE], or has not filled a segment since the store opened: the zeros halve the time of a force on Linux,
-/// but double the bytes the device takes, which slowed an ingest of a history, whose commits do not wait, and 256
-/// committers writing 100 MB a second, by a fifth. On Windows, where they spare a force nothing, only while the log
-/// writes groups through as well ([LogFiles#zeroFills(boolean)]).
+/// [#ZEROED_RATE], or has not filled a segment since the store opened but commits have waited for [#ZEROS_AFTER] groups:
+/// the zeros halve the time of a force on Linux, but double the bytes the device takes, which slowed an ingest of a
+/// history, whose commits do not wait, and 256 committers writing 100 MB a second, by a fifth. On Windows, where they
+/// spare a force nothing, only while the log writes groups through as well ([LogFiles#zeroFills(boolean)]).
 ///
 /// Where [WriteThrough] can, a group that one write holds and that lands below the bytes its segment already has is
 /// written through to stable storage instead, durable once the write returns, and not forced: one round trip to the
@@ -61,10 +61,11 @@ import java.util.zip.CRC32C;
 /// keeps the bandwidth of the cache, and a file system that refuses the writes through moves the writer to forces.
 ///
 /// A store just opened has such bytes only in the first block of its first segment, which its first group takes when
-/// one block holds it. The next segment is written with zeros on a thread of its own once a commit has waited, and the
-/// log moves to it between two groups as soon as it is ready, leaving the rest of the segment it was writing unused;
-/// until then each group is forced. So commits reach the path within the time of one preparation, whatever the size of
-/// a segment.
+/// one block holds it. The next segment is prepared without zeros, and written with them on a thread of its own once
+/// commits have waited for [#ZEROS_AFTER] groups: on Windows a force beside the zeros takes several times as long,
+/// which the few commits of a store that opens, writes and closes would pay and never gain from. The log moves to it between two groups as soon as it is ready, leaving the rest of the segment it was writing
+/// unused; until then each group is forced. So a run of commits reaches the path within the time of one preparation,
+/// whatever the size of a segment.
 ///
 /// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames. Each use of it, the writing of one
 /// open, draws a random tag, and the key of the use derives from the segment's number, a random salt of its own and
@@ -160,6 +161,10 @@ final class LogWriter {
     static final int COMMIT_HEAP = 128;
     /// The bytes a second of log below which a new segment is written with zeros first, if the commits wait for it.
     private static final long ZEROED_RATE = 64L << 20;
+    /// The groups commits wait for, since the store opened, before a segment is written with zeros with no segment
+    /// filled yet: writing a segment with zeros slows the forces beside it, which a store that opens and commits a few
+    /// times would pay for writes through it never reaches.
+    static final int ZEROS_AFTER = 64;
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
@@ -205,12 +210,18 @@ final class LogWriter {
     // The preparation of the segment after the current one, run on a thread of its own, or by whichever of the flush
     // task and a close needs it first
     private FutureTask<LogFiles.Prepared> next;
+    // Whether zeros were asked for the segment of next, by its preparation or after it; owned by the flush task
+    private boolean nextZeroed;
     // When the current segment opened, and how long the one before it took to fill, or -1; owned by the flush task
     private long segmentOpened;
     private long lastFill = -1;
     // Whether a commit waited for a force since the segment before the current one opened
     private volatile boolean waited;
     private boolean waitedBefore;
+    // Whether a commit waited since the last group began to be written
+    private volatile boolean waitedGroup;
+    // The groups written since the store opened that a commit waited for; owned by the flush task
+    private long waitedGroups;
     private final Cipher cipher;
     private final CRC32C crc;
     // The buffer frames are sealed into and written from, a slice at a time whatever their size; it grows up to OUTPUT
@@ -407,13 +418,50 @@ final class LogWriter {
     /// behind it would make every commit waiting on that flush wait as long.
     private void prepareNext() {
         var number = segmentNumber + 1;
-        // Filled slower than the rate, or not filled yet, by commits that waited for its forces
-        var slow = (waited || waitedBefore) && (lastFill < 0 || lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE);
+        var zeros = wantsZeros();
         // On the thread of the preparation: the answer of a device may take a round trip to it
         var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize,
-                slow && !closing && files.zeroFills(writeThrough.enabled()), writeThrough.kind() != null, () -> closing));
+                zeros && !closing && files.zeroFills(writeThrough.enabled()), writeThrough.kind() != null, () -> closing));
         next = preparation;
+        nextZeroed = zeros;
         Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
+    }
+
+    /// {@return whether the next segment is written with zeros: commits waited for the forces of a segment that filled
+    /// slower than [#ZEROED_RATE], or for [#ZEROS_AFTER] groups with no segment filled yet}
+    private boolean wantsZeros() {
+        if (!(waited || waitedBefore)) {
+            return false;
+        }
+        return lastFill < 0 ? waitedGroups >= ZEROS_AFTER : lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE;
+    }
+
+    /// Writes the segment prepared after the current one with zeros, on a platform thread of its own, once they are
+    /// wanted and it was prepared without them.
+    ///
+    /// The zeros only give the file its blocks, so a preparation they fail to complete still serves as it was.
+    private void fillNext() {
+        var preparation = next;
+        if (nextZeroed || preparation == null || preparation.state() != Future.State.SUCCESS || !wantsZeros()) {
+            return;
+        }
+        nextZeroed = true;
+        var prepared = preparation.resultNow();
+        if (prepared.valid() >= segmentSize / 2) {
+            return;
+        }
+        var fill = new FutureTask<>(() -> {
+            if (closing || !files.zeroFills(writeThrough.enabled())) {
+                return prepared;
+            }
+            try {
+                return files.fill(prepared, segmentSize, () -> closing);
+            } catch (IOException _) {
+                return prepared;
+            }
+        });
+        next = fill;
+        Thread.ofPlatform().daemon().name("ledger-prepare").start(fill);
     }
 
     /// {@return whether, between two groups, the log moves to the prepared segment after the current one: commits wait
@@ -814,6 +862,10 @@ final class LogWriter {
         if (smallGroups >= SHRINK_AFTER && output.length > MIN_OUTPUT) {
             output = new byte[MIN_OUTPUT];
         }
+        if (waitedGroup) {
+            waitedGroup = false;
+            waitedGroups++;
+        }
         // Before a frame is sealed, while the output holds no byte of the group
         var through = writesThrough(group);
         var unitForce = units ? forceUnits() : null;
@@ -873,6 +925,8 @@ final class LogWriter {
         groupEnd = end;
         if (next == null) {
             prepareNext();
+        } else {
+            fillNext();
         }
         return bodies;
     }
@@ -1256,6 +1310,7 @@ final class LogWriter {
         }
         checkHealthy();
         waited = true;
+        waitedGroup = true;
         if (timeout < 0 && !Thread.currentThread().isInterrupted() && alone(sequence)) {
             // Writes the group itself if no flush is writing: a wait with a timeout, which a slow force would outlast,
             // leaves it to the pool
