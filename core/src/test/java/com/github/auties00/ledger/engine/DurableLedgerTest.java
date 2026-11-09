@@ -809,7 +809,7 @@ class DurableLedgerTest {
             // a close cuts to two blocks
             Files.delete(directory.resolve("log").resolve(LogWriter.segmentName(number + 1)));
             var opened = StoreHeader.openOrCreate(directory, EncryptionSpec.key(KEY));
-            new LogFiles(directory.resolve("log"), opened.keys(), opened.header().storeId()).prepare(number + 1, 16 << 20, true);
+            new LogFiles(directory.resolve("log"), opened.keys(), opened.header().storeId()).prepare(number + 1, 16 << 20, true, false, () -> false);
             try (var ledger = open(directory, NAMES)) {
                 assertEquals(number + 1, ((LiveLedger) ledger).log().currentSegment());
                 assertEquals(Optional.of("1"), ledger.get(NAMES, "a"));

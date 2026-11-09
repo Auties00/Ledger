@@ -53,8 +53,9 @@ import java.util.function.BooleanSupplier;
 /// default, `off`, `dsync` or `direct`.
 ///
 /// A way that fails moves the writer to the next one down, `O_DSYNC` after `O_DIRECT`, and from the last to forces.
-/// Only the flush that holds the log writer uses an instance, so one thread at a time; its buffer, aligned to
-/// [LogWriter#ALIGNMENT] as `O_DIRECT` and `FILE_FLAG_NO_BUFFERING` need, serves every segment of the writer.
+/// Only the flush that holds the log writer writes through an instance, so one thread at a time; its buffer, aligned to
+/// [LogWriter#ALIGNMENT] as `O_DIRECT` and `FILE_FLAG_NO_BUFFERING` need, serves every segment of the writer. The thread
+/// preparing a segment may ask which way is left beside it, so the round trip of asking the device holds no commit up.
 final class WriteThrough {
     private static final String OS = System.getProperty("os.name", "");
 
@@ -101,9 +102,11 @@ final class WriteThrough {
         DSYNC
     }
 
-    // The way segments are opened in now, or null once groups are forced
+    private final Object lock;
+    // The way segments are opened in now, or null once groups are forced; guarded by the lock
     private Kind kind;
-    // What must answer before the first segment is opened through, or null once it has or if nothing need
+    // What must answer before the first segment is opened through, or null once it has or if nothing need; guarded by
+    // the lock
     private BooleanSupplier proof;
     // The buffer a group is copied into before it is written, aligned to LogWriter.ALIGNMENT, and a view of it
     private MemorySegment buffer;
@@ -114,6 +117,7 @@ final class WriteThrough {
     /// @param proof what must answer `true` before the first segment is opened through, asked once, on the thread of
     ///              the flush that needs it; or `null` if nothing need
     WriteThrough(Kind kind, BooleanSupplier proof) {
+        this.lock = new Object();
         this.kind = kind;
         this.proof = proof;
     }
@@ -148,29 +152,38 @@ final class WriteThrough {
     /// The first call asks the device, if this way needs it to, which may take a round trip to it, and moves the writer
     /// to forces unless it answers that a write through holds.
     boolean enabled() {
-        if (proof != null) {
-            var asked = proof;
-            proof = null;
-            if (!asked.getAsBoolean()) {
-                kind = null;
+        synchronized (lock) {
+            if (proof != null) {
+                var asked = proof;
+                proof = null;
+                if (!asked.getAsBoolean()) {
+                    kind = null;
+                }
             }
+            return kind != null;
         }
-        return kind != null;
     }
 
-    /// {@return the way later segments are opened in, or `null` if their groups are forced}
+    /// {@return the way later segments are opened in, or `null` if their groups are forced; it asks no device, so a way
+    /// still waiting for the answer counts}
     Kind kind() {
-        return kind;
+        synchronized (lock) {
+            return kind;
+        }
     }
 
     /// Moves to the next way down after the current one failed, or to forces after the last.
     void downgrade() {
-        kind = kind == Kind.DIRECT ? Kind.DSYNC : null;
+        synchronized (lock) {
+            kind = kind == Kind.DIRECT ? Kind.DSYNC : null;
+        }
     }
 
     /// Writes the groups of every later segment into the cache and forces them.
     void disable() {
-        kind = null;
+        synchronized (lock) {
+            kind = null;
+        }
     }
 
     /// Opens the segment at `path` to write through, the current way.
@@ -181,7 +194,7 @@ final class WriteThrough {
         if (!enabled()) {
             throw new IllegalStateException("The log forces its groups");
         }
-        return switch (kind) {
+        return switch (kind()) {
             case UNBUFFERED -> UnbufferedHandle.open(path, this);
             case DIRECT -> new ChannelHandle(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC,
                     ExtendedOpenOption.DIRECT), this);

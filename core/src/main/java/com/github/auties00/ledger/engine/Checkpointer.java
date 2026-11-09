@@ -39,8 +39,9 @@ import java.util.concurrent.locks.ReentrantLock;
 /// The log still holds every commit.
 final class Checkpointer implements IdleTicker.Watched {
     /// The obsolete segments a closed store keeps for reuse: none. The next open writes into the segment the log kept
-    /// for it ([LogWriter#nextOpenSegment()]), so a spare saves it nothing, and forcing a spare that a copy of the store
-    /// left in the OS cache held the first durable commit after the open for tens of milliseconds.
+    /// for it ([LogWriter#nextOpenSegment()]), so a spare would save it only the zeros of the segment after that one,
+    /// on a thread no commit waits for, while forcing a spare that a copy of the store left in the OS cache held the
+    /// first durable commit after the open for tens of milliseconds.
     private static final int SPARES = 0;
     /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint, whatever the heap.
     private static final int MAX_BACKLOG = 6;

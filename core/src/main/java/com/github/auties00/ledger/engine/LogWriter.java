@@ -20,6 +20,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
@@ -43,18 +44,27 @@ import java.util.zip.CRC32C;
 ///
 /// A close keeps the segment prepared after the current one, cut to its first two blocks, and the next open writes
 /// into it, as it does into any segment recovery finds prepared and never written: the first durable commit after an
-/// open then waits for one force, where preparing a segment cost two more before it.
+/// open then waits for one round trip to the device or one force, where preparing a segment cost two more before it.
+/// The close marks the segment ([#KEPT_MARK]) as one whose name a force made durable, so a clean open forces nothing
+/// for it; an open that finds a segment no close marked forces its name before a commit depends on it.
 ///
 /// A new file is written with zeros first only while the commits wait for the forces and the log fills slower than
-/// [#ZEROED_RATE]: the zeros halve the time of a force on Linux, but double the bytes the device takes, which slowed an
-/// ingest of a history, whose commits do not wait, and 256 committers writing 100 MB a second, by a fifth. On Windows,
-/// where they spare a force nothing, only while the log writes groups through as well ([LogFiles#zeroFills(boolean)]).
+/// [#ZEROED_RATE], or has not filled a segment since the store opened: the zeros halve the time of a force on Linux,
+/// but double the bytes the device takes, which slowed an ingest of a history, whose commits do not wait, and 256
+/// committers writing 100 MB a second, by a fifth. On Windows, where they spare a force nothing, only while the log
+/// writes groups through as well ([LogFiles#zeroFills(boolean)]).
 ///
 /// Where [WriteThrough] can, a group that one write holds and that lands below the bytes its segment already has is
 /// written through to stable storage instead, durable once the write returns, and not forced: one round trip to the
 /// device where a write and a force take two. The segment is opened a second time for it. A group of several writes,
 /// one that rolls over, or one that would grow the file is written into the cache and forced as before, so an ingest
 /// keeps the bandwidth of the cache, and a file system that refuses the writes through moves the writer to forces.
+///
+/// A store just opened has such bytes only in the first block of its first segment, which its first group takes when
+/// one block holds it. The next segment is written with zeros on a thread of its own once a commit has waited, and the
+/// log moves to it between two groups as soon as it is ready, leaving the rest of the segment it was writing unused;
+/// until then each group is forced. So commits reach the path within the time of one preparation, whatever the size of
+/// a segment.
 ///
 /// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames. Each use of it, the writing of one
 /// open, draws a random tag, and the key of the use derives from the segment's number, a random salt of its own and
@@ -113,6 +123,13 @@ final class LogWriter {
     static final int USE_TAG_OFFSET = 28;
     /// The length of a segment a close keeps for the next open: its header and a first frame block of zeros.
     static final long KEPT_LENGTH = SEGMENT_HEADER + ALIGNMENT;
+    /// The offset of the byte a close sets in the segment it keeps once a force made the segment's name durable, the
+    /// last of the first frame block. The write follows the force, so a segment that holds the byte needs no force of
+    /// its name at the next open, and one that lost it to a loss of power only takes that force again. The first group
+    /// of the segment overwrites it, with frames or the padding after them, and no frame or group starts there.
+    static final long KEPT_MARK = KEPT_LENGTH - 1;
+    /// What the byte at [#KEPT_MARK] holds in a segment a close kept.
+    static final byte KEPT_MARK_VALUE = 1;
     private static final SecureRandom TAGS = new SecureRandom();
     /// The largest size of the buffer frames are sealed into and written from.
     private static final int OUTPUT = 1 << 20;
@@ -156,6 +173,8 @@ final class LogWriter {
     private FileChannel channel;
     // The current segment opened to write through, or null where its groups are forced
     private WriteThrough.Handle throughFile;
+    // Whether no write yet tried the way throughFile was opened in, so a failure of its first write moves one way down
+    private boolean unprobed;
     // The bytes the current segment had when it was prepared, below which a write changes neither its size nor the
     // length of its data
     private long valid;
@@ -310,7 +329,8 @@ final class LogWriter {
     /// Starts writing `segment`.
     private void open(LogFiles.Prepared segment) throws IOException {
         var now = System.nanoTime();
-        if (channel != null) {
+        var first = channel == null;
+        if (!first) {
             lastFill = now - segmentOpened;
         }
         segmentOpened = now;
@@ -321,16 +341,25 @@ final class LogWriter {
         this.segmentNumber = segment.number();
         this.currentSegment = segment.number();
         this.position = SEGMENT_HEADER;
-        // Its preparation forced the header
-        this.forcedPosition = SEGMENT_HEADER;
+        // Its preparation forced the header. A name no force made durable has the first group forced, which makes it so
+        this.forcedPosition = segment.nameDurable() ? SEGMENT_HEADER : -1;
         this.valid = segment.valid();
         this.groupEnd = SEGMENT_HEADER;
         this.segmentTag = ByteBuffer.wrap(segment.salt()).getLong();
         this.useTag = TAGS.nextLong();
         this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt(), useTag) : null;
         this.next = null;
-        // A segment of its header and first block holds at most one group through, which the probe would cost
-        this.throughFile = valid > KEPT_LENGTH ? openThrough() : null;
+        this.unprobed = false;
+        // A segment of its header and first block holds at most one group through, which a probe would cost. That group
+        // is worth a handle only as the first of a store just opened, which may commit once, and it probes the way itself
+        if (valid > KEPT_LENGTH) {
+            this.throughFile = openThrough(true);
+        } else if (first && segment.nameDurable()) {
+            this.throughFile = openThrough(false);
+            this.unprobed = throughFile != null;
+        } else {
+            this.throughFile = null;
+        }
     }
 
     /// {@return the current segment opened to write through, or `null` if [#writeThrough] has no way left}
@@ -340,12 +369,16 @@ final class LogWriter {
     /// of `O_DIRECT` at the write and not at the open, moves the writer to the next way down before a group needs it.
     /// An interrupt that cuts the probe short has it run again, and is given back to a commit's thread when the flush
     /// ends.
-    private WriteThrough.Handle openThrough() {
+    ///
+    /// @param probe whether to write the probe, which a handle whose first write is a group's goes without
+    private WriteThrough.Handle openThrough(boolean probe) {
         while (writeThrough.enabled()) {
             WriteThrough.Handle handle = null;
             try {
                 handle = writeThrough.open(segmentPath);
-                handle.write(new byte[ALIGNMENT], ALIGNMENT, output.length, SEGMENT_HEADER);
+                if (probe) {
+                    handle.write(new byte[ALIGNMENT], ALIGNMENT, output.length, SEGMENT_HEADER);
+                }
                 return handle;
             } catch (ClosedByInterruptException _) {
                 interruptedWrite |= Thread.interrupted();
@@ -374,12 +407,35 @@ final class LogWriter {
     /// behind it would make every commit waiting on that flush wait as long.
     private void prepareNext() {
         var number = segmentNumber + 1;
-        // Filled slower than the rate, by commits that waited for its forces
-        var zeros = (waited || waitedBefore) && lastFill >= 0 && lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE
-                && files.zeroFills(writeThrough.enabled());
-        var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize, zeros && !closing));
+        // Filled slower than the rate, or not filled yet, by commits that waited for its forces
+        var slow = (waited || waitedBefore) && (lastFill < 0 || lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE);
+        // On the thread of the preparation: the answer of a device may take a round trip to it
+        var preparation = new FutureTask<>(() -> files.prepare(number, segmentSize,
+                slow && !closing && files.zeroFills(writeThrough.enabled()), writeThrough.kind() != null, () -> closing));
         next = preparation;
         Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
+    }
+
+    /// {@return whether, between two groups, the log moves to the prepared segment after the current one: commits wait
+    /// for durability, the current segment has no bytes left to write them through and the next has them}
+    ///
+    /// Everything written to the current segment is durable at that point, so no force goes with the move. Only a next
+    /// segment of at least half the full size counts, so a short spare left by an earlier move is never moved to.
+    private boolean rollsEarly() {
+        if ((throughFile != null && position + ALIGNMENT <= valid) || !(waited || waitedBefore) || writeThrough.kind() == null) {
+            return false;
+        }
+        var preparation = next;
+        return preparation != null && preparation.state() == Future.State.SUCCESS
+                && preparation.resultNow().valid() >= segmentSize / 2;
+    }
+
+    /// Moves to the prepared segment after the current one, whose time to fill says nothing of the rate of the log.
+    private void rollEarly() throws IOException {
+        var fill = lastFill;
+        closeSegment();
+        rollover();
+        lastFill = fill;
     }
 
     /// Switches to the prepared segment after the current one, preparing it here if its thread has not.
@@ -751,6 +807,8 @@ final class LogWriter {
     private long write(List<Queued> group, boolean units) throws IOException {
         if (channel == null) {
             rollover();
+        } else if (rollsEarly()) {
+            rollEarly();
         }
         // Between groups: the last drain's bytes, which an interrupted force writes again, are durable by now
         if (smallGroups >= SHRINK_AFTER && output.length > MIN_OUTPUT) {
@@ -1035,7 +1093,8 @@ final class LogWriter {
     /// the same offsets, as [#drain()] does. A write through that fails otherwise, as one a file system refuses the
     /// alignment of does, moves the writer to forces: the group is written again into the cache and forced, which
     /// makes each of its pages dirty again whatever the failed write left on the device, so a force that succeeds
-    /// makes the group durable, and one that fails stops the writer as it always does.
+    /// makes the group durable, and one that fails stops the writer as it always does. The first write of a handle no
+    /// probe tried moves one way down first, as a probe that failed would.
     private void writeThrough() throws IOException {
         var start = position;
         lastDrainStart = start;
@@ -1047,11 +1106,18 @@ final class LogWriter {
                 used = 0;
                 forcedPosition = position;
                 writtenThrough++;
+                unprobed = false;
                 return;
             } catch (ClosedByInterruptException _) {
                 reopen();
             } catch (IOException _) {
-                break;
+                if (!unprobed) {
+                    break;
+                }
+                unprobed = false;
+                writeThrough.downgrade();
+                closeQuietly(throughFile);
+                throughFile = openThrough(true);
             }
         }
         writeThrough.disable();
@@ -1345,10 +1411,14 @@ final class LogWriter {
             while (true) {
                 try {
                     var prepared = preparation.get();
-                    // Not forced: recovery reads the segment the same at either length
-                    try (var channel = FileChannel.open(prepared.path(), StandardOpenOption.WRITE)) {
+                    // Not forced: recovery reads the segment the same at either length, and without the mark forces
+                    // its name once more
+                    try (var channel = FileChannel.open(prepared.path(), StandardOpenOption.READ, StandardOpenOption.WRITE)) {
                         if (channel.size() > KEPT_LENGTH) {
                             channel.truncate(KEPT_LENGTH);
+                        }
+                        if (prepared.nameDurable()) {
+                            mark(channel);
                         }
                     }
                     kept = prepared.number();
@@ -1363,6 +1433,18 @@ final class LogWriter {
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    /// Sets the byte at [#KEPT_MARK] in the segment open in `channel`, unless an earlier close did.
+    private static void mark(FileChannel channel) throws IOException {
+        var mark = ByteBuffer.allocate(1);
+        if (channel.read(mark, KEPT_MARK) == 1 && mark.get(0) == KEPT_MARK_VALUE) {
+            return;
+        }
+        mark.clear().put(0, KEPT_MARK_VALUE);
+        while (mark.hasRemaining()) {
+            channel.write(mark, KEPT_MARK);
         }
     }
 

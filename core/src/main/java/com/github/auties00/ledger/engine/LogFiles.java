@@ -12,6 +12,7 @@ import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.function.BooleanSupplier;
 import java.util.zip.CRC32C;
 
 /// The files of a store's log directory.
@@ -22,10 +23,11 @@ import java.util.zip.CRC32C;
 /// %016x.prep   a new segment being prepared, which a crash may leave behind
 /// ```
 ///
-/// A segment is prepared before the log needs it ([#prepare(long, long)]): a spare, or a new file, gets the segment's
-/// header with a fresh salt and a zeroed first frame block, is forced, and only then takes its name, so recovery never
-/// meets a segment half prepared, and finds one never written empty at once. A spare has its blocks already, and a new
-/// file can be written with zeros to its full length first ([#zeroFills(boolean)]): writing into either leaves a force
+/// A segment is prepared before the log needs it ([#prepare(long, long, boolean, boolean, BooleanSupplier)]): a spare,
+/// or a new file, gets the segment's header with a fresh salt and a zeroed first frame block, is forced, and only then
+/// takes its name, so recovery never meets a segment half prepared, and finds one never written empty at once. A spare
+/// has its blocks already, and a new file can be written with zeros to its full length first
+/// ([#zeroFills(boolean)]): writing into either leaves a force
 /// no file size and no block allocation to record, which on ext4 halved the time of a durable commit and spared one
 /// force in a thousand a wait of tens of milliseconds for a journal commit, and lets the log write a group through to
 /// stable storage with no metadata to write beside it ([WriteThrough]). Once a checkpoint makes segments obsolete, they
@@ -114,15 +116,28 @@ final class LogFiles {
     /// @param salt the salt of its key, which its frame headers carry
     /// @param valid the bytes of the file from its start that it had when it was prepared, a multiple of
     ///              [LogWriter#ALIGNMENT]: a write below them changes neither its size nor the length of its data
-    record Prepared(long number, Path path, byte[] salt, long valid) {
+    /// @param nameDurable whether its name is known to survive a loss of power; if not, only a force of the file or of
+    ///                    its directory makes it so, so a group written through is not durable without one
+    record Prepared(long number, Path path, byte[] salt, long valid, boolean nameDurable) {
+        /// {@return this segment, once a force made its name durable}
+        Prepared named() {
+            return nameDurable ? this : new Prepared(number, path, salt, valid, true);
+        }
     }
 
     /// Prepares segment `number`, which must not exist, from a spare or a new file of `length` bytes.
     ///
-    /// @param zeros whether a new file is first written with zeros to its full length, which [#zeroFills(boolean)]
-    ///              allows
-    /// @return the segment, durable under its name
-    Prepared prepare(long number, long length, boolean zeros) throws IOException {
+    /// Where a directory cannot be forced, as on NTFS, the name of the segment waits in the journal for the next force
+    /// of a file, which a group the log forces is and a group it writes through is not; so for a log that may write its
+    /// groups through the file is forced again here, on the thread of the preparation, where no commit waits for it.
+    ///
+    /// @param zeros whether a new file, or a spare shorter than `length`, is first written with zeros to its full
+    ///              length, which [#zeroFills(boolean)] allows
+    /// @param writesThrough whether the log may write groups of this segment through
+    /// @param stopFill asked between the writes of the zeros: once it answers `true` the file keeps only the header and
+    ///                 the first frame block, for a store closing, which would cut the zeros off and wait for them
+    /// @return the segment, durable under its name if [Prepared#nameDurable()] says so
+    Prepared prepare(long number, long length, boolean zeros, boolean writesThrough, BooleanSupplier stopFill) throws IOException {
         synchronized (lock) {
             var target = segment(number);
             var spares = spares();
@@ -151,8 +166,9 @@ final class LogFiles {
             start.putInt(LogWriter.HEADER_CRC_OFFSET, (int) crc.getValue());
             long valid;
             try (var channel = FileChannel.open(source, StandardOpenOption.WRITE)) {
-                if (fresh && zeros) {
-                    fill(channel, start.capacity(), length);
+                // A spare may be the short segment a log moved on from to one it could write through
+                if (zeros && channel.size() < length && !fill(channel, Math.max(channel.size(), start.capacity()), length, stopFill)) {
+                    channel.truncate(start.capacity());
                 }
                 // The header, and a first frame block of zeros that marks the segment as never written
                 while (start.hasRemaining()) {
@@ -163,8 +179,14 @@ final class LogFiles {
                 channel.force(true);
             }
             Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
-            Durability.forceDirectory(directory);
-            return new Prepared(number, target, salt, valid);
+            var named = Durability.forceDirectory(directory);
+            if (!named && writesThrough) {
+                try (var channel = FileChannel.open(target, StandardOpenOption.WRITE)) {
+                    channel.force(true);
+                }
+                named = true;
+            }
+            return new Prepared(number, target, salt, valid, named);
         }
     }
 
@@ -206,16 +228,22 @@ final class LogFiles {
     }
 
     /// Writes zeros to `channel` from `from` to `to`, so the file has the blocks of its full length.
-    private static void fill(FileChannel channel, long from, long to) throws IOException {
+    ///
+    /// @return whether it wrote them all, which it stops doing once `stop` answers `true`
+    private static boolean fill(FileChannel channel, long from, long to, BooleanSupplier stop) throws IOException {
         // A view of its own of the shared zeros, whose bytes no one writes
         var zeros = Zeros.BUFFER.duplicate();
         var position = from;
         while (position < to) {
+            if (stop.getAsBoolean()) {
+                return false;
+            }
             zeros.clear().limit((int) Math.min(zeros.capacity(), to - position));
             while (zeros.hasRemaining()) {
                 position += channel.write(zeros, position);
             }
         }
+        return true;
     }
 
     /// Turns the segments numbered below `first`, which a durable checkpoint made obsolete, into spares until there
