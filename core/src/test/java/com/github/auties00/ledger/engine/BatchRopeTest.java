@@ -181,13 +181,16 @@ class BatchRopeTest {
         }
 
         @Test
-        @DisplayName("refuses to detach, and compacts nothing, on a rope")
-        void detachAndCompact() {
+        @DisplayName("compacts nothing on a rope, whose writes keep their homes")
+        void compacts() {
             var batch = batch(pool());
             batch.put(MESSAGES, new byte[]{1}, new byte[100_000]).put(MESSAGES, new byte[]{2}, new byte[100_000]).put(MESSAGES, new byte[]{3}, new byte[100_000]);
             batch.compact();
-            assertThrows(IllegalStateException.class, batch::detach);
             assertArrayEquals(new byte[]{3}, bytes(batch.key(2)));
+            batch.prepare(false);
+            assertArrayEquals(new byte[100_000], bytes(batch.home(2).asSlice(batch.homeOffset(2), 100_000)));
+            batch.finish();
+            assertTrue(batch.isEmpty());
         }
 
         @Test
