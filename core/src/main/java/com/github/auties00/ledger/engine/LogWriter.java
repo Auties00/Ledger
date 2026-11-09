@@ -1399,6 +1399,12 @@ final class LogWriter {
         return forces;
     }
 
+    /// {@return whether the work on the segment after the current one, if any was started, is over, for tests}
+    boolean nextSettled() {
+        var preparation = next;
+        return preparation == null || preparation.isDone();
+    }
+
     /// {@return the groups written through so far, for tests}
     long writtenThrough() {
         return writtenThrough;
