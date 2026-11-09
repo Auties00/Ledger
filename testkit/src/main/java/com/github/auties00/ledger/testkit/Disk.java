@@ -26,13 +26,19 @@ import java.util.SplittableRandom;
 /// - a truncation is durable once a force of its file returns;
 /// - creating, renaming and deleting are durable once a force of a directory they touch returns; a loss of power keeps
 ///   an unforced prefix of them, in the order they ran, and a file whose entry it does not keep is gone with its data;
-/// - a crash of the process alone keeps everything.
+/// - a crash of the process alone keeps everything, durable or not: what no force made durable stays at risk from a
+///   later loss of power.
+///
+/// With `ntfs`, the namespace behaves as NTFS journals it instead: a directory cannot be opened, so it cannot be forced;
+/// a force of any file makes every change of the namespace so far durable, as it flushes the journal; and the write of
+/// a channel opened with `DSYNC`, which changes no metadata the journal must hold, makes none of them durable.
 ///
 /// Every call holds [#lock].
 final class Disk {
     static final int SECTOR = 512;
 
     final Object lock;
+    private final boolean ntfs;
     // Absolute path to node, as the namespace is now
     private final Map<String, Node> names;
     // As the last forces left it
@@ -46,8 +52,9 @@ final class Disk {
     private long forces;
     private boolean stopped;
 
-    Disk() {
+    Disk(boolean ntfs) {
         this.lock = new Object();
+        this.ntfs = ntfs;
         this.names = new HashMap<>();
         this.durableNames = new HashMap<>();
         this.pending = new ArrayList<>();
@@ -128,6 +135,11 @@ final class Disk {
 
     private static String child(String directory, String name) {
         return directory.equals("/") ? "/" + name : directory + "/" + name;
+    }
+
+    /// {@return whether a directory can be opened and forced}
+    boolean opensDirectories() {
+        return !ntfs;
     }
 
     /// Counts a change, and stops the process when it is the one [#stopAfter(long)] named.
@@ -301,8 +313,18 @@ final class Disk {
         }
     }
 
-    /// Makes the contents of `file` durable.
+    /// Makes the contents of `file` durable, and on NTFS every change of the namespace so far.
     void force(FileNode file) throws IOException {
+        forceContents(file);
+        if (ntfs) {
+            for (var change : pending) {
+                apply(durableNames, change);
+            }
+            pending.clear();
+        }
+    }
+
+    private void forceContents(FileNode file) throws IOException {
         alive();
         forced();
         file.durableData = Arrays.copyOf(file.data, (int) file.size);
@@ -319,7 +341,7 @@ final class Disk {
     void forceRange(FileNode file, long offset, long length) throws IOException {
         for (var change : file.changes) {
             if (change.truncation() >= 0) {
-                force(file);
+                forceContents(file);
                 return;
             }
         }
@@ -373,7 +395,7 @@ final class Disk {
         for (var i = 0; i < kept; i++) {
             apply(image, pending.get(i));
         }
-        var disk = new Disk();
+        var disk = new Disk(ntfs);
         var copies = new IdentityHashMap<Node, Node>();
         for (var entry : image.entrySet()) {
             var copy = copies.computeIfAbsent(entry.getValue(), node -> switch (node) {
@@ -385,18 +407,33 @@ final class Disk {
         return disk;
     }
 
-    /// {@return a new disk holding everything written now, as a crash of the process alone leaves it}
+    /// {@return a new disk holding everything written now, as a crash of the process alone leaves it, with what no force
+    /// made durable still at risk from a loss of power, as the cache of the operating system holds it}
     Disk afterProcessCrash() {
-        var disk = new Disk();
+        var disk = new Disk(ntfs);
         var copies = new IdentityHashMap<Node, Node>();
-        for (var entry : names.entrySet()) {
-            var copy = copies.computeIfAbsent(entry.getValue(), node -> switch (node) {
-                case DirectoryNode _ -> new DirectoryNode();
-                case FileNode file -> new FileNode(Arrays.copyOf(file.data, (int) file.size));
-            });
-            disk.place(entry.getKey(), copy);
+        disk.names.clear();
+        names.forEach((path, node) -> disk.names.put(path, copy(node, copies)));
+        disk.durableNames.clear();
+        durableNames.forEach((path, node) -> disk.durableNames.put(path, copy(node, copies)));
+        for (var change : pending) {
+            disk.pending.add(change instanceof Create(var path, var node) ? new Create(path, copy(node, copies)) : change);
         }
         return disk;
+    }
+
+    /// {@return the copy of `node` in `copies`, made now if it is the first}
+    private static Node copy(Node node, Map<Node, Node> copies) {
+        return copies.computeIfAbsent(node, _ -> switch (node) {
+            case DirectoryNode _ -> new DirectoryNode();
+            case FileNode file -> {
+                var copy = new FileNode(Arrays.copyOf(file.data, (int) file.size));
+                copy.durableData = file.durableData.clone();
+                copy.durableSize = file.durableSize;
+                copy.changes.addAll(file.changes);
+                yield copy;
+            }
+        });
     }
 
     private void place(String path, Node node) {

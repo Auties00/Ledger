@@ -41,6 +41,11 @@ import java.util.Set;
 /// directory for reading, then forced); a loss of power keeps a prefix, in order, of those not forced, and a file
 /// whose entry it drops is gone, with its data.
 ///
+/// A file system from [#createNtfs()] keeps its namespace as NTFS journals it. A directory cannot be opened, as on
+/// Windows, where opening one throws [java.nio.file.AccessDeniedException]. A force of any file flushes the journal, so
+/// it makes every creation, rename and deletion so far durable; this assumes a force flushes the whole journal, which
+/// is not measured on real NTFS. A write of a `DSYNC` channel, which changes no metadata, makes none of them durable.
+///
 /// # Limits
 /// Only what an embedded store uses is simulated: files, directories, positional and gathering channels, file
 /// locks, atomic renames of files. Symbolic links, attributes other than the basic ones, file stores, watch services,
@@ -66,7 +71,12 @@ public final class CrashFileSystem extends FileSystem {
 
     /// {@return a new, empty file system}
     public static CrashFileSystem create() {
-        return new CrashFileSystem(new Disk());
+        return new CrashFileSystem(new Disk(false));
+    }
+
+    /// {@return a new, empty file system that keeps its namespace as NTFS journals it}
+    public static CrashFileSystem createNtfs() {
+        return new CrashFileSystem(new Disk(true));
     }
 
     Disk disk() {
@@ -151,6 +161,9 @@ public final class CrashFileSystem extends FileSystem {
     }
 
     /// {@return a new file system holding everything written so far, as a crash of the process alone leaves it}
+    ///
+    /// The operating system still holds in its cache what no force made durable, so a later [#afterPowerLoss(Random)]
+    /// of the new file system may lose it.
     public CrashFileSystem afterProcessCrash() {
         synchronized (disk.lock) {
             return new CrashFileSystem(disk.afterProcessCrash());
