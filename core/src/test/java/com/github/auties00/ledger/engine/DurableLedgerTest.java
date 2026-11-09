@@ -21,10 +21,14 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
@@ -924,19 +928,33 @@ class DurableLedgerTest {
     }
 
     private static void copyWithoutLock(Path source, Path target) throws IOException {
-        try (var files = Files.walk(source)) {
-            for (var file : files.toList()) {
-                var destination = target.resolve(source.relativize(file));
-                if (Files.isDirectory(file)) {
-                    Files.createDirectories(destination);
-                } else if (!file.getFileName().toString().equals(DirectoryLock.FILE)) {
+        Files.walkFileTree(source, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attributes) throws IOException {
+                Files.createDirectories(target.resolve(source.relativize(directory)));
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) throws IOException {
+                if (!file.getFileName().toString().equals(DirectoryLock.FILE)) {
                     try {
-                        Files.copy(file, destination);
-                    } catch (java.nio.file.NoSuchFileException _) {
+                        Files.copy(file, target.resolve(source.relativize(file)));
+                    } catch (NoSuchFileException _) {
                         // A segment being prepared beside the store took its name meanwhile: a crash would not see it
                     }
                 }
+                return FileVisitResult.CONTINUE;
             }
-        }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path file, IOException failure) throws IOException {
+                // The same rename, between the listing of the directory and the look at the name it listed
+                if (failure instanceof NoSuchFileException) {
+                    return FileVisitResult.CONTINUE;
+                }
+                throw failure;
+            }
+        });
     }
 }
