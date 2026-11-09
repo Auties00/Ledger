@@ -171,7 +171,13 @@ final class Checkpointer implements IdleTicker.Watched {
     }
 
     /// Starts a checkpoint if the store committed nothing since the last tick of the [IdleTicker] and the writes the
-    /// trees lack hold at least [#IDLE_BACKLOG] of heap, whole chunks of the slab their values may be on included.
+    /// trees lack hold at least [#IDLE_BACKLOG] of heap, whole chunks of the slab their values may be on included; or,
+    /// however often it commits, if the slab is cold and the chunks made since the last cut take that much.
+    ///
+    /// A burst that stops and leaves a trickle goes no tick without a commit, and the first value after the cut on each
+    /// of the chunks of the burst holds it whole until the next checkpoint, an interval of log away, which at a trickle
+    /// may be days. A cold slab makes no chunk, so this starts at most one checkpoint for each time it was hot, not one
+    /// a write.
     ///
     /// Checkpoints otherwise start once every interval of log, so a store that wrote less than one and stopped kept
     /// those writes in memory, more than their bytes in the log, for as long as it stayed open.
@@ -188,7 +194,9 @@ final class Checkpointer implements IdleTicker.Watched {
             startSweep();
         }
         var logged = log.appendedHeap() - publishedHeap;
-        if (idle && !closed && stopped == null && logged > 0 && logged + slab.chunkBytes() - publishedChunks >= IDLE_BACKLOG) {
+        var chunks = slab.chunkBytes() - publishedChunks;
+        var due = idle ? logged + chunks >= IDLE_BACKLOG : !slab.hot() && chunks >= IDLE_BACKLOG;
+        if (due && !closed && stopped == null && logged > 0) {
             start();
         }
     }
@@ -212,6 +220,11 @@ final class Checkpointer implements IdleTicker.Watched {
         } catch (Throwable _) {
             sweeping.set(false);
         }
+    }
+
+    /// {@return whether a checkpoint started on a thread of its own has not ended; for tests}
+    boolean startedForTests() {
+        return scheduled.get();
     }
 
     /// {@return whether a thread is finishing the sweep of the store; for tests}
