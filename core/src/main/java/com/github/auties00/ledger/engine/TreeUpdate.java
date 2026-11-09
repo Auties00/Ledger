@@ -9,8 +9,8 @@ import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.ForkJoinTask;
 import java.util.concurrent.RecursiveTask;
+import java.util.concurrent.atomic.AtomicReference;
 
 /// Applies the writes of one checkpoint to a key space's tree, copy on write.
 ///
@@ -47,8 +47,15 @@ final class TreeUpdate {
     private final PageCounts records;
     // Fills the delta pages of this update's thread
     private final DeltaLeaves.Packer packer;
+    // The first failure of a task of this update or of the updates of its subtrees, which all share it
+    private final AtomicReference<Throwable> failure;
 
     TreeUpdate(PageFile pages, PageFile.Writer writer, FreeSpace space) {
+        this(pages, writer, space, new AtomicReference<>());
+    }
+
+    private TreeUpdate(PageFile pages, PageFile.Writer writer, FreeSpace space, AtomicReference<Throwable> failure) {
+        this.failure = failure;
         this.pages = pages;
         this.writer = writer;
         this.space = space;
@@ -419,6 +426,12 @@ final class TreeUpdate {
     /// the free space are shared, and safe for concurrent use. A checkpoint of a write rate that rewrites most leaves
     /// would otherwise rewrite them on one processor.
     ///
+    /// It returns only once every task has ended, even if one failed, and a failure stops the tasks that have not
+    /// started yet: a checkpoint that fails gives back the pages its update took and the next one retries at once, so a
+    /// task left running would take pages no one gives back, give back pages the retry took and move the position of the
+    /// channel under the retry's writes. [java.util.concurrent.ForkJoinTask#invokeAll(java.util.Collection)] does not
+    /// wait: it rethrows the first failure it finds and cancels the others, which does not stop a running one.
+    ///
     /// @return what replaces each child, `null` where nothing does
     private Replacement[] updateInParallel(List<Child> children, Plan[] plans, List<Op> ops, List<Range> removals) throws IOException {
         var replacements = new Replacement[children.size()];
@@ -426,18 +439,36 @@ final class TreeUpdate {
         for (var i = 0; i < children.size(); i++) {
             var plan = plans[i];
             if (plan != null && plan != Plan.DROP) {
-                tasks.add(new Subtree(i, new TreeUpdate(pages, writer, space), children.get(i), ops, removals, plan));
+                tasks.add(new Subtree(i, new TreeUpdate(pages, writer, space, failure), children.get(i), ops, removals, plan));
             }
         }
+        // The tasks before this index stay on this thread: the first, and any the pool refused
+        var forked = tasks.size();
         try {
-            ForkJoinTask.invokeAll(tasks);
-        } catch (UncheckedIOException exception) {
-            throw exception.getCause();
-        } finally {
-            // Whatever the tasks took, even those of a failed update, goes back if the checkpoint fails
-            for (var task : tasks) {
-                allocated.addAll(task.update.allocated);
+            for (; forked > 1; forked--) {
+                tasks.get(forked - 1).fork();
             }
+        } catch (Throwable refused) {
+            failure.compareAndSet(null, refused);
+        }
+        for (var i = 0; i < forked; i++) {
+            tasks.get(i).quietlyInvoke();
+        }
+        for (var i = forked; i < tasks.size(); i++) {
+            tasks.get(i).quietlyJoin();
+        }
+        // Whatever the tasks took, even those of a failed update, goes back if the checkpoint fails
+        for (var task : tasks) {
+            allocated.addAll(task.update.allocated);
+        }
+        switch (failure.get()) {
+            case null -> {
+            }
+            case IOException exception -> throw exception;
+            case UncheckedIOException exception -> throw exception.getCause();
+            case RuntimeException exception -> throw exception;
+            case Error error -> throw error;
+            case Throwable other -> throw new IllegalStateException(other);
         }
         for (var task : tasks) {
             freed.addAll(task.update.freed);
@@ -586,13 +617,18 @@ final class TreeUpdate {
 
         @Override
         protected Replacement compute() {
+            // The update has failed, so nothing reads the result: the branch that waits for this task throws instead
+            if (update.failure.get() != null) {
+                return null;
+            }
             try {
                 var replacement = update.update(child, ops, removals, plan);
                 // The records of the subtree end its own pages, so the branch above reads them back from the writer
                 update.packer.close();
                 return replacement;
-            } catch (IOException exception) {
-                throw new UncheckedIOException(exception);
+            } catch (Throwable throwable) {
+                update.failure.compareAndSet(null, throwable);
+                return null;
             }
         }
     }
