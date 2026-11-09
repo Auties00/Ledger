@@ -25,6 +25,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Random;
@@ -281,6 +282,52 @@ class BatchRopeTest {
             var lastWrite = 29 + last - 1;
             assertEquals(home, batch.home(lastWrite).byteSize());
             assertArrayEquals(value(lastWrite, 9_000), bytes(batch.home(lastWrite).asSlice(batch.homeOffset(lastWrite), 9_000)));
+        }
+
+        @ParameterizedTest(name = "values of {0} bytes")
+        @ValueSource(ints = {87_500, 100_000, 110_000, 127_000})
+        @DisplayName("keeps no chunk of values with more than a sixteenth unused, whatever the size of its values, and returns those it copied to the pool")
+        void wasteOfEveryChunk(int length) {
+            var pool = pool();
+            var batch = batch(pool);
+            for (var i = 0; i < 20; i++) {
+                batch.put(MESSAGES, key(i), value(i, length));
+            }
+            batch.prepare(false);
+            var homes = new HashSet<MemorySegment>();
+            for (var i = 0; i < 20; i++) {
+                var home = batch.home(i);
+                homes.add(home);
+                // Two values to a chunk: a third does not fit
+                assertTrue(home.byteSize() - 2L * length <= CHUNK / 16, () -> home.byteSize() + " bytes for two values of " + length);
+                assertArrayEquals(value(i, length), bytes(home.asSlice(batch.homeOffset(i), length)));
+            }
+            assertEquals(10, homes.size());
+            var copied = homes.stream().filter(home -> home.byteSize() != CHUNK).count();
+            var before = pool.pooledBytesForTests();
+            batch.finish();
+            // Those copied, and the chunk of the keys
+            assertEquals(before + (copied + 1) * CHUNK, pool.pooledBytesForTests());
+        }
+
+        @Test
+        @DisplayName("keeps a mix that would leave half of each chunk unused to the bytes of its values")
+        void wasteOfMix() {
+            var batch = batch(pool());
+            // Each pair takes a chunk just over half full, which the next value just below half a chunk does not fit in
+            var total = 0L;
+            for (var i = 0; i < 20; i += 2) {
+                batch.put(MESSAGES, key(i), value(i, CHUNK / 2 - 1));
+                batch.put(MESSAGES, key(i + 1), value(i + 1, 1_100));
+                total += CHUNK / 2 - 1 + 1_100;
+            }
+            batch.prepare(false);
+            var homes = new HashSet<MemorySegment>();
+            for (var i = 0; i < 20; i++) {
+                homes.add(batch.home(i));
+            }
+            assertEquals(10, homes.size());
+            assertEquals(total, homes.stream().mapToLong(MemorySegment::byteSize).sum(), "the homes hold the bytes of the values and no more");
         }
 
         @Test

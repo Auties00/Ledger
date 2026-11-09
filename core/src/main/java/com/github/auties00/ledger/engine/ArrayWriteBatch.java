@@ -714,8 +714,8 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// once the commit [ends][#finish()]. On the batch's array, a message committed beside a session of 1.5 KiB would
     /// keep the session's bytes, which the store holds a copy of already, until the next checkpoint. A value on an array
     /// of its own stays there and counts for none of this. A batch on a rope has its paged values alone on their chunks
-    /// already, which it hands over as they are, but for the last one, copied to an array of its bytes if it leaves
-    /// more than [#SLACK] bytes or a sixteenth unused.
+    /// already, which it hands over as they are, but for one that leaves more than [#SLACK] bytes or a sixteenth unused,
+    /// copied to an array of its bytes.
     ///
     /// A commit that fails prepares again when it is retried: a prepare writes nothing a former one exposed.
     ///
@@ -757,17 +757,18 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// Exposes the chunks of values no prepare has: from here on no one writes them, as a commit that fails may leave
     /// versions on them, so a write added for a retry starts a new chunk, and a retry finds each chunk's home as it was.
     ///
-    /// Every chunk but the last is more than half full, as its next value did not fit, so they waste at most a value's
-    /// bytes each.
+    /// The heap a commit is estimated to hold counts its values and not the arrays around them, and the checkpoint
+    /// backlog's budget trusts that estimate, so no chunk keeps more than a sixteenth unused: values of 87 KiB fill two
+    /// thirds of each. Only a value above a sixteenth of a chunk leaves that much behind it, so a batch of smaller ones
+    /// copies its last chunk at most; a chunk copied goes back to the pool once the commit ends.
     private void prepareRope() {
         homesMode = HOMES_ROPE;
-        var last = valueChunk;
         valueChunk = null;
         for (var i = 1; i < chunkCount; i++) {
             var chunk = chunks[i];
             if (chunk.values && chunk.home == null) {
                 var unused = chunk.array.length - chunk.fill;
-                chunk.home = chunk == last && unused > Math.max(SLACK, chunk.array.length / 16)
+                chunk.home = unused > Math.max(SLACK, chunk.array.length / 16)
                         ? MemorySegment.ofArray(Arrays.copyOf(chunk.array, chunk.fill)).asReadOnly()
                         : chunk.view;
             }
