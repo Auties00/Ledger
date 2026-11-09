@@ -301,9 +301,14 @@ final class TreeNodes {
         return entries;
     }
 
+    /// {@return whether `unit` is the leaf of a delta record, whose header names its base leaf rather than itself}
+    static boolean madeFromDelta(byte[] unit) {
+        return unit[ORIGIN] == FROM_DELTA;
+    }
+
     /// {@return the leaf the leaf `unit` named by `ref` is made from: `ref` itself, or the base leaf of a delta}
     static PageRef base(byte[] unit, PageRef ref) {
-        if (unit[ORIGIN] != FROM_DELTA) {
+        if (!madeFromDelta(unit)) {
             return ref;
         }
         return new PageRef(Bytes.i32(unit, PageFormat.PAGE), 1, Bytes.i64(unit, PageFormat.NONCE),

@@ -48,9 +48,15 @@ class PageCacheStressTest {
 
         /// {@return a new array for this target, with the header of its own or, for a delta record, of another unit}
         byte[] unit() {
+            return unit(null);
+        }
+
+        /// {@return a new array for this target, with the header of its own or, for a delta record, of `base` if not
+        /// `null` and of another unit otherwise}
+        byte[] unit(PageRef base) {
             var unit = new byte[LENGTH];
             if (ref.isRecord()) {
-                TreeNodes.deltaHeader(unit, new PageRef(ref.page() + 1, 1, 99, 99), 0);
+                TreeNodes.deltaHeader(unit, base != null ? base : new PageRef(ref.page() + 1, 1, 99, 99), 0);
             } else {
                 PageFile.header(unit, PageFormat.LEAF, 0, ref.page(), ref.pages(), 0, ref.nonceHigh(), ref.nonceLow());
             }
@@ -198,6 +204,54 @@ class PageCacheStressTest {
         assertEquals(1, cache.clockLengthForTests());
         assertEquals(LENGTH, cache.size());
         cache.close();
+    }
+
+    @Test
+    @DisplayName("a read of a base leaf gets the base or a miss when the leaf of a delta record on it takes the slot the base left")
+    void recordLeafInTheSlotOfItsBase() throws InterruptedException {
+        var cache = PageCache.isolated(1L << 20);
+        IdleTicker.unwatch(cache);
+        var baseRef = new PageRef(HOT_PAGE, 1, 5, ~5);
+        var base = new Target(PageCache.dataKey(HOT_PAGE, -1), baseRef);
+        var record = recordInSameSlot(base.key());
+        // The premise: the record's leaf reuses the very slot the base left, as a table of the fewest slots has
+        cache.put(base.key(), base.ref(), base.unit(), true);
+        cache.remove(base.key());
+        assertEquals(1, cache.tombstonesForTests());
+        cache.put(record.key(), record.ref(), record.unit(baseRef), true);
+        assertEquals(0, cache.tombstonesForTests());
+        cache.remove(record.key());
+        var tasks = new ArrayList<Task>();
+        // More readers than processors: a reader the scheduler stops between its probe and its read of the slot's array
+        // finds whatever the writer left there by then
+        for (var i = 0; i < 2 * Runtime.getRuntime().availableProcessors(); i++) {
+            tasks.add(() -> {
+                var hit = cache.get(base.key(), base.ref());
+                if (hit != null) {
+                    assertNull(base.check(hit));
+                }
+            });
+        }
+        tasks.add(() -> {
+            cache.put(base.key(), base.ref(), base.unit(), true);
+            cache.remove(base.key());
+            cache.put(record.key(), record.ref(), record.unit(baseRef), true);
+            cache.remove(record.key());
+        });
+        run(tasks);
+        cache.close();
+    }
+
+    /// {@return a delta record whose key has the same first slot as `key` in a table of 64 slots}
+    private static Target recordInSameSlot(long key) {
+        // The table's hash, multiplying by 2^64 over the golden ratio and keeping the top bits
+        var hash = 0x9E3779B97F4A7C15L;
+        for (var page = HOT_PAGE + 1; ; page++) {
+            var candidate = PageCache.dataKey(page, 0);
+            if (candidate * hash >>> 58 == key * hash >>> 58) {
+                return new Target(candidate, new PageRef(page, 1, 7, ~7, 0));
+            }
+        }
     }
 
     private static byte[] peekOrGet(PageCache cache, Target target) {
