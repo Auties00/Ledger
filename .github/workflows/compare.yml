@@ -113,6 +113,8 @@ jobs:
           # A workload that prints nothing for 30 minutes has hung: record the threads of every JVM into results/ and
           # kill the benchmark's fork, so that JMH goes on to the next workload and the job still reports the others.
           (
+            # bash -e would end this watchdog at the first grep that matches nothing, such as jps looking at itself
+            set +e
             size=-1; still=0
             while [ ! -f results/.done ]; do
               sleep 60
