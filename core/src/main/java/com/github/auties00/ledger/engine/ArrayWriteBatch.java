@@ -53,7 +53,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     private static final byte HOMES_NONE = 0;
     // Every write's home is the batch's own view
     private static final byte HOMES_OWN = 1;
-    // A paged write's home is in homes, a resident one has none
+    // A paged write's home is packedHome, at the offset the high half of its key's length holds; a resident one has none
     private static final byte HOMES_CHUNKS = 2;
     // A paged write's home is the home of its chunk of the rope, a resident one has none
     private static final byte HOMES_ROPE = 3;
@@ -93,14 +93,14 @@ public final class ArrayWriteBatch implements WriteBatch {
     private byte[] spare;
     // Where the store's versions find the values, as prepare decided: one of the HOMES_ constants
     private byte homesMode;
-    // In HOMES_CHUNKS, the segment each write's value was copied into, or null, and where in it the value starts
-    private MemorySegment[] homes;
-    private int[] homeOffsets;
+    // In HOMES_CHUNKS, the read-only segment the values of the paged writes were copied into
+    private MemorySegment packedHome;
 
     private byte[] kinds;
     private Keyspace<?, ?>[] targets;
     private Object[] values;
-    // Per write: first offset and length, then second offset and length (value, or upper bound of a range)
+    // Per write: first offset and length, then second offset and length (value, or upper bound of a range). Only the low
+    // half of the first length is the length: in HOMES_CHUNKS the high half is where the write's value is in packedHome
     private long[] spans;
     // The array of each value of OWN_BYTES or more, or null before the first
     private byte[][] owns;
@@ -574,8 +574,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         ownBytes = 0;
         leaveRope();
         // What a commit that failed prepared
-        homes = null;
-        homeOffsets = null;
+        packedHome = null;
         homesMode = HOMES_NONE;
         if (exposed) {
             dropData();
@@ -685,7 +684,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         if (offset < 0) {
             return offset == ABSENT ? null : MemorySegment.ofArray(owns[index]).asReadOnly();
         }
-        var length = spans[index * 4 + field + 1];
+        var length = (int) spans[index * 4 + field + 1];
         var chunk = (int) (offset >>> 32);
         return chunk == 0 ? view.asSlice(offset, length) : chunks[chunk].view.asSlice((int) offset, length);
     }
@@ -712,10 +711,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// it and no read needs it, and with it whatever array the value is part of. A batch that holds little but those
     /// values, at most [#SLACK] bytes or a sixteenth besides, keeps them on its own array, [compacted][#compact()];
     /// any other has them copied, alone, into arrays below [#CHUNK_BYTES], and its own array goes back to the pool
-    /// once the commit [ends][#finish()]. On the batch's array, a message committed beside a session of 1.5 KiB kept
-    /// the session's bytes, which the store held a copy of already, until the next checkpoint, and a batch of a
-    /// thousand messages one array of over 2 MiB, which the collector gives regions of its own. A value on an array of
-    /// its own stays there and counts for none of this. A batch on a rope has its paged values alone on their chunks
+    /// once the commit [ends][#finish()]. On the batch's array, a message committed beside a session of 1.5 KiB would
+    /// keep the session's bytes, which the store holds a copy of already, until the next checkpoint. A value on an array
+    /// of its own stays there and counts for none of this. A batch on a rope has its paged values alone on their chunks
     /// already, which it hands over as they are, but for the last one, copied to an array of its bytes if it leaves
     /// more than [#SLACK] bytes or a sixteenth unused.
     ///
@@ -723,8 +721,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     ///
     /// @param copies whether the store copies every value it keeps, as a store in memory does, so no write has a home
     void prepare(boolean copies) {
-        homes = null;
-        homeOffsets = null;
+        packedHome = null;
         homesMode = HOMES_NONE;
         if (copies) {
             return;
@@ -749,8 +746,6 @@ public final class ArrayWriteBatch implements WriteBatch {
         if (paged == 0) {
             return;
         }
-        homes = new MemorySegment[size];
-        homeOffsets = new int[size];
         homesMode = HOMES_CHUNKS;
         // At most CHUNK_BYTES, as the batch's array is
         var packer = new Packer((int) paged);
@@ -790,13 +785,12 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// would not compile the loop of a method called once a commit through the first large commits of a process.
     private final class Packer {
         private final byte[] chunk;
-        private final MemorySegment chunkView;
         private int fill;
 
-        /// Makes the array for values of `bytes` bytes in all.
+        /// Makes the array for values of `bytes` bytes in all, and the home of those values.
         Packer(int bytes) {
             chunk = new byte[bytes];
-            chunkView = MemorySegment.ofArray(chunk).asReadOnly();
+            packedHome = MemorySegment.ofArray(chunk).asReadOnly();
         }
 
         /// Gives write `index` its home, if it puts a value to a paged key space.
@@ -807,8 +801,7 @@ public final class ArrayWriteBatch implements WriteBatch {
             var offset = (int) spans[index * 4 + 2];
             var length = (int) spans[index * 4 + 3];
             System.arraycopy(data, offset, chunk, fill, length);
-            homes[index] = chunkView;
-            homeOffsets[index] = fill;
+            spans[index * 4 + 1] = (long) fill << 32 | (int) spans[index * 4 + 1];
             fill += length;
         }
     }
@@ -823,7 +816,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         Objects.checkIndex(index, size);
         return switch (homesMode) {
             case HOMES_OWN -> spans[index * 4 + 2] == OWN ? null : view;
-            case HOMES_CHUNKS -> homes[index];
+            case HOMES_CHUNKS -> packed(index) ? packedHome : null;
             case HOMES_ROPE -> packed(index) ? chunks[(int) (spans[index * 4 + 2] >>> 32)].home : null;
             default -> null;
         };
@@ -836,7 +829,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         Objects.checkIndex(index, size);
         return switch (homesMode) {
             case HOMES_OWN -> spans[index * 4 + 2] == OWN ? 0 : Math.toIntExact(spans[index * 4 + 2]);
-            case HOMES_CHUNKS -> homeOffsets[index];
+            case HOMES_CHUNKS -> packed(index) ? (int) (spans[index * 4 + 1] >>> 32) : 0;
             case HOMES_ROPE -> packed(index) ? (int) spans[index * 4 + 2] : 0;
             default -> 0;
         };
