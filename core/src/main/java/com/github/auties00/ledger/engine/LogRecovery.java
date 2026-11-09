@@ -70,7 +70,8 @@ final class LogRecovery {
     ///
     /// @param lastSequence the sequence of the last commit replayed, or the checkpoint's
     /// @param lastSegment the number of the last segment, or 0 if there was none
-    /// @param empty the last segment if it was prepared and never written, which the next writer writes into, with
+    /// @param empty the last segment if it was prepared and never written and has the current version, which the next
+    ///              writer writes into, with
     ///              [LogFiles.Prepared#nameDurable()] telling whether a close marked it; or `null`
     /// @param lastWritten the last segment that holds a frame, or `null` if none does
     record Result(long lastSequence, long lastSegment, LogFiles.Prepared empty, Path lastWritten) {
@@ -106,6 +107,11 @@ final class LogRecovery {
                     }
                     throw new LedgerCorruptedException(path + " has a damaged header", null);
                 }
+                var version = ByteBuffer.wrap(header).getInt(8);
+                if (version < LogWriter.OLDEST_SEGMENT_VERSION || version > LogWriter.SEGMENT_VERSION) {
+                    throw new LedgerCorruptedException(path + " has segment version " + version + ", and this build reads "
+                            + LogWriter.OLDEST_SEGMENT_VERSION + " to " + LogWriter.SEGMENT_VERSION, null);
+                }
                 if (!ownSegmentHeader(header, number, storeId, keys)) {
                     throw new LedgerCorruptedException(path + " is not a segment of this store", null);
                 }
@@ -120,7 +126,9 @@ final class LogRecovery {
                     checkNoLaterGroup(reader, position, Long.MIN_VALUE, tag, crc, path);
                     var mark = new byte[1];
                     var kept = reader.read(LogWriter.KEPT_MARK, mark, 0, 1) && mark[0] == LogWriter.KEPT_MARK_VALUE;
-                    empty = new LogFiles.Prepared(number, path, salt, reader.size() / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT, kept);
+                    // An older version's stays empty: its header promises frames the writer may not keep to
+                    empty = version != LogWriter.SEGMENT_VERSION ? null
+                            : new LogFiles.Prepared(number, path, salt, reader.size() / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT, kept);
                     continue;
                 }
                 empty = null;
@@ -234,13 +242,12 @@ final class LogRecovery {
         }
     }
 
-    /// {@return whether `header` is a whole segment header of this format}
+    /// {@return whether `header` is a whole segment header, of any version}
     private static boolean intactSegmentHeader(byte[] header, CRC32C crc) {
         var buffer = ByteBuffer.wrap(header);
         crc.reset();
         crc.update(header, 0, LogWriter.HEADER_CRC_OFFSET);
         return buffer.getLong(0) == LogWriter.SEGMENT_MAGIC
-                && buffer.getInt(8) == LogWriter.SEGMENT_VERSION
                 && buffer.getInt(LogWriter.HEADER_CRC_OFFSET) == (int) crc.getValue();
     }
 

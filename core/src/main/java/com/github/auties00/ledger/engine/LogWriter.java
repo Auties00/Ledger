@@ -113,7 +113,11 @@ final class LogWriter {
     static final int MAGIC = 0x4C474631;
     static final byte GROUP_START = 1;
     static final long SEGMENT_MAGIC = 0x4C475345474D4E54L;
-    static final int SEGMENT_VERSION = 2;
+    /// The version of the segments a writer starts: from 3 a segment may hold frames of type [FrameBody#COMMITS], so a
+    /// build that reads only earlier versions refuses it by its version and not at the first such frame.
+    static final int SEGMENT_VERSION = 3;
+    /// The oldest version recovery reads, whose frame types the current version all has.
+    static final int OLDEST_SEGMENT_VERSION = 2;
     static final int TAG_BYTES = 16;
     static final int SALT_OFFSET = 40;
     static final int SALT_BYTES = 16;

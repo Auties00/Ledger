@@ -36,6 +36,7 @@ import java.util.Random;
 import java.util.TreeMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.zip.CRC32C;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -640,6 +641,77 @@ class DurableLedgerTest {
             bytes[3] ^= 1;
             Files.write(segment, bytes);
             assertThrows(LedgerCorruptedException.class, () -> open(directory, NAMES));
+            assertTrue(Files.exists(segment));
+        }
+
+        /// Gives the segment at `path` the version `version`, its header intact.
+        private static void setVersion(Path path, int version) throws IOException {
+            try (var channel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                var header = ByteBuffer.allocate(LogWriter.HEADER_CRC_OFFSET + Integer.BYTES);
+                channel.read(header, 0);
+                header.putInt(8, version);
+                var crc = new CRC32C();
+                crc.update(header.array(), 0, LogWriter.HEADER_CRC_OFFSET);
+                header.putInt(LogWriter.HEADER_CRC_OFFSET, (int) crc.getValue());
+                channel.write(header.clear(), 0);
+            }
+        }
+
+        private static int version(Path path) throws IOException {
+            try (var channel = FileChannel.open(path, StandardOpenOption.READ)) {
+                var version = ByteBuffer.allocate(Integer.BYTES);
+                channel.read(version, 8);
+                return version.getInt(0);
+            }
+        }
+
+        @Test
+        @DisplayName("reads the segments of the previous version and writes none of them: a prepared one stays empty, and the writer starts a segment of the current version")
+        void previousVersion(@TempDir Path directory) throws Exception {
+            var crashed = open(directory, NAMES);
+            try {
+                crashed.commit(crashed.newBatch().put(NAMES, "a", "1")).awaitDurable();
+            } finally {
+                crash(crashed);
+            }
+            var previous = segments(directory);
+            assertTrue(previous.size() > 1, "a written segment and the prepared one after it");
+            for (var segment : previous) {
+                setVersion(segment, LogWriter.OLDEST_SEGMENT_VERSION);
+            }
+            var reopened = open(directory, NAMES);
+            try {
+                assertEquals(Optional.of("1"), reopened.get(NAMES, "a"));
+                reopened.commit(reopened.newBatch().put(NAMES, "b", "2")).awaitDurable();
+                var written = writing(directory, reopened);
+                assertFalse(previous.contains(written));
+                assertEquals(LogWriter.SEGMENT_VERSION, version(written));
+                for (var segment : previous) {
+                    assertEquals(LogWriter.OLDEST_SEGMENT_VERSION, version(segment));
+                }
+            } finally {
+                crash(reopened);
+            }
+            try (var ledger = open(directory, NAMES)) {
+                assertEquals(Optional.of("1"), ledger.get(NAMES, "a"));
+                assertEquals(Optional.of("2"), ledger.get(NAMES, "b"));
+            }
+        }
+
+        @ParameterizedTest(name = "version {0}")
+        @ValueSource(ints = {1, LogWriter.SEGMENT_VERSION + 1})
+        @DisplayName("refuses a segment of a version it does not read, naming that version, and deletes nothing, even a segment with no frames")
+        void unknownVersion(int unknown, @TempDir Path directory) throws Exception {
+            var crashed = open(directory, NAMES);
+            try {
+                crashed.commit(crashed.newBatch().put(NAMES, "a", "1")).awaitDurable();
+            } finally {
+                crash(crashed);
+            }
+            var segment = segments(directory).getLast();
+            setVersion(segment, unknown);
+            var failure = assertThrows(LedgerCorruptedException.class, () -> open(directory, NAMES));
+            assertTrue(failure.getMessage().contains("version " + unknown), failure::getMessage);
             assertTrue(Files.exists(segment));
         }
     }
