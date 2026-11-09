@@ -21,6 +21,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Locale;
 import java.util.function.BooleanSupplier;
+import java.util.function.LongFunction;
 
 /// The writes of the log's groups through to stable storage, so a group that one write holds needs no force after it,
 /// used by default only where the write holds what the force would.
@@ -52,7 +53,8 @@ import java.util.function.BooleanSupplier;
 /// The system property `ledger.log.writeThrough` sets the [Mode] of every store the process opens: `auto`, the
 /// default, `off`, `dsync` or `direct`.
 ///
-/// A way that fails moves the writer to the next one down, `O_DSYNC` after `O_DIRECT`, and from the last to forces.
+/// A way that fails moves the writer to the next one down, `O_DSYNC` after `O_DIRECT`, and from the last to forces; a
+/// buffer or a handle the native memory has no room for is such a failure, since a force needs neither.
 /// Only the flush that holds the log writer writes through an instance, so one thread at a time; its buffer, aligned to
 /// [LogWriter#ALIGNMENT] as `O_DIRECT` and `FILE_FLAG_NO_BUFFERING` need, serves every segment of the writer. The thread
 /// preparing a segment may ask which way is left beside it, so the round trip of asking the device holds no commit up.
@@ -111,6 +113,8 @@ final class WriteThrough {
     // The buffer a group is copied into before it is written, aligned to LogWriter.ALIGNMENT, and a view of it
     private MemorySegment buffer;
     private ByteBuffer bufferView;
+    /// Allocates the buffer in place of the arena, by its size; for tests that refuse it.
+    LongFunction<MemorySegment> allocatorForTests;
 
     /// Creates the way to write through that starts at `kind`, or forces if it is `null`.
     ///
@@ -188,18 +192,22 @@ final class WriteThrough {
 
     /// Opens the segment at `path` to write through, the current way.
     ///
-    /// @throws IOException if it cannot be opened that way
+    /// @throws IOException if it cannot be opened that way, native memory for its handle included
     /// @throws IllegalStateException if no way is left
     Handle open(Path path) throws IOException {
         if (!enabled()) {
             throw new IllegalStateException("The log forces its groups");
         }
-        return switch (kind()) {
-            case UNBUFFERED -> UnbufferedHandle.open(path, this);
-            case DIRECT -> new ChannelHandle(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC,
-                    ExtendedOpenOption.DIRECT), this);
-            case DSYNC -> new ChannelHandle(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC), this);
-        };
+        try {
+            return switch (kind()) {
+                case UNBUFFERED -> UnbufferedHandle.open(path, this);
+                case DIRECT -> new ChannelHandle(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC,
+                        ExtendedOpenOption.DIRECT), this);
+                case DSYNC -> new ChannelHandle(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC), this);
+            };
+        } catch (OutOfMemoryError exception) {
+            throw new IOException("A log segment could not be opened to write through", exception);
+        }
     }
 
     /// {@return the buffer holding the first `length` bytes of `bytes`, at least `capacity` bytes long and aligned to
@@ -207,12 +215,20 @@ final class WriteThrough {
     ///
     /// It follows the size of the log's output, which grows while groups need more and goes back once they no longer
     /// do, so it is replaced only when that size changes.
-    private MemorySegment copy(byte[] bytes, int length, int capacity) {
+    ///
+    /// @throws IOException if native memory has no room for it, as under a limit of direct memory
+    private MemorySegment copy(byte[] bytes, int length, int capacity) throws IOException {
         var size = (long) (capacity + LogWriter.ALIGNMENT - 1) / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT;
         if (buffer == null || buffer.byteSize() != size) {
-            // Given back to the collector with the view, once a later size replaces both
-            buffer = Arena.ofAuto().allocate(size, LogWriter.ALIGNMENT);
-            bufferView = buffer.asByteBuffer();
+            try {
+                // Given back to the collector with the view, once a later size replaces both
+                var allocator = allocatorForTests;
+                var replaced = allocator != null ? allocator.apply(size) : Arena.ofAuto().allocate(size, LogWriter.ALIGNMENT);
+                bufferView = replaced.asByteBuffer();
+                buffer = replaced;
+            } catch (OutOfMemoryError exception) {
+                throw new IOException("The buffer of a write through could not be allocated", exception);
+            }
         }
         MemorySegment.copy(bytes, 0, buffer, ValueLayout.JAVA_BYTE, 0, length);
         return buffer;
@@ -226,7 +242,8 @@ final class WriteThrough {
         /// @param capacity the size of `bytes`, which the copy the write takes them from follows
         /// @throws java.nio.channels.ClosedByInterruptException if an interrupt closed the handle meanwhile, which
         ///         left some, all or none of the bytes written; only a channel's write is interruptible
-        /// @throws IOException if the write failed, which may have left some of the bytes written
+        /// @throws IOException if the write failed, which may have left some of the bytes written, or if the buffer the
+        ///                     bytes are copied into could not be allocated
         void write(byte[] bytes, int length, int capacity, long position) throws IOException;
 
         /// {@return whether the handle is open; an interrupt of a write closes a channel}
