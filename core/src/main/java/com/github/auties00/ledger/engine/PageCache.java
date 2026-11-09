@@ -28,10 +28,11 @@ import java.util.concurrent.atomic.AtomicLong;
 /// checkpoint wrote and no one read, for as long as it stayed open.
 ///
 /// The entries live in the parallel arrays of an open-addressing [Table], so a read finds a unit with one probe of
-/// primitive slots instead of walking a map's node, boxed key and entry, and allocates nothing. Reads take no lock:
-/// each validates the slot it read against the slot's array, as a sequence lock validates against its stamp, and a read
-/// that races a writer only misses, which costs a read of the file. Whatever changes the cache holds its lock, and the
-/// eviction of another cache's entries happens outside it, so no thread holds the locks of two caches.
+/// four bytes a slot instead of walking a map's node, boxed key and entry, and allocates nothing: a read that misses,
+/// each of a scan's past the limit, touches a line of an array that fits a core's cache, and one that hits reads the
+/// nonce and pages in the unit's own header, which it reads anyway. Reads take no lock, and a read that races a writer
+/// only misses, which costs a read of the file. Whatever changes the cache holds its lock, and the eviction of another
+/// cache's entries happens outside it, so no thread holds the locks of two caches.
 ///
 /// The clock passes the entries in the order they came, as a list through the slots rather than in the order of the
 /// slots: a unit a checkpoint wrote and no one read yet waits its turn behind the older ones, wherever its key hashes,
@@ -48,17 +49,17 @@ final class PageCache implements IdleTicker.Watched {
     /// The most slots of a table, as three longs per slot must fit an array. At half of them, 2^28 entries of at least a
     /// page each, a terabyte of heap, the cache evicts rather than grow.
     private static final int MAX_CAPACITY = 1 << 29;
-    /// The key of a slot no entry used since its table was built. Page 0 of the data file is a superblock, which the
-    /// cache never holds.
-    private static final long EMPTY = 0;
-    /// The key of a slot whose entry left, which a probe passes over; it would be a page of file `0xFFFFFFFF`.
-    private static final long TOMBSTONE = -1;
+    /// The tag of a slot no entry used since its table was built; an entry's tag is odd ([Table#tag(long)]).
+    private static final int EMPTY = 0;
+    /// The tag of a slot whose entry left, which a probe passes over.
+    private static final int TOMBSTONE = 2;
     /// The flag of an entry a read used since the clock last passed it.
     private static final byte REFERENCED = 1;
     /// The flag a tick of the idle ticker sets and a read clears: a tick that finds it set evicts the entry.
     private static final byte IDLE = 2;
     /// 2^64 over the golden ratio: multiplying by it spreads the consecutive pages of a file evenly over the slots.
     private static final long HASH = 0x9E3779B97F4A7C15L;
+    private static final VarHandle TAGS = MethodHandles.arrayElementVarHandle(int[].class);
     private static final VarHandle META = MethodHandles.arrayElementVarHandle(long[].class);
     private static final VarHandle UNITS = MethodHandles.arrayElementVarHandle(byte[][].class);
 
@@ -162,16 +163,12 @@ final class PageCache implements IdleTicker.Watched {
 
     /// Caches `unit`, the plaintext of the unit `ref` names, at `key`, replacing whatever the cache held there.
     ///
-    /// @param key a key of [#key(int, int)] or [#dataKey(int, int)], never that of page 0 of the data file
+    /// @param key a key of [#key(int, int)] or [#dataKey(int, int)]
     /// @param unit an array the cache never held under another key or nonce and never will, whose content no one writes
-    ///             again. A reader tells that a slot changed under it by the slot's array, so an array cached again under
-    ///             other metadata could pass as the unit of a nonce it does not hold
+    ///             again. A reader of a delta record's leaf tells that a slot changed under it by the slot's array, so an
+    ///             array cached again under other metadata could pass as the leaf of a nonce it does not hold
     /// @param referenced whether the unit counts as read, rather than written and maybe never read
-    /// @throws IllegalArgumentException if `key` is one the slots keep for themselves
     void put(long key, PageRef ref, byte[] unit, boolean referenced) {
-        if (key == EMPTY || key == TOMBSTONE) {
-            throw new IllegalArgumentException("The page cache holds no unit at key " + key);
-        }
         if (unit.length > budget.limit() / 4) {
             // A unit this large would evict most of the cache for one read; what the page held is out of date
             remove(key);
@@ -189,13 +186,13 @@ final class PageCache implements IdleTicker.Watched {
     /// Stores `unit` at `key`, in the slot that holds the key or a free one, as the newest entry of the clock.
     private void fill(long key, PageRef ref, byte[] unit, boolean referenced) {
         var table = this.table;
-        var slot = table.find(key);
+        var slot = table.locate(key);
         if (slot >= 0) {
             drain(table, slot);
         } else {
             table = roomFor(table);
             slot = table.vacancy(key);
-            if (table.meta[3 * slot] == TOMBSTONE) {
+            if (table.tags[slot] == TOMBSTONE) {
                 table.clock.tombstones--;
             }
         }
@@ -206,6 +203,7 @@ final class PageCache implements IdleTicker.Watched {
         META.setOpaque(table.meta, 3 * slot + 1, ref.nonceHigh());
         META.setOpaque(table.meta, 3 * slot + 2, identity(ref.nonceLow(), ref.pages()));
         META.setOpaque(table.meta, 3 * slot, key);
+        TAGS.setOpaque(table.tags, slot, Table.tag(key * HASH));
         table.flags[slot] = referenced ? REFERENCED : 0;
         UNITS.setRelease(table.units, slot, unit);
         table.append(slot);
@@ -244,6 +242,7 @@ final class PageCache implements IdleTicker.Watched {
         var table = new Table(capacity);
         for (var slot = old.clock.oldest; slot != -1; slot = old.next(slot)) {
             var at = table.vacancy(old.meta[3 * slot]);
+            table.tags[at] = old.tags[slot];
             table.meta[3 * at] = old.meta[3 * slot];
             table.meta[3 * at + 1] = old.meta[3 * slot + 1];
             table.meta[3 * at + 2] = old.meta[3 * slot + 2];
@@ -267,8 +266,8 @@ final class PageCache implements IdleTicker.Watched {
         var key = dataKey(ref.page(), ref.slot());
         synchronized (lock) {
             var table = this.table;
-            var slot = table.find(key);
-            if (slot >= 0 && key != EMPTY && table.meta[3 * slot + 1] == ref.nonceHigh()
+            var slot = table.locate(key);
+            if (slot >= 0 && table.meta[3 * slot + 1] == ref.nonceHigh()
                     && (int) (table.meta[3 * slot + 2] >>> 32) == ref.nonceLow()) {
                 drop(table, slot);
             }
@@ -279,8 +278,8 @@ final class PageCache implements IdleTicker.Watched {
     void remove(long key) {
         synchronized (lock) {
             var table = this.table;
-            var slot = table.find(key);
-            if (slot >= 0 && key != EMPTY) {
+            var slot = table.locate(key);
+            if (slot >= 0) {
                 drop(table, slot);
             }
         }
@@ -289,11 +288,10 @@ final class PageCache implements IdleTicker.Watched {
     /// Takes the entry of `slot` out of the table and the accounts, and lets go of its array.
     private void drop(Table table, int slot) {
         drain(table, slot);
-        // The null before the key, so a reader that saw the slot change finds its array gone. The slot never goes back
-        // to empty, or a probe would stop before the keys past it
+        // The slot never goes back to empty, or a probe would stop before the keys past it
         UNITS.setRelease(table.units, slot, null);
         VarHandle.storeStoreFence();
-        META.setOpaque(table.meta, 3 * slot, TOMBSTONE);
+        TAGS.setOpaque(table.tags, slot, TOMBSTONE);
         table.clock.tombstones++;
     }
 
@@ -445,13 +443,17 @@ final class PageCache implements IdleTicker.Watched {
 
     /// The slots of a cache, in arrays indexed by the hash of the key, probed linearly.
     ///
-    /// A slot starts [#EMPTY], which ends a probe, and in a published table never goes back to it: a slot whose entry
-    /// left holds [#TOMBSTONE] until a later entry reuses it, and a rebuild clears them by publishing a new table.
+    /// A slot's tag starts [#EMPTY], which ends a probe, and in a published table never goes back to it: a slot whose
+    /// entry left holds [#TOMBSTONE] until a later entry reuses it, and a rebuild clears them by publishing a new table.
     /// Readers read the fields of the table and the slots; the fields that change at every put are in a [Padded.Clock]
     /// away from them. Everything but [#find(long)] and [#unit(int, long, long, int, int)] runs under the lock of the
     /// cache, or on a table not published yet.
     private static final class Table {
-        // Three longs per slot: the key, the first 8 bytes of the nonce, and the last 4 with the unit's pages
+        // What a probe reads, per slot: an odd hash of the entry's key, or EMPTY or TOMBSTONE. It keeps a miss to these 4
+        // bytes a slot, as a map's table was: at three longs a slot a scan past the limit paid a cold line per unit
+        final int[] tags;
+        // Three longs per slot: the key, the first 8 bytes of the nonce, and the last 4 with the unit's pages; read by a
+        // reader only for the leaf of a delta record, whose header is its base's
         final long[] meta;
         // The plaintext of each slot, or null when the slot holds no entry or a writer is changing it
         final byte[][] units;
@@ -464,6 +466,7 @@ final class PageCache implements IdleTicker.Watched {
         final Padded.Clock clock;
 
         Table(int capacity) {
+            this.tags = new int[capacity];
             this.meta = new long[3 * capacity];
             this.units = new byte[capacity][];
             this.flags = new byte[capacity];
@@ -477,14 +480,43 @@ final class PageCache implements IdleTicker.Watched {
             return mask + 1;
         }
 
-        /// {@return the slot that holds `key`, or -1; a slot a writer is changing fails [#unit(int, long, long, int, int)]}
+        /// {@return the tag of the key whose product by [#HASH] is `hash`}
+        ///
+        /// Both halves, as the lower is the same for a page of each file. Two keys of one probe share a tag once in 2^31:
+        /// the later then misses until one of them leaves, as [#unit(int, long, long, int, int)] refuses the other's unit.
+        static int tag(long hash) {
+            return (int) (hash ^ hash >>> 32) | 1;
+        }
+
+        /// {@return the slot whose tag is that of `key`, or -1; one that holds another unit, or that a writer is changing,
+        /// fails [#unit(int, long, long, int, int)]}
         int find(long key) {
-            var meta = this.meta;
+            var tags = this.tags;
             var mask = this.mask;
-            var slot = (int) (key * HASH >>> shift);
+            var hash = key * HASH;
+            var tag = tag(hash);
+            var slot = (int) (hash >>> shift);
             for (var probes = 0; probes <= mask; probes++) {
-                var found = (long) META.getOpaque(meta, 3 * slot);
-                if (found == key) {
+                var found = (int) TAGS.getOpaque(tags, slot);
+                if (found == tag) {
+                    return slot;
+                }
+                if (found == EMPTY) {
+                    return -1;
+                }
+                slot = (slot + 1) & mask;
+            }
+            return -1;
+        }
+
+        /// {@return the slot that holds `key`, or -1, holding the lock of the cache or on a table not published yet}
+        int locate(long key) {
+            var hash = key * HASH;
+            var tag = tag(hash);
+            var slot = (int) (hash >>> shift);
+            for (var probes = 0; probes <= mask; probes++) {
+                var found = tags[slot];
+                if (found == tag && meta[3 * slot] == key) {
                     return slot;
                 }
                 if (found == EMPTY) {
@@ -497,28 +529,29 @@ final class PageCache implements IdleTicker.Watched {
 
         /// {@return the array of `slot` if it holds the unit the arguments name, or `null`}
         ///
-        /// The array is read first and again after the metadata: a writer takes it out before it changes the metadata
-        /// and puts the new one in after, and no array is ever cached under two identities, so an array read the same
-        /// both times held the metadata read between them.
+        /// A unit of a file says what it is: its header, which never changes, names its page, nonce and pages, and a nonce
+        /// is never used twice, so one that matches is the unit whatever the slot's race.
         ///
-        /// The leaf of a delta record has the header of its base leaf, so the metadata alone speaks for it; any other
-        /// unit also has its header compared, which leaves such a hit correct whatever the slot's race.
+        /// The leaf of a delta record has the header of its base leaf, so the slot's metadata speaks for it. Its array is
+        /// read first and again after the metadata: a writer takes it out before it changes the metadata and puts the new
+        /// one in after, and no array is ever cached under two identities, so an array read the same both times held the
+        /// metadata read between them.
         byte[] unit(int slot, long key, long nonceHigh, int nonceLow, int pages) {
             var units = this.units;
-            var meta = this.meta;
             var unit = (byte[]) UNITS.getAcquire(units, slot);
             if (unit == null) {
                 return null;
             }
+            if (key >>> 32 < RECORDS) {
+                return describes(unit, (int) key, nonceHigh, nonceLow, pages) ? unit : null;
+            }
+            var meta = this.meta;
             var at = 3 * slot;
             var same = (long) META.getOpaque(meta, at) == key
                     & (long) META.getOpaque(meta, at + 1) == nonceHigh
                     & (long) META.getOpaque(meta, at + 2) == identity(nonceLow, pages);
             VarHandle.loadLoadFence();
-            if (!same || (byte[]) UNITS.getOpaque(units, slot) != unit) {
-                return null;
-            }
-            return key >>> 32 >= RECORDS || describes(unit, (int) key, nonceHigh, nonceLow, pages) ? unit : null;
+            return same && (byte[]) UNITS.getOpaque(units, slot) == unit ? unit : null;
         }
 
         private static boolean describes(byte[] unit, int page, long nonceHigh, int nonceLow, int pages) {
@@ -532,7 +565,7 @@ final class PageCache implements IdleTicker.Watched {
         int vacancy(long key) {
             var slot = (int) (key * HASH >>> shift);
             while (true) {
-                var found = meta[3 * slot];
+                var found = tags[slot];
                 if (found == EMPTY || found == TOMBSTONE) {
                     return slot;
                 }
