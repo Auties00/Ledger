@@ -197,7 +197,7 @@ final class KeyspaceState {
     /// of it: no commit writes a key of a resident key space its loader has not passed.
     ///
     /// @throws IllegalStateException if the store closes meanwhile
-    /// @throws RuntimeException the failure of the load, which the next write retries
+    /// @throws com.github.auties00.ledger.LedgerCorruptedException if the load failed, which the next write retries
     void awaitLoaded(MemorySegment key) {
         var loader = loading;
         if (loader != null) {

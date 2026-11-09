@@ -6,6 +6,7 @@ import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
+import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.LedgerException;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.View;
@@ -669,8 +670,16 @@ class ResidentLoadTest {
             assertEquals(ENTRIES, ledger.size(FRAGILE));
             // A long scan reads on from the tree: the loader it would wait for has stopped
             assertEquals(ENTRIES, ledger.forEachEncoded(FRAGILE, KeyRange.all(), (_, _) -> true));
-            // A write of a key the loader did not reach retries the load, and throws its failure again
-            assertThrows(IllegalStateException.class, () -> ledger.commit(ledger.newBatch().put(FRAGILE, key(900), "x")));
+            // A write of a key the loader did not reach retries the load, and throws an exception of its own thread
+            var failed = assertThrows(LedgerCorruptedException.class, () -> ledger.commit(ledger.newBatch().put(FRAGILE, key(900), "x")));
+            assertEquals("refused " + value(700), assertInstanceOf(IllegalStateException.class, failed.getCause()).getMessage());
+            assertTrue(Arrays.stream(failed.getStackTrace()).anyMatch(frame -> frame.getMethodName().equals("commit")), "no frame of the commit");
+            assertNotNull(reports.poll(60, TimeUnit.SECONDS));
+            assertInstanceOf(IllegalStateException.class,
+                    assertThrows(LedgerCorruptedException.class, () -> ledger.update(transaction -> transaction.put(FRAGILE, key(900), "x"))).getCause());
+            assertNotNull(reports.poll(60, TimeUnit.SECONDS));
+            assertInstanceOf(IllegalStateException.class,
+                    assertThrows(LedgerCorruptedException.class, () -> ledger.update(transaction -> transaction.deleteRange(FRAGILE, KeyRange.all()))).getCause());
             assertNotNull(reports.poll(60, TimeUnit.SECONDS));
             assertEquals(Optional.of(value(900)), ledger.get(FRAGILE, key(900)));
             REFUSED.set(null);
