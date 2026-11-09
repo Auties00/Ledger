@@ -30,9 +30,9 @@ import java.util.stream.IntStream;
 /// on the one thread that writes a checkpoint, through a [Writer].
 final class PageFile implements AutoCloseable {
     static final String FILE = "ledger.data";
-    /// The channels reads take turns on, and the most threads [#readAll(List, byte)] reads on.
+    /// The channels reads take turns on, and the most threads [#readAll(List, byte, int)] reads on.
     static final int READ_CHANNELS = 8;
-    /// The most pages [#readAll(List, byte)] reads with one call.
+    /// The most pages [#readAll(List, byte, int)] reads with one call.
     static final int RUN_PAGES = 64;
     private static final int STAGED_LIMIT = 8 << 20;
     // The staged bytes a flush seals before it writes them, which bounds the sealed arrays it holds at once
@@ -213,20 +213,9 @@ final class PageFile implements AutoCloseable {
 
     /// {@return the plaintext of the units `refs` name, in their order, none of them cached}
     ///
-    /// Units in consecutive pages are read with one call, up to [#RUN_PAGES] pages, and the calls run on as many
-    /// virtual threads as there are read channels: reading many units one after another out of the OS cache made the
-    /// caller wait for each read in turn.
-    ///
-    /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
-    /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
-    /// @throws LedgerIoException if the file cannot be read
-    byte[][] readAll(List<PageRef> refs, byte kind) {
-        return readAll(refs, kind, READ_CHANNELS);
-    }
-
-    /// {@return the plaintext of the units `refs` name, in their order, none of them cached}
-    ///
-    /// It reads as [#readAll(List, byte)] does, on at most `threads` threads.
+    /// Units in consecutive pages are read with one call, up to [#RUN_PAGES] pages, and the calls run on at most
+    /// `threads` virtual threads, and no more than there are read channels: reading many units one after another out of
+    /// the OS cache made the caller wait for each read in turn.
     ///
     /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
     /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
