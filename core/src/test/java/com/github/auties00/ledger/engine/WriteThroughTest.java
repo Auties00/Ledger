@@ -549,6 +549,54 @@ class WriteThroughTest {
             survivesPowerLoss(disk, model);
         }
 
+        @ParameterizedTest(name = "{0}")
+        @EnumSource(value = WriteThrough.Kind.class, names = {"DIRECT", "DSYNC"})
+        @DisplayName("a first write through with no native memory for its buffer fails its way and every way below, not the log: the group is forced")
+        void bufferRefused(WriteThrough.Kind kind) throws Exception {
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, String>();
+            var way = new WriteThrough(kind, null);
+            way.allocatorForTests = _ -> {
+                throw new OutOfMemoryError("Cannot reserve direct buffer memory");
+            };
+            try (var ledger = open(disk.getPath("/store"), way)) {
+                var log = log(ledger);
+                commit(ledger, model, "first");
+                assertEquals(0, log.writtenThrough());
+                assertNull(log.writeThroughKind());
+                survivesPowerLoss(disk, model);
+                commit(ledger, model, "second");
+            }
+            survivesPowerLoss(disk, model);
+        }
+
+        @Test
+        @DisplayName("a later write through with no native memory for a larger buffer leaves the store to forces, and the log goes on")
+        void largerBufferRefused() throws Exception {
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, String>();
+            var way = new WriteThrough(WriteThrough.Kind.DSYNC, null);
+            try (var ledger = open(disk.getPath("/store"), way)) {
+                var log = log(ledger);
+                var commits = reachWriteThrough(ledger, model);
+                way.allocatorForTests = _ -> {
+                    throw new OutOfMemoryError("Cannot reserve direct buffer memory");
+                };
+                // A group larger than the smallest output, which its buffer follows, once one lands where it is written through
+                var value = "v".repeat(20_000);
+                for (var i = 0; i < 200 && log.writeThroughKind() != null; i++) {
+                    var key = "w" + commits++;
+                    ledger.commit(ledger.newBatch().put(NAMES, key, value)).awaitDurable();
+                    model.put(key, value);
+                }
+                assertNull(log.writeThroughKind());
+                var through = log.writtenThrough();
+                commit(ledger, model, "after");
+                assertEquals(through, log.writtenThrough());
+                survivesPowerLoss(disk, model);
+            }
+        }
+
         @Test
         @DisplayName("a way nothing refuses stays the way the log writes through in as segments roll")
         void keepsWay() throws Exception {
