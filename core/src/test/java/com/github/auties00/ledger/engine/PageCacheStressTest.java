@@ -244,11 +244,9 @@ class PageCacheStressTest {
 
     /// {@return a delta record whose key has the same first slot as `key` in a table of 64 slots}
     private static Target recordInSameSlot(long key) {
-        // The table's hash, multiplying by 2^64 over the golden ratio and keeping the top bits
-        var hash = 0x9E3779B97F4A7C15L;
         for (var page = HOT_PAGE + 1; ; page++) {
             var candidate = PageCache.dataKey(page, 0);
-            if (candidate * hash >>> 58 == key * hash >>> 58) {
+            if (PageCache.homeForTests(candidate, 64) == PageCache.homeForTests(key, 64)) {
                 return new Target(candidate, new PageRef(page, 1, 7, ~7, 0));
             }
         }

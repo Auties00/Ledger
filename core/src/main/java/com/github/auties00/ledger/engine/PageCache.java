@@ -34,6 +34,14 @@ import java.util.concurrent.atomic.AtomicLong;
 /// only misses, which costs a read of the file. Whatever changes the cache holds its lock, and the eviction of another
 /// cache's entries happens outside it, so no thread holds the locks of two caches.
 ///
+/// A key's probe starts at the slot of its page, offset by its file, so the units a scan reads, which checkpoints
+/// write in runs of consecutive pages, take consecutive slots and share the lines of the arrays and the pages of
+/// memory that hold them, as the buckets of a map keyed by the page did. A start taken from a hash of the key sent each
+/// of them to a line and a page of each array of its own, so a scan of 200,000 messages read a new line of each of the
+/// three arrays a hit reads for every one of its 50,000 units, and ran at 0.87 times the speed of the map on Ubuntu.
+/// The probe goes on by a stride of the key's hash, so the keys a run of pages pushes out of their slots, a page of
+/// another file or one a table's size apart, scatter over the table instead of walking the run.
+///
 /// The clock passes the entries in the order they came, as a list through the slots rather than in the order of the
 /// slots: a unit a checkpoint wrote and no one read yet waits its turn behind the older ones, wherever its key hashes,
 /// and is not the next to go because it landed just ahead of the hand.
@@ -57,8 +65,11 @@ final class PageCache implements IdleTicker.Watched {
     private static final byte REFERENCED = 1;
     /// The flag a tick of the idle ticker sets and a read clears: a tick that finds it set evicts the entry.
     private static final byte IDLE = 2;
-    /// 2^64 over the golden ratio: multiplying by it spreads the consecutive pages of a file evenly over the slots.
+    /// 2^64 over the golden ratio: the product of a key by it gives the key's tag and the stride of its probe.
     private static final long HASH = 0x9E3779B97F4A7C15L;
+    /// 2^32 over the golden ratio: how far apart, in slots, the pages of each file start, so that the same page of two
+    /// files rarely shares a slot.
+    private static final int FILE_OFFSET = 0x9E3779B9;
     private static final VarHandle TAGS = MethodHandles.arrayElementVarHandle(int[].class);
     private static final VarHandle META = MethodHandles.arrayElementVarHandle(long[].class);
     private static final VarHandle UNITS = MethodHandles.arrayElementVarHandle(byte[][].class);
@@ -371,6 +382,12 @@ final class PageCache implements IdleTicker.Watched {
         return table.capacity();
     }
 
+    /// {@return the first slot of the probe of `key` in a table of `capacity` slots, for tests that make two keys share
+    /// it}
+    static int homeForTests(long key, int capacity) {
+        return Table.home(key, capacity - 1);
+    }
+
     /// {@return the slots whose entry left and that no entry reused, for tests that bound them}
     int tombstonesForTests() {
         synchronized (lock) {
@@ -441,7 +458,8 @@ final class PageCache implements IdleTicker.Watched {
         return (long) nonceLow << 32 | (pages & 0xFFFF_FFFFL);
     }
 
-    /// The slots of a cache, in arrays indexed by the hash of the key, probed linearly.
+    /// The slots of a cache, in arrays a key's probe visits from the slot of its page ([#home(long, int)]) by a stride
+    /// of its hash ([#stride(long)]).
     ///
     /// A slot's tag starts [#EMPTY], which ends a probe, and in a published table never goes back to it: a slot whose
     /// entry left holds [#TOMBSTONE] until a later entry reuses it, and a rebuild clears them by publishing a new table.
@@ -488,6 +506,20 @@ final class PageCache implements IdleTicker.Watched {
             return (int) (hash ^ hash >>> 32) | 1;
         }
 
+        /// {@return the first slot of the probe of `key` in a table whose slots less one are `mask`: the slot of its
+        /// page, offset by its file}
+        static int home(long key, int mask) {
+            return (int) key + (int) (key >>> 32) * FILE_OFFSET & mask;
+        }
+
+        /// {@return the step of the probe of the key whose product by [#HASH] is `hash`}
+        ///
+        /// It is odd, so a probe passes every slot before any twice, and it is the key's own, so the keys of a run of
+        /// slots other keys took first go on to slots all over the table rather than one after another along the run.
+        int stride(long hash) {
+            return (int) (hash >>> shift) | 1;
+        }
+
         /// {@return the slot whose tag is that of `key`, or -1; one that holds another unit, or that a writer is changing,
         /// fails [#unit(int, long, long, int, int)]}
         int find(long key) {
@@ -495,7 +527,8 @@ final class PageCache implements IdleTicker.Watched {
             var mask = this.mask;
             var hash = key * HASH;
             var tag = tag(hash);
-            var slot = (int) (hash >>> shift);
+            var slot = home(key, mask);
+            var stride = stride(hash);
             for (var probes = 0; probes <= mask; probes++) {
                 var found = (int) TAGS.getOpaque(tags, slot);
                 if (found == tag) {
@@ -504,7 +537,7 @@ final class PageCache implements IdleTicker.Watched {
                 if (found == EMPTY) {
                     return -1;
                 }
-                slot = (slot + 1) & mask;
+                slot = (slot + stride) & mask;
             }
             return -1;
         }
@@ -513,7 +546,8 @@ final class PageCache implements IdleTicker.Watched {
         int locate(long key) {
             var hash = key * HASH;
             var tag = tag(hash);
-            var slot = (int) (hash >>> shift);
+            var slot = home(key, mask);
+            var stride = stride(hash);
             for (var probes = 0; probes <= mask; probes++) {
                 var found = tags[slot];
                 if (found == tag && meta[3 * slot] == key) {
@@ -522,7 +556,7 @@ final class PageCache implements IdleTicker.Watched {
                 if (found == EMPTY) {
                     return -1;
                 }
-                slot = (slot + 1) & mask;
+                slot = (slot + stride) & mask;
             }
             return -1;
         }
@@ -566,13 +600,14 @@ final class PageCache implements IdleTicker.Watched {
 
         /// {@return the first slot on the probe of `key`, which the table does not hold, that an entry may take}
         int vacancy(long key) {
-            var slot = (int) (key * HASH >>> shift);
+            var slot = home(key, mask);
+            var stride = stride(key * HASH);
             while (true) {
                 var found = tags[slot];
                 if (found == EMPTY || found == TOMBSTONE) {
                     return slot;
                 }
-                slot = (slot + 1) & mask;
+                slot = (slot + stride) & mask;
             }
         }
 
