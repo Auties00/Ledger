@@ -256,6 +256,40 @@ class PageCacheTest {
     }
 
     @Test
+    @DisplayName("starts the probes of consecutive pages of a file at consecutive slots, and finds every unit of runs of pages that share their slots across files and table sizes")
+    void runsOfPages() {
+        for (var file : new int[]{PageCache.DATA, PageCache.BLOBS}) {
+            for (var page = 0; page < 1_000; page++) {
+                assertEquals((PageCache.homeForTests(PageCache.key(file, page), 1 << 14) + 1) & ((1 << 14) - 1),
+                        PageCache.homeForTests(PageCache.key(file, page + 1), 1 << 14));
+            }
+        }
+        var cache = PageCache.isolated(LIMIT);
+        var keys = new ArrayList<long[]>();
+        // Runs a table's size apart for any size the table takes, so most keys find their first slot taken
+        for (var lap = 0; lap < 4; lap++) {
+            for (var page = 0; page < 1_024; page++) {
+                var at = lap * (1 << 16) + page;
+                keys.add(new long[]{PageCache.key(PageCache.DATA, at), at});
+                keys.add(new long[]{PageCache.key(PageCache.BLOBS, at), at});
+                keys.add(new long[]{PageCache.dataKey(at, lap), at});
+            }
+        }
+        var units = new ArrayList<byte[]>();
+        for (var key : keys) {
+            var ref = new PageRef((int) key[1], 1, key[0], (int) key[1]);
+            var unit = shortUnit(ref);
+            units.add(unit);
+            cache.put(key[0], ref, unit, true);
+        }
+        for (var i = 0; i < keys.size(); i++) {
+            var key = keys.get(i);
+            assertSame(units.get(i), cache.get(key[0], new PageRef((int) key[1], 1, key[0], (int) key[1])), "key " + Long.toHexString(key[0]));
+        }
+        assertEquals(keys.size(), cache.clockLengthForTests());
+    }
+
+    @Test
     @DisplayName("replaces a key in its slot, with the old nonce gone and the bytes exact")
     void replacement() {
         var budget = new PageCache.Budget();
