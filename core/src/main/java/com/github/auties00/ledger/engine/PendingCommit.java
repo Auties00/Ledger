@@ -1,5 +1,6 @@
 package com.github.auties00.ledger.engine;
 
+import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.locks.LockSupport;
@@ -65,6 +66,10 @@ final class PendingCommit {
     final Chain[] chains;
     /// The key space of each write.
     final KeyspaceState[] states;
+    /// The key of each write, sliced from the batch once while the commit prepared, which the sequencer and the
+    /// committing thread read; cleared by the committing thread once the commit is published, before the batch gives
+    /// the array the keys are slices of back to the pool.
+    MemorySegment[] keys;
     /// The decoded value of each put to a resident key space, or `null`.
     final Object[] decoded;
     /// The unit of the file of large values of each put, or `null`.
@@ -97,12 +102,13 @@ final class PendingCommit {
     /// The threads of later commits parked until this one applies, or `null`.
     private volatile Waiter waiters;
 
-    PendingCommit(ArrayWriteBatch writes, Chain[] chains, KeyspaceState[] states, Object[] decoded, PageRef[] units,
-                  LiveLedger.Hints hints) {
+    PendingCommit(ArrayWriteBatch writes, Chain[] chains, KeyspaceState[] states, MemorySegment[] keys, Object[] decoded,
+                  PageRef[] units, LiveLedger.Hints hints) {
         this.writes = writes;
         this.owner = Thread.currentThread();
         this.chains = chains;
         this.states = states;
+        this.keys = keys;
         this.decoded = decoded;
         this.units = units;
         this.hints = hints;
@@ -110,7 +116,7 @@ final class PendingCommit {
 
     /// Creates the commit the pipeline starts from: the last one published when the store opened, at `sequence`.
     PendingCommit(long sequence) {
-        this(null, null, null, null, null, null);
+        this(null, null, null, null, null, null, null);
         this.sequence = sequence;
         this.state = DONE;
     }

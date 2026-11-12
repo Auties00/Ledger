@@ -125,6 +125,19 @@ final class KeySlab {
         return stripe();
     }
 
+    /// {@return the bytes claimed in the chunks the stripes hold now, not counting those of chunks replaced or keys
+    /// given arrays of their own; for tests}
+    int usedForTests() {
+        var used = 0;
+        for (var stripe = 0; stripe < STRIPES; stripe++) {
+            var chunk = stripes.get(stripe);
+            if (chunk != null) {
+                used += (int) USED.getVolatile(chunk);
+            }
+        }
+        return used;
+    }
+
     // Thread ids are consecutive: a multiplicative hash spreads them over the stripes
     private static int stripe() {
         return (int) ((Thread.currentThread().threadId() * 0x9E3779B97F4A7C15L) >>> 40) & (STRIPES - 1);
