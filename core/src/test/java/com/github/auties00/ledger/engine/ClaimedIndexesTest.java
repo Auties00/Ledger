@@ -26,14 +26,29 @@ class ClaimedIndexesTest {
         var size = 10_000;
         var done = new AtomicIntegerArray(size);
         var threads = ConcurrentHashMap.<Thread>newKeySet();
+        var caller = Thread.currentThread();
+        // A helper that starts at once could take every index before the caller takes its first, so the helpers hold
+        // their first index until the caller has one: the caller claims after it starts them, whatever they do
+        var callerClaimed = new CountDownLatch(1);
         ClaimedIndexes.run("test-claimed", size, 7, index -> {
             done.incrementAndGet(index);
             threads.add(Thread.currentThread());
+            if (Thread.currentThread() == caller) {
+                callerClaimed.countDown();
+            } else {
+                try {
+                    if (!callerClaimed.await(60, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("the caller claimed no index");
+                    }
+                } catch (InterruptedException exception) {
+                    throw new RuntimeException(exception);
+                }
+            }
         });
         for (var i = 0; i < size; i++) {
             assertEquals(1, done.get(i), "index " + i);
         }
-        assertTrue(threads.contains(Thread.currentThread()) || threads.size() > 1);
+        assertTrue(threads.contains(caller), "the caller did no index");
     }
 
     @Test
