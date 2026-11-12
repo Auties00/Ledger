@@ -264,8 +264,8 @@ final class ValueSlab {
     /// @param length the bytes of the value
     /// @param spans the high half of the element at `slot` receives where the value starts in the chunk
     /// @param slot the element of `spans`
-    /// @return the read-only view of the chunk that holds the value, or `null` if the slab declined it
-    MemorySegment place(byte[] source, int offset, int length, long[] spans, int slot) {
+    /// @return the chunk that holds the value, or `null` if the slab declined it
+    Chunk place(byte[] source, int offset, int length, long[] spans, int slot) {
         if (length > capacity) {
             return null;
         }
@@ -285,7 +285,7 @@ final class ValueSlab {
             if (USED.compareAndSet(chunk, start, start + length)) {
                 System.arraycopy(source, offset, chunk.array, start, length);
                 spans[slot] = (long) start << 32 | (int) spans[slot];
-                return chunk.view;
+                return chunk;
             }
             // Another thread claimed from the chunk meanwhile: the loop reads its new end
         }
@@ -632,7 +632,7 @@ final class ValueSlab {
 
     /// An array values are copied into, and the read-only view of it versions hold; its counter, which the threads of
     /// a stripe write at every value, is on lines of its own.
-    private static final class Chunk extends ChunkPadding {
+    static final class Chunk extends ChunkPadding {
         private final byte[] array;
         private final MemorySegment view;
         // The bytes claimed at the last tick that saw the chunk, or -1; the ticks' alone
@@ -642,6 +642,18 @@ final class ValueSlab {
             this.array = new byte[capacity];
             this.view = MemorySegment.ofArray(array).asReadOnly();
             this.usedAtTick = -1;
+        }
+
+        /// {@return the read-only view of the chunk, which versions of its values slice}
+        MemorySegment view() {
+            return view;
+        }
+
+        /// {@return the array behind [#view()]: each value's bytes are written once, by the copy that claimed them,
+        /// before the version of the value is published, and the array never holds other bytes there, nor goes to a
+        /// pool}
+        byte[] array() {
+            return array;
         }
     }
 

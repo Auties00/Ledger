@@ -90,10 +90,12 @@ final class LiveTransaction implements Transaction {
         if (size < 0 || size > ValueCodec.MAX_LENGTH) {
             throw new IllegalArgumentException("Values are at most " + ValueCodec.MAX_LENGTH + " bytes: " + size);
         }
-        var encodedValue = MemorySegment.ofArray(new byte[Math.toIntExact(size)]);
-        keyspace.values().encode(value, encodedValue);
+        applier.checkFrame(encodedKey.byteSize() + size);
+        var encodedValue = new byte[Math.toIntExact(size)];
+        var view = MemorySegment.ofArray(encodedValue);
+        keyspace.values().encode(value, view);
         state.awaitLoaded(encodedKey);
-        applier.put(state, encodedKey, encodedValue.asReadOnly(), state.resident ? value : null);
+        applier.put(state, encodedKey, view.asReadOnly(), encodedValue, state.resident ? value : null);
         return this;
     }
 
@@ -107,10 +109,12 @@ final class LiveTransaction implements Transaction {
         if (value.byteSize() > ValueCodec.MAX_LENGTH) {
             throw new IllegalArgumentException("Values are at most " + ValueCodec.MAX_LENGTH + " bytes: " + value.byteSize());
         }
+        applier.checkFrame(keyLength + value.byteSize());
         var ownKey = Segments.copy(key);
-        var ownValue = Segments.copy(value);
+        var ownValue = Segments.toBytes(value);
+        var view = MemorySegment.ofArray(ownValue).asReadOnly();
         state.awaitLoaded(ownKey);
-        applier.put(state, ownKey, ownValue, state.resident ? keyspace.values().decode(ownValue) : null);
+        applier.put(state, ownKey, view, ownValue, state.resident ? keyspace.values().decode(view) : null);
         return this;
     }
 
@@ -118,6 +122,7 @@ final class LiveTransaction implements Transaction {
     public <K> Transaction delete(Keyspace<K, ?> keyspace, K key) {
         var state = state(keyspace);
         var encodedKey = Segments.encodeKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
+        applier.checkFrame(encodedKey.byteSize());
         state.awaitLoaded(encodedKey);
         applier.delete(state, encodedKey);
         return this;
@@ -129,6 +134,7 @@ final class LiveTransaction implements Transaction {
         Objects.requireNonNull(range, "range");
         var from = range.from().map(key -> Segments.encodeKey(keyspace.keys(), key)).orElse(null);
         var to = range.to().map(key -> Segments.encodeKey(keyspace.keys(), key)).orElse(null);
+        applier.checkFrame(FrameBody.boundBytes(from) + FrameBody.boundBytes(to));
         state.awaitLoaded(null);
         applier.deleteRange(state, from, to);
         return this;
