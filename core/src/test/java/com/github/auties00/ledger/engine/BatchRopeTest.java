@@ -51,13 +51,20 @@ class BatchRopeTest {
     private static final Keyspace<byte[], byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.bytes(), ValueCodec.bytes());
     private static final Keyspace<byte[], byte[]> SESSIONS = Keyspace.resident("sessions", KeyCodec.bytes(), ValueCodec.bytes());
     private static final Keyspace<byte[], String> NAMES = Keyspace.resident("names", KeyCodec.bytes(), ValueCodec.utf8());
+    // Resident byte arrays through a codec of their own, which the batch keeps on its arrays as it does any resident
+    // value but those of the codec of byte arrays
+    private static final Keyspace<byte[], byte[]> COPIES = Keyspace.resident("copies", KeyCodec.bytes(), ValueCodec.<byte[]>of(
+            value -> value.length,
+            (value, target) -> MemorySegment.copy(value, 0, target, ValueLayout.JAVA_BYTE, 0, value.length),
+            source -> source.toArray(ValueLayout.JAVA_BYTE)));
 
     private static Ledger.Options options(Path directory) {
         return Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(MESSAGES).keyspace(SESSIONS).keyspace(NAMES);
     }
 
     private static ArrayWriteBatch batch(HeapPool pool) {
-        return new ArrayWriteBatch(new Object(), pool, Map.of(MESSAGES.name(), MESSAGES, SESSIONS.name(), SESSIONS, NAMES.name(), NAMES));
+        return new ArrayWriteBatch(new Object(), pool, Map.of(MESSAGES.name(), MESSAGES, SESSIONS.name(), SESSIONS, NAMES.name(), NAMES,
+                COPIES.name(), COPIES));
     }
 
     private static HeapPool pool() {
@@ -91,7 +98,7 @@ class BatchRopeTest {
             var batch = batch(pool());
             // Each write takes 4 + 1,000 bytes, so the 262nd crosses
             for (var i = 0; i < 300; i++) {
-                batch.put(i % 3 == 0 ? SESSIONS : MESSAGES, key(i), value(i, 1_000));
+                batch.put(i % 3 == 0 ? COPIES : MESSAGES, key(i), value(i, 1_000));
                 assertEquals(i >= 261, batch.chunksForTests() > 0, "write " + i);
                 assertEquals((i + 1) * 1_004L, batch.encodedBytes());
             }
@@ -186,7 +193,7 @@ class BatchRopeTest {
         void packs() {
             var batch = batch(pool());
             batch.put(MESSAGES, new byte[]{1}, value(1, 3_000))
-                    .put(SESSIONS, new byte[]{2}, value(2, 9_000))
+                    .put(COPIES, new byte[]{2}, value(2, 9_000))
                     .put(MESSAGES, new byte[]{3}, value(3, 2_000))
                     .delete(MESSAGES, new byte[]{4})
                     .deleteRange(MESSAGES, KeyRange.between(new byte[]{5}, new byte[]{6}));
@@ -209,8 +216,8 @@ class BatchRopeTest {
                 assertArrayEquals(new byte[]{5}, bytes(batch.key(4)));
                 assertArrayEquals(new byte[]{6}, bytes(batch.value(4)));
             }
-            batch.put(SESSIONS, new byte[]{7}, new byte[CHUNK / 2 - 1]);
-            batch.put(SESSIONS, new byte[]{8}, new byte[CHUNK / 2 - 1]);
+            batch.put(COPIES, new byte[]{7}, new byte[CHUNK / 2 - 1]);
+            batch.put(COPIES, new byte[]{8}, new byte[CHUNK / 2 - 1]);
             assertTrue(batch.chunksForTests() > 0);
             assertArrayEquals(new byte[]{3}, bytes(batch.key(2)));
             assertArrayEquals(value(3, 2_000), bytes(batch.value(2)));
