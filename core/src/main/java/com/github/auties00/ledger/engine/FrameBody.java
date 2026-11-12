@@ -129,12 +129,6 @@ final class FrameBody {
         this(capacity, referable, null);
     }
 
-    /// Makes a body that refers to no value, with room for `capacity` bytes before it grows, which keeps its bytes past
-    /// [#CHUNK_BYTES] in chunks from `pool`.
-    FrameBody(int capacity, HeapPool pool) {
-        this(capacity, NOT_REFERABLE, pool);
-    }
-
     /// Makes a body with room for `capacity` bytes of its own before it grows, which refers to the values of at least
     /// `referable` bytes a put offers on an array and keeps its own bytes past [#CHUNK_BYTES] in chunks from `pool`.
     ///

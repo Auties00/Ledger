@@ -118,7 +118,7 @@ class FrameChunksTest {
     @DisplayName("holds the bytes a body of one array holds, the chunk boundary anywhere in a write")
     void boundary(Write write, int before, int chunk) {
         var pool = new HeapPool(1L << 30, false);
-        var chunked = new FrameBody(1_024, pool);
+        var chunked = new FrameBody(1_024, FrameBody.NOT_REFERABLE, pool);
         var plain = new FrameBody(1_024);
         for (var body : List.of(chunked, plain)) {
             fillTo(body, chunk * CHUNK - before);
@@ -136,7 +136,7 @@ class FrameChunksTest {
         for (var target : new int[]{300 << 10, 600 << 10, 1_536 << 10}) {
             for (var capacity : new int[]{16, 256, CHUNK / 2, CHUNK, target}) {
                 var pool = new HeapPool(1L << 30, false);
-                var chunked = new FrameBody(capacity, pool);
+                var chunked = new FrameBody(capacity, FrameBody.NOT_REFERABLE, pool);
                 var plain = new FrameBody(16);
                 while (plain.size() < target) {
                     var write = WRITES.get(random.nextInt(WRITES.size()));
@@ -209,7 +209,7 @@ class FrameChunksTest {
     @DisplayName("a body started on a chunk that ends small is one array, which goes back as a run takes it")
     void overestimated() {
         var pool = new HeapPool(1L << 30, false);
-        var body = new FrameBody(4 * CHUNK, pool);
+        var body = new FrameBody(4 * CHUNK, FrameBody.NOT_REFERABLE, pool);
         body.put(1, bytes(10, 1), bytes(1_000, 2));
         assertEquals(1, body.chunkCount());
         assertEquals(CHUNK, body.array().length);
@@ -230,7 +230,7 @@ class FrameChunksTest {
     @DisplayName("a chunked body serves no single array, and a released one no bytes at all")
     void accessors() {
         var pool = new HeapPool(1L << 30, false);
-        var body = new FrameBody(256, pool);
+        var body = new FrameBody(256, FrameBody.NOT_REFERABLE, pool);
         fillTo(body, CHUNK + 100);
         assertEquals(2, body.chunkCount());
         assertThrows(IllegalStateException.class, body::array);
@@ -248,7 +248,7 @@ class FrameChunksTest {
     @DisplayName("gives its chunks back once, however often it is released or discarded")
     void releasesOnce() {
         var pool = new HeapPool(1L << 30, false);
-        var body = new FrameBody(CHUNK, pool);
+        var body = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
         fillTo(body, 3 * CHUNK + 5);
         var arrays = arrays(body);
         assertEquals(4, arrays.size());
@@ -276,14 +276,14 @@ class FrameChunksTest {
     @DisplayName("a body taken back before the log took it gives its chunks back at once")
     void discarded() {
         var pool = new HeapPool(1L << 30, false);
-        var body = new FrameBody(256, pool);
+        var body = new FrameBody(256, FrameBody.NOT_REFERABLE, pool);
         fillTo(body, 2 * CHUNK + 1);
         var arrays = arrays(body);
         body.discard();
         body.discard();
         assertFreeOnce(pool, arrays);
         // A second body takes the same chunks back from the pool, and they hold its bytes alone
-        var next = new FrameBody(CHUNK, pool);
+        var next = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
         fillTo(next, 2 * CHUNK + 1);
         var plain = new FrameBody(16);
         fillTo(plain, 2 * CHUNK + 1);

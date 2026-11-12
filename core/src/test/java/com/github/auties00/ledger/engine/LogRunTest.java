@@ -991,7 +991,7 @@ class LogRunTest {
         /// {@return a body of at least `size` bytes on chunks of `pool`, of writes of random sizes so its chunk
         /// boundaries fall inside them}
         private static FrameBody chunked(HeapPool pool, int size, Random random) {
-            var body = new FrameBody(random.nextBoolean() ? 256 : size, pool);
+            var body = new FrameBody(random.nextBoolean() ? 256 : size, FrameBody.NOT_REFERABLE, pool);
             while (body.size() < size) {
                 var key = new byte[1 + random.nextInt(60)];
                 random.nextBytes(key);
@@ -1053,7 +1053,7 @@ class LogRunTest {
                 released.addAll(add(log, batch, pool, 600 << 10, random));
                 released.addAll(add(log, batch, pool, 1_536 << 10, random));
                 // A body started on a chunk that ends small, which a run takes
-                var small = new FrameBody(FrameBody.CHUNK_BYTES, pool);
+                var small = new FrameBody(FrameBody.CHUNK_BYTES, FrameBody.NOT_REFERABLE, pool);
                 small.put(1, MemorySegment.ofArray(new byte[]{1, 2, 3}), MemorySegment.ofArray(new byte[1_000]));
                 log.bodies.add(small.toBytes());
                 released.add(small.array());
