@@ -6,6 +6,7 @@ import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.LedgerCorruptedException;
+import com.github.auties00.ledger.LedgerIoException;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.testkit.ChangeInterceptor;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
@@ -984,6 +985,12 @@ class LogRunTest {
         ///
         /// @return the arrays of the body, by identity
         private static List<byte[]> add(Log log, LogWriter.Batch batch, HeapPool pool, int size, Random random) {
+            return add(log, batch, chunked(pool, size, random));
+        }
+
+        /// {@return a body of at least `size` bytes on chunks of `pool`, of writes of random sizes so its chunk
+        /// boundaries fall inside them}
+        private static FrameBody chunked(HeapPool pool, int size, Random random) {
             var body = new FrameBody(random.nextBoolean() ? 256 : size, pool);
             while (body.size() < size) {
                 var key = new byte[1 + random.nextInt(60)];
@@ -999,6 +1006,13 @@ class LogRunTest {
                     }
                 }
             }
+            return body;
+        }
+
+        /// Adds `body` to `batch` as the next commit.
+        ///
+        /// @return the arrays of the body, by identity
+        private static List<byte[]> add(Log log, LogWriter.Batch batch, FrameBody body) {
             log.bodies.add(body.toBytes());
             var arrays = new ArrayList<byte[]>();
             for (var i = 0; i < body.chunkCount(); i++) {
@@ -1071,6 +1085,54 @@ class LogRunTest {
             }
             assertEquals(9, large, "the frames of bodies on more than one chunk");
             log.assertReplayed(log.replay(0), 1, log.last());
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("refuses a group once stopped and leaves its bodies on chunks to their writers, whose discard gives each chunk back once")
+        void refused(boolean encrypted) throws Exception {
+            var disk = CrashFileSystem.create();
+            var log = new Log(disk.getPath("/log"), encrypted, 64L << 20);
+            var pool = new HeapPool(1L << 30, false);
+            var random = new Random(encrypted ? 11 : 12);
+            try {
+                log.group(5, 100);
+                // The next group's force fails, which stops the writer
+                disk.stopAtForce(0);
+                try {
+                    log.group(5, 100);
+                } catch (LedgerIoException _) {
+                    // The flush that failed may report it here or leave it to the next append
+                }
+                assertThrows(LedgerIoException.class, log.writer::checkHealthy);
+                // A publisher pass as the store's: bodies on chunks among small ones, refused by the stopped writer
+                var batch = new LogWriter.Batch();
+                var bodies = new ArrayList<FrameBody>();
+                var chunks = new ArrayList<byte[]>();
+                for (var size : new int[]{300 << 10, 600 << 10, 1_536 << 10}) {
+                    log.add(batch, 100);
+                    var body = chunked(pool, size, random);
+                    bodies.add(body);
+                    for (var array : add(log, batch, body)) {
+                        if (array.length == FrameBody.CHUNK_BYTES) {
+                            chunks.add(array);
+                        }
+                    }
+                }
+                assertTrue(chunks.size() >= 9, "the chunks of the bodies");
+                assertThrows(LedgerIoException.class, () -> log.writer.appendAll(batch));
+                assertEquals(List.of(), pool.freeForTests(FrameBody.CHUNK_BYTES), "the chunks given back before the discards");
+                // The rollback of each commit discards its body, as the store's does when the log refuses its pass
+                for (var body : bodies) {
+                    body.discard();
+                    body.discard();
+                }
+                assertReleased(pool, chunks);
+                assertEquals(chunks.size(), pool.freeForTests(FrameBody.CHUNK_BYTES).size(), "the chunks given back");
+            } finally {
+                // The close of a stopped writer reports its failure
+                assertThrows(LedgerIoException.class, log::close);
+            }
         }
 
         @ParameterizedTest(name = "encrypted: {0}")
