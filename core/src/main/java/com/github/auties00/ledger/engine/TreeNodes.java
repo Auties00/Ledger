@@ -209,7 +209,13 @@ final class TreeNodes {
     }
 
     static PageRef blobRef(byte[] unit, int entry) {
-        return PageRef.read(unit, valueField(unit, entry) + 5);
+        return PageRef.read(unit, blobRefOffset(unit, entry));
+    }
+
+    /// {@return where the reference of the blob or unit of leaf entry `entry` starts in `unit`, as
+    /// [PageRef#read(byte\[\], int)] reads it}
+    static int blobRefOffset(byte[] unit, int entry) {
+        return valueField(unit, entry) + 5;
     }
 
     /// {@return the index of the child of the branch `unit` whose subtree would hold `key`}
@@ -260,6 +266,13 @@ final class TreeNodes {
             }
         }
         return low - 1;
+    }
+
+    /// {@return a negative number, zero or a positive number as the first key of child `index` of the branch `unit`
+    /// sorts before, with or after `key`}
+    static int compareChildKey(byte[] unit, int index, byte[] key) {
+        var entry = entry(unit, index);
+        return compare(unit, entry + BRANCH_FIXED, Bytes.u16(unit, entry + BRANCH_FIXED - 2), key);
     }
 
     static PageRef childRef(byte[] unit, int index) {

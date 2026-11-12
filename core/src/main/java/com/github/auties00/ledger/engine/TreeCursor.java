@@ -13,9 +13,26 @@ import java.util.Arrays;
 /// evicts before any other. A long scan reads each unit once, so caching what it reads would only evict the units
 /// other reads use: the PostgreSQL buffer manager holds a large sequential scan to a small ring for the same reason. A
 /// cache with room evicts nothing to take them, and keeps a key space small enough to fit for the next scan.
+///
+/// While the caller handles an entry, the processor fetches the memory the next ones need: the cursor touches it ahead
+/// of its reads. Entering a leaf it reads the key length and value form of its next [#AHEAD] entries, and at each entry
+/// those of the entry [#AHEAD] further, so the misses of their lines overlap instead of each waiting behind the caller's
+/// work on the entry before, as entries laid out in ascending order defeat the hardware's prefetch going down. It looks
+/// the next entry's blob up in the page cache, and on entering a leaf the leaf it reads after it, the next child of the
+/// same parent, whose first entries it touches too. The lookups do not count as reads
+/// ([PageCache#peek(long, long, int, int)]) and keep nothing, so the cache's clock, its idle ticker and the admission of
+/// the units the cursor reads see only what it reads, as they would without the touches. A touch issues no I/O, changes
+/// no state of the cursor and never throws: an entry the cursor never reaches is never reported damaged.
 final class TreeCursor {
     /// The leaves and blobs a cursor adds to the page cache, enough for the pages of a chat a reader scrolls through.
     static final int ADMITTED = 64;
+    /// How many entries past the current one the cursor touches: a leaf of a chat's messages holds about nine.
+    static final int AHEAD = 8;
+    /// A value no touch folds to, every touch folding bytes below 2^8; a field the JIT cannot fold, so that comparing
+    /// what a touch read with it keeps the touch's loads in compiled code, with nothing waiting for them.
+    private static int untouched = 1 << 16;
+    /// Written only if a touch folds to [#untouched], which none does.
+    private static int matched;
 
     private final PageFile pages;
     // The bounds in arrays, which the nodes compare with their keys word by word
@@ -74,6 +91,7 @@ final class TreeCursor {
         } else {
             index = from == null ? 0 : TreeNodes.lowerBound(unit, from);
         }
+        touchLeaf();
     }
 
     private void push(byte[] unit, int child) {
@@ -111,6 +129,8 @@ final class TreeCursor {
             exhausted = true;
             return false;
         }
+        touchEntries(leaf, index + (descending ? -AHEAD : AHEAD), 1);
+        touchNextBlob();
         return true;
     }
 
@@ -128,6 +148,7 @@ final class TreeCursor {
                 }
                 leaf = node;
                 index = descending ? TreeNodes.count(node) - 1 : 0;
+                touchLeaf();
                 return true;
             }
             depth--;
@@ -186,5 +207,96 @@ final class TreeCursor {
         }
         admitted++;
         return true;
+    }
+
+    /// Touches the leaf the cursor entered from its current index on, and the leaf it reads after it.
+    private void touchLeaf() {
+        touchEntries(leaf, index, AHEAD);
+        touchSibling();
+    }
+
+    /// Reads the key length and the value form of up to `entries` entries of the leaf `unit`, from index `from` on in
+    /// the cursor's order, those of them it holds.
+    ///
+    /// Every offset it reads at is checked against the array, so a damaged leaf reads nothing past it.
+    private void touchEntries(byte[] unit, int from, int entries) {
+        var length = unit.length;
+        if (length < PageFormat.HEADER + 2) {
+            return;
+        }
+        var count = TreeNodes.count(unit);
+        var step = descending ? -1 : 1;
+        var folded = 0;
+        for (var i = from; entries > 0 && i >= 0 && i < count; i += step, entries--) {
+            var at = PageFormat.HEADER + 2 + 2 * i;
+            if (at + 2 > length) {
+                break;
+            }
+            var offset = Bytes.u16(unit, at);
+            if (offset + 2 > length) {
+                continue;
+            }
+            var field = offset + 2 + Bytes.u16(unit, offset);
+            if (field < length) {
+                folded ^= unit[field] & 0xFF;
+            }
+        }
+        sink(folded);
+    }
+
+    /// Looks the blob of the entry after the current one in the cursor's order up in the page cache, if its value has
+    /// one.
+    private void touchNextBlob() {
+        var unit = leaf;
+        var next = index + (descending ? -1 : 1);
+        try {
+            if (next < 0 || next >= TreeNodes.count(unit)) {
+                return;
+            }
+            var at = TreeNodes.entry(unit, next);
+            if (!TreeNodes.isInline(unit, at)) {
+                var blob = pages.peekBlob(unit, at);
+                if (blob != null) {
+                    sink(blob[PageFormat.LENGTH] & 0xFF);
+                }
+            }
+        } catch (IndexOutOfBoundsException _) {
+            // A damaged entry, which a read that reaches it reports
+        }
+    }
+
+    /// Looks the leaf the cursor reads after its current one up in the page cache, if it is the next child of the same
+    /// parent and may hold keys of the range, and touches its first entries.
+    private void touchSibling() {
+        if (depth == 0) {
+            return;
+        }
+        var parent = path[depth - 1];
+        var current = indexes[depth - 1];
+        var sibling = current + (descending ? -1 : 1);
+        try {
+            if (sibling < 0 || sibling >= TreeNodes.count(parent)) {
+                return;
+            }
+            // Going down, every key of the sibling sorts before the current child's first key; going up, none before
+            // the sibling's
+            if (descending ? from != null && TreeNodes.compareChildKey(parent, current, from) <= 0
+                    : to != null && TreeNodes.compareChildKey(parent, sibling, to) >= 0) {
+                return;
+            }
+            var unit = pages.peekNode(parent, sibling);
+            if (unit != null && TreeNodes.isLeaf(unit)) {
+                touchEntries(unit, descending ? TreeNodes.count(unit) - 1 : 0, AHEAD);
+            }
+        } catch (IndexOutOfBoundsException _) {
+            // A damaged branch, which a read that reaches the child reports
+        }
+    }
+
+    /// Keeps the loads that produced `folded` in compiled code, through a branch on it that is never taken.
+    private static void sink(int folded) {
+        if (folded == untouched) {
+            matched++;
+        }
     }
 }

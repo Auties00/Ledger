@@ -157,10 +157,18 @@ final class PageCache implements IdleTicker.Watched {
     /// {@return the plaintext of the unit `ref` of the data file names, or of the leaf its delta record makes, or
     /// `null` if the cache does not hold it, without counting as a read of the entry}
     byte[] peek(PageRef ref) {
-        var key = dataKey(ref.page(), ref.slot());
+        return peek(dataKey(ref.page(), ref.slot()), ref.nonceHigh(), ref.nonceLow(), ref.pages());
+    }
+
+    /// {@return the plaintext of the unit of `pages` pages sealed under the nonce `nonceHigh` and `nonceLow`, at `key`,
+    /// or `null` if the cache does not hold it, without counting as a read of the entry}
+    ///
+    /// It takes no lock, allocates nothing and writes nothing; a put, removal or rebuild it races makes it return `null`
+    /// at worst.
+    byte[] peek(long key, long nonceHigh, int nonceLow, int pages) {
         var table = this.table;
         var slot = table.find(key);
-        return slot < 0 ? null : table.unit(slot, key, ref.nonceHigh(), ref.nonceLow(), ref.pages());
+        return slot < 0 ? null : table.unit(slot, key, nonceHigh, nonceLow, pages);
     }
 
     /// Caches `unit`, the plaintext of the unit `ref` of the data file names, replacing whatever the cache held for its

@@ -319,6 +319,33 @@ final class PageFile implements AutoCloseable {
         return hit != null && kindMatches(hit[PageFormat.KIND], NODE) ? hit : null;
     }
 
+    /// {@return the node child `index` of the branch `parent` names if the cache holds it, or `null`, without counting
+    /// as a read of the entry ([PageCache#peek(long, long, int, int)])}
+    byte[] peekNode(byte[] parent, int index) {
+        var entry = TreeNodes.entry(parent, index);
+        var key = PageCache.dataKey(TreeNodes.childPage(parent, entry), TreeNodes.childSlot(parent, entry));
+        var hit = cache.peek(key, TreeNodes.childNonceHigh(parent, entry), TreeNodes.childNonceLow(parent, entry), 1);
+        return hit != null && kindMatches(hit[PageFormat.KIND], NODE) ? hit : null;
+    }
+
+    /// {@return the unit that holds the value of leaf entry `entry` of `leaf`, a blob of this file or a unit of
+    /// [#blobs()], if the cache holds it, or `null`, without counting as a read of the entry
+    /// ([PageCache#peek(long, long, int, int)])}
+    ///
+    /// The entry's value must not be inline. It reads the reference from the leaf as it is, costing no [PageRef].
+    byte[] peekBlob(byte[] leaf, int entry) {
+        var at = TreeNodes.blobRefOffset(leaf, entry);
+        var page = Bytes.i32(leaf, at);
+        var unitPages = Bytes.i32(leaf, at + 4);
+        var nonceHigh = Bytes.i64(leaf, at + 8);
+        var nonceLow = Bytes.i32(leaf, at + 16);
+        if (TreeNodes.isExternal(leaf, entry)) {
+            return cache.peek(PageCache.key(PageCache.BLOBS, page), nonceHigh, nonceLow, unitPages);
+        }
+        var hit = cache.peek(PageCache.dataKey(page, -1), nonceHigh, nonceLow, unitPages);
+        return hit != null && hit[PageFormat.KIND] == PageFormat.VALUE ? hit : null;
+    }
+
     private static boolean kindMatches(byte actual, byte expected) {
         return expected == NODE ? actual == PageFormat.LEAF || actual == PageFormat.BRANCH : actual == expected;
     }
