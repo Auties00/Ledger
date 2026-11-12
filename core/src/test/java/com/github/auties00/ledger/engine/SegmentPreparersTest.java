@@ -25,10 +25,12 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The threads that prepare the log's segments: a thread that finished a preparation takes the next, from any store
@@ -271,6 +273,50 @@ class SegmentPreparersTest {
                     assertEquals(model, contents(ledger));
                 }
                 survivesPowerLoss(disk, model);
+            }
+        }
+
+        @Test
+        @DisplayName("under group commit from several threads rolls over into segments their threads prepared ahead")
+        void preparedAhead() throws Exception {
+            var disk = CrashFileSystem.create();
+            var model = new ConcurrentHashMap<String, String>();
+            long rollovers;
+            long unprepared;
+            try (var ledger = open(disk.getPath("/store"))) {
+                var log = log(ledger);
+                awaitTrue(log::nextSettled, "the preparation of the open never settled");
+                var last = log.currentSegment() + 40;
+                var failure = new AtomicReference<Throwable>();
+                var committers = new ArrayList<Thread>();
+                for (var t = 0; t < 4; t++) {
+                    var thread = t;
+                    committers.add(Thread.ofPlatform().start(() -> {
+                        try {
+                            for (var i = 0; log.currentSegment() < last && failure.get() == null; i++) {
+                                var key = "t" + thread + "-" + i;
+                                var value = "v".repeat(500) + key;
+                                ledger.commit(ledger.newBatch().put(NAMES, key, value)).awaitDurable();
+                                model.put(key, value);
+                            }
+                        } catch (Throwable exception) {
+                            failure.compareAndSet(null, exception);
+                        }
+                    }));
+                }
+                for (var committer : committers) {
+                    committer.join();
+                }
+                assertNull(failure.get());
+                rollovers = log.rollovers();
+                unprepared = log.unpreparedRollovers();
+            }
+            assertTrue(rollovers >= 40, rollovers + " rollovers");
+            // A preparation takes microseconds on this file system and a segment fifteen groups, so a rollover that
+            // finds its segment unprepared means the start of its preparation came late
+            assertTrue(unprepared * 4 <= rollovers, unprepared + " of " + rollovers + " rollovers prepared their segment");
+            try (var ledger = open(disk.getPath("/store"))) {
+                assertEquals(new TreeMap<>(model), contents(ledger));
             }
         }
 
