@@ -568,7 +568,7 @@ final class LogWriter {
     ///
     /// @throws LedgerIoException if the writer has stopped
     void append(byte type, long sequence, FrameBody body) {
-        append(type, sequence, body, 0, 0);
+        append(type, sequence, body, 0, 0, false);
     }
 
     /// Queues a frame as [#append(byte, long, FrameBody)] does, for a commit of `writes` writes that wrote `unitBytes`
@@ -578,9 +578,10 @@ final class LogWriter {
     /// starts a checkpoint, as if their values were in the frame: memory holds them until a checkpoint takes them. The
     /// writes count toward [#appendedHeap()].
     ///
+    /// @param sharesChunk whether the commit's values are on one chunk of the [ValueSlab], as [#heapOf] takes it
     /// @return the frames queued since the writer opened, the new one included
     /// @throws LedgerIoException if the writer has stopped
-    long append(byte type, long sequence, FrameBody body, long unitBytes, int writes) {
+    long append(byte type, long sequence, FrameBody body, long unitBytes, int writes, boolean sharesChunk) {
         checkHealthy();
         var length = body.size();
         long frames;
@@ -596,7 +597,7 @@ final class LogWriter {
             lastQueued = sequence;
             frames = ++appended;
             appendedBytes += 13 + length + unitBytes;
-            appendedHeap += heapOf(length, unitBytes, writes);
+            appendedHeap += heapOf(length, unitBytes, writes, sharesChunk);
             queuedUnits |= unitBytes > 0;
         } finally {
             queueLock.unlock();
@@ -607,8 +608,8 @@ final class LogWriter {
         return frames;
     }
 
-    /// Queues the frames of `batch`, in its order, as [#append(byte, long, FrameBody, long, int)] queues each, and empties
-    /// it: one hold of the queue lock for a whole pass of the store's publisher.
+    /// Queues the frames of `batch`, in its order, as [#append(byte, long, FrameBody, long, int, boolean)] queues each, and
+    /// empties it: one hold of the queue lock for a whole pass of the store's publisher.
     ///
     /// The batch waits on a full queue as one frame of its total size would. Either every frame is queued or, if the
     /// writer has stopped, none is.
@@ -1344,12 +1345,12 @@ final class LogWriter {
         }
 
         /// Adds a frame, which the writer owns once queued, for a commit of `writes` writes that wrote `unitBytes` of
-        /// units.
-        void add(byte type, long sequence, FrameBody body, long unitBytes, int writes) {
+        /// units, whose values are on one chunk of the [ValueSlab] if `sharesChunk`.
+        void add(byte type, long sequence, FrameBody body, long unitBytes, int writes, boolean sharesChunk) {
             frames.add(new Queued(type, sequence, body));
             bodyBytes += body.size();
             appendedBytes += 13 + body.size() + unitBytes;
-            appendedHeap += heapOf(body.size(), unitBytes, writes);
+            appendedHeap += heapOf(body.size(), unitBytes, writes, sharesChunk);
             units |= unitBytes > 0;
         }
 
@@ -1551,8 +1552,12 @@ final class LogWriter {
 
     /// {@return the heap a commit of `writes` writes, whose frame body is `bodyBytes` and whose units are `unitBytes`,
     /// holds until a checkpoint takes it, as [#appendedHeap()] estimates it}
-    static long heapOf(long bodyBytes, long unitBytes, int writes) {
-        return 13 + bodyBytes + unitBytes + (long) writes * WRITE_HEAP + (writes > 0 ? COMMIT_HEAP : 0);
+    ///
+    /// @param sharesChunk whether the commit's values are on one chunk of the [ValueSlab], whose view the slab shares
+    ///                    among the commits on the chunk and whose whole the slab's own estimate counts: such a commit
+    ///                    allocates none of what [#COMMIT_HEAP] counts
+    static long heapOf(long bodyBytes, long unitBytes, int writes, boolean sharesChunk) {
+        return 13 + bodyBytes + unitBytes + (long) writes * WRITE_HEAP + (writes > 0 && !sharesChunk ? COMMIT_HEAP : 0);
     }
 
     /// {@return the offset in the current segment where the frames of the last group end, before their padding}

@@ -409,7 +409,7 @@ public final class LiveLedger implements Ledger {
             unitBytes += unit.length;
         }
         replayedBytes += 13 + body.length + unitBytes;
-        replayedHeap += LogWriter.heapOf(body.length, unitBytes, applier.touched.size());
+        replayedHeap += LogWriter.heapOf(body.length, unitBytes, applier.touched.size(), false);
         return true;
     }
 
@@ -683,7 +683,7 @@ public final class LiveLedger implements Ledger {
             ensureOpen();
             checkHealthy();
             applier = new Applier(sequenced.next, log != null, writes.size(), log == null ? 0 : FrameBody.capacityFor(writes, units),
-                    pages != null && log != null);
+                    pages != null && log != null, writes.sharesChunk());
             if (outcome != null) {
                 outcome[0] = applier;
             }
@@ -959,7 +959,7 @@ public final class LiveLedger implements Ledger {
     private void apply(PendingCommit pending) {
         var writes = pending.writes;
         var applier = new Applier(pending.sequence, log != null, pending.writes.size(),
-                log == null ? 0 : FrameBody.capacityFor(pending.writes, pending.units));
+                log == null ? 0 : FrameBody.capacityFor(pending.writes, pending.units), false, writes.sharesChunk());
         try {
             var size = writes.size();
             for (var i = 0; i < size; i++) {
@@ -1098,7 +1098,7 @@ public final class LiveLedger implements Ledger {
         do {
             commit = commit.next;
             if (commit.failure != null) {
-                batch.add(FrameBody.COMMIT, commit.sequence, new FrameBody(), 0, 0);
+                batch.add(FrameBody.COMMIT, commit.sequence, new FrameBody(), 0, 0, false);
             } else {
                 commit.applier.queueFrame(batch);
             }
@@ -2019,6 +2019,51 @@ public final class LiveLedger implements Ledger {
         return sweepPending || sweepWanted.held();
     }
 
+    /// Lets go of the last commit the arrival list and the sequence hold on to, putting an empty one of the same
+    /// sequence in its place, unless a thread holds or wants a role or a commit is under way; at a tick of the
+    /// [IdleTicker], so no commit pays for it.
+    ///
+    /// The next commit given a sequence takes the last one's place, and the next one that arrives while another
+    /// sequences takes the arrival list's: until then, in a store gone quiet or one whose commits stopped meeting,
+    /// the last one kept its writes as applied, and with them the chunk of the [ValueSlab] its value is on, after a
+    /// checkpoint dropped every chain of it. The commit is not changed, so its committing thread may still be pruning
+    /// its chains.
+    void forgetLastCommits() {
+        if (closed || sequencingWanted.held() || !sequencing.tryAcquire()) {
+            return;
+        }
+        try {
+            if (!publishingWanted.held() && publishing.tryAcquire()) {
+                try {
+                    var last = sequenced.last;
+                    // Every commit given a sequence is published, and the last is not an empty one already
+                    if (last == published.last && last.writes != null) {
+                        var start = new PendingCommit(last.sequence);
+                        sequenced.last = start;
+                        LAST_PUBLISHED.setRelease(published, start);
+                    }
+                } finally {
+                    publishing.release();
+                }
+            }
+            // No commit swapped itself in after the last one the sequencer took: one that swaps itself in after the
+            // compare-and-set links itself to the new start, which the cursor moves to before the role goes
+            var tail = arrivalTail.commit;
+            if (tail.writes != null && arrivalCursor.commit == tail && tail.arrival == null) {
+                var start = new PendingCommit(0);
+                if (arrivalTail.compareAndSet(tail, start)) {
+                    arrivalCursor.setLazily(start);
+                }
+            }
+        } finally {
+            sequencing.release();
+        }
+        // As after an exclusive operation: the commits that arrived or applied while this thread held a role may have
+        // parked for it
+        drainArrivals();
+        publishApplied();
+    }
+
     /// Runs the sweep through a whole pass over the store, or until it has nothing left to do, on the caller's thread.
     ///
     /// A commit sweeps a few chains, so what a snapshot kept through a checkpoint stayed in memory long after it closed:
@@ -2224,25 +2269,24 @@ public final class LiveLedger implements Ledger {
         private List<Version.External> replaced;
         // Whether a range removal of a paged key space with a tree may count after the commit ([PendingRanges])
         private final boolean deferredRanges;
+        // Whether the commit's values are on one chunk of the slab, as the log's estimate of its heap takes it
+        private final boolean sharesChunk;
         // The range removals this commit counts after it is published, or null before any
         private ArrayList<PendingRanges.Removal> deferred;
         // Whether the publication of the commit listed them with their key spaces
         private boolean deferredListed;
 
         Applier(long sequence, boolean journaled) {
-            this(sequence, journaled, 4, 256);
-        }
-
-        /// Creates the applier of a commit of about `writes` writes, whose frame body takes about `frameBytes`.
-        Applier(long sequence, boolean journaled, int writes, int frameBytes) {
-            this(sequence, journaled, writes, frameBytes, false);
+            this(sequence, journaled, 4, 256, false, false);
         }
 
         /// Creates the applier of a commit of about `writes` writes, whose frame body takes about `frameBytes`.
         ///
         /// @param deferredRanges whether its range removals of paged key spaces with a tree may count after the
         ///                       commit: only for a batch that runs alone in a store in a directory
-        Applier(long sequence, boolean journaled, int writes, int frameBytes, boolean deferredRanges) {
+        /// @param sharesChunk whether the batch put the values the store keeps on one chunk of the [ValueSlab], as the
+        ///                    log's estimate of the commit's heap takes it
+        Applier(long sequence, boolean journaled, int writes, int frameBytes, boolean deferredRanges, boolean sharesChunk) {
             this.sequence = sequence;
             // Most commits write one or two key spaces
             this.deltaStates = new KeyspaceState[2];
@@ -2250,6 +2294,7 @@ public final class LiveLedger implements Ledger {
             this.touched = new ArrayList<>(writes);
             this.frame = journaled ? new FrameBody(frameBytes) : null;
             this.deferredRanges = deferredRanges;
+            this.sharesChunk = sharesChunk;
         }
 
         /// {@return whether the commit's frame is queued in the log}
@@ -2580,7 +2625,7 @@ public final class LiveLedger implements Ledger {
             // Queued before it is visible, so the log holds every commit a reader can see, in order
             if (frame != null) {
                 try {
-                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, touched.size());
+                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, touched.size(), sharesChunk);
                     logged = true;
                 } catch (RuntimeException exception) {
                     rollback();
@@ -2593,7 +2638,7 @@ public final class LiveLedger implements Ledger {
         /// Adds the commit's frame, if it is journaled, to `batch`.
         void queueFrame(LogWriter.Batch batch) {
             if (frame != null) {
-                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, touched.size());
+                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, touched.size(), sharesChunk);
             }
         }
 
