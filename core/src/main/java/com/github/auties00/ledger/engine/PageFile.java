@@ -344,10 +344,17 @@ final class PageFile implements AutoCloseable {
         }
     }
 
-    /// Gives back to the store's pool `sealed`, an array [#readSealed(int, int, Lease)] returned, once the caller opened
-    /// the units in it.
-    void release(byte[] sealed) {
-        pool.release(sealed);
+    /// {@return an array of the store's pool of at least `length` bytes, for [#openInto(byte\[\], int, PageRef, byte, byte\[\])]}
+    ///
+    /// The caller gives it back with [#release(byte\[\])] once it no longer reads it, and never puts it in the cache.
+    byte[] acquire(int length) {
+        return pool.acquire(length);
+    }
+
+    /// Gives back to the store's pool `array`, an array [#readSealed(int, int, Lease)] or [#acquire(int)] returned,
+    /// which the caller no longer reads.
+    void release(byte[] array) {
+        pool.release(array);
     }
 
     /// {@return a read channel of the pool, which the caller reads on until it gives it back, or `null` if every one is

@@ -21,10 +21,10 @@ import java.util.function.Consumer;
 /// by leaf, so a key space of one group is still opened on every thread, and the taker installs a leaf while the next
 /// ones are opened. No group is claimed that starts more than [#lead] leaves past the taker, the workers hold at most
 /// [#SEALED_PAGES] pages read in groups not all opened, which bounds the pages held sealed, and no thread opens a leaf
-/// more than [#OPENED_AHEAD] past the taker, which bounds the plaintext: a leaf is opened into an array the stream uses again for a later leaf once the taker took it, and lets go of as it closes, so a load
-/// keeps no memory past its end, in the store's pool or elsewhere, and allocates no more plaintext than it holds at once.
-/// A leaf the cache holds when it is read is taken from the cache, and its array, which others may still read, is never
-/// written again.
+/// more than [#OPENED_AHEAD] past the taker, which bounds the plaintext: a leaf is opened into an array of the store's
+/// pool that the taker gives back once it took the leaf, and the pool, which keeps the arrays that come back, keeps no
+/// more of a load's than the load held at once. A leaf the cache holds when it is read is taken from the cache, and its
+/// array, which others may still read, never goes to the pool.
 ///
 /// The stream waits for the reads and opens that were claimed, never for its threads, and no thread parks while it
 /// holds one: a thread takes its read channel without waiting ([PageFile#tryLease()]) before it claims a group or the
@@ -61,8 +61,9 @@ final class LeafStream implements AutoCloseable {
     private static final int WAKE_EVERY = 16;
     /// The most leaves past the taker a thread of the stream opens, other than the one the taker waits for: opened as soon
     /// as they were read, the leaves of [#lead] read ahead were held as plaintext at once, most of them long before the
-    /// taker reached them. Four wake-ups' worth: the taker installs a leaf in about the time a thread opens one, and the
-    /// workers resume at every [#WAKE_EVERY] leaves it takes.
+    /// taker reached them, and the store's pool kept every one of those arrays once they came back. Four wake-ups'
+    /// worth: the taker installs a leaf in about the time a thread opens one, and the workers resume at every
+    /// [#WAKE_EVERY] leaves it takes.
     static final int OPENED_AHEAD = 4 * WAKE_EVERY;
     /// The most pages the workers hold read in groups not yet all opened. The pages of a group wait in arrays of the
     /// store's pool, which the pool keeps once they come back, so the pages held at once are what a load leaves in the
@@ -89,8 +90,8 @@ final class LeafStream implements AutoCloseable {
         private final MemorySegment first;
         // The plaintext, written before the volatile store of state that publishes it; dropped once taken
         private byte[] unit;
-        // Whether unit is an array of the stream's, which it uses again once the leaf is taken
-        private boolean owned;
+        // Whether unit is an array of the pool, which the stream gives back
+        private boolean pooled;
         // Why the leaf could not be read, written before the volatile store of state
         private Throwable failure;
         // While sealed: the pages the leaf is opened from, read only by the thread that claimed its open
@@ -197,10 +198,8 @@ final class LeafStream implements AutoCloseable {
     private final PageFile pages;
     // The thread that takes the leaves and closes the stream
     private final Thread taker;
-    // Receives each array of the stream's before it is used again or let go of; for tests, or null
+    // Receives each pooled array before it goes back to the pool; for tests, or null
     private final Consumer<byte[]> released;
-    // The arrays of one page of the leaves taken, which the next opens write over; let go of as the stream closes
-    private final ConcurrentLinkedQueue<byte[]> spare;
     // The leaves known so far, in key order; replaced by a longer copy as the branches after the path are read
     private volatile Slot[] plan;
     // Set once plan holds every leaf, after its last copy
@@ -246,7 +245,7 @@ final class LeafStream implements AutoCloseable {
     ///
     /// The caller is the taker, which must close the stream before the tree's pages may be freed.
     ///
-    /// @param released receives each array of the stream's before it is used again or let go of, for tests; or `null`
+    /// @param released receives each pooled array before it goes back to the pool, for tests; or `null`
     /// @throws com.github.auties00.ledger.LedgerCorruptedException if a node on the path fails authentication
     /// @throws com.github.auties00.ledger.LedgerIoException if the file cannot be read
     LeafStream(PageFile pages, TreeRoot root, MemorySegment from, int workers, boolean wide, Consumer<byte[]> released) {
@@ -254,7 +253,6 @@ final class LeafStream implements AutoCloseable {
         this.pages = pages;
         this.taker = Thread.currentThread();
         this.released = released;
-        this.spare = new ConcurrentLinkedQueue<>();
         this.plan = slots(path.leaves());
         this.rest = path.rest();
         this.unplanned = unplanned(rest, 0);
@@ -429,10 +427,10 @@ final class LeafStream implements AutoCloseable {
         }
     }
 
-    /// Records that the taker is done with `slot`, the leaf [#next()] returned last, and keeps its array for a later
-    /// leaf if it is one of the stream's.
+    /// Records that the taker is done with `slot`, the leaf [#next()] returned last, and gives its array back to the
+    /// pool if it is one of the pool's.
     void taken(Slot slot) {
-        drop(slot, true);
+        drop(slot);
         var next = taken + 1;
         taken = next;
         if (next % WAKE_EVERY == 0 && idle.get() > 0) {
@@ -440,24 +438,20 @@ final class LeafStream implements AutoCloseable {
         }
     }
 
-    /// Lets go of the plaintext of `slot`, keeping its array for a later leaf if `reuse` and it is one of the stream's
-    /// of one page.
-    private void drop(Slot slot, boolean reuse) {
+    private void drop(Slot slot) {
         var unit = slot.unit;
         slot.unit = null;
-        if (slot.owned && unit != null) {
+        if (slot.pooled && unit != null) {
             if (released != null) {
                 released.accept(unit);
             }
-            if (reuse && unit.length == PageFormat.SIZE) {
-                spare.offer(unit);
-            }
+            pages.release(unit);
         }
     }
 
     /// Stops the claims, waits until every claimed read and open and the read of the branches end, whatever the
-    /// interrupt status of the taker, which it keeps, and lets go of every plaintext array of the stream; by the taker,
-    /// once.
+    /// interrupt status of the taker, which it keeps, and gives back to the pool the arrays of the leaves not taken; by
+    /// the taker, once.
     ///
     /// It counts the opens no thread claimed finished without opening them, so it waits for no thread that would.
     @Override
@@ -477,10 +471,9 @@ final class LeafStream implements AutoCloseable {
         var slots = plan;
         for (var i = taken; i < frontier; i++) {
             if (slots[i].state == READY) {
-                drop(slots[i], false);
+                drop(slots[i]);
             }
         }
-        spare.clear();
         if (interrupted) {
             Thread.currentThread().interrupt();
         }
@@ -812,18 +805,12 @@ final class LeafStream implements AutoCloseable {
         slot.sealed = null;
         try {
             if (claimed.get() != CLOSED) {
-                var length = slot.ref.pages() * PageFormat.SIZE;
-                var unit = length == PageFormat.SIZE ? spare.poll() : null;
-                if (unit == null) {
-                    unit = new byte[length];
-                }
+                var unit = pages.acquire(slot.ref.pages() * PageFormat.SIZE);
                 try {
                     pages.openInto(sealed.array, (slot.ref.page() - sealed.first) * PageFormat.SIZE, slot.ref, PageFile.NODE, unit);
                 } catch (Throwable failure) {
-                    // What the open left in it is no unit's, and the next open writes over it
-                    if (length == PageFormat.SIZE) {
-                        spare.offer(unit);
-                    }
+                    // What the open left in it is no unit's, and the next use of the array writes over it
+                    pages.release(unit);
                     throw failure;
                 }
                 slot.openedBy = Thread.currentThread();
@@ -868,9 +855,9 @@ final class LeafStream implements AutoCloseable {
     }
 
     /// Publishes the plaintext of `slot`, and wakes the taker if it waits for it.
-    private void publish(Slot slot, byte[] unit, boolean owned) {
+    private void publish(Slot slot, byte[] unit, boolean pooled) {
         slot.unit = unit;
-        slot.owned = owned;
+        slot.pooled = pooled;
         slot.state = READY;
         wakeTakerFor(slot);
     }

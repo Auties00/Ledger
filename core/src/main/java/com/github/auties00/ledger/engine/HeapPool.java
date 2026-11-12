@@ -170,4 +170,10 @@ public final class HeapPool {
     long pooledBytesForTests() {
         return pooledBytes.get();
     }
+
+    /// {@return the bytes of the free arrays of the size [#acquire(int)] returns for `capacity` bytes; for tests}
+    long pooledBytesForTests(int capacity) {
+        var shift = Math.max(MIN_SHIFT, 32 - Integer.numberOfLeadingZeros(Math.max(1, capacity) - 1));
+        return pooledBySize[shift - MIN_SHIFT].get();
+    }
 }
