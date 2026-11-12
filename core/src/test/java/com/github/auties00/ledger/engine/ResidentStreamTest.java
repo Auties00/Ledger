@@ -279,7 +279,7 @@ class ResidentStreamTest {
     }
 
     @Test
-    @DisplayName("a load on every read channel holds no more plaintext arrays than the leaves it opens ahead of the loader, gives none to the store's pool, and gives back every group of pages it held sealed")
+    @DisplayName("a load on every read channel holds no more plaintext arrays than the leaves it opens ahead of the loader, gives none to the store's pool, and gives back every page it held sealed")
     void plaintextBoundedAndKeptFromThePool(@TempDir Path directory) throws Exception {
         var model = populate(directory, SESSIONS);
         try (var executor = Executors.newVirtualThreadPerTaskExecutor(); var ledger = open(directory, false)) {
@@ -312,8 +312,8 @@ class ResidentStreamTest {
             handed.forEach(pool::release);
             // A worker that took a group as the stream closed gives it back once its claim fails
             var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
-            while (loader.freeGroupsForTests() != LeafStream.SEALED_GROUPS) {
-                assertTrue(System.nanoTime() < deadline, loader.freeGroupsForTests() + " groups free after the load");
+            while (loader.freePagesForTests() != LeafStream.SEALED_PAGES) {
+                assertTrue(System.nanoTime() < deadline, loader.freePagesForTests() + " pages free after the load");
                 Thread.sleep(1);
             }
             model.put(key(ENTRIES - 1), "last");

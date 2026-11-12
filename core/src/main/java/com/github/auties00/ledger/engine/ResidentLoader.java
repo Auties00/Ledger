@@ -83,8 +83,8 @@ final class ResidentLoader {
     volatile Consumer<byte[]> releaseHookForTests;
     // The workers of the last attempt; for tests
     private volatile int workers;
-    // The groups the workers of the last attempt's stream may claim; for tests
-    private volatile AtomicInteger freeGroups;
+    // The pages the groups of the workers of the last attempt's stream do not hold; for tests
+    private volatile AtomicInteger freePages;
 
     /// Creates the loader of `state`, whose tree is in `pages`.
     ///
@@ -321,7 +321,7 @@ final class ResidentLoader {
         var leaves = new LeafStream(pages, root, from, wide ? LeafStream.MAX_WORKERS : THREADS - 1, wide, releaseHookForTests);
         try {
             workers = leaves.workers();
-            freeGroups = leaves.freeGroupsForTests();
+            freePages = leaves.freePagesForTests();
             var installed = 0;
             var signalled = 0;
             while (!stopping) {
@@ -396,10 +396,11 @@ final class ResidentLoader {
         }
     }
 
-    /// {@return the groups of [LeafStream#SEALED_GROUPS] the workers of the last attempt's stream may claim, for tests}
-    int freeGroupsForTests() {
-        var free = freeGroups;
-        return free == null ? LeafStream.SEALED_GROUPS : free.get();
+    /// {@return the pages of [LeafStream#SEALED_PAGES] the groups of the workers of the last attempt's stream do not
+    /// hold, for tests}
+    int freePagesForTests() {
+        var free = freePages;
+        return free == null ? LeafStream.SEALED_PAGES : free.get();
     }
 
     /// {@return the workers the last attempt read on, for tests}
