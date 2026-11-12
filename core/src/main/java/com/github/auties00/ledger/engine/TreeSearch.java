@@ -161,13 +161,27 @@ final class TreeSearch {
         var ref = TreeNodes.blobRef(unit, entry);
         var blob = TreeNodes.isExternal(unit, entry) ? pages.blobs().read(ref, cached, referenced)
                 : pages.read(ref, PageFormat.VALUE, cached, referenced);
+        checkBlob(unit, entry, ref, blob);
+        return blob;
+    }
+
+    /// {@return the read-only value of leaf entry `entry` of `unit`, which has a blob in the data file, from `blob`,
+    /// the plaintext of the unit `ref` names}
+    ///
+    /// @throws LedgerCorruptedException if the leaf records a value longer than the blob's content
+    static MemorySegment blobValue(byte[] unit, int entry, PageRef ref, byte[] blob) {
+        checkBlob(unit, entry, ref, blob);
+        return MemorySegment.ofArray(blob).asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry)).asReadOnly();
+    }
+
+    // Throws if leaf entry `entry` of `unit` records a value longer than the content of `blob`, its blob
+    private static void checkBlob(byte[] unit, int entry, PageRef ref, byte[] blob) {
         var length = TreeNodes.blobLength(unit, entry);
         // The cache may hold the blob's header and content alone, which a longer value would read past
         if (length > Bytes.i32(blob, PageFormat.LENGTH)) {
             throw new LedgerCorruptedException("A leaf records a value of " + length + " bytes in a unit holding "
                     + Bytes.i32(blob, PageFormat.LENGTH) + ", at page " + ref.page(), null);
         }
-        return blob;
     }
 
     /// {@return the entries of the tree under `root` from `from`, included, to `to`, excluded, either `null` for no
