@@ -132,6 +132,9 @@ final class KeyspaceState {
     private final AtomicInteger leftCount;
     // Whether so many chains left the map at once, unlisted, that the next repair relinks the map
     private volatile boolean relinkWanted;
+    /// Whether the store is closing, after which a commit no longer waits for the creator of a chain to list it; set
+    /// by the store before its close waits for the commits under way.
+    volatile boolean closing;
 
     private static final VarHandle UNORDERED;
 
@@ -228,7 +231,7 @@ final class KeyspaceState {
             return;
         }
         if (lazy) {
-            list(created);
+            listCreated(created);
         } else {
             order(created);
         }
@@ -259,7 +262,9 @@ final class KeyspaceState {
     /// or orders it, and a commit that finds it there may publish before that thread goes on. So one that finds it
     /// neither listed nor ordered orders it itself where chains order eagerly, and otherwise waits the few instructions
     /// until its creator lists it: the link of a chain holds the list until a thread orders it and the chain below it
-    /// after, so the creator alone may enter it on the list.
+    /// after, so the creator alone may enter it on the list. A creator that fails to list it drops it, and the chain is
+    /// returned dropped; once the store is closing, the wait gives up and returns the chain unlisted, which a read of a
+    /// range during the close may miss while the log and the final checkpoint hold its writes.
     Chain open(MemorySegment key) {
         var hash = Segments.hash(key);
         var chain = index.get(key, hash);
@@ -274,7 +279,7 @@ final class KeyspaceState {
             if (chain == null) {
                 chain = created;
                 if (lazy) {
-                    list(created);
+                    listCreated(created);
                     return created;
                 }
             }
@@ -289,10 +294,34 @@ final class KeyspaceState {
         return chain;
     }
 
-    /// Waits until the thread that created `chain`, which entered the index and is about to enter the list, listed it.
-    private static void awaitListed(Chain chain) {
-        while (!chain.reachable()) {
+    /// Waits until the thread that created `chain`, which entered the index and is about to enter the list, listed it,
+    /// or dropped it as it failed to, or until the store is closing.
+    ///
+    /// Only a virtual machine error, a stack overflow or a failure to link a call site on its first use, stops a
+    /// creator between the two, and a creator that throws drops the chain; the close is the bound if its handler
+    /// fails too, as a commit that waits here holds the close back.
+    private void awaitListed(Chain chain) {
+        while (!chain.reachable() && !chain.released() && !closing) {
             Thread.yield();
+        }
+    }
+
+    /// Lists `chain`, which this thread created and entered in the index, or drops it if that fails, so no commit that
+    /// found it in the index waits for it for good.
+    private void listCreated(Chain chain) {
+        try {
+            list(chain);
+        } catch (Throwable failure) {
+            abandon(chain);
+            throw failure;
+        }
+    }
+
+    /// Drops `chain`, which this thread created and entered in the index and failed to list or to give its first
+    /// version: no write was claimed on it, so the claim of the first is still 0.
+    private void abandon(Chain chain) {
+        if (chain.release(0)) {
+            empty(chain);
         }
     }
 

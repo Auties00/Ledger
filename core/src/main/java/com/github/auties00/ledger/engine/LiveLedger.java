@@ -1411,6 +1411,10 @@ public final class LiveLedger implements Ledger {
     }
 
     private void close(boolean checkpoint) {
+        // Before the roles: a commit waiting for the creator of a chain to list it may hold the sequencing role
+        for (var state : states.values()) {
+            state.closing = true;
+        }
         enterExclusive();
         try {
             if (closed) {
