@@ -219,11 +219,13 @@ class ResidentStreamTest {
             var failures = new ConcurrentLinkedQueue<String>();
             var stop = new AtomicBoolean();
             var readers = new ArrayList<Thread>();
+            // The readers keep to the first half: they would otherwise cache every leaf before the loader claims it
+            // when they outrun it, and the uncached leaves of the second half reach the loader alone, on its arrays
             for (var reader = 0; reader < 4; reader++) {
                 readers.add(Thread.ofPlatform().start(() -> {
                     var random = ThreadLocalRandom.current();
                     while (!stop.get()) {
-                        var index = random.nextInt(ENTRIES);
+                        var index = random.nextInt(ENTRIES / 2);
                         try {
                             if (!ledger.get(SESSIONS, key(index)).equals(Optional.of(value(index)))) {
                                 failures.add("read " + key(index) + " wrong");
