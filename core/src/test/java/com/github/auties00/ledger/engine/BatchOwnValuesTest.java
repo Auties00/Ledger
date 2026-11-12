@@ -211,8 +211,8 @@ class BatchOwnValuesTest {
             var caller = value(length, length);
             var expected = caller.clone();
             try (var ledger = (LiveLedger) options(directory).build()) {
-                // A session beside it, so a value below half a chunk has to leave the batch's array
-                var batch = ledger.newBatch().put(SESSIONS, new byte[]{9}, new byte[16_384]).put(MESSAGES, new byte[]{1}, caller);
+                // A name beside it, so a value below half a chunk has to leave the batch's array
+                var batch = ledger.newBatch().put(NAMES, new byte[]{9}, "x".repeat(16_384)).put(MESSAGES, new byte[]{1}, caller);
                 // The batch copied the value at the put
                 caller[0]++;
                 ledger.commit(batch).awaitDurable();
