@@ -27,9 +27,9 @@ import java.util.function.BooleanSupplier;
 /// on the one thread that writes a checkpoint, through a [Writer].
 final class PageFile implements AutoCloseable {
     static final String FILE = "ledger.data";
-    /// The channels reads take turns on, and the most threads [#readAll(List, byte, int)] reads on.
+    /// The channels reads take turns on.
     static final int READ_CHANNELS = 8;
-    /// The most pages [#readAll(List, byte, int)] reads with one call.
+    /// The most pages [#readAll(List, byte, Lease)] reads with one call.
     static final int RUN_PAGES = 64;
     private static final int STAGED_LIMIT = 8 << 20;
     // The staged bytes a flush seals before it writes them, which bounds the sealed arrays it holds at once
@@ -170,11 +170,26 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
     byte[] read(PageRef ref, byte kind, boolean cached, boolean referenced) {
+        return read(ref, kind, cached, referenced, null);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, from the cache or the file, read on the channel of `lease`}
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    /// @param cached whether to keep the unit in the cache, and the units a delta record's leaf is made of
+    /// @param lease the channel to read on, or `null` to take one of the pool's for each read, waiting for one
+    /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[] read(PageRef ref, byte kind, boolean cached, Lease lease) {
+        return read(ref, kind, cached, true, lease);
+    }
+
+    private byte[] read(PageRef ref, byte kind, boolean cached, boolean referenced, Lease lease) {
         var hit = cache.get(ref);
         if (hit != null && kindMatches(hit[PageFormat.KIND], kind)) {
             return hit;
         }
-        return load(ref, kind, cached, referenced);
+        return load(ref, kind, cached, referenced, lease);
     }
 
     /// {@return the plaintext of the unit `ref` names, from the file, for a read that found the cache without it}
@@ -187,10 +202,14 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
     byte[] load(PageRef ref, byte kind, boolean cached, boolean referenced) {
+        return load(ref, kind, cached, referenced, null);
+    }
+
+    private byte[] load(PageRef ref, byte kind, boolean cached, boolean referenced, Lease lease) {
         if (ref.isRecord()) {
             // The delta page and the base go to the cache as the entries it evicts first: the leaf they make is what a
             // read uses again, and holding all three filled the cache with each leaf twice
-            var leaf = DeltaLeaves.materialize(ref, (unit, unitKind) -> read(unit, unitKind, cached, false));
+            var leaf = DeltaLeaves.materialize(ref, (unit, unitKind) -> read(unit, unitKind, cached, false, lease));
             if (!kindMatches(leaf[PageFormat.KIND], kind)) {
                 throw new LedgerCorruptedException(path + " holds a delta record where a branch belongs, at page " + ref.page(), null);
             }
@@ -202,7 +221,7 @@ final class PageFile implements AutoCloseable {
         var length = ref.pages() * PageFormat.SIZE;
         var sealed = pool.acquire(length);
         try {
-            readFully(sealed, length, PageFormat.offset(ref.page()));
+            readFully(sealed, length, PageFormat.offset(ref.page()), lease);
             // The header is the additional data of the tag and the open copies it as it is, so what it says holds once
             // the unit authenticates: it is checked first, and tells the bytes to keep
             var content = Bytes.i32(sealed, PageFormat.LENGTH);
@@ -223,22 +242,23 @@ final class PageFile implements AutoCloseable {
 
     /// {@return the plaintext of the units `refs` name, in their order, none of them cached}
     ///
-    /// Units in consecutive pages are read with one call, up to [#RUN_PAGES] pages, and the calls run on at most
-    /// `threads` virtual threads, and no more than there are read channels: reading many units one after another out of
-    /// the OS cache made the caller wait for each read in turn.
+    /// Units in consecutive pages are read with one call, up to [#RUN_PAGES] pages, on the calling thread: reading many
+    /// units one after another out of the OS cache made the caller wait for each read in turn. No other thread shares
+    /// the reads, so a caller that holds work others wait for waits only for the file, and for a channel if `lease` is
+    /// `null`.
     ///
     /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
+    /// @param lease the channel to read on, or `null` to take one of the pool's for each read, waiting for one
     /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
     /// @throws LedgerIoException if the file cannot be read
-    byte[][] readAll(List<PageRef> refs, byte kind, int threads) {
+    byte[][] readAll(List<PageRef> refs, byte kind, Lease lease) {
         var units = new byte[refs.size()][];
         var order = new Integer[refs.size()];
         for (var i = 0; i < order.length; i++) {
             order[i] = i;
         }
         Arrays.sort(order, (left, right) -> Integer.compare(refs.get(left).page(), refs.get(right).page()));
-        // Runs of indexes into refs, by page
-        var runs = new ArrayList<int[]>();
+        // The indexes into refs of a run of consecutive pages
         var run = new ArrayList<Integer>();
         var runPages = 0;
         var next = -1;
@@ -246,12 +266,12 @@ final class PageFile implements AutoCloseable {
             var ref = refs.get(index);
             var alone = ref.isRecord() || cache.peek(ref) != null;
             if (!run.isEmpty() && (alone || ref.page() != next || runPages + ref.pages() > RUN_PAGES)) {
-                runs.add(run.stream().mapToInt(Integer::intValue).toArray());
+                readRun(refs, run, kind, units, lease);
                 run.clear();
                 runPages = 0;
             }
             if (alone) {
-                runs.add(new int[]{index});
+                units[index] = read(ref, kind, false, true, lease);
                 continue;
             }
             run.add(index);
@@ -259,25 +279,23 @@ final class PageFile implements AutoCloseable {
             next = ref.page() + ref.pages();
         }
         if (!run.isEmpty()) {
-            runs.add(run.stream().mapToInt(Integer::intValue).toArray());
+            readRun(refs, run, kind, units, lease);
         }
-        var running = Math.min(Math.min(READ_CHANNELS, threads), runs.size());
-        ClaimedIndexes.run("ledger-read", runs.size(), running - 1, i -> readRun(refs, runs.get(i), kind, units));
         return units;
     }
 
     /// Reads the units at `indexes` of `refs`, in consecutive pages, with one call, into `units`.
-    private void readRun(List<PageRef> refs, int[] indexes, byte kind, byte[][] units) {
-        if (indexes.length == 1) {
-            units[indexes[0]] = read(refs.get(indexes[0]), kind, false);
+    private void readRun(List<PageRef> refs, List<Integer> indexes, byte kind, byte[][] units, Lease lease) {
+        if (indexes.size() == 1) {
+            units[indexes.getFirst()] = read(refs.get(indexes.getFirst()), kind, false, true, lease);
             return;
         }
-        var first = refs.get(indexes[0]).page();
-        var last = refs.get(indexes[indexes.length - 1]);
+        var first = refs.get(indexes.getFirst()).page();
+        var last = refs.get(indexes.getLast());
         var length = (last.page() + last.pages() - first) * PageFormat.SIZE;
         var sealed = pool.acquire(length);
         try {
-            readFully(sealed, length, PageFormat.offset(first));
+            readFully(sealed, length, PageFormat.offset(first), lease);
             for (var index : indexes) {
                 var ref = refs.get(index);
                 var plain = new byte[ref.pages() * PageFormat.SIZE];
@@ -292,76 +310,108 @@ final class PageFile implements AutoCloseable {
         }
     }
 
-    /// Receives the units [#readOwned(PageRef\[\], int, byte, OwnedUnits)] reads, one at a time.
-    @FunctionalInterface
-    interface OwnedUnits {
-        /// Takes the plaintext of the unit at `index` of the references read.
-        ///
-        /// @param pooled whether `unit` is an array of the store's pool, which the receiver owns and gives back with
-        ///               [PageFile#release(byte\[\])] once it no longer reads it, rather than the cache's own array, which may
-        ///               still be read by others and is never given back
-        void accept(int index, byte[] unit, boolean pooled);
-    }
-
-    /// Reads the first `count` units `refs` names, at most 64, which follow one another in pages and none of which is a
-    /// delta record, and passes each to `units` once it has it.
+    /// {@return an array of the store's pool that holds the `count` pages from page `first` as the file holds them,
+    /// read with one call on the channel of `lease`}
     ///
-    /// A unit the cache holds is passed as the cache's array, and is not read; the others are read with one call and
-    /// each is opened into an array of the store's pool, passed as soon as it authenticates, so the receiver can use
-    /// the first while the rest are opened. A pooled array never goes to the cache: readers keep using the arrays the
-    /// cache evicts, so an array it held cannot go back to the pool. An array may be longer than its unit.
+    /// The caller gives the array back with [#release(byte\[\])] once it opened the units in it
+    /// ([#openOwned(byte\[\], int, PageRef, byte)]). It may be longer than the pages.
     ///
-    /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
-    /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names, once the
-    ///                                  units before it were passed
+    /// @param lease the channel to read on, or `null` to take one of the pool's, waiting for one
     /// @throws LedgerIoException if the file cannot be read
-    void readOwned(PageRef[] refs, int count, byte kind, OwnedUnits units) {
-        if (count > Long.SIZE) {
-            throw new IllegalArgumentException("A read of " + count + " units");
-        }
-        // The units the cache lacks, by their index
-        var missing = 0L;
-        for (var index = 0; index < count; index++) {
-            var hit = cached(refs[index], kind);
-            if (hit != null) {
-                units.accept(index, hit, false);
-            } else {
-                missing |= 1L << index;
-            }
-        }
-        if (missing == 0) {
-            return;
-        }
-        var low = Long.numberOfTrailingZeros(missing);
-        var high = Long.SIZE - 1 - Long.numberOfLeadingZeros(missing);
-        var first = refs[low].page();
-        var length = (refs[high].page() + refs[high].pages() - first) * PageFormat.SIZE;
+    byte[] readSealed(int first, int count, Lease lease) {
+        var length = count * PageFormat.SIZE;
         var sealed = pool.acquire(length);
         try {
-            readFully(sealed, length, PageFormat.offset(first));
-            for (var index = low; index <= high; index++) {
-                if ((missing & 1L << index) == 0) {
-                    continue;
-                }
-                var ref = refs[index];
-                var plain = pool.acquire(ref.pages() * PageFormat.SIZE);
-                if (!cipher.open(sealed, (ref.page() - first) * PageFormat.SIZE, ref.pages(), plain) || !ref.describes(plain)
-                        || !kindMatches(plain[PageFormat.KIND], kind)) {
-                    // What the open left in it is no unit's
-                    pool.release(plain);
-                    throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
-                }
-                units.accept(index, plain, true);
-            }
-        } finally {
+            readFully(sealed, length, PageFormat.offset(first), lease);
+            return sealed;
+        } catch (RuntimeException | Error failure) {
             pool.release(sealed);
+            throw failure;
         }
     }
 
-    /// Gives back to the store's pool `unit`, an array [#readOwned(PageRef\[\], int, byte, OwnedUnits)] passed as
-    /// pooled, which the caller no longer reads.
+    /// {@return the plaintext of the unit `ref` names, opened from `sealed`, pages [#readSealed(int, int, Lease)] read,
+    /// in which the unit starts at `offset`, into an array of the store's pool}
+    ///
+    /// The caller owns the array and gives it back with [#release(byte\[\])] once it no longer reads it. It never goes
+    /// to the cache: readers keep using the arrays the cache evicts, so an array it held cannot go back to the pool. It
+    /// may be longer than the unit.
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
+    byte[] openOwned(byte[] sealed, int offset, PageRef ref, byte kind) {
+        var plain = pool.acquire(ref.pages() * PageFormat.SIZE);
+        var opened = false;
+        try {
+            opened = cipher.open(sealed, offset, ref.pages(), plain) && ref.describes(plain) && kindMatches(plain[PageFormat.KIND], kind);
+        } finally {
+            if (!opened) {
+                // What the open left in it is no unit's
+                pool.release(plain);
+            }
+        }
+        if (!opened) {
+            throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+        }
+        return plain;
+    }
+
+    /// Gives back to the store's pool `unit`, an array [#readSealed(int, int, Lease)] or
+    /// [#openOwned(byte\[\], int, PageRef, byte)] returned, which the caller no longer reads.
     void release(byte[] unit) {
         pool.release(unit);
+    }
+
+    /// {@return a read channel of the pool, which the caller reads on until it gives it back, or `null` if every one is
+    /// in use or the file is closed}
+    ///
+    /// It never waits: a thread that holds work other threads wait for takes its channel before it claims the work, as
+    /// a thread that parked for one may get no carrier to resume on while an application's virtual threads hold them
+    /// all.
+    Lease tryLease() {
+        if (closed) {
+            return null;
+        }
+        var channel = readers.poll();
+        if (channel == null) {
+            return null;
+        }
+        if (!channel.isOpen()) {
+            // A channel an interrupt closed and that could not be replaced at the time
+            try {
+                channel = FileChannel.open(path, StandardOpenOption.READ);
+            } catch (IOException _) {
+                readers.offer(channel);
+                return null;
+            }
+        }
+        return new Lease(channel);
+    }
+
+    /// {@return whether a read channel of the pool is free now}
+    boolean leasable() {
+        return !readers.isEmpty();
+    }
+
+    /// A read channel of the pool that one thread took with [#tryLease()] and reads on until it gives it back
+    /// ([#close()]).
+    final class Lease implements AutoCloseable {
+        // The channel, or null once given back; replaced if an interrupt closes it during a read
+        private FileChannel channel;
+
+        private Lease(FileChannel channel) {
+            this.channel = channel;
+        }
+
+        /// Gives the channel back to the pool; does nothing the second time.
+        @Override
+        public void close() {
+            var held = channel;
+            if (held != null) {
+                channel = null;
+                readers.offer(held);
+            }
+        }
     }
 
     /// {@return the plaintext of the unit `ref` names if the cache holds it, or `null`}
@@ -395,8 +445,13 @@ final class PageFile implements AutoCloseable {
         return expected == NODE ? actual == PageFormat.LEAF || actual == PageFormat.BRANCH : actual == expected;
     }
 
-    private void readFully(byte[] array, int length, long position) {
-        var channel = takeChannel();
+    /// Reads `length` bytes at `position` into `array`, on the channel of `lease`, or on one of the pool's if `lease` is
+    /// `null`.
+    private void readFully(byte[] array, int length, long position, Lease lease) {
+        if (lease != null && lease.channel == null) {
+            throw new IllegalStateException("The channel was given back");
+        }
+        var channel = lease == null ? takeChannel() : lease.channel;
         var interrupted = false;
         try {
             var buffer = ByteBuffer.wrap(array, 0, length);
@@ -414,7 +469,11 @@ final class PageFile implements AutoCloseable {
         } catch (IOException exception) {
             throw new LedgerIoException(path + " could not be read", exception);
         } finally {
-            readers.offer(channel);
+            if (lease == null) {
+                readers.offer(channel);
+            } else {
+                lease.channel = channel;
+            }
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }

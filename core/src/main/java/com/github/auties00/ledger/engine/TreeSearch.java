@@ -116,13 +116,15 @@ final class TreeSearch {
 
     /// {@return the leaves under `nodes`, nodes of one level of a tree in key order, in key order}
     ///
-    /// It reads the nodes a level at a time, with [PageFile#readAll(List, byte, int)] on up to `threads` threads: a
-    /// store that just opened finds its file out of the OS cache as often as not, and reading the nodes of a level one
-    /// after another made the reader wait for each read in turn.
-    static List<Leaf> leavesUnder(PageFile pages, List<Leaf> nodes, int threads) {
+    /// It reads the nodes a level at a time, with [PageFile#readAll(List, byte, PageFile.Lease)], on the calling thread
+    /// alone: a store that just opened finds its file out of the OS cache as often as not, and reading the nodes of a
+    /// level one after another made the reader wait for each read in turn.
+    ///
+    /// @param lease the channel to read on, or `null` to take one of the pool's for each read, waiting for one
+    static List<Leaf> leavesUnder(PageFile pages, List<Leaf> nodes, PageFile.Lease lease) {
         var level = nodes;
         while (true) {
-            var units = pages.readAll(level.stream().map(Leaf::ref).toList(), PageFile.NODE, threads);
+            var units = pages.readAll(level.stream().map(Leaf::ref).toList(), PageFile.NODE, lease);
             var children = new ArrayList<Leaf>();
             for (var unit : units) {
                 children.addAll(children(unit, 0));

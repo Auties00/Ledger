@@ -20,8 +20,9 @@ import java.util.function.IntConsumer;
 /// store of [#below] after each leaf publishes it: a read or a write of a key below it finds the key's chain, or no
 /// chain if the key has no entry, as in a key space loaded while the store opened.
 ///
-/// The leaves come from a [LeafStream]: workers read and open them ahead of the loader's thread, which installs them in
-/// key order as each is opened, and reads those no worker reached itself. It runs on a virtual thread of its own from
+/// The leaves come from a [LeafStream]: workers read them ahead of the loader's thread and open them, the loader's
+/// thread too when it would wait, which installs them in key order as each is opened, and reads those no worker
+/// reached itself. It runs on a virtual thread of its own from
 /// the first use of its key space ([#start()]), beside one worker, which leaves the other processors to the reads of
 /// the store and to the compiler, busy after an open; or on the opening thread ([#loadNow()]), beside as many workers
 /// as the data file has read channels for. Once a thread waits for it or a long scan reads beside it

@@ -24,6 +24,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Optional;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -34,6 +35,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntConsumer;
 
@@ -47,9 +49,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The stream a resident key space's loader reads its leaves from ([LeafStream]): the arrays it gives back to the pool,
-/// the trees of every height, failed reads on its workers, a close while it reads on every channel, and an open that
-/// loads at open while an application's virtual threads hold every carrier. Values of 1,400 bytes put two entries in a
-/// leaf.
+/// the trees of every height, failed reads on its workers, a close while it reads on every channel, the opens of one
+/// group spread over its threads, and a taker that ends while an application's virtual threads hold every carrier,
+/// whether the stream's threads found every read channel in use or lost their carriers while they read. Values of
+/// 1,400 bytes put two entries in a leaf.
 class ResidentStreamTest {
     private static final byte[] KEY = new byte[32];
     private static final int ENTRIES = 1_200;
@@ -450,6 +453,205 @@ class ResidentStreamTest {
         try (var ledger = opened.get()) {
             assertTrue(((LiveLedger) ledger).residentLoadedForTests(SESSIONS));
             checkAll(ledger, SESSIONS, model);
+        }
+    }
+
+    /// {@return the number of leaves of the tree of `keyspace`}
+    private static int leaves(LiveLedger live, Keyspace<?, ?> keyspace) {
+        var pages = live.writerPoint(0).pages();
+        var root = live.tree().root(live.state(keyspace).id);
+        var top = pages.read(root.ref(), PageFile.NODE, false);
+        return TreeNodes.isLeaf(top) ? 1 : TreeSearch.leavesUnder(pages, List.of(new TreeSearch.Leaf(root.ref(), null)), null).size();
+    }
+
+    /// Takes every leaf of a stream of every worker over the tree of [#SESSIONS] on a platform thread, which builds the
+    /// stream, counts `built` down, starts taking once `proceed` is counted down, and counts the leaves into `taken`
+    /// once it closed the stream.
+    private static Thread taker(LiveLedger live, CountDownLatch built, CountDownLatch proceed, AtomicInteger taken,
+                                AtomicReference<Throwable> failure) {
+        var pages = live.writerPoint(0).pages();
+        var root = live.tree().root(live.state(SESSIONS).id);
+        return Thread.ofPlatform().start(() -> {
+            try (var stream = new LeafStream(pages, root, MemorySegment.ofArray(new byte[0]), LeafStream.MAX_WORKERS, true, null)) {
+                built.countDown();
+                assertTrue(proceed.await(60, TimeUnit.SECONDS));
+                var count = 0;
+                for (LeafStream.Slot slot; (slot = stream.next()) != null; ) {
+                    stream.taken(slot);
+                    count++;
+                }
+                taken.set(count);
+            } catch (Throwable throwable) {
+                failure.set(throwable);
+            } finally {
+                built.countDown();
+            }
+        });
+    }
+
+    /// Starts virtual threads that spin until `stop` is set, more than there are carriers, and returns them once they
+    /// hold every carrier.
+    private static List<Thread> holdCarriers(AtomicBoolean stop) throws InterruptedException {
+        var carriers = Integer.getInteger("jdk.virtualThreadScheduler.parallelism", Runtime.getRuntime().availableProcessors());
+        var spinning = new AtomicInteger();
+        var spinners = new ArrayList<Thread>();
+        for (var i = 0; i < carriers * 4 + 16; i++) {
+            spinners.add(Thread.ofVirtual().start(() -> {
+                spinning.incrementAndGet();
+                while (!stop.get()) {
+                    Thread.onSpinWait();
+                }
+            }));
+        }
+        var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+        while (spinning.get() < carriers) {
+            assertTrue(System.nanoTime() < deadline, "the spinners got no carriers");
+            Thread.sleep(1);
+        }
+        return spinners;
+    }
+
+    @Test
+    @DisplayName("a stream whose threads found every read channel in use ends on its taker while an application's virtual threads hold every carrier")
+    void workersWithoutChannels(@TempDir Path directory) throws Exception {
+        populate(directory, SESSIONS);
+        try (var ledger = open(directory, false)) {
+            var live = (LiveLedger) ledger;
+            var pages = live.writerPoint(0).pages();
+            var root = live.tree().root(live.state(SESSIONS).id);
+            // The path in the cache, so the taker builds the stream on no channel
+            var top = pages.read(root.ref(), PageFile.NODE, true);
+            pages.node(top, TreeNodes.childFor(top, MemorySegment.ofArray(new byte[0])));
+            var sequence = live.readers().register();
+            var held = new ArrayList<PageFile.Lease>();
+            for (var i = 0; i < PageFile.READ_CHANNELS; i++) {
+                held.add(pages.tryLease());
+            }
+            assertNull(pages.tryLease());
+            var stop = new AtomicBoolean();
+            var spinners = new ArrayList<Thread>();
+            var built = new CountDownLatch(1);
+            var proceed = new CountDownLatch(1);
+            var taken = new AtomicInteger(-1);
+            var failure = new AtomicReference<Throwable>();
+            Thread taker = null;
+            try {
+                taker = taker(live, built, proceed, taken, failure);
+                assertTrue(built.await(60, TimeUnit.SECONDS));
+                // The workers and the planner run, and find no channel to read on
+                Thread.sleep(300);
+                spinners.addAll(holdCarriers(stop));
+                held.forEach(PageFile.Lease::close);
+                proceed.countDown();
+                taker.join(TimeUnit.SECONDS.toMillis(30));
+                assertFalse(taker.isAlive(), "the taker waits for a thread with no carrier");
+            } finally {
+                held.forEach(PageFile.Lease::close);
+                proceed.countDown();
+                stop.set(true);
+                for (var spinner : spinners) {
+                    spinner.join();
+                }
+                if (taker != null) {
+                    taker.join();
+                }
+                live.readers().unregister(sequence);
+            }
+            assertNull(failure.get());
+            assertEquals(leaves(live, SESSIONS), taken.get());
+        }
+    }
+
+    @Test
+    @DisplayName("a stream whose threads lose their carriers while they read and open ends on its taker")
+    void carriersTakenWhileReading(@TempDir Path directory) throws Exception {
+        populate(directory, SESSIONS);
+        try (var ledger = open(directory, false)) {
+            var live = (LiveLedger) ledger;
+            var expected = leaves(live, SESSIONS);
+            for (var round = 0; round < 12; round++) {
+                // Every round reads the file, not the leaves the last one cached
+                live.writerPoint(0).pages().cache().clearForTests();
+                var sequence = live.readers().register();
+                var stop = new AtomicBoolean();
+                var spinners = new ArrayList<Thread>();
+                var built = new CountDownLatch(1);
+                var proceed = new CountDownLatch(0);
+                var taken = new AtomicInteger(-1);
+                var failure = new AtomicReference<Throwable>();
+                Thread taker = null;
+                try {
+                    taker = taker(live, built, proceed, taken, failure);
+                    assertTrue(built.await(60, TimeUnit.SECONDS));
+                    // A later moment of the reads each round, the first while the workers start
+                    if (round > 0) {
+                        Thread.sleep(0, round * 80_000);
+                    }
+                    spinners.addAll(holdCarriers(stop));
+                    taker.join(TimeUnit.SECONDS.toMillis(30));
+                    assertFalse(taker.isAlive(), "the taker waits for a thread with no carrier, round " + round);
+                } finally {
+                    stop.set(true);
+                    for (var spinner : spinners) {
+                        spinner.join();
+                    }
+                    if (taker != null) {
+                        taker.join();
+                    }
+                    live.readers().unregister(sequence);
+                }
+                assertNull(failure.get());
+                assertEquals(expected, taken.get());
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("the leaves of one group are opened on more than one thread, and the taker gets them in key order")
+    void opensSpreadOverThreads(@TempDir Path directory) throws Exception {
+        // 40 leaves of one page: one group of the most pages a worker reads with one call
+        try (var ledger = open(directory, false)) {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < 80; i++) {
+                batch.put(SESSIONS, key(i), value(i));
+            }
+            ledger.commit(batch);
+        }
+        try (var ledger = open(directory, false)) {
+            var live = (LiveLedger) ledger;
+            var pages = live.writerPoint(0).pages();
+            var root = live.tree().root(live.state(SESSIONS).id);
+            var expected = leaves(live, SESSIONS);
+            assertTrue(expected <= PageFile.RUN_PAGES && expected > 16, expected + " leaves");
+            var spread = false;
+            for (var round = 0; round < 50 && !spread; round++) {
+                pages.cache().clearForTests();
+                var sequence = live.readers().register();
+                var openers = Collections.newSetFromMap(new IdentityHashMap<Thread, Boolean>());
+                var keys = new ArrayList<String>();
+                try (var stream = new LeafStream(pages, root, MemorySegment.ofArray(new byte[0]), LeafStream.MAX_WORKERS, true, null)) {
+                    // The workers read and open the group before the taker takes it
+                    Thread.sleep(20);
+                    for (LeafStream.Slot slot; (slot = stream.next()) != null; ) {
+                        if (slot.openedBy != null && slot.openedBy != Thread.currentThread()) {
+                            openers.add(slot.openedBy);
+                        }
+                        var unit = slot.unit();
+                        for (var i = 0; i < TreeNodes.count(unit); i++) {
+                            keys.add(new String(TreeNodes.leafKey(unit, TreeNodes.entry(unit, i)).toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8));
+                        }
+                        stream.taken(slot);
+                    }
+                } finally {
+                    live.readers().unregister(sequence);
+                }
+                var ordered = new ArrayList<>(keys);
+                Collections.sort(ordered);
+                assertEquals(80, keys.size());
+                assertEquals(ordered, keys);
+                spread = openers.size() > 1;
+            }
+            assertTrue(spread, "every group was opened on one worker");
         }
     }
 
