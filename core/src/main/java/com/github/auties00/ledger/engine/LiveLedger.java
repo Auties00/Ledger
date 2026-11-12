@@ -2527,9 +2527,13 @@ public final class LiveLedger implements Ledger {
         }
 
         /// Applies a put of `key` whose value is a read-only view of the whole of `array`, which no one writes from now
-        /// on and the store's pool never hands out, so the commit's frame may refer to it.
+        /// on and the store's pool never hands out: the version keeps it as its own, with no copy, and the commit's
+        /// frame may refer to it.
+        ///
+        /// @param decoded the decoded value of a put to a resident key space; ignored for one of byte arrays, whose
+        ///                reads return `array`
         void put(KeyspaceState state, MemorySegment key, MemorySegment value, byte[] array, Object decoded) {
-            put(state, claim(state, key), key, value, null, null, array, 0, decoded, TreeSearch.UNKNOWN, null);
+            put(state, claim(state, key), key, value, array, null, array, 0, decoded, TreeSearch.UNKNOWN, null);
         }
 
         /// Checks that the commit's frame, if it has one, has room for a write of `payload` bytes of keys and values,
