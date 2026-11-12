@@ -1,5 +1,6 @@
 package com.github.auties00.ledger.engine;
 
+import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -13,10 +14,9 @@ import java.util.concurrent.atomic.AtomicLong;
 /// request above 1 MiB gets an array of its own, which is not recycled. Arrays come back with the contents of their
 /// last use: callers write before they read.
 ///
-/// A pool no array was taken from for a tick of the [IdleTicker], between one and two of its periods, gives its free
-/// arrays to the collector:
-/// a store whose last checkpoint left a megabyte of sealed arrays in its pool kept them as long as it stayed idle,
-/// which a process of many stores, most of them idle, paid for each.
+/// The free arrays of a size none was taken of for a tick of the [IdleTicker], between one and two of its periods, go
+/// to the collector, so neither a store idle after a checkpoint, in a process of many stores, nor one that goes on
+/// taking the small arrays of its commits after a history sync keeps the arrays it no longer takes.
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
@@ -27,11 +27,11 @@ public final class HeapPool {
     // The bytes each size holds free, which may not take more than half of maxPooledBytes: a checkpoint's flush
     // releases its many small arrays at once, and would otherwise leave no room for the large ones
     private final AtomicLong[] pooledBySize;
-    // The acquires so far, a plain count: a stale read only delays a trim, or trims a pool just used, whose next
-    // acquire then allocates
-    private int acquires;
-    // The count of acquires the trimmer saw last; the trimmer's alone
-    private int acquiresSeen;
+    // The acquires of each size so far, plain counts: a stale read only delays a trim, or trims a size just used,
+    // whose next acquire then allocates
+    private final int[] acquires;
+    // The counts of acquires the trimmer saw last; the trimmer's alone
+    private final int[] acquiresSeen;
     // What the idle ticker calls, which holds it weakly: the pool keeps it as long as it lives
     private final IdleTicker.Watched trimmer;
     // What sees the arrays the pool hands out again and takes back, or null; for tests
@@ -103,6 +103,8 @@ public final class HeapPool {
         for (var i = 0; i < free.length; i++) {
             pooledBySize[i] = new AtomicLong();
         }
+        this.acquires = new int[free.length];
+        this.acquiresSeen = new int[free.length];
         this.trimmer = trimmed ? this::trimIfIdle : null;
         if (trimmed) {
             IdleTicker.watch(trimmer);
@@ -117,7 +119,7 @@ public final class HeapPool {
             return new byte[capacity];
         }
         var shift = Math.max(MIN_SHIFT, 32 - Integer.numberOfLeadingZeros(Math.max(1, capacity) - 1));
-        acquires++;
+        acquires[shift - MIN_SHIFT]++;
         var array = free[shift - MIN_SHIFT].poll();
         if (array == null) {
             return new byte[1 << shift];
@@ -156,19 +158,19 @@ public final class HeapPool {
         free[size].offer(array);
     }
 
-    /// Gives the free arrays to the collector if no array was acquired since the last call.
+    /// Gives the free arrays of each size to the collector if no array of that size was acquired since the last call.
     void trimIfIdle() {
-        var seen = acquires;
-        if (seen == acquiresSeen) {
-            for (var i = 0; i < free.length; i++) {
+        for (var i = 0; i < free.length; i++) {
+            var seen = acquires[i];
+            if (seen == acquiresSeen[i]) {
                 byte[] array;
                 while ((array = free[i].poll()) != null) {
                     pooledBytes.addAndGet(-array.length);
                     pooledBySize[i].addAndGet(-array.length);
                 }
             }
+            acquiresSeen[i] = seen;
         }
-        acquiresSeen = seen;
     }
 
     /// Makes `watcher` see every array the pool takes back from now on, before another thread can acquire it, and every
@@ -194,5 +196,10 @@ public final class HeapPool {
     /// {@return the bytes of the free arrays; for tests}
     long pooledBytesForTests() {
         return pooledBytes.get();
+    }
+
+    /// {@return the free arrays of `length` bytes, a pooled size, as they stand; for tests}
+    List<byte[]> freeForTests(int length) {
+        return List.copyOf(free[Integer.numberOfTrailingZeros(length) - MIN_SHIFT]);
     }
 }

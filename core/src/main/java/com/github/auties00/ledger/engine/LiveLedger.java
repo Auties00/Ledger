@@ -682,7 +682,7 @@ public final class LiveLedger implements Ledger {
         try {
             ensureOpen();
             checkHealthy();
-            applier = new Applier(sequenced.next, log == null ? null : FrameBody.forCommit(writes, units), writes.size(),
+            applier = new Applier(sequenced.next, log == null ? null : FrameBody.forCommit(writes, units, pool), writes.size(),
                     pages != null && log != null, writes.sharesChunk());
             if (outcome != null) {
                 outcome[0] = applier;
@@ -959,7 +959,7 @@ public final class LiveLedger implements Ledger {
     /// go on, and its committing thread throws the failure.
     private void apply(PendingCommit pending) {
         var writes = pending.writes;
-        var applier = new Applier(pending.sequence, log == null ? null : FrameBody.forCommit(writes, pending.units), writes.size(), false,
+        var applier = new Applier(pending.sequence, log == null ? null : FrameBody.forCommit(writes, pending.units, pool), writes.size(), false,
                 writes.sharesChunk());
         try {
             var size = writes.size();
@@ -2303,7 +2303,7 @@ public final class LiveLedger implements Ledger {
 
         /// Creates the applier of a transaction, or of a commit recovery replays when nothing is `journaled`.
         Applier(long sequence, boolean journaled) {
-            this(sequence, journaled ? FrameBody.forTransaction() : null, 4, false, false);
+            this(sequence, journaled ? FrameBody.forTransaction(pool) : null, 4, false, false);
         }
 
         /// Creates the applier of a commit of about `writes` writes.
@@ -2765,8 +2765,13 @@ public final class LiveLedger implements Ledger {
 
         /// Takes back every write this commit applied; no reader saw them, since the commit was never published.
         ///
-        /// The keys it wrote stay marked for the next checkpoint, which writes their unchanged state.
+        /// The keys it wrote stay marked for the next checkpoint, which writes their unchanged state. The frame's pooled
+        /// chunks go back to the pool unless the log took the frame, which then gives them back once it sealed it.
         void rollback() {
+            assert !logged : "a commit whose frame the log queued is taken back";
+            if (frame != null) {
+                frame.discard();
+            }
             for (var write : touched) {
                 var chain = write.chain();
                 var head = chain.head;
