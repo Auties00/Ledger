@@ -77,7 +77,7 @@ class BuiltinCodecsTest {
         // Below the pool's smallest array, the batch grew an array of its own by doubling from its first write
         var array = batch.viewForTests().byteSize();
         assertTrue(array >= encoded && array < 2 * encoded, () -> array + " bytes for " + encoded);
-        batch.prepare(false);
+        batch.prepare(false, null, Map.of());
         assertEquals(encoded, batch.home(0).byteSize());
         batch.finish();
         assertTrue(batch.isEmpty());

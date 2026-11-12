@@ -176,7 +176,7 @@ final class ValueSlab {
         return off;
     }
 
-    /// {@return the bytes of a chunk, 0 until the slab knows the region}
+    /// {@return the bytes of a chunk, 0 until the slab knows the region; for tests}
     int capacity() {
         return capacity;
     }

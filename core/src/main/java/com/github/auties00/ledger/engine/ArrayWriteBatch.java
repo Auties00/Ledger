@@ -24,7 +24,7 @@ import java.util.Objects;
 ///
 /// A value of half a [chunk][#CHUNK_BYTES] or more never enters that array: it takes an array of its own at the put,
 /// which is private to the batch, is never written again, and is what the file of large values seals and the store's
-/// version keeps, so the value is encoded once and copied by neither [#prepare(boolean)] nor the store.
+/// version keeps, so the value is encoded once and copied by neither [#prepare(boolean, ValueSlab, Map)] nor the store.
 ///
 /// A range removal stores its bounds, each encoded or absent; the store reads them back through the accessors of
 /// this class when it applies the batch, then starts it again with [#finish()].
@@ -41,7 +41,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     private static final MemorySegment EMPTY_MEMORY = MemorySegment.ofArray(EMPTY);
     /// The writes a new batch has room for: most batches hold one or two.
     private static final int INITIAL_WRITES = 2;
-    /// The most bytes of a batch's array, of the chunks of its rope, and of the array [#prepare(boolean)] copies values
+    /// The most bytes of a batch's array, of the chunks of its rope, and of the array [#prepare(boolean, ValueSlab, Map)] copies values
     /// into: below half a region of the smallest the G1 collector makes, 1 MiB, so none takes a region of its own, as
     /// an object of half a region or more does.
     static final int CHUNK_BYTES = 256 * 1024;
@@ -733,13 +733,6 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// copied to an array of its bytes.
     ///
     /// A commit that fails prepares again when it is retried: a prepare writes nothing a former one exposed.
-    ///
-    /// @param copies whether the store copies every value it keeps, as a store in memory does, so no write has a home
-    void prepare(boolean copies) {
-        prepare(copies, null, Map.of());
-    }
-
-    /// Does what [#prepare(boolean)] does, with the chunks of `slab` for the values it takes.
     ///
     /// @param copies whether the store copies every value it keeps, as a store in memory does, so no write has a home
     /// @param slab the store's chunks of values, or `null` if it has none

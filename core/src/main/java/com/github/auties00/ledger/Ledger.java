@@ -85,12 +85,14 @@ import java.util.function.Consumer;
 /// # Threading
 /// Every method may be called from any thread, virtual threads included. Calls that wait (a commit behind an earlier
 /// one on its keys or behind a transaction, a wait for durability) spin briefly, then park the calling thread without
-/// holding a carrier. The store writes and
-/// forces its log on the platform threads of its [IoPool], and writes the checkpoints it starts on its own on a
-/// platform thread of their own; a read of a page the cache does not hold reads the file on the calling thread. A
-/// commit writes its large values on the calling thread, and reads the pages of the trees its writes need, which
-/// the cache does not hold, on virtual threads of its own, before it waits for the writer. On Windows a commit whose
-/// thread writes its own group through to stable storage holds a virtual thread's carrier while the device takes the
+/// holding a carrier. The store writes and forces its log on the platform threads of its [IoPool], and writes the
+/// checkpoints it starts on its own on a platform thread of their own, which encrypts the pages of a large checkpoint
+/// on virtual threads of its own beside it. A store that went quiet, or kept older versions in memory for a snapshot
+/// that closed, lets go of them on a platform thread of its own, started at most once every 30 seconds. A read of a
+/// page the cache does not hold reads the file on the calling thread. A commit writes its large values on the calling
+/// thread, and reads the pages of the trees its writes need, which the cache does not hold, on virtual threads of its
+/// own, before it waits for the writer. On Windows a commit whose thread writes its own group through to stable
+/// storage holds a virtual thread's carrier while the device takes the
 /// write, as the JDK lends a carrier only for its own blocking calls. The entries of a
 /// [resident][Keyspace.Residency#RESIDENT] key space are read into memory on virtual threads of the store's own, from
 /// the first use of the key space after the store opens, unless [Options#loadResidentAtOpen(boolean)] has the open
@@ -311,8 +313,11 @@ public non-sealed interface Ledger extends View, AutoCloseable {
 
         /// Lets a commit wait up to `window` for other commits to join the force it starts.
         ///
-        /// The default, zero, starts each force as soon as the previous one ends, which already groups the commits
-        /// that arrive during a force. A window trades the latency of a lone commit for fewer forces under a burst.
+        /// The default, zero, takes no fixed window: the commits that arrive during a force make the next one, and
+        /// after a force that woke several commits the next waits for them to commit again, for at most three quarters
+        /// of a force and one millisecond, so concurrent committers share one force rather than take turns; a lone
+        /// committer is never held back. A window trades the latency of a lone commit for fewer forces under a burst,
+        /// and replaces that wait.
         ///
         /// @param window the longest wait, from zero to one second
         /// @return these options

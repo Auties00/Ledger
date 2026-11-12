@@ -233,7 +233,7 @@ class ByteValueReadsTest {
             try (var ledger = open(directory, Long.MAX_VALUE)) {
                 var batch = (ArrayWriteBatch) ledger.newBatch();
                 batch.put(FILES, "huge", value(11, HUGE)).put(FILES, "small", value(12, 10));
-                batch.prepare(false);
+                batch.prepare(false, null, Map.of());
                 assertEquals(HUGE, batch.ownValue(0).length, "the large value has no array of its own");
                 assertNull(batch.home(0), "the large value has a home besides its array");
                 assertInstanceOf(MemorySegment.class, batch.home(1), "the small value has no home");

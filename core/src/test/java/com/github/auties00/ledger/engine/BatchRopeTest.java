@@ -174,7 +174,7 @@ class BatchRopeTest {
             assertArrayEquals(value(5, CHUNK / 2), bytes(batch.value(4)));
             assertArrayEquals(value(6, CHUNK / 2), bytes(batch.value(5)));
             assertEquals(CHUNK + 300_000 + CHUNK + 6, batch.encodedBytes());
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             assertNull(batch.home(0));
             assertNull(batch.home(4));
             assertNull(batch.home(5));
@@ -191,7 +191,7 @@ class BatchRopeTest {
                     .delete(MESSAGES, new byte[]{4})
                     .deleteRange(MESSAGES, KeyRange.between(new byte[]{5}, new byte[]{6}));
             for (var round = 0; round < 2; round++) {
-                batch.prepare(false);
+                batch.prepare(false, null, Map.of());
                 var home = batch.home(0);
                 assertEquals(5_000, home.byteSize());
                 assertTrue(home.isReadOnly());
@@ -214,7 +214,7 @@ class BatchRopeTest {
             assertTrue(batch.chunksForTests() > 0);
             assertArrayEquals(new byte[]{3}, bytes(batch.key(2)));
             assertArrayEquals(value(3, 2_000), bytes(batch.value(2)));
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             assertArrayEquals(value(3, 2_000), bytes(batch.home(2).asSlice(batch.homeOffset(2), 2_000)));
             assertNull(batch.home(1));
         }
@@ -226,7 +226,7 @@ class BatchRopeTest {
             batch.put(MESSAGES, new byte[]{1}, new byte[100_000]).put(MESSAGES, new byte[]{2}, new byte[100_000]).put(MESSAGES, new byte[]{3}, new byte[100_000]);
             batch.compact();
             assertArrayEquals(new byte[]{3}, bytes(batch.key(2)));
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             assertArrayEquals(new byte[100_000], bytes(batch.home(2).asSlice(batch.homeOffset(2), 100_000)));
             batch.finish();
             assertTrue(batch.isEmpty());
@@ -239,7 +239,7 @@ class BatchRopeTest {
             for (var i = 0; i < 500; i++) {
                 batch.put(i % 5 == 0 ? SESSIONS : MESSAGES, key(i), value(i, 1_000 + i));
             }
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             for (var i = 0; i < 500; i++) {
                 var home = batch.home(i);
                 if (i % 5 == 0) {
@@ -261,7 +261,7 @@ class BatchRopeTest {
                 batch.put(MESSAGES, key(i), new byte[10_000]);
             }
             var chunks = batch.chunksForTests();
-            batch.prepare(true);
+            batch.prepare(true, null, Map.of());
             assertNull(batch.home(0));
             var before = pool.pooledBytesForTests();
             batch.finish();
@@ -277,7 +277,7 @@ class BatchRopeTest {
             for (var i = 0; i < 29 + last; i++) {
                 batch.put(MESSAGES, key(i), value(i, 9_000));
             }
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             assertEquals(CHUNK, batch.home(0).byteSize());
             var lastWrite = 29 + last - 1;
             assertEquals(home, batch.home(lastWrite).byteSize());
@@ -293,7 +293,7 @@ class BatchRopeTest {
             for (var i = 0; i < 20; i++) {
                 batch.put(MESSAGES, key(i), value(i, length));
             }
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             var homes = new HashSet<MemorySegment>();
             for (var i = 0; i < 20; i++) {
                 var home = batch.home(i);
@@ -321,7 +321,7 @@ class BatchRopeTest {
                 batch.put(MESSAGES, key(i + 1), value(i + 1, 1_100));
                 total += CHUNK / 2 - 1 + 1_100;
             }
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             var homes = new HashSet<MemorySegment>();
             for (var i = 0; i < 20; i++) {
                 homes.add(batch.home(i));
@@ -337,20 +337,20 @@ class BatchRopeTest {
             for (var i = 0; i < 40; i++) {
                 batch.put(MESSAGES, key(i), value(i, 9_000));
             }
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             var homes = new MemorySegment[40];
             for (var i = 0; i < 40; i++) {
                 homes[i] = batch.home(i);
             }
             var chunks = batch.chunksForTests();
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             for (var i = 0; i < 40; i++) {
                 assertSame(homes[i], batch.home(i));
             }
             assertEquals(chunks, batch.chunksForTests());
             batch.put(MESSAGES, key(40), value(40, 9_000));
             assertEquals(chunks + 1, batch.chunksForTests());
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             for (var i = 0; i < 40; i++) {
                 assertSame(homes[i], batch.home(i));
                 assertArrayEquals(value(i, 9_000), bytes(homes[i].asSlice(batch.homeOffset(i), 9_000)));
@@ -366,7 +366,7 @@ class BatchRopeTest {
             for (var i = 0; i < 40; i++) {
                 batch.put(MESSAGES, key(i), value(i, 9_000));
             }
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             var home = batch.home(0);
             var last = batch.home(39);
             assertNotEquals(CHUNK, last.byteSize());
@@ -381,7 +381,7 @@ class BatchRopeTest {
                     other.put(MESSAGES, key(i), new byte[9_000]);
                     Arrays.fill(other.valueArray(i), other.valueArrayOffset(i), other.valueArrayOffset(i) + 9_000, (byte) 0x7F);
                 }
-                other.prepare(true);
+                other.prepare(true, null, Map.of());
                 other.finish();
             }
             assertArrayEquals(value(0, 9_000), bytes(home.asSlice(0, 9_000)));
@@ -396,7 +396,7 @@ class BatchRopeTest {
             for (var i = 0; i < 40; i++) {
                 batch.put(MESSAGES, key(i), value(i, 9_000));
             }
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             var before = pool.pooledBytesForTests();
             batch.clear();
             assertEquals(before + 2L * CHUNK, pool.pooledBytesForTests());
