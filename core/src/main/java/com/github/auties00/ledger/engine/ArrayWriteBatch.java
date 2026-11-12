@@ -53,6 +53,13 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// batch fills its own chunks in one go, and the slab's would come on top of what a history sync's batches take
     /// already.
     private static final int SLAB_WRITES = 16;
+    /// The least values of paged key spaces of a batch that would keep them on an array of their size that go to a
+    /// [ValueSlab] as one run whatever [ValueSlab.Overwrites] says of their key spaces: that array stays until the last
+    /// of its values is replaced, as a chunk does, so only a smaller batch, whose array goes as soon as its few values
+    /// do, has its values judged.
+    private static final int RUN_VALUES = 8;
+    // What placeOnSlab returns when it took values, rather than the bytes it counted toward the slab's rate
+    private static final long PLACED = -1;
     // No write has a home: the store copies every value it keeps
     private static final byte HOMES_NONE = 0;
     // Every write's home is the batch's own view
@@ -66,6 +73,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     private static final byte HOMES_PER_WRITE = 4;
     // As HOMES_CHUNKS, but packedHome is the shared view of a slab's chunk, which no commit allocates
     private static final byte HOMES_SLAB = 5;
+    // A paged write's home is packedHome, the shared view of a slab's chunk the batch's bytes were copied to as one run,
+    // at runStart plus the offset of its value in the batch's array; a resident one has none
+    private static final byte HOMES_SLAB_RUN = 6;
 
     /// A write of a value under a key.
     public static final byte PUT = 0;
@@ -102,8 +112,11 @@ public final class ArrayWriteBatch implements WriteBatch {
     private byte[] spare;
     // Where the store's versions find the values, as prepare decided: one of the HOMES_ constants
     private byte homesMode;
-    // In HOMES_CHUNKS and HOMES_SLAB, the read-only segment the values of the paged writes were copied into
+    // In HOMES_CHUNKS, HOMES_SLAB and HOMES_SLAB_RUN, the read-only segment the values of the paged writes were copied
+    // into
     private MemorySegment packedHome;
+    // In HOMES_SLAB_RUN, what the offset of a value in the batch's array is moved by to be its offset in packedHome
+    private int runStart;
     // In HOMES_PER_WRITE, the read-only segment the value of each paged write was copied into: a slab's chunks, more than
     // one of them or beside the array of the values it did not take
     private MemorySegment[] perWriteHomes;
@@ -113,7 +126,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     private Object[] values;
     // Per write: first offset and length, then second offset and length (value, or upper bound of a range). Only the low
     // half of the first length is the length: in HOMES_CHUNKS, HOMES_SLAB and HOMES_PER_WRITE the high half is where
-    // the write's value is in its home
+    // the write's value is in its home, and every prepare that picks one of them writes it for each write it gives one
     private long[] spans;
     // The array of each value of OWN_BYTES or more, or null before the first
     private byte[][] owns;
@@ -590,6 +603,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         packedHome = null;
         perWriteHomes = null;
         homesMode = HOMES_NONE;
+        runStart = 0;
         if (exposed) {
             dropData();
         }
@@ -726,7 +740,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// values, at most [#SLACK] bytes or a sixteenth besides, keeps them on its own array, [compacted][#compact()];
     /// any other has them copied, alone, into arrays below [#CHUNK_BYTES], and its own array goes back to the pool
     /// once the commit [ends][#finish()]. The small values of a small batch go to a [ValueSlab] while it takes them, and
-    /// the batch's array goes back the same way. On the batch's array, a message committed beside a session of 1.5 KiB
+    /// the batch's array goes back the same way; so do those of a batch that would keep them on an array of their size,
+    /// as [one run][#placeOnSlabRun(ValueSlab, Map, long)], which no young collection copies as it would that array. On
+    /// the batch's array, a message committed beside a session of 1.5 KiB
     /// would keep the session's bytes, which the store holds a copy of already, until the next checkpoint. A value on an
     /// array of its own stays there and counts for none of this. A batch on a rope has its paged values alone on their
     /// chunks already, which it hands over as they are, but for one that leaves more than [#SLACK] bytes or a sixteenth unused,
@@ -741,6 +757,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         packedHome = null;
         perWriteHomes = null;
         homesMode = HOMES_NONE;
+        runStart = 0;
         if (copies) {
             return;
         }
@@ -749,8 +766,14 @@ public final class ArrayWriteBatch implements WriteBatch {
             return;
         }
         var paged = pagedValueBytes;
-        if (paged > 0 && size <= SLAB_WRITES && slab != null && !slab.off() && placeOnSlab(slab, states)) {
-            return;
+        var measured = paged > 0 && slab != null && !slab.off();
+        // The bytes a small batch's placement counted toward the slab's rate, which a run counts no more
+        var noted = -1L;
+        if (measured && size <= SLAB_WRITES) {
+            noted = placeOnSlab(slab, states);
+            if (noted == PLACED) {
+                return;
+            }
         }
         // A batch of resident writes alone keeps them on its array as before, where the store's rule for resident
         // values finds it small enough; any other copies them, so the paged values' array holds none
@@ -759,6 +782,9 @@ public final class ArrayWriteBatch implements WriteBatch {
             return;
         }
         if (used - kept <= Math.max(SLACK, used / 16)) {
+            if (measured && placeOnSlabRun(slab, states, noted)) {
+                return;
+            }
             compact();
             homesMode = HOMES_OWN;
             exposed = true;
@@ -805,8 +831,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// or a value the slab declined makes, has a home per write, and the values the slab did not take go on an array of
     /// their bytes.
     ///
-    /// @return whether it took any, so every paged write has its home
-    private boolean placeOnSlab(ValueSlab slab, Map<String, KeyspaceState> states) {
+    /// @return [#PLACED] if it took any, so every paged write has its home, or else the bytes it counted toward the
+    ///         slab's rate
+    private long placeOnSlab(ValueSlab slab, Map<String, KeyspaceState> states) {
         var accepting = slab.accepting();
         var eligible = 0L;
         var placedBytes = 0L;
@@ -843,12 +870,12 @@ public final class ArrayWriteBatch implements WriteBatch {
         }
         slab.note(eligible);
         if (first == null) {
-            return false;
+            return eligible;
         }
         if (several == null && !declined) {
             packedHome = first;
             homesMode = HOMES_SLAB;
-            return true;
+            return PLACED;
         }
         perWriteHomes = several != null ? several : new MemorySegment[size];
         homesMode = HOMES_PER_WRITE;
@@ -865,6 +892,78 @@ public final class ArrayWriteBatch implements WriteBatch {
                 perWriteHomes[i] = packedHome;
             } else if (perWriteHomes[i] == null) {
                 perWriteHomes[i] = first;
+            }
+        }
+        return PLACED;
+    }
+
+    /// Gives `slab` the values of the paged writes of a batch that would keep them on an array of their size, as one run
+    /// of the batch's array from the first of them to the end of the last, if it is accepting them, and counts them
+    /// toward its rate whether it is or not, beyond the `noted` bytes [#placeOnSlab(ValueSlab, Map)] counted of the
+    /// batch, unless the run is [longer][ValueSlab#runFits(long)] than a chunk takes: those values are bytes the slab
+    /// could never take, which must not turn it hot.
+    ///
+    /// A run of [#RUN_VALUES] values or more is taken whatever their key spaces' [overwrites][ValueSlab.Overwrites]
+    /// say, values for the file of large values included, as the array would take them; a smaller one only if each of
+    /// its values is one the slab takes alone, which `placeOnSlab` has judged already when it ran. The run takes the
+    /// bytes of the keys between the values too, which the heap the commit is estimated to hold counts as the array's
+    /// would be: the batch keeps on it only the values and at most [#SLACK] bytes or a sixteenth besides. The slab copies
+    /// a run whole or not at all, so either every paged write has its home on the one chunk or the batch is as it was.
+    ///
+    /// The batch's array is copied, never exposed: it goes back to the pool once the commit ends, unless a former
+    /// prepare of a commit that failed exposed it.
+    ///
+    /// @param noted the bytes `placeOnSlab` counted toward the slab's rate, or -1 if it did not run
+    /// @return whether the slab took the run, so every paged write has its home
+    private boolean placeOnSlabRun(ValueSlab slab, Map<String, KeyspaceState> states, long noted) {
+        var values = 0;
+        var first = -1;
+        var start = Long.MAX_VALUE;
+        var end = 0L;
+        for (var i = 0; i < size; i++) {
+            if (!packed(i)) {
+                continue;
+            }
+            var offset = spans[i * 4 + 2];
+            if (first < 0) {
+                first = i;
+            }
+            values++;
+            start = Math.min(start, offset);
+            end = Math.max(end, offset + spans[i * 4 + 3]);
+        }
+        if (values < RUN_VALUES && (noted >= 0 || !eachTaken(states))) {
+            return false;
+        }
+        var length = end - start;
+        if (!slab.runFits(length)) {
+            return false;
+        }
+        slab.note(pagedValueBytes - Math.max(noted, 0));
+        var slot = first * 4 + 1;
+        var home = slab.placeRun(data, (int) start, (int) length, spans, slot);
+        if (home == null) {
+            return false;
+        }
+        // The slab puts where the run starts in the high half of the slot, which no other prepare reads before writing
+        runStart = (int) (spans[slot] >>> 32) - (int) start;
+        spans[slot] = (int) spans[slot];
+        packedHome = home;
+        homesMode = HOMES_SLAB_RUN;
+        return true;
+    }
+
+    /// {@return whether a slab would take each value of the paged writes alone: none is empty or for the file of large
+    /// values, and each one's key space does not overwrite or remove most of what it writes}
+    private boolean eachTaken(Map<String, KeyspaceState> states) {
+        for (var i = 0; i < size; i++) {
+            if (!packed(i)) {
+                continue;
+            }
+            var length = spans[i * 4 + 3];
+            var state = states.get(targets[i].name());
+            if (length == 0 || length >= state.largeValues || !state.overwrites.worthwhile()) {
+                return false;
             }
         }
         return true;
@@ -913,7 +1012,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         Objects.checkIndex(index, size);
         return switch (homesMode) {
             case HOMES_OWN -> spans[index * 4 + 2] == OWN ? null : view;
-            case HOMES_CHUNKS, HOMES_SLAB -> packed(index) ? packedHome : null;
+            case HOMES_CHUNKS, HOMES_SLAB, HOMES_SLAB_RUN -> packed(index) ? packedHome : null;
             case HOMES_ROPE -> packed(index) ? chunks[(int) (spans[index * 4 + 2] >>> 32)].home : null;
             case HOMES_PER_WRITE -> packed(index) ? perWriteHomes[index] : null;
             default -> null;
@@ -929,6 +1028,7 @@ public final class ArrayWriteBatch implements WriteBatch {
             case HOMES_OWN -> spans[index * 4 + 2] == OWN ? 0 : Math.toIntExact(spans[index * 4 + 2]);
             case HOMES_CHUNKS, HOMES_SLAB, HOMES_PER_WRITE -> packed(index) ? (int) (spans[index * 4 + 1] >>> 32) : 0;
             case HOMES_ROPE -> packed(index) ? (int) spans[index * 4 + 2] : 0;
+            case HOMES_SLAB_RUN -> packed(index) ? runStart + (int) spans[index * 4 + 2] : 0;
             default -> 0;
         };
     }
@@ -936,7 +1036,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// {@return whether the last prepare put the values the store keeps on one chunk of a [ValueSlab], whose view the
     /// slab shares, so the commit allocates no array, view or session for them}
     boolean sharesChunk() {
-        return homesMode == HOMES_SLAB;
+        return homesMode == HOMES_SLAB || homesMode == HOMES_SLAB_RUN;
     }
 
     /// Starts the batch again, empty, once the store has applied its writes: it hands over to the store the arrays the

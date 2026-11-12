@@ -21,7 +21,9 @@ import java.util.function.LongSupplier;
 /// view's session: three objects beside its [Version], all of which live until a checkpoint, several young collections
 /// later, so at hundreds of thousands of writes a second the collector spends a good part of its time copying them
 /// from survivor space to survivor space and to the old generation. Here a value is a span of a chunk's one view, which
-/// its version holds as the view, an offset and a length. An array just short of a region is humongous, so it takes
+/// its version holds as the view, an offset and a length; a batch of many values [places][#placeRun(byte\[\], int, int, long\[\], int)]
+/// the bytes from its first value to its last as one run, keys between them included, with one claim and one copy, in
+/// place of the array of their size it would keep them on. An array just short of a region is humongous, so it takes
 /// the region alone and no young or mixed collection copies it. An array of half a region to almost a whole one would
 /// waste what it leaves of its region, and a smaller one would be copied whole, so every chunk is
 /// [the same size][#capacity()].
@@ -67,6 +69,9 @@ final class ValueSlab {
     /// The chunks a store holds at once, a power of two: the tails of more would be heap neither the values nor a
     /// checkpoint needs.
     private static final int MAX_HELD = 8;
+    /// The fraction of a chunk a [run][#placeRun(byte\[\], int, int, long\[\], int)] may take at most, so a chunk retired
+    /// for lack of room for one leaves no more than that unused.
+    private static final int RUN_SHARE = 16;
     /// The fraction of the heap the chunks every store of the process holds at once may take.
     private static final int HEAP_SHARE = 64;
     /// The stripes of the chunks, as many as [KeySlab]'s, so threads running at once seldom share one, up to
@@ -289,6 +294,38 @@ final class ValueSlab {
             }
             // Another thread claimed from the chunk meanwhile: the loop reads its new end
         }
+    }
+
+    /// {@return whether a [run][#placeRun(byte\[\], int, int, long\[\], int)] of `length` bytes is one the slab could
+    /// take once hot: no longer than a [#RUN_SHARE]th of a chunk, any length while the slab does not know the region}
+    ///
+    /// A batch counts toward the rate only the runs this accepts, so runs no chunk takes never turn the slab hot; while
+    /// the region is unknown they still count, so a store that commits them fast enough learns it.
+    boolean runFits(long length) {
+        var size = capacity;
+        return size == 0 || length <= size / RUN_SHARE;
+    }
+
+    /// Copies a run of a batch's bytes, which holds the values of many writes, into a chunk whole, with one claim and one
+    /// copy, unless the slab declines it: it is not [accepting][#accepting()], the run takes more than a
+    /// [#RUN_SHARE]th of a chunk, another thread is making the chunk of its stripe, or the limits refuse the stripe one.
+    /// Never places part of a run, and never waits for another thread.
+    ///
+    /// A run is bounded so the chunk it does not fit, which is retired with what it leaves unused, leaves at most a
+    /// [#RUN_SHARE]th of itself, which the heap estimate of the backlog counts as slack.
+    ///
+    /// @param source the array holding the run
+    /// @param offset where the run starts in `source`
+    /// @param length the bytes of the run, more than 0
+    /// @param spans the high half of the element at `slot` receives where the run starts in the chunk
+    /// @param slot the element of `spans`
+    /// @return the read-only view of the chunk that holds the run, or `null` if the slab declined it
+    MemorySegment placeRun(byte[] source, int offset, int length, long[] spans, int slot) {
+        var size = capacity;
+        if (size == 0 || length > size / RUN_SHARE || !accepting()) {
+            return null;
+        }
+        return place(source, offset, length, spans, slot);
     }
 
     /// Gives stripe `stripe`, which held `full`, its next chunk.

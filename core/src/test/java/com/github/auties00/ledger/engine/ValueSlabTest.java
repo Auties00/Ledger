@@ -107,7 +107,7 @@ class ValueSlabTest {
         }
 
         @Test
-        @DisplayName("a batch of many writes, a value of half a batch chunk or more, an empty one and one for the file of large values stay off a hot slab")
+        @DisplayName("a batch of many writes goes to a hot slab as one run; an empty value and one for the file of large values stay off it")
         void declines(@TempDir Path directory) throws Exception {
             try (var ledger = (LiveLedger) store(directory).largeValues(64 << 10).build()) {
                 ledger.valueSlab().forceHotForTests(REGION);
@@ -116,8 +116,16 @@ class ValueSlabTest {
                     many.put(MESSAGES, new byte[]{1, (byte) i}, filled(100, i));
                 }
                 ledger.commit(many).awaitDurable();
+                assertEquals(1, ledger.valueSlab().heldForTests());
+                var chunk = head(ledger, MESSAGES, new byte[]{1, 0}).sourceForTests();
+                for (var i = 0; i < 17; i++) {
+                    var version = head(ledger, MESSAGES, new byte[]{1, (byte) i});
+                    assertEquals(CHUNK, version.sourceBytesForTests());
+                    assertEquals(chunk, version.sourceForTests());
+                    assertArrayEquals(filled(100, i), ledger.get(MESSAGES, new byte[]{1, (byte) i}).orElseThrow());
+                }
+                ledger.valueSlab().tick(true);
                 assertEquals(0, ledger.valueSlab().heldForTests());
-                assertTrue(head(ledger, MESSAGES, new byte[]{1, 0}).sourceBytesForTests() < CHUNK);
                 ledger.commit(ledger.newBatch().put(MESSAGES, new byte[]{2}, new byte[0])).awaitDurable();
                 assertEquals(0, ledger.valueSlab().heldForTests());
                 ledger.commit(ledger.newBatch().put(MESSAGES, new byte[]{3}, filled(70_000, 3))).awaitDurable();
