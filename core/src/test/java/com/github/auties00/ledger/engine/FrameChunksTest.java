@@ -49,8 +49,9 @@ class FrameChunksTest {
     }
 
     static Stream<Arguments> boundaries() {
-        // From the boundary itself to past the longest varint and reference before it, at the first and third chunk
-        return WRITES.stream().flatMap(write -> IntStream.rangeClosed(0, 26)
+        // From the boundary itself to past the room a write checks for before it, so a write that fits whole before
+        // the boundary takes the path that checks no field, at the first and third chunk
+        return WRITES.stream().flatMap(write -> IntStream.rangeClosed(0, 40)
                 .mapToObj(before -> Arguments.of(write, before, before % 2 == 0 ? 1 : 3)));
     }
 
@@ -192,6 +193,8 @@ class FrameChunksTest {
         body.handOff();
         body.release();
         assertThrows(IllegalStateException.class, body::chunkCount);
+        assertThrows(IllegalStateException.class, () -> body.chunk(0));
+        assertThrows(IllegalStateException.class, () -> body.chunkLength(0));
         assertThrows(IllegalStateException.class, body::array);
         assertEquals(CHUNK + 100, body.size());
     }

@@ -28,11 +28,14 @@ import java.util.Arrays;
 /// Numbers are unsigned LEB128 varints; keys are never empty, so a bound of length 0 is an absent bound.
 ///
 /// A body made with a [HeapPool] keeps its bytes past [#CHUNK_BYTES] in chunks of that size from the pool, every one
-/// but the last full, where one array would grow by doubling: a large commit's body otherwise took an array of
-/// megabytes, zeroed, which the collector gave regions of their own, read once by the log and then left as garbage.
-/// The log hands the chunks back once it sealed the frame ([#release()]); a body the log never took goes back with
-/// [#discard()]. A chunked body is read through [#chunkCount()], [#chunk(int)] and [#chunkLength(int)]; [#array()]
-/// serves only a body of one array.
+/// but the last full, rather than in one array of megabytes that the collector would give regions of their own and that
+/// the log reads once. The log hands the chunks back once it sealed the frame ([#release()]); a body the log never took
+/// goes back with [#discard()]. A chunked body is read through [#chunkCount()], [#chunk(int)] and [#chunkLength(int)];
+/// [#array()] serves only a body of one array.
+///
+/// A write checks once that the array it writes has room for its longest encoding, and takes a path that checks each
+/// field only when it may not: that path, which grows the array or goes on in the next chunk, runs at a chunk boundary
+/// whichever field the boundary falls in, so the compiled write has no branch that only a rare alignment takes.
 final class FrameBody {
     /// A frame holding a commit.
     static final byte COMMIT = 1;
@@ -52,6 +55,9 @@ final class FrameBody {
     private static final byte DELETE = 1;
     private static final byte RANGE = 2;
     private static final byte EXTERNAL = 3;
+    // The most bytes a write takes beside its keys, value and unit reference: a kind and three numbers of up to ten
+    // bytes each
+    private static final int WRITE_FIELDS = 1 + 3 * 10;
 
     // The body is its writer's, which writes it or discards it
     private static final byte OPEN = 0;
@@ -70,6 +76,7 @@ final class FrameBody {
     private int base;
     // The chunks, data last, in the first chunkCount slots; null until the body passes CHUNK_BYTES
     private byte[][] chunks;
+    // The chunks in use, the first slots of chunks
     private int chunkCount;
     // OPEN, HANDED or RELEASED; written by the body's writer until it hands the body off, then by the log alone
     private byte state;
@@ -131,24 +138,37 @@ final class FrameBody {
         return base + size;
     }
 
-    /// {@return the arrays the body's bytes are in: one, or its chunks}
+    /// {@return the number of arrays the body's bytes are in: one, or its chunks}
     ///
     /// @throws IllegalStateException if the body is released
     int chunkCount() {
-        if (state == RELEASED) {
-            throw new IllegalStateException("The body is released");
-        }
+        checkHeld();
         return chunks == null ? 1 : chunkCount;
     }
 
     /// {@return the array `index` of the body's bytes, in order, below [#chunkCount()]}
+    ///
+    /// @throws IllegalStateException if the body is released
     byte[] chunk(int index) {
+        checkHeld();
         return chunks == null ? data : chunks[index];
     }
 
     /// {@return the bytes of the body in the array `index`: [#CHUNK_BYTES] for every chunk but the last}
+    ///
+    /// @throws IllegalStateException if the body is released
     int chunkLength(int index) {
+        checkHeld();
         return chunks == null || index == chunkCount - 1 ? size : CHUNK_BYTES;
+    }
+
+    /// Checks that the body still holds its bytes.
+    ///
+    /// @throws IllegalStateException if the body is released
+    private void checkHeld() {
+        if (state == RELEASED) {
+            throw new IllegalStateException("The body is released");
+        }
     }
 
     /// {@return a copy of the bytes of the body, gathered from its chunks; for tests}
@@ -208,6 +228,21 @@ final class FrameBody {
     }
 
     void put(int keyspace, MemorySegment key, MemorySegment value) {
+        var keyLength = key.byteSize();
+        var valueLength = value.byteSize();
+        if (data.length - size < WRITE_FIELDS + keyLength + valueLength) {
+            putChecked(keyspace, key, value);
+            return;
+        }
+        data[size++] = PUT;
+        putVarInt(keyspace);
+        putSegment(key, (int) keyLength);
+        putSegment(value, (int) valueLength);
+    }
+
+    /// Records a put as [#put(int, MemorySegment, MemorySegment)] does, checking the room for each field: for a write
+    /// that may grow the array or go on in the next chunk.
+    private void putChecked(int keyspace, MemorySegment key, MemorySegment value) {
         writeByte(PUT);
         writeVarInt(keyspace);
         writeSegment(key);
@@ -216,15 +251,31 @@ final class FrameBody {
 
     /// Records a put whose value is the unit `ref` of [BlobFile], holding `length` bytes.
     void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
+        var keyLength = key.byteSize();
+        if (data.length - size < WRITE_FIELDS + keyLength + PageRef.BYTES) {
+            putExternalChecked(keyspace, key, length, ref);
+            return;
+        }
+        data[size++] = EXTERNAL;
+        putVarInt(keyspace);
+        putSegment(key, (int) keyLength);
+        putVarInt(length);
+        ref.write(data, size);
+        size += PageRef.BYTES;
+    }
+
+    /// Records a put of a unit as [#putExternal(int, MemorySegment, long, PageRef)] does, checking the room for each
+    /// field.
+    private void putExternalChecked(int keyspace, MemorySegment key, long length, PageRef ref) {
         writeByte(EXTERNAL);
         writeVarInt(keyspace);
         writeSegment(key);
         writeVarInt(length);
-        if (data.length - size >= PageRef.BYTES) {
+        if (data.length - size >= PageRef.BYTES || grow(PageRef.BYTES)) {
             ref.write(data, size);
             size += PageRef.BYTES;
         } else {
-            // The reference may span two chunks
+            // The reference spans two chunks
             var bytes = new byte[PageRef.BYTES];
             ref.write(bytes, 0);
             writeBytes(bytes);
@@ -278,6 +329,18 @@ final class FrameBody {
     }
 
     void delete(int keyspace, MemorySegment key) {
+        var keyLength = key.byteSize();
+        if (data.length - size < WRITE_FIELDS + keyLength) {
+            deleteChecked(keyspace, key);
+            return;
+        }
+        data[size++] = DELETE;
+        putVarInt(keyspace);
+        putSegment(key, (int) keyLength);
+    }
+
+    /// Records a removal as [#delete(int, MemorySegment)] does, checking the room for each field.
+    private void deleteChecked(int keyspace, MemorySegment key) {
         writeByte(DELETE);
         writeVarInt(keyspace);
         writeSegment(key);
@@ -318,16 +381,15 @@ final class FrameBody {
 
     /// Writes the `length` bytes of `segment` across chunks, filling the last one first.
     private void writeSpanning(MemorySegment segment, int length) {
-        var offset = 0;
-        while (true) {
+        for (var offset = 0; offset < length; ) {
+            // A full chunk goes on in the next one first, so no copy is empty
+            if (size == data.length) {
+                nextChunk();
+            }
             var part = Math.min(length - offset, data.length - size);
             MemorySegment.copy(segment, ValueLayout.JAVA_BYTE, offset, data, size, part);
             size += part;
             offset += part;
-            if (offset == length) {
-                return;
-            }
-            nextChunk();
         }
     }
 
@@ -335,19 +397,34 @@ final class FrameBody {
         var length = bytes.length;
         if (length > data.length - size && !grow(length)) {
             // Across chunks, filling the last one first
-            var offset = 0;
-            while (true) {
+            for (var offset = 0; offset < length; ) {
+                if (size == data.length) {
+                    nextChunk();
+                }
                 var part = Math.min(length - offset, data.length - size);
                 System.arraycopy(bytes, offset, data, size, part);
                 size += part;
                 offset += part;
-                if (offset == length) {
-                    return;
-                }
-                nextChunk();
             }
+            return;
         }
         System.arraycopy(bytes, 0, data, size, length);
+        size += length;
+    }
+
+    /// Writes `value` as a varint where `data` has room for ten bytes after the ones written.
+    private void putVarInt(long value) {
+        while ((value & ~0x7FL) != 0) {
+            data[size++] = (byte) ((value & 0x7F) | 0x80);
+            value >>>= 7;
+        }
+        data[size++] = (byte) value;
+    }
+
+    /// Writes the `length` bytes of `segment`, after their length, where `data` has room for them.
+    private void putSegment(MemorySegment segment, int length) {
+        putVarInt(length);
+        MemorySegment.copy(segment, ValueLayout.JAVA_BYTE, 0, data, size, length);
         size += length;
     }
 
@@ -368,11 +445,7 @@ final class FrameBody {
             writeByte((byte) value);
             return;
         }
-        while ((value & ~0x7FL) != 0) {
-            data[size++] = (byte) ((value & 0x7F) | 0x80);
-            value >>>= 7;
-        }
-        data[size++] = (byte) value;
+        putVarInt(value);
     }
 
     /// Makes room for `extra` bytes past the ones written, which `data` lacks.

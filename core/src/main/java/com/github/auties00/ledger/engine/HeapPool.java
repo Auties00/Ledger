@@ -15,9 +15,8 @@ import java.util.concurrent.atomic.AtomicLong;
 /// last use: callers write before they read.
 ///
 /// The free arrays of a size none was taken of for a tick of the [IdleTicker], between one and two of its periods, go
-/// to the collector: a store whose last checkpoint left a megabyte of sealed arrays in its pool kept them as long as it
-/// stayed idle, which a process of many stores, most of them idle, paid for each; and the chunks the log hands back
-/// after a history sync stayed as long as the store went on taking the small arrays of its commits.
+/// to the collector, so neither a store idle after a checkpoint, in a process of many stores, nor one that goes on
+/// taking the small arrays of its commits after a history sync keeps the arrays it no longer takes.
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
