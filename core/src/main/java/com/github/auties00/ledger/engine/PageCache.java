@@ -52,6 +52,8 @@ final class PageCache implements IdleTicker.Watched {
     static final int BLOBS = 1;
     /// The first of the keys of the leaves delta records make, one per slot of a delta page of `ledger.data`.
     private static final int RECORDS = 2;
+    /// The least bytes [#admission()] gives while the limit allows it: 4,096 leaves.
+    private static final long MIN_ADMISSION = 16L << 20;
     /// The slots of a new table, and the fewest a table shrinks to.
     private static final int MIN_CAPACITY = 64;
     /// The most slots of a table, as three longs per slot must fit an array. At half of them, 2^28 entries of at least a
@@ -180,7 +182,7 @@ final class PageCache implements IdleTicker.Watched {
     ///             array cached again under other metadata could pass as the leaf of a nonce it does not hold
     /// @param referenced whether the unit counts as read, rather than written and maybe never read
     void put(long key, PageRef ref, byte[] unit, boolean referenced) {
-        if (unit.length > budget.limit() / 4) {
+        if (!holds(unit.length)) {
             // A unit this large would evict most of the cache for one read; what the page held is out of date
             remove(key);
             return;
@@ -278,15 +280,20 @@ final class PageCache implements IdleTicker.Watched {
         synchronized (lock) {
             var table = this.table;
             var slot = table.locate(key);
-            if (slot >= 0 && table.meta[3 * slot + 1] == ref.nonceHigh()
-                    && (int) (table.meta[3 * slot + 2] >>> 32) == ref.nonceLow()) {
+            if (slot >= 0 && table.holdsNonce(slot, ref)) {
                 drop(table, slot);
             }
         }
     }
 
     /// Drops whatever the cache holds at `key`.
+    ///
+    /// A key no slot tags returns without the lock, as a checkpoint drops the place of every unit it writes and does
+    /// not cache: a put of `key` that happened before the call is seen, and one that races it may stay either way.
     void remove(long key) {
+        if (table.find(key) < 0) {
+            return;
+        }
         synchronized (lock) {
             var table = this.table;
             var slot = table.locate(key);
@@ -363,6 +370,32 @@ final class PageCache implements IdleTicker.Watched {
     /// nothing}
     boolean hasRoom(long bytes) {
         return budget.total.get() + bytes <= budget.limit();
+    }
+
+    /// {@return whether the cache would keep a unit of `bytes` bytes: one above a quarter of the limit it never does}
+    boolean holds(long bytes) {
+        return bytes <= budget.limit() / 4;
+    }
+
+    /// {@return the bytes of leaves and delta pages one checkpoint may cache at the cost of evicting others}
+    ///
+    /// Half of this cache's share of the limit, so a checkpoint that writes more than the cache holds leaves it the
+    /// units it wrote first and the other half to the reads, rather than a turnover of units no one reads before the
+    /// clock takes them. At least [#MIN_ADMISSION] while that is at most half the limit, as a process of many stores
+    /// would otherwise cache next to nothing of what each of them writes.
+    long admission() {
+        return Math.max(budget.share() / 2, Math.min(budget.limit() / 2, MIN_ADMISSION));
+    }
+
+    /// {@return whether the cache holds the unit `ref` of the data file names, or the leaf its delta record makes, as
+    /// an entry a read used since the clock last passed it; for tests of what a checkpoint promotes}
+    boolean referencedForTests(PageRef ref) {
+        var key = dataKey(ref.page(), ref.slot());
+        synchronized (lock) {
+            var table = this.table;
+            var slot = table.locate(key);
+            return slot >= 0 && table.holdsNonce(slot, ref) && (table.flags[slot] & REFERENCED) != 0;
+        }
     }
 
     /// {@return the entries the clock holds, for tests that bound it}
@@ -559,6 +592,11 @@ final class PageCache implements IdleTicker.Watched {
                 slot = (slot + stride) & mask;
             }
             return -1;
+        }
+
+        /// {@return whether the entry of `slot` was cached under the nonce of `ref`, holding the lock of the cache}
+        boolean holdsNonce(int slot, PageRef ref) {
+            return meta[3 * slot + 1] == ref.nonceHigh() && (int) (meta[3 * slot + 2] >>> 32) == ref.nonceLow();
         }
 
         /// {@return the array of `slot` if it holds the unit the arguments name, or `null`}
