@@ -33,6 +33,10 @@ import java.util.concurrent.locks.ReentrantLock;
 /// Every unit of a checkpoint is sealed under a nonce made of 8 random bytes drawn for the checkpoint and a counter,
 /// so no nonce repeats under the store's key, even across a checkpoint that a crash cut short.
 ///
+/// The units a checkpoint replaced, and the delta records it dropped, leave the page cache once every reader has let go
+/// of them: each checkpoint and each tick of the [IdleTicker] drops those released since the last on a virtual thread
+/// ([#dropReleased()]). The clock would otherwise keep them, unread, until it evicted them or two ticks passed.
+///
 /// A checkpoint that fails before its superblock gives its pages back, and the next one retries. One that fails while
 /// it writes its superblock leaves it unknown whether that superblock is durable, so the pages it wrote stay in use and
 /// no checkpoint runs again until the store reopens: overwriting either superblock could leave none that authenticates.
@@ -193,6 +197,7 @@ final class Checkpointer implements IdleTicker.Watched {
         slab.tick(idle);
         if (!closed) {
             ledger.forgetLastCommits();
+            dropReleased();
         }
         if (!closed && ledger.sweepWaiting()) {
             startSweep();
@@ -202,6 +207,29 @@ final class Checkpointer implements IdleTicker.Watched {
         var due = idle ? logged + chunks >= IDLE_BACKLOG : !slab.hot() && chunks >= IDLE_BACKLOG;
         if (due && !closed && stopped == null && logged > 0) {
             start();
+        }
+    }
+
+    /// Drops from the page cache, on a virtual thread, the units and delta records no reader reads any more that the
+    /// data file and the file of large values let go of since the last drop, if any.
+    ///
+    /// The units of a checkpoint are released by the commit that finds every reader past it, which must not wait for
+    /// hundreds of thousands of removals, and a checkpoint that waited for them would hold up the commits that wait for
+    /// it. A thread the system refuses loses its lists, which only leaves the clock to evict what they name.
+    private void dropReleased() {
+        var data = space.takeReleased();
+        var external = blobs == null ? List.<List<PageRef>>of() : blobs.takeReleased();
+        if (data.isEmpty() && external.isEmpty()) {
+            return;
+        }
+        var cache = pages.cache();
+        try {
+            Thread.ofVirtual().name("ledger-cache-drop").start(() -> {
+                cache.removeAll(PageCache.DATA, data);
+                cache.removeAll(PageCache.BLOBS, external);
+            });
+        } catch (Throwable _) {
+            // The entries stay until the clock or the ticker evicts them
         }
     }
 
@@ -375,6 +403,7 @@ final class Checkpointer implements IdleTicker.Watched {
             if (stopped != null) {
                 throw stopped;
             }
+            dropReleased();
             // Before the cut, so a write after it is never on a chunk these count as gone
             var slackAtCut = slab.slackBytes();
             var chunksAtCut = slab.retiredChunkBytes();
@@ -461,7 +490,8 @@ final class Checkpointer implements IdleTicker.Watched {
             } finally {
                 ledger.readers().unregister(cut.sequence());
             }
-            ledger.publish(cut, number, roots, catalog, freeList, blobFreeList, freed, update.freedExternal(), adopted);
+            ledger.publish(cut, number, roots, catalog, freeList, blobFreeList, freed, update.droppedRecords(),
+                    update.freedExternal(), adopted);
             publishedBytes = cut.logBytes();
             publishedHeap = cut.logHeap();
             publishedSlack = slackAtCut;

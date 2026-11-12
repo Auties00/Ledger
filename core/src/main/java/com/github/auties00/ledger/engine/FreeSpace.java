@@ -13,6 +13,10 @@ import java.util.List;
 /// published, until every reader is past it ([#releasePassed(long)]). Pages a checkpoint took and then gave up never
 /// reached a durable state, and are free at once.
 ///
+/// The units whose pages it frees once the readers are past, and the delta records a checkpoint dropped with them, then
+/// wait for [#takeReleased()], as the lists [#pend(long, List, List)] took: the page cache may still hold them, and
+/// dropping them there is no work for the commit that found the readers past.
+///
 /// It is safe for concurrent use: the writer releases pages while a checkpoint takes them.
 final class FreeSpace {
     private final Object lock;
@@ -25,6 +29,8 @@ final class FreeSpace {
     private int runCursor;
     private int pageCount;
     private final ArrayDeque<Pending> pending;
+    // The lists of units and delta records releasePassed let go of since the last takeReleased, or null if none
+    private ArrayList<List<PageRef>> released;
 
     /// Creates the free space of a file of `pageCount` pages whose free pages are the set bits of `free`.
     FreeSpace(int pageCount, BitSet free) {
@@ -133,25 +139,63 @@ final class FreeSpace {
 
     /// Frees `units` once every reader is past `published`.
     void pend(long published, List<PageRef> units) {
-        if (units.isEmpty()) {
+        pend(published, units, List.of());
+    }
+
+    /// Frees `units` once every reader is past `published`, and then hands them to [#takeReleased()] with `records`.
+    ///
+    /// The lists are kept as they are, so no one may change them from now on.
+    ///
+    /// @param records delta records the checkpoint dropped, which no reader past `published` reads either; their pages
+    ///                are not freed, as their delta pages may hold live records
+    void pend(long published, List<PageRef> units, List<PageRef> records) {
+        if (units.isEmpty() && records.isEmpty()) {
             return;
         }
         synchronized (lock) {
-            pending.add(new Pending(published, units));
+            pending.add(new Pending(published, units, records));
         }
     }
 
-    /// Frees the pending pages of every checkpoint published at a sequence below `oldestReader`.
+    /// Frees the pending pages of every checkpoint published at a sequence below `oldestReader`, and hands their lists
+    /// to [#takeReleased()].
+    ///
+    /// It hands each list over whole, as it runs on the commit path.
     ///
     /// @param oldestReader the lowest sequence a reader reads at, or [Long#MAX_VALUE] if none is reading
     void releasePassed(long oldestReader) {
         synchronized (lock) {
             while (!pending.isEmpty() && pending.peekFirst().published() < oldestReader) {
-                for (var unit : pending.pollFirst().units()) {
+                var passed = pending.pollFirst();
+                for (var unit : passed.units()) {
                     free.set(unit.page(), unit.page() + unit.pages());
                     lowestFree = Math.min(lowestFree, unit.page());
                 }
+                handOver(passed.units());
+                handOver(passed.records());
             }
+        }
+    }
+
+    private void handOver(List<PageRef> refs) {
+        if (refs.isEmpty()) {
+            return;
+        }
+        if (released == null) {
+            released = new ArrayList<>();
+        }
+        released.add(refs);
+    }
+
+    /// {@return the lists of units and delta records [#releasePassed(long)] let go of since the last call, which no
+    /// reader reads any more; empty if none}
+    ///
+    /// A page among them may already hold a unit a later checkpoint wrote, under another nonce.
+    List<List<PageRef>> takeReleased() {
+        synchronized (lock) {
+            var taken = released;
+            released = null;
+            return taken == null ? List.of() : taken;
         }
     }
 
@@ -232,6 +276,7 @@ final class FreeSpace {
     ///
     /// @param published the latest sequence when the checkpoint was published
     /// @param units the units it freed
-    private record Pending(long published, List<PageRef> units) {
+    /// @param records the delta records it dropped, whose pages stay in use
+    private record Pending(long published, List<PageRef> units, List<PageRef> records) {
     }
 }
