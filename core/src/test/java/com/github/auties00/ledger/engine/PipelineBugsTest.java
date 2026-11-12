@@ -63,7 +63,7 @@ class PipelineBugsTest {
             ledger.commit(ledger.newBatch().deleteRange(VALUES, KeyRange.all()));
             assertEquals(Optional.empty(), ledger.get(VALUES, "k"));
             // A commit of "k" given its sequence, its write not applied yet
-            var claimer = new PendingCommit(null, null, null, null, null, null);
+            var claimer = new PendingCommit(null, null, null, null, null, null, null);
             ledger.state(VALUES).chain(key("k")).claim(claimer, ledger.latest() + 100);
             snapshot.close();
             // Its publication applies the removal

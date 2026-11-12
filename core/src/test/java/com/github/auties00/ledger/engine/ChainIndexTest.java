@@ -380,4 +380,266 @@ class ChainIndexTest {
         }
         assertEquals(found, index.size());
     }
+
+    @Test
+    @DisplayName("a block of lookups finds what a lookup of each key finds, through colliding hashes, tombstones, growth and shrinking")
+    void lookupsModel() {
+        var random = new SplittableRandom(11);
+        for (var trial = 0; trial < 6; trial++) {
+            // Two key spaces' indexes, which one block looks up in at once
+            var indexes = new ChainIndex[]{new ChainIndex(), new ChainIndex()};
+            var models = java.util.List.of(new HashMap<String, Chain>(), new HashMap<String, Chain>());
+            var forced = new int[]{0x0000FFFF, 0x0000FFFE, 0x0000FFEF, 0x7C00000F, 0};
+            var lookups = new ChainIndex.Lookups(random.nextBoolean());
+            for (var step = 0; step < 120_000; step++) {
+                var many = (step / 30_000) % 2 == 0;
+                var which = random.nextInt(2);
+                var index = indexes[which];
+                var model = models.get(which);
+                var id = random.nextInt(many ? 3_000 : 300);
+                var bytes = keyBytes(id);
+                var name = java.util.HexFormat.of().formatHex(bytes);
+                var hash = forced[Math.floorMod(java.util.Arrays.hashCode(bytes), forced.length)];
+                var key = MemorySegment.ofArray(bytes).asReadOnly();
+                if (random.nextInt(3) != 0) {
+                    var created = SLAB.chain(key, hash);
+                    if (index.putIfAbsent(created) == null) {
+                        model.put(name, created);
+                    }
+                } else {
+                    var held = model.remove(name);
+                    if (held != null) {
+                        index.remove(held);
+                    }
+                }
+                if (step % 37 == 0) {
+                    lookups.clear();
+                    var count = 1 + random.nextInt(ChainIndex.Lookups.BLOCK);
+                    var expected = new Chain[count];
+                    for (var at = 0; at < count; at++) {
+                        var into = random.nextInt(3);
+                        var lookedUp = keyBytes(random.nextInt(many ? 3_200 : 320));
+                        var lookedUpHash = forced[Math.floorMod(java.util.Arrays.hashCode(lookedUp), forced.length)];
+                        var segment = MemorySegment.ofArray(lookedUp);
+                        // A third of them in no index, as a key space that holds no chain looks up
+                        var target = into == 2 ? null : indexes[into];
+                        lookups.add(target, segment, lookedUpHash);
+                        expected[at] = target == null ? null : target.get(segment, lookedUpHash);
+                    }
+                    lookups.run();
+                    for (var at = 0; at < count; at++) {
+                        assertSame(expected[at], lookups.found(at), "lookup " + at + " of " + count + " at step " + step);
+                    }
+                }
+            }
+        }
+    }
+
+    // The key of `id`: 1 to 11 bytes
+    private static byte[] keyBytes(int id) {
+        var length = 1 + id % 11;
+        var bytes = new byte[length];
+        for (var i = 0; i < length; i++) {
+            bytes[i] = (byte) (id >>> (8 * (i % 4)));
+        }
+        bytes[length - 1] ^= (byte) (id / 256 + length);
+        return bytes;
+    }
+
+    @Test
+    @DisplayName("a block of lookups probes past a slot whose chain is not published yet, a tombstone and another key of the same tag")
+    void lookupsPastCandidates() {
+        var index = new ChainIndex();
+        // The same segment, tag and first slot of a small table, and different hashes: bit 4 alone differs
+        var hash = 0x00000001;
+        var sameTag = 0x00000011;
+        var inFlight = new Chain(MemorySegment.ofArray(new byte[]{1}).asReadOnly(), hash);
+        var sameHash = new Chain(MemorySegment.ofArray(new byte[]{2}).asReadOnly(), hash);
+        var otherHash = new Chain(MemorySegment.ofArray(new byte[]{3}).asReadOnly(), sameTag);
+        var removed = new Chain(MemorySegment.ofArray(new byte[]{4}).asReadOnly(), hash);
+        var behind = new Chain(MemorySegment.ofArray(new byte[]{5}).asReadOnly(), hash);
+        // The first slot holds a tag whose chain is not published, as an insertion holds it between its two stores
+        var slot = index.tagForTests(inFlight);
+        for (var chain : new Chain[]{sameHash, otherHash, removed, behind}) {
+            index.publishForTests(chain, index.tagForTests(chain));
+        }
+        index.remove(removed);
+        var lookups = new ChainIndex.Lookups(true);
+        var absent = MemorySegment.ofArray(new byte[]{6});
+        for (var key : new Chain[]{inFlight, sameHash, otherHash, removed, behind}) {
+            lookups.add(index, key.key(), key.hash);
+        }
+        lookups.add(index, absent, hash);
+        lookups.run();
+        assertNull(lookups.found(0), "a chain not published yet");
+        assertSame(sameHash, lookups.found(1));
+        assertSame(otherHash, lookups.found(2));
+        assertNull(lookups.found(3), "a removed chain");
+        assertSame(behind, lookups.found(4), "a chain behind a tombstone");
+        assertNull(lookups.found(5));
+        for (var at = 0; at < 6; at++) {
+            var key = at == 5 ? absent : new Chain[]{inFlight, sameHash, otherHash, removed, behind}[at].key();
+            assertSame(index.get(key, at == 2 ? sameTag : hash), lookups.found(at), "lookup " + at + " against get");
+        }
+        index.publishForTests(inFlight, slot);
+        lookups.clear();
+        lookups.add(index, inFlight.key(), hash);
+        lookups.run();
+        assertSame(inFlight, lookups.found(0));
+        assertSame(inFlight, index.get(inFlight.key(), hash));
+    }
+
+    @Test
+    @DisplayName("a block of lookups answers from the tables it read first while the index grows, shrinks and drops chains between its steps")
+    void lookupsStaleTables() {
+        var random = new SplittableRandom(13);
+        var index = new ChainIndex();
+        // Keys no change touches, which every lookup must find
+        var stable = new ArrayList<Chain>();
+        for (var key = 0L; key < 2_000; key++) {
+            var created = chain(key);
+            index.putIfAbsent(created);
+            stable.add(created);
+        }
+        // Every chain each changing key ever had
+        var held = new HashMap<Long, java.util.Set<Chain>>();
+        var current = new HashMap<Long, Chain>();
+        for (var key = 10_000L; key < 12_000; key++) {
+            var created = chain(key);
+            index.putIfAbsent(created);
+            current.put(key, created);
+            held.computeIfAbsent(key, _ -> java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>())).add(created);
+        }
+        var fresh = new long[]{1_000_000L};
+        for (var round = 0; round < 300; round++) {
+            var lookups = new ChainIndex.Lookups(random.nextBoolean());
+            var looked = new long[ChainIndex.Lookups.BLOCK];
+            for (var at = 0; at < looked.length; at++) {
+                looked[at] = random.nextBoolean() ? random.nextInt(2_000) : 10_000L + random.nextInt(2_000);
+                var bytes = keyOf(looked[at]);
+                lookups.add(index, bytes, Segments.hash(bytes));
+            }
+            lookups.runForTests(() -> {
+                // Drop and recreate changing keys, then grow the segments past a rebuild and shrink them back
+                for (var i = 0; i < 300; i++) {
+                    var key = 10_000L + random.nextInt(2_000);
+                    var chain = current.remove(key);
+                    if (chain != null) {
+                        index.remove(chain);
+                    } else {
+                        var created = chain(key);
+                        index.putIfAbsent(created);
+                        current.put(key, created);
+                        held.get(key).add(created);
+                    }
+                }
+                var added = new ArrayList<Chain>();
+                var count = random.nextInt(6_000);
+                for (var i = 0; i < count; i++) {
+                    var created = chain(fresh[0]++);
+                    index.putIfAbsent(created);
+                    added.add(created);
+                }
+                for (var chain : added) {
+                    index.remove(chain);
+                }
+            });
+            for (var at = 0; at < looked.length; at++) {
+                var found = lookups.found(at);
+                if (looked[at] < 2_000) {
+                    assertSame(stable.get((int) looked[at]), found, "a stable key in round " + round);
+                } else {
+                    assertTrue(found == null || held.get(looked[at]).contains(found), "a chain the key never had in round " + round);
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("blocks of lookups never miss a chain the index holds while writers add and remove others and the segments grow")
+    void lookupsConcurrent() throws Exception {
+        var index = new ChainIndex();
+        var stable = new ArrayList<Chain>();
+        for (var key = 0L; key < 5_000; key++) {
+            var created = chain(key);
+            index.putIfAbsent(created);
+            stable.add(created);
+        }
+        var stop = new AtomicBoolean();
+        var failure = new AtomicReference<Throwable>();
+        var start = new CountDownLatch(1);
+        var threads = new ArrayList<Thread>();
+        for (var t = 0; t < 3; t++) {
+            var seed = t;
+            threads.add(Thread.ofPlatform().start(() -> {
+                try {
+                    start.await();
+                    var random = new SplittableRandom(seed);
+                    while (!stop.get()) {
+                        var key = 1_000_000L + random.nextInt(200_000);
+                        if (random.nextInt(3) == 0) {
+                            var bytes = keyOf(key);
+                            var held = index.get(bytes, Segments.hash(bytes));
+                            if (held != null) {
+                                index.remove(held);
+                            }
+                        } else {
+                            index.putIfAbsent(chain(key));
+                        }
+                    }
+                } catch (Throwable throwable) {
+                    failure.compareAndSet(null, throwable);
+                }
+            }));
+        }
+        for (var t = 0; t < 3; t++) {
+            var seed = 100 + t;
+            threads.add(Thread.ofPlatform().start(() -> {
+                try {
+                    start.await();
+                    var random = new SplittableRandom(seed);
+                    var lookups = new ChainIndex.Lookups(seed % 2 == 0);
+                    var expected = new Chain[ChainIndex.Lookups.BLOCK];
+                    var keys = new MemorySegment[ChainIndex.Lookups.BLOCK];
+                    while (!stop.get()) {
+                        lookups.clear();
+                        var count = 1 + random.nextInt(ChainIndex.Lookups.BLOCK);
+                        for (var at = 0; at < count; at++) {
+                            if (random.nextInt(4) == 0) {
+                                // A key the writers add and remove: a lookup finds one of its chains or none
+                                keys[at] = keyOf(1_000_000L + random.nextInt(200_000));
+                                expected[at] = null;
+                            } else {
+                                var held = stable.get(random.nextInt(stable.size()));
+                                keys[at] = held.key();
+                                expected[at] = held;
+                            }
+                            lookups.add(index, keys[at], Segments.hash(keys[at]));
+                        }
+                        lookups.run();
+                        for (var at = 0; at < count; at++) {
+                            var found = lookups.found(at);
+                            if (expected[at] != null && found != expected[at]) {
+                                throw new AssertionError("a block of lookups missed a chain the index holds");
+                            }
+                            if (found != null && !found.keyEquals(keys[at])) {
+                                throw new AssertionError("a block of lookups found the chain of another key");
+                            }
+                        }
+                    }
+                } catch (Throwable throwable) {
+                    failure.compareAndSet(null, throwable);
+                }
+            }));
+        }
+        start.countDown();
+        Thread.sleep(2_000);
+        stop.set(true);
+        for (var thread : threads) {
+            thread.join();
+        }
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+    }
 }
