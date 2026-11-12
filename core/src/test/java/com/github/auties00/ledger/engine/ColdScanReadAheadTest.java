@@ -68,6 +68,8 @@ class ColdScanReadAheadTest {
 
         Tree(Path directory, boolean encrypted, long seed) throws IOException {
             this.directory = directory;
+            // A collection between two scans would free what the first read ahead into, which the second then allocates
+            pool.holdCollectableForTests(true);
             this.pages = PageFile.open(directory, new PageCipher(encrypted ? new SecretKeySpec(KEY, "AES") : null), 64L << 20, pool);
             this.random = new Random(seed);
         }
@@ -184,13 +186,13 @@ class ColdScanReadAheadTest {
             tree.pages.cache().clearForTests();
             var entries = entries(tree, from, to, descending, limit, wanted);
             var cached = tree.pages.cache().size();
-            var pooled = tree.pool.pooledBytesForTests();
+            var pooled = tree.pool.pooledBytesForTests() + tree.pool.collectableBytesForTests();
             tree.pages.cache().clearForTests();
             var threads = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
             var before = threads.getCurrentThreadAllocatedBytes();
             entries(tree, from, to, descending, limit, wanted);
             var allocated = threads.getCurrentThreadAllocatedBytes() - before;
-            return new Result(entries, cached, pooled, tree.pool.pooledBytesForTests(), allocated);
+            return new Result(entries, cached, pooled, tree.pool.pooledBytesForTests() + tree.pool.collectableBytesForTests(), allocated);
         } finally {
             tree.pages.forceColdReadsForTests(false);
         }
