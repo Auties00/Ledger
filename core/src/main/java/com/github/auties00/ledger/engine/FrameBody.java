@@ -82,20 +82,10 @@ final class FrameBody {
     // The bytes the body holds itself, in the first `used`
     private byte[] data;
     private int used;
-    // The shortest value the body refers to
-    private final int referable;
-    // The values the body refers to: their number and their bytes
-    private int references;
-    private int referencedBytes;
-    // The first reference, in fields of its own, as the body of a commit of one value has no other: its array, where in
-    // data its value belongs, and where in its array the value starts and how long it is
-    private byte[] firstArray;
-    private int firstAt;
-    private int firstOffset;
-    private int firstLength;
-    // The references after the first, in order, or null before the second
-    private byte[][] laterArrays;
-    private int[] laterSpans;
+    // The values the body refers to and the shortest it refers to, one shared and empty while it refers to none: apart,
+    // so the body of a commit that refers to nothing, as those of small values and of large batches do, has no field
+    // of references besides this one
+    private References referred;
 
     FrameBody() {
         this(256);
@@ -110,7 +100,7 @@ final class FrameBody {
     /// `referable` bytes a put offers on an array.
     FrameBody(int capacity, int referable) {
         this.data = new byte[Math.max(16, capacity)];
-        this.referable = referable;
+        this.referred = References.none(referable);
     }
 
     /// {@return the empty body of the frame of a transaction, which refers to its values of [#SEALED_REFERABLE]
@@ -168,69 +158,59 @@ final class FrameBody {
 
     /// {@return the bytes of a body that refers to no value; only the first [#size()] are meaningful}
     byte[] array() {
-        assert references == 0 : "the body refers to values";
+        assert referred.count == 0 : "the body refers to values";
         return data;
     }
 
     /// {@return the length of the body, the values it refers to included}
     int size() {
-        return used + referencedBytes;
+        return used + referred.bytes;
     }
 
     /// {@return the shortest value the body refers to rather than copies, [#NOT_REFERABLE] for none}
     int referable() {
-        return referable;
+        return referred.referable;
     }
 
     /// {@return the number of values the body refers to}
     int references() {
-        return references;
+        return referred.count;
     }
 
     /// {@return the number of pieces whose bytes, in order, are the body: a run of its own bytes, then for each value
     /// it refers to that value and the run after it}
     int pieces() {
-        return 2 * references + 1;
+        return 2 * references() + 1;
     }
 
     /// {@return the array piece `piece` is part of, which no one writes while the body is queued}
     byte[] pieceArray(int piece) {
-        return (piece & 1) == 0 ? data : referenceArray(piece >> 1);
+        return (piece & 1) == 0 ? data : referred.array(piece >> 1);
     }
 
     /// {@return where piece `piece` starts in its array}
     int pieceOffset(int piece) {
         var reference = piece >> 1;
         if ((piece & 1) != 0) {
-            return reference == 0 ? firstOffset : laterSpans[(reference - 1) * SPAN_FIELDS + 1];
+            return referred.offset(reference);
         }
-        return reference == 0 ? 0 : referenceAt(reference - 1);
+        return reference == 0 ? 0 : referred.at(reference - 1);
     }
 
     /// {@return the bytes of piece `piece`, maybe 0}
     int pieceLength(int piece) {
         var reference = piece >> 1;
         if ((piece & 1) != 0) {
-            return reference == 0 ? firstLength : laterSpans[(reference - 1) * SPAN_FIELDS + 2];
+            return referred.length(reference);
         }
-        return (reference == references ? used : referenceAt(reference)) - pieceOffset(piece);
-    }
-
-    /// {@return the array of reference `reference`}
-    private byte[] referenceArray(int reference) {
-        return reference == 0 ? firstArray : laterArrays[reference - 1];
-    }
-
-    /// {@return where in the body's own bytes the value of reference `reference` belongs}
-    private int referenceAt(int reference) {
-        return reference == 0 ? firstAt : laterSpans[(reference - 1) * SPAN_FIELDS];
+        return (reference == references() ? used : referred.at(reference)) - pieceOffset(piece);
     }
 
     /// Copies the body into `target` at `offset`, the values it refers to gathered.
     ///
     /// @return the offset after the body, `offset` plus [#size()]
     int copyTo(byte[] target, int offset) {
-        if (references == 0) {
+        if (referred.count == 0) {
             System.arraycopy(data, 0, target, offset, used);
             return offset + used;
         }
@@ -275,7 +255,7 @@ final class FrameBody {
         writeVarInt(keyspace);
         writeSegment(key);
         writeVarInt(length);
-        if (length < referable) {
+        if (length < referred.referable) {
             ensure(length);
             System.arraycopy(array, offset, data, used, length);
             used += length;
@@ -286,13 +266,71 @@ final class FrameBody {
 
     /// Records the `length` bytes at `offset` of `array` as the next bytes of the body, by reference.
     private void refer(byte[] array, int offset, int length) {
-        if (references == 0) {
-            firstArray = array;
-            firstAt = used;
-            firstOffset = offset;
-            firstLength = length;
+        var references = referred;
+        if (references.count == 0) {
+            referred = new References(references.referable, array, used, offset, length);
         } else {
-            var later = references - 1;
+            references.add(array, used, offset, length);
+        }
+    }
+
+    /// The values a body refers to, in order, and the shortest it refers to.
+    private static final class References {
+        // What a body that refers to no value holds, by the shortest value it would refer to; never changed
+        private static final References NONE = new References(NOT_REFERABLE);
+        private static final References RUN = new References(RUN_REFERABLE);
+        private static final References SEALED = new References(SEALED_REFERABLE);
+
+        // The shortest value the body refers to
+        private final int referable;
+        // The values: their number and their bytes
+        private int count;
+        private int bytes;
+        // The first, in fields of its own, as the body of a commit of one value has no other: its array, where in the
+        // body's own bytes its value belongs, and where in its array the value starts and how long it is
+        private final byte[] firstArray;
+        private final int firstAt;
+        private final int firstOffset;
+        private final int firstLength;
+        // The references after the first, in order, or null before the second
+        private byte[][] laterArrays;
+        private int[] laterSpans;
+
+        /// Makes the references of a body that refers to no value yet.
+        private References(int referable) {
+            this.referable = referable;
+            this.firstArray = null;
+            this.firstAt = 0;
+            this.firstOffset = 0;
+            this.firstLength = 0;
+        }
+
+        /// Makes the references of a body whose first reference is the `length` bytes at `offset` of `array`, which
+        /// belong at `at` of the body's own bytes.
+        References(int referable, byte[] array, int at, int offset, int length) {
+            this.referable = referable;
+            this.firstArray = array;
+            this.firstAt = at;
+            this.firstOffset = offset;
+            this.firstLength = length;
+            this.count = 1;
+            this.bytes = length;
+        }
+
+        /// {@return the references of a body that refers to no value yet, and to the values of at least `referable`
+        /// bytes later}
+        static References none(int referable) {
+            return switch (referable) {
+                case NOT_REFERABLE -> NONE;
+                case RUN_REFERABLE -> RUN;
+                case SEALED_REFERABLE -> SEALED;
+                default -> new References(referable);
+            };
+        }
+
+        /// Records the reference after the first, whose value belongs at `at` of the body's own bytes.
+        void add(byte[] array, int at, int offset, int length) {
+            var later = count - 1;
             if (laterArrays == null) {
                 laterArrays = new byte[LATER_REFERENCES][];
                 laterSpans = new int[LATER_REFERENCES * SPAN_FIELDS];
@@ -302,12 +340,32 @@ final class FrameBody {
             }
             laterArrays[later] = array;
             var span = later * SPAN_FIELDS;
-            laterSpans[span] = used;
+            laterSpans[span] = at;
             laterSpans[span + 1] = offset;
             laterSpans[span + 2] = length;
+            count++;
+            bytes += length;
         }
-        references++;
-        referencedBytes += length;
+
+        /// {@return the array of reference `reference`}
+        byte[] array(int reference) {
+            return reference == 0 ? firstArray : laterArrays[reference - 1];
+        }
+
+        /// {@return where in the body's own bytes the value of reference `reference` belongs}
+        int at(int reference) {
+            return reference == 0 ? firstAt : laterSpans[(reference - 1) * SPAN_FIELDS];
+        }
+
+        /// {@return where the value of reference `reference` starts in its array}
+        int offset(int reference) {
+            return reference == 0 ? firstOffset : laterSpans[(reference - 1) * SPAN_FIELDS + 1];
+        }
+
+        /// {@return the bytes of the value of reference `reference`}
+        int length(int reference) {
+            return reference == 0 ? firstLength : laterSpans[(reference - 1) * SPAN_FIELDS + 2];
+        }
     }
 
     /// Records a put whose value is the unit `ref` of [BlobFile], holding `length` bytes.
