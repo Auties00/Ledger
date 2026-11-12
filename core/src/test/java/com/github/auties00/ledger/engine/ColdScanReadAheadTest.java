@@ -196,13 +196,14 @@ class ColdScanReadAheadTest {
         }
     }
 
-    /// {@return the entries a cursor passes, at most `limit`, which then gives back what it read ahead into, as a scan
-    /// of the store does}
+    /// {@return the entries a cursor passes, at most `limit`, each counted as taken, which then gives back what it read
+    /// ahead into, as a scan of the store does}
     private static List<byte[][]> entries(Tree tree, byte[] from, byte[] to, boolean descending, int limit, long wanted) {
         var cursor = new TreeCursor(tree.pages, tree.root, from, to, descending, wanted);
         try {
             var entries = new ArrayList<byte[][]>();
             while (entries.size() < limit && cursor.next()) {
+                cursor.took();
                 entries.add(new byte[][]{cursor.key().toArray(ValueLayout.JAVA_BYTE), cursor.value().toArray(ValueLayout.JAVA_BYTE)});
             }
             return entries;
@@ -644,6 +645,43 @@ class ColdScanReadAheadTest {
         }
     }
 
+    @ParameterizedTest(name = "descending: {0}")
+    @ValueSource(booleans = {false, true})
+    @DisplayName("a cursor that stepped past the entries its scan wants without the scan taking them still reads ahead only as many values as the scan may take")
+    void wantedPastSteps(boolean descending, @TempDir Path directory) throws Exception {
+        try (var tree = new Tree(directory, true, descending ? 41 : 43)) {
+            var states = new TreeMap<byte[], byte[]>(UNSIGNED);
+            for (var i = 0; i < 1_000; i++) {
+                states.put(key(i), tree.bytes(6_000));
+            }
+            tree.apply(states);
+            tree.pages.cache().clearForTests();
+            for (var leaf : tree.leaves()) {
+                tree.pages.read(leaf.ref(), PageFile.NODE, true);
+            }
+            var wanted = 5;
+            tree.pages.forceColdReadsForTests(true);
+            var cursor = new TreeCursor(tree.pages, tree.root, null, null, descending, wanted);
+            try {
+                // A scan whose first entries memory hides: the cursor steps over them, and the scan takes none
+                var most = 0L;
+                for (var i = 0; i < 200; i++) {
+                    assertTrue(cursor.next(), "entry " + i);
+                    assertNotNull(cursor.value());
+                    most = Math.max(most, cursor.heldBytesForTests());
+                }
+                // Six blobs of two pages and the pages their reads join, rounded up to a size of the pool, where a
+                // gather bounded by nothing reads 64 of them
+                var bound = 256L << 10;
+                assertTrue(most > 0, "the scan read nothing ahead");
+                assertTrue(most <= bound, "the cursor held " + most + " bytes read ahead for " + wanted + " entries, against " + bound);
+            } finally {
+                cursor.release();
+                tree.pages.forceColdReadsForTests(false);
+            }
+        }
+    }
+
     @Test
     @DisplayName("units read ahead across gaps take an array the pool recycles, the pages between counted, and every one of them opens")
     void gapsWithinPool(@TempDir Path directory) throws Exception {
@@ -676,6 +714,49 @@ class ColdScanReadAheadTest {
                 }
             } finally {
                 pages.releasePrefetched(sealed);
+            }
+        }
+    }
+
+    @ParameterizedTest(name = "descending: {0}")
+    @ValueSource(booleans = {false, true})
+    @DisplayName("a sibling read ahead that authenticates but cannot be searched fails no scan, as the cursor walks it without searching it")
+    void unsearchableSibling(boolean descending, @TempDir Path directory) throws Exception {
+        try (var tree = new Tree(directory, true, descending ? 53 : 59)) {
+            tree.load(4_000);
+            var leaves = tree.leaves();
+            var step = descending ? -1 : 1;
+            var start = -1;
+            for (var i = 2; i < leaves.size() - 2 && start < 0; i++) {
+                var leaf = leaves.get(i);
+                if (leaves.get(i + step).parent() == leaf.parent() && hasBlob(leaves.get(i + step))
+                        && leaves.get(i + step).unit()[PageFormat.FORMAT] == PageFormat.INDEXED) {
+                    start = i;
+                }
+            }
+            assertTrue(start >= 0);
+            // The next leaf, sealed again with a reserved bit of its index byte set: it authenticates, and a search of
+            // it throws
+            var sibling = leaves.get(start + step);
+            var unit = sibling.unit().clone();
+            unit[PageFormat.INDEX] |= 0x10;
+            var ref = sibling.ref();
+            var writer = tree.pages.writer(ref.nonceHigh());
+            writer.write(PageFormat.LEAF, 0, ref.page(), ref.pages(), unit, Bytes.i32(unit, PageFormat.LENGTH), false, ref.nonceLow());
+            writer.flush();
+            tree.pages.cache().clearForTests();
+            var from = descending ? null : leaves.get(start).firstKey();
+            var to = descending ? leaves.get(start + 1).firstKey() : null;
+            assertThrows(LedgerCorruptedException.class, () -> TreeNodes.lowerBound(tree.pages.read(ref, PageFile.NODE, false),
+                    descending ? to : from));
+            for (var limit : new int[]{leaves.get(start).count(), Integer.MAX_VALUE}) {
+                var expected = expected(tree, from, to, descending, limit);
+                var plain = scan(tree, from, to, descending, limit, false, 0);
+                assertSameEntries(expected, plain.entries(), "without reading ahead, at most " + limit);
+                for (var wanted : new long[]{limit, Long.MAX_VALUE}) {
+                    var cold = scan(tree, from, to, descending, limit, true, wanted);
+                    assertSameEntries(expected, cold.entries(), "reading ahead for " + wanted + ", at most " + limit);
+                }
             }
         }
     }
