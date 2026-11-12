@@ -76,6 +76,13 @@ import java.util.function.Consumer;
 /// which Windows documents as writing through its own cache only, with the same risk, and with `O_DSYNC` alone
 /// elsewhere but on macOS.
 ///
+/// The commits that wait for durability together, from several threads, make groups of several blocks of the log,
+/// which the store writes through as up to four chunks at once, to a device that serves several requests in about the
+/// time of one; a commit returns once every chunk is durable. On Linux, where the device writes without forced unit
+/// access and has a volatile cache, the chunks are written with `O_DIRECT` alone and the log is forced once after them,
+/// since `O_DSYNC` would empty the cache once a chunk. The system property `ledger.log.chunks` set to `off` writes
+/// each group in one write; `dsync` and `direct` choose between the two ways on any device.
+///
 /// # Memory
 /// The store keeps the bytes it encrypts, decrypts and writes on the Java heap, in arrays it recycles: the JDK's
 /// AES-GCM runs fastest on arrays, and recycling keeps the memory from becoming garbage. The page cache

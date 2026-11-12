@@ -75,6 +75,13 @@ import java.util.zip.CRC32C;
 /// into the cache and forced as before, so an ingest keeps the bandwidth of the cache, and a file system that refuses
 /// the writes through moves the writer to forces.
 ///
+/// A group written through that spans several blocks, that a commit waits for and that the pool's flush writes, is
+/// written in chunks at once where [WriteThrough] can ([WriteThrough#chunksFor(long)]): a device with several requests
+/// in flight serves them in about the time of one block, where the one write of the group took the transfer of each
+/// block in turn, and the flush thread waited out every one of them with the processors idle. A commit writing its own
+/// group writes it whole, as do the groups no commit waits for, which are bound by the device's bandwidth: their
+/// latency holds nothing up, and the threads that write the chunks would take processors from the commits.
+///
 /// A store just opened has such bytes only in the first block of its first segment, which its first group takes when
 /// one block holds it. The next segment is prepared without zeros, and written with them on a thread of its own once
 /// commits have waited for [#ZEROS_AFTER] groups: on Windows a force beside the zeros takes several times as long,
@@ -298,6 +305,10 @@ final class LogWriter {
     private volatile long forces;
     // The groups written through, of the forces; written by the flush task only
     private volatile long writtenThrough;
+    // The groups written through in more than one chunk, of those; written by the flush task only
+    private volatile long writtenInChunks;
+    // The chunks the last group was written in, 1 for one write; owned by the flush task
+    private int lastChunks;
     // The segment the flush task writes, for a checkpoint to read
     private volatile long currentSegment;
 
@@ -920,7 +931,8 @@ final class LogWriter {
     /// most [#MAX_COHORT_WAIT], have passed since the last group was published.
     ///
     /// It spins, then yields between looks. A close, a failure, a commit waiting for room in the queue, or a task of
-    /// another store waiting for the pool ends it at once. A wait that runs out while a frame waits in the queue turns
+    /// another store waiting for the pool ends it at once. After a group written in chunks, the threads that write
+    /// them look for the next group's chunks meanwhile, so it finds them awake. A wait that runs out while a frame waits in the queue turns
     /// the next ones off for twice as many groups as the last that ran out did, from 2 to 64; one that ends with all of
     /// them back resets that.
     private void awaitCohort() {
@@ -928,6 +940,9 @@ final class LogWriter {
         cohort = 0;
         try {
             var budget = Math.min(forceNanos - forceNanos / 4, MAX_COHORT_WAIT);
+            if (lastChunks > 1 && throughFile != null) {
+                throughFile.prime(lastChunks, budget);
+            }
             var looked = false;
             while (registered.get() - cohortBase < target) {
                 var waited = System.nanoTime() - cohortStart;
@@ -968,6 +983,8 @@ final class LogWriter {
             channel = FileChannel.open(segmentPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
         }
         if (throughFile != null && !throughFile.isOpen()) {
+            // A handle of two channels may have kept one open
+            closeQuietly(throughFile);
             try {
                 throughFile = writeThrough.open(segmentPath);
             } catch (IOException | RuntimeException | LinkageError _) {
@@ -996,12 +1013,19 @@ final class LogWriter {
         if (smallGroups >= SHRINK_AFTER && output.length > MIN_OUTPUT) {
             output = new byte[MIN_OUTPUT];
         }
-        if (waitedGroup) {
+        var waitedFor = waitedGroup;
+        if (waitedFor) {
             waitedGroup = false;
             waitedGroups++;
         }
         // Before a frame is sealed, while the output holds no byte of the group
         var through = writesThrough(group);
+        var chunked = through && (writeThrough.chunkEveryGroupForTests || (waitedFor && !leading));
+        if (chunked) {
+            // The threads that write the chunks look for them while the frames are sealed
+            var bound = sealedBytes(group);
+            throughFile.prime(WriteThrough.chunksFor((bound + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT), 0);
+        }
         var unitForce = units ? forceUnits() : null;
         var start = position;
         var groupStart = true;
@@ -1046,8 +1070,9 @@ final class LogWriter {
         used += padding;
         smallGroups = position + used - start <= MIN_OUTPUT / 2 ? smallGroups + 1 : 0;
         var forceStart = System.nanoTime();
+        lastChunks = 1;
         if (through) {
-            writeThrough();
+            writeThrough(chunked ? WriteThrough.chunksFor(used) : 1);
         } else {
             drain();
             force();
@@ -1292,17 +1317,25 @@ final class LogWriter {
     /// makes the group durable, and one that fails stops the writer as it always does. Until a write has succeeded in
     /// a way, a failure moves the writer one way down instead, and the next way writes the same bytes at the same
     /// offsets.
-    private void writeThrough() throws IOException {
+    ///
+    /// The group is written in up to `chunks` chunks at once, if the handle writes chunks, and the write returns once
+    /// every chunk has: an interrupt that closed the handle under any chunk has every chunk written again, as the
+    /// others may have found it closed too, and any other failure of a chunk is a failure of the write.
+    private void writeThrough(int chunks) throws IOException {
         var start = position;
         lastDrainStart = start;
         lastDrainLength = used;
         while (throughFile != null) {
             try {
-                throughFile.write(output, used, output.length, start);
+                var wrote = throughFile.write(output, used, output.length, start, chunks);
                 position = start + used;
                 used = 0;
                 forcedPosition = position;
                 writtenThrough++;
+                if (wrote > 1) {
+                    writtenInChunks++;
+                }
+                lastChunks = wrote;
                 wayProven = true;
                 return;
             } catch (ClosedByInterruptException _) {
@@ -1591,6 +1624,11 @@ final class LogWriter {
         return writtenThrough;
     }
 
+    /// {@return the groups written through in more than one chunk so far, for tests}
+    long writtenInChunks() {
+        return writtenInChunks;
+    }
+
     /// {@return the way later segments are opened to write through, or `null` if their groups are forced, for tests}
     WriteThrough.Kind writeThroughKind() {
         return writeThrough.kind();
@@ -1766,6 +1804,8 @@ final class LogWriter {
             closeSegment();
         } catch (IOException _) {
             // The data is durable already; nothing to recover from a failed close
+        } finally {
+            writeThrough.release();
         }
     }
 
