@@ -188,6 +188,15 @@ public final class HeapPool {
         void released(byte[] array);
     }
 
+    /// {@return the arrays of every size taken from the pool so far; for tests that count the reads of a file}
+    int acquiresForTests() {
+        var total = 0;
+        for (var count : acquires) {
+            total += count;
+        }
+        return total;
+    }
+
     /// {@return the free bytes the pool keeps at most; for tests}
     long maxPooledBytesForTests() {
         return maxPooledBytes;
