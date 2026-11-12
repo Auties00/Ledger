@@ -42,7 +42,8 @@ public sealed interface View permits Ledger, Snapshot, Transaction {
     /// Passes the entries of `range` to `visitor` in the order of the range, until there are no more or the visitor
     /// returns `false`.
     ///
-    /// The whole visit reads one state, as a [Snapshot] would.
+    /// The whole visit reads one state, the one at the call, as a [Snapshot] would: in a [Transaction], what the
+    /// visitor writes is not passed to it.
     ///
     /// @apiNote Use it to read more entries than a list should hold. The state stays pinned while the visitor runs,
     /// as a snapshot pins it.
