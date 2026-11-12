@@ -19,8 +19,9 @@ import java.util.function.Consumer;
 /// consecutive pages. The leaves of a group read are then opened by every thread of the stream that has nothing else to
 /// do, one claim a leaf in key order, the taker's included: the reads are spread over the workers by group and the opens
 /// by leaf, so a key space of one group is still opened on every thread, and the taker installs a leaf while the next
-/// ones are opened. No group is claimed that starts more than [#lead] leaves past the taker, which bounds the pages held
-/// sealed, and no thread opens a leaf more than [#OPENED_AHEAD] past it, which bounds the plaintext: a leaf is opened
+/// ones are opened. No group is claimed that starts more than [#lead] leaves past the taker, the workers hold at most
+/// [#SEALED_GROUPS] groups read and not all opened, which bounds the pages held sealed, and no thread opens a leaf more
+/// than [#OPENED_AHEAD] past the taker, which bounds the plaintext: a leaf is opened
 /// into an array the stream uses again for a later leaf once the taker took it, and lets go of as it closes, so a load
 /// keeps no memory past its end, in the store's pool or elsewhere, and allocates no more plaintext than it holds at once.
 /// A leaf the cache holds when it is read is taken from the cache, and its array, which others may still read, is never
@@ -64,12 +65,20 @@ final class LeafStream implements AutoCloseable {
     /// taker reached them. Four wake-ups' worth: the taker installs a leaf in about the time a thread opens one, and the
     /// workers resume at every [#WAKE_EVERY] leaves it takes.
     static final int OPENED_AHEAD = 4 * WAKE_EVERY;
+    /// The most groups the workers hold read and not yet all opened. The pages of each wait in an array of the store's
+    /// pool, which the pool keeps once it comes back, so the groups held at once are what a load leaves in the pool:
+    /// with the opens held to [#OPENED_AHEAD], the groups read up to the lead waited sealed, seven of the largest arrays
+    /// where a load before the stream held five on four processors. Four groups are [#OPENED_AHEAD] leaves being opened
+    /// and three groups more read ahead of them.
+    static final int SEALED_GROUPS = 4;
     /// Why a thread of the stream rests ([#rest(int, int, int)]): the next group starts past the lead, the leaves after
-    /// the plan are being read, every read channel is in use, or the claimed reads have yet to end.
+    /// the plan are being read, every read channel is in use, the claimed reads have yet to end, or the workers hold
+    /// [#SEALED_GROUPS] groups already.
     private static final int AHEAD = 0;
     private static final int UNPLANNED = 1;
     private static final int NO_CHANNEL = 2;
     private static final int READING = 3;
+    private static final int HELD = 4;
 
     /// A leaf of the stream and what was read of it.
     static final class Slot {
@@ -111,11 +120,34 @@ final class LeafStream implements AutoCloseable {
         private final int first;
         // The leaves in the pages still to open
         private final AtomicInteger unopened;
+        // The group of a worker the pages are part of, or null for the taker's
+        private final Group group;
 
-        private Sealed(byte[] array, int first, int leaves) {
+        private Sealed(byte[] array, int first, int leaves, Group group) {
             this.array = array;
             this.first = first;
             this.unopened = new AtomicInteger(leaves);
+            this.group = group;
+        }
+    }
+
+    /// A group a worker claimed, which holds one of the [#SEALED_GROUPS] until its read ended and the arrays of its pages
+    /// went back to the pool.
+    private final class Group {
+        // One for the read, and one for each array of its pages not given back
+        private final AtomicInteger holds = new AtomicInteger(1);
+
+        private void hold() {
+            holds.incrementAndGet();
+        }
+
+        private void release() {
+            if (holds.decrementAndGet() == 0) {
+                freeGroups.incrementAndGet();
+                if (idle.get() > 0) {
+                    wakeWorkers();
+                }
+            }
         }
     }
 
@@ -192,6 +224,8 @@ final class LeafStream implements AutoCloseable {
     private int started;
     // The threads of the stream parked until the taker, the plan, the claims, the opens or the channels move
     private final AtomicInteger idle;
+    // The groups of SEALED_GROUPS the workers may claim now
+    private final AtomicInteger freeGroups;
     // Whether a wait of the taker cleared its interrupt, which close gives back; the taker's alone
     private boolean interrupted;
 
@@ -223,6 +257,7 @@ final class LeafStream implements AutoCloseable {
         this.waitingOn = NONE;
         this.workers = new AtomicReferenceArray<>(MAX_WORKERS);
         this.idle = new AtomicInteger();
+        this.freeGroups = new AtomicInteger(SEALED_GROUPS);
         this.planner = planned ? null : Thread.ofVirtual().name("ledger-resident-plan").unstarted(this::plan);
         if (planner != null) {
             try {
@@ -289,6 +324,12 @@ final class LeafStream implements AutoCloseable {
     /// {@return the workers started}
     int workers() {
         return started;
+    }
+
+    /// {@return the count of the groups of [#SEALED_GROUPS] the workers may claim now, which is [#SEALED_GROUPS] once
+    /// every group they claimed ended; for tests}
+    AtomicInteger freeGroupsForTests() {
+        return freeGroups;
     }
 
     /// {@return the lowest key of the leaves past those the stream may read before the taker moves, or `null` if it may
@@ -362,7 +403,7 @@ final class LeafStream implements AutoCloseable {
                 // Every leaf before it is taken, so claimed: no worker claimed it unless the claims passed it
                 var end = groupEnd(slots, next, Math.min(FIRST_GROUP_PAGES, next + 1));
                 if (claimed.compareAndSet(next, end)) {
-                    read(slots, next, end, null);
+                    read(slots, next, end, null, null);
                 }
                 continue;
             }
@@ -470,21 +511,38 @@ final class LeafStream implements AutoCloseable {
             }
             var cap = wide ? PageFile.RUN_PAGES : Math.clamp(start, FIRST_GROUP_PAGES, PageFile.RUN_PAGES);
             var end = groupEnd(slots, start, cap);
+            if (!takeGroup()) {
+                rest(start, slots.length, HELD);
+                continue;
+            }
+            var group = new Group();
             // The channel first: once the group is claimed, the taker may wait for it
             var lease = pages.tryLease();
             if (lease == null) {
+                group.release();
                 rest(start, slots.length, NO_CHANNEL);
                 continue;
             }
             if (claimed.compareAndSet(start, end)) {
-                read(slots, start, end, lease);
+                read(slots, start, end, lease, group);
             } else {
                 lease.close();
+                group.release();
                 if (idle.get() > 0) {
                     wakeWorkers();
                 }
             }
         }
+    }
+
+    /// {@return whether it took one of the groups of [#SEALED_GROUPS], which the caller releases through a [Group]}
+    private boolean takeGroup() {
+        for (var free = freeGroups.get(); free > 0; free = freeGroups.get()) {
+            if (freeGroups.compareAndSet(free, free - 1)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Reads the branches after the path, unless another thread does or the stream closes; on the planner's thread.
@@ -532,6 +590,7 @@ final class LeafStream implements AutoCloseable {
                 case AHEAD -> start >= taken + lead;
                 case UNPLANNED -> plan.length == known && expansion.get() == EXPANDING;
                 case READING -> finished.get() < start;
+                case HELD -> freeGroups.get() <= 0;
                 default -> !pages.leasable();
             };
             if (still) {
@@ -585,7 +644,8 @@ final class LeafStream implements AutoCloseable {
     /// consecutive pages, and leaves them to open to every thread of the stream; then gives `lease` back.
     ///
     /// @param lease the channel to read on, or `null` for the taker, which waits for one
-    private void read(Slot[] slots, int start, int end, PageFile.Lease lease) {
+    /// @param group the group of a worker, which the read releases once it ended, or `null` for the taker's
+    private void read(Slot[] slots, int start, int end, PageFile.Lease lease, Group group) {
         // The leaves of the group that end here: those the cache holds, a delta record, or those a failure fails
         var ended = 0;
         try {
@@ -615,7 +675,7 @@ final class LeafStream implements AutoCloseable {
             }
             missing = Arrays.copyOf(missing, count);
             try {
-                seal(missing, lease);
+                seal(missing, lease, group);
             } catch (Throwable failure) {
                 for (var slot : missing) {
                     fail(slot, failure);
@@ -646,6 +706,9 @@ final class LeafStream implements AutoCloseable {
             if (lease != null) {
                 lease.close();
             }
+            if (group != null) {
+                group.release();
+            }
             ended(ended);
             if (idle.get() > 0) {
                 wakeWorkers();
@@ -655,7 +718,7 @@ final class LeafStream implements AutoCloseable {
 
     /// Reads the pages of `missing`, leaves in key order, one call for each run of consecutive pages, and points each
     /// leaf at the pages it is in; on a failure it gives back what it read and throws.
-    private void seal(Slot[] missing, PageFile.Lease lease) {
+    private void seal(Slot[] missing, PageFile.Lease lease, Group group) {
         var order = missing.clone();
         sortByPage(order);
         var buffers = new ArrayList<Sealed>(1);
@@ -665,7 +728,10 @@ final class LeafStream implements AutoCloseable {
                 if (i == order.length || order[i].ref.page() != order[i - 1].ref.page() + order[i - 1].ref.pages()) {
                     var first = order[from].ref.page();
                     var last = order[i - 1].ref;
-                    var sealed = new Sealed(pages.readSealed(first, last.page() + last.pages() - first, lease), first, i - from);
+                    var sealed = new Sealed(pages.readSealed(first, last.page() + last.pages() - first, lease), first, i - from, group);
+                    if (group != null) {
+                        group.hold();
+                    }
                     buffers.add(sealed);
                     for (var j = from; j < i; j++) {
                         order[j].sealed = sealed;
@@ -676,6 +742,9 @@ final class LeafStream implements AutoCloseable {
         } catch (Throwable failure) {
             for (var buffer : buffers) {
                 pages.release(buffer.array);
+                if (group != null) {
+                    group.release();
+                }
             }
             for (var slot : missing) {
                 slot.sealed = null;
@@ -744,6 +813,9 @@ final class LeafStream implements AutoCloseable {
         } finally {
             if (sealed.unopened.decrementAndGet() == 0) {
                 pages.release(sealed.array);
+                if (sealed.group != null) {
+                    sealed.group.release();
+                }
             }
             ended(1);
         }

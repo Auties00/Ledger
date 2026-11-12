@@ -4,6 +4,7 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.LedgerException;
 
 import java.lang.foreign.MemorySegment;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
@@ -82,6 +83,8 @@ final class ResidentLoader {
     volatile Consumer<byte[]> releaseHookForTests;
     // The workers of the last attempt; for tests
     private volatile int workers;
+    // The groups the workers of the last attempt's stream may claim; for tests
+    private volatile AtomicInteger freeGroups;
 
     /// Creates the loader of `state`, whose tree is in `pages`.
     ///
@@ -318,6 +321,7 @@ final class ResidentLoader {
         var leaves = new LeafStream(pages, root, from, wide ? LeafStream.MAX_WORKERS : THREADS - 1, wide, releaseHookForTests);
         try {
             workers = leaves.workers();
+            freeGroups = leaves.freeGroupsForTests();
             var installed = 0;
             var signalled = 0;
             while (!stopping) {
@@ -390,6 +394,12 @@ final class ResidentLoader {
             // Past the last key: a key between it and the next leaf's first has no entry
             below = after(last);
         }
+    }
+
+    /// {@return the groups of [LeafStream#SEALED_GROUPS] the workers of the last attempt's stream may claim, for tests}
+    int freeGroupsForTests() {
+        var free = freeGroups;
+        return free == null ? LeafStream.SEALED_GROUPS : free.get();
     }
 
     /// {@return the workers the last attempt read on, for tests}
