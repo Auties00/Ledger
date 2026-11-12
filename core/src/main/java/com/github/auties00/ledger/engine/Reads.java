@@ -362,6 +362,9 @@ final class Reads {
                     held = memory.next();
                     if (value != null) {
                         visited++;
+                        if (tree != null) {
+                            tree.took();
+                        }
                         if (!consumer.visit(key, value, decoded)) {
                             break;
                         }
@@ -370,6 +373,7 @@ final class Reads {
                     var key = tree.key();
                     if (!hiddenSinceTree(key, point, removals)) {
                         visited++;
+                        tree.took();
                         if (!consumer.visit(key, tree.value(), null)) {
                             break;
                         }

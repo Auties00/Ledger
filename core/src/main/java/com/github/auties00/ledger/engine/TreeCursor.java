@@ -69,8 +69,8 @@ final class TreeCursor {
     private boolean exhausted;
     // The leaves and blobs read so far, up to ADMITTED
     private int admitted;
-    // The entries the cursor has moved to
-    private long stepped;
+    // The entries the scan has taken, from the tree or from memory, as it counts them with took()
+    private long taken;
     // The leaves the next gather reads
     private int window;
     // The leaves read ahead that the cursor has not used yet, opened into an array of `held`, by reference; null
@@ -110,8 +110,9 @@ final class TreeCursor {
     /// @param root the root, or `null` for an empty tree
     /// @param from the lowest key, which the cursor keeps and no one may change while it is used
     /// @param to the first key past the range, which the cursor keeps and no one may change while it is used
-    /// @param wanted the entries the scan is expected to take, [Long#MAX_VALUE] if it may take them all, which bounds
-    ///               the values the cursor reads ahead; or 0 for a cursor that never reads ahead
+    /// @param wanted the entries the scan is expected to take, [Long#MAX_VALUE] if it may take them all, which, less
+    ///               those it [took][#took()], bounds the values each gather reads; or 0 for a cursor that never reads
+    ///               ahead
     TreeCursor(PageFile pages, TreeRoot root, byte[] from, byte[] to, boolean descending, long wanted) {
         this.pages = pages;
         this.from = from;
@@ -188,8 +189,21 @@ final class TreeCursor {
             exhausted = true;
             return false;
         }
-        stepped++;
         return true;
+    }
+
+    /// Counts an entry the scan took, from the tree or from memory: the entries it still takes, at most `wanted` less
+    /// those it took, bound the values the cursor reads ahead.
+    ///
+    /// Entries the cursor moved to that the scan hid or took from memory instead count nothing, so a scan whose first
+    /// entries in the tree are hidden still reads ahead only what it may take.
+    void took() {
+        taken++;
+    }
+
+    /// {@return the entries a gather reads values for: those the scan may still take, `extra` more, and at least one}
+    private long budget(int extra) {
+        return wanted == Long.MAX_VALUE ? Long.MAX_VALUE : Math.max(1, wanted - taken + extra);
     }
 
     /// {@return whether entry `entry` of leaf `unit` is past the cursor's range, in its order}
@@ -428,9 +442,11 @@ final class TreeCursor {
         this.window = Math.min(window * 2, GATHER_LEAVES);
         // The leaves of the gather in the cursor's order, those the cache holds included, and the ones to read
         var leaves = new byte[window][];
+        var refs = new PageRef[window];
         var reads = new PageRef[window];
         var positions = new int[window];
         var read = 0;
+        refs[0] = ref;
         reads[read++] = ref;
         var size = 1;
         var step = descending ? -1 : 1;
@@ -446,6 +462,7 @@ final class TreeCursor {
                 // Read when the cursor reaches it, with its delta page and base through the cache
                 continue;
             }
+            refs[size] = sibling;
             var cached = pages.cache().peek(sibling);
             if (cached != null) {
                 leaves[size] = cached;
@@ -476,14 +493,30 @@ final class TreeCursor {
         } finally {
             pages.releasePrefetched(sealed);
         }
-        budget = stepped < wanted ? wanted - stepped : Long.MAX_VALUE;
+        budget = budget(0);
         pagesLeft = GATHER_PAGES;
         var values = new PageRef[GATHER_VALUES];
         var count = 0;
         for (var i = 0; i < size && budget > 0 && count < values.length; i++) {
             var unit = leaves[i];
             if (unit != null && TreeNodes.isLeaf(unit)) {
-                count = collectValues(unit, first(unit), values, count);
+                var before = count;
+                try {
+                    count = collectValues(unit, first(unit), values, count);
+                } catch (RuntimeException _) {
+                    // A leaf that authenticates but that its search or its entries cannot be read in, which may lie
+                    // past where the scan stops: none of its blobs is read ahead, nor anything past it, and a sibling
+                    // is read again by the cursor if it gets there, which then fails at that leaf as it would have
+                    count = before;
+                    if (i > 0) {
+                        var opened = gathered.remove(refs[i]);
+                        if (opened != null) {
+                            held.remove(opened.array());
+                            pages.releasePrefetched(opened.array());
+                        }
+                    }
+                    break;
+                }
             }
         }
         aheadValues = prefetchValues(values, count);
@@ -498,11 +531,18 @@ final class TreeCursor {
         } else if (leafValues != null) {
             dropLeafValues();
         }
-        // The current entry is counted already, and is the one the cursor needs
-        budget = stepped <= wanted ? wanted - stepped + 1 : Long.MAX_VALUE;
+        // The current entry, which the cursor needs, may be counted already
+        budget = budget(1);
         pagesLeft = GATHER_PAGES;
         var values = new PageRef[GATHER_VALUES];
-        var count = collectValues(leaf, index, values, 0);
+        int count;
+        try {
+            count = collectValues(leaf, index, values, 0);
+        } catch (RuntimeException _) {
+            // Entries past the current one that cannot be read, which the scan may never reach: nothing is read ahead,
+            // and the cursor fails at them if it gets there
+            count = 0;
+        }
         leafValues = prefetchValues(values, count);
         if (leafValues != null) {
             leafRefs = values;
