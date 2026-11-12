@@ -208,7 +208,7 @@ class CachedUnitsTest {
             var ref = writer.write(PageFormat.VALUE, 0, space.allocate(1), 1, new byte[PageFormat.HEADER + 2_500], 2_500, true);
             writer.flush();
             var entries = List.of(new TreeNodes.LeafEntry(segment("key"), null, ref, 2_600));
-            var leaf = TreeNodes.writeLeaf(entries, 0, 1, 2 + entries.getFirst().size());
+            var leaf = TreeNodes.writeLeaf(entries, 0, 1);
             var entry = TreeNodes.entry(leaf, 0);
             assertThrows(LedgerCorruptedException.class, () -> TreeSearch.value(pages, leaf, entry), "the unit the checkpoint cached");
             assertThrows(LedgerCorruptedException.class, () -> TreeSearch.valueBytes(pages, leaf, entry), "an array from the unit the checkpoint cached");

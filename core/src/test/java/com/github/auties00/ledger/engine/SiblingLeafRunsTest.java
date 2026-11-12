@@ -250,7 +250,7 @@ class SiblingLeafRunsTest {
         private void collect(PageRef ref, List<Leaf> leaves) {
             var unit = pages.read(ref, PageFile.NODE, false);
             if (TreeNodes.isLeaf(unit)) {
-                leaves.add(new Leaf(ref, TreeNodes.leafKey(unit, TreeNodes.entry(unit, 0)).toArray(ValueLayout.JAVA_BYTE), TreeNodes.count(unit), Bytes.i32(unit, PageFormat.LENGTH) - 2));
+                leaves.add(new Leaf(ref, TreeNodes.leafKey(unit, TreeNodes.entry(unit, 0)).toArray(ValueLayout.JAVA_BYTE), TreeNodes.count(unit), TreeNodes.fill(unit)));
                 return;
             }
             for (var i = 0; i < TreeNodes.count(unit); i++) {
@@ -320,7 +320,7 @@ class SiblingLeafRunsTest {
 
     /// {@return the bytes a leaf takes for an entry of `key` and `value`}
     private static int entrySize(byte[] key, byte[] value) {
-        return 2 + 2 + key.length + 1 + 2 + value.length;
+        return TreeNodes.SLOT + 2 + key.length + 1 + 2 + value.length;
     }
 
     private static List<byte[]> firstKeys(List<Leaf> leaves) {
@@ -562,7 +562,7 @@ class SiblingLeafRunsTest {
                 }
                 tree.apply(states, List.of());
                 var sizes = new int[70];
-                Arrays.fill(sizes, 2 + 2 + 16 + 1 + 2 + 64);
+                Arrays.fill(sizes, TreeNodes.SLOT + 2 + 16 + 1 + 2 + 64);
                 var expected = TreeNodes.split(sizes, 70);
                 assertEquals(expected.size(), tree.leaves().size());
                 assertEquals(expected.getFirst()[1], tree.leaves().getFirst().count());

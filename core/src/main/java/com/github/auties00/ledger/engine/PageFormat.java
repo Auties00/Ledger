@@ -16,10 +16,15 @@ package com.github.auties00.ledger.engine;
 ///  8  number of its first page, 4 bytes
 /// 12  bytes of content, 4 bytes
 /// 16  nonce, 12 bytes
-/// 28  reserved, 4 bytes
+/// 28  search index of a node of the second format, 1 byte; 0 in every other unit
+/// 29  reserved, 3 bytes
 /// 32  content, encrypted, then zero up to the tag
 ///     AES-GCM tag, 16 bytes; without encryption a CRC-32C of everything before it, then 12 zero bytes
 /// ```
+///
+/// Every unit is of format [#VERSION], but a leaf or a branch of format [#INDEXED], which holds a search index between
+/// the offsets of its entries and the entries ([NodeIndex]). A reader finds the entries of either through their
+/// offsets, so the first format's readers read both, and a store holds nodes of both formats.
 ///
 /// The header is the additional data of the GCM tag, so a unit read at another position, or under another kind,
 /// fails authentication. The nonce of each unit is new (see [Checkpointer]), and whatever refers to a unit (a parent
@@ -34,6 +39,8 @@ final class PageFormat {
     static final int HEADER = 32;
     static final int TAG = 16;
     static final byte VERSION = 1;
+    /// The format of a leaf or a branch that holds a search index ([NodeIndex]).
+    static final byte INDEXED = 2;
 
     static final byte SUPERBLOCK = 1;
     static final byte LEAF = 2;
@@ -58,6 +65,8 @@ final class PageFormat {
     static final int PAGE = 8;
     static final int LENGTH = 12;
     static final int NONCE = 16;
+    /// The header byte that describes the search index of a node of format [#INDEXED].
+    static final int INDEX = 28;
     /// The least padding a unit the page cache takes must have for the cache to keep it without the padding: below
     /// it, copying the content out of the opened unit costs more than the memory it saves.
     static final int TRIM_LEAST = 512;

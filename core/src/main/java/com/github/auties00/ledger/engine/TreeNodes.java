@@ -11,8 +11,12 @@ import java.util.List;
 /// ```text
 /// 0  entries, 2 bytes
 /// 2  offset of each entry in the unit, 2 bytes each, in key order
+///    the search index of the keys, in a node of format PageFormat.INDEXED (NodeIndex)
 ///    the entries
 /// ```
+///
+/// A checkpoint writes every node with a search index, which its searches use; a node of the first format, which an
+/// older version wrote, is searched through the offsets of its entries.
 ///
 /// A leaf entry is a key and its value, inline, in a blob of its own, or in a unit of [BlobFile] a commit wrote:
 ///
@@ -35,9 +39,13 @@ import java.util.List;
 /// Every child's first key is the lowest key of its subtree, so a key below the first key of a branch's first child
 /// still belongs to it.
 final class TreeNodes {
-    /// The bytes a node's entries and their offsets may take.
-    static final int CAPACITY = PageFormat.capacity(1) - 2;
-    /// The largest entry, offset included, so that every leaf holds at least two.
+    /// The bytes a node's entries may take, their offsets and heads included, as [LeafEntry#size()] and
+    /// [Child#size()] count them: the content of a page but the count of the entries and the longest prefix of a search
+    /// index ([NodeIndex]).
+    static final int CAPACITY = PageFormat.capacity(1) - 2 - NodeIndex.MAX_PREFIX;
+    /// The bytes of an entry of a node besides the entry itself: its offset and the head of its key.
+    static final int SLOT = 2 + NodeIndex.HEAD;
+    /// The largest entry, offset and head included, so that every leaf holds at least two.
     static final int MAX_ENTRY = CAPACITY / 2;
     /// The fill below which a node a checkpoint rewrote merges with a neighbour.
     static final int MIN_FILL = CAPACITY / 4;
@@ -48,6 +56,8 @@ final class TreeNodes {
     /// The fill to split leaves to that take new keys among their old ones, in sixteenths of [#CAPACITY].
     static final int TARGET_ROOMY = 14;
     private static final int BRANCH_FIXED = 4 + 8 + 4 + 8 + 1 + 2;
+    /// The bytes into a leaf entry where its key starts.
+    private static final int LEAF_KEY = 2;
     private static final byte INLINE = 0;
     private static final byte BLOB = 1;
     private static final byte EXTERNAL = 2;
@@ -100,6 +110,9 @@ final class TreeNodes {
 
     /// {@return the index of the first entry of the leaf `unit` whose key is at or after `key`, or its count}
     static int lowerBound(byte[] unit, MemorySegment key) {
+        if (unit[PageFormat.FORMAT] == PageFormat.INDEXED) {
+            return NodeIndex.search(unit, key, LEAF_KEY, false);
+        }
         var low = 0;
         var high = count(unit);
         while (low < high) {
@@ -116,6 +129,9 @@ final class TreeNodes {
 
     /// {@return the index of the first entry of the leaf `unit` whose key is at or after `key`, or its count}
     static int lowerBound(byte[] unit, byte[] key) {
+        if (unit[PageFormat.FORMAT] == PageFormat.INDEXED) {
+            return NodeIndex.search(unit, key, LEAF_KEY, false);
+        }
         var low = 0;
         var high = count(unit);
         while (low < high) {
@@ -214,6 +230,9 @@ final class TreeNodes {
 
     /// {@return the index of the child of the branch `unit` whose subtree would hold `key`}
     static int childFor(byte[] unit, MemorySegment key) {
+        if (unit[PageFormat.FORMAT] == PageFormat.INDEXED) {
+            return Math.max(0, NodeIndex.search(unit, key, BRANCH_FIXED, true) - 1);
+        }
         // The last child whose first key is at or before the key, or the first child
         var low = 1;
         var high = count(unit);
@@ -231,6 +250,9 @@ final class TreeNodes {
 
     /// {@return the index of the child of the branch `unit` whose subtree would hold `key`}
     static int childFor(byte[] unit, byte[] key) {
+        if (unit[PageFormat.FORMAT] == PageFormat.INDEXED) {
+            return Math.max(0, NodeIndex.search(unit, key, BRANCH_FIXED, true) - 1);
+        }
         // The last child whose first key is at or before the key, or the first child
         var low = 1;
         var high = count(unit);
@@ -248,6 +270,9 @@ final class TreeNodes {
 
     /// {@return the index of the last child of the branch `unit` whose first key is before `key`, or -1}
     static int lastChildBefore(byte[] unit, byte[] key) {
+        if (unit[PageFormat.FORMAT] == PageFormat.INDEXED) {
+            return NodeIndex.search(unit, key, BRANCH_FIXED, false) - 1;
+        }
         var low = 0;
         var high = count(unit);
         while (low < high) {
@@ -341,25 +366,75 @@ final class TreeNodes {
         return children;
     }
 
-    /// {@return the bytes of content of a node of the entries or children whose sizes, as [LeafEntry#size()] and
-    /// [Child#size()] give them, are those of `sizes` from `from` to `to`}
-    static int contentLength(int[] sizes, int from, int to) {
-        var content = 2;
+    /// {@return the bytes the entries or children whose sizes, as [LeafEntry#size()] and [Child#size()] give them, are
+    /// those of `sizes` from `from` to `to` take in a node, as [#CAPACITY] bounds them}
+    static int fill(int[] sizes, int from, int to) {
+        var fill = 0;
         for (var i = from; i < to; i++) {
-            content += sizes[i];
+            fill += sizes[i];
         }
-        return content;
+        return fill;
     }
 
-    /// {@return a leaf of `entries` from `from` to `to`, its content filled in and its header left to fill, in an array
-    /// of its header and `content` bytes, the content [#contentLength(int\[\], int, int)] counts for them}
+    /// {@return the bytes the entries or children of the node `unit` take, as [#fill(int\[\], int, int)] counts them
+    /// for a node it plans, whatever the format of `unit`}
+    static int fill(byte[] unit) {
+        var count = count(unit);
+        var fill = SLOT * count;
+        var leaf = isLeaf(unit);
+        for (var i = 0; i < count; i++) {
+            var entry = entry(unit, i);
+            fill += leaf ? entryLength(unit, entry) : childLength(unit, entry);
+        }
+        return fill;
+    }
+
+    /// {@return the bytes the child at branch entry `entry` takes, without its offset and head}
+    private static int childLength(byte[] unit, int entry) {
+        return BRANCH_FIXED + Bytes.u16(unit, entry + BRANCH_FIXED - 2) + ((unit[entry + 24] & IS_DELTA) != 0 ? 2 : 0);
+    }
+
+    /// {@return a leaf of `entries` from `from` to `to`, with a search index, its content filled in and its header but
+    /// for its format and index byte left to fill, in an array of its header and content}
+    static byte[] writeLeaf(List<LeafEntry> entries, int from, int to) {
+        return writeLeaf(entries, from, to, true);
+    }
+
+    /// {@return a leaf of `entries` from `from` to `to`, its content filled in and its header but for its format and
+    /// index byte left to fill, in an array of its header and content}
     ///
-    /// @throws IllegalStateException if the entries take fewer than `content` bytes; more fail as they are written
-    static byte[] writeLeaf(List<LeafEntry> entries, int from, int to, int content) {
-        var unit = new byte[PageFormat.HEADER + content];
+    /// A leaf of entries that [#fill(int\[\], int, int)] counts at most [#CAPACITY] bytes for fits in a page.
+    ///
+    /// @param indexed whether the leaf holds a search index; one without is of the first format, and takes the bytes
+    ///                its entries and their offsets take
+    static byte[] writeLeaf(List<LeafEntry> entries, int from, int to, boolean indexed) {
         var count = to - from;
-        Bytes.u16(unit, PageFormat.HEADER, count);
+        var bytes = 0;
+        for (var i = from; i < to; i++) {
+            bytes += entries.get(i).bytes();
+        }
         var position = PageFormat.HEADER + 2 + 2 * count;
+        if (!indexed) {
+            var unit = new byte[position + bytes];
+            Bytes.u16(unit, PageFormat.HEADER, count);
+            return writeEntries(unit, position, entries, from, count);
+        }
+        var first = count == 0 ? MemorySegment.NULL : entries.get(from).key();
+        var prefix = count == 0 ? 0 : NodeIndex.prefix(first, entries.get(to - 1).key());
+        var heads = new long[count];
+        for (var i = 0; i < count; i++) {
+            heads[i] = NodeIndex.head(entries.get(from + i).key(), prefix);
+        }
+        var wide = NodeIndex.wide(heads, position - PageFormat.HEADER + NodeIndex.length(count, prefix, true) + (long) bytes);
+        var unit = new byte[position + NodeIndex.length(count, prefix, wide) + bytes];
+        Bytes.u16(unit, PageFormat.HEADER, count);
+        position = NodeIndex.write(unit, position, first, prefix, heads, wide);
+        return writeEntries(unit, position, entries, from, count);
+    }
+
+    /// {@return `unit`, a leaf whose `count` entries from `from` of `entries` it writes from `position` on, and their
+    /// offsets}
+    private static byte[] writeEntries(byte[] unit, int position, List<LeafEntry> entries, int from, int count) {
         for (var i = 0; i < count; i++) {
             Bytes.u16(unit, PageFormat.HEADER + 2 + 2 * i, position);
             position = writeEntry(unit, position, entries.get(from + i));
@@ -401,15 +476,27 @@ final class TreeNodes {
         return position + 5 + PageRef.BYTES;
     }
 
-    /// {@return a branch of `children` from `from` to `to`, its content filled in and its header left to fill, in an
-    /// array of its header and `content` bytes, the content [#contentLength(int\[\], int, int)] counts for them}
+    /// {@return a branch of `children` from `from` to `to`, with a search index, its content filled in and its header
+    /// but for its format and index byte left to fill, in an array of its header and content}
     ///
-    /// @throws IllegalStateException if the children take fewer than `content` bytes; more fail as they are written
-    static byte[] writeBranch(List<Child> children, int from, int to, int content) {
-        var unit = new byte[PageFormat.HEADER + content];
+    /// A branch of children that [#fill(int\[\], int, int)] counts at most [#CAPACITY] bytes for fits in a page.
+    static byte[] writeBranch(List<Child> children, int from, int to) {
         var count = to - from;
-        Bytes.u16(unit, PageFormat.HEADER, count);
+        var bytes = 0;
+        for (var i = from; i < to; i++) {
+            bytes += children.get(i).bytes();
+        }
         var position = PageFormat.HEADER + 2 + 2 * count;
+        var first = count == 0 ? MemorySegment.NULL : children.get(from).firstKey();
+        var prefix = count == 0 ? 0 : NodeIndex.prefix(first, children.get(to - 1).firstKey());
+        var heads = new long[count];
+        for (var i = 0; i < count; i++) {
+            heads[i] = NodeIndex.head(children.get(from + i).firstKey(), prefix);
+        }
+        var wide = NodeIndex.wide(heads, position - PageFormat.HEADER + NodeIndex.length(count, prefix, true) + (long) bytes);
+        var unit = new byte[position + NodeIndex.length(count, prefix, wide) + bytes];
+        Bytes.u16(unit, PageFormat.HEADER, count);
+        position = NodeIndex.write(unit, position, first, prefix, heads, wide);
         var target = MemorySegment.ofArray(unit);
         for (var i = 0; i < count; i++) {
             var child = children.get(from + i);
@@ -527,17 +614,22 @@ final class TreeNodes {
             return value == null || MemorySegment.mismatch(value, 0, length, other.value, 0, length) == -1;
         }
 
-        /// {@return the bytes the entry takes in a leaf, offset included}
+        /// {@return the bytes the entry takes in a leaf, its offset and the head of its key included}
         int size() {
+            return SLOT + bytes();
+        }
+
+        /// {@return the bytes the entry takes as a leaf or a delta record holds it, without an offset or a head}
+        int bytes() {
             if (isRemoved()) {
-                return 2 + 2 + (int) key.byteSize() + 1;
+                return 2 + (int) key.byteSize() + 1;
             }
-            return 2 + 2 + (int) key.byteSize() + 1 + (blob == null ? 2 + length : 4 + PageRef.BYTES);
+            return 2 + (int) key.byteSize() + 1 + (blob == null ? 2 + length : 4 + PageRef.BYTES);
         }
 
         /// {@return whether a value of `length` bytes under a key of `keyLength` bytes is stored inline}
         static boolean fitsInline(long keyLength, long length) {
-            return 2 + 2 + keyLength + 1 + 2 + length <= MAX_ENTRY;
+            return SLOT + 2 + keyLength + 1 + 2 + length <= MAX_ENTRY;
         }
     }
 
@@ -548,11 +640,17 @@ final class TreeNodes {
     /// @param count the entries of the subtree
     /// @param blobs whether a leaf of the subtree holds a value in a blob
     /// @param level the level of the node, 0 for a leaf
-    /// @param fill the bytes of the node's content if a checkpoint just wrote it, or -1
+    /// @param fill the bytes the node's entries or children take, as [TreeNodes#fill(int\[\], int, int)] counts them,
+    ///             if a checkpoint just wrote it, or -1
     record Child(MemorySegment firstKey, PageRef ref, long count, boolean blobs, int level, int fill) {
-        /// {@return the bytes the child takes in a branch, offset included}
+        /// {@return the bytes the child takes in a branch, its offset and the head of its key included}
         int size() {
-            return 2 + BRANCH_FIXED + (int) firstKey.byteSize() + (ref.isRecord() ? 2 : 0);
+            return SLOT + bytes();
+        }
+
+        /// {@return the bytes the child takes in a branch, without its offset and head}
+        int bytes() {
+            return BRANCH_FIXED + (int) firstKey.byteSize() + (ref.isRecord() ? 2 : 0);
         }
     }
 }

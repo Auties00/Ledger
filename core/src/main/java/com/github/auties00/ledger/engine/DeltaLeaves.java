@@ -40,7 +40,7 @@ import java.util.List;
 final class DeltaLeaves {
     /// The most bytes a record takes: past them, the leaf is written whole. Each change of a leaf of entries of a few
     /// hundred bytes rewrites the record with the changes before it, so a larger record would cost more than it saves.
-    static final int MAX_RECORD = TreeNodes.CAPACITY * 3 / 10;
+    static final int MAX_RECORD = (PageFormat.capacity(1) - 2) * 3 / 10;
     private static final int RECORD_FIXED = 16 + 2;
     private static final int COUNT = PageFormat.HEADER;
 
@@ -57,6 +57,9 @@ final class DeltaLeaves {
     /// {@return the leaf the delta record `ref` makes of its base, as a leaf unit whose header names the base, in an
     /// array of its header and content}
     ///
+    /// The leaf holds a search index ([NodeIndex]) if it fits in a page with one. A record an older version wrote may
+    /// make a leaf that fits only without one, which is of the first format.
+    ///
     /// @throws LedgerCorruptedException if the page does not hold the record, or the leaf would not fit in a page
     static byte[] materialize(PageRef ref, Source source) {
         var page = source.read(ref.unit(), PageFormat.DELTA);
@@ -70,12 +73,13 @@ final class DeltaLeaves {
         for (var entry : entries) {
             size += entry.size();
         }
-        if (size > TreeNodes.CAPACITY) {
+        var indexed = size <= TreeNodes.CAPACITY;
+        // Without an index, the leaf takes the count of its entries, their offsets and the entries
+        if (!indexed && 2 + size - NodeIndex.HEAD * entries.size() > PageFormat.capacity(1)) {
             throw new LedgerCorruptedException("A delta record at page " + ref.page() + " makes a leaf too large", null);
         }
-        // The count of the entries, then their offsets and the entries themselves, which size() counts together
-        var unit = TreeNodes.writeLeaf(entries, 0, entries.size(), 2 + size);
-        TreeNodes.deltaHeader(unit, base, 2 + size);
+        var unit = TreeNodes.writeLeaf(entries, 0, entries.size(), indexed);
+        TreeNodes.deltaHeader(unit, base, unit.length - PageFormat.HEADER);
         return unit;
     }
 
@@ -168,8 +172,7 @@ final class DeltaLeaves {
     static int recordSize(List<LeafEntry> changes) {
         var size = RECORD_FIXED;
         for (var change : changes) {
-            // An entry of a leaf counts its offset, which a record has not
-            size += change.size() - 2;
+            size += change.bytes();
         }
         return size;
     }

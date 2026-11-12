@@ -464,10 +464,8 @@ class PageCacheTest {
                 var firstKey = MemorySegment.ofArray(new byte[]{(byte) ref.page()});
                 children.add(new TreeNodes.Child(firstKey, ref, 1, false, 0, -1));
             }
-            var sizes = children.stream().mapToInt(TreeNodes.Child::size).toArray();
-            var length = TreeNodes.contentLength(sizes, 0, sizes.length);
-            var branch = TreeNodes.writeBranch(children, 0, sizes.length, length);
-            PageFile.header(branch, PageFormat.BRANCH, 1, 20, 1, length, 1, 1);
+            var branch = TreeNodes.writeBranch(children, 0, children.size());
+            PageFile.header(branch, PageFormat.BRANCH, 1, 20, 1, branch.length - PageFormat.HEADER, 1, 1);
             for (var i = 0; i < children.size(); i++) {
                 assertEquals(children.get(i).ref(), TreeNodes.childRef(branch, i));
             }
