@@ -243,7 +243,7 @@ final class Reads {
             throw new IllegalArgumentException("limit must be positive: " + limit);
         }
         var entries = new ArrayList<Entry<K, V>>(Math.min(limit, 64));
-        scan(state, keyspace, range, point, (key, value, decoded) -> {
+        scan(state, keyspace, range, point, limit, (key, value, decoded) -> {
             entries.add(new Entry<>(keyspace.keys().decode(key), value(state, keyspace, value, decoded)));
             return entries.size() < limit;
         });
@@ -299,6 +299,16 @@ final class Reads {
     ///
     /// @return the number of entries passed
     static <K> long scan(KeyspaceState state, Keyspace<K, ?> keyspace, KeyRange<K> range, ReadPoint point, Visitor consumer) {
+        return scan(state, keyspace, range, point, Long.MAX_VALUE, consumer);
+    }
+
+    /// Passes the entries of `range` `point` sees to `consumer`, as the scan without `wanted` does, for a consumer
+    /// expected to take `wanted` of them, which bounds the values the tree's cursor reads ahead.
+    ///
+    /// @param wanted the entries `consumer` is expected to take, at least 1, or [Long#MAX_VALUE] if it may take them all
+    /// @return the number of entries passed
+    static <K> long scan(KeyspaceState state, Keyspace<K, ?> keyspace, KeyRange<K> range, ReadPoint point, long wanted,
+                         Visitor consumer) {
         Objects.requireNonNull(range, "range");
         // Copies, whatever the codec: the cursor keeps its bounds while a visitor runs, which may change a caller's array
         var fromBytes = range.from().map(key -> Segments.encodeKeyBytes(keyspace.keys(), key)).orElse(null);
@@ -317,7 +327,7 @@ final class Reads {
         }
         var root = point.root(state);
         var memory = state.walk(from, to, descending);
-        var tree = root == null ? null : new TreeCursor(point.pages(), root, fromBytes, toBytes, descending);
+        var tree = root == null ? null : new TreeCursor(point.pages(), root, fromBytes, toBytes, descending, wanted);
         var inTree = tree != null && tree.next();
         var held = memory.next();
         var visited = 0L;

@@ -43,6 +43,25 @@ final class PageFile implements AutoCloseable {
     private static final boolean FORCE_BESIDE = !System.getProperty("os.name", "").startsWith("Windows");
     /// Marks a read that accepts a leaf or a branch.
     static final byte NODE = -1;
+    /// The average read time from which reads count as cold, in microseconds: reads the OS cache serves take 1 to 5
+    /// microseconds on Linux and 5 to 20 on Windows, where those of the device of a CI runner took about 145, and a
+    /// Windows read out of the cache that Defender or paging slows rarely averages past 50.
+    static final int COLD_READ_MICROS = 80;
+    /// The pages between two units that [#prefetch(PageRef\[\], int, byte)] still reads with one call, throwing the
+    /// pages between away: a device takes a few more pages in the same request for little more than one.
+    static final int GAP_PAGES = 8;
+    // The bytes of a read that count as one sample of the read time: the copy of a long read out of the OS cache must
+    // not pass for a read of the device
+    private static final int SAMPLE_BYTES = 32 << 10;
+    // The longest read a sample records, in microseconds, which keeps the average from overflowing and lets the
+    // average fall back below the bound a few quick reads after one that a pause stretched
+    private static final int SAMPLE_LIMIT_MICROS = 1 << 10;
+    // Whether every page file opened from now on reads as cold, whatever it measures; for tests
+    private static volatile boolean forceColdNewForTests;
+    // A pool that keeps no array, for the arrays a read ahead opens its units with: the threads of one read ahead hold
+    // up to two arrays each at once, which the store's pool would keep until it idles, where a scan's own reads, one
+    // after another, leave it no more than they take at once
+    private static final HeapPool UNPOOLED = new HeapPool(0, false);
 
     private final Path path;
     private final PageCipher cipher;
@@ -53,6 +72,11 @@ final class PageFile implements AutoCloseable {
     // The file of large values, which leaves point into
     private volatile BlobFile blobs;
     private volatile boolean closed;
+    // The moving average of the time a read of the file takes, in microseconds; racy, as a lost or stale sample only
+    // moves the average less
+    private int readMicros;
+    // Whether reads count as cold whatever they measure; for tests
+    private volatile boolean forcedCold;
 
     private PageFile(Path path, PageCipher cipher, PageCache cache, HeapPool pool) throws IOException {
         this.path = path;
@@ -61,6 +85,7 @@ final class PageFile implements AutoCloseable {
         this.pool = pool;
         this.writer = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
         this.readers = new ArrayBlockingQueue<>(READ_CHANNELS);
+        this.forcedCold = forceColdNewForTests;
         try {
             for (var i = 0; i < READ_CHANNELS; i++) {
                 readers.add(FileChannel.open(path, StandardOpenOption.READ));
@@ -203,12 +228,7 @@ final class PageFile implements AutoCloseable {
         var sealed = pool.acquire(length);
         try {
             readFully(sealed, length, PageFormat.offset(ref.page()));
-            // The header is the additional data of the tag and the open copies it as it is, so what it says holds once
-            // the unit authenticates: it is checked first, and tells the bytes to keep
-            var content = Bytes.i32(sealed, PageFormat.LENGTH);
-            var plain = ref.describes(sealed) && kindMatches(sealed[PageFormat.KIND], kind) && PageFormat.fits(ref.pages(), content)
-                    ? cipher.open(sealed, 0, ref.pages(), cached ? PageFormat.cachedLength(ref.pages(), content) : length, pool)
-                    : null;
+            var plain = open(ref, kind, sealed, 0, cached, pool);
             if (plain == null) {
                 throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
             }
@@ -219,6 +239,150 @@ final class PageFile implements AutoCloseable {
         } finally {
             pool.release(sealed);
         }
+    }
+
+    /// {@return the plaintext of the unit `ref` names, sealed at `offset` of `sealed`, in an array of its own, or
+    /// `null` if it fails authentication or is not the unit `ref` names}
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    /// @param cached whether to keep the unit as the cache does, ending with its content, rather than whole
+    /// @param scratch the pool the open of a unit kept short of its pages takes its array from
+    private byte[] open(PageRef ref, byte kind, byte[] sealed, int offset, boolean cached, HeapPool scratch) {
+        // The header is the additional data of the tag and the open copies it as it is, so what it says holds once the
+        // unit authenticates: it is checked first, and tells the bytes to keep
+        var content = Bytes.i32(sealed, offset + PageFormat.LENGTH);
+        if (!ref.describes(sealed, offset) || !kindMatches(sealed[offset + PageFormat.KIND], kind)
+                || !PageFormat.fits(ref.pages(), content)) {
+            return null;
+        }
+        var length = ref.pages() * PageFormat.SIZE;
+        return cipher.open(sealed, offset, ref.pages(), cached ? PageFormat.cachedLength(ref.pages(), content) : length, scratch);
+    }
+
+    /// {@return the plaintext of the first `count` units `refs` names, in their order, each as the cache keeps it, or
+    /// `null` for a unit that could not be read; none of them cached}
+    ///
+    /// It reads ahead of a scan whose reads are [cold][#coldReads()], which may never use what it reads, so it reports
+    /// no failure: a unit it could not read, that fails authentication or that is not the one its reference names is
+    /// `null`, and the read that needs it fails as it would have without this one. Units at most [#GAP_PAGES] pages
+    /// apart are read with one call, up to [#RUN_PAGES] pages, the pages between thrown away unopened, and the calls run
+    /// on up to [#READ_CHANNELS] threads at once, the caller's among them: a scan that read its units out of the device
+    /// one after another waited for each in turn, about 145 microseconds each on the Windows runner. The arrays it reads
+    /// and opens into are its own and none goes back to the store's pool, which keeps no more than the scan's own reads
+    /// leave in it.
+    ///
+    /// @param refs references to units, none of them a delta record, each at most [#RUN_PAGES] pages
+    /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
+    byte[][] prefetch(PageRef[] refs, int count, byte kind) {
+        var units = new byte[count][];
+        // The references by page, each with its index in the low half
+        var order = new long[count];
+        for (var i = 0; i < count; i++) {
+            order[i] = (long) refs[i].page() << 32 | i;
+        }
+        Arrays.sort(order);
+        // Where each run of `order` starts, and the end of the last one
+        var starts = new int[count + 1];
+        var runs = 0;
+        var first = 0;
+        var end = 0;
+        for (var i = 0; i < count; i++) {
+            var ref = refs[(int) order[i]];
+            var unitEnd = ref.page() + ref.pages();
+            if (runs == 0 || ref.page() > end + GAP_PAGES || Math.max(end, unitEnd) - first > RUN_PAGES) {
+                starts[runs++] = i;
+                first = ref.page();
+                end = unitEnd;
+            } else {
+                end = Math.max(end, unitEnd);
+            }
+        }
+        starts[runs] = count;
+        try {
+            ClaimedIndexes.run("ledger-prefetch", runs, Math.min(READ_CHANNELS, runs) - 1,
+                    run -> prefetchRun(refs, order, starts[run], starts[run + 1], kind, units));
+        } catch (RuntimeException _) {
+            // A thread that would not start: the units left unread are read by the reads that need them
+        }
+        return units;
+    }
+
+    /// Reads the units of `refs` at `order[from]` to `order[to]`, excluded, which are sorted by page, with one call,
+    /// into `units`; a unit it cannot read stays `null`.
+    private void prefetchRun(PageRef[] refs, long[] order, int from, int to, byte kind, byte[][] units) {
+        if (to - from == 1) {
+            var index = (int) order[from];
+            units[index] = prefetchUnit(refs[index], kind);
+            return;
+        }
+        var first = refs[(int) order[from]].page();
+        var end = first;
+        for (var i = from; i < to; i++) {
+            var ref = refs[(int) order[i]];
+            end = Math.max(end, ref.page() + ref.pages());
+        }
+        var length = (end - first) * PageFormat.SIZE;
+        var sealed = new byte[length];
+        try {
+            readFully(sealed, length, PageFormat.offset(first));
+        } catch (LedgerCorruptedException | LedgerIoException | IllegalStateException _) {
+            // A call that fails, or that the end of the file cuts short, fails none of its units: each is read alone
+            for (var i = from; i < to; i++) {
+                var index = (int) order[i];
+                units[index] = prefetchUnit(refs[index], kind);
+            }
+            return;
+        }
+        for (var i = from; i < to; i++) {
+            var index = (int) order[i];
+            var ref = refs[index];
+            units[index] = open(ref, kind, sealed, (ref.page() - first) * PageFormat.SIZE, true, UNPOOLED);
+        }
+    }
+
+    /// {@return the plaintext of the unit `ref` names, as the cache keeps it, read alone and not cached, or `null` if
+    /// it cannot be read, fails authentication or is not the unit `ref` names}
+    private byte[] prefetchUnit(PageRef ref, byte kind) {
+        var length = ref.pages() * PageFormat.SIZE;
+        var sealed = new byte[length];
+        try {
+            readFully(sealed, length, PageFormat.offset(ref.page()));
+            return open(ref, kind, sealed, 0, true, UNPOOLED);
+        } catch (LedgerCorruptedException | LedgerIoException | IllegalStateException _) {
+            return null;
+        }
+    }
+
+    /// {@return whether reads of the file take long enough, on average, that they come from the device rather than the
+    /// OS cache: [#COLD_READ_MICROS] microseconds or more}
+    ///
+    /// The average moves a quarter of the way to each sample, so it passes the bound after about three reads of the
+    /// device and falls below it after a few quick ones.
+    boolean coldReads() {
+        return readMicros >= COLD_READ_MICROS || forcedCold;
+    }
+
+    /// Records in the average of [#coldReads()] a read of `length` bytes that took `nanos` nanoseconds.
+    void sampleRead(long nanos, int length) {
+        var micros = Math.clamp(nanos / 1_000 / Math.max(1, length / SAMPLE_BYTES), 0, SAMPLE_LIMIT_MICROS);
+        var average = readMicros;
+        readMicros = average + ((micros - average) >> 2);
+    }
+
+    /// {@return the moving average of the read time, in microseconds; for tests}
+    int readMicrosForTests() {
+        return readMicros;
+    }
+
+    /// Makes reads count as cold whatever they measure, or as they measure; for tests.
+    void forceColdReadsForTests(boolean cold) {
+        forcedCold = cold;
+    }
+
+    /// Makes every page file opened from now on count its reads as cold whatever they measure, or as they measure;
+    /// for tests.
+    static void forceColdNewForTests(boolean cold) {
+        forceColdNewForTests = cold;
     }
 
     /// {@return the plaintext of the units `refs` name, in their order, none of them cached}
@@ -328,6 +492,7 @@ final class PageFile implements AutoCloseable {
         var interrupted = false;
         try {
             var buffer = ByteBuffer.wrap(array, 0, length);
+            var start = System.nanoTime();
             while (buffer.hasRemaining()) {
                 try {
                     if (channel.read(buffer, position + buffer.position()) < 0) {
@@ -339,6 +504,7 @@ final class PageFile implements AutoCloseable {
                     channel = FileChannel.open(path, StandardOpenOption.READ);
                 }
             }
+            sampleRead(System.nanoTime() - start, length);
         } catch (IOException exception) {
             throw new LedgerIoException(path + " could not be read", exception);
         } finally {
