@@ -160,6 +160,51 @@ final class Padded {
         }
     }
 
+    abstract static class SlotsFields extends Before {
+        volatile int taken;
+    }
+
+    /// Slots that a few threads at a time take and give back, each with one read-modify-write of their count.
+    @SuppressWarnings("unused")
+    static final class Slots extends SlotsFields {
+        private static final VarHandle TAKEN;
+
+        static {
+            try {
+                TAKEN = MethodHandles.lookup().findVarHandle(SlotsFields.class, "taken", int.class);
+            } catch (ReflectiveOperationException exception) {
+                throw new ExceptionInInitializerError(exception);
+            }
+        }
+
+        long q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14, q15, q16;
+
+        /// {@return whether it took one of `limit` slots}
+        ///
+        /// A thread that finds them all taken writes nothing; one that takes a slot beyond the limit, in a race with
+        /// another, gives it back at once, so no more than `limit` threads ever hold one.
+        boolean tryTake(int limit) {
+            if (taken >= limit) {
+                return false;
+            }
+            if ((int) TAKEN.getAndAdd(this, 1) < limit) {
+                return true;
+            }
+            TAKEN.getAndAdd(this, -1);
+            return false;
+        }
+
+        /// Gives back a slot [#tryTake(int)] took.
+        void giveBack() {
+            TAKEN.getAndAdd(this, -1);
+        }
+
+        /// {@return the slots taken; for tests}
+        int taken() {
+            return taken;
+        }
+    }
+
     abstract static class SequencedFields extends Before {
         /// The last commit given a sequence.
         PendingCommit last;

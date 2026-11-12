@@ -121,6 +121,8 @@ public final class LiveLedger implements Ledger {
     private final Padded.Role checkpointWaiting;
     // publishApplied, which waiting commits run to help, made once
     private final Runnable publishHelper;
+    // Which waiting platform committers spin on once a wait outlasts its first stretch
+    private final SpinGate spinGate;
     // The frames of a pass of the publisher, queued in the log together; guarded by the publishing role
     private final LogWriter.Batch passFrames;
     // The passes of the publisher since the last maintenance; guarded by the publishing role
@@ -215,6 +217,7 @@ public final class LiveLedger implements Ledger {
         this.requests = new ReentrantLock();
         this.checkpointWaiting = new Padded.Role();
         this.publishHelper = this::publishApplied;
+        this.spinGate = new SpinGate();
         this.passFrames = new LogWriter.Batch();
         sequenced.next = 1;
         this.byId = new HashMap<>();
@@ -473,6 +476,11 @@ public final class LiveLedger implements Ledger {
         }
     }
 
+    /// {@return the gate of the waits of the commit pipeline; for tests}
+    SpinGate spinGate() {
+        return spinGate;
+    }
+
     KeyspaceState state(Keyspace<?, ?> keyspace) {
         Objects.requireNonNull(keyspace, "keyspace");
         var state = states.get(keyspace.name());
@@ -646,12 +654,20 @@ public final class LiveLedger implements Ledger {
         // Needed only to release the units of large values no log frame names
         var outcome = units == null ? null : new Applier[1];
         Commit commit;
+        var flag = -1;
         try {
             if (unloaded.get() != 0) {
                 awaitLoaded(writes);
             }
-            commit = writes.removesRanges() ? commitAlone(writes, units, outcome) : commitPipelined(writes, units, outcome);
+            if (writes.removesRanges()) {
+                commit = commitAlone(writes, units, outcome);
+            } else {
+                // Counted while it commits, so that waits spin less once the committing threads outnumber the processors
+                flag = spinGate.enter();
+                commit = commitPipelined(writes, units, outcome);
+            }
         } finally {
+            spinGate.exit(flag);
             if (outcome != null && (outcome[0] == null || !outcome[0].logged())) {
                 // No log frame names them
                 for (var unit : units) {
@@ -828,7 +844,7 @@ public final class LiveLedger implements Ledger {
         // The wait gives up, so this thread helps, while the role is free or held by a commit sequencing itself; a
         // park that ends early (a spurious wake-up, or the guard's timeout) helps again too
         while (pending.state < PendingCommit.SEQUENCED
-                && !pending.await(PendingCommit.SEQUENCED, sequencing, sequencingWanted)) {
+                && !pending.await(PendingCommit.SEQUENCED, sequencing, sequencingWanted, spinGate)) {
             if (sequencing.heldBriefly()) {
                 Thread.onSpinWait();
             }
@@ -843,7 +859,7 @@ public final class LiveLedger implements Ledger {
         publishApplied();
         // The wait helps every few spins while the role is free: a commit is then published by the first thread that
         // notices it applied, not by the next pass of a holder
-        pending.awaitHelping(PendingCommit.DONE, publishing, publishingWanted, publishHelper);
+        pending.awaitHelping(PendingCommit.DONE, publishing, publishingWanted, publishHelper, spinGate);
     }
 
     /// Adds `pending` to the commits waiting for a sequence.
@@ -979,7 +995,7 @@ public final class LiveLedger implements Ledger {
     private void applyWrite(PendingCommit pending, Applier applier, int index) {
         var predecessor = pending.predecessors[index];
         if (predecessor != null) {
-            predecessor.awaitApplied();
+            predecessor.awaitApplied(spinGate);
         }
         var writes = pending.writes;
         var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(index, tree);

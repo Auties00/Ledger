@@ -17,6 +17,11 @@ import java.util.concurrent.locks.LockSupport;
 /// parks, by a full fence, the mover's or one it shares with the moves of a whole pass. The sequencer and the
 /// publisher move commits with release stores and fence once per pass ([#wake()]); the committing thread moves its
 /// own to [#APPLIED] with a volatile store, since commits on its keys may wait for it.
+///
+/// A platform thread waiting for its commit to publish, or for an earlier one to apply, asks the store's [SpinGate]
+/// whether it spins on once the wait outlasts [#FREE_SPINS], and yields instead while the gate is closed: most waits
+/// end before, and touch none of the gate's lines. A thread waiting for a sequence is not gated, since the step it
+/// waits for is short and the thread takes it itself whenever the sequencing role is free.
 final class PendingCommit {
     /// Waiting for a sequence.
     static final int ARRIVED = 0;
@@ -29,7 +34,11 @@ final class PendingCommit {
 
     /// The spins of a waiting platform thread before it yields; about 68 microseconds: a parked thread costs the
     /// thread that wakes it a system call, on the sequencer's or the publisher's path.
-    private static final int PLATFORM_SPINS = 2_048;
+    static final int PLATFORM_SPINS = 2_048;
+    /// The spins of a waiting platform thread before it asks the [SpinGate] whether it spins on; about 8
+    /// microseconds, longer than most waits for a commit to publish, past four of the help points of
+    /// [#awaitHelping(int, Padded.Role, Padded.Role, Runnable, SpinGate)].
+    static final int FREE_SPINS = 256;
     /// The yields of a waiting platform thread before it parks.
     private static final int PLATFORM_YIELDS = 256;
     /// The spins of a waiting virtual thread before it yields its carrier: a spinning virtual thread keeps the
@@ -121,29 +130,57 @@ final class PendingCommit {
     }
 
     /// Waits, on the thread of a later commit, until this commit has applied its writes, or will never apply any.
-    void awaitApplied() {
+    ///
+    /// @param gate the gate of the store, which a platform thread asks whether it spins on past [#FREE_SPINS]
+    void awaitApplied(SpinGate gate) {
         var virtual = Thread.currentThread().isVirtual();
         var spins = virtual ? VIRTUAL_SPINS : PLATFORM_SPINS;
         var yields = spins + (virtual ? VIRTUAL_YIELDS : PLATFORM_YIELDS);
-        for (var spin = 0; !applied(); spin++) {
-            if (spin < spins) {
-                Thread.onSpinWait();
-            } else if (spin < yields) {
-                Thread.yield();
-            } else {
-                var waiter = new Waiter(Thread.currentThread());
-                while (true) {
-                    var head = waiters;
-                    waiter.next = head;
-                    // A compare-and-set, so a full fence before the state is read again
-                    if (WAITERS.compareAndSet(this, head, waiter)) {
-                        break;
+        var holding = false;
+        try {
+            for (var spin = 0; !applied(); spin++) {
+                if (spin == FREE_SPINS && !virtual) {
+                    var admission = gate.admit();
+                    if (admission == SpinGate.HOLDING) {
+                        holding = true;
+                    } else if (admission == SpinGate.GATED) {
+                        // Yields from this turn on, its budget of yields unchanged
+                        spins = spin;
+                        yields = spins + PLATFORM_YIELDS;
                     }
                 }
-                while (!applied()) {
-                    park(this);
+                if (spin < spins) {
+                    Thread.onSpinWait();
+                    continue;
                 }
-                return;
+                if (holding) {
+                    holding = false;
+                    gate.release();
+                }
+                if (spin < yields) {
+                    if (spin == spins && !virtual) {
+                        gate.yields(spin);
+                    }
+                    Thread.yield();
+                } else {
+                    var waiter = new Waiter(Thread.currentThread());
+                    while (true) {
+                        var head = waiters;
+                        waiter.next = head;
+                        // A compare-and-set, so a full fence before the state is read again
+                        if (WAITERS.compareAndSet(this, head, waiter)) {
+                            break;
+                        }
+                    }
+                    while (!applied()) {
+                        park(this, gate);
+                    }
+                    return;
+                }
+            }
+        } finally {
+            if (holding) {
+                gate.release();
             }
         }
     }
@@ -154,7 +191,7 @@ final class PendingCommit {
     ///
     /// @return whether it did; `false` after a park that ended before, so the caller may help and wait again
     boolean await(int wanted) {
-        return await(wanted, null, null);
+        return await(wanted, null, null, null);
     }
 
     /// Waits as [#await(int)] does, and returns `false` instead of parking while `role` is free or held briefly:
@@ -165,7 +202,8 @@ final class PendingCommit {
     /// kept spinning and yielding would only take the processor, or the carrier, from the one thread that can move on.
     ///
     /// @param roleWanted the flag raised for an operation that wants `role` for itself, or `null`
-    boolean await(int wanted, Padded.Role role, Padded.Role roleWanted) {
+    /// @param gate the gate of the store, which lowers the thread's flag while it parks, or `null`
+    boolean await(int wanted, Padded.Role role, Padded.Role roleWanted, SpinGate gate) {
         var virtual = Thread.currentThread().isVirtual();
         var spins = virtual ? VIRTUAL_SPINS : PLATFORM_SPINS;
         var yields = spins + (virtual ? VIRTUAL_YIELDS : PLATFORM_YIELDS);
@@ -185,7 +223,7 @@ final class PendingCommit {
                 parking = true;
                 if (state < wanted && (role == null || (roleWanted != null && roleWanted.held())
                         || (role.held() && !role.heldBriefly()))) {
-                    park(this);
+                    park(this, gate);
                 }
                 parking = false;
                 return state >= wanted;
@@ -194,49 +232,105 @@ final class PendingCommit {
         return true;
     }
 
-    /// Waits, on the committing thread, until [#state] reaches `wanted`, running `help` every few spins while `role`
-    /// is free and once after each park.
+    /// Waits, on the committing thread, until [#state] reaches `wanted`, running `help` every few spins and before
+    /// each yield while `role` is free, and once after each park.
     ///
-    /// Unlike [#await(int, Padded.Role)], it keeps its count of spins across the help, so it still parks once it has
-    /// spun and yielded its budget: helping finds nothing to do while an earlier commit has not applied, and its
-    /// thread wakes this one when it is published. While `roleWanted` is raised it parks at once, as
-    /// [#await(int, Padded.Role, Padded.Role)] does.
-    void awaitHelping(int wanted, Padded.Role role, Padded.Role roleWanted, Runnable help) {
+    /// Unlike [#await(int, Padded.Role, Padded.Role, SpinGate)], it keeps its count of spins across the help, so it
+    /// still parks once it has spun and yielded its budget: helping finds nothing to do while an earlier commit has
+    /// not applied, and its thread wakes this one when it is published. While `roleWanted` is raised it parks at
+    /// once, as that wait does. A platform thread that the gate does not let spin past [#FREE_SPINS] yields, still
+    /// helping before each yield; one that spins holding a slot of the gate gives it back while it helps, since a
+    /// help may publish and maintain the store for a while, and spins on only if it takes a slot again.
+    ///
+    /// @param gate the gate of the store, which a platform thread asks whether it spins on past [#FREE_SPINS]
+    void awaitHelping(int wanted, Padded.Role role, Padded.Role roleWanted, Runnable help, SpinGate gate) {
         var virtual = Thread.currentThread().isVirtual();
         var spins = virtual ? VIRTUAL_SPINS : PLATFORM_SPINS;
         var yields = spins + (virtual ? VIRTUAL_YIELDS : PLATFORM_YIELDS);
-        for (var spin = 0; state < wanted; spin++) {
-            if (roleWanted.held()) {
-                spin = Math.max(spin, yields);
-            }
-            if (spin < spins) {
-                if ((spin & 63) == 63 && !role.held()) {
-                    help.run();
+        var holding = false;
+        try {
+            for (var spin = 0; state < wanted; spin++) {
+                if (roleWanted.held()) {
+                    spin = Math.max(spin, yields);
+                } else if (spin == FREE_SPINS && !virtual) {
+                    var admission = gate.admit();
+                    if (admission == SpinGate.HOLDING) {
+                        holding = true;
+                    } else if (admission == SpinGate.GATED) {
+                        // Yields from this turn on, its budget of yields unchanged
+                        spins = spin;
+                        yields = spins + PLATFORM_YIELDS;
+                    }
+                }
+                if (spin < spins) {
+                    if ((spin & 63) == 63 && !role.held()) {
+                        if (holding) {
+                            holding = false;
+                            gate.release();
+                            help.run();
+                            holding = gate.reclaim();
+                            if (!holding) {
+                                // Yields from the next turn on
+                                spins = spin + 1;
+                                yields = spins + PLATFORM_YIELDS;
+                            }
+                        } else {
+                            help.run();
+                        }
+                    } else {
+                        Thread.onSpinWait();
+                    }
+                    continue;
+                }
+                if (holding) {
+                    holding = false;
+                    gate.release();
+                }
+                if (spin < yields) {
+                    if (spin == spins && !virtual) {
+                        gate.yields(spin);
+                    }
+                    if (!role.held()) {
+                        help.run();
+                    }
+                    if (state < wanted) {
+                        Thread.yield();
+                    }
                 } else {
-                    Thread.onSpinWait();
+                    // Announced with a volatile store, a full fence, before the state is read again
+                    parking = true;
+                    if (state < wanted) {
+                        park(this, gate);
+                    }
+                    parking = false;
+                    // A park that ended early, a spurious wake-up or the guard's timeout, helps once
+                    if (state < wanted) {
+                        help.run();
+                    }
                 }
-            } else if (spin < yields) {
-                Thread.yield();
-            } else {
-                // Announced with a volatile store, a full fence, before the state is read again
-                parking = true;
-                if (state < wanted) {
-                    park(this);
-                }
-                parking = false;
-                // A park that ended early, a spurious wake-up or the guard's timeout, helps once
-                if (state < wanted) {
-                    help.run();
-                }
+            }
+        } finally {
+            if (holding) {
+                gate.release();
             }
         }
     }
 
-    private static void park(Object blocker) {
-        if (PARK_NANOS == 0) {
-            LockSupport.park(blocker);
-        } else {
-            LockSupport.parkNanos(blocker, PARK_NANOS);
+    /// Parks the current thread, a committing one, lowering its flag of `gate` while it does, unless `gate` is `null`.
+    private static void park(Object blocker, SpinGate gate) {
+        if (gate != null) {
+            gate.parks();
+        }
+        try {
+            if (PARK_NANOS == 0) {
+                LockSupport.park(blocker);
+            } else {
+                LockSupport.parkNanos(blocker, PARK_NANOS);
+            }
+        } finally {
+            if (gate != null) {
+                gate.unparks();
+            }
         }
     }
 
