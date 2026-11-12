@@ -86,6 +86,7 @@ final class ResidentLoader {
         this.lock = new ReentrantLock();
         this.progress = lock.newCondition();
         this.below = NOTHING;
+        state.keepLoadedOrder();
     }
 
     /// {@return whether memory holds `key`'s entry, if it has one}
@@ -290,6 +291,7 @@ final class ResidentLoader {
         try {
             step(0);
             var from = below;
+            state.restageLoadedOrder();
             var trees = ledger.point(sequence).tree();
             var root = trees == null ? null : trees.root(state.id);
             if (root != null) {
@@ -329,7 +331,8 @@ final class ResidentLoader {
         }
     }
 
-    /// Installs the entries of `leaves` at or after `from`, then publishes them by moving [#below] past the last.
+    /// Installs the entries of `leaves` at or after `from`, then publishes them by moving [#below] past the last, after
+    /// the key space's array of the chains the loader installed ([KeyspaceState#loadedOrder()]).
     ///
     /// A key that has a chain already got it from an earlier attempt that failed, and keeps it: no commit writes the
     /// keys at or after [#below].
@@ -355,8 +358,10 @@ final class ResidentLoader {
             }
         }
         if (last != null) {
+            var next = after(last);
+            state.publishLoadedOrder(false);
             // Past the last key: a key between it and the next leaf's first has no entry
-            below = after(last);
+            below = next;
         }
     }
 
@@ -367,8 +372,10 @@ final class ResidentLoader {
         return MemorySegment.ofArray(next).asReadOnly();
     }
 
-    /// Marks every entry loaded and lets the key space read memory alone.
+    /// Marks every entry loaded and lets the key space read memory alone, after it published the array of the chains
+    /// it installed, trimmed to them.
     private void finish() {
+        state.publishLoadedOrder(true);
         complete = true;
         state.loading = null;
         ledger.residentLoaded();

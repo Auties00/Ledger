@@ -6,6 +6,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -47,6 +48,14 @@ import java.util.function.LongSupplier;
 /// scan that steps onto it reads the tree for its key, as for an empty chain still in the map, and one that finds its
 /// link cleared asks the map for the next chain.
 ///
+/// A resident key space a loader fills also keeps the chains the loader installed in an array, in the order of their
+/// keys, as long as they are its only chains ([LoadedOrder]): no commit created a chain in it and none was dropped. Its
+/// scans then step along the array from a binary search and order no chain. Ordering costs a walk down the map for each
+/// chain, and a scan of a key space read whole after an open, as a first screen reads its chats, would pay those of the
+/// loader's last run with nothing else to wait for. The first chain created otherwise, or dropped, drops the array for
+/// good, before that chain enters the index or leaves it; from then on the scans order the listed chains as above. The
+/// array costs 4 bytes a chain, the ordered map 73.
+///
 /// Readers use it concurrently with the commits. Commits create chains before they are given a sequence; everything
 /// else changes only under it.
 final class KeyspaceState {
@@ -71,6 +80,11 @@ final class KeyspaceState {
     private static final int UNLINKED = 0;
     private static final int RELINKING = 1;
     private static final int LINKED = 2;
+    /// The value of [#loadedOrder] in a key space no loader fills, and once the chains its loader installed are not
+    /// every chain it holds, by identity; it never changes back.
+    private static final LoadedOrder NO_LOADED_ORDER = new LoadedOrder(new Chain[0], 0);
+    /// The slots the loader's array takes first, which each growth doubles.
+    private static final int LOADED_ORDER_SLOTS = 64;
 
     final Keyspace<?, ?> keyspace;
     final boolean resident;
@@ -135,12 +149,24 @@ final class KeyspaceState {
     /// Whether the store is closing, after which a commit no longer waits for the creator of a chain to list it; set
     /// by the store before its close waits for the commits under way.
     volatile boolean closing;
+    // The chains the loader installed and published, in the order of their keys, while they are every chain of the key
+    // space; NO_LOADED_ORDER otherwise. Only the loader publishes another, by a compare-and-set from the one it
+    // published last, so once a commit drops it, it stays dropped
+    private volatile LoadedOrder loadedOrder;
+    // The array the loader appends to, of which no reader reads the slots past the count of the last published order,
+    // or null once the loader stopped keeping the order; written by the loader alone, each attempt after the last
+    private Chain[] stagedChains;
+    // The chains stagedChains holds, those of the last published order first; written by the loader alone
+    private int stagedCount;
 
     private static final VarHandle UNORDERED;
+    private static final VarHandle LOADED_ORDER;
 
     static {
         try {
-            UNORDERED = MethodHandles.lookup().findVarHandle(KeyspaceState.class, "unordered", Chain.class);
+            var lookup = MethodHandles.lookup();
+            UNORDERED = lookup.findVarHandle(KeyspaceState.class, "unordered", Chain.class);
+            LOADED_ORDER = lookup.findVarHandle(KeyspaceState.class, "loadedOrder", LoadedOrder.class);
         } catch (ReflectiveOperationException exception) {
             throw new ExceptionInInitializerError(exception);
         }
@@ -165,6 +191,7 @@ final class KeyspaceState {
         this.linking = new ReentrantLock();
         this.left = new ConcurrentLinkedQueue<>();
         this.leftCount = new AtomicInteger();
+        this.loadedOrder = NO_LOADED_ORDER;
     }
 
     /// {@return the chain of `key`, or `null` if memory holds none}
@@ -216,11 +243,14 @@ final class KeyspaceState {
     /// loader of a resident key space, which no commit writes beside.
     ///
     /// The chain has its version before it is in the index, so the sweep, which walks the index, never finds it empty.
+    /// The loader's array takes the chain the index holds for `key` ([#publishLoadedOrder(boolean)]), the one an
+    /// attempt that failed installed included.
     void install(MemorySegment key, Version head) {
         var hash = Segments.hash(key);
         var chain = index.get(key, hash);
         if (chain != null) {
             if (!chain.released()) {
+                stageLoaded(chain);
                 return;
             }
             index.remove(chain);
@@ -228,6 +258,7 @@ final class KeyspaceState {
         var created = keys.chain(key, hash);
         created.head = head;
         if (index.putIfAbsent(created) != null) {
+            // Created by a commit, which dropped the loader's array first
             return;
         }
         if (lazy) {
@@ -235,6 +266,89 @@ final class KeyspaceState {
         } else {
             order(created);
         }
+        stageLoaded(created);
+    }
+
+    /// Starts keeping the chains the loader installs in the order of their keys, for the scans; called as the store
+    /// opens, before the loader runs, and does nothing unless the key space is resident, orders lazily and holds no
+    /// chain.
+    void keepLoadedOrder() {
+        if (lazy && resident && index.holdsNone()) {
+            loadedOrder = new LoadedOrder(new Chain[0], 0);
+        }
+    }
+
+    /// Starts an attempt of the loader, on its thread: the chains it installs go on the array after those of the last
+    /// published order, over the slots an attempt that failed staged and never published.
+    ///
+    /// The published order holds the chains of the keys below the loader's position, where the attempt starts, since
+    /// the loader publishes it and then moves the position with a store that cannot fail; the chains an attempt that
+    /// failed installed past the position the next one finds in the index and stages again, so the array has no gap and
+    /// no key twice.
+    void restageLoadedOrder() {
+        var order = loadedOrder;
+        if (order == NO_LOADED_ORDER) {
+            stagedChains = null;
+            return;
+        }
+        stagedChains = order.chains;
+        stagedCount = order.count;
+    }
+
+    /// Appends `chain`, which the loader installed past the keys it staged, to its array, unless it keeps none.
+    private void stageLoaded(Chain chain) {
+        var chains = stagedChains;
+        if (chains == null) {
+            return;
+        }
+        if (stagedCount == chains.length) {
+            // A copy of its own: the published orders keep the array they hold
+            chains = Arrays.copyOf(chains, Math.max(LOADED_ORDER_SLOTS, chains.length * 2));
+            stagedChains = chains;
+        }
+        chains[stagedCount++] = chain;
+    }
+
+    /// Publishes the chains the loader staged, before the loader publishes its position past them, so a scan that reads
+    /// the position and then the order finds every chain below the position; on the loader's thread.
+    ///
+    /// @param last whether the load ends with them, which trims the array to its chains and ends the staging
+    void publishLoadedOrder(boolean last) {
+        var chains = stagedChains;
+        if (chains == null) {
+            return;
+        }
+        var current = loadedOrder;
+        if (current == NO_LOADED_ORDER) {
+            stagedChains = null;
+            return;
+        }
+        if (!last && current.count == stagedCount) {
+            return;
+        }
+        var published = last && stagedCount < chains.length ? Arrays.copyOf(chains, stagedCount) : chains;
+        // Fails only once a commit dropped the order, which then stays dropped
+        if (!LOADED_ORDER.compareAndSet(this, current, new LoadedOrder(published, stagedCount)) || last) {
+            stagedChains = null;
+        }
+    }
+
+    /// Drops the loader's array for good, before a chain the loader did not install enters the index or a chain leaves
+    /// it; it reads first, so the commits of a key space that keeps none store nothing here.
+    private void dropLoadedOrder() {
+        if (loadedOrder != NO_LOADED_ORDER) {
+            loadedOrder = NO_LOADED_ORDER;
+        }
+    }
+
+    /// {@return the chains the loader installed, in the order of their keys, if they are every chain of the key space,
+    /// or `null`}
+    ///
+    /// A scan reads it after it took its point and read the loader's position: a commit the point sees created its
+    /// chains, and dropped the order, before it was published, and the loader publishes the order before its position.
+    LoadedOrder loadedOrder() {
+        var order = loadedOrder;
+        return order == NO_LOADED_ORDER ? null : order;
     }
 
     /// {@return the newest version of `key` in memory, or `null`}
@@ -274,6 +388,8 @@ final class KeyspaceState {
             chain = null;
         }
         if (chain == null) {
+            // Before the chain is in the index: a scan whose point sees a commit of the key finds the order dropped
+            dropLoadedOrder();
             var created = keys.chain(key, hash);
             chain = index.putIfAbsent(created);
             if (chain == null) {
@@ -745,6 +861,8 @@ final class KeyspaceState {
     }
 
     private void empty(Chain chain) {
+        // An emptied chain resolves to no version on the array too: the drop only lets go of its chains and keys
+        dropLoadedOrder();
         chain.markDropped();
         chain.head = null;
         index.remove(chain);
@@ -895,10 +1013,15 @@ final class KeyspaceState {
     /// {@return a walk over the chains between `from`, included, and `to`, excluded, either `null` for no bound, in
     /// the order of their keys, or the reverse if `descending`}
     ///
-    /// It orders the listed chains first, as [#slice] does. A descending walk of a key space that orders lazily steps
-    /// along the links of the chains, which it links first if no descending walk did; while another thread links them,
-    /// and for any other walk, it iterates the ordered map.
+    /// While the chains the loader installed are every chain, it steps along their array ([#loadedOrder()]).
+    /// Otherwise it orders the listed chains first, as [#slice] does. A descending walk of a key space that orders
+    /// lazily steps along the links of the chains, which it links first if no descending walk did; while another thread
+    /// links them, and for any other walk, it iterates the ordered map.
     Walk walk(MemorySegment from, MemorySegment to, boolean descending) {
+        var loaded = loadedOrder();
+        if (loaded != null) {
+            return loaded.walk(from, to, descending);
+        }
         orderListed();
         if (descending && lazy && linked()) {
             return new Walk(entries, from, to);
@@ -944,14 +1067,22 @@ final class KeyspaceState {
     /// it returns every chain the map held when it started that does not leave meanwhile, and may miss the chains that
     /// enter during the walk: those belong to commits after its reader's point, or replace dropped chains whose versions
     /// the reader's tree holds. It may return chains that left the map, emptied, whose keys the reader reads from the
-    /// tree.
+    /// tree. A walk over a [LoadedOrder] steps along its array, in either direction.
     static final class Walk {
         // The map the walk asks for the chain below one whose link does not lead down; null when it iterates it
         private final ConcurrentSkipListMap<MemorySegment, Chain> entries;
-        // The map's entries, or null when the walk steps along the links
+        // The map's entries, or null when the walk steps along the links or an array
         private final Iterator<Map.Entry<MemorySegment, Chain>> iterator;
         // Where a walk along the links ends, or null for no bound
         private final MemorySegment from;
+        // The loader's array the walk steps along, or null
+        private final Chain[] chains;
+        // The slot of the array the walk returns next
+        private int slot;
+        // The slot past the last the walk along the array returns, in the walk's direction
+        private final int end;
+        // The step from one slot of the array to the next, 1 or -1
+        private final int step;
         private Chain chain;
         private MemorySegment key;
         // Whether the walk along the links returned the chain it starts at
@@ -962,6 +1093,21 @@ final class KeyspaceState {
             this.entries = null;
             this.iterator = iterator;
             this.from = null;
+            this.chains = null;
+            this.end = 0;
+            this.step = 0;
+        }
+
+        /// Makes a walk over the chains of `chains` from slot `start`, included, to `end`, excluded, in the order of the
+        /// array, or the reverse if `descending`.
+        Walk(Chain[] chains, int start, int end, boolean descending) {
+            this.entries = null;
+            this.iterator = null;
+            this.from = null;
+            this.chains = chains;
+            this.slot = descending ? end - 1 : start;
+            this.end = descending ? start - 1 : end;
+            this.step = descending ? -1 : 1;
         }
 
         /// Makes a walk down the linked chains of `entries` between `from`, included, and `to`, excluded, either `null`
@@ -970,6 +1116,9 @@ final class KeyspaceState {
             this.entries = entries;
             this.iterator = null;
             this.from = from;
+            this.chains = null;
+            this.end = 0;
+            this.step = 0;
             var start = to == null ? entries.lastEntry() : entries.lowerEntry(to);
             if (start != null && (from == null || Segments.compare(start.getKey(), from) >= 0)) {
                 this.chain = start.getValue();
@@ -981,6 +1130,17 @@ final class KeyspaceState {
         ///
         /// @return whether there is one, which [#chain()] and [#key()] then return
         boolean next() {
+            if (chains != null) {
+                if (slot == end) {
+                    chain = null;
+                    key = null;
+                    return false;
+                }
+                chain = chains[slot];
+                key = null;
+                slot += step;
+                return true;
+            }
             if (iterator != null) {
                 if (!iterator.hasNext()) {
                     chain = null;
@@ -1022,8 +1182,61 @@ final class KeyspaceState {
         }
 
         /// {@return the key of the chain the walk is at, read-only}
+        ///
+        /// A walk along an array makes the key's segment at the first call for each chain.
         MemorySegment key() {
-            return key;
+            var current = key;
+            if (current == null && chain != null) {
+                current = chain.key();
+                key = current;
+            }
+            return current;
+        }
+    }
+
+    /// The chains a loader installed and published, in the order of their keys: those of `chains` below slot `count`,
+    /// which never change.
+    ///
+    /// A chain dropped since stays on it, emptied, and resolves to no version; while the order is its key space's, the
+    /// key space holds no other chain.
+    static final class LoadedOrder {
+        private final Chain[] chains;
+        private final int count;
+
+        LoadedOrder(Chain[] chains, int count) {
+            this.chains = chains;
+            this.count = count;
+        }
+
+        /// {@return the number of chains}
+        int count() {
+            return count;
+        }
+
+        /// {@return the first slot whose chain's key is at least `key`, or [#count()] if none is; 0 for `null`}
+        int lowerBound(MemorySegment key) {
+            if (key == null) {
+                return 0;
+            }
+            var low = 0;
+            var high = count;
+            while (low < high) {
+                var middle = (low + high) >>> 1;
+                if (chains[middle].compareKey(key) < 0) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            return low;
+        }
+
+        /// {@return a walk over the chains between `from`, included, and `to`, excluded, either `null` for no bound, in
+        /// the order of their keys, or the reverse if `descending`}
+        Walk walk(MemorySegment from, MemorySegment to, boolean descending) {
+            var start = lowerBound(from);
+            var end = to == null ? count : Math.max(start, lowerBound(to));
+            return new Walk(chains, start, end, descending);
         }
     }
 }

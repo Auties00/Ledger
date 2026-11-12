@@ -901,7 +901,7 @@ class ResidentLoadTest {
     }
 
     @Test
-    @DisplayName("a descending scan beside the loader links no chain, and the first after the load links those it installed, which stay linked through later writes")
+    @DisplayName("a descending scan beside the loader walks its array, or once a commit created a chain orders the chains and links none, and the first after the load links them, and they stay linked through later writes")
     void linksAfterLoad(@TempDir Path directory) throws Exception {
         var model = populate(directory, SESSIONS, ENTRIES);
         try (var ledger = open(directory, false)) {
@@ -911,6 +911,13 @@ class ResidentLoadTest {
             assertEquals(Optional.of(value(0)), ledger.get(SESSIONS, key(0)));
             pause.awaitPaused(1);
             var state = live.state(SESSIONS);
+            assertEquals(descending(model), ledger.range(SESSIONS, KeyRange.<String>all().reversed(), Integer.MAX_VALUE));
+            assertNotNull(state.loadedOrder());
+            assertTrue(state.entries.isEmpty());
+            // A new key the loader passed: the scans order the chains from here on
+            ledger.commit(ledger.newBatch().put(SESSIONS, key(0) + "a", "entered"));
+            model.put(key(0) + "a", "entered");
+            assertNull(state.loadedOrder());
             assertEquals(descending(model), ledger.range(SESSIONS, KeyRange.<String>all().reversed(), Integer.MAX_VALUE));
             assertFalse(state.entries.isEmpty());
             for (var chain : state.entries.values()) {
@@ -924,7 +931,7 @@ class ResidentLoadTest {
                 assertSame(below, chain.below());
                 below = chain;
             }
-            assertEquals(ENTRIES, state.entries.size());
+            assertEquals(ENTRIES + 1, state.entries.size());
             ledger.commit(ledger.newBatch().put(SESSIONS, key(500) + "a", "entered").delete(SESSIONS, key(501)));
             model.put(key(500) + "a", "entered");
             model.remove(key(501));

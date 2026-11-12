@@ -108,7 +108,22 @@ final class ResidentScan {
     }
 
     /// Passes the entries memory holds from `low`, included, to `high`, excluded.
+    ///
+    /// It steps along the loader's array while the chains the loader installed are every chain of the key space
+    /// ([KeyspaceState#loadedOrder()]), read again at each call, after the position it bounds `high` with: the loader
+    /// publishes the array before the position, and a commit that drops the array between two calls created no chain
+    /// the scan's point sees.
     private void memory(MemorySegment low, MemorySegment high) {
+        var loaded = state.loadedOrder();
+        if (loaded != null) {
+            var walk = loaded.walk(low, high, descending);
+            while (walk.next()) {
+                if (!pass(walk)) {
+                    return;
+                }
+            }
+            return;
+        }
         var slice = state.slice(low, high);
         for (var entry : (descending ? slice.descendingMap() : slice).entrySet()) {
             var version = KeyspaceState.resolve(entry.getValue().head, entry.getKey(), point.bound(), removals);
@@ -120,6 +135,23 @@ final class ResidentScan {
                 }
             }
         }
+    }
+
+    /// Passes the entry of the chain `walk` is at, if the scan sees one.
+    ///
+    /// @return whether the scan goes on
+    private boolean pass(KeyspaceState.Walk walk) {
+        // The key's segment only for the range removals and an entry the scan passes on
+        var version = KeyspaceState.resolve(walk.chain().head, removals.length == 0 ? null : walk.key(), point.bound(), removals);
+        if (version == null || version == Version.HIDDEN) {
+            return true;
+        }
+        visited++;
+        if (!consumer.visit(walk.key(), version.value(), version.decoded)) {
+            stopped = true;
+            return false;
+        }
+        return true;
     }
 
     /// Passes the entries the tree holds from `low`, included, to `high`, excluded, until the loader passes the scan.
