@@ -111,11 +111,14 @@ public final class ArrayWriteBatch implements WriteBatch {
     private byte[] spare;
     // Where the store's versions find the values, as prepare decided: one of the HOMES_ constants
     private byte homesMode;
-    // In HOMES_CHUNKS and HOMES_SLAB, the read-only segment the values of the paged writes were copied into
+    // In HOMES_CHUNKS and HOMES_SLAB, the read-only segment the values of the paged writes were copied into, and the
+    // array behind it
     private MemorySegment packedHome;
+    private byte[] packedHomeArray;
     // In HOMES_PER_WRITE, the read-only segment the value of each paged write was copied into: a slab's chunks, more than
-    // one of them or beside the array of the values it did not take
+    // one of them or beside the array of the values it did not take; and the array behind each
     private MemorySegment[] perWriteHomes;
+    private byte[][] perWriteHomeArrays;
 
     private byte[] kinds;
     private Keyspace<?, ?>[] targets;
@@ -531,6 +534,8 @@ public final class ArrayWriteBatch implements WriteBatch {
         // What the versions of its values slice once a prepare exposed it: its view, or a copy of its bytes in an array
         // of their size; null for a chunk no prepare exposed
         MemorySegment home;
+        // The array behind home: the chunk's own, which then never goes back to the pool, or the copy
+        byte[] homeArray;
 
         Chunk(int number, byte[] array, boolean values) {
             this.number = number;
@@ -604,7 +609,9 @@ public final class ArrayWriteBatch implements WriteBatch {
         leaveRope();
         // What a commit that failed prepared
         packedHome = null;
+        packedHomeArray = null;
         perWriteHomes = null;
+        perWriteHomeArrays = null;
         homesMode = HOMES_NONE;
         if (exposed) {
             dropData();
@@ -755,7 +762,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// @param states the store's key spaces by name
     void prepare(boolean copies, ValueSlab slab, Map<String, KeyspaceState> states) {
         packedHome = null;
+        packedHomeArray = null;
         perWriteHomes = null;
+        perWriteHomeArrays = null;
         homesMode = HOMES_NONE;
         if (copies) {
             return;
@@ -805,9 +814,13 @@ public final class ArrayWriteBatch implements WriteBatch {
             var chunk = chunks[i];
             if (chunk.values && chunk.home == null) {
                 var unused = chunk.array.length - chunk.fill;
-                chunk.home = unused > Math.max(SLACK, chunk.array.length / 16)
-                        ? MemorySegment.ofArray(Arrays.copyOf(chunk.array, chunk.fill)).asReadOnly()
-                        : chunk.view;
+                if (unused > Math.max(SLACK, chunk.array.length / 16)) {
+                    chunk.homeArray = Arrays.copyOf(chunk.array, chunk.fill);
+                    chunk.home = MemorySegment.ofArray(chunk.homeArray).asReadOnly();
+                } else {
+                    chunk.homeArray = chunk.array;
+                    chunk.home = chunk.view;
+                }
             }
         }
     }
@@ -828,8 +841,8 @@ public final class ArrayWriteBatch implements WriteBatch {
         var placedBytes = 0L;
         var placed = 0;
         var declined = false;
-        MemorySegment first = null;
-        MemorySegment[] several = null;
+        ValueSlab.Chunk first = null;
+        ValueSlab.Chunk[] several = null;
         for (var i = 0; i < size; i++) {
             if (!packed(i)) {
                 continue;
@@ -851,7 +864,7 @@ public final class ArrayWriteBatch implements WriteBatch {
             if (first == null) {
                 first = home;
             } else if (several == null && home != first) {
-                several = new MemorySegment[size];
+                several = new ValueSlab.Chunk[size];
             }
             if (several != null) {
                 several[i] = home;
@@ -862,11 +875,21 @@ public final class ArrayWriteBatch implements WriteBatch {
             return false;
         }
         if (several == null && !declined) {
-            packedHome = first;
+            packedHome = first.view();
+            packedHomeArray = first.array();
             homesMode = HOMES_SLAB;
             return true;
         }
-        perWriteHomes = several != null ? several : new MemorySegment[size];
+        perWriteHomes = new MemorySegment[size];
+        perWriteHomeArrays = new byte[size][];
+        if (several != null) {
+            for (var i = 0; i < size; i++) {
+                if (several[i] != null) {
+                    perWriteHomes[i] = several[i].view();
+                    perWriteHomeArrays[i] = several[i].array();
+                }
+            }
+        }
         homesMode = HOMES_PER_WRITE;
         Packer packer = null;
         for (var i = 0; i < size; i++) {
@@ -879,8 +902,10 @@ public final class ArrayWriteBatch implements WriteBatch {
                 }
                 packer.pack(i);
                 perWriteHomes[i] = packedHome;
+                perWriteHomeArrays[i] = packedHomeArray;
             } else if (perWriteHomes[i] == null) {
-                perWriteHomes[i] = first;
+                perWriteHomes[i] = first.view();
+                perWriteHomeArrays[i] = first.array();
             }
         }
         return true;
@@ -904,6 +929,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         Packer(int bytes) {
             chunk = new byte[bytes];
             packedHome = MemorySegment.ofArray(chunk).asReadOnly();
+            packedHomeArray = chunk;
         }
 
         /// Gives write `index` its home, if it puts a value to a paged key space.
@@ -932,6 +958,26 @@ public final class ArrayWriteBatch implements WriteBatch {
             case HOMES_CHUNKS, HOMES_SLAB -> packed(index) ? packedHome : null;
             case HOMES_ROPE -> packed(index) ? chunks[(int) (spans[index * 4 + 2] >>> 32)].home : null;
             case HOMES_PER_WRITE -> packed(index) ? perWriteHomes[index] : null;
+            default -> null;
+        };
+    }
+
+    /// {@return the array [#home(int)] is a view of, holding the value at [#homeOffset(int)], or `null` if the write
+    /// has no home}
+    ///
+    /// No one writes the array where the value lies once the prepare has returned, and the pool never gets it back,
+    /// as [#finish()] says, so a log frame may refer to the value after the batch has started again: it is the batch's
+    /// own array once a prepare exposed it, an array the values were copied into, a slab's chunk, or a chunk of the
+    /// rope the versions keep or the copy of it they keep instead.
+    ///
+    /// @param index a write that puts a value
+    byte[] homeArray(int index) {
+        Objects.checkIndex(index, size);
+        return switch (homesMode) {
+            case HOMES_OWN -> spans[index * 4 + 2] == OWN ? null : data;
+            case HOMES_CHUNKS, HOMES_SLAB -> packed(index) ? packedHomeArray : null;
+            case HOMES_ROPE -> packed(index) ? chunks[(int) (spans[index * 4 + 2] >>> 32)].homeArray : null;
+            case HOMES_PER_WRITE -> packed(index) ? perWriteHomeArrays[index] : null;
             default -> null;
         };
     }

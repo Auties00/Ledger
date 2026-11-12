@@ -225,6 +225,12 @@ class LogRunTest {
             batch.add(FrameBody.COMMIT, bodies.size(), body, 0, size > 0 ? 1 : 0, false);
         }
 
+        /// Adds `body` to `batch` as the next commit, recording the bytes it holds.
+        void add(LogWriter.Batch batch, FrameBody body) {
+            bodies.add(body.toBytes());
+            batch.add(FrameBody.COMMIT, bodies.size(), body, 0, body.size() > 0 ? 1 : 0, false);
+        }
+
         /// {@return the sequence of the last commit given}
         long last() {
             return bodies.size();
@@ -834,6 +840,136 @@ class LogRunTest {
                 state.forEach((name, entries) -> copy.put(name, new TreeMap<>(entries)));
                 return copy;
             }
+        }
+    }
+
+    @Nested
+    @DisplayName("frames that refer to values")
+    class References {
+        // Both sides of the shortest values a body refers to, of the shortest piece the writer hands to the cipher as
+        // it is, of an AES block and of a slice of the writer
+        private static final int[] LENGTHS = {0, 1, 15, 16, 17, 255, 256, 257, 2_047, 2_048, 2_049, 4_095, 65_535, 65_536,
+                65_537, 70_001};
+
+        /// {@return a commit body of `writes` writes, built twice: `copied` holds every value itself, the returned
+        /// one refers to those of at least `referable` bytes; values of `longest` bytes at most}
+        private static FrameBody body(Random random, int writes, int referable, int longest, FrameBody copied) {
+            var referring = new FrameBody(64, referable);
+            for (var write = 0; write < writes; write++) {
+                var key = MemorySegment.ofArray(("key" + write + ":" + random.nextInt(1_000)).getBytes(StandardCharsets.US_ASCII));
+                if (random.nextInt(8) == 0) {
+                    copied.delete(1, key);
+                    referring.delete(1, key);
+                    continue;
+                }
+                var length = random.nextBoolean() ? LENGTHS[random.nextInt(LENGTHS.length)] : random.nextInt(3_000);
+                length = Math.min(length, longest);
+                var offset = random.nextInt(40);
+                var array = new byte[offset + length + random.nextInt(40)];
+                random.nextBytes(array);
+                copied.put(1, key, MemorySegment.ofArray(array).asSlice(offset, length));
+                referring.put(1, key, array, offset, length);
+            }
+            return referring;
+        }
+
+        /// Checks every frame of `log` against its bodies sealed out of place, and the bodies recovery replays.
+        private static void assertSealedAsCopied(Log log) throws Exception {
+            var next = 1L;
+            for (var segment : log.frames().entrySet()) {
+                var number = segment.getKey();
+                var bytes = Files.readAllBytes(log.files.segment(number));
+                for (var frame : segment.getValue()) {
+                    var body = log.open(number, frame);
+                    byte[] expected;
+                    if (frame.type() == FrameBody.COMMITS) {
+                        var entries = entries(body);
+                        var plain = new ByteArrayOutputStream();
+                        for (var i = 0; i < entries.size(); i++) {
+                            var commit = log.bodies.get((int) (next + i - 1));
+                            plain.writeBytes(varInt(commit.length));
+                            plain.writeBytes(commit);
+                        }
+                        expected = plain.toByteArray();
+                        next += entries.size();
+                    } else {
+                        assertEquals(FrameBody.COMMIT, frame.type());
+                        expected = log.bodies.get((int) next - 1);
+                        next++;
+                    }
+                    assertArrayEquals(expected, body, "the body of the frame at " + frame.offset() + " of segment " + number);
+                    var header = Arrays.copyOfRange(bytes, frame.offset(), frame.bodyAt());
+                    assertArrayEquals(log.seal(number, bytes, frame.offset(), header, expected),
+                            Arrays.copyOfRange(bytes, frame.bodyAt(), frame.end()), "the frame at " + frame.offset() + " of segment " + number);
+                }
+            }
+            assertEquals(log.last() + 1, next, "the commits in frames");
+            log.assertReplayed(log.replay(0), 1, log.last());
+        }
+
+        @ParameterizedTest(name = "seed {0}, encrypted: {1}")
+        @CsvSource({"1, true", "2, true", "3, true", "4, true", "1, false", "2, false", "3, false", "4, false"})
+        @DisplayName("seals small and large bodies that refer to values as it seals the same bodies holding them, across segments")
+        void sealedAsCopied(int seed, boolean encrypted, @TempDir Path directory) throws Exception {
+            var random = new Random(seed);
+            var log = new Log(directory, encrypted, 256 << 10);
+            try {
+                for (var group = 0; group < 40; group++) {
+                    var batch = new LogWriter.Batch();
+                    for (var commit = random.nextInt(12); commit >= 0; commit--) {
+                        var copied = new FrameBody();
+                        var shape = random.nextInt(5);
+                        // Bodies a run takes, sealed whole in the output; bodies past RUN_MAX_BODY whose pieces are
+                        // long, short or a single byte each; and bodies that refer to nothing
+                        var referring = switch (shape) {
+                            case 0 -> body(random, 1 + random.nextInt(3), FrameBody.RUN_REFERABLE, 4_000, copied);
+                            case 1 -> body(random, 4 + random.nextInt(30), FrameBody.RUN_REFERABLE, 70_001, copied);
+                            case 2 -> body(random, 4 + random.nextInt(30), FrameBody.SEALED_REFERABLE, 70_001, copied);
+                            case 3 -> body(random, 40 + random.nextInt(200), 1, 600, copied);
+                            default -> body(random, 1 + random.nextInt(8), FrameBody.NOT_REFERABLE, 3_000, copied);
+                        };
+                        assertEquals(copied.size(), referring.size());
+                        assertArrayEquals(copied.toBytes(), referring.toBytes());
+                        log.add(batch, referring);
+                    }
+                    log.writer.appendAll(batch);
+                }
+            } finally {
+                log.close();
+            }
+            assertTrue(log.frames().size() > 3, "the frames took " + log.frames().size() + " segments");
+            assertSealedAsCopied(log);
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("seals a body whose pieces fall on every offset of an AES block, gathered or handed to the cipher")
+        void blockOffsets(boolean encrypted, @TempDir Path directory) throws Exception {
+            var random = new Random(5);
+            var log = new Log(directory, encrypted, 8 << 20);
+            try {
+                for (var shift = 0; shift < 32; shift++) {
+                    var batch = new LogWriter.Batch();
+                    var referring = new FrameBody(64, FrameBody.RUN_REFERABLE);
+                    var key = MemorySegment.ofArray(new byte[1 + shift]);
+                    // A first piece of its own bytes that ends on each offset of a block, then values on both sides of
+                    // the direct pieces, pieces that run past a slice, and short ones between them
+                    referring.put(1, key, MemorySegment.ofArray(new byte[7 * shift + 1]));
+                    for (var length : new int[]{2_048 + shift, 300, 17, 65_536 + 3 * shift, 2_047, 4_096, 256 + shift, 70_001 - shift}) {
+                        var array = new byte[length + shift];
+                        random.nextBytes(array);
+                        referring.put(1, key, array, shift, length);
+                        if (random.nextBoolean()) {
+                            referring.delete(1, key);
+                        }
+                    }
+                    log.add(batch, referring);
+                    log.writer.appendAll(batch);
+                }
+            } finally {
+                log.close();
+            }
+            assertSealedAsCopied(log);
         }
     }
 }
