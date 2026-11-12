@@ -26,6 +26,13 @@ import java.util.Arrays;
 /// ```
 ///
 /// Numbers are unsigned LEB128 varints; keys are never empty, so a bound of length 0 is an absent bound.
+///
+/// A body made with a [HeapPool] keeps its bytes past [#CHUNK_BYTES] in chunks of that size from the pool, every one
+/// but the last full, where one array would grow by doubling: a large commit's body otherwise took an array of
+/// megabytes, zeroed, which the collector gave regions of their own, read once by the log and then left as garbage.
+/// The log hands the chunks back once it sealed the frame ([#release()]); a body the log never took goes back with
+/// [#discard()]. A chunked body is read through [#chunkCount()], [#chunk(int)] and [#chunkLength(int)]; [#array()]
+/// serves only a body of one array.
 final class FrameBody {
     /// A frame holding a commit.
     static final byte COMMIT = 1;
@@ -36,22 +43,55 @@ final class FrameBody {
     /// A frame holding a run of commits of consecutive sequences, from the one it carries, which [LogWriter] seals as
     /// one message.
     static final byte COMMITS = 4;
+    /// The bytes of a chunk of a body made with a pool: the size of the chunks of a batch's rope, so the frames of a
+    /// history sync hand theirs on to the next batches; below half the smallest region of the G1 collector; and a
+    /// multiple of the slice [LogWriter] seals at a time, so no slice spans two chunks.
+    static final int CHUNK_BYTES = ArrayWriteBatch.CHUNK_BYTES;
 
     private static final byte PUT = 0;
     private static final byte DELETE = 1;
     private static final byte RANGE = 2;
     private static final byte EXTERNAL = 3;
 
+    // The body is its writer's, which writes it or discards it
+    private static final byte OPEN = 0;
+    // The log owns the body, which only it releases
+    private static final byte HANDED = 1;
+    // The body's pooled arrays went back to the pool; nothing reads or writes it again
+    private static final byte RELEASED = 2;
+
+    // The pool chunks come from, or null for a body of one array that grows by doubling
+    private final HeapPool pool;
+    // The array written: the body's only one, or its last chunk
     private byte[] data;
+    // The bytes of data written
     private int size;
+    // The bytes of the full chunks before data, a multiple of CHUNK_BYTES; 0 for a body of one array
+    private int base;
+    // The chunks, data last, in the first chunkCount slots; null until the body passes CHUNK_BYTES
+    private byte[][] chunks;
+    private int chunkCount;
+    // OPEN, HANDED or RELEASED; written by the body's writer until it hands the body off, then by the log alone
+    private byte state;
 
     FrameBody() {
         this(256);
     }
 
-    /// Makes a body with room for `capacity` bytes before it grows.
+    /// Makes a body of one array with room for `capacity` bytes before it grows.
     FrameBody(int capacity) {
+        this.pool = null;
         this.data = new byte[Math.max(16, capacity)];
+    }
+
+    /// Makes a body with room for `capacity` bytes before it grows, which keeps its bytes past [#CHUNK_BYTES] in
+    /// chunks from `pool`.
+    ///
+    /// A capacity of a chunk or more starts on a chunk of the pool; a smaller one on an array of its own, which grows
+    /// to at most a chunk. Further chunks are taken as the bytes reach them, never ahead: [#capacityFor] overestimates.
+    FrameBody(int capacity, HeapPool pool) {
+        this.pool = pool;
+        this.data = pool != null && capacity >= CHUNK_BYTES ? takeChunk() : new byte[Math.max(16, capacity)];
     }
 
     /// {@return the bytes the body of a commit of `writes` takes, its large values in their units, near enough that it
@@ -76,14 +116,95 @@ final class FrameBody {
         return (int) Math.min(bytes, 64L << 20);
     }
 
-    /// {@return the bytes of the body; only the first [#size()] are meaningful}
+    /// {@return the bytes of a body of one array; only the first [#size()] are meaningful}
+    ///
+    /// @throws IllegalStateException if the body is chunked or released
     byte[] array() {
+        if (chunks != null || state == RELEASED) {
+            throw new IllegalStateException("The body is not one array");
+        }
         return data;
     }
 
     /// {@return the length of the body}
     int size() {
-        return size;
+        return base + size;
+    }
+
+    /// {@return the arrays the body's bytes are in: one, or its chunks}
+    ///
+    /// @throws IllegalStateException if the body is released
+    int chunkCount() {
+        if (state == RELEASED) {
+            throw new IllegalStateException("The body is released");
+        }
+        return chunks == null ? 1 : chunkCount;
+    }
+
+    /// {@return the array `index` of the body's bytes, in order, below [#chunkCount()]}
+    byte[] chunk(int index) {
+        return chunks == null ? data : chunks[index];
+    }
+
+    /// {@return the bytes of the body in the array `index`: [#CHUNK_BYTES] for every chunk but the last}
+    int chunkLength(int index) {
+        return chunks == null || index == chunkCount - 1 ? size : CHUNK_BYTES;
+    }
+
+    /// {@return a copy of the bytes of the body, gathered from its chunks; for tests}
+    byte[] toArray() {
+        var copy = new byte[size()];
+        var offset = 0;
+        for (var i = 0; i < chunkCount(); i++) {
+            var length = chunkLength(i);
+            System.arraycopy(chunk(i), 0, copy, offset, length);
+            offset += length;
+        }
+        return copy;
+    }
+
+    /// Records that the log owns the body from now on, which then only it releases; called as the log takes it.
+    void handOff() {
+        state = HANDED;
+    }
+
+    /// Gives the body's pooled arrays back to its pool, once the log sealed its frame and never reads it again; a body
+    /// made without a pool keeps its array. A second call does nothing.
+    void release() {
+        if (pool == null || state == RELEASED) {
+            return;
+        }
+        state = RELEASED;
+        if (chunks != null) {
+            for (var i = 0; i < chunkCount; i++) {
+                assert poison(chunks[i]);
+                pool.release(chunks[i]);
+            }
+            chunks = null;
+            chunkCount = 0;
+        } else if (data.length == CHUNK_BYTES) {
+            assert poison(data);
+            pool.release(data);
+        }
+        data = null;
+    }
+
+    /// Fills `array`, about to go back to the pool, with a pattern, with assertions on: a frame sealed from a body after
+    /// its release, or a value on an array a released body still held, reads it, which no recovery or read check then
+    /// takes for the bytes it wrote.
+    ///
+    /// @return `true`, for an `assert`
+    private static boolean poison(byte[] array) {
+        Arrays.fill(array, (byte) 0x5A);
+        return true;
+    }
+
+    /// Releases the body as [#release()] does, unless the log took it and releases it itself once it sealed it: for a
+    /// commit taken back before its frame was queued.
+    void discard() {
+        if (state == OPEN) {
+            release();
+        }
     }
 
     void put(int keyspace, MemorySegment key, MemorySegment value) {
@@ -99,9 +220,15 @@ final class FrameBody {
         writeVarInt(keyspace);
         writeSegment(key);
         writeVarInt(length);
-        ensure(PageRef.BYTES);
-        ref.write(data, size);
-        size += PageRef.BYTES;
+        if (data.length - size >= PageRef.BYTES) {
+            ref.write(data, size);
+            size += PageRef.BYTES;
+        } else {
+            // The reference may span two chunks
+            var bytes = new byte[PageRef.BYTES];
+            ref.write(bytes, 0);
+            writeBytes(bytes);
+        }
     }
 
     /// {@return the body of an epoch frame for `epoch`}
@@ -128,17 +255,20 @@ final class FrameBody {
         return varIntBytes(length) + length;
     }
 
-    /// Writes this commit body into `target` at `offset` as an entry of a run body, its length then its bytes.
+    /// Writes this commit body, of one array, into `target` at `offset` as an entry of a run body, its length then its
+    /// bytes.
     ///
     /// @return the offset after the entry, `offset` plus [#runEntryBytes(int)] of [#size()]
+    /// @throws IllegalStateException if the body is chunked or released
     int writeRunEntry(byte[] target, int offset) {
+        var body = array();
         var value = size;
         while ((value & ~0x7F) != 0) {
             target[offset++] = (byte) ((value & 0x7F) | 0x80);
             value >>>= 7;
         }
         target[offset++] = (byte) value;
-        System.arraycopy(data, 0, target, offset, size);
+        System.arraycopy(body, 0, target, offset, size);
         return offset + size;
     }
 
@@ -164,9 +294,7 @@ final class FrameBody {
         writeVarInt(keyspace);
         var bytes = name.getBytes(StandardCharsets.UTF_8);
         writeVarInt(bytes.length);
-        ensure(bytes.length);
-        System.arraycopy(bytes, 0, data, size, bytes.length);
-        size += bytes.length;
+        writeBytes(bytes);
     }
 
     private void writeOptional(MemorySegment bound) {
@@ -180,18 +308,66 @@ final class FrameBody {
     private void writeSegment(MemorySegment segment) {
         var length = Math.toIntExact(segment.byteSize());
         writeVarInt(length);
-        ensure(length);
+        if (length > data.length - size && !grow(length)) {
+            writeSpanning(segment, length);
+            return;
+        }
         MemorySegment.copy(segment, ValueLayout.JAVA_BYTE, 0, data, size, length);
         size += length;
     }
 
+    /// Writes the `length` bytes of `segment` across chunks, filling the last one first.
+    private void writeSpanning(MemorySegment segment, int length) {
+        var offset = 0;
+        while (true) {
+            var part = Math.min(length - offset, data.length - size);
+            MemorySegment.copy(segment, ValueLayout.JAVA_BYTE, offset, data, size, part);
+            size += part;
+            offset += part;
+            if (offset == length) {
+                return;
+            }
+            nextChunk();
+        }
+    }
+
+    private void writeBytes(byte[] bytes) {
+        var length = bytes.length;
+        if (length > data.length - size && !grow(length)) {
+            // Across chunks, filling the last one first
+            var offset = 0;
+            while (true) {
+                var part = Math.min(length - offset, data.length - size);
+                System.arraycopy(bytes, offset, data, size, part);
+                size += part;
+                offset += part;
+                if (offset == length) {
+                    return;
+                }
+                nextChunk();
+            }
+        }
+        System.arraycopy(bytes, 0, data, size, length);
+        size += length;
+    }
+
     private void writeByte(byte value) {
-        ensure(1);
+        if (size == data.length && !grow(1)) {
+            nextChunk();
+        }
         data[size++] = value;
     }
 
     private void writeVarInt(long value) {
-        ensure(10);
+        if (data.length - size < 10) {
+            // Byte by byte, as the number may span two chunks
+            while ((value & ~0x7FL) != 0) {
+                writeByte((byte) ((value & 0x7F) | 0x80));
+                value >>>= 7;
+            }
+            writeByte((byte) value);
+            return;
+        }
         while ((value & ~0x7FL) != 0) {
             data[size++] = (byte) ((value & 0x7F) | 0x80);
             value >>>= 7;
@@ -199,10 +375,54 @@ final class FrameBody {
         data[size++] = (byte) value;
     }
 
-    private void ensure(int extra) {
-        if (size + extra > data.length) {
-            data = Arrays.copyOf(data, (int) Math.min(Integer.MAX_VALUE - 8, Math.max((long) size + extra, data.length * 2L)));
+    /// Makes room for `extra` bytes past the ones written, which `data` lacks.
+    ///
+    /// @return whether `data` now has them after the ones written; `false` for a chunked body, whose writer fills
+    ///         `data` and goes on in the next chunk
+    private boolean grow(int extra) {
+        var needed = (long) size + extra;
+        if (pool == null) {
+            data = Arrays.copyOf(data, (int) Math.min(Integer.MAX_VALUE - 8, Math.max(needed, data.length * 2L)));
+            return true;
         }
+        if (chunks != null) {
+            return false;
+        }
+        if (needed <= CHUNK_BYTES) {
+            data = Arrays.copyOf(data, (int) Math.min(CHUNK_BYTES, Math.max(needed, data.length * 2L)));
+            return true;
+        }
+        // The bytes so far move to the first chunk once, where doubling would copy them again at each step
+        if (data.length != CHUNK_BYTES) {
+            var first = takeChunk();
+            System.arraycopy(data, 0, first, 0, size);
+            data = first;
+        }
+        chunks = new byte[8][];
+        chunks[0] = data;
+        chunkCount = 1;
+        return false;
+    }
+
+    /// Starts the next chunk, once `data`, the last one, is full.
+    private void nextChunk() {
+        assert size == CHUNK_BYTES : "a chunk left with " + (CHUNK_BYTES - size) + " bytes free";
+        base = Math.addExact(base, CHUNK_BYTES);
+        if (chunkCount == chunks.length) {
+            chunks = Arrays.copyOf(chunks, chunkCount * 2);
+        }
+        data = takeChunk();
+        chunks[chunkCount++] = data;
+        size = 0;
+    }
+
+    /// {@return a chunk of the pool, of exactly [#CHUNK_BYTES]}
+    private byte[] takeChunk() {
+        var chunk = pool.acquire(CHUNK_BYTES);
+        if (chunk.length != CHUNK_BYTES) {
+            throw new IllegalStateException("The pool gave a chunk of " + chunk.length + " bytes");
+        }
+        return chunk;
     }
 
     /// Reads a commit body, passing each write to `visitor`.

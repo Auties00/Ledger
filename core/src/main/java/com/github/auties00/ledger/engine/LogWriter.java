@@ -119,6 +119,10 @@ import java.util.zip.CRC32C;
 /// and rolls over at the frames it would one frame per commit; a group torn by a crash drops its runs whole, commits
 /// of a group never acknowledged durable.
 ///
+/// Once a frame is sealed into the output, which is all a retried write or a rewrite after an interrupt sends again,
+/// its body is never read: the writer gives the body's pooled chunks back then ([FrameBody#release()]). A stopped
+/// writer leaves the bodies it still queues to the collector.
+///
 /// A failed write or force stops the writer for good: [#awaitDurable(long)] and every later [#append] throw. A failed
 /// write through only moves the writer to forces.
 final class LogWriter {
@@ -592,6 +596,7 @@ final class LogWriter {
             }
             checkHealthy();
             queueDeferred();
+            body.handOff();
             queue.add(new Queued(type, sequence, body));
             pendingBytes += length;
             lastQueued = sequence;
@@ -660,6 +665,7 @@ final class LogWriter {
     void defer(byte type, long sequence, FrameBody body) {
         queueLock.lock();
         try {
+            body.handOff();
             deferred = new Queued(type, sequence, body);
         } finally {
             queueLock.unlock();
@@ -1030,11 +1036,14 @@ final class LogWriter {
             }
             if (bodyLength > RUN_MAX_BODY) {
                 seal(frame, sealedLength, groupStart);
+                frame.body().release();
                 index++;
             } else {
                 var end = runEnd(group, index);
                 sealRun(group, index, end, groupStart);
-                index = end;
+                for (; index < end; index++) {
+                    group.get(index).body().release();
+                }
             }
             groupStart = false;
         }
@@ -1170,26 +1179,31 @@ final class LogWriter {
 
     /// Seals `frame` into the output, writing the output out whenever it fills.
     ///
-    /// The body goes to the cipher a slice at a time: the frame is the one GCM message a single call would make, and
-    /// the output stays at most [#OUTPUT] bytes whatever the frame's size.
+    /// The body goes to the cipher a slice at a time, chunk by chunk: the frame is the one GCM message a single call
+    /// would make, and the output stays at most [#OUTPUT] bytes whatever the frame's size. Every chunk but the last
+    /// holds [FrameBody#CHUNK_BYTES], a multiple of [#SLICE], so the slices are those of a body of one array.
     private void seal(Queued frame, int sealedLength, boolean groupStart) throws IOException {
         room(FRAME_HEADER);
         var at = used;
         var frameOffset = position + used;
         writeHeader(at, sealedLength, frame.sequence(), frame.type(), groupStart);
         used += FRAME_HEADER;
-        var body = frame.body().array();
-        var length = frame.body().size();
+        var body = frame.body();
+        var chunks = body.chunkCount();
         if (cipher != null) {
             try {
                 cipher.init(Cipher.ENCRYPT_MODE, segmentKey, new GCMParameterSpec(TAG_BYTES * 8, nonce(frameOffset)));
                 // The cipher keeps the additional data, so the header may leave the output before the body is sealed
                 cipher.updateAAD(output, at, FRAME_HEADER);
-                for (var offset = 0; offset < length; ) {
-                    var slice = Math.min(SLICE, length - offset);
-                    room(slice + TAG_BYTES);
-                    used += cipher.update(body, offset, slice, output, used);
-                    offset += slice;
+                for (var chunk = 0; chunk < chunks; chunk++) {
+                    var bytes = body.chunk(chunk);
+                    var length = body.chunkLength(chunk);
+                    for (var offset = 0; offset < length; ) {
+                        var slice = Math.min(SLICE, length - offset);
+                        room(slice + TAG_BYTES);
+                        used += cipher.update(bytes, offset, slice, output, used);
+                        offset += slice;
+                    }
                 }
                 room(2 * TAG_BYTES);
                 used += cipher.doFinal(output, used);
@@ -1201,13 +1215,17 @@ final class LogWriter {
         // Without encryption the CRC covers the header and the body
         crc.reset();
         crc.update(output, at, FRAME_HEADER);
-        for (var offset = 0; offset < length; ) {
-            var slice = Math.min(SLICE, length - offset);
-            room(slice);
-            System.arraycopy(body, offset, output, used, slice);
-            crc.update(body, offset, slice);
-            used += slice;
-            offset += slice;
+        for (var chunk = 0; chunk < chunks; chunk++) {
+            var bytes = body.chunk(chunk);
+            var length = body.chunkLength(chunk);
+            for (var offset = 0; offset < length; ) {
+                var slice = Math.min(SLICE, length - offset);
+                room(slice);
+                System.arraycopy(bytes, offset, output, used, slice);
+                crc.update(bytes, offset, slice);
+                used += slice;
+                offset += slice;
+            }
         }
         room(Integer.BYTES);
         ByteBuffer.wrap(output, used, Integer.BYTES).putInt((int) crc.getValue());
@@ -1349,9 +1367,10 @@ final class LogWriter {
             this.frames = new ArrayList<>();
         }
 
-        /// Adds a frame, which the writer owns once queued, for a commit of `writes` writes that wrote `unitBytes` of
-        /// units, whose values are on one chunk of the [ValueSlab] if `sharesChunk`.
+        /// Adds a frame, whose body the writer owns from now on, queued or not, for a commit of `writes` writes that
+        /// wrote `unitBytes` of units, whose values are on one chunk of the [ValueSlab] if `sharesChunk`.
         void add(byte type, long sequence, FrameBody body, long unitBytes, int writes, boolean sharesChunk) {
+            body.handOff();
             frames.add(new Queued(type, sequence, body));
             bodyBytes += body.size();
             appendedBytes += 13 + body.size() + unitBytes;

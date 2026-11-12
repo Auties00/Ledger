@@ -31,6 +31,8 @@ import java.security.GeneralSecurityException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -834,6 +836,128 @@ class LogRunTest {
                 state.forEach((name, entries) -> copy.put(name, new TreeMap<>(entries)));
                 return copy;
             }
+        }
+    }
+
+    @Nested
+    @DisplayName("bodies on chunks of a pool")
+    class Chunked {
+        /// Adds to `batch` the next commit, a body of at least `size` bytes on chunks of `pool`, of writes of random sizes
+        /// so its chunk boundaries fall inside them.
+        ///
+        /// @return the arrays of the body, by identity
+        private static List<byte[]> add(Log log, LogWriter.Batch batch, HeapPool pool, int size, Random random) {
+            var body = new FrameBody(random.nextBoolean() ? 256 : size, pool);
+            while (body.size() < size) {
+                var key = new byte[1 + random.nextInt(60)];
+                random.nextBytes(key);
+                switch (random.nextInt(6)) {
+                    case 0 -> body.putExternal(1, MemorySegment.ofArray(key), 100_000 + random.nextInt(1_000_000),
+                            new PageRef(random.nextInt(), 1 + random.nextInt(9), random.nextLong(), random.nextInt()));
+                    case 1 -> body.delete(2, MemorySegment.ofArray(key));
+                    default -> {
+                        var value = new byte[random.nextInt(4_000)];
+                        random.nextBytes(value);
+                        body.put(1, MemorySegment.ofArray(key), MemorySegment.ofArray(value));
+                    }
+                }
+            }
+            log.bodies.add(body.toArray());
+            var arrays = new ArrayList<byte[]>();
+            for (var i = 0; i < body.chunkCount(); i++) {
+                arrays.add(body.chunk(i));
+            }
+            batch.add(FrameBody.COMMIT, log.last(), body, 0, 1, false);
+            return arrays;
+        }
+
+        /// Checks that `pool` holds no chunk free twice, and holds every one of `released`.
+        private static void assertReleased(HeapPool pool, List<byte[]> released) {
+            var free = Collections.newSetFromMap(new IdentityHashMap<byte[], Boolean>());
+            for (var array : pool.freeForTests(FrameBody.CHUNK_BYTES)) {
+                assertTrue(free.add(array), "a chunk is free twice");
+            }
+            for (var array : released) {
+                if (array.length == FrameBody.CHUNK_BYTES) {
+                    assertTrue(free.contains(array), "a chunk of a sealed body did not go back");
+                }
+            }
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("seals bodies of 300 KiB, 600 KiB and 1.5 MiB on chunks as one array would, beside runs, and gives each chunk back once")
+        void sealed(boolean encrypted, @TempDir Path directory) throws Exception {
+            var log = new Log(directory, encrypted, 64L << 20);
+            var pool = new HeapPool(1L << 30, false);
+            var random = new Random(encrypted ? 7 : 8);
+            for (var round = 0; round < 3; round++) {
+                // The chunks the last round gave back go to this one's bodies
+                var batch = new LogWriter.Batch();
+                var released = new ArrayList<byte[]>();
+                released.addAll(add(log, batch, pool, 300 << 10, random));
+                for (var i = 0; i < 20; i++) {
+                    log.add(batch, 100);
+                }
+                released.addAll(add(log, batch, pool, 600 << 10, random));
+                released.addAll(add(log, batch, pool, 1_536 << 10, random));
+                // A body started on a chunk that ends small, which a run takes
+                var small = new FrameBody(FrameBody.CHUNK_BYTES, pool);
+                small.put(1, MemorySegment.ofArray(new byte[]{1, 2, 3}), MemorySegment.ofArray(new byte[1_000]));
+                log.bodies.add(small.toArray());
+                released.add(small.array());
+                batch.add(FrameBody.COMMIT, log.last(), small, 0, 1, false);
+                for (var i = 0; i < 20; i++) {
+                    log.add(batch, 100);
+                }
+                log.writer.appendAll(batch);
+                assertReleased(pool, released);
+            }
+            log.close();
+
+            var segments = log.frames();
+            var number = segments.firstKey();
+            var bytes = Files.readAllBytes(log.files.segment(number));
+            var large = 0;
+            for (var frame : segments.get(number)) {
+                if (frame.type() != FrameBody.COMMIT) {
+                    continue;
+                }
+                var expected = log.bodies.get((int) frame.sequence() - 1);
+                assertArrayEquals(expected, log.open(number, frame), "the body of commit " + frame.sequence());
+                var header = Arrays.copyOfRange(bytes, frame.offset(), frame.bodyAt());
+                assertArrayEquals(log.seal(number, bytes, frame.offset(), header, expected), Arrays.copyOfRange(bytes, frame.bodyAt(), frame.end()),
+                        "commit " + frame.sequence() + " sealed as one call would");
+                if (expected.length > FrameBody.CHUNK_BYTES) {
+                    large++;
+                }
+            }
+            assertEquals(9, large, "the frames of bodies on more than one chunk");
+            log.assertReplayed(log.replay(0), 1, log.last());
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("seals bodies on chunks across segment rollovers, one larger than a segment, which recovery replays")
+        void rollover(boolean encrypted, @TempDir Path directory) throws Exception {
+            var log = new Log(directory, encrypted, 1L << 20);
+            var pool = new HeapPool(1L << 30, false);
+            var random = new Random(encrypted ? 9 : 10);
+            for (var size : new int[]{600 << 10, 700 << 10, 1_536 << 10, 300 << 10}) {
+                var batch = new LogWriter.Batch();
+                var released = new ArrayList<byte[]>();
+                for (var i = 0; i < 5; i++) {
+                    log.add(batch, 100);
+                }
+                released.addAll(add(log, batch, pool, size, random));
+                released.addAll(add(log, batch, pool, 400 << 10, random));
+                log.add(batch, 100);
+                log.writer.appendAll(batch);
+                assertReleased(pool, released);
+            }
+            log.close();
+            assertTrue(log.frames().values().stream().filter(frames -> !frames.isEmpty()).count() >= 4, "the segments written");
+            log.assertReplayed(log.replay(0), 1, log.last());
         }
     }
 }

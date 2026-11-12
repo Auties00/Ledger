@@ -2297,7 +2297,7 @@ public final class LiveLedger implements Ledger {
             this.deltaStates = new KeyspaceState[2];
             this.deltas = new long[2];
             this.touched = new ArrayList<>(writes);
-            this.frame = journaled ? new FrameBody(frameBytes) : null;
+            this.frame = journaled ? new FrameBody(frameBytes, pool) : null;
             this.deferredRanges = deferredRanges;
             this.sharesChunk = sharesChunk;
         }
@@ -2708,8 +2708,13 @@ public final class LiveLedger implements Ledger {
 
         /// Takes back every write this commit applied; no reader saw them, since the commit was never published.
         ///
-        /// The keys it wrote stay marked for the next checkpoint, which writes their unchanged state.
+        /// The keys it wrote stay marked for the next checkpoint, which writes their unchanged state. The frame's pooled
+        /// chunks go back to the pool unless the log took the frame, which then gives them back once it sealed it.
         void rollback() {
+            assert !logged : "a commit whose frame the log queued is taken back";
+            if (frame != null) {
+                frame.discard();
+            }
             for (var write : touched) {
                 var chain = write.chain();
                 var head = chain.head;
