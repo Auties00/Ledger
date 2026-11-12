@@ -253,6 +253,71 @@ class ResidentBytesOwnTest {
             }
         }
 
+        @ParameterizedTest(name = "in memory: {0}")
+        @ValueSource(booleans = {false, true})
+        @DisplayName("a transaction's put keeps the array its value was encoded into as the version's, in resident and paged key spaces")
+        void transactionOwnArray(boolean memory, @TempDir Path directory) throws Exception {
+            // A codec that records the array each value is encoded into
+            var encodedInto = new ArrayList<Object>();
+            ValueCodec<String> recording = ValueCodec.of(value -> value.getBytes(StandardCharsets.UTF_8).length,
+                    (value, target) -> {
+                        encodedInto.add(target.heapBase().orElseThrow());
+                        MemorySegment.copy(MemorySegment.ofArray(value.getBytes(StandardCharsets.UTF_8)), 0, target, 0, target.byteSize());
+                    },
+                    source -> new String(source.toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8));
+            var resident = Keyspace.resident("resident", KeyCodec.bytes(), recording);
+            var paged = Keyspace.paged("paged", KeyCodec.bytes(), recording);
+            var builder = memory ? Ledger.builder().memory() : Ledger.builder().directory(directory).encryption(Encryption.key(KEY));
+            try (var ledger = (LiveLedger) builder.keyspace(resident).keyspace(paged).keyspace(SESSIONS).build()) {
+                var text = "x".repeat(3_000);
+                ledger.update(transaction -> transaction.put(resident, key("r"), text).put(paged, key("p"), text)).awaitDurable();
+                assertEquals(2, encodedInto.size());
+                var residentHead = head(ledger, resident, key("r"));
+                assertSame(encodedInto.get(0), residentHead.sourceForTests());
+                assertSame(text, residentHead.decoded);
+                assertSame(encodedInto.get(1), head(ledger, paged, key("p")).sourceForTests());
+                assertEquals(text, ledger.get(resident, key("r")).orElseThrow());
+                assertEquals(text, ledger.get(paged, key("p")).orElseThrow());
+                // A byte array, put or put encoded: one copy, which reads return in place of the caller's
+                var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+                var caller = value(4, 200_000);
+                var encoded = value(5, 200_000);
+                var allocated = new long[2];
+                ledger.update(transaction -> {
+                    var before = threads.getCurrentThreadAllocatedBytes();
+                    transaction.put(SESSIONS, key("s"), caller);
+                    allocated[0] = threads.getCurrentThreadAllocatedBytes() - before;
+                    before = threads.getCurrentThreadAllocatedBytes();
+                    transaction.putEncoded(SESSIONS, MemorySegment.ofArray(key("e")), MemorySegment.ofArray(encoded));
+                    allocated[1] = threads.getCurrentThreadAllocatedBytes() - before;
+                }).awaitDurable();
+                for (var i = 0; i < 2; i++) {
+                    assertTrue(allocated[i] >= 200_000 && allocated[i] < 300_000, "write " + i + " allocated " + allocated[i]);
+                }
+                for (var name : new String[]{"s", "e"}) {
+                    var version = head(ledger, SESSIONS, key(name));
+                    assertSame(version.sourceForTests(), version.decoded);
+                    assertSame(version.decoded, ledger.get(SESSIONS, key(name)).orElseThrow());
+                }
+                assertNotSame(caller, ledger.get(SESSIONS, key("s")).orElseThrow());
+                assertArrayEquals(value(4, 200_000), ledger.get(SESSIONS, key("s")).orElseThrow());
+                assertArrayEquals(value(5, 200_000), ledger.get(SESSIONS, key("e")).orElseThrow());
+                if (!memory) {
+                    ledger.checkpoint();
+                    assertEquals(text, ledger.get(paged, key("p")).orElseThrow());
+                }
+            }
+            if (!memory) {
+                try (var ledger = Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(resident)
+                        .keyspace(paged).keyspace(SESSIONS).build()) {
+                    assertEquals("x".repeat(3_000), ledger.get(resident, key("r")).orElseThrow());
+                    assertEquals("x".repeat(3_000), ledger.get(paged, key("p")).orElseThrow());
+                    assertArrayEquals(value(4, 200_000), ledger.get(SESSIONS, key("s")).orElseThrow());
+                    assertArrayEquals(value(5, 200_000), ledger.get(SESSIONS, key("e")).orElseThrow());
+                }
+            }
+        }
+
         @Test
         @DisplayName("a commit whose decoder throws leaves a session's clone in the batch, which the retry keeps")
         void failedCommit(@TempDir Path directory) throws Exception {
