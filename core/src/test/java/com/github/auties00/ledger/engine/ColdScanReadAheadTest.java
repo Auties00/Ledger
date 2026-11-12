@@ -599,6 +599,52 @@ class ColdScanReadAheadTest {
         }
     }
 
+    @ParameterizedTest(name = "descending: {0}")
+    @ValueSource(booleans = {false, true})
+    @DisplayName("a scan whose leaves are cached and whose blobs are not holds the blobs of two gathers at most, whatever its length")
+    void cachedLeavesColdBlobs(boolean descending, @TempDir Path directory) throws Exception {
+        try (var tree = new Tree(directory, true, descending ? 19 : 23)) {
+            var states = new TreeMap<byte[], byte[]>(UNSIGNED);
+            for (var i = 0; i < 3_000; i++) {
+                states.put(key(i), tree.bytes(6_000));
+            }
+            tree.apply(states);
+            // The leaves in the cache and none of the blobs, as a checkpoint leaves them
+            tree.pages.cache().clearForTests();
+            var leaves = tree.leaves();
+            for (var leaf : leaves) {
+                tree.pages.read(leaf.ref(), PageFile.NODE, true);
+            }
+            assertTrue(leaves.size() > 2 * TreeCursor.GATHER_LEAVES, "too few leaves: " + leaves.size());
+            var expected = expected(tree, null, null, descending, Integer.MAX_VALUE);
+            // Two gathers of blobs, a megabyte of pages each with the pages their reads join across gaps, rounded up to
+            // the sizes of the pool; the scan reads 18 megabytes of blobs
+            var gather = (TreeCursor.GATHER_PAGES + (long) TreeCursor.GATHER_VALUES * PageFile.GAP_PAGES) * PageFormat.SIZE;
+            var bound = 2 * (Long.highestOneBit(gather - 1) << 1);
+            tree.pages.forceColdReadsForTests(true);
+            var cursor = new TreeCursor(tree.pages, tree.root, null, null, descending, Long.MAX_VALUE);
+            try {
+                var most = 0L;
+                for (var i = 0; i < expected.size(); i++) {
+                    assertTrue(cursor.next(), "entry " + i);
+                    assertArrayEquals(expected.get(i)[0], cursor.key().toArray(ValueLayout.JAVA_BYTE), "key " + i);
+                    assertArrayEquals(expected.get(i)[1], cursor.value().toArray(ValueLayout.JAVA_BYTE), "value " + i);
+                    most = Math.max(most, cursor.heldBytesForTests());
+                }
+                assertFalse(cursor.next());
+                assertTrue(most > 0, "the scan read nothing ahead");
+                assertTrue(most <= bound, "the scan held " + most + " bytes read ahead, against " + bound);
+                for (var leaf : leaves) {
+                    assertNotNull(tree.pages.cache().peek(leaf.ref()), "a leaf left the cache");
+                }
+            } finally {
+                cursor.release();
+                tree.pages.forceColdReadsForTests(false);
+            }
+            assertEquals(0, cursor.heldBytesForTests(), "the released cursor holds arrays");
+        }
+    }
+
     @Test
     @DisplayName("a store whose reads are cold passes every scan, range and first as one whose reads are not")
     void storeScans(@TempDir Path directory) throws Exception {
