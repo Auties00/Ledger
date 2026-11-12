@@ -38,6 +38,9 @@ class SegmentsCompareTest {
         assertEquals(expected, Integer.signum(Segments.compare(leftSegment.asReadOnly(), leftFrom, leftLength, rightSegment.asReadOnly(), rightFrom, rightLength)), "read-only ranges: " + name);
         assertEquals(expected, Integer.signum(Segments.compare(left, leftFrom, leftLength, right, rightFrom, rightLength)), "arrays: " + name);
         assertEquals(expected, Integer.signum(Segments.compare(left, leftFrom, leftLength, rightSlice)), "array and slice: " + name);
+        // The bytes of the right array past the key, which the bounded comparison must not read
+        var rightPast = rightSegment.asSlice(rightFrom).asReadOnly();
+        assertEquals(expected, Integer.signum(Segments.compare(left, leftFrom, leftLength, rightPast, rightLength)), "array and bounded segment: " + name);
         assertEquals(expected, Integer.signum(TreeNodes.compare(left, leftFrom, leftLength, rightSlice)), "node and slice: " + name);
         assertEquals(expected, Integer.signum(TreeNodes.compare(left, leftFrom, leftLength, rightKey)), "node and array: " + name);
         assertEquals(expected, Integer.signum(byMismatch(leftSlice, rightSlice)), "mismatch: " + name);

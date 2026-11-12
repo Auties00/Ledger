@@ -240,30 +240,33 @@ final class TreeUpdate {
             }
         }
         mergeUnderfull(result);
-        while (result.size() > 1) {
-            result = writeBranches(result);
-        }
-        if (result.isEmpty()) {
-            return null;
-        }
-        var top = result.getFirst();
-        // A root with one child is replaced by the child
-        while (top.level() > 0) {
-            var unit = read(top.ref(), PageFormat.BRANCH);
-            if (TreeNodes.count(unit) != 1) {
-                keep(top.ref(), unit);
-                break;
+        while (true) {
+            while (result.size() > 1) {
+                result = writeBranches(result);
             }
-            freed.add(top.ref());
-            top = TreeNodes.children(unit).getFirst();
-        }
-        if (top.ref().isRecord()) {
-            // A root is a unit of its own: a leaf left alone at the top is written whole
+            if (result.isEmpty()) {
+                return null;
+            }
+            var top = result.getFirst();
+            // A root with one child is replaced by the child
+            while (top.level() > 0) {
+                var unit = read(top.ref(), PageFormat.BRANCH);
+                if (TreeNodes.count(unit) != 1) {
+                    keep(top.ref(), unit);
+                    break;
+                }
+                freed.add(top.ref());
+                top = TreeNodes.children(unit).getFirst();
+            }
+            if (!top.ref().isRecord()) {
+                return new TreeRoot(top.ref(), top.count(), top.blobs());
+            }
+            // A root is a unit of its own: a leaf left alone at the top is written whole, in two leaves under a branch
+            // if a record of a leaf without a search index made it too large for one with
             var unit = read(top.ref(), PageFormat.LEAF);
             retire(top.ref(), TreeNodes.base(unit, top.ref()));
-            top = writeLeaves(TreeNodes.leafEntries(unit)).getFirst();
+            result = writeLeaves(TreeNodes.leafEntries(unit));
         }
-        return new TreeRoot(top.ref(), top.count(), top.blobs());
     }
 
     /// {@return what replaces `node`, or `null` if the writes change nothing under it}
@@ -287,11 +290,15 @@ final class TreeUpdate {
                     return delta.isEmpty() ? null : new Written(delta);
                 }
             }
-            var size = 2;
+            var size = 0;
             for (var entry : merged.entries()) {
                 size += entry.size();
             }
-            return new Rewrite(node.ref(), base, merged.entries(), merged.inserted(), merged.gaps(), size != Bytes.i32(unit, PageFormat.LENGTH));
+            var before = 0;
+            for (var entry : entries) {
+                before += entry.size();
+            }
+            return new Rewrite(node.ref(), base, merged.entries(), merged.inserted(), merged.gaps(), size != before);
         }
         var children = TreeNodes.children(unit);
         // What each child takes: none of the writes, a removal of all of it, or a share of them
@@ -525,13 +532,13 @@ final class TreeUpdate {
         if (merged.isEmpty()) {
             return null;
         }
-        var fill = 2;
+        var fill = 0;
         var blobs = false;
         for (var entry : merged) {
             fill += entry.size();
             blobs |= entry.blob() != null;
         }
-        if (fill - 2 > TreeNodes.CAPACITY || fill < TreeNodes.MIN_FILL) {
+        if (fill > TreeNodes.CAPACITY || fill < TreeNodes.MIN_FILL) {
             return null;
         }
         var touched = DeltaLeaves.diff(entries, merged);
@@ -553,9 +560,9 @@ final class TreeUpdate {
             dropRecord(ref);
         }
         var record = packer.append(base, changes, size);
-        if (writer.admits(PageFormat.HEADER + fill)) {
-            var leaf = TreeNodes.writeLeaf(merged, 0, merged.size(), fill);
-            TreeNodes.deltaHeader(leaf, base, fill);
+        if (writer.admits(PageFormat.HEADER + 2 + NodeIndex.prefix(merged.getFirst().key(), merged.getLast().key()) + fill)) {
+            var leaf = TreeNodes.writeLeaf(merged, 0, merged.size());
+            TreeNodes.deltaHeader(leaf, base, leaf.length - PageFormat.HEADER);
             pages.cache().put(record, leaf, false);
         } else {
             // A leaf a former use of the page left at the record's place, which no read finds under the new nonce,
@@ -863,14 +870,14 @@ final class TreeUpdate {
         var out = new ArrayList<Child>(runs.size());
         for (var run : runs) {
             var page = allocate(1);
-            var length = TreeNodes.contentLength(sizes, run[0], run[1]);
-            var unit = TreeNodes.writeLeaf(entries, run[0], run[1], length);
+            var unit = TreeNodes.writeLeaf(entries, run[0], run[1]);
             var blobs = false;
             for (var i = run[0]; i < run[1]; i++) {
                 blobs |= entries.get(i).blob() != null;
             }
-            var ref = writer.write(PageFormat.LEAF, 0, page, 1, unit, length, writer.admits(unit.length));
-            out.add(new Child(TreeNodes.leafKey(unit, TreeNodes.entry(unit, 0)), ref, run[1] - run[0], blobs, 0, length));
+            var ref = writer.write(PageFormat.LEAF, 0, page, 1, unit, unit.length - PageFormat.HEADER, writer.admits(unit.length));
+            out.add(new Child(TreeNodes.leafKey(unit, TreeNodes.entry(unit, 0)), ref, run[1] - run[0], blobs, 0,
+                    TreeNodes.fill(sizes, run[0], run[1])));
         }
         return out;
     }
@@ -884,22 +891,24 @@ final class TreeUpdate {
         var out = new ArrayList<Child>();
         for (var run : TreeNodes.split(sizes, sizes.length)) {
             var page = allocate(1);
-            var length = TreeNodes.contentLength(sizes, run[0], run[1]);
-            var unit = TreeNodes.writeBranch(children, run[0], run[1], length);
+            var unit = TreeNodes.writeBranch(children, run[0], run[1]);
             var count = 0L;
             var blobs = false;
             for (var i = run[0]; i < run[1]; i++) {
                 count += children.get(i).count();
                 blobs |= children.get(i).blobs();
             }
-            var ref = writer.write(PageFormat.BRANCH, level, page, 1, unit, length, true);
-            out.add(new Child(TreeNodes.childKey(unit, 0), ref, count, blobs, level, length));
+            var ref = writer.write(PageFormat.BRANCH, level, page, 1, unit, unit.length - PageFormat.HEADER, true);
+            out.add(new Child(TreeNodes.childKey(unit, 0), ref, count, blobs, level, TreeNodes.fill(sizes, run[0], run[1])));
         }
         return out;
     }
 
     /// Merges each node of `nodes` a checkpoint just wrote less than a quarter full with a neighbour, when both fit in
     /// one node; every merge leaves one node fewer, so the loop ends.
+    ///
+    /// Whether they fit is what the split of their entries counts, whatever the format of the two nodes: an even
+    /// spread of entries whose sizes add up to [TreeNodes#CAPACITY] at most takes one node.
     private void mergeUnderfull(List<Child> nodes) throws IOException {
         var i = 0;
         while (i < nodes.size() && nodes.size() > 1) {
@@ -918,8 +927,7 @@ final class TreeUpdate {
                 var b = nodes.get(left + 1);
                 var unitA = read(a.ref(), PageFile.NODE);
                 var unitB = read(b.ref(), PageFile.NODE);
-                // Both contents count the entry count field, which the merged node keeps once
-                if (Bytes.i32(unitA, PageFormat.LENGTH) + Bytes.i32(unitB, PageFormat.LENGTH) - 2 > PageFormat.capacity(1)) {
+                if (TreeNodes.fill(unitA) + TreeNodes.fill(unitB) > TreeNodes.CAPACITY) {
                     keep(a.ref(), unitA);
                     keep(b.ref(), unitB);
                     continue;

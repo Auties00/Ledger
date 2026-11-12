@@ -471,9 +471,16 @@ final class PageFile implements AutoCloseable {
     }
 
     /// Fills the header of `unit`.
+    ///
+    /// A leaf or a branch whose writer gave it a search index ([NodeIndex]) keeps its format and index byte; every
+    /// other unit is of format [PageFormat#VERSION].
     static void header(byte[] unit, byte kind, int level, int page, int pages, int length, long nonceHigh, int nonceLow) {
+        var indexed = (kind == PageFormat.LEAF || kind == PageFormat.BRANCH) && unit[PageFormat.FORMAT] == PageFormat.INDEXED;
         unit[PageFormat.KIND] = kind;
-        unit[PageFormat.FORMAT] = PageFormat.VERSION;
+        if (!indexed) {
+            unit[PageFormat.FORMAT] = PageFormat.VERSION;
+            unit[PageFormat.INDEX] = 0;
+        }
         unit[PageFormat.LEVEL] = (byte) level;
         unit[3] = 0;
         Bytes.i32(unit, PageFormat.PAGES, pages);
@@ -481,7 +488,8 @@ final class PageFile implements AutoCloseable {
         Bytes.i32(unit, PageFormat.LENGTH, length);
         Bytes.i64(unit, PageFormat.NONCE, nonceHigh);
         Bytes.i32(unit, PageFormat.NONCE + 8, nonceLow);
-        Bytes.i32(unit, 28, 0);
+        unit[PageFormat.INDEX + 1] = 0;
+        Bytes.u16(unit, PageFormat.INDEX + 2, 0);
     }
 
     /// Forces every unit written so far, and the length of the file.
