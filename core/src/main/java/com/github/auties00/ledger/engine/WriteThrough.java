@@ -20,7 +20,10 @@ import java.nio.file.FileSystems;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Locale;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import java.util.function.LongFunction;
 
 /// The writes of the log's groups through to stable storage, so a group that one write holds needs no force after it,
@@ -40,9 +43,12 @@ import java.util.function.LongFunction;
 ///   module has native access: for that pair Windows documents that it also requests a write-through of the drive's
 ///   cache, and for `FILE_FLAG_WRITE_THROUGH` alone it does not. It adds that not all hardware supports the request,
 ///   and a force asks the device to empty its cache instead, so [Mode#AUTO] takes this way only on a device that
-///   reports the request holds ([WriteCache#provesWriteThrough()]), and forces on any other. The JDK opens a channel
-///   with [StandardOpenOption#DSYNC] with `FILE_FLAG_WRITE_THROUGH` alone, and `ExtendedOpenOption.DIRECT` leaves the
-///   handle the channel writes through buffered.
+///   reports the request holds ([WriteCache#provesWriteThrough()]), and forces on any other. The device of a volume
+///   is asked once for the life of the process where its answer rests on what the device is, forced unit access or a
+///   cache that keeps its contents without power, or where it proves nothing, which only costs forces; an answer that
+///   rests on a cache an administrator turned off, which a setting turns back on, is asked again by each store. The
+///   JDK opens a channel with [StandardOpenOption#DSYNC] with `FILE_FLAG_WRITE_THROUGH` alone, and
+///   `ExtendedOpenOption.DIRECT` leaves the handle the channel writes through buffered.
 /// - on macOS never: `O_DSYNC` leaves the data in the drive's cache, which only the `fcntl(F_FULLFSYNC)` of a force
 ///   empties.
 ///
@@ -67,6 +73,12 @@ final class WriteThrough {
         /// Through, on the default file system, where the write holds what a force holds: `O_DIRECT` and `O_DSYNC` on
         /// Linux; unbuffered write-through on Windows while the module has native access, on a device that reports the
         /// request holds. Every other group, and every group elsewhere, is forced.
+        ///
+        /// On Windows the answer of a volume's device holds for the rest of the process when it rests on forced unit
+        /// access or on a cache that keeps its contents without power, or when it proves nothing, so a change to the
+        /// settings of the device's cache made while the process runs reaches the stores of the next process. Where
+        /// only a write cache that is turned off proves it, each store asks again, so turning that cache back on
+        /// reaches the next store opened.
         AUTO,
         /// Every group is forced.
         OFF,
@@ -439,9 +451,13 @@ final class WriteThrough {
         private static final int QUERY_PROPERTY = 0x2D_1400;
         private static final int QUERY_BYTES = 12;
         private static final int WRITE_CACHE_PROPERTY = 4;
-        // GetFinalPathNameByHandleW: VOLUME_NAME_GUID, and the longest path Windows has, in characters
+        // GetFinalPathNameByHandleW: VOLUME_NAME_GUID, then the longest path Windows has and the room the name is
+        // asked into first, in characters; the name of a volume takes 49 of them, its separator included
         private static final int VOLUME_NAME_GUID = 1;
         private static final int PATH_CHARS = 32_768;
+        private static final int NAME_CHARS = 1_024;
+        // The answers of the devices under this process's stores
+        private static final Answers ANSWERS = new Answers(WriteCache::volumeOf, WriteCache::ofVolume);
         private static final int FILE_FLAG_BACKUP_SEMANTICS = 0x0200_0000;
 
         /// {@return whether a write through holds what a force holds on this device}
@@ -452,11 +468,33 @@ final class WriteThrough {
             return writeThrough == SUPPORTED || enabled == DISABLED || nonVolatile;
         }
 
+        /// {@return whether this answer holds for the rest of the process}
+        ///
+        /// Forced unit access and a cache that keeps its contents without power are what the device is, and an answer
+        /// that proves nothing only costs forces while it stands. A cache that is turned off is a setting an
+        /// administrator can turn back on while the process runs, which would leave the writes through in a volatile
+        /// cache.
+        boolean lastsForProcess() {
+            return writeThrough == SUPPORTED || nonVolatile || !provesWriteThrough();
+        }
+
         /// {@return whether the device under `directory` reports that a write through holds; `false` if it cannot be
         /// asked, as on a network share}
+        ///
+        /// The device of a volume is asked once for the life of the process where its answer
+        /// [lasts for it][#lastsForProcess()], and by each call otherwise.
         static boolean proves(Path directory) {
-            var cache = of(directory);
-            return cache != null && cache.provesWriteThrough();
+            return ANSWERS.proves(directory);
+        }
+
+        /// Forgets the answers of every volume, for tests that count the questions sent to devices.
+        static void clearForTests() {
+            ANSWERS.clear();
+        }
+
+        /// {@return the questions sent to devices so far, for tests}
+        static int asksForTests() {
+            return ANSWERS.asks();
         }
 
         /// {@return what the device of the volume that really holds `directory`, through its links and mount points,
@@ -465,12 +503,17 @@ final class WriteThrough {
         /// It takes no privileges: both handles are opened for no access, and the query needs none. The answer may take
         /// a round trip to the device.
         static WriteCache of(Path directory) {
+            var volume = volumeOf(directory);
+            return volume == null ? null : ofVolume(volume);
+        }
+
+        /// {@return what the device of `volume`, a name such as `\\?\Volume{guid}`, reports, or `null` if it cannot be
+        /// asked or does not answer}
+        ///
+        /// The answer may take a round trip to the device.
+        static WriteCache ofVolume(String volume) {
             try (var arena = Arena.ofConfined()) {
                 var state = arena.allocate(Kernel32.CALL_STATE);
-                var volume = volumeOf(directory, arena, state);
-                if (volume == null) {
-                    return null;
-                }
                 var device = (MemorySegment) Kernel32.CREATE_FILE.invokeExact(state, arena.allocateFrom(volume, StandardCharsets.UTF_16LE),
                         0, UnbufferedHandle.SHARE_ALL, MemorySegment.NULL, UnbufferedHandle.OPEN_EXISTING, 0, MemorySegment.NULL);
                 if (device.address() == -1L) {
@@ -493,27 +536,42 @@ final class WriteThrough {
             }
         }
 
-        /// {@return the name of the volume that holds `directory`, without the separator after it, or `null` if it has
-        /// none}
-        private static String volumeOf(Path directory, Arena arena, MemorySegment state) throws Throwable {
-            var opened = (MemorySegment) Kernel32.CREATE_FILE.invokeExact(state,
-                    arena.allocateFrom(UnbufferedHandle.win32Path(directory), StandardCharsets.UTF_16LE), 0, UnbufferedHandle.SHARE_ALL,
-                    MemorySegment.NULL, UnbufferedHandle.OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, MemorySegment.NULL);
-            if (opened.address() == -1L) {
-                return null;
-            }
-            try {
-                var name = arena.allocate((long) PATH_CHARS * Character.BYTES, Character.BYTES);
-                var length = (int) Kernel32.GET_FINAL_PATH.invokeExact(state, opened, name, PATH_CHARS, VOLUME_NAME_GUID);
-                if (length <= 0 || length >= PATH_CHARS) {
+        /// {@return the name of the volume that really holds `directory`, without the separator after it, or `null` if
+        /// it has none or cannot be asked}
+        ///
+        /// It takes no privileges: the directory is opened for no access.
+        static String volumeOf(Path directory) {
+            try (var arena = Arena.ofConfined()) {
+                var state = arena.allocate(Kernel32.CALL_STATE);
+                var opened = (MemorySegment) Kernel32.CREATE_FILE.invokeExact(state,
+                        arena.allocateFrom(UnbufferedHandle.win32Path(directory), StandardCharsets.UTF_16LE), 0, UnbufferedHandle.SHARE_ALL,
+                        MemorySegment.NULL, UnbufferedHandle.OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, MemorySegment.NULL);
+                if (opened.address() == -1L) {
                     return null;
                 }
-                // Starts with the name: \\?\Volume{guid}\
-                var path = name.getString(0, StandardCharsets.UTF_16LE);
-                var end = path.indexOf('\\', "\\\\?\\".length());
-                return end < 0 ? path : path.substring(0, end);
-            } finally {
-                var _ = (int) Kernel32.CLOSE_HANDLE.invokeExact(state, opened);
+                try {
+                    var capacity = NAME_CHARS;
+                    var name = arena.allocate((long) capacity * Character.BYTES, Character.BYTES);
+                    var length = (int) Kernel32.GET_FINAL_PATH.invokeExact(state, opened, name, capacity, VOLUME_NAME_GUID);
+                    if (length >= capacity && length <= PATH_CHARS) {
+                        // Too short for the name, whose characters with the terminator the length then counts
+                        capacity = length;
+                        name = arena.allocate((long) capacity * Character.BYTES, Character.BYTES);
+                        length = (int) Kernel32.GET_FINAL_PATH.invokeExact(state, opened, name, capacity, VOLUME_NAME_GUID);
+                    }
+                    if (length <= 0 || length >= capacity) {
+                        return null;
+                    }
+                    // Starts with the name: \\?\Volume{guid}\
+                    var path = name.getString(0, StandardCharsets.UTF_16LE);
+                    var end = path.indexOf('\\', "\\\\?\\".length());
+                    return end < 0 ? path : path.substring(0, end);
+                } finally {
+                    var _ = (int) Kernel32.CLOSE_HANDLE.invokeExact(state, opened);
+                }
+            } catch (Throwable _) {
+                // No volume, so the log forces, which needs none
+                return null;
             }
         }
 
@@ -526,6 +584,61 @@ final class WriteThrough {
             }
             return new WriteCache(property.get(ValueLayout.JAVA_INT, ENABLED), property.get(ValueLayout.JAVA_INT, WRITE_THROUGH),
                     returned > NON_VOLATILE && property.get(ValueLayout.JAVA_BYTE, NON_VOLATILE) != 0);
+        }
+    }
+
+    /// The answers of the devices under the stores of the process, by the name of their volume, each kept for the rest
+    /// of the process if it [lasts for it][WriteCache#lastsForProcess()].
+    ///
+    /// No answer is kept for a volume that cannot be named or a device that does not answer, so a failure that passes
+    /// is asked again by the next store rather than leaving it to forces. Two stores that ask beside each other may
+    /// both send the question.
+    static final class Answers {
+        private final Function<Path, String> volumes;
+        private final Function<String, WriteCache> devices;
+        private final ConcurrentHashMap<String, WriteCache> answers;
+        // The questions sent to devices, for tests
+        private final AtomicInteger asks;
+
+        /// Creates the answers that `volumes` names the volume of a directory for, or `null` for none, and that
+        /// `devices` asks the device of a volume for, or `null` if it does not answer.
+        Answers(Function<Path, String> volumes, Function<String, WriteCache> devices) {
+            this.volumes = volumes;
+            this.devices = devices;
+            this.answers = new ConcurrentHashMap<>();
+            this.asks = new AtomicInteger();
+        }
+
+        /// {@return whether the device under `directory` reports that a write through holds; `false` if it cannot be
+        /// asked}
+        boolean proves(Path directory) {
+            var volume = volumes.apply(directory);
+            if (volume == null) {
+                return false;
+            }
+            var known = answers.get(volume);
+            if (known != null) {
+                return known.provesWriteThrough();
+            }
+            asks.incrementAndGet();
+            var answer = devices.apply(volume);
+            if (answer == null) {
+                return false;
+            }
+            if (answer.lastsForProcess()) {
+                answers.put(volume, answer);
+            }
+            return answer.provesWriteThrough();
+        }
+
+        /// Forgets every answer.
+        void clear() {
+            answers.clear();
+        }
+
+        /// {@return the questions sent to devices so far}
+        int asks() {
+            return asks.get();
         }
     }
 
