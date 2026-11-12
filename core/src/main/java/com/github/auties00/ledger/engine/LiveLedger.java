@@ -80,10 +80,11 @@ public final class LiveLedger implements Ledger {
     /// The writes up to which a commit's lookups also load the newest version of each key they find, which its writes
     /// read once the commit has a sequence: the lines of a larger commit's first writes leave the caches before then.
     private static final int TOUCHED_HEADS = 256;
-    /// The blocks a commit opens one write at a time, at most, after a block whose lookups found fewer than half their
-    /// keys, as the blocks of a batch of new keys do: their lookups probe for nothing that the open then probes for again
-    /// in an index the caches hold, as one a commit is filling does. Each such block doubles the blocks it skips, from
-    /// one, and a block that found half its keys or more takes the next one back to one.
+    /// The blocks a commit opens one write at a time, at most, after a block whose lookups found none of their keys, as
+    /// the blocks of a batch of new keys do: their lookups probe for nothing that the open then probes for again, in an
+    /// index the caches hold when a commit is filling it. Each such block doubles the blocks it skips, from one, and a
+    /// block that found a key takes the next one back to one; a block of a batch overwriting keys that memory holds one
+    /// in three of finds none about once in 600.
     private static final int SKIPPED_BLOCKS = 64;
     private static final VarHandle LAST_PUBLISHED;
     private static final VarHandle LATEST;
@@ -773,7 +774,7 @@ public final class LiveLedger implements Ledger {
                 if (skipped > 0) {
                     skipped--;
                     openWrites(writes, from, to, chains, keyspaceStates, keys, found, decoded);
-                } else if (openBlock(writes, from, to, lookups, chains, keyspaceStates, keys, found, decoded) * 2 < to - from) {
+                } else if (openBlock(writes, from, to, lookups, chains, keyspaceStates, keys, found, decoded) == 0) {
                     skipped = skipping;
                     skipping = Math.min(skipping * 2, SKIPPED_BLOCKS);
                 } else {
