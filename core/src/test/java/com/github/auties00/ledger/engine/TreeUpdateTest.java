@@ -250,7 +250,9 @@ class TreeUpdateTest {
 
     private static Subtree verifyNode(PageFile pages, PageRef ref) {
         var unit = pages.read(ref, PageFile.NODE, false);
-        assertTrue(Bytes.i32(unit, PageFormat.LENGTH) - 2 <= TreeNodes.CAPACITY, "a node passes its capacity");
+        assertTrue(TreeNodes.fill(unit) <= TreeNodes.CAPACITY, "a node passes its capacity");
+        assertTrue(PageFormat.fits(1, Bytes.i32(unit, PageFormat.LENGTH)), "a node passes its page");
+        assertEquals(PageFormat.INDEXED, unit[PageFormat.FORMAT], "a node has no search index");
         assertTrue(TreeNodes.count(unit) > 0, "a node is empty");
         if (TreeNodes.isLeaf(unit)) {
             var blobs = false;
@@ -303,7 +305,7 @@ class TreeUpdateTest {
         return segment.toArray(ValueLayout.JAVA_BYTE);
     }
 
-    private static void verify(PageFile pages, TreeRoot root, TreeMap<byte[], byte[]> model, Random random, List<byte[]> keys) {
+    static void verify(PageFile pages, TreeRoot root, TreeMap<byte[], byte[]> model, Random random, List<byte[]> keys) {
         assertEquals(model.size(), root == null ? 0 : root.count());
         assertScan(pages, root, model, null, null);
         for (var i = 0; i < 3; i++) {
@@ -357,7 +359,7 @@ class TreeUpdateTest {
     }
 
     /// {@return the delta records the tree refers to}
-    private static int verifyPages(PageFile pages, FreeSpace space, TreeRoot root, DeltaTable deltas) {
+    static int verifyPages(PageFile pages, FreeSpace space, TreeRoot root, DeltaTable deltas) {
         var used = new BitSet();
         var records = new TreeMap<Integer, Integer>();
         if (root != null) {

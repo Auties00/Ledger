@@ -86,7 +86,18 @@ final class Segments {
     /// {@return the order of the `leftLength` bytes at `leftFrom` of `left` and `right`, as
     /// [#compare(MemorySegment, MemorySegment)] gives}
     static int compare(byte[] left, int leftFrom, int leftLength, MemorySegment right) {
-        var rightLength = right.byteSize();
+        return compare(left, leftFrom, leftLength, right, right.byteSize());
+    }
+
+    /// {@return the order of the `leftLength` bytes at `leftFrom` of `left` and the first `rightLength` bytes of
+    /// `right`, as [#compare(MemorySegment, MemorySegment)] gives}
+    ///
+    /// The array is read as it is, so a comparison of part of a segment's bytes with an array, as a search of a node's
+    /// index compares a key with the prefix its keys share, allocates nothing: a segment of the array would escape to
+    /// the comparison of the bytes after the last whole word.
+    ///
+    /// @param rightLength at most the bytes of `right`
+    static int compare(byte[] left, int leftFrom, int leftLength, MemorySegment right, long rightLength) {
         var common = (int) Math.min(leftLength, rightLength);
         var words = Math.min(common, WORDS) & -Long.BYTES;
         for (var at = 0; at < words; at += Long.BYTES) {
