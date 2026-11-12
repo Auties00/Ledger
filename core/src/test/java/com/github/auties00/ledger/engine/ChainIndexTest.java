@@ -435,6 +435,50 @@ class ChainIndexTest {
         }
     }
 
+    @Test
+    @DisplayName("a block of lookups finds keys its chains hold in words of their own and keys they hold out of them alike, of 25 to 48 bytes sharing their first words and colliding hashes")
+    void lookupsAcrossInline() {
+        var random = new SplittableRandom(13);
+        var index = new ChainIndex();
+        var held = new HashMap<Integer, Chain>();
+        // Few hashes, so a probe meets candidates of both forms with the same first word before its own key
+        var hashes = new int[]{0x0000FFFF, 0x0000FFFE, 0x7C00000F};
+        for (var id = 0; id < 1_200; id += 1 + random.nextInt(2)) {
+            var key = MemorySegment.ofArray(longKeyBytes(id)).asReadOnly();
+            var chain = SLAB.chain(key, hashes[id % hashes.length]);
+            assertSame(null, index.putIfAbsent(chain));
+            held.put(id, chain);
+        }
+        assertTrue(held.values().stream().anyMatch(Chain::inlineKey), "keys in words of their chains");
+        assertTrue(held.values().stream().anyMatch(chain -> !chain.inlineKey()), "keys out of their chains");
+        var lookups = new ChainIndex.Lookups(true);
+        for (var round = 0; round < 500; round++) {
+            lookups.clear();
+            var count = 1 + random.nextInt(ChainIndex.Lookups.BLOCK);
+            var ids = new int[count];
+            for (var at = 0; at < count; at++) {
+                ids[at] = random.nextInt(1_300);
+                lookups.add(index, MemorySegment.ofArray(longKeyBytes(ids[at])), hashes[ids[at] % hashes.length]);
+            }
+            lookups.run();
+            for (var at = 0; at < count; at++) {
+                assertSame(held.get(ids[at]), lookups.found(at), "the lookup of key " + ids[at]);
+            }
+        }
+    }
+
+    // The key of `id`: 25 to 48 bytes, the first 16 shared by every key, then the id and a filler of its length
+    private static byte[] longKeyBytes(int id) {
+        var length = 25 + id % 24;
+        var bytes = new byte[length];
+        java.util.Arrays.fill(bytes, 0, 16, (byte) 0x42);
+        ByteBuffer.wrap(bytes, 16, 4).putInt(id);
+        for (var i = 20; i < length; i++) {
+            bytes[i] = (byte) (id * 7 + i);
+        }
+        return bytes;
+    }
+
     // The key of `id`: 1 to 11 bytes
     private static byte[] keyBytes(int id) {
         var length = 1 + id % 11;
