@@ -47,21 +47,19 @@ final class PageFile implements AutoCloseable {
     /// microseconds on Linux and 5 to 20 on Windows, where those of the device of a CI runner took about 145, and a
     /// Windows read out of the cache that Defender or paging slows rarely averages past 50.
     static final int COLD_READ_MICROS = 80;
-    /// The pages between two units that [#prefetch(PageRef\[\], int, byte)] still reads with one call, throwing the
+    /// The pages between two units that [#prefetch(PageRef\[\], int, int\[\])] still reads with one call, throwing the
     /// pages between away: a device takes a few more pages in the same request for little more than one.
     static final int GAP_PAGES = 8;
     // The bytes of a read that count as one sample of the read time: the copy of a long read out of the OS cache must
     // not pass for a read of the device
     private static final int SAMPLE_BYTES = 32 << 10;
-    // The longest read a sample records, in microseconds, which keeps the average from overflowing and lets the
-    // average fall back below the bound a few quick reads after one that a pause stretched
-    private static final int SAMPLE_LIMIT_MICROS = 1 << 10;
+    // The longest read a sample records, in microseconds: twice the bound, so a read of the OS cache that a pause, a
+    // page fault or a scan of the antivirus stretched moves the average of quick reads less than halfway to the bound,
+    // and only three in a row pass it, where one stretched read made a full scan of a warm store read ahead, on threads
+    // of its own, for the next few misses, and the average falls below the bound three quick reads after the device's
+    private static final int SAMPLE_LIMIT_MICROS = 2 * COLD_READ_MICROS;
     // Whether every page file opened from now on reads as cold, whatever it measures; for tests
     private static volatile boolean forceColdNewForTests;
-    // A pool that keeps no array, for the arrays a read ahead opens its units with: the threads of one read ahead hold
-    // up to two arrays each at once, which the store's pool would keep until it idles, where a scan's own reads, one
-    // after another, leave it no more than they take at once
-    private static final HeapPool UNPOOLED = new HeapPool(0, false);
 
     private final Path path;
     private final PageCipher cipher;
@@ -228,7 +226,7 @@ final class PageFile implements AutoCloseable {
         var sealed = pool.acquire(length);
         try {
             readFully(sealed, length, PageFormat.offset(ref.page()));
-            var plain = open(ref, kind, sealed, 0, cached, pool);
+            var plain = open(ref, kind, sealed, 0, cached);
             if (plain == null) {
                 throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
             }
@@ -246,8 +244,7 @@ final class PageFile implements AutoCloseable {
     ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     /// @param cached whether to keep the unit as the cache does, ending with its content, rather than whole
-    /// @param scratch the pool the open of a unit kept short of its pages takes its array from
-    private byte[] open(PageRef ref, byte kind, byte[] sealed, int offset, boolean cached, HeapPool scratch) {
+    private byte[] open(PageRef ref, byte kind, byte[] sealed, int offset, boolean cached) {
         // The header is the additional data of the tag and the open copies it as it is, so what it says holds once the
         // unit authenticates: it is checked first, and tells the bytes to keep
         var content = Bytes.i32(sealed, offset + PageFormat.LENGTH);
@@ -256,108 +253,163 @@ final class PageFile implements AutoCloseable {
             return null;
         }
         var length = ref.pages() * PageFormat.SIZE;
-        return cipher.open(sealed, offset, ref.pages(), cached ? PageFormat.cachedLength(ref.pages(), content) : length, scratch);
+        return cipher.open(sealed, offset, ref.pages(), cached ? PageFormat.cachedLength(ref.pages(), content) : length, pool);
     }
 
-    /// {@return the plaintext of the first `count` units `refs` names, in their order, each as the cache keeps it, or
-    /// `null` for a unit that could not be read; none of them cached}
+    /// Reads the first `count` units `refs` names into one array of the store's pool, sealed as the file holds them,
+    /// and returns it; [#openPrefetched(PageRef, byte, byte\[\], int)] opens each, and [#releasePrefetched(byte\[\])]
+    /// gives the array back once none is needed.
     ///
     /// It reads ahead of a scan whose reads are [cold][#coldReads()], which may never use what it reads, so it reports
-    /// no failure: a unit it could not read, that fails authentication or that is not the one its reference names is
-    /// `null`, and the read that needs it fails as it would have without this one. Units at most [#GAP_PAGES] pages
-    /// apart are read with one call, up to [#RUN_PAGES] pages, the pages between thrown away unopened, and the calls run
-    /// on up to [#READ_CHANNELS] threads at once, the caller's among them: a scan that read its units out of the device
-    /// one after another waited for each in turn, about 145 microseconds each on the Windows runner. The arrays it reads
-    /// and opens into are its own and none goes back to the store's pool, which keeps no more than the scan's own reads
-    /// leave in it.
+    /// no failure: a unit it could not read has an offset of -1, and the read that needs it fails as it would have
+    /// without this one. Units at most [#GAP_PAGES] pages apart are read with one call, up to [#RUN_PAGES] pages, the
+    /// pages between thrown away unopened, and the calls run on up to [#READ_CHANNELS] threads at once, the caller's
+    /// among them: a scan that read its units out of the device one after another waited for each in turn, about 145
+    /// microseconds each on the Windows runner. It opens nothing, so its threads hold no array of the pool but the one
+    /// it returns, and a scan's reads ahead leave the pool no more arrays than the scan holds at once.
     ///
     /// @param refs references to units, none of them a delta record, each at most [#RUN_PAGES] pages
-    /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
-    byte[][] prefetch(PageRef[] refs, int count, byte kind) {
-        var units = new byte[count][];
+    /// @param offsets receives, for each unit, where it starts in the array, or -1 if it could not be read
+    /// @return the array, of the store's pool, or `null` if `count` is 0
+    byte[] prefetch(PageRef[] refs, int count, int[] offsets) {
+        Arrays.fill(offsets, 0, count, -1);
+        if (count == 0) {
+            return null;
+        }
         // The references by page, each with its index in the low half
         var order = new long[count];
         for (var i = 0; i < count; i++) {
             order[i] = (long) refs[i].page() << 32 | i;
         }
         Arrays.sort(order);
-        // Where each run of `order` starts, and the end of the last one
+        // Where each run of `order` starts, and the end of the last one; the first page of each run and the end of it
         var starts = new int[count + 1];
+        var firsts = new int[count];
+        var ends = new int[count];
         var runs = 0;
-        var first = 0;
-        var end = 0;
         for (var i = 0; i < count; i++) {
             var ref = refs[(int) order[i]];
             var unitEnd = ref.page() + ref.pages();
-            if (runs == 0 || ref.page() > end + GAP_PAGES || Math.max(end, unitEnd) - first > RUN_PAGES) {
-                starts[runs++] = i;
-                first = ref.page();
-                end = unitEnd;
+            if (runs == 0 || ref.page() > ends[runs - 1] + GAP_PAGES
+                    || Math.max(ends[runs - 1], unitEnd) - firsts[runs - 1] > RUN_PAGES) {
+                starts[runs] = i;
+                firsts[runs] = ref.page();
+                ends[runs++] = unitEnd;
             } else {
-                end = Math.max(end, unitEnd);
+                ends[runs - 1] = Math.max(ends[runs - 1], unitEnd);
             }
         }
         starts[runs] = count;
+        // Where each run starts in the array
+        var bases = new int[runs];
+        var length = 0;
+        for (var run = 0; run < runs; run++) {
+            bases[run] = length;
+            length += (ends[run] - firsts[run]) * PageFormat.SIZE;
+        }
+        var sealed = pool.acquire(length);
         try {
-            ClaimedIndexes.run("ledger-prefetch", runs, Math.min(READ_CHANNELS, runs) - 1,
-                    run -> prefetchRun(refs, order, starts[run], starts[run + 1], kind, units));
+            ClaimedIndexes.run("ledger-prefetch", runs, Math.min(READ_CHANNELS, runs) - 1, run -> prefetchRun(refs,
+                    order, starts[run], starts[run + 1], firsts[run], ends[run], sealed, bases[run], offsets));
         } catch (RuntimeException _) {
             // A thread that would not start: the units left unread are read by the reads that need them
+        } catch (Throwable throwable) {
+            // No thread holds the array once the run returns or throws
+            pool.release(sealed);
+            throw throwable;
         }
-        return units;
+        return sealed;
     }
 
-    /// Reads the units of `refs` at `order[from]` to `order[to]`, excluded, which are sorted by page, with one call,
-    /// into `units`; a unit it cannot read stays `null`.
-    private void prefetchRun(PageRef[] refs, long[] order, int from, int to, byte kind, byte[][] units) {
-        if (to - from == 1) {
-            var index = (int) order[from];
-            units[index] = prefetchUnit(refs[index], kind);
-            return;
-        }
-        var first = refs[(int) order[from]].page();
-        var end = first;
-        for (var i = from; i < to; i++) {
-            var ref = refs[(int) order[i]];
-            end = Math.max(end, ref.page() + ref.pages());
-        }
-        var length = (end - first) * PageFormat.SIZE;
-        var sealed = new byte[length];
+    /// Reads the units of `refs` at `order[from]` to `order[to]`, excluded, which are sorted by page and lie in the
+    /// pages from `first` to `end`, excluded, with one call into `sealed` from `base` on, and records where each starts
+    /// in `offsets`; a unit it cannot read keeps an offset of -1.
+    private void prefetchRun(PageRef[] refs, long[] order, int from, int to, int first, int end, byte[] sealed,
+                             int base, int[] offsets) {
         try {
-            readFully(sealed, length, PageFormat.offset(first));
-        } catch (LedgerCorruptedException | LedgerIoException | IllegalStateException _) {
-            // A call that fails, or that the end of the file cuts short, fails none of its units: each is read alone
+            readFully(sealed, base, (end - first) * PageFormat.SIZE, PageFormat.offset(first));
             for (var i = from; i < to; i++) {
                 var index = (int) order[i];
-                units[index] = prefetchUnit(refs[index], kind);
+                offsets[index] = base + (refs[index].page() - first) * PageFormat.SIZE;
             }
-            return;
-        }
-        for (var i = from; i < to; i++) {
-            var index = (int) order[i];
-            var ref = refs[index];
-            units[index] = open(ref, kind, sealed, (ref.page() - first) * PageFormat.SIZE, true, UNPOOLED);
+        } catch (LedgerCorruptedException | LedgerIoException | IllegalStateException _) {
+            if (to - from == 1) {
+                return;
+            }
+            // A call that fails, or that the end of the file cuts short, fails none of its units: each is read alone,
+            // into its own place
+            for (var i = from; i < to; i++) {
+                var index = (int) order[i];
+                var ref = refs[index];
+                var offset = base + (ref.page() - first) * PageFormat.SIZE;
+                try {
+                    readFully(sealed, offset, ref.pages() * PageFormat.SIZE, PageFormat.offset(ref.page()));
+                    offsets[index] = offset;
+                } catch (LedgerCorruptedException | LedgerIoException | IllegalStateException _) {
+                    // Read by the read that needs it, which fails as it would have
+                }
+            }
         }
     }
 
-    /// {@return the plaintext of the unit `ref` names, as the cache keeps it, read alone and not cached, or `null` if
-    /// it cannot be read, fails authentication or is not the unit `ref` names}
-    private byte[] prefetchUnit(PageRef ref, byte kind) {
-        var length = ref.pages() * PageFormat.SIZE;
-        var sealed = new byte[length];
+    /// {@return the plaintext of the unit `ref` names, as the cache keeps it, from an array of
+    /// [#prefetch(PageRef\[\], int, int\[\])] that holds it sealed at `offset`, in an array of its own and not cached,
+    /// or `null` if it fails authentication or is not the unit `ref` names}
+    ///
+    /// It checks and opens the unit as [#load(PageRef, byte, boolean, boolean)] does, and leaves `sealed` as it was.
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    byte[] openPrefetched(PageRef ref, byte kind, byte[] sealed, int offset) {
         try {
-            readFully(sealed, length, PageFormat.offset(ref.page()));
-            return open(ref, kind, sealed, 0, true, UNPOOLED);
-        } catch (LedgerCorruptedException | LedgerIoException | IllegalStateException _) {
+            return open(ref, kind, sealed, offset, true);
+        } catch (IllegalStateException _) {
+            // A cipher that fails other than on the tag, as the read that needs the unit then does
             return null;
+        }
+    }
+
+    /// Opens into `plain` the unit `ref` names, from an array of [#prefetch(PageRef\[\], int, int\[\])] that holds it
+    /// sealed at `offset`, as [#openPrefetched(PageRef, byte, byte\[\], int)] does, and leaves `sealed` as it was.
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    /// @param plain an array of [#acquireOpened(PageRef)] for the unit
+    /// @return the bytes of `plain` the cache keeps of the unit, from its header to the end of its content, or -1 if it
+    /// fails authentication or is not the unit `ref` names, which leaves `plain` undefined
+    int openPrefetched(PageRef ref, byte kind, byte[] sealed, int offset, byte[] plain) {
+        var content = Bytes.i32(sealed, offset + PageFormat.LENGTH);
+        if (!ref.describes(sealed, offset) || !kindMatches(sealed[offset + PageFormat.KIND], kind)
+                || !PageFormat.fits(ref.pages(), content)) {
+            return -1;
+        }
+        try {
+            return cipher.open(sealed, offset, ref.pages(), plain) ? PageFormat.cachedLength(ref.pages(), content) : -1;
+        } catch (IllegalStateException _) {
+            return -1;
+        }
+    }
+
+    /// {@return an array of the store's pool that the unit `ref` names opens into, which
+    /// [#releasePrefetched(byte\[\])] gives back}
+    byte[] acquireOpened(PageRef ref) {
+        return pool.acquire(ref.pages() * PageFormat.SIZE - PageFormat.TAG);
+    }
+
+    /// Gives an array of [#prefetch(PageRef\[\], int, int\[\])] or [#acquireOpened(PageRef)] back to the store's pool;
+    /// no one may read it afterwards.
+    ///
+    /// @param array the array, or `null` for none
+    void releasePrefetched(byte[] array) {
+        if (array != null) {
+            pool.release(array);
         }
     }
 
     /// {@return whether reads of the file take long enough, on average, that they come from the device rather than the
     /// OS cache: [#COLD_READ_MICROS] microseconds or more}
     ///
-    /// The average moves a quarter of the way to each sample, so it passes the bound after about three reads of the
-    /// device and falls below it after a few quick ones.
+    /// The average moves a quarter of the way to each sample, of at most twice the bound, so it passes the bound after
+    /// three or four reads of the device and falls below it after three quick ones, and two stretched reads in a row of
+    /// the OS cache leave it below.
     boolean coldReads() {
         return readMicros >= COLD_READ_MICROS || forcedCold;
     }
@@ -366,7 +418,11 @@ final class PageFile implements AutoCloseable {
     void sampleRead(long nanos, int length) {
         var micros = Math.clamp(nanos / 1_000 / Math.max(1, length / SAMPLE_BYTES), 0, SAMPLE_LIMIT_MICROS);
         var average = readMicros;
-        readMicros = average + ((micros - average) >> 2);
+        var next = average + ((micros - average) >> 2);
+        // Written only when it moves: the readers of the file on every thread share its line
+        if (next != average) {
+            readMicros = next;
+        }
     }
 
     /// {@return the moving average of the read time, in microseconds; for tests}
@@ -488,14 +544,19 @@ final class PageFile implements AutoCloseable {
     }
 
     private void readFully(byte[] array, int length, long position) {
+        readFully(array, 0, length, position);
+    }
+
+    // Reads `length` bytes of the file from `position` into `array` from `offset` on
+    private void readFully(byte[] array, int offset, int length, long position) {
         var channel = takeChannel();
         var interrupted = false;
         try {
-            var buffer = ByteBuffer.wrap(array, 0, length);
+            var buffer = ByteBuffer.wrap(array, offset, length);
             var start = System.nanoTime();
             while (buffer.hasRemaining()) {
                 try {
-                    if (channel.read(buffer, position + buffer.position()) < 0) {
+                    if (channel.read(buffer, position + buffer.position() - offset) < 0) {
                         throw new LedgerCorruptedException(path + " ends before the unit at " + position, null);
                     }
                 } catch (ClosedByInterruptException _) {

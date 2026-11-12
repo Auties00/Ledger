@@ -18,6 +18,7 @@ import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -171,26 +172,46 @@ class ColdScanReadAheadTest {
         return "key%07d".formatted(i).getBytes(StandardCharsets.US_ASCII);
     }
 
-    /// {@return the entries a cursor passes, at most `limit`, and the bytes the cache and the emptied pool hold after it}
+    /// {@return the entries a cursor passes, at most `limit`, the bytes the cache holds after it and the bytes the
+    /// emptied pool holds after it, and, from a second cursor of the same scan over the same emptied cache, the bytes
+    /// the pool then holds and the heap that second scan allocates on the calling thread}
     private static Result scan(Tree tree, byte[] from, byte[] to, boolean descending, int limit, boolean cold, long wanted) {
-        tree.pages.cache().clearForTests();
         // Two trims with no acquire between them empty the pool
         tree.pool.trimIfIdle();
         tree.pool.trimIfIdle();
         tree.pages.forceColdReadsForTests(cold);
         try {
-            var cursor = new TreeCursor(tree.pages, tree.root, from, to, descending, wanted);
-            var entries = new ArrayList<byte[][]>();
-            while (entries.size() < limit && cursor.next()) {
-                entries.add(new byte[][]{cursor.key().toArray(ValueLayout.JAVA_BYTE), cursor.value().toArray(ValueLayout.JAVA_BYTE)});
-            }
-            return new Result(entries, tree.pages.cache().size(), tree.pool.pooledBytesForTests());
+            tree.pages.cache().clearForTests();
+            var entries = entries(tree, from, to, descending, limit, wanted);
+            var cached = tree.pages.cache().size();
+            var pooled = tree.pool.pooledBytesForTests();
+            tree.pages.cache().clearForTests();
+            var threads = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+            var before = threads.getCurrentThreadAllocatedBytes();
+            entries(tree, from, to, descending, limit, wanted);
+            var allocated = threads.getCurrentThreadAllocatedBytes() - before;
+            return new Result(entries, cached, pooled, tree.pool.pooledBytesForTests(), allocated);
         } finally {
             tree.pages.forceColdReadsForTests(false);
         }
     }
 
-    private record Result(List<byte[][]> entries, long cached, long pooled) {
+    /// {@return the entries a cursor passes, at most `limit`, which then gives back what it read ahead into, as a scan
+    /// of the store does}
+    private static List<byte[][]> entries(Tree tree, byte[] from, byte[] to, boolean descending, int limit, long wanted) {
+        var cursor = new TreeCursor(tree.pages, tree.root, from, to, descending, wanted);
+        try {
+            var entries = new ArrayList<byte[][]>();
+            while (entries.size() < limit && cursor.next()) {
+                entries.add(new byte[][]{cursor.key().toArray(ValueLayout.JAVA_BYTE), cursor.value().toArray(ValueLayout.JAVA_BYTE)});
+            }
+            return entries;
+        } finally {
+            cursor.release();
+        }
+    }
+
+    private record Result(List<byte[][]> entries, long cached, long pooled, long pooledAgain, long allocated) {
     }
 
     private static List<byte[][]> expected(Tree tree, byte[] from, byte[] to, boolean descending, int limit) {
@@ -219,7 +240,7 @@ class ColdScanReadAheadTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
-    @DisplayName("passes what a cursor that never reads ahead passes, caches what it caches and leaves no more in the pool, at every leaf boundary, both ways")
+    @DisplayName("passes what a cursor that never reads ahead passes, caches what it caches and allocates little more, its pool arrays reused, at every leaf boundary, both ways")
     void sameAsWithout(boolean encrypted, @TempDir Path directory) throws Exception {
         try (var tree = new Tree(directory, encrypted, encrypted ? 7 : 11)) {
             tree.load(4_000);
@@ -254,8 +275,12 @@ class ColdScanReadAheadTest {
                             var cold = scan(tree, low, to, descending, limit, true, wanted);
                             assertSameEntries(expected, cold.entries(), message + ", reading ahead for " + wanted);
                             assertEquals(plain.cached(), cold.cached(), message + ": the cache holds other units, reading ahead for " + wanted);
-                            assertTrue(cold.pooled() <= plain.pooled(), message + ": the pool keeps " + cold.pooled()
-                                    + " bytes, against " + plain.pooled() + " without reading ahead, reading ahead for " + wanted);
+                            assertEquals(cold.pooled(), cold.pooledAgain(), message + ": the pool grows by the same scan again, reading ahead for " + wanted);
+                            // The leaves and blobs it read ahead lie in arrays of the pool, and only those the cursor
+                            // reaches are copied out, as its own reads copy them; what is left is its bookkeeping
+                            assertTrue(cold.allocated() <= plain.allocated() + plain.allocated() / 4 + (64 << 10),
+                                    message + ": a scan reading ahead allocates " + cold.allocated() + " bytes, against "
+                                            + plain.allocated() + " without, reading ahead for " + wanted);
                         }
                         cases++;
                     }
@@ -388,6 +413,21 @@ class ColdScanReadAheadTest {
         return false;
     }
 
+    /// {@return the units `refs` name, read ahead and each opened as `kind`, or `null` where one cannot be}
+    private static byte[][] prefetched(PageFile pages, List<PageRef> refs, byte kind) {
+        var offsets = new int[refs.size()];
+        var sealed = pages.prefetch(refs.toArray(PageRef[]::new), refs.size(), offsets);
+        try {
+            var units = new byte[refs.size()][];
+            for (var i = 0; i < units.length; i++) {
+                units[i] = offsets[i] < 0 ? null : pages.openPrefetched(refs.get(i), kind, sealed, offsets[i]);
+            }
+            return units;
+        } finally {
+            pages.releasePrefetched(sealed);
+        }
+    }
+
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
     @DisplayName("a read that joins units across gaps opens each alone: a damaged, misnamed or missing one hides none of the others")
@@ -424,7 +464,7 @@ class ColdScanReadAheadTest {
             asked.add(missing);
             // Out of page order, as the cursor asks for them going down
             java.util.Collections.reverse(asked);
-            var units = pages.prefetch(asked.toArray(PageRef[]::new), asked.size(), PageFormat.VALUE);
+            var units = prefetched(pages, asked, PageFormat.VALUE);
             for (var i = 0; i < asked.size(); i++) {
                 var ref = asked.get(i);
                 var at = refs.indexOf(ref);
@@ -440,7 +480,7 @@ class ColdScanReadAheadTest {
             }
             // A kind the units do not have opens none of them
             pages.cache().clearForTests();
-            var leaves = pages.prefetch(refs.toArray(PageRef[]::new), refs.size(), PageFormat.LEAF);
+            var leaves = prefetched(pages, refs, PageFormat.LEAF);
             for (var unit : leaves) {
                 assertNull(unit);
             }
@@ -466,13 +506,26 @@ class ColdScanReadAheadTest {
             for (var i = 0; i < 100; i++) {
                 pages.sampleRead(Long.MAX_VALUE, PageFormat.SIZE);
             }
-            assertTrue(pages.readMicrosForTests() > 0 && pages.readMicrosForTests() <= 1 << 10, pages.readMicrosForTests() + " microseconds");
+            assertTrue(pages.readMicrosForTests() > 0 && pages.readMicrosForTests() <= 2 * PageFile.COLD_READ_MICROS, pages.readMicrosForTests() + " microseconds");
             for (var i = 0; i < 10; i++) {
                 pages.sampleRead(5_000, PageFormat.SIZE);
             }
             assertFalse(pages.coldReads(), pages.readMicrosForTests() + " microseconds");
             pages.sampleRead(-1, PageFormat.SIZE);
             assertTrue(pages.readMicrosForTests() >= 0);
+            // Quick reads of the OS cache, two of them stretched in a row: still warm; a third in a row reads as cold
+            for (var i = 0; i < 20; i++) {
+                pages.sampleRead(5_000, PageFormat.SIZE);
+            }
+            pages.sampleRead(Long.MAX_VALUE, PageFormat.SIZE);
+            pages.sampleRead(Long.MAX_VALUE, PageFormat.SIZE);
+            assertFalse(pages.coldReads(), pages.readMicrosForTests() + " microseconds after two stretched reads");
+            pages.sampleRead(Long.MAX_VALUE, PageFormat.SIZE);
+            assertTrue(pages.coldReads(), pages.readMicrosForTests() + " microseconds after three stretched reads");
+            for (var i = 0; i < 3; i++) {
+                pages.sampleRead(5_000, PageFormat.SIZE);
+            }
+            assertFalse(pages.coldReads(), pages.readMicrosForTests() + " microseconds after three quick reads");
             // A long read out of the OS cache is no read of the device
             for (var i = 0; i < 8; i++) {
                 pages.sampleRead(400_000, PageFile.RUN_PAGES * PageFormat.SIZE);
