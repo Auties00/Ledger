@@ -1,5 +1,6 @@
 package com.github.auties00.ledger.engine;
 
+import java.lang.ref.WeakReference;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
@@ -17,6 +18,13 @@ import java.util.concurrent.atomic.AtomicLong;
 /// The free arrays of a size none was taken of for a tick of the [IdleTicker], between one and two of its periods, go
 /// to the collector, so neither a store idle after a checkpoint, in a process of many stores, nor one that goes on
 /// taking the small arrays of its commits after a history sync keeps the arrays it no longer takes.
+///
+/// The arrays of work that comes in bursts, such as the reads ahead of a scan while the file reads from the device or
+/// the leaves a resident key space loads, are [collectable][#acquireCollectable(int)]: the pool recycles them as it
+/// does the others, but reaches the free ones only weakly, so the first collection after a burst frees them. Kept
+/// strongly, the sealed and opened arrays of a scan's reads ahead stayed in the pool for as long as scans read ahead,
+/// one of each size a round read into, 520 KiB after 1,000 cold chat pages; a burst after a collection allocates them
+/// again, once.
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
@@ -36,6 +44,17 @@ public final class HeapPool {
     private final IdleTicker.Watched trimmer;
     // What sees the arrays the pool hands out again and takes back, or null; for tests
     private volatile Watcher watcher;
+    // The free collectable arrays, which only this reference reaches; replaced, holding the lock, once the collector
+    // cleared it or a trim dropped it
+    private volatile WeakReference<Collectable> collectable;
+    private final Object collectableLock;
+    // The collectable acquires so far, and the count the trimmer saw last, as for the other arrays
+    private int collectableAcquires;
+    private int collectableAcquiresSeen;
+    // Whether the free collectable arrays are kept strongly too, and the set so kept, guarded by the lock; for tests
+    // that count the bytes a burst allocates across collections
+    private boolean holdCollectable;
+    private Collectable heldCollectable;
 
     // The pool the stores of the process share, made with the first; guarded by the class
     private static HeapPool process;
@@ -105,6 +124,8 @@ public final class HeapPool {
         }
         this.acquires = new int[free.length];
         this.acquiresSeen = new int[free.length];
+        this.collectable = new WeakReference<>(null);
+        this.collectableLock = new Object();
         this.trimmer = trimmed ? this::trimIfIdle : null;
         if (trimmed) {
             IdleTicker.watch(trimmer);
@@ -158,7 +179,61 @@ public final class HeapPool {
         free[size].offer(array);
     }
 
-    /// Gives the free arrays of each size to the collector if no array of that size was acquired since the last call.
+    /// {@return an array of at least `capacity` bytes for work that comes in bursts, which goes back to the pool through
+    /// [#releaseCollectable(byte\[\])]}
+    ///
+    /// A burst reuses the arrays of the burst before it, unless a collection ran between them.
+    ///
+    /// @param capacity the least length, not negative
+    byte[] acquireCollectable(int capacity) {
+        if (capacity > 1 << MAX_SHIFT) {
+            return new byte[capacity];
+        }
+        var shift = Math.max(MIN_SHIFT, 32 - Integer.numberOfLeadingZeros(Math.max(1, capacity) - 1));
+        collectableAcquires++;
+        var set = collectable.get();
+        if (set != null) {
+            var array = set.free[shift - MIN_SHIFT].poll();
+            if (array != null) {
+                set.bytes[shift - MIN_SHIFT].addAndGet(-array.length);
+                return array;
+            }
+        }
+        return new byte[1 << shift];
+    }
+
+    /// Returns `array` to the free collectable arrays, unless it is not one of the pooled sizes or the free collectable
+    /// arrays of its size hold half the bytes the pool keeps.
+    ///
+    /// @param array an array [#acquireCollectable(int)] returned, which the caller no longer uses
+    void releaseCollectable(byte[] array) {
+        var length = array.length;
+        if (Integer.bitCount(length) != 1 || length < 1 << MIN_SHIFT || length > 1 << MAX_SHIFT) {
+            return;
+        }
+        var size = Integer.numberOfTrailingZeros(length) - MIN_SHIFT;
+        var set = collectable.get();
+        if (set == null) {
+            synchronized (collectableLock) {
+                set = collectable.get();
+                if (set == null) {
+                    set = new Collectable(free.length);
+                    collectable = new WeakReference<>(set);
+                    if (holdCollectable) {
+                        heldCollectable = set;
+                    }
+                }
+            }
+        }
+        if (set.bytes[size].addAndGet(length) > maxPooledBytes / 2) {
+            set.bytes[size].addAndGet(-length);
+            return;
+        }
+        set.free[size].offer(array);
+    }
+
+    /// Gives the free arrays of each size to the collector if no array of that size was acquired since the last call,
+    /// and the free collectable arrays if no collectable one was.
     void trimIfIdle() {
         for (var i = 0; i < free.length; i++) {
             var seen = acquires[i];
@@ -170,6 +245,62 @@ public final class HeapPool {
                 }
             }
             acquiresSeen[i] = seen;
+        }
+        var seen = collectableAcquires;
+        if (seen == collectableAcquiresSeen) {
+            dropCollectable();
+        }
+        collectableAcquiresSeen = seen;
+    }
+
+    // Leaves the free collectable arrays to the collector
+    private void dropCollectable() {
+        synchronized (collectableLock) {
+            collectable = new WeakReference<>(null);
+            heldCollectable = null;
+        }
+    }
+
+    /// Keeps the free collectable arrays strongly too, so that no collection frees them, or only weakly again; for
+    /// tests that count the bytes a burst allocates.
+    void holdCollectableForTests(boolean hold) {
+        synchronized (collectableLock) {
+            holdCollectable = hold;
+            heldCollectable = hold ? collectable.get() : null;
+        }
+    }
+
+    /// Drops the free collectable arrays, as a collection that found them unreachable does; for tests.
+    void collectForTests() {
+        dropCollectable();
+    }
+
+    /// {@return the bytes of the free collectable arrays; for tests}
+    long collectableBytesForTests() {
+        var set = collectable.get();
+        if (set == null) {
+            return 0;
+        }
+        var total = 0L;
+        for (var bytes : set.bytes) {
+            total += bytes.get();
+        }
+        return total;
+    }
+
+    /// The free collectable arrays of each size, and the bytes those of each size hold.
+    private static final class Collectable {
+        final ConcurrentLinkedQueue<byte[]>[] free;
+        final AtomicLong[] bytes;
+
+        @SuppressWarnings("unchecked")
+        Collectable(int sizes) {
+            this.free = new ConcurrentLinkedQueue[sizes];
+            this.bytes = new AtomicLong[sizes];
+            for (var i = 0; i < sizes; i++) {
+                free[i] = new ConcurrentLinkedQueue<>();
+                bytes[i] = new AtomicLong();
+            }
         }
     }
 
@@ -188,9 +319,10 @@ public final class HeapPool {
         void released(byte[] array);
     }
 
-    /// {@return the arrays of every size taken from the pool so far; for tests that count the reads of a file}
+    /// {@return the arrays of every size taken from the pool so far, collectable ones included; for tests that count
+    /// the reads of a file}
     int acquiresForTests() {
-        var total = 0;
+        var total = collectableAcquires;
         for (var count : acquires) {
             total += count;
         }

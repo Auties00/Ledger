@@ -4,6 +4,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -47,5 +48,49 @@ class HeapPoolTest {
         // A trimmed pool recycles again
         pool.release(pool.acquire(4_096));
         assertEquals(4_096, pool.pooledBytesForTests());
+    }
+
+    @Test
+    @DisplayName("hands back a released collectable array, kept apart from the others, and trims them once none was acquired between two trims")
+    void recyclesCollectable() {
+        var pool = new HeapPool(1 << 20, false);
+        pool.holdCollectableForTests(true);
+        var array = pool.acquireCollectable(5_000);
+        assertEquals(8_192, array.length);
+        pool.releaseCollectable(array);
+        assertEquals(0, pool.pooledBytesForTests(), "kept with the other arrays");
+        assertEquals(8_192, pool.collectableBytesForTests());
+        assertSame(array, pool.acquireCollectable(8_000));
+        assertNotSame(array, pool.acquire(8_000), "handed out as one of the other arrays");
+        pool.releaseCollectable(array);
+        // Larger than a pooled size, or past half of what the pool keeps: left to the collector
+        pool.releaseCollectable(new byte[(1 << 20) + 1]);
+        pool.releaseCollectable(new byte[1 << 20]);
+        assertEquals(8_192, pool.collectableBytesForTests());
+        pool.trimIfIdle();
+        assertEquals(8_192, pool.collectableBytesForTests(), "acquired since the last trim");
+        pool.trimIfIdle();
+        assertEquals(0, pool.collectableBytesForTests(), "idle since the last trim");
+        assertEquals(4_096, pool.acquireCollectable(1).length);
+    }
+
+    @Test
+    @DisplayName("frees the free collectable arrays at a collection, unless held for a test")
+    void collectsCollectable() {
+        var pool = new HeapPool(1 << 20, false);
+        pool.releaseCollectable(pool.acquireCollectable(4_096));
+        assertEquals(4_096, pool.collectableBytesForTests());
+        for (var i = 0; i < 50 && pool.collectableBytesForTests() != 0; i++) {
+            System.gc();
+        }
+        assertEquals(0, pool.collectableBytesForTests(), "a collection left the free collectable arrays");
+        pool.holdCollectableForTests(true);
+        var array = pool.acquireCollectable(4_096);
+        pool.releaseCollectable(array);
+        System.gc();
+        assertSame(array, pool.acquireCollectable(4_096), "a collection freed the held arrays");
+        pool.releaseCollectable(array);
+        pool.collectForTests();
+        assertEquals(0, pool.collectableBytesForTests());
     }
 }
