@@ -1225,4 +1225,137 @@ class WriteThroughTest {
             }
         }
     }
+
+    @Nested
+    @DisplayName("the answers of devices")
+    class DeviceAnswers {
+        // WRITE_CACHE_ENABLE: 1 disabled, 2 enabled; WRITE_THROUGH: 1 not supported, 2 supported
+        private static final WriteThrough.WriteCache FUA = new WriteThrough.WriteCache(2, 2, false);
+        private static final WriteThrough.WriteCache NON_VOLATILE = new WriteThrough.WriteCache(2, 1, true);
+        private static final WriteThrough.WriteCache VOLATILE = new WriteThrough.WriteCache(2, 1, false);
+        private static final WriteThrough.WriteCache TURNED_OFF = new WriteThrough.WriteCache(1, 1, false);
+
+        private record Counted(WriteThrough.Answers answers, Map<String, AtomicInteger> asked) {
+        }
+
+        /// Answers whose directories are named after their volumes, the first name of their path, but `unnamed`.
+        private static Counted answers(Map<String, WriteThrough.WriteCache> devices) {
+            var asked = new ConcurrentHashMap<String, AtomicInteger>();
+            var answers = new WriteThrough.Answers(directory -> {
+                var name = directory.getName(0).toString();
+                return name.equals("unnamed") ? null : name;
+            }, volume -> {
+                asked.computeIfAbsent(volume, _ -> new AtomicInteger()).incrementAndGet();
+                return devices.get(volume);
+            });
+            return new Counted(answers, asked);
+        }
+
+        private static int asked(Counted counted, String volume) {
+            var count = counted.asked().get(volume);
+            return count == null ? 0 : count.get();
+        }
+
+        @Test
+        @DisplayName("keep for the process an answer that rests on what the device is, or that proves nothing")
+        void lasting() {
+            var counted = answers(Map.of("fua", FUA, "nonVolatile", NON_VOLATILE, "volatile", VOLATILE));
+            for (var store = 0; store < 3; store++) {
+                assertTrue(counted.answers().proves(Path.of("fua", "store" + store)));
+                assertTrue(counted.answers().proves(Path.of("nonVolatile", "store" + store)));
+                assertFalse(counted.answers().proves(Path.of("volatile", "store" + store)));
+            }
+            assertEquals(1, asked(counted, "fua"));
+            assertEquals(1, asked(counted, "nonVolatile"));
+            assertEquals(1, asked(counted, "volatile"));
+            assertEquals(3, counted.answers().asks());
+        }
+
+        @Test
+        @DisplayName("ask again for each store where only a cache turned off proves it, or the device did not answer")
+        void asksAgain() {
+            var devices = new ConcurrentHashMap<String, WriteThrough.WriteCache>();
+            devices.put("off", TURNED_OFF);
+            var counted = answers(devices);
+            for (var store = 0; store < 3; store++) {
+                assertTrue(counted.answers().proves(Path.of("off", "store" + store)));
+                assertFalse(counted.answers().proves(Path.of("silent", "store" + store)));
+            }
+            assertEquals(3, asked(counted, "off"));
+            assertEquals(3, asked(counted, "silent"));
+            // The cache turned back on, or a device that answers at last, reaches the next store
+            devices.put("off", VOLATILE);
+            devices.put("silent", FUA);
+            assertFalse(counted.answers().proves(Path.of("off", "store")));
+            assertTrue(counted.answers().proves(Path.of("silent", "store")));
+            assertTrue(counted.answers().proves(Path.of("silent", "store")));
+            assertEquals(4, asked(counted, "silent"));
+        }
+
+        @Test
+        @DisplayName("prove nothing for a directory whose volume cannot be named, without asking any device")
+        void unnamed() {
+            var counted = answers(Map.of("fua", FUA));
+            assertFalse(counted.answers().proves(Path.of("unnamed", "store")));
+            assertEquals(0, counted.answers().asks());
+        }
+
+        @Test
+        @DisplayName("keep each volume's answer apart, and ask again once they are forgotten")
+        void perVolume() {
+            var counted = answers(Map.of("fua", FUA, "volatile", VOLATILE));
+            assertTrue(counted.answers().proves(Path.of("fua", "a")));
+            assertFalse(counted.answers().proves(Path.of("volatile", "b")));
+            counted.answers().clear();
+            assertEquals(2, counted.answers().asks());
+            assertTrue(counted.answers().proves(Path.of("fua", "c")));
+            assertEquals(2, asked(counted, "fua"));
+            assertEquals(1, asked(counted, "volatile"));
+        }
+
+        @Test
+        @DisplayName("give stores asking beside each other the same answer, and keep it for the later ones")
+        void concurrent() throws Exception {
+            var counted = answers(Map.of("fua", FUA));
+            var start = new CountDownLatch(1);
+            try (var threads = Executors.newVirtualThreadPerTaskExecutor()) {
+                var answers = new ArrayList<Future<Boolean>>();
+                for (var store = 0; store < 16; store++) {
+                    var directory = Path.of("fua", "store" + store);
+                    answers.add(threads.submit(() -> {
+                        start.await();
+                        return counted.answers().proves(directory);
+                    }));
+                }
+                start.countDown();
+                for (var answer : answers) {
+                    assertTrue(answer.get(60, TimeUnit.SECONDS));
+                }
+            }
+            var before = asked(counted, "fua");
+            assertTrue(before >= 1 && before <= 16, "asked " + before + " times");
+            assertTrue(counted.answers().proves(Path.of("fua", "later")));
+            assertEquals(before, asked(counted, "fua"));
+        }
+
+        @Test
+        @EnabledOnOs(OS.WINDOWS)
+        @DisplayName("on Windows a device whose answer lasts is asked once by the stores of a process, and only when a segment needs it")
+        void windowsOnce(@TempDir Path directory) {
+            Assumptions.assumeTrue(WriteThrough.class.getModule().isNativeAccessEnabled(), "the tests run without native access");
+            var volume = WriteThrough.WriteCache.volumeOf(directory);
+            Assumptions.assumeTrue(volume != null, "the volume under the temporary directory has no name");
+            assertTrue(volume.startsWith("\\\\?\\Volume{") && volume.endsWith("}"), volume);
+            var cache = WriteThrough.WriteCache.ofVolume(volume);
+            Assumptions.assumeTrue(cache != null, "the device under the temporary directory does not answer");
+            WriteThrough.WriteCache.clearForTests();
+            var asks = WriteThrough.WriteCache.asksForTests();
+            var first = WriteThrough.of(WriteThrough.Mode.AUTO, directory);
+            var second = WriteThrough.of(WriteThrough.Mode.AUTO, directory);
+            assertEquals(asks, WriteThrough.WriteCache.asksForTests(), "the device was asked before a segment needed it");
+            assertEquals(cache.provesWriteThrough(), first.enabled());
+            assertEquals(cache.provesWriteThrough(), second.enabled());
+            assertEquals(cache.lastsForProcess() ? 1 : 2, WriteThrough.WriteCache.asksForTests() - asks);
+        }
+    }
 }
