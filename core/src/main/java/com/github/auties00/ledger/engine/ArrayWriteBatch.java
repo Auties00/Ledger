@@ -64,6 +64,8 @@ public final class ArrayWriteBatch implements WriteBatch {
     // A paged write's home is in perWriteHomes, at the offset the high half of its key's length holds; a resident one
     // has none
     private static final byte HOMES_PER_WRITE = 4;
+    // As HOMES_CHUNKS, but packedHome is the shared view of a slab's chunk, which no commit allocates
+    private static final byte HOMES_SLAB = 5;
 
     /// A write of a value under a key.
     public static final byte PUT = 0;
@@ -100,7 +102,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     private byte[] spare;
     // Where the store's versions find the values, as prepare decided: one of the HOMES_ constants
     private byte homesMode;
-    // In HOMES_CHUNKS, the read-only segment the values of the paged writes were copied into
+    // In HOMES_CHUNKS and HOMES_SLAB, the read-only segment the values of the paged writes were copied into
     private MemorySegment packedHome;
     // In HOMES_PER_WRITE, the read-only segment the value of each paged write was copied into: a slab's chunks, more than
     // one of them or beside the array of the values it did not take
@@ -110,8 +112,8 @@ public final class ArrayWriteBatch implements WriteBatch {
     private Keyspace<?, ?>[] targets;
     private Object[] values;
     // Per write: first offset and length, then second offset and length (value, or upper bound of a range). Only the low
-    // half of the first length is the length: in HOMES_CHUNKS and HOMES_PER_WRITE the high half is where the write's
-    // value is in its home
+    // half of the first length is the length: in HOMES_CHUNKS, HOMES_SLAB and HOMES_PER_WRITE the high half is where
+    // the write's value is in its home
     private long[] spans;
     // The array of each value of OWN_BYTES or more, or null before the first
     private byte[][] owns;
@@ -852,7 +854,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         }
         if (several == null && !declined) {
             packedHome = first;
-            homesMode = HOMES_CHUNKS;
+            homesMode = HOMES_SLAB;
             return true;
         }
         perWriteHomes = several != null ? several : new MemorySegment[size];
@@ -875,12 +877,13 @@ public final class ArrayWriteBatch implements WriteBatch {
         return true;
     }
 
-    // Whether write `index` puts a value the store keeps on a chunk, in HOMES_CHUNKS, HOMES_PER_WRITE and HOMES_ROPE
+    // Whether write `index` puts a value the store keeps on a chunk, in HOMES_CHUNKS, HOMES_SLAB, HOMES_PER_WRITE and
+    // HOMES_ROPE
     private boolean packed(int index) {
         return kinds[index] == PUT && spans[index * 4 + 2] != OWN && targets[index].residency() == Keyspace.Residency.PAGED;
     }
 
-    /// The array [#prepare(boolean)] copies the values of paged key spaces into, in the order of the writes.
+    /// The array [#prepare(boolean, ValueSlab, Map)] copies the values of paged key spaces into, in the order of the writes.
     ///
     /// Each write is packed by a call of its own, which the JIT compiles once a few thousand writes have made it, as it
     /// would not compile the loop of a method called once a commit through the first large commits of a process.
@@ -917,7 +920,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         Objects.checkIndex(index, size);
         return switch (homesMode) {
             case HOMES_OWN -> spans[index * 4 + 2] == OWN ? null : view;
-            case HOMES_CHUNKS -> packed(index) ? packedHome : null;
+            case HOMES_CHUNKS, HOMES_SLAB -> packed(index) ? packedHome : null;
             case HOMES_ROPE -> packed(index) ? chunks[(int) (spans[index * 4 + 2] >>> 32)].home : null;
             case HOMES_PER_WRITE -> packed(index) ? perWriteHomes[index] : null;
             default -> null;
@@ -931,10 +934,16 @@ public final class ArrayWriteBatch implements WriteBatch {
         Objects.checkIndex(index, size);
         return switch (homesMode) {
             case HOMES_OWN -> spans[index * 4 + 2] == OWN ? 0 : Math.toIntExact(spans[index * 4 + 2]);
-            case HOMES_CHUNKS, HOMES_PER_WRITE -> packed(index) ? (int) (spans[index * 4 + 1] >>> 32) : 0;
+            case HOMES_CHUNKS, HOMES_SLAB, HOMES_PER_WRITE -> packed(index) ? (int) (spans[index * 4 + 1] >>> 32) : 0;
             case HOMES_ROPE -> packed(index) ? (int) spans[index * 4 + 2] : 0;
             default -> 0;
         };
+    }
+
+    /// {@return whether the last prepare put the values the store keeps on one chunk of a [ValueSlab], whose view the
+    /// slab shares, so the commit allocates no array, view or session for them}
+    boolean sharesChunk() {
+        return homesMode == HOMES_SLAB;
     }
 
     /// Starts the batch again, empty, once the store has applied its writes: it hands over to the store the arrays the

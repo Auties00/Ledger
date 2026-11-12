@@ -121,6 +121,13 @@ final class Padded {
         void setLazily(PendingCommit commit) {
             COMMIT.setRelease(this, commit);
         }
+
+        /// Makes `commit` the reference if it is still `expected`, with a full fence.
+        ///
+        /// @return whether it did
+        boolean compareAndSet(PendingCommit expected, PendingCommit commit) {
+            return COMMIT.compareAndSet(this, expected, commit);
+        }
     }
 
     abstract static class CountFields extends Before {

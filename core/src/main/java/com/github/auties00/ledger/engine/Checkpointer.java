@@ -183,13 +183,17 @@ final class Checkpointer implements IdleTicker.Watched {
     /// those writes in memory, more than their bytes in the log, for as long as it stayed open.
     ///
     /// It also finishes, on a thread of its own, a sweep the commits have not, however busy the store: they sweep a few
-    /// chains each, and a store with none would never do so.
+    /// chains each, and a store with none would never do so; and it lets go of the last commit the pipeline holds on
+    /// to ([LiveLedger#forgetLastCommits()]).
     @Override
     public void tick() {
         var appended = log.appendedBytes();
         var idle = appended == appendedAtTick;
         appendedAtTick = appended;
         slab.tick(idle);
+        if (!closed) {
+            ledger.forgetLastCommits();
+        }
         if (!closed && ledger.sweepWaiting()) {
             startSweep();
         }
@@ -329,8 +333,13 @@ final class Checkpointer implements IdleTicker.Watched {
 
     /// {@return the heap the writes the trees of the store lack hold, by the log's estimate and the slab's of what its
     /// chunks take beside the values}
-    private long backlogHeap() {
-        return log.appendedHeap() - publishedHeap + slab.slackBytes() - publishedSlack;
+    ///
+    /// The slack counts no less than none: a chunk held at the cut counts whole there, and only its tail once the slab
+    /// lets go of it, while a version written after the cut may still keep the whole of it. Taken as it came, the
+    /// difference went below zero by as much as the chunks the slab let go of, and took that much off the backlog of
+    /// every other store of the process.
+    long backlogHeap() {
+        return log.appendedHeap() - publishedHeap + Math.max(0, slab.slackBytes() - publishedSlack);
     }
 
     /// {@return the heap the writes the trees of every open store of the process lack hold, by their logs' estimates}

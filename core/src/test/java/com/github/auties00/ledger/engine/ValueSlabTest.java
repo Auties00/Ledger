@@ -329,6 +329,65 @@ class ValueSlabTest {
                 assertEquals(CHUNK, slab.retiredChunkBytes());
             }
         }
+
+        @Test
+        @DisplayName("the heap estimate of the backlog counts no less than none for the chunks the slab let go of after the cut")
+        void slackAfterCut(@TempDir Path directory) throws Exception {
+            try (var ledger = hot(directory)) {
+                var checkpointer = ledger.checkpointer();
+                IdleTicker.unwatch(checkpointer);
+                ledger.commit(ledger.newBatch().put(MESSAGES, new byte[]{1}, new byte[100])).awaitDurable();
+                // The cut counts the held chunk whole, and the slab then keeps only its tail
+                ledger.checkpoint();
+                ledger.valueSlab().tick(true);
+                assertEquals(0, checkpointer.backlogHeap());
+            }
+        }
+
+        @Test
+        @DisplayName("a commit whose values share a chunk counts none of the view, session and array a commit of its own allocates")
+        void sharedChunkHeap(@TempDir Path directory) throws Exception {
+            try (var ledger = hot(directory)) {
+                var log = ledger.log();
+                // The first commit takes the frames the open deferred to its group
+                ledger.commit(ledger.newBatch().put(MESSAGES, new byte[]{0}, new byte[100])).awaitDurable();
+                var before = log.appendedHeap();
+                ledger.commit(ledger.newBatch().put(MESSAGES, new byte[]{1}, new byte[100])).awaitDurable();
+                var shared = log.appendedHeap() - before;
+                assertEquals(1, ledger.valueSlab().heldForTests());
+                before = log.appendedHeap();
+                // An empty value, which the slab declines and the store copies: the same frame but for the 100 bytes
+                ledger.commit(ledger.newBatch().put(MESSAGES, new byte[]{2}, new byte[0])).awaitDurable();
+                var own = log.appendedHeap() - before;
+                assertEquals(100 - LogWriter.COMMIT_HEAP, shared - own);
+            }
+        }
+
+        @Test
+        @Timeout(60)
+        @DisplayName("a tick lets go of the last commit, whose writes kept its value's chunk after a checkpoint dropped the chain")
+        void forgetsLastCommit(@TempDir Path directory) throws Exception {
+            try (var ledger = hot(directory)) {
+                var checkpointer = ledger.checkpointer();
+                IdleTicker.unwatch(checkpointer);
+                var key = new byte[]{1};
+                ledger.commit(ledger.newBatch().put(MESSAGES, key, new byte[100])).awaitDurable();
+                var version = new java.lang.ref.WeakReference<>(head(ledger, MESSAGES, key));
+                ledger.checkpoint();
+                while (ledger.state(MESSAGES).head(MemorySegment.ofArray(key)) != null) {
+                    Thread.sleep(10);
+                }
+                checkpointer.tick();
+                for (var i = 0; i < 100 && version.get() != null; i++) {
+                    System.gc();
+                    Thread.sleep(10);
+                }
+                assertTrue(version.get() == null, "the version of the last commit is still reachable");
+                // The pipeline goes on from the empty commit that took its place
+                ledger.commit(ledger.newBatch().put(MESSAGES, key, new byte[]{7})).awaitDurable();
+                assertArrayEquals(new byte[]{7}, ledger.get(MESSAGES, key).orElseThrow());
+            }
+        }
     }
 
     private static boolean place(ValueSlab slab, byte[] value) {
