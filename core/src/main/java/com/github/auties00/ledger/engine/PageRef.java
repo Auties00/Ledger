@@ -43,9 +43,14 @@ record PageRef(int page, int pages, long nonceHigh, int nonceLow, int slot) {
 
     /// {@return whether the header of `unit` names this reference's pages and nonce}
     boolean describes(byte[] unit) {
-        return Bytes.i32(unit, PageFormat.PAGES) == pages
-                && Bytes.i32(unit, PageFormat.PAGE) == page
-                && Bytes.i64(unit, PageFormat.NONCE) == nonceHigh
-                && Bytes.i32(unit, PageFormat.NONCE + 8) == nonceLow;
+        return describes(unit, 0);
+    }
+
+    /// {@return whether the header of the unit at `offset` of `array` names this reference's pages and nonce}
+    boolean describes(byte[] array, int offset) {
+        return Bytes.i32(array, offset + PageFormat.PAGES) == pages
+                && Bytes.i32(array, offset + PageFormat.PAGE) == page
+                && Bytes.i64(array, offset + PageFormat.NONCE) == nonceHigh
+                && Bytes.i32(array, offset + PageFormat.NONCE + 8) == nonceLow;
     }
 }

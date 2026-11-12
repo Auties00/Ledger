@@ -322,6 +322,13 @@ final class TreeNodes {
         return MemorySegment.ofArray(unit).asSlice(entry + BRANCH_FIXED, Bytes.u16(unit, entry + BRANCH_FIXED - 2)).asReadOnly();
     }
 
+    /// {@return a negative number, zero or a positive number as the first key of child `index` of the branch `unit`
+    /// sorts before, with or after `key`}
+    static int compareChildKey(byte[] unit, int index, byte[] key) {
+        var entry = entry(unit, index);
+        return compare(unit, entry + BRANCH_FIXED, Bytes.u16(unit, entry + BRANCH_FIXED - 2), key);
+    }
+
     /// {@return the entries of the leaf `unit`, as views of it}
     static List<LeafEntry> leafEntries(byte[] unit) {
         var count = count(unit);
