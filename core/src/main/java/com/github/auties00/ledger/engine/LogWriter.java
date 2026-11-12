@@ -271,8 +271,8 @@ final class LogWriter {
     private int used;
     // The groups in a row written since one needed more than half of MIN_OUTPUT
     private int smallGroups;
-    // How long the write and force of a group took, or its write through, a moving average in nanoseconds, or 0 before
-    // the first group
+    // How long the write and force of a group took, or its write through, a moving average in nanoseconds of the groups
+    // after the first, each at most four times the average before it, or 0 before the second group
     private long forceNanos;
     // The commits the last published group woke, its leader included; read by commits deciding whether to lead
     private volatile int lastGroupWaiters;
@@ -1053,7 +1053,12 @@ final class LogWriter {
             force();
         }
         var took = Math.max(1, System.nanoTime() - forceStart);
-        forceNanos = forceNanos == 0 ? took : forceNanos + (took - forceNanos) / 8;
+        // The first group pays for the first force of its segment, and an average one stalled force moves would hold
+        // the wait for woken commits at its bound for dozens of groups: the first counts for nothing, and a later one
+        // for four times the average at most
+        if (forces > 0) {
+            forceNanos = forceNanos == 0 ? took : forceNanos + (Math.min(took, 4 * forceNanos) - forceNanos) / 8;
+        }
         forces++;
         if (unitForce != null) {
             await(unitForce);
