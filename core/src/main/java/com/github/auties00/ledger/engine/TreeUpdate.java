@@ -29,10 +29,11 @@ import java.util.concurrent.atomic.AtomicReference;
 /// ([#target(List)]), and a run that would keep its number of leaves keeps its boundaries
 /// ([#splitsTogether(List, int\[\], int)]). A leaf written whole with no such neighbour splits on its own.
 ///
-/// The units of the old tree the update replaces go to [#freed()]; the pages it takes go to [#allocated()], so a
-/// checkpoint that fails gives them back. The delta records it writes and those it drops are counted by page, which
-/// [#finishDeltas(DeltaTable)] applies to the table of delta pages once every tree is updated. A branch with many
-/// writes below it updates its children's subtrees in parallel, in the common fork-join pool.
+/// The units of the old tree the update replaces go to [#freed()], and the delta records it drops to
+/// [#droppedRecords()]; the pages it takes go to [#allocated()], so a checkpoint that fails gives them back. The delta
+/// records it writes and those it drops are counted by page, which [#finishDeltas(DeltaTable)] applies to the table of
+/// delta pages once every tree is updated. A branch with many writes below it updates its children's subtrees in
+/// parallel, in the common fork-join pool.
 ///
 /// A node read to be replaced is neither cached nor counted as read ([PageFile#readForReplace(PageRef, byte)]); one the
 /// writes turn out not to change then counts as read after all. What the update writes goes to the page cache as the
@@ -48,6 +49,7 @@ final class TreeUpdate {
     private final List<PageRef> freed;
     private final List<PageRef> freedExternal;
     private final List<PageRef> allocated;
+    private final List<PageRef> droppedRecords;
     // The records each delta page gained or lost, by page
     private final PageCounts records;
     // Fills the delta pages of this update's thread
@@ -71,6 +73,7 @@ final class TreeUpdate {
         this.freed = new ArrayList<>();
         this.freedExternal = new ArrayList<>();
         this.allocated = new ArrayList<>();
+        this.droppedRecords = new ArrayList<>();
         this.records = new PageCounts();
         this.packer = new DeltaLeaves.Packer(writer, new DeltaLeaves.Packer.Space() {
             @Override
@@ -187,6 +190,12 @@ final class TreeUpdate {
     /// {@return the pages the update took}
     List<PageRef> allocated() {
         return allocated;
+    }
+
+    /// {@return the delta records of the old trees the update gave up, whose leaves the page cache may hold; their
+    /// delta pages are freed through [#freed()] only once they hold no record}
+    List<PageRef> droppedRecords() {
+        return droppedRecords;
     }
 
     /// Queues the delta page being filled and applies the records written and dropped to `table`, once every tree is
@@ -485,6 +494,7 @@ final class TreeUpdate {
         for (var task : tasks) {
             freed.addAll(task.update.freed);
             freedExternal.addAll(task.update.freedExternal);
+            droppedRecords.addAll(task.update.droppedRecords);
             records.addAll(task.update.records);
             replacements[task.index] = task.getRawResult();
         }
@@ -575,6 +585,7 @@ final class TreeUpdate {
 
     private void dropRecord(PageRef ref) {
         records.add(ref.page(), -1);
+        droppedRecords.add(ref);
     }
 
     /// The share of the writes of one child of a branch.

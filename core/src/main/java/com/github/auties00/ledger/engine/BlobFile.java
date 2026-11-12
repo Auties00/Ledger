@@ -338,6 +338,12 @@ final class BlobFile implements AutoCloseable {
         space.releasePassed(oldestReader);
     }
 
+    /// {@return the lists of units [#releasePassed(long)] freed since the last call, which the page cache may still
+    /// hold under [PageCache#BLOBS]; empty if none}
+    List<List<PageRef>> takeReleased() {
+        return space.takeReleased();
+    }
+
     /// {@return the pages of the file, and the runs of them a store reopened at the checkpoint being written may use}
     ///
     /// They are the free and pending pages, `alsoFree`, and every unit no tree points to but those in `adopted`, the

@@ -4,6 +4,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.lang.ref.Cleaner;
 import java.lang.ref.WeakReference;
+import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -63,6 +64,9 @@ final class PageCache implements IdleTicker.Watched {
     private static final int EMPTY = 0;
     /// The tag of a slot whose entry left, which a probe passes over.
     private static final int TOMBSTONE = 2;
+    /// The references [#removeAll(int, List)] drops per hold of the lock: at a probe or two each, a fraction of a
+    /// millisecond.
+    private static final int REMOVE_CHUNK = 2_048;
     /// The flag of an entry a read used since the clock last passed it.
     private static final byte REFERENCED = 1;
     /// The flag a tick of the idle ticker sets and a read clears: a tick that finds it set evicts the entry.
@@ -282,6 +286,50 @@ final class PageCache implements IdleTicker.Watched {
             var slot = table.locate(key);
             if (slot >= 0 && table.holdsNonce(slot, ref)) {
                 drop(table, slot);
+            }
+        }
+    }
+
+    /// Drops the units of `file`, [#DATA] or [#BLOBS], that the lists of `released` name, and for the data file the
+    /// leaves of the delta records they name, if the cache holds them; a unit of another nonce the cache holds for one
+    /// of their pages stays.
+    ///
+    /// It takes the lock once per [#REMOVE_CHUNK] references, and a reference whose key no slot tags costs no hold of
+    /// it: a checkpoint frees hundreds of thousands of units, and holding the lock for all of them at once would keep
+    /// every read that misses from caching what it read for as long.
+    void removeAll(int file, List<List<PageRef>> released) {
+        var held = new long[REMOVE_CHUNK];
+        var refs = new PageRef[REMOVE_CHUNK];
+        var count = 0;
+        for (var list : released) {
+            for (var ref : list) {
+                var key = file == DATA ? dataKey(ref.page(), ref.slot()) : key(file, ref.page());
+                if (table.find(key) < 0) {
+                    continue;
+                }
+                held[count] = key;
+                refs[count++] = ref;
+                if (count == REMOVE_CHUNK) {
+                    removeHeld(held, refs, count);
+                    count = 0;
+                }
+            }
+        }
+        if (count > 0) {
+            removeHeld(held, refs, count);
+        }
+    }
+
+    /// Drops, holding the lock once, the units the first `count` of `refs` name at the keys of `keys`.
+    private void removeHeld(long[] keys, PageRef[] refs, int count) {
+        synchronized (lock) {
+            var table = this.table;
+            for (var i = 0; i < count; i++) {
+                var slot = table.locate(keys[i]);
+                if (slot >= 0 && table.holdsNonce(slot, refs[i])) {
+                    drop(table, slot);
+                }
+                refs[i] = null;
             }
         }
     }

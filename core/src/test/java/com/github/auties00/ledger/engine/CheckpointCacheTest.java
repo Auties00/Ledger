@@ -40,6 +40,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -724,6 +725,213 @@ class CheckpointCacheTest {
                 }
             }
             verifyRecords(survivorPath, true);
+        }
+    }
+
+    @Nested
+    @DisplayName("the units a checkpoint replaced")
+    class Released {
+        private static PageRef unit(int page, long nonceHigh, int nonceLow) {
+            return new PageRef(page, 1, nonceHigh, nonceLow);
+        }
+
+        /// {@return a unit of `kind` whose header names `ref`, as the cache finds units of the files by their header}
+        private static byte[] sealedAs(byte kind, PageRef ref) {
+            var unit = new byte[PageFormat.SIZE];
+            PageFile.header(unit, kind, 0, ref.page(), ref.pages(), 0, ref.nonceHigh(), ref.nonceLow());
+            return unit;
+        }
+
+        @Test
+        @DisplayName("wait for the readers, then go to the cache's drop whole, the delta records with them, once each")
+        void handedOver() {
+            var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+            var page = space.allocate(4);
+            var units = List.of(unit(page, 1, 1), unit(page + 1, 1, 2));
+            var records = List.of(new PageRef(page + 2, 1, 1, 3, 0), new PageRef(page + 2, 1, 1, 3, 1));
+            space.pend(10, units, records);
+            space.pend(20, List.of(), List.of());
+            space.releasePassed(10);
+            assertTrue(space.takeReleased().isEmpty(), "a reader at the publish still reads them");
+            space.releasePassed(11);
+            var released = space.takeReleased();
+            assertEquals(2, released.size());
+            assertSame(units, released.get(0), "the commit path copied the units");
+            assertSame(records, released.get(1), "the commit path copied the records");
+            assertTrue(space.isUnused(page) && space.isUnused(page + 1));
+            assertFalse(space.isUnused(page + 2), "the delta page of dropped records may hold live ones");
+            assertTrue(space.takeReleased().isEmpty());
+        }
+
+        @Test
+        @DisplayName("reach exactly one taker when releases race the takes")
+        void releaseRacesTake() throws Exception {
+            var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+            var pended = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<List<PageRef>, Boolean>());
+            var taken = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<List<PageRef>, Boolean>());
+            var stop = new AtomicBoolean();
+            var failure = new AtomicReference<Throwable>();
+            var taker = Thread.ofPlatform().start(() -> {
+                try {
+                    while (!stop.get()) {
+                        for (var list : space.takeReleased()) {
+                            assertTrue(taken.add(list), "a list taken twice");
+                        }
+                    }
+                } catch (Throwable throwable) {
+                    failure.compareAndSet(null, throwable);
+                }
+            });
+            var releasers = new ArrayList<Thread>();
+            var published = new java.util.concurrent.atomic.AtomicLong();
+            for (var thread = 0; thread < 4; thread++) {
+                var lists = new ArrayList<List<PageRef>>();
+                for (var i = 0; i < 2_000; i++) {
+                    lists.add(List.of(unit(space.allocate(1), thread, i)));
+                }
+                pended.addAll(lists);
+                releasers.add(Thread.ofPlatform().unstarted(() -> {
+                    for (var list : lists) {
+                        space.pend(published.incrementAndGet(), list);
+                        space.releasePassed(Long.MAX_VALUE);
+                    }
+                }));
+            }
+            for (var thread : releasers) {
+                thread.start();
+            }
+            for (var thread : releasers) {
+                thread.join();
+            }
+            stop.set(true);
+            taker.join();
+            if (failure.get() != null) {
+                throw new AssertionError(failure.get());
+            }
+            for (var list : space.takeReleased()) {
+                assertTrue(taken.add(list), "a list taken twice");
+            }
+            assertEquals(pended, taken);
+        }
+
+        @Test
+        @DisplayName("leave the cache by file and nonce, the leaves of dropped records included, past a hold of the lock")
+        void removedExactly() {
+            var cache = PageCache.isolated(64 * MIB);
+            IdleTicker.unwatch(cache);
+            try {
+                var dead = unit(10, 7, 1);
+                var reused = unit(11, 7, 2);
+                var reusedNow = unit(11, 8, 1);
+                var record = new PageRef(12, 1, 7, 3, 2);
+                var bystander = new PageRef(12, 1, 7, 3, 3);
+                var blob = unit(10, 9, 1);
+                cache.put(dead, sealedAs(PageFormat.LEAF, dead), true);
+                cache.put(reusedNow, sealedAs(PageFormat.LEAF, reusedNow), true);
+                cache.put(record, new byte[100], true);
+                cache.put(bystander, new byte[100], true);
+                cache.put(PageCache.key(PageCache.BLOBS, 10), blob, sealedAs(PageFormat.EXTERNAL, blob), true);
+                // Units of other pages, more than one hold of the lock drops
+                var many = new ArrayList<PageRef>();
+                for (var i = 0; i < 5_000; i++) {
+                    var ref = unit(1_000 + i, 7, 100 + i);
+                    cache.put(ref, sealedAs(PageFormat.LEAF, ref), false);
+                    many.add(ref);
+                }
+                cache.removeAll(PageCache.DATA, List.of(List.of(dead, reused, record), many));
+                assertNull(cache.peek(dead));
+                assertNull(cache.peek(record));
+                for (var ref : many) {
+                    assertNull(cache.peek(ref), "unit " + ref);
+                }
+                assertNotNull(cache.peek(reusedNow), "a later checkpoint's unit at a page released before");
+                assertNotNull(cache.peek(bystander), "a live record of the same delta page");
+                assertNotNull(cache.get(PageCache.key(PageCache.BLOBS, 10), blob), "the unit of the same page of the other file");
+                assertEquals(PageFormat.SIZE + 100 + PageFormat.SIZE, cache.size());
+                cache.removeAll(PageCache.BLOBS, List.of(List.of(unit(10, 9, 2)), List.of(dead)));
+                assertNotNull(cache.get(PageCache.key(PageCache.BLOBS, 10), blob), "a unit of another nonce at its page");
+                cache.removeAll(PageCache.BLOBS, List.of(List.of(blob)));
+                assertNull(cache.get(PageCache.key(PageCache.BLOBS, 10), blob));
+                assertNotNull(cache.peek(reusedNow));
+                assertEquals(PageFormat.SIZE + 100, cache.size());
+                assertEquals(2, cache.clockLengthForTests());
+            } finally {
+                cache.close();
+            }
+        }
+
+        private static final int KEYS = 20_000;
+        private static final int LARGE_KEYS = 64;
+        private static final int LARGE = 20_000;
+
+        private static String key(int i) {
+            return "k%06d".formatted(i);
+        }
+
+        private static String value(int round, int i, boolean large) {
+            return round + ":" + i + ":" + "v".repeat(large ? LARGE : 150 + round);
+        }
+
+        private static void write(Ledger ledger, int round, boolean large) {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < (large ? LARGE_KEYS : KEYS); i++) {
+                batch.put(VALUES, key(i), value(round, i, large));
+            }
+            ledger.commit(batch);
+        }
+
+        private static void verify(com.github.auties00.ledger.View view, int round, boolean large) {
+            var keys = large ? LARGE_KEYS : KEYS;
+            assertEquals(keys, view.size(VALUES));
+            for (var i = 0; i < keys; i += large ? 1 : 7) {
+                assertEquals(value(round, i, large), view.get(VALUES, key(i)).orElseThrow(), key(i));
+            }
+        }
+
+        /// Waits until the store's page cache holds at most `bytes`, as the drop runs on a thread of its own.
+        private static void awaitAtMost(LiveLedger ledger, long bytes) throws InterruptedException {
+            var deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+            while (ledger.pageCacheBytesForTests() > bytes) {
+                assertTrue(System.nanoTime() < deadline, () -> "the cache still holds " + ledger.pageCacheBytesForTests()
+                        + " bytes, not at most " + bytes);
+                Thread.sleep(5);
+            }
+        }
+
+        @ParameterizedTest(name = "large values: {0}")
+        @ValueSource(booleans = {false, true})
+        @DisplayName("leave the cache once no reader reads them, and not before")
+        void leaveTheCache(boolean large, @TempDir Path directory) throws Exception {
+            var options = Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(VALUES)
+                    .pageCache(64 * MIB).largeValues(large ? 4_096 : Long.MAX_VALUE);
+            try (var ledger = (LiveLedger) options.build()) {
+                write(ledger, 0, large);
+                ledger.checkpoint();
+                // The values of the file of large values enter the cache as they are read
+                verify(ledger, 0, large);
+                var first = ledger.pageCacheBytesForTests();
+                var replaced = large ? (long) LARGE_KEYS * LARGE : first;
+                var snapshot = ledger.snapshot();
+                write(ledger, 1, large);
+                ledger.checkpoint();
+                // A commit finds the readers past the checkpoint, the next checkpoint drops what it freed
+                ledger.commit(ledger.newBatch().put(VALUES, key(0), value(1, 0, large)));
+                ledger.checkpoint();
+                var held = ledger.pageCacheBytesForTests();
+                // The new leaves enter the cache as they are written, the new large values only once read
+                var written = large ? 0 : replaced * 9 / 10;
+                assertTrue(held >= first + written, () -> "the replaced units left while a reader reads them: " + held
+                        + " bytes after " + first);
+                verify(snapshot, 0, large);
+                snapshot.close();
+                ledger.commit(ledger.newBatch().put(VALUES, key(0), value(1, 0, large)));
+                ledger.checkpoint();
+                awaitAtMost(ledger, held - replaced * 9 / 10);
+                verify(ledger, 1, large);
+            }
+            try (var ledger = (LiveLedger) options.build()) {
+                verify(ledger, 1, large);
+            }
         }
     }
 }
