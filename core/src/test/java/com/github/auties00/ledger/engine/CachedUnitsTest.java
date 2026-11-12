@@ -128,8 +128,8 @@ class CachedUnitsTest {
             var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
             var writer = pages.writer(1);
             var random = new Random(19);
-            var sizes = new int[]{2_500, 3_800, 6_000, 70_000};
-            // 3,800 bytes leave 264 of padding in their page, and 70,000 a ninth of a page in each of their 18
+            var sizes = new int[]{2_500, 4_020, 6_000, 70_000};
+            // 4,020 bytes leave 44 of padding in their page, and 70,000 a ninth of a page in each of their 18
             var kept = new int[]{PageFormat.HEADER + 2_500, PageFormat.SIZE, PageFormat.HEADER + 6_000, 18 * PageFormat.SIZE};
             var refs = new PageRef[sizes.length];
             var values = new byte[sizes.length][];

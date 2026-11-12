@@ -67,9 +67,13 @@ final class PageFormat {
     static final int NONCE = 16;
     /// The header byte that describes the search index of a node of format [#INDEXED].
     static final int INDEX = 28;
-    /// The least padding a unit the page cache takes must have for the cache to keep it without the padding: below
-    /// it, copying the content out of the opened unit costs more than the memory it saves.
-    static final int TRIM_LEAST = 512;
+    /// The least padding a unit the page cache takes must have for the cache to keep it without the padding. Opening
+    /// a unit into an array of the pool and copying its content out costs what opening it into an array of its own
+    /// does, which the JVM zeroes first, so the bound only spares the round trip through the pool for a few bytes: a
+    /// bound of 512 kept 1,519 of the 3,791 units a warm store of chats cached whole, 364,000 bytes of padding.
+    static final int TRIM_LEAST = 64;
+    /// The most pages of a unit the page cache keeps without its padding.
+    static final int TRIMMED_PAGES = 16;
 
     private PageFormat() {
     }
@@ -85,15 +89,15 @@ final class PageFormat {
     }
 
     /// {@return the bytes the page cache keeps of a unit of `pages` pages with `content` bytes of content, which
-    /// [fit][#fits(int, int)] them: its header and content if that drops at least [#TRIM_LEAST] bytes and a sixteenth
-    /// of the unit, or the whole unit}
+    /// [fit][#fits(int, int)] them: its header and content if the unit has at most [#TRIMMED_PAGES] pages and that
+    /// drops at least [#TRIM_LEAST] bytes, or the whole unit}
     ///
     /// The pages [#pagesFor(long)] gives pad a unit by less than a page and a tag, so one of more than 16 pages is kept
-    /// whole: dropping its padding would copy all its content to save a few kilobytes of it.
+    /// whole: dropping its padding would copy all its content to save less than a sixteenth of it.
     static int cachedLength(int pages, int content) {
         var length = pages * SIZE;
         var kept = HEADER + content;
-        return length - kept >= Math.max(TRIM_LEAST, length >> 4) ? kept : length;
+        return pages <= TRIMMED_PAGES && length - kept >= TRIM_LEAST ? kept : length;
     }
 
     /// {@return the pages of a unit holding `content` bytes}
