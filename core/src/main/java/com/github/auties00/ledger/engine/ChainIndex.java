@@ -321,10 +321,11 @@ final class ChainIndex {
     /// of one key's lookup overlap those of the others.
     ///
     /// A lookup in a large index is a chain of dependent loads that each miss the processor's caches: the tags of the
-    /// key's slot, the slot's chain, the chain, the bytes of its key. Lookups made one after another, between the work
-    /// done for each key, wait for each miss in turn; here each step of every lookup of the block runs in a loop of its
-    /// own, small enough that the processor issues the loads of the next lookups while the first miss is still in
-    /// flight, and the misses of the block cost about as much as those of one lookup.
+    /// key's slot, the slot's chain, the chain, and the bytes of its key if it is longer than [Chain#INLINE], since a
+    /// shorter one is in words of the chain's own. Lookups made one after another, between the work done for each key,
+    /// wait for each miss in turn; here each step of every lookup of the block runs in a loop of its own, small enough
+    /// that the processor issues the loads of the next lookups while the first miss is still in flight, and the misses
+    /// of the block cost about as much as those of one lookup.
     ///
     /// Each lookup reads its segment's table once, in the first step, and probes that table to the end, as [#get]
     /// probes the table it read: it answers what a lookup made at the first step would have, which may be a chain
@@ -506,11 +507,12 @@ final class ChainIndex {
             }
         }
 
-        /// Loads the first word of each candidate's key: the fourth miss.
+        /// Loads the first word of each candidate's key held out of its chain, longer than [Chain#INLINE]: the fourth
+        /// miss. A shorter key is in words of the chain's own, which the step before loaded.
         private void touchKeys() {
             for (var at = 0; at < count; at++) {
                 var chain = chains[at];
-                if (chain != null) {
+                if (chain != null && !chain.inlineKey()) {
                     keyWords[at] = chain.word(0);
                 }
             }
