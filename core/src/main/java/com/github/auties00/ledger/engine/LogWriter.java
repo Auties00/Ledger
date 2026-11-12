@@ -296,6 +296,10 @@ final class LogWriter {
     // The waits for a cohort that ended with all of it back and that ran out, for tests
     private volatile long cohortsGathered;
     private volatile long cohortsMissed;
+    // The rollovers and the ones that found the preparation of their segment unfinished, or none started, so that the
+    // flush ran or waited for it, for tests; written by the flush task only
+    private volatile long rollovers;
+    private volatile long unpreparedRollovers;
     // The emptied queue, which the next swap reuses
     private ArrayList<Queued> flushing;
     // Written by the flush task only
@@ -561,6 +565,10 @@ final class LogWriter {
     private void rollover() throws IOException {
         // Prepared here, with no thread of its own
         var preparation = next != null ? next : preparation();
+        rollovers++;
+        if (!preparation.isDone()) {
+            unpreparedRollovers++;
+        }
         // Runs it on this thread unless it started elsewhere, so a rollover never waits on a thread yet to start
         preparation.run();
         LogFiles.Prepared prepared;
@@ -1621,6 +1629,17 @@ final class LogWriter {
     /// {@return the waits for the commits a force woke that ran out, for tests}
     long cohortsMissed() {
         return cohortsMissed;
+    }
+
+    /// {@return the rollovers so far, for tests}
+    long rollovers() {
+        return rollovers;
+    }
+
+    /// {@return the rollovers that found the preparation of their segment unfinished or never made, and ran or waited
+    /// for it on the flush, for tests}
+    long unpreparedRollovers() {
+        return unpreparedRollovers;
     }
 
     /// Makes everything queued durable, then closes the segment.
