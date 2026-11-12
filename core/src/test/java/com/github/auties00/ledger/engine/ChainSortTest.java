@@ -40,7 +40,17 @@ class ChainSortTest {
                     return Arrays.copyOf(key, 41 + random.nextInt(9));
                 }),
                 Arguments.of("keys ending in runs of zero bytes", (Function<SplittableRandom, byte[]>) random ->
-                        new byte[random.nextInt(24)]));
+                        new byte[random.nextInt(24)]),
+                // Either side of the longest key a chain holds in its own words, so chains of both kinds tie and mix
+                Arguments.of("keys of 0 to 40 bytes sharing a prefix, ending in 0x00 or 0xFF bytes", (Function<SplittableRandom, byte[]>) random -> {
+                    var key = new byte[random.nextInt(41)];
+                    Arrays.fill(key, (byte) 'p');
+                    var tail = random.nextInt(4);
+                    for (var i = Math.max(0, key.length - tail); i < key.length; i++) {
+                        key[i] = random.nextBoolean() ? 0 : (byte) 0xFF;
+                    }
+                    return key;
+                }));
     }
 
     @ParameterizedTest(name = "{0}")

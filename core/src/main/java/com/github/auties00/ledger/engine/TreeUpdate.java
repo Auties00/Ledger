@@ -49,6 +49,9 @@ final class TreeUpdate {
     private final DeltaLeaves.Packer packer;
     // The first failure of a task of this update or of the updates of its subtrees, which all share it
     private final AtomicReference<Throwable> failure;
+    // Where the update copies the keys of the entries it writes whose chains hold them in words of their own: a view
+    // of a shared chunk costs a written key less than an array, a view and a memory session of its own
+    private final KeySlab keys;
 
     TreeUpdate(PageFile pages, PageFile.Writer writer, FreeSpace space) {
         this(pages, writer, space, new AtomicReference<>());
@@ -56,6 +59,7 @@ final class TreeUpdate {
 
     private TreeUpdate(PageFile pages, PageFile.Writer writer, FreeSpace space, AtomicReference<Throwable> failure) {
         this.failure = failure;
+        this.keys = new KeySlab();
         this.pages = pages;
         this.writer = writer;
         this.space = space;
@@ -93,11 +97,6 @@ final class TreeUpdate {
         /// Makes the state of `key` with `value`, or with none if `null`.
         Op(MemorySegment key, MemorySegment value) {
             this(new Chain(key, 0), value == null ? null : new Version(0, value, null, null), null);
-        }
-
-        /// {@return the key, a segment made for the call}
-        MemorySegment key() {
-            return keyed.key();
         }
 
         /// {@return the order of the key and `other`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
@@ -754,7 +753,7 @@ final class TreeUpdate {
     }
 
     private LeafEntry entry(Op op) throws IOException {
-        var key = op.key();
+        var key = keys.key(op.keyed());
         var value = op.value();
         var length = value.byteSize();
         var external = op.external();

@@ -86,8 +86,8 @@ final class ChainIndex {
 
     /// {@return the chain of the key of `hash` whose bytes are `key`, or `null` if the index holds none}
     ///
-    /// A lookup by an array, for a read: it makes a segment of `key` only for a chain whose tag and hash match, as the
-    /// lookup of a key memory does not hold finds none.
+    /// A lookup by an array, for a read: it compares `key` with a chain whose tag and hash match, in words for a chain
+    /// whose key is in its own words, and makes a segment of `key` only for one whose key is in a segment.
     Chain get(byte[] key, int hash) {
         var segment = (Segment) SEGMENT_SLOTS.getAcquire(segments, segmentOf(hash));
         if (segment == null) {
@@ -106,7 +106,7 @@ final class ChainIndex {
             if (held == tag) {
                 // Null while an insertion that wrote the tag has not published its chain, which this lookup need not see
                 var chain = (Chain) SLOTS.getAcquire(chains, slot);
-                if (chain != null && chain.hash == hash && chain != TOMBSTONE && chain.keyEquals(MemorySegment.ofArray(key))) {
+                if (chain != null && chain.hash == hash && chain != TOMBSTONE && chain.keyEquals(key)) {
                     return chain;
                 }
             }
