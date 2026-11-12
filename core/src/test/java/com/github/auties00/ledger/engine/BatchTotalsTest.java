@@ -243,13 +243,15 @@ class BatchTotalsTest {
                 }
                 var home = batch.home(i);
                 var length = batch.valueBytes(i);
+                // A resident byte array takes an array of its own from a smaller length than any other value
+                var ownFrom = batch.keyspace(i) == SESSIONS ? ArrayWriteBatch.RESIDENT_OWN_BYTES : ArrayWriteBatch.CHUNK_BYTES / 2;
                 if (batch.ownValue(i) != null) {
-                    assertTrue(length >= ArrayWriteBatch.CHUNK_BYTES / 2, "a value of " + length + " bytes on an array of its own");
-                    assertEquals(length, batch.ownValue(i).length, "a value of half a chunk or more shares its array");
+                    assertTrue(length >= ownFrom, "a value of " + length + " bytes on an array of its own");
+                    assertEquals(length, batch.ownValue(i).length, "a value with an array of its own shares it");
                     assertNull(home, "write " + i + " has a home besides its array");
                     continue;
                 }
-                assertTrue(length < ArrayWriteBatch.CHUNK_BYTES / 2, "a value of " + length + " bytes shares an array");
+                assertTrue(length < ownFrom, "a value of " + length + " bytes shares an array");
                 if (own) {
                     assertSame(batch.viewForTests(), home, "write " + i + " not on the batch's array");
                     assertEquals(batch.valueArrayOffset(i), batch.homeOffset(i));

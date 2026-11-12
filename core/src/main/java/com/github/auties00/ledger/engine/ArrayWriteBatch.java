@@ -25,6 +25,9 @@ import java.util.Objects;
 /// A value of half a [chunk][#CHUNK_BYTES] or more never enters that array: it takes an array of its own at the put,
 /// which is private to the batch, is never written again, and is what the file of large values seals and the store's
 /// version keeps, so the value is encoded once and copied by neither [#prepare(boolean, ValueSlab, Map)] nor the store.
+/// So does a byte array of [#RESIDENT_OWN_BYTES] or more put to a resident key space of byte arrays, whose version
+/// the store gives an array of its own in any case: cloned at the put, it is the one copy the store keeps, where on the
+/// batch's array it would be copied again by the store and leave the batch's bytes for the collector.
 ///
 /// A range removal stores its bounds, each encoded or absent; the store reads them back through the accessors of
 /// this class when it applies the batch, then starts it again with [#finish()].
@@ -49,6 +52,12 @@ public final class ArrayWriteBatch implements WriteBatch {
     private static final int OWN_BYTES = CHUNK_BYTES / 2;
     /// The bytes besides the values the store keeps that a batch may hold and still keep them on its own array.
     private static final int SLACK = 64;
+    /// The least bytes of a byte array put to a resident key space of byte arrays that takes an array of its own.
+    ///
+    /// Below it, what an array of its own costs besides the value, the read-only view the store reads it through
+    /// (about 100 bytes, against 40 for a slice of the batch's array) and the batch's array of those arrays, outweighs
+    /// the bytes it spares the batch's array.
+    static final int RESIDENT_OWN_BYTES = 2 * SLACK;
     /// The most writes of a batch whose values a [ValueSlab] takes, which fits the mask of the writes it took. A larger
     /// batch fills its own chunks in one go, and the slab's would come on top of what a history sync's batches take
     /// already.
@@ -115,7 +124,8 @@ public final class ArrayWriteBatch implements WriteBatch {
     // half of the first length is the length: in HOMES_CHUNKS, HOMES_SLAB and HOMES_PER_WRITE the high half is where
     // the write's value is in its home
     private long[] spans;
-    // The array of each value of OWN_BYTES or more, or null before the first
+    // The array of each value of OWN_BYTES or more, and of each resident byte array of RESIDENT_OWN_BYTES or more, or
+    // null before the first
     private byte[][] owns;
     // The bytes of the arrays in owns
     private long ownBytes;
@@ -166,7 +176,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         Objects.requireNonNull(value, "value");
         var keyLength = checkKeyLength(keyspace.keys().sizeOf(Objects.requireNonNull(key, "key")));
         var valueLength = checkValueLength(keyspace.values().sizeOf(value));
-        if (valueLength >= OWN_BYTES) {
+        if (valueLength >= OWN_BYTES || valueLength >= RESIDENT_OWN_BYTES && residentBytes(keyspace)) {
             checkRoom(valueLength);
             var own = encodeOwn(keyspace.values(), value, (int) valueLength);
             var ownKeyOffset = encodeKey(keyspace, key, keyLength);
@@ -191,7 +201,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         checkOpened(keyspace);
         var keyLength = checkKeyLength(key.byteSize());
         var valueLength = checkValueLength(value.byteSize());
-        if (valueLength >= OWN_BYTES) {
+        if (valueLength >= OWN_BYTES || valueLength >= RESIDENT_OWN_BYTES && residentBytes(keyspace)) {
             checkRoom(valueLength);
             var own = copyOwn(value);
             var ownKeyOffset = reserve(keyLength);
@@ -271,6 +281,12 @@ public final class ArrayWriteBatch implements WriteBatch {
         }
         keyspace.keys().encode(key, memory.asSlice(offset, length));
         return offset;
+    }
+
+    /// {@return whether `keyspace` is resident and of byte arrays, whose versions the store always gives an array of
+    /// their own: the test the store makes of a put's key space when it applies the put}
+    private static boolean residentBytes(Keyspace<?, ?> keyspace) {
+        return keyspace.values() == BuiltinCodecs.BYTES_VALUE && keyspace.residency() == Keyspace.Residency.RESIDENT;
     }
 
     private void checkOpened(Keyspace<?, ?> keyspace) {
@@ -390,8 +406,8 @@ public final class ArrayWriteBatch implements WriteBatch {
         return offset;
     }
 
-    /// Moves the encodings of the batch to a rope, rewriting the spans of its writes; only a put of a value below
-    /// [#OWN_BYTES] or a key comes here, so none has a span that outgrows a chunk.
+    /// Moves the encodings of the batch to a rope, rewriting the spans of its writes; a value on an array of its own
+    /// stays there, so only keys and values below [#OWN_BYTES] come here, and none has a span that outgrows a chunk.
     private void moveToRope() {
         chunks = new Chunk[8];
         chunkCount = 1;

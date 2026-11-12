@@ -811,7 +811,7 @@ public final class LiveLedger implements Ledger {
         keyspaceStates[index] = state;
         if (state.resident) {
             if (decoded != null && writes.kind(index) == ArrayWriteBatch.PUT) {
-                decoded[index] = residentValue(state, writes.decodedValue(index), writes.value(index));
+                decoded[index] = residentValue(state, writes, index);
             }
         } else if (found != null) {
             found[index] = TreeSearch.BLIND;
@@ -1285,8 +1285,22 @@ public final class LiveLedger implements Ledger {
         return segment == null ? null : MemorySegment.ofArray(Segments.toBytes(segment)).asReadOnly();
     }
 
+    /// {@return the decoded value of a put of `value` to the resident key space `state`: `decoded` if the put has it or
+    /// the key space is of byte arrays, whose versions the applier gives an array of the store's in place of any
+    /// decoded value, and `value` decoded otherwise}
     private static Object residentValue(KeyspaceState state, Object decoded, MemorySegment value) {
-        return decoded != null ? decoded : state.keyspace.values().decode(value);
+        return decoded != null || state.keyspace.values() == BuiltinCodecs.BYTES_VALUE
+                ? decoded
+                : state.keyspace.values().decode(value);
+    }
+
+    /// {@return the decoded value of write `index` of `writes`, a put to the resident key space `state`, as
+    /// [#residentValue(KeyspaceState, Object, MemorySegment)] gives it, reading the encoded value only to decode it}
+    private static Object residentValue(KeyspaceState state, ArrayWriteBatch writes, int index) {
+        var decoded = writes.decodedValue(index);
+        return decoded != null || state.keyspace.values() == BuiltinCodecs.BYTES_VALUE
+                ? decoded
+                : state.keyspace.values().decode(writes.value(index));
     }
 
     @Override

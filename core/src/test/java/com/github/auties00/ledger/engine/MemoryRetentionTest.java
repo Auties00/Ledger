@@ -70,8 +70,9 @@ class MemoryRetentionTest {
             ledger.valueSlab().forceColdForTests();
             ledger.commit(ledger.newBatch().put(SESSIONS, new byte[]{1}, new byte[1_500]).put(MESSAGES, new byte[]{1}, new byte[1_500]))
                     .awaitDurable();
-            // The session's bytes, which the store holds a copy of, are not kept for the message
-            assertEquals(1_500, head(ledger, MESSAGES, new byte[]{1}).sourceBytesForTests());
+            // The session's bytes, which the store holds a copy of, are not kept for the message: the session took an
+            // array of its own at the put, and the message keeps the batch's array, with the two keys beside it
+            assertEquals(1_502, head(ledger, MESSAGES, new byte[]{1}).sourceBytesForTests());
             ledger.commit(ledger.newBatch().put(MESSAGES, new byte[]{2}, new byte[1_500])).awaitDurable();
             assertEquals(1_501, head(ledger, MESSAGES, new byte[]{2}).sourceBytesForTests());
             var batch = ledger.newBatch().put(SESSIONS, new byte[]{3}, new byte[64]);
