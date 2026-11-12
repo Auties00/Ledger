@@ -25,8 +25,12 @@ import java.util.HashMap;
 /// rounds of reads made at once. What it reads ahead stays with the cursor until the cursor reaches it, and then goes
 /// to the cache as the cursor's own read would have, so the cache holds what it would have held without the reads
 /// ahead, and what the cursor never reaches goes with it. The leaves are opened as they arrive, as the blobs to read
-/// are found in them; the blobs stay sealed, in arrays of the store's pool, until the cursor opens the one it reaches,
-/// and [#release()] gives the arrays back, so a scan's reads ahead allocate about what its own reads would have:
+/// are found in them; the blobs stay sealed, in arrays of the store's pool, until the cursor opens the one it reaches.
+/// The array of a set of blobs read at once goes back to the pool once the cursor has opened all of them; that of the
+/// blobs of one leaf also once the cursor leaves the leaf, and that of a gather of leaves at the next one or at
+/// [#release()]. A cursor so holds the arrays of two sets of blobs at most, whatever the length of its scan, also when
+/// the cache holds its leaves and none of its blobs, as it does after a checkpoint. A scan's reads ahead allocate about
+/// what its own reads would have:
 /// arrays of their own for each unit read ahead, read into and opened into, would make 1,000 cold chat pages allocate
 /// 188 megabytes rather than 103, which the process keeps resident as heap until it collects. The reads ahead run on
 /// the calling thread and on threads it waits for, so none outlives the call that made it, and a unit they cannot read
@@ -44,7 +48,8 @@ final class TreeCursor {
     static final int GATHER_VALUES = 64;
     /// The most pages of a blob a gather reads: a longer read keeps the device busy on its own.
     static final int GATHER_VALUE_PAGES = 16;
-    /// The most pages of blobs a gather reads, which bounds what a cursor holds read ahead to a megabyte.
+    /// The most pages of blobs a gather reads, a megabyte; a cursor holds the blobs of two gathers at most, its last
+    /// gather of leaves and the gather of its current leaf.
     static final int GATHER_PAGES = 256;
 
     private final PageFile pages;
@@ -71,10 +76,18 @@ final class TreeCursor {
     // The leaves read ahead that the cursor has not used yet, opened into an array of `held`, by reference; null
     // before the first gather
     private HashMap<PageRef, Opened> gathered;
-    // The blobs read ahead that the cursor has not used yet, sealed in an array of `held`, by reference
+    // The blobs read ahead that the cursor has not used yet, sealed in the array of `aheadValues` or `leafValues`, by
+    // reference
     private HashMap<PageRef, Sealed> sealedValues;
-    // The arrays of the store's pool that the leaves and blobs read ahead lie in, until the cursor gives them back
+    // The arrays of the store's pool that the leaves read ahead lie in, until the cursor gives them back
     private ArrayList<byte[]> held;
+    // The blobs the last gather of leaves read, or null once none of them is left
+    private Values aheadValues;
+    // The blobs of the current leaf that its gather read, or null once none of them is left, and the references it
+    // read them for
+    private Values leafValues;
+    private PageRef[] leafRefs;
+    private int leafRefCount;
     // Whether the blobs of the current leaf were gathered, which happens once a leaf
     private boolean leafGathered;
     // The entries a gather still reads values for, and the pages of blobs it still reads, as it collects them
@@ -269,6 +282,9 @@ final class TreeCursor {
             return pages.node(parent, index);
         }
         leafGathered = false;
+        if (leafValues != null) {
+            dropLeafValues();
+        }
         var admit = admit();
         var hit = pages.cachedNode(parent, index);
         if (hit != null) {
@@ -326,7 +342,55 @@ final class TreeCursor {
             return null;
         }
         var sealed = sealedValues.remove(ref);
-        return sealed == null ? null : pages.openPrefetched(ref, PageFormat.VALUE, sealed.array(), sealed.offset());
+        if (sealed == null) {
+            return null;
+        }
+        var values = sealed.values();
+        var plain = pages.openPrefetched(ref, PageFormat.VALUE, values.array, sealed.offset());
+        if (--values.left == 0) {
+            // None of its blobs is left to open
+            pages.releasePrefetched(values.array);
+            if (values == aheadValues) {
+                aheadValues = null;
+            } else {
+                leafValues = null;
+                leafRefs = null;
+                leafRefCount = 0;
+            }
+        }
+        return plain;
+    }
+
+    /// Forgets the blobs of the current leaf that its gather read and the cursor has not used, as the cursor leaves the
+    /// leaf and never comes back to it, and gives back the array they lie in.
+    private void dropLeafValues() {
+        for (var i = 0; i < leafRefCount; i++) {
+            var sealed = sealedValues.get(leafRefs[i]);
+            if (sealed != null && sealed.values() == leafValues) {
+                sealedValues.remove(leafRefs[i]);
+            }
+        }
+        pages.releasePrefetched(leafValues.array);
+        leafValues = null;
+        leafRefs = null;
+        leafRefCount = 0;
+    }
+
+    /// {@return the bytes of the arrays of the store's pool that hold what the cursor read ahead; for tests}
+    long heldBytesForTests() {
+        var bytes = 0L;
+        if (held != null) {
+            for (var array : held) {
+                bytes += array.length;
+            }
+        }
+        if (aheadValues != null) {
+            bytes += aheadValues.array.length;
+        }
+        if (leafValues != null) {
+            bytes += leafValues.array.length;
+        }
+        return bytes;
     }
 
     /// Forgets what the cursor read ahead and has not used, and gives back the arrays it lies in.
@@ -343,6 +407,16 @@ final class TreeCursor {
         held.clear();
         gathered.clear();
         sealedValues.clear();
+        if (aheadValues != null) {
+            pages.releasePrefetched(aheadValues.array);
+            aheadValues = null;
+        }
+        if (leafValues != null) {
+            pages.releasePrefetched(leafValues.array);
+            leafValues = null;
+        }
+        leafRefs = null;
+        leafRefCount = 0;
     }
 
     /// Reads ahead child `index` of the branch `parent` of the leaves, which `ref` names and neither the cache nor the
@@ -412,7 +486,7 @@ final class TreeCursor {
                 count = collectValues(unit, first(unit), values, count);
             }
         }
-        prefetchValues(values, count);
+        aheadValues = prefetchValues(values, count);
     }
 
     /// Reads ahead the blobs of the values in the range that the current leaf holds from the current entry on, which
@@ -421,12 +495,19 @@ final class TreeCursor {
         leafGathered = true;
         if (held == null) {
             letGo();
+        } else if (leafValues != null) {
+            dropLeafValues();
         }
         // The current entry is counted already, and is the one the cursor needs
         budget = stepped <= wanted ? wanted - stepped + 1 : Long.MAX_VALUE;
         pagesLeft = GATHER_PAGES;
         var values = new PageRef[GATHER_VALUES];
-        prefetchValues(values, collectValues(leaf, index, values, 0));
+        var count = collectValues(leaf, index, values, 0);
+        leafValues = prefetchValues(values, count);
+        if (leafValues != null) {
+            leafRefs = values;
+            leafRefCount = count;
+        }
     }
 
     /// Adds to `values`, from `count` on, the blobs of the data file of the entries of leaf `unit` from `index` on, in
@@ -462,22 +543,40 @@ final class TreeCursor {
 
     /// Reads the first `count` blobs of `values` at once, and keeps those it could read, sealed, until the cursor uses
     /// them.
-    private void prefetchValues(PageRef[] values, int count) {
+    ///
+    /// @return the blobs read, or `null` if it could read none, whose array it then gave back
+    private Values prefetchValues(PageRef[] values, int count) {
         if (count == 0) {
-            return;
+            return null;
         }
         var offsets = new int[count];
         var sealed = pages.prefetch(values, count, offsets);
-        held.add(sealed);
+        var read = new Values(sealed);
         for (var i = 0; i < count; i++) {
             if (offsets[i] >= 0) {
-                sealedValues.put(values[i], new Sealed(sealed, offsets[i]));
+                sealedValues.put(values[i], new Sealed(read, offsets[i]));
+                read.left++;
             }
+        }
+        if (read.left == 0) {
+            pages.releasePrefetched(sealed);
+            return null;
+        }
+        return read;
+    }
+
+    /// Blobs read ahead at once, sealed in `array`, of the store's pool, of which `left` are not used yet.
+    private static final class Values {
+        final byte[] array;
+        int left;
+
+        Values(byte[] array) {
+            this.array = array;
         }
     }
 
-    /// A blob read ahead, sealed at `offset` of `array`.
-    private record Sealed(byte[] array, int offset) {
+    /// A blob read ahead, sealed at `offset` of the array of `values`.
+    private record Sealed(Values values, int offset) {
     }
 
     /// A leaf read ahead, opened into `array`, whose first `length` bytes the cache keeps.
