@@ -945,7 +945,8 @@ final class KeyspaceState {
 
     /// The chains of a range in memory, one at a time, in the order of a scan.
     ///
-    /// A walk along the links steps from a chain to the one it links ([Chain#below()]). As an iterator of the map does,
+    /// A walk along the links steps from a chain to the one it links ([Chain#below()]), which is always [Chain#BOTTOM]
+    /// or a chain of a lower key, so the walk takes it without comparing the two keys. As an iterator of the map does,
     /// it returns every chain the map held when it started that does not leave meanwhile, and may miss the chains that
     /// enter during the walk: those belong to commits after its reader's point, or replace dropped chains whose versions
     /// the reader's tree holds. It may return chains that left the map, emptied, whose keys the reader reads from the
@@ -955,7 +956,7 @@ final class KeyspaceState {
         private static final int FIRST_COPIES = 8 * Chain.INLINE;
         /// The bytes of a walk's arrays of key copies, at most.
         private static final int LAST_COPIES = 4_096;
-        // The map the walk asks for the chain below one whose link does not lead down; null when it iterates it
+        // The map the walk asks for the chain below one with no link; null when it iterates it
         private final ConcurrentSkipListMap<MemorySegment, Chain> entries;
         // The map's entries, or null when the walk steps along the links
         private final Iterator<Map.Entry<MemorySegment, Chain>> iterator;
@@ -1018,14 +1019,15 @@ final class KeyspaceState {
                 return false;
             }
             var below = chain.below();
-            // A chain not linked yet, one that left whose link a repair cleared, or, which no write makes, a link that
-            // does not lead down: the map gives the chain below, so the walk neither misses an entry nor returns one twice
+            // A chain not linked yet, or one that left whose link a repair cleared: the map gives the chain below, so
+            // the walk neither misses an entry nor returns one twice
             MemorySegment belowKey = null;
-            if (below == null || below != Chain.BOTTOM && Chain.compareKeys(below, chain) >= 0) {
+            if (below == null) {
                 var lower = entries.lowerEntry(key());
                 below = lower == null ? Chain.BOTTOM : lower.getValue();
                 belowKey = lower == null ? null : lower.getKey();
             }
+            assert below == Chain.BOTTOM || Chain.compareKeys(below, chain) < 0 : "A link leads up";
             if (below == Chain.BOTTOM || from != null && below.compareKey(from) < 0) {
                 chain = null;
                 key = null;

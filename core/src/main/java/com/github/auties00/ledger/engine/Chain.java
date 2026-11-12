@@ -292,7 +292,11 @@ sealed class Chain permits Chain.Inline8 {
 
     /// Links `chain`, [#BOTTOM] for none or `null` to clear the link, as the one below this chain in the ordered map,
     /// with a release store, which publishes the link of `chain` to the readers that load this one after.
+    ///
+    /// A chain linked has a lower key than this one, which a walk down the links ([KeyspaceState.Walk]) trusts without
+    /// comparing them.
     void linkBelow(Chain chain) {
+        assert chain == null || chain == BOTTOM || compareKeys(chain, this) < 0 : "A link leads up";
         LINK.setRelease(this, chain);
     }
 
