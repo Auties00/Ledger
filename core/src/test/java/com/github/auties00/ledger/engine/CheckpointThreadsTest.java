@@ -53,11 +53,11 @@ class CheckpointThreadsTest {
         ledger.commit(batch).awaitDurable();
     }
 
-    @ParameterizedTest(name = "{0} keys, every {1}, the values {2} long or more")
-    @CsvSource({"30000, 1, 900", "30000, 1, 40", "120000, 3, 40"})
+    @ParameterizedTest(name = "{0} keys, every {1}, the values {2} long or more, write {3} failing")
+    @CsvSource({"30000, 1, 900, 3", "30000, 1, 40, 3", "120000, 3, 40, 3", "30000, 1, 900, 40", "120000, 3, 40, 40"})
     @Timeout(300)
-    @DisplayName("a checkpoint that fails a write while it rewrites its trees in parallel has stopped every task when it throws, and the retry leaves every page used or free and every key readable")
-    void failedWrite(int count, int step, int length) throws Exception {
+    @DisplayName("a checkpoint that fails a write while it rewrites its trees in parallel, as other tasks read the units of the batch that failed, fails with an I/O failure, has stopped every task when it throws, and the retry leaves every page used or free and every key readable")
+    void failedWrite(int count, int step, int length, int failing) throws Exception {
         var disk = CrashFileSystem.create();
         var writes = new AtomicInteger();
         var failAfter = new AtomicInteger(Integer.MAX_VALUE);
@@ -77,8 +77,9 @@ class CheckpointThreadsTest {
             write(ledger, count, 1, before);
             ledger.checkpoint();
             write(ledger, count, step, after);
-            // The third write: the first flush happens with the update under way, once 8 MiB are queued
-            failAfter.set(3);
+            // The third write is in the first batch, which fills with the update under way once 4 MiB are queued; the
+            // fortieth in a later one
+            failAfter.set(failing);
             assertThrows(LedgerIoException.class, ledger::checkpoint);
             var atFailure = writes.get();
             // A task left running reaches its next flush within this

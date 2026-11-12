@@ -13,27 +13,38 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 
 /// The data file of a store: its units, read through the page cache and verified against the reference that named
 /// them, and the superblocks.
 ///
 /// Reads run on the calling thread, each on a channel of its own from a small pool: Windows serializes positional
-/// reads on one channel, and an interrupt during a read closes the channel it ran on, which then is replaced. Writes run
-/// on the one thread that writes a checkpoint, through a [Writer].
+/// reads on one channel, and an interrupt during a read closes the channel it ran on, which then is replaced. Writes are
+/// those of a checkpoint, through a [Writer], which writes one batch of units at a time.
 final class PageFile implements AutoCloseable {
     static final String FILE = "ledger.data";
     /// The channels reads take turns on, and the most threads [#readAll(List, byte, int)] reads on.
     static final int READ_CHANNELS = 8;
     /// The most pages [#readAll(List, byte, int)] reads with one call.
     static final int RUN_PAGES = 64;
-    private static final int STAGED_LIMIT = 8 << 20;
+    // The queued bytes that make a batch, which a write seals and writes outside the writer's lock while the next ones
+    // queue. A batch in flight holds this and the unit that passes it at most, and the writes that queue behind it wait
+    // once the queue holds twice this, each with its unit queued: about three times this of plaintext the writer keeps
+    // from the cache's evictions, plus one unit per writing task, and the sealed arrays of one window
+    private static final int STAGED_LIMIT = 4 << 20;
     // The staged bytes a flush seals before it writes them, which bounds the sealed arrays it holds at once
     private static final long SEAL_WINDOW = 1 << 20;
+    // The most bytes of one write of consecutive units, which the JDK copies into a direct buffer it keeps for the
+    // thread, any task of a checkpoint that fills a batch
+    private static final int RUN_BYTES = 256 << 10;
     // The bytes a checkpoint writes from which it forces them beside its work, as the device takes them, instead of
     // all at once before its superblock: forced at the end, the writes of a checkpoint that rewrites hundreds of
     // megabytes kept the device idle while it built them, then made it wait seconds for them
@@ -481,27 +492,44 @@ final class PageFile implements AutoCloseable {
         }
     }
 
-    /// Writes the units of one checkpoint: it queues them, then seals and writes them in order of their pages,
-    /// coalescing consecutive ones into one call.
+    /// Writes the units of one checkpoint: it queues them, then seals and writes them in batches, in order of their
+    /// pages, each run of consecutive pages with one call.
     ///
     /// Each unit gets the next nonce of the checkpoint: the checkpoint's random first 8 bytes and a counter. A queued
-    /// unit is read back through [#staged(PageRef)], since the file does not hold it yet.
+    /// unit is read back through [#staged(PageRef)] until the file holds it.
     ///
-    /// It is safe for concurrent use, as the tasks of a checkpoint that rewrites its trees in parallel use it; a flush
-    /// seals its units on every processor.
+    /// It is safe for concurrent use, as the tasks of a checkpoint that rewrites its trees in parallel use it. The
+    /// write that fills a batch seals it, on every processor, and writes it outside the writer's lock, while the other
+    /// tasks queue the next one: one batch is written at a time, and a write that queues a second batch's worth behind
+    /// the one being written waits for it. A batch that fails to be written stays readable through
+    /// [#staged(PageRef)] until [#discard()], and every later write and flush fails with its failure.
     final class Writer {
         /// The queued units from which a flush seals them on every processor.
         private static final int PARALLEL_SEALS = 16;
 
         private final Object lock;
         private final long nonceHigh;
-        private int nonceLow;
-        private final TreeMap<Integer, Staged> staged;
+        // The last 4 bytes of the next nonce; -1 once every one was given
+        private final AtomicInteger nonceLow;
+        // The units queued for the next batch, by page; guarded by lock
+        private TreeMap<Integer, Staged> staged;
         private long stagedBytes;
+        // The batch being written, or the one whose write failed, by page, or none; replaced and never changed while it
+        // is written, as the thread writing it reads it without the lock; guarded by lock
+        private Map<Integer, Staged> inFlight;
+        private long inFlightBytes;
+        // Whether a thread writes the batch in inFlight; guarded by lock
+        private boolean flushing;
+        // The failure of a batch or of a force beside the checkpoint, which every later write and flush throws; guarded
+        // by lock
+        private Throwable failure;
+        // Whether the checkpoint failed and gave its units back; guarded by lock
+        private boolean discarded;
+        // The bytes the file holds; guarded by lock
         private long written;
-        // The bytes written when the last force beside the checkpoint started
+        // The bytes written when the last force beside the checkpoint started; guarded by lock
         private long forcedUpTo;
-        // The force beside the checkpoint, running or done, or null
+        // The force beside the checkpoint, running or done, or null; guarded by lock
         private FutureTask<Void> forcing;
         // Whether the commits wait for the checkpoint, which only then forces beside its work
         private final BooleanSupplier lagging;
@@ -509,7 +537,9 @@ final class PageFile implements AutoCloseable {
         private Writer(long nonceHigh, BooleanSupplier lagging) {
             this.lock = new Object();
             this.nonceHigh = nonceHigh;
+            this.nonceLow = new AtomicInteger();
             this.staged = new TreeMap<>();
+            this.inFlight = Map.of();
             this.lagging = lagging;
         }
 
@@ -518,10 +548,13 @@ final class PageFile implements AutoCloseable {
         /// `unit` may end with its content, or anywhere up to the end of the unit: the unit is sealed as if zeros
         /// followed it. The writer, and the page cache if `cached`, own `unit` from now on.
         ///
+        /// It writes the batch the unit fills, and waits for the batch being written if a second one queued behind it.
+        ///
         /// @param length the bytes of content
         /// @return the reference of the unit
         /// @throws IllegalArgumentException if `unit` ends before its content or past the unit, or the content does not
         ///                                  fit in the unit
+        /// @throws IOException if a batch of this checkpoint could not be written, by this call or an earlier one
         PageRef write(byte kind, int level, int page, int pages, byte[] unit, int length, boolean cached) throws IOException {
             return write(kind, level, page, pages, unit, length, cached, nextNonce());
         }
@@ -537,29 +570,56 @@ final class PageFile implements AutoCloseable {
             }
             var ref = new PageRef(page, pages, nonceHigh, nonce);
             header(unit, kind, level, page, pages, length, ref.nonceHigh(), ref.nonceLow());
+            boolean fills;
+            boolean full;
             synchronized (lock) {
-                if (staged.put(page, new Staged(ref, unit)) != null) {
+                checkWritable();
+                // In either map, as one map held both before a flush wrote them
+                if (inFlight.containsKey(page) || staged.putIfAbsent(page, new Staged(ref, unit)) != null) {
                     throw new IllegalStateException("A checkpoint wrote page " + page + " twice");
                 }
                 stagedBytes += (long) pages * PageFormat.SIZE;
-                if (stagedBytes >= STAGED_LIMIT) {
-                    flush();
-                }
+                fills = !flushing && stagedBytes >= STAGED_LIMIT;
+                full = flushing && stagedBytes >= 2L * STAGED_LIMIT;
             }
             // Outside the writer's lock: the tasks of a checkpoint all pass through it, for every unit they read too,
-            // so one waiting for the cache's lock, or rebuilding its table or evicting, would hold up the others
+            // so one waiting for the cache's lock, or rebuilding its table or evicting, would hold up the others.
+            // Before the batch is taken: a batch in flight is written only by the thread that took it, so a failure
+            // of the cache, such as an OutOfMemoryError of a rebuild of its table, between the two would leave it unwritten
+            // and every thread waiting for its end waiting for good; the unit is queued, and the next write or flush
+            // takes it
             if (cached) {
                 cache.put(ref, unit, false);
             } else {
                 cache.remove(page);
             }
+            if (!fills && !full) {
+                return ref;
+            }
+            if (full) {
+                await(() -> flushing && stagedBytes >= 2L * STAGED_LIMIT && failure == null && !discarded);
+            }
+            Map<Integer, Staged> batch;
+            synchronized (lock) {
+                checkWritable();
+                batch = takeBatch();
+            }
+            writeBatches(batch);
             return ref;
         }
 
         /// {@return the plaintext of the queued unit `ref` names, or `null` if it is not queued}
+        ///
+        /// A unit of another checkpoint is never queued here, which it tells without the lock.
         byte[] staged(PageRef ref) {
+            if (ref.nonceHigh() != nonceHigh) {
+                return null;
+            }
             synchronized (lock) {
                 var entry = staged.get(ref.page());
+                if (entry == null) {
+                    entry = inFlight.get(ref.page());
+                }
                 return entry != null && entry.ref().equals(ref) ? entry.unit() : null;
             }
         }
@@ -571,28 +631,159 @@ final class PageFile implements AutoCloseable {
 
         /// {@return the next nonce, for a unit written outside this writer or whose reference is needed before it is
         /// queued}
+        ///
+        /// @throws IllegalStateException if every nonce was given
         int nextNonce() {
-            synchronized (lock) {
-                if (nonceLow == -1) {
+            while (true) {
+                var value = nonceLow.get();
+                // Never past -1, which would wrap to the first nonce
+                if (value == -1) {
                     throw new IllegalStateException("A checkpoint ran out of nonces");
                 }
-                return nonceLow++;
+                if (nonceLow.compareAndSet(value, value + 1)) {
+                    return value;
+                }
             }
         }
 
-        /// Seals and writes every queued unit.
+        /// Seals and writes every queued unit, after the batch being written, if any.
         ///
         /// The units leave the queue once they are written, so a read of one meanwhile still finds it there.
+        ///
+        /// @throws IOException if a batch of this checkpoint could not be written, by this call or an earlier one
         void flush() throws IOException {
-            synchronized (lock) {
-                flushQueued();
+            while (true) {
+                await(() -> flushing);
+                Map<Integer, Staged> batch;
+                synchronized (lock) {
+                    if (flushing) {
+                        continue;
+                    }
+                    checkWritable();
+                    if (staged.isEmpty()) {
+                        return;
+                    }
+                    batch = swap();
+                }
+                writeBatches(batch);
             }
         }
 
-        private void flushQueued() throws IOException {
-            var entries = new ArrayList<>(staged.values());
-            // A window at a time: sealing all the staged units before writing any left the pool holding a whole flush
-            // of sealed arrays, 8 MiB, from one checkpoint to the next
+        /// {@return a batch of the queued units to write, now in flight, if they fill one and none is in flight}
+        ///
+        /// Holding the lock.
+        private Map<Integer, Staged> takeBatch() {
+            return flushing || failure != null || discarded || stagedBytes < STAGED_LIMIT ? null : swap();
+        }
+
+        /// {@return the queued units of the lowest pages, [#STAGED_LIMIT] bytes of them and the unit that passes it, or
+        /// all of them if fewer, as the batch to write, now in flight}
+        ///
+        /// Holding the lock, with no batch in flight. The others stay queued: the writes that queue a second batch
+        /// behind the one in flight go on until the queue holds two, so taking all of them would make a batch of twice
+        /// the limit, with two more queued behind it.
+        private Map<Integer, Staged> swap() {
+            // Nothing changes before the allocations, which may fail
+            SortedMap<Integer, Staged> batch = staged;
+            var rest = new TreeMap<Integer, Staged>();
+            var bytes = stagedBytes;
+            if (bytes > STAGED_LIMIT) {
+                var taken = 0L;
+                for (var entry : staged.entrySet()) {
+                    if (taken >= STAGED_LIMIT) {
+                        // The view is never changed, as the queue that backs it is replaced
+                        batch = staged.headMap(entry.getKey());
+                        rest = new TreeMap<>(staged.tailMap(entry.getKey()));
+                        bytes = taken;
+                        break;
+                    }
+                    taken += (long) entry.getValue().ref().pages() * PageFormat.SIZE;
+                }
+            }
+            inFlight = batch;
+            inFlightBytes = bytes;
+            staged = rest;
+            stagedBytes -= bytes;
+            flushing = true;
+            return batch;
+        }
+
+        /// Throws the failure of this checkpoint's writer, if any; holding the lock.
+        ///
+        /// @throws IOException if a batch or a force beside the checkpoint failed with one
+        /// @throws IllegalStateException if one failed otherwise, or the checkpoint was abandoned: no task of a
+        ///                               checkpoint writes after it gave back its pages
+        private void checkWritable() throws IOException {
+            switch (failure) {
+                case null -> {
+                }
+                case IOException exception -> throw new IOException("A write of this checkpoint failed", exception);
+                default -> throw new IllegalStateException("A write of this checkpoint failed", failure);
+            }
+            if (discarded) {
+                throw new IllegalStateException("A checkpoint wrote a unit after it was abandoned");
+            }
+        }
+
+        /// Writes `batch`, then each batch that filled while it was written, while this thread is the one to.
+        private void writeBatches(Map<Integer, Staged> batch) throws IOException {
+            while (batch != null) {
+                batch = writeBatch(batch);
+            }
+        }
+
+        /// Seals and writes `batch`, the one in flight, in order of its pages, then records how that ended: written, or
+        /// a failure that leaves it in flight, where reads still find its units, which then are in no other place they
+        /// authenticate.
+        ///
+        /// @return the next batch, now in flight, that this thread is to write, or `null`
+        private Map<Integer, Staged> writeBatch(Map<Integer, Staged> batch) throws IOException {
+            Throwable thrown = null;
+            try {
+                writeUnits(new ArrayList<>(batch.values()));
+            } catch (Throwable throwable) {
+                thrown = throwable;
+            }
+            Map<Integer, Staged> next = null;
+            synchronized (lock) {
+                try {
+                    flushing = false;
+                    if (thrown == null) {
+                        written += inFlightBytes;
+                        inFlight = Map.of();
+                        inFlightBytes = 0;
+                        try {
+                            forceBeside();
+                        } catch (Throwable force) {
+                            thrown = force;
+                        }
+                    }
+                    if (thrown == null) {
+                        next = takeBatch();
+                    } else if (failure == null) {
+                        failure = thrown;
+                    }
+                } finally {
+                    // The writes waiting for this batch, and a flush or a discard
+                    lock.notifyAll();
+                }
+            }
+            switch (thrown) {
+                case null -> {
+                    return next;
+                }
+                case IOException exception -> throw exception;
+                case RuntimeException exception -> throw exception;
+                case Error error -> throw error;
+                default -> throw new IllegalStateException(thrown);
+            }
+        }
+
+        /// Seals and writes `entries`, in the order of their pages, a window at a time.
+        ///
+        /// Sealing all the units of a batch before writing any left the pool holding a whole batch of sealed arrays from
+        /// one checkpoint to the next; a window's units seal into one array.
+        private void writeUnits(List<Staged> entries) throws IOException {
             for (var from = 0; from < entries.size(); ) {
                 var to = from;
                 var bytes = 0L;
@@ -600,72 +791,66 @@ final class PageFile implements AutoCloseable {
                     bytes += (long) entries.get(to).ref().pages() * PageFormat.SIZE;
                     to++;
                 }
-                flushWindow(entries.subList(from, to));
+                writeWindow(entries.subList(from, to), (int) bytes);
                 from = to;
             }
-            written += stagedBytes;
-            staged.clear();
-            stagedBytes = 0;
-            forceBeside();
         }
 
-        /// Seals and writes the staged units of `entries`, in the order of their pages.
-        private void flushWindow(List<Staged> entries) throws IOException {
-            var run = new ArrayList<ByteBuffer>();
-            var sealedUnits = new byte[entries.size()][];
-            var runStart = -1L;
-            var runEnd = -1L;
+        /// Seals the units of `entries`, `bytes` in all, one after the other into an array of the pool, on every
+        /// processor from [#PARALLEL_SEALS] units, and writes each run of them on consecutive pages with one call of at
+        /// most [#RUN_BYTES].
+        ///
+        /// The caller waits for the seals, so they run on virtual threads and never in the common pool, where the tasks
+        /// of a parallel update wait for this writer: a split of a seal forked to the deque of a worker parked on a
+        /// join, after the caller last looked there or above a task only a free worker can take from its base, would
+        /// never run, and the checkpoint with it. It waits for the units and not for the threads ([ClaimedIndexes]):
+        /// an application's virtual threads may hold every carrier for as long as they compute.
+        private void writeWindow(List<Staged> entries, int bytes) throws IOException {
+            var count = entries.size();
+            var offsets = new int[count + 1];
+            for (var i = 0; i < count; i++) {
+                offsets[i + 1] = offsets[i] + entries.get(i).ref().pages() * PageFormat.SIZE;
+            }
+            var sealed = pool.acquire(bytes);
             try {
-                seal(entries, sealedUnits);
-                for (var index = 0; index < entries.size(); index++) {
-                    var entry = entries.get(index);
-                    var length = entry.ref().pages() * PageFormat.SIZE;
-                    var sealed = sealedUnits[index];
-                    var start = PageFormat.offset(entry.ref().page());
-                    if (start != runEnd && !run.isEmpty()) {
-                        writeRun(run, runStart);
-                        run.clear();
+                var helpers = count < PARALLEL_SEALS ? 0 : Runtime.getRuntime().availableProcessors() - 1;
+                ClaimedIndexes.run("ledger-seal", count, helpers, i -> {
+                    var entry = entries.get(i);
+                    cipher.seal(entry.unit(), entry.ref().pages(), sealed, offsets[i]);
+                });
+                var first = 0;
+                var runStart = PageFormat.offset(entries.getFirst().ref().page());
+                for (var i = 1; i <= count; i++) {
+                    var runLength = offsets[i] - offsets[first];
+                    if (i == count || PageFormat.offset(entries.get(i).ref().page()) != runStart + runLength
+                            || offsets[i + 1] - offsets[first] > RUN_BYTES) {
+                        writeRun(sealed, offsets[first], runLength, runStart);
+                        if (i < count) {
+                            first = i;
+                            runStart = PageFormat.offset(entries.get(i).ref().page());
+                        }
                     }
-                    if (run.isEmpty()) {
-                        runStart = start;
-                    }
-                    run.add(ByteBuffer.wrap(sealed, 0, length));
-                    runEnd = start + length;
-                }
-                if (!run.isEmpty()) {
-                    writeRun(run, runStart);
                 }
             } finally {
-                for (var sealed : sealedUnits) {
-                    if (sealed != null) {
-                        pool.release(sealed);
-                    }
-                }
+                pool.release(sealed);
             }
         }
 
-        /// Seals the staged units of `entries` into arrays of the pool, in `sealedUnits` by index, on every processor
-        /// from [#PARALLEL_SEALS] units; `sealedUnits` holds those it sealed if it throws.
+        /// Writes the `length` bytes of `sealed` at `offset` to the file at `position`, with one call unless the system
+        /// takes fewer.
         ///
-        /// The caller holds the lock and waits for the seals, so they run on virtual threads and never in the common
-        /// pool, where the tasks of a parallel update wait for this same lock: a split of a seal forked to the deque of a
-        /// worker parked on a join, after the caller last looked there or above a task only a free worker can take from
-        /// its base, would never run, and the checkpoint with it.
-        ///
-        /// It waits for the units and not for the threads ([ClaimedIndexes]): an application's virtual threads may hold
-        /// every carrier for as long as they compute.
-        private void seal(List<Staged> entries, byte[][] sealedUnits) {
-            var helpers = entries.size() < PARALLEL_SEALS ? 0 : Runtime.getRuntime().availableProcessors() - 1;
-            ClaimedIndexes.run("ledger-seal", entries.size(), helpers, i -> {
-                var entry = entries.get(i);
-                var sealed = pool.acquire(entry.ref().pages() * PageFormat.SIZE);
-                sealedUnits[i] = sealed;
-                cipher.seal(entry.unit(), entry.ref().pages(), sealed, 0);
-            });
+        /// One buffer and not one per unit: Windows writes a gathering write's buffers one call at a time, and the
+        /// JDK copies each heap buffer it writes into a direct one of its size.
+        private void writeRun(byte[] sealed, int offset, int length, long position) throws IOException {
+            var buffer = ByteBuffer.wrap(sealed, offset, length);
+            while (buffer.hasRemaining()) {
+                writer.write(buffer, position + (buffer.position() - offset));
+            }
         }
 
         /// Starts forcing what the checkpoint wrote so far, beside its work, once it wrote [#FORCE_EVERY] bytes since
         /// the last force started and that one is done, while the checkpoint lags; throws the failure of that one.
+        /// Holding the lock.
         ///
         /// A checkpoint the commits do not wait for forces at its end only: forcing beside it made the device take
         /// its writes while the commits' log writes queued behind them, which cost an ingest of a history a tenth of
@@ -721,27 +906,39 @@ final class PageFile implements AutoCloseable {
             }
         }
 
-        private void writeRun(ArrayList<ByteBuffer> run, long position) throws IOException {
-            var buffers = run.toArray(ByteBuffer[]::new);
-            var remaining = 0L;
-            for (var buffer : buffers) {
-                remaining += buffer.remaining();
+        /// Waits, keeping the interrupt status, while `waiting` holds, which is read holding the lock and changes only
+        /// where the lock is notified.
+        ///
+        /// A task of the common pool waits as a managed blocker, so the pool may run another task meanwhile. The wait
+        /// is never interrupted: the batch it waits for always ends, whether it is written or fails.
+        private void await(BooleanSupplier waiting) {
+            var blocker = new Blocker(waiting);
+            try {
+                ForkJoinPool.managedBlock(blocker);
+            } catch (InterruptedException _) {
+                blocker.interrupted = true;
             }
-            writer.position(position);
-            while (remaining > 0) {
-                remaining -= writer.write(buffers);
+            if (blocker.interrupted) {
+                Thread.currentThread().interrupt();
             }
         }
 
         /// {@return the bytes written or queued so far}
         long written() {
             synchronized (lock) {
-                return written + stagedBytes;
+                return written + inFlightBytes + stagedBytes;
             }
         }
 
-        /// Drops every queued unit, for a checkpoint that failed.
+        /// Drops every queued unit, for a checkpoint that failed, once the batch being written, if any, ended; any write
+        /// after it throws.
         void discard() {
+            synchronized (lock) {
+                discarded = true;
+                lock.notifyAll();
+            }
+            // Before the force: the end of the batch may start one
+            await(() -> flushing);
             try {
                 awaitForce();
             } catch (IOException _) {
@@ -751,8 +948,45 @@ final class PageFile implements AutoCloseable {
                 for (var entry : staged.values()) {
                     cache.remove(entry.ref().page());
                 }
-                staged.clear();
+                for (var entry : inFlight.values()) {
+                    cache.remove(entry.ref().page());
+                }
+                staged = new TreeMap<>();
                 stagedBytes = 0;
+                inFlight = Map.of();
+                inFlightBytes = 0;
+            }
+        }
+
+        /// A wait on the writer's lock while a condition holds.
+        private final class Blocker implements ForkJoinPool.ManagedBlocker {
+            private final BooleanSupplier waiting;
+            // Whether an interrupt came during the wait
+            private boolean interrupted;
+
+            private Blocker(BooleanSupplier waiting) {
+                this.waiting = waiting;
+            }
+
+            @Override
+            public boolean block() {
+                synchronized (lock) {
+                    while (waiting.getAsBoolean()) {
+                        try {
+                            lock.wait();
+                        } catch (InterruptedException _) {
+                            interrupted = true;
+                        }
+                    }
+                }
+                return true;
+            }
+
+            @Override
+            public boolean isReleasable() {
+                synchronized (lock) {
+                    return !waiting.getAsBoolean();
+                }
             }
         }
     }
