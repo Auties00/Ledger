@@ -25,10 +25,12 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The threads that prepare the log's segments: a thread that finished a preparation takes the next, from any store
@@ -271,6 +273,57 @@ class SegmentPreparersTest {
                     assertEquals(model, contents(ledger));
                 }
                 survivesPowerLoss(disk, model);
+            }
+        }
+
+        @Test
+        @DisplayName("under group commit from several threads starts the preparation of each segment before the rollover into it")
+        void preparedAhead() throws Exception {
+            var disk = CrashFileSystem.create();
+            var model = new ConcurrentHashMap<String, String>();
+            var started = Collections.synchronizedList(new ArrayList<FutureTask<?>>());
+            long rollovers;
+            long unprepared;
+            try (var ledger = open(disk.getPath("/store"))) {
+                var log = log(ledger);
+                awaitTrue(log::nextSettled, "the preparation of the open never settled");
+                // Each preparation runs as the log starts it, so a rollover finds its segment unprepared only if the
+                // log had not started its preparation by then, whatever the threads of the preparers are doing
+                log.starterForTests = preparation -> {
+                    started.add(preparation);
+                    preparation.run();
+                };
+                var last = log.currentSegment() + 40;
+                var failure = new AtomicReference<Throwable>();
+                var committers = new ArrayList<Thread>();
+                for (var t = 0; t < 4; t++) {
+                    var thread = t;
+                    committers.add(Thread.ofPlatform().start(() -> {
+                        try {
+                            for (var i = 0; log.currentSegment() < last && failure.get() == null; i++) {
+                                var key = "t" + thread + "-" + i;
+                                var value = "v".repeat(500) + key;
+                                ledger.commit(ledger.newBatch().put(NAMES, key, value)).awaitDurable();
+                                model.put(key, value);
+                            }
+                        } catch (Throwable exception) {
+                            failure.compareAndSet(null, exception);
+                        }
+                    }));
+                }
+                for (var committer : committers) {
+                    committer.join();
+                }
+                assertNull(failure.get());
+                rollovers = log.rollovers();
+                unprepared = log.unpreparedRollovers();
+            }
+            assertTrue(rollovers >= 40, rollovers + " rollovers");
+            // The first rollover takes the preparation the open started, which the hook never saw
+            assertTrue(started.size() >= rollovers - 1, started.size() + " preparations started for " + rollovers + " rollovers");
+            assertEquals(0, unprepared, unprepared + " of " + rollovers + " rollovers found their segment unprepared");
+            try (var ledger = open(disk.getPath("/store"))) {
+                assertEquals(new TreeMap<>(model), contents(ledger));
             }
         }
 
