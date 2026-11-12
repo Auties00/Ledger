@@ -174,6 +174,27 @@ final class Segments {
         return Byte.compareUnsigned(left.get(ValueLayout.JAVA_BYTE, leftFrom + mismatch), right.get(ValueLayout.JAVA_BYTE, rightFrom + mismatch));
     }
 
+    /// {@return the 8 bytes at `at` of the first `length` bytes of `segment`, big-endian, zero past `length`}
+    ///
+    /// It reads no byte at or past `length`, which is at most the size of `segment`, so `segment` may be a slice that
+    /// ends there, of any kind and alignment.
+    static long word(MemorySegment segment, long at, long length) {
+        if (at + Long.BYTES <= length) {
+            return segment.get(BIG_ENDIAN_LONG, at);
+        }
+        var rest = (int) (length - at);
+        return rest <= 0 ? 0 : tail(segment, at, rest) << (Long.SIZE - Byte.SIZE * rest);
+    }
+
+    /// {@return the 8 bytes at `at` of the first `length` bytes of `array`, big-endian, zero past `length`}
+    static long word(byte[] array, int at, int length) {
+        if (at + Long.BYTES <= length) {
+            return Bytes.i64(array, at);
+        }
+        var rest = length - at;
+        return rest <= 0 ? 0 : tail(array, at, rest) << (Long.SIZE - Byte.SIZE * rest);
+    }
+
     /// {@return the 1 to 7 bytes at `from` of `segment`, as a big-endian number}
     private static long tail(MemorySegment segment, long from, int length) {
         var value = 0L;
