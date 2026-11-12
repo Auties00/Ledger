@@ -147,6 +147,12 @@ final class LeafStream implements AutoCloseable {
             holds.incrementAndGet();
         }
 
+        /// Gives back the pages of a group whose claim failed, which read nothing, without waking the workers: one that
+        /// woke each time would wake another that took pages and found no channel, and so on, with no read in between.
+        private void cancel() {
+            freePages.addAndGet(pages);
+        }
+
         private void release() {
             if (holds.decrementAndGet() == 0) {
                 freePages.addAndGet(pages);
@@ -516,25 +522,25 @@ final class LeafStream implements AutoCloseable {
                 continue;
             }
             var cap = wide ? PageFile.RUN_PAGES : Math.clamp(start, FIRST_GROUP_PAGES, PageFile.RUN_PAGES);
+            // The channel first: once the group is claimed, the taker may wait for it
+            var lease = pages.tryLease();
+            if (lease == null) {
+                rest(start, slots.length, NO_CHANNEL);
+                continue;
+            }
             // A group as large as the pages left allow, of one leaf at least
             var end = groupEnd(slots, start, Math.min(cap, freePages.get()));
             var group = takePages(slots, start, end);
             if (group == null) {
+                lease.close();
                 rest(start, slots.length, HELD);
-                continue;
-            }
-            // The channel first: once the group is claimed, the taker may wait for it
-            var lease = pages.tryLease();
-            if (lease == null) {
-                group.release();
-                rest(start, slots.length, NO_CHANNEL);
                 continue;
             }
             if (claimed.compareAndSet(start, end)) {
                 read(slots, start, end, lease, group);
             } else {
                 lease.close();
-                group.release();
+                group.cancel();
                 if (idle.get() > 0) {
                     wakeWorkers();
                 }
