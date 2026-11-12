@@ -35,6 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The links from each chain of a lazily ordered key space to the one below it, which descending scans walk: what a
@@ -187,6 +188,12 @@ class ChainLinksTest {
         return reached;
     }
 
+    /// {@return a builder of threads whose uncaught errors, the failed assertions of the engine among them, land in
+    /// `failures`}
+    private static Thread.Builder.OfPlatform recording(ConcurrentLinkedQueue<String> failures) {
+        return Thread.ofPlatform().uncaughtExceptionHandler((thread, error) -> failures.add("uncaught " + error));
+    }
+
     private static void assertStrictlyDescending(List<Chain> chains) {
         for (var i = 1; i < chains.size(); i++) {
             assertTrue(Chain.compareKeys(chains.get(i - 1), chains.get(i)) > 0, "a walk went up at step " + i);
@@ -221,6 +228,46 @@ class ChainLinksTest {
         assertTrue(range.getFirst().keyEquals(key("k0198")) && range.getLast().keyEquals(key("k0100")));
         assertTrue(descending(state, key("k2000"), null).isEmpty());
         assertEquals(1, descending(state, null, key("k0001")).size());
+    }
+
+    @Test
+    @DisplayName("the engine runs with assertions on in its tests, so the walks that trust their links check each step")
+    void assertionsOn() {
+        assertTrue(Chain.class.desiredAssertionStatus(), "assertions are off for the engine");
+        assertTrue(KeyspaceState.Walk.class.desiredAssertionStatus(), "assertions are off for the engine");
+    }
+
+    @Test
+    @DisplayName("a link to a chain of the same key or of a higher one fails where it is written")
+    void upwardLinkFailsAtWrite() throws Exception {
+        var state = lazy(PAGED);
+        var low = state.open(key("k1"));
+        var high = state.open(key("k2"));
+        descending(state, null, null);
+        assertSame(low, high.below());
+        assertThrows(AssertionError.class, () -> low.linkBelow(high));
+        assertThrows(AssertionError.class, () -> low.linkBelow(low));
+        var twin = new KeyspaceState(PAGED).open(key("k1"));
+        assertThrows(AssertionError.class, () -> low.linkBelow(twin));
+        assertSame(Chain.BOTTOM, low.below(), "a refused link was written");
+        low.linkBelow(null);
+        assertNull(low.below());
+        low.linkBelow(Chain.BOTTOM);
+        assertEquals(List.of(high, low), descending(state, null, null));
+    }
+
+    @Test
+    @DisplayName("a walk that steps on a link leading up, written past the check of the writes, fails rather than loop or return a chain twice")
+    void upwardLinkFailsAtWalk() throws Exception {
+        var state = lazy(PAGED);
+        var low = state.open(key("k1"));
+        var high = state.open(key("k2"));
+        descending(state, null, null);
+        // The plain field, as the list of the chains to order writes it
+        low.link = high;
+        assertThrows(AssertionError.class, () -> descending(state, null, null));
+        low.linkBelow(Chain.BOTTOM);
+        assertEquals(List.of(high, low), descending(state, null, null));
     }
 
     @Test
@@ -841,7 +888,7 @@ class ChainLinksTest {
         var threads = new ArrayList<Thread>();
         for (var p = 0; p < pushers; p++) {
             var pusher = p;
-            threads.add(Thread.ofPlatform().start(() -> {
+            threads.add(recording(failures).start(() -> {
                 var random = ThreadLocalRandom.current();
                 while (!stop.get()) {
                     // Each pusher opens its own keys, so the chain it records is listed before any walk reads it
@@ -861,7 +908,7 @@ class ChainLinksTest {
                 }
             }));
         }
-        threads.add(Thread.ofPlatform().start(() -> {
+        threads.add(recording(failures).start(() -> {
             var random = ThreadLocalRandom.current();
             while (!stop.get()) {
                 var chain = opened.get(random.nextInt(keys));
@@ -871,14 +918,14 @@ class ChainLinksTest {
             }
         }));
         // The commits' maintenance
-        threads.add(Thread.ofPlatform().start(() -> {
+        threads.add(recording(failures).start(() -> {
             while (!stop.get()) {
                 state.removeDropped(256);
                 state.unlinkDropped();
             }
         }));
         // The checkpoints' end
-        threads.add(Thread.ofPlatform().start(() -> {
+        threads.add(recording(failures).start(() -> {
             var random = ThreadLocalRandom.current();
             while (!stop.get()) {
                 state.removeDropped();
@@ -895,7 +942,7 @@ class ChainLinksTest {
             }
         }));
         for (var r = 0; r < 2; r++) {
-            threads.add(Thread.ofPlatform().start(() -> {
+            threads.add(recording(failures).start(() -> {
                 var random = ThreadLocalRandom.current();
                 while (!stop.get()) {
                     var low = random.nextInt(4) == 0 ? -1 : random.nextInt(keys);
@@ -977,7 +1024,7 @@ class ChainLinksTest {
             var scans = new AtomicInteger();
             var threads = new ArrayList<Thread>();
             for (var r = 0; r < 2; r++) {
-                threads.add(Thread.ofPlatform().start(() -> {
+                threads.add(recording(failures).start(() -> {
                     var random = ThreadLocalRandom.current();
                     while (!stop.get()) {
                         var low = "k%04d".formatted(random.nextInt(3_000));
@@ -1015,7 +1062,7 @@ class ChainLinksTest {
                     }
                 }));
             }
-            threads.add(Thread.ofPlatform().start(() -> {
+            threads.add(recording(failures).start(() -> {
                 while (!stop.get()) {
                     ledger.checkpoint();
                     try {
