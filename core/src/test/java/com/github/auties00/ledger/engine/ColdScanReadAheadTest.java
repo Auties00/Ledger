@@ -617,10 +617,9 @@ class ColdScanReadAheadTest {
             }
             assertTrue(leaves.size() > 2 * TreeCursor.GATHER_LEAVES, "too few leaves: " + leaves.size());
             var expected = expected(tree, null, null, descending, Integer.MAX_VALUE);
-            // Two gathers of blobs, a megabyte of pages each with the pages their reads join across gaps, rounded up to
-            // the sizes of the pool; the scan reads 18 megabytes of blobs
-            var gather = (TreeCursor.GATHER_PAGES + (long) TreeCursor.GATHER_VALUES * PageFile.GAP_PAGES) * PageFormat.SIZE;
-            var bound = 2 * (Long.highestOneBit(gather - 1) << 1);
+            // Two gathers of blobs, of at most a megabyte each with the pages their reads join across gaps; the scan
+            // reads 18 megabytes of blobs
+            var bound = 2L * HeapPool.MAX_POOLED;
             tree.pages.forceColdReadsForTests(true);
             var cursor = new TreeCursor(tree.pages, tree.root, null, null, descending, Long.MAX_VALUE);
             try {
@@ -642,6 +641,42 @@ class ColdScanReadAheadTest {
                 tree.pages.forceColdReadsForTests(false);
             }
             assertEquals(0, cursor.heldBytesForTests(), "the released cursor holds arrays");
+        }
+    }
+
+    @Test
+    @DisplayName("units read ahead across gaps take an array the pool recycles, the pages between counted, and every one of them opens")
+    void gapsWithinPool(@TempDir Path directory) throws Exception {
+        try (var tree = new Tree(directory, true, 47)) {
+            var pages = tree.pages;
+            var writer = pages.writer(1);
+            var refs = new ArrayList<PageRef>();
+            var values = new ArrayList<byte[]>();
+            // A megabyte of units of one page, each four pages past the last: joined across every gap, a read of
+            // five megabytes
+            var units = HeapPool.MAX_POOLED / PageFormat.SIZE;
+            for (var i = 0; i < units; i++) {
+                tree.space.allocate(4);
+                var value = tree.bytes(1_000);
+                var unit = new byte[PageFormat.HEADER + value.length];
+                System.arraycopy(value, 0, unit, PageFormat.HEADER, value.length);
+                refs.add(writer.write(PageFormat.VALUE, 0, tree.space.allocate(1), 1, unit, value.length, false));
+                values.add(value);
+            }
+            writer.flush();
+            var offsets = new int[refs.size()];
+            var sealed = pages.prefetch(refs.toArray(PageRef[]::new), refs.size(), offsets);
+            try {
+                assertTrue(sealed.length <= HeapPool.MAX_POOLED, "an array of " + sealed.length + " bytes");
+                for (var i = 0; i < refs.size(); i++) {
+                    assertTrue(offsets[i] >= 0, "unit " + i + " was not read");
+                    var plain = pages.openPrefetched(refs.get(i), PageFormat.VALUE, sealed, offsets[i]);
+                    assertNotNull(plain, "unit " + i);
+                    assertArrayEquals(values.get(i), Arrays.copyOfRange(plain, PageFormat.HEADER, PageFormat.HEADER + values.get(i).length));
+                }
+            } finally {
+                pages.releasePrefetched(sealed);
+            }
         }
     }
 
