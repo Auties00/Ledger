@@ -647,31 +647,39 @@ final class LogWriter {
     /// Queues the frames of `batch`, in its order, as [#append(byte, long, FrameBody, long, int, boolean)] queues each, and
     /// empties it: one hold of the queue lock for a whole pass of the store's publisher.
     ///
-    /// The batch waits on a full queue as one frame of its total size would. Either every frame is queued or, if the
-    /// writer has stopped, none is.
+    /// The batch waits on a full queue as one frame of its total size would. Either every frame is queued, and the
+    /// writer owns its body from then on, or, if the writer has stopped, none is, and each body is still its writer's
+    /// to discard.
     ///
     /// @throws LedgerIoException if the writer has stopped
     void appendAll(Batch batch) {
-        if (batch.frames.isEmpty()) {
-            return;
-        }
-        checkHealthy();
-        queueLock.lock();
         try {
-            while (pendingBytes > 0 && pendingBytes + batch.bodyBytes > QUEUE_LIMIT && failure == null) {
-                awaitRoom();
+            if (batch.frames.isEmpty()) {
+                return;
             }
             checkHealthy();
-            queueDeferred();
-            queue.addAll(batch.frames);
-            pendingBytes += batch.bodyBytes;
-            lastQueued = batch.frames.getLast().sequence();
-            appended += batch.frames.size();
-            appendedBytes += batch.appendedBytes;
-            appendedHeap += batch.appendedHeap;
-            queuedUnits |= batch.units;
+            queueLock.lock();
+            try {
+                while (pendingBytes > 0 && pendingBytes + batch.bodyBytes > QUEUE_LIMIT && failure == null) {
+                    awaitRoom();
+                }
+                checkHealthy();
+                queueDeferred();
+                var frames = batch.frames;
+                for (var i = 0; i < frames.size(); i++) {
+                    frames.get(i).body().handOff();
+                }
+                queue.addAll(frames);
+                pendingBytes += batch.bodyBytes;
+                lastQueued = frames.getLast().sequence();
+                appended += frames.size();
+                appendedBytes += batch.appendedBytes;
+                appendedHeap += batch.appendedHeap;
+                queuedUnits |= batch.units;
+            } finally {
+                queueLock.unlock();
+            }
         } finally {
-            queueLock.unlock();
             batch.clear();
         }
         if (scheduled.compareAndSet(false, true)) {
@@ -1505,10 +1513,10 @@ final class LogWriter {
             this.frames = new ArrayList<>();
         }
 
-        /// Adds a frame, whose body the writer owns from now on, queued or not, for a commit of `writes` writes that
-        /// wrote `unitBytes` of units, whose values are on one chunk of the [ValueSlab] if `sharesChunk`.
+        /// Adds a frame for a commit of `writes` writes that wrote `unitBytes` of units, whose values are on one chunk
+        /// of the [ValueSlab] if `sharesChunk`; its body is its writer's until [LogWriter#appendAll(Batch)] queues it,
+        /// and the log's from then on.
         void add(byte type, long sequence, FrameBody body, long unitBytes, int writes, boolean sharesChunk) {
-            body.handOff();
             frames.add(new Queued(type, sequence, body));
             bodyBytes += body.size();
             appendedBytes += 13 + body.size() + unitBytes;
