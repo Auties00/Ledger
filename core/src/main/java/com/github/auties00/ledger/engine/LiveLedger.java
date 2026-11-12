@@ -80,6 +80,11 @@ public final class LiveLedger implements Ledger {
     /// The writes up to which a commit's lookups also load the newest version of each key they find, which its writes
     /// read once the commit has a sequence: the lines of a larger commit's first writes leave the caches before then.
     private static final int TOUCHED_HEADS = 256;
+    /// The blocks a commit opens one write at a time, at most, after a block whose lookups found fewer than half their
+    /// keys, as the blocks of a batch of new keys do: their lookups probe for nothing that the open then probes for again
+    /// in an index the caches hold, as one a commit is filling does. Each such block doubles the blocks it skips, from
+    /// one, and a block that found half its keys or more takes the next one back to one.
+    private static final int SKIPPED_BLOCKS = 64;
     private static final VarHandle LAST_PUBLISHED;
     private static final VarHandle LATEST;
 
@@ -761,9 +766,19 @@ public final class LiveLedger implements Ledger {
             }
         } else {
             var lookups = new ChainIndex.Lookups(size <= TOUCHED_HEADS);
+            var skipped = 0;
+            var skipping = 1;
             for (var from = 0; from < size; from += ChainIndex.Lookups.BLOCK) {
-                openBlock(writes, from, Math.min(size, from + ChainIndex.Lookups.BLOCK), lookups, chains, keyspaceStates,
-                        keys, found, decoded);
+                var to = Math.min(size, from + ChainIndex.Lookups.BLOCK);
+                if (skipped > 0) {
+                    skipped--;
+                    openWrites(writes, from, to, chains, keyspaceStates, keys, found, decoded);
+                } else if (openBlock(writes, from, to, lookups, chains, keyspaceStates, keys, found, decoded) * 2 < to - from) {
+                    skipped = skipping;
+                    skipping = Math.min(skipping * 2, SKIPPED_BLOCKS);
+                } else {
+                    skipping = 1;
+                }
             }
         }
         var hints = found == null ? null : new Hints(trees, found);
@@ -833,20 +848,36 @@ public final class LiveLedger implements Ledger {
         prepareValue(writes, index, state, found, decoded);
     }
 
+    /// Prepares writes `from` to `to`, excluded, of a commit of the pipeline one at a time, as [#openWrite] does.
+    private void openWrites(ArrayWriteBatch writes, int from, int to, Chain[] chains, KeyspaceState[] keyspaceStates,
+                            MemorySegment[] keys, byte[] found, Object[] decoded) {
+        for (var i = from; i < to; i++) {
+            openWrite(writes, i, chains, keyspaceStates, keys, found, decoded);
+        }
+    }
+
     /// Prepares writes `from` to `to`, excluded, of a commit of the pipeline, as [#openWrite] prepares each: looks up
     /// the chains of their keys together, in `lookups`, then opens them and decodes the values in the order of the
     /// writes, so a decoder that throws leaves open the chains of the writes before its own, and a key the block
     /// writes twice gets one chain.
-    private void openBlock(ArrayWriteBatch writes, int from, int to, ChainIndex.Lookups lookups, Chain[] chains,
-                           KeyspaceState[] keyspaceStates, MemorySegment[] keys, byte[] found, Object[] decoded) {
+    ///
+    /// @return the writes whose key the lookups found a chain of
+    private int openBlock(ArrayWriteBatch writes, int from, int to, ChainIndex.Lookups lookups, Chain[] chains,
+                          KeyspaceState[] keyspaceStates, MemorySegment[] keys, byte[] found, Object[] decoded) {
         lookups.clear();
         for (var i = from; i < to; i++) {
             lookUpWrite(writes, i, lookups, keyspaceStates, keys);
         }
         lookups.run();
+        var hits = 0;
         for (var i = from; i < to; i++) {
-            openLookedUp(writes, i, lookups.found(i - from), lookups.hash(i - from), chains, keyspaceStates, keys, found, decoded);
+            var lookedUp = lookups.found(i - from);
+            if (lookedUp != null) {
+                hits++;
+            }
+            openLookedUp(writes, i, lookedUp, lookups.hash(i - from), chains, keyspaceStates, keys, found, decoded);
         }
+        return hits;
     }
 
     /// Adds to `lookups` the lookup of the chain of the key of write `index`, recording its key space and its key.

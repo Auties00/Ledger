@@ -126,6 +126,55 @@ class BlockLookupsTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    @DisplayName("a batch whose runs of new keys open blocks one write at a time, between runs of held keys looked up a block at a time, with keys repeated across both, matches a model")
+    void newKeysBetweenHeldKeys(boolean inDirectory, @TempDir Path directory) {
+        var paged = new HashMap<String, String>();
+        var resident = new HashMap<String, String>();
+        var held = 400;
+        try (var ledger = inDirectory ? directory(directory, 1L << 30) : memory()) {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < held; i++) {
+                for (var keyspace : List.of(PAGED, RESIDENT)) {
+                    batch.put(keyspace, "key" + i, "held" + i);
+                    (keyspace == PAGED ? paged : resident).put("key" + i, "held" + i);
+                }
+            }
+            ledger.commit(batch);
+            for (var round = 0; round < 3; round++) {
+                batch = ledger.newBatch();
+                var write = 0;
+                // Runs long enough that the blocks of new keys skip up to the most blocks, each run of held keys
+                // ending the skips; every new key is written again in the next run of held keys
+                for (var run = 0; run < 6; run++) {
+                    var fresh = run % 2 == 0;
+                    var length = fresh ? 16 * (40 + 13 * run) + 5 : 16 * 9 + 3;
+                    for (var i = 0; i < length; i++, write++) {
+                        var keyspace = i % 5 == 0 ? RESIDENT : PAGED;
+                        var model = keyspace == PAGED ? paged : resident;
+                        var name = fresh ? "key" + (held + round * 10_000 + write)
+                                : i % 4 == 0 ? "key" + (held + round * 10_000 + write - length) : "key" + ((write * 7) % held);
+                        var value = round + ":" + write;
+                        if (!fresh && i % 11 == 0) {
+                            batch.delete(keyspace, name);
+                            model.remove(name);
+                        } else {
+                            batch.put(keyspace, name, value);
+                            model.put(name, value);
+                        }
+                    }
+                }
+                ledger.commit(batch);
+                verify(ledger, paged, resident, held + round * 10_000 + write);
+                if (inDirectory) {
+                    ledger.checkpoint();
+                    verify(ledger, paged, resident, held + round * 10_000 + write);
+                }
+            }
+        }
+    }
+
     @Test
     @DisplayName("a chain dropped after a block looked it up, or between the lookup's steps, gives way to a chain of its own")
     void droppedAfterLookup() {
