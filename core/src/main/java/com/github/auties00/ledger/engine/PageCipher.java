@@ -87,6 +87,21 @@ class PageCipher {
     /// @param buffer the buffer the sealed bytes pass through, of at least 64 KiB
     /// @throws IOException if `out` fails
     void seal(byte[] header, byte[] content, int contentOffset, int contentLength, int pages, byte[] buffer, Output out) throws IOException {
+        seal(header, content, contentOffset, contentLength, pages, buffer, buffer.length, out);
+    }
+
+    /// Seals the unit as [#seal(byte\[\], byte\[\], int, int, int, byte\[\], Output)] does, but passes `out` the bytes
+    /// the buffer holds as soon as they reach `part`, so the first part reaches the file without waiting for the buffer
+    /// to fill: with encryption a part is then the whole slices of 64 KiB that reach `part`, the first with the header
+    /// besides, and without it `part` bytes. A part that would not fit the buffer is cut at its end, as without `part`.
+    ///
+    /// @param buffer the buffer the sealed bytes pass through, of at least 64 KiB
+    /// @param part the bytes after which the buffer is passed on, above the header's and at most the buffer's
+    /// @throws IOException if `out` fails
+    void seal(byte[] header, byte[] content, int contentOffset, int contentLength, int pages, byte[] buffer, int part, Output out) throws IOException {
+        if (part > buffer.length || part <= PageFormat.HEADER) {
+            throw new IllegalArgumentException("A part of " + part + " bytes does not fit a buffer of " + buffer.length);
+        }
         var tag = pages * PageFormat.SIZE - PageFormat.TAG;
         var padding = tag - PageFormat.HEADER - (long) contentLength;
         if (padding < 0) {
@@ -99,11 +114,11 @@ class PageCipher {
             var crc = new CRC32C();
             crc.update(header, 0, PageFormat.HEADER);
             for (var offset = 0L; offset < total; ) {
-                if (used == buffer.length) {
+                if (used >= part) {
                     out.write(buffer, used);
                     used = 0;
                 }
-                var count = (int) Math.min(buffer.length - used, total - offset);
+                var count = (int) Math.min(part - used, total - offset);
                 var fromContent = (int) Math.max(0, Math.min(count, contentLength - offset));
                 if (fromContent > 0) {
                     System.arraycopy(content, contentOffset + (int) offset, buffer, used, fromContent);
@@ -131,7 +146,7 @@ class PageCipher {
             for (var offset = 0L; offset < total; ) {
                 var count = (int) Math.min(sliceLength, total - offset);
                 // The cipher may hold back a partial block, and gives it out with the next call
-                if (buffer.length - used < count + PageFormat.TAG) {
+                if (used >= part || buffer.length - used < count + PageFormat.TAG) {
                     out.write(buffer, used);
                     used = 0;
                 }

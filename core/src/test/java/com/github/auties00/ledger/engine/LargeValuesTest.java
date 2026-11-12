@@ -87,6 +87,26 @@ class LargeValuesTest {
         }
 
         @Test
+        @DisplayName("read back values of one part, of several and of megabytes, encrypted or not, after a reopen")
+        void sizes(@TempDir Path directory) throws Exception {
+            var lengths = new int[]{4_096, 100_000, WriteBack.PART - 100, WriteBack.PART + 1, 1 << 20, (16 << 20) + 13};
+            for (var encrypted : new boolean[]{false, true}) {
+                var store = directory.resolve(encrypted ? "encrypted" : "plain");
+                try (var ledger = open(store, encrypted)) {
+                    for (var i = 0; i < lengths.length; i++) {
+                        ledger.commit(ledger.newBatch().put(FILES, "v" + i, value(i, lengths[i]))).awaitDurable();
+                    }
+                }
+                try (var ledger = open(store, encrypted)) {
+                    for (var i = 0; i < lengths.length; i++) {
+                        assertArrayEquals(value(i, lengths[i]), ledger.get(FILES, "v" + i).orElseThrow(), "value " + i);
+                    }
+                }
+                CheckpointTest.verifyPages(store, encrypted);
+            }
+        }
+
+        @Test
         @DisplayName("keep values below the threshold, and those of a key space with a threshold of its own, in the log")
         void thresholds(@TempDir Path directory) throws Exception {
             var below = value(2, 4_095);

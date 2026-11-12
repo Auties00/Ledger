@@ -76,6 +76,13 @@ import java.util.function.Consumer;
 /// which Windows documents as writing through its own cache only, with the same risk, and with `O_DSYNC` alone
 /// elsewhere but on macOS.
 ///
+/// On Linux, while this module has native access, a large value of more than 256 KiB is written to its file in parts
+/// of that size, and the kernel is asked to start writing each part to the device (`sync_file_range` with
+/// `SYNC_FILE_RANGE_WRITE`) while the next is encrypted, on a platform thread of the store's own: the force of the
+/// commit then finds most of the value written. The request neither waits for the device nor empties its cache, so
+/// the force is still what makes the value durable. Without native access, or with the system property
+/// `ledger.blobs.writeBack` set to `off`, the value is left whole to the force.
+///
 /// # Memory
 /// The store keeps the bytes it encrypts, decrypts and writes on the Java heap, in arrays it recycles: the JDK's
 /// AES-GCM runs fastest on arrays, and recycling keeps the memory from becoming garbage. The page cache

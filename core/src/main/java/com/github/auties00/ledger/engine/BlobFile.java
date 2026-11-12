@@ -37,6 +37,8 @@ final class BlobFile implements AutoCloseable {
     /// The name of the file in the store's directory.
     static final String FILE = "ledger.blobs";
     private static final int BUFFER = 1 << 20;
+    // The buffer of a unit written back as it is sealed, which a part of WriteBack.PART bytes and a slice fit
+    private static final int PART_BUFFER = 2 * WriteBack.PART;
     /// The trailing free pages, 64 MiB of them, below which [#trim()] keeps the file's length.
     private static final int TRIM_SLACK = 16_384;
 
@@ -53,6 +55,8 @@ final class BlobFile implements AutoCloseable {
     private final PageCache cache;
     private final HeapPool pool;
     private final FreeSpace space;
+    // Starts the writeback of a unit's pages as soon as they are written, where the kernel takes it
+    private final WriteBack writeBack;
     // The epoch of this open, set once recovery has read the earlier ones
     private volatile int epoch;
     private final AtomicLong counter;
@@ -65,7 +69,8 @@ final class BlobFile implements AutoCloseable {
     // Whether a unit was sealed under this open's epoch, which a later open must then not reuse
     private volatile boolean epochTaken;
 
-    private BlobFile(Path path, FileChannel channel, PageCipher cipher, PageCache cache, HeapPool pool, FreeSpace space) throws IOException {
+    private BlobFile(Path path, FileChannel channel, PageCipher cipher, PageCache cache, HeapPool pool, FreeSpace space,
+                     WriteBack writeBack) throws IOException {
         this.path = path;
         this.channel = channel;
         this.channels = new ArrayBlockingQueue<>(CHANNELS);
@@ -83,6 +88,7 @@ final class BlobFile implements AutoCloseable {
         this.cache = cache;
         this.pool = pool;
         this.space = space;
+        this.writeBack = writeBack;
         this.counter = new AtomicLong();
         this.lock = new Object();
         this.unadopted = new HashSet<>();
@@ -105,7 +111,12 @@ final class BlobFile implements AutoCloseable {
         }
         var channel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
         var space = new FreeSpace(Math.max(pageCount, PageFormat.FIRST_UNIT_PAGE), free);
-        return new BlobFile(path, channel, cipher, cache, pool, space);
+        try {
+            return new BlobFile(path, channel, cipher, cache, pool, space, WriteBack.of(path));
+        } catch (IOException exception) {
+            channel.close();
+            throw exception;
+        }
     }
 
     /// Sets the epoch of this open, above every earlier one, once recovery has read them.
@@ -130,6 +141,10 @@ final class BlobFile implements AutoCloseable {
 
     /// Seals the `length` bytes of `value` at `offset` into free pages and writes them, without forcing them.
     ///
+    /// Where [WriteBack] is active, a unit of more than [WriteBack#PART] bytes is written a part of that size at a
+    /// time, and the writeback of each part starts while the next is sealed; elsewhere it is written a part of 1 MiB at
+    /// a time and left to the force.
+    ///
     /// The unit is in flight until a checkpoint takes it or [#release(PageRef)] frees it.
     ///
     /// @return where the unit is
@@ -149,12 +164,15 @@ final class BlobFile implements AutoCloseable {
         }
         var header = new byte[PageFormat.HEADER];
         PageFile.header(header, PageFormat.EXTERNAL, 0, ref.page(), pages, length, ref.nonceHigh(), ref.nonceLow());
-        var buffer = pool.acquire(BUFFER);
+        var first = PageFormat.offset(ref.page());
+        var unit = writeBack.unit(first, first + (long) pages * PageFormat.SIZE);
+        var buffer = pool.acquire(unit != null ? PART_BUFFER : BUFFER);
+        var part = unit != null ? WriteBack.PART : buffer.length;
         var through = new FileChannel[]{takeChannel()};
         var interrupted = new boolean[1];
         try {
-            var position = new long[]{PageFormat.offset(ref.page())};
-            cipher.seal(header, value, offset, length, pages, buffer, (bytes, count) -> {
+            var position = new long[]{first};
+            cipher.seal(header, value, offset, length, pages, buffer, part, (bytes, count) -> {
                 var start = position[0];
                 while (true) {
                     try {
@@ -164,6 +182,9 @@ final class BlobFile implements AutoCloseable {
                             at += through[0].write(source, at);
                         }
                         position[0] = at;
+                        if (unit != null) {
+                            unit.written(at);
+                        }
                         return;
                     } catch (ClosedByInterruptException _) {
                         // The interrupt closed the channel: the same bytes again, at the same offset, on a new one,
@@ -388,8 +409,14 @@ final class BlobFile implements AutoCloseable {
         }
     }
 
+    /// {@return the early writeback of the file's units, for tests}
+    WriteBack writeBackForTests() {
+        return writeBack;
+    }
+
     @Override
     public void close() {
+        writeBack.close();
         try {
             channel.close();
         } catch (IOException _) {

@@ -64,4 +64,36 @@ class PageCipherTest {
         tampered[PageFormat.HEADER + length / 2] ^= 1;
         assertFalse(cipher.open(tampered, 0, pages, opened));
     }
+    static Stream<Arguments> partUnits() {
+        var part = WriteBack.PART;
+        var lengths = new int[]{0, 4_000, part - 100, part, part + 1, 2 * part - 48, 2 * part, 3 * part + 13, 1 << 20, (5 << 20) + 7};
+        return Arrays.stream(lengths).boxed().flatMap(length -> Stream.of(true, false).map(encrypted -> Arguments.of(length, encrypted)));
+    }
+
+    @ParameterizedTest(name = "{0} bytes, encrypted: {1}")
+    @MethodSource("partUnits")
+    @DisplayName("sealing in parts shorter than the buffer gives the same unit, in parts of the size asked for")
+    void sealsInParts(int length, boolean encrypted) throws IOException {
+        var pages = PageFormat.pagesFor(length);
+        var content = new byte[length];
+        new Random(length).nextBytes(content);
+        var header = new byte[PageFormat.HEADER];
+        PageFile.header(header, PageFormat.EXTERNAL, 0, 5, pages, length, 77L, length);
+
+        var whole = new ByteArrayOutputStream();
+        new PageCipher(encrypted ? KEY : null).seal(header, content, 0, length, pages, new byte[1 << 20], (bytes, count) -> whole.write(bytes, 0, count));
+
+        var part = WriteBack.PART;
+        var parts = new ByteArrayOutputStream();
+        var lengths = new java.util.ArrayList<Integer>();
+        new PageCipher(encrypted ? KEY : null).seal(header, content, 0, length, pages, new byte[2 * part], part, (bytes, count) -> {
+            parts.write(bytes, 0, count);
+            lengths.add(count);
+        });
+        assertArrayEquals(whole.toByteArray(), parts.toByteArray());
+        for (var i = 0; i < lengths.size() - 1; i++) {
+            var expected = encrypted && i == 0 ? part + PageFormat.HEADER : part;
+            assertEquals(expected, lengths.get(i), "part " + i);
+        }
+    }
 }
