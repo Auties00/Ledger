@@ -91,7 +91,8 @@ final class KeyspaceState {
     final BlindWrites blind;
     // The range removals whose count is not known yet
     final PendingRanges ranges;
-    // The copies of the keys the chains hold
+    // The copies of the keys the chains hold, and of the map's keys of the chains that hold their keys in words of
+    // their own; nothing else, as a copy here stays reachable while another in its chunk does
     private final KeySlab keys;
     /// What the commits say about whether the values may share a [ValueSlab]'s chunks; `null` in a resident key space,
     /// whose values never do.
@@ -493,10 +494,14 @@ final class KeyspaceState {
     /// a chain that does not, rather than one for each neighbour.
     private void order(Chain chain) {
         var linked = lazy && linksEach();
+        // The map's key, made once for every try: a copy in the slab for a key in the words of its chain
+        MemorySegment key = null;
         // Released counts as dropped on both sides: another thread may have used the chain, and a prune dropped it,
         // while this one was still inserting it; a later chain of the key then holds the place
         while (!chain.dropped() && !chain.released()) {
-            var key = chain.key();
+            if (key == null) {
+                key = keys.key(chain);
+            }
             Chain above = null;
             if (linked) {
                 var higher = entries.higherEntry(key);
@@ -946,6 +951,10 @@ final class KeyspaceState {
     /// the reader's tree holds. It may return chains that left the map, emptied, whose keys the reader reads from the
     /// tree.
     static final class Walk {
+        /// The bytes of a walk's first array of key copies, which holds the longest key a chain holds in its words.
+        private static final int FIRST_COPIES = 8 * Chain.INLINE;
+        /// The bytes of a walk's arrays of key copies, at most.
+        private static final int LAST_COPIES = 4_096;
         // The map the walk asks for the chain below one whose link does not lead down; null when it iterates it
         private final ConcurrentSkipListMap<MemorySegment, Chain> entries;
         // The map's entries, or null when the walk steps along the links
@@ -953,7 +962,16 @@ final class KeyspaceState {
         // Where a walk along the links ends, or null for no bound
         private final MemorySegment from;
         private Chain chain;
+        // The key of `chain`: the map's for a chain the walk took from the map, and otherwise made when first asked
+        // for, as the key of a chain whose key is in its own words is a copy
         private MemorySegment key;
+        // The array the walk copies the keys of chains that hold them in words of their own into, one after another,
+        // and its read-only view: the walk's own, so the copies are garbage once the walk and its caller drop them,
+        // where a copy in the key space's slab would stay reachable while a key of the map in its chunk did
+        private byte[] copies;
+        private MemorySegment copiesView;
+        // The bytes of `copies` taken
+        private int copied;
         // Whether the walk along the links returned the chain it starts at
         private boolean started;
 
@@ -1002,9 +1020,11 @@ final class KeyspaceState {
             var below = chain.below();
             // A chain not linked yet, one that left whose link a repair cleared, or, which no write makes, a link that
             // does not lead down: the map gives the chain below, so the walk neither misses an entry nor returns one twice
+            MemorySegment belowKey = null;
             if (below == null || below != Chain.BOTTOM && Chain.compareKeys(below, chain) >= 0) {
-                var lower = entries.lowerEntry(key);
+                var lower = entries.lowerEntry(key());
                 below = lower == null ? Chain.BOTTOM : lower.getValue();
+                belowKey = lower == null ? null : lower.getKey();
             }
             if (below == Chain.BOTTOM || from != null && below.compareKey(from) < 0) {
                 chain = null;
@@ -1012,7 +1032,7 @@ final class KeyspaceState {
                 return false;
             }
             chain = below;
-            key = below.key();
+            key = belowKey;
             return true;
         }
 
@@ -1023,7 +1043,32 @@ final class KeyspaceState {
 
         /// {@return the key of the chain the walk is at, read-only}
         MemorySegment key() {
+            var key = this.key;
+            if (key == null && chain != null) {
+                key = copy(chain);
+                this.key = key;
+            }
             return key;
+        }
+
+        // A read-only copy of the key of `chain`, reached through a link: a view of the segment that holds it, or a
+        // span of the walk's array for a key in the chain's words, which costs a view and the key's bytes, as the map's
+        // keys do, rather than an array and two views of its own
+        private MemorySegment copy(Chain chain) {
+            if (!chain.inlineKey()) {
+                return chain.key();
+            }
+            var length = chain.keyLength();
+            if (copies == null || copied + length > copies.length) {
+                // A short scan takes a small array, a long one arrays up to 4 KiB, each holding at least one key
+                copies = new byte[copies == null ? FIRST_COPIES : Math.min(LAST_COPIES, 2 * copies.length)];
+                copiesView = MemorySegment.ofArray(copies).asReadOnly();
+                copied = 0;
+            }
+            chain.copyKey(copies, copied);
+            var copy = copiesView.asSlice(copied, length);
+            copied += length;
+            return copy;
         }
     }
 }

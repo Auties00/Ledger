@@ -13,6 +13,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.ref.Reference;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -730,6 +731,77 @@ class ChainLinksTest {
 
     /// {@return how many of `references` the collector has not cleared, once at most `bound` or after a few
     /// collections}
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    @DisplayName("descending walks and removals between new keys of 20 bytes keep no copies of keys beside the map's: the key space's slab holds about the bytes of the keys it ordered")
+    void walksKeepNoKeyCopies(boolean resident) throws Exception {
+        var state = lazy(resident ? RESIDENT : PAGED);
+        descending(state, null, null);
+        var chunks = new ArrayList<WeakReference<byte[]>>();
+        var ordered = 0;
+        for (var round = 0; round < 400; round++) {
+            // 20 bytes, a key a chain holds in its words, in no order, so each enters among the others
+            state.open(key("k%019d".formatted(round * 2_654_435_761L % 1_000_000_000_000L)));
+            ordered++;
+            if (!resident && round % 4 == 3) {
+                // A key that leaves, as after a checkpoint: its removal and the repair of the link above it look it up
+                var leaving = state.entries.firstEntry().getValue();
+                state.drop(leaving, null, () -> Long.MAX_VALUE);
+                state.removeDropped(Integer.MAX_VALUE);
+            }
+            var walk = state.walk(null, null, true);
+            slabChunks(state, chunks);
+            var walked = 0;
+            while (walk.next()) {
+                assertTrue(walk.chain().keyEquals(walk.key()), "a walk's key is not its chain's");
+                walked++;
+            }
+            assertTrue(walked >= state.entries.size(), "the walk missed chains of the map");
+            slabChunks(state, chunks);
+        }
+        var keyBytes = 20L * ordered;
+        var held = 0L;
+        for (var attempt = 0; attempt < 10; attempt++) {
+            System.gc();
+            Thread.sleep(20);
+            held = 0;
+            for (var reference : chunks) {
+                var array = reference.get();
+                if (array != null) {
+                    held += array.length;
+                }
+            }
+            if (held <= 2 * keyBytes + 4_096) {
+                break;
+            }
+        }
+        // The map's copies fill chunks that double up to 4 KiB, the last one partly
+        assertTrue(held <= 2 * keyBytes + 4_096, "the slab's chunks keep " + held + " bytes for " + keyBytes + " bytes of keys");
+        Reference.reachabilityFence(state);
+    }
+
+    // Adds to `chunks` the arrays of the chunks the stripes of the key space's slab hold, once each
+    private static void slabChunks(KeyspaceState state, List<WeakReference<byte[]>> chunks) throws ReflectiveOperationException {
+        var keysField = KeyspaceState.class.getDeclaredField("keys");
+        keysField.setAccessible(true);
+        var slab = keysField.get(state);
+        var stripesField = KeySlab.class.getDeclaredField("stripes");
+        stripesField.setAccessible(true);
+        var stripes = (AtomicReferenceArray<?>) stripesField.get(slab);
+        for (var i = 0; i < stripes.length(); i++) {
+            var chunk = stripes.get(i);
+            if (chunk == null) {
+                continue;
+            }
+            var arrayField = chunk.getClass().getDeclaredField("array");
+            arrayField.setAccessible(true);
+            var array = (byte[]) arrayField.get(chunk);
+            if (chunks.stream().noneMatch(reference -> reference.refersTo(array))) {
+                chunks.add(new WeakReference<>(array));
+            }
+        }
+    }
+
     private static int retained(List<WeakReference<Chain>> references, int bound) throws InterruptedException {
         var retained = references.size();
         for (var attempt = 0; attempt < 10 && retained > bound; attempt++) {

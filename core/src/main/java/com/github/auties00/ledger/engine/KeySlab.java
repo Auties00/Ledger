@@ -8,12 +8,19 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /// The copies of the keys a key space's chains hold, packed into small shared arrays.
 ///
+/// A key of at most [Chain#INLINE] bytes goes into the words of its chain instead, which a comparison reads without a
+/// load that waits for the chain's own. A holder that keeps such a key as a segment for as long as the slab's other
+/// copies live takes a copy of it here ([#key(Chain)]): the ordered map of a key space, whose keys are segments, as the
+/// chain enters it, and the update of a tree, with a slab of its own, for the entries it writes. A copy only a short
+/// lookup needs is made elsewhere ([Chain#key()]), since a copy here stays reachable while another copy in its chunk
+/// does: the copies of a key space's scans and removals would stay with its map's keys.
+///
 /// A key copied into an array of its own costs the array's header and, for the read-only view of it, a segment and a
 /// memory session of the segment's own: about a hundred bytes for a 16-byte key, on every key a commit writes. A copy
 /// here is a span of a chunk's one read-only view, which its chain holds as the view, an offset and a length: no
-/// object of its own. A chunk stays reachable while a chain holds a key in it, so chunks are small: a long-lived chain
-/// keeps a few kilobytes, not more. A stripe's first chunk is small too, and each that fills is followed by one twice
-/// its size: a key space of a few keys keeps a few hundred bytes of chunks, not kilobytes.
+/// object of its own. A chunk stays reachable while a chain or a map holds a key in it, so chunks are small: a
+/// long-lived key keeps a few kilobytes, not more. A stripe's first chunk is small too, and each that fills is followed
+/// by one twice its size: a key space of a few keys keeps a few hundred bytes of chunks, not kilobytes.
 ///
 /// It is safe for concurrent use: a copy claims its bytes with a compare-and-set, and a full chunk is replaced with
 /// another. Every key goes to one stripe until two threads claim from its chunk at once; from then on each thread
@@ -52,32 +59,70 @@ final class KeySlab {
     /// {@return the chain of a read-only copy of `key`, whose hash is `hash`}
     Chain chain(MemorySegment key, int hash) {
         var length = (int) key.byteSize();
+        if (length <= Chain.INLINE) {
+            return Chain.inline(key, hash);
+        }
         if (length > LARGEST) {
             return new Chain(Segments.copy(key), hash);
         }
         var stripe = contended ? stripe() : 0;
         while (true) {
-            var chunk = stripes.get(stripe);
-            if (chunk == null) {
-                stripes.compareAndSet(stripe, null, new Chunk(FIRST_CHUNK));
-                continue;
-            }
+            var chunk = room(stripe);
             var start = (int) USED.getVolatile(chunk);
-            if (start + length > chunk.array.length) {
-                // Full: every thread that saw it full tries to replace it, with a chunk twice as large
-                stripes.compareAndSet(stripe, chunk, new Chunk(Math.min(CHUNK, 2 * chunk.array.length)));
-                continue;
-            }
-            if (USED.compareAndSet(chunk, start, start + length)) {
+            if (start + length <= chunk.array.length && USED.compareAndSet(chunk, start, start + length)) {
                 MemorySegment.copy(key, ValueLayout.JAVA_BYTE, 0, chunk.array, start, length);
                 return new Chain(chunk.view, start, length, hash);
             }
-            // Another thread claimed from the chunk meanwhile
-            if (!contended) {
-                contended = true;
-            }
-            stripe = stripe();
+            stripe = retry(stripe, chunk, start, length);
         }
+    }
+
+    /// {@return the key of `chain`, a read-only segment the ordered map may keep as long as it holds the chain}
+    ///
+    /// For a chain whose key is in a segment, a view of that segment; for one whose key is in its own words, a copy
+    /// here, which costs the map the bytes of the key and a view, as a key in a slab does, rather than an array of its
+    /// own as well. A lookup that drops the key when it returns takes [Chain#key()] instead, as a copy here stays
+    /// reachable while any other copy in its chunk does.
+    MemorySegment key(Chain chain) {
+        if (!chain.inlineKey()) {
+            return chain.key();
+        }
+        var length = chain.keyLength();
+        var stripe = contended ? stripe() : 0;
+        while (true) {
+            var chunk = room(stripe);
+            var start = (int) USED.getVolatile(chunk);
+            if (start + length <= chunk.array.length && USED.compareAndSet(chunk, start, start + length)) {
+                chain.copyKey(chunk.array, start);
+                return chunk.view.asSlice(start, length);
+            }
+            stripe = retry(stripe, chunk, start, length);
+        }
+    }
+
+    // The chunk of `stripe`, made if it has none yet
+    private Chunk room(int stripe) {
+        while (true) {
+            var chunk = stripes.get(stripe);
+            if (chunk != null) {
+                return chunk;
+            }
+            stripes.compareAndSet(stripe, null, new Chunk(FIRST_CHUNK));
+        }
+    }
+
+    // What a claim of `length` bytes at `start` of `chunk`, the chunk of `stripe`, that failed does next: it replaces a
+    // full chunk, and moves to the stripe of its thread if another thread claimed from the chunk meanwhile
+    private int retry(int stripe, Chunk chunk, int start, int length) {
+        if (start + length > chunk.array.length) {
+            // Full: every thread that saw it full tries to replace it, with a chunk twice as large
+            stripes.compareAndSet(stripe, chunk, new Chunk(Math.min(CHUNK, 2 * chunk.array.length)));
+            return stripe;
+        }
+        if (!contended) {
+            contended = true;
+        }
+        return stripe();
     }
 
     // Thread ids are consecutive: a multiplicative hash spreads them over the stripes
