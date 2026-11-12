@@ -1423,6 +1423,11 @@ public final class LiveLedger implements Ledger {
         return blobs;
     }
 
+    /// {@return the bytes the page cache holds, 0 for a store in memory; for tests of what it lets go of}
+    long pageCacheBytesForTests() {
+        return pages == null ? 0 : pages.cache().size();
+    }
+
     /// Drops every unit the page cache holds, so the next reads go to the file. For tests of reads that miss it.
     void clearPageCacheForTests() {
         if (pages != null) {
@@ -1643,14 +1648,16 @@ public final class LiveLedger implements Ledger {
     /// replaced before a checkpoint took them are free at once, since only memory reads them; those its trees no longer
     /// point to wait for the reads of the trees before it.
     ///
+    /// @param droppedRecords the delta records the trees before held and these do not, which leave the page cache with
+    ///                       the units freed
     /// @param freedExternal the units of the file of large values the trees before pointed to and these do not
     /// @param adopted the units of the file of large values these trees took
     void publish(Cut cut, long number, TreeRoot[] roots, PageRef catalog, PageRef freeList, PageRef blobFreeList,
-                 List<PageRef> freed, List<PageRef> freedExternal, Set<PageRef> adopted) {
+                 List<PageRef> freed, List<PageRef> droppedRecords, List<PageRef> freedExternal, Set<PageRef> adopted) {
         enterPublishing();
         try {
             tree = new TreeVersion(number, cut.sequence(), latest(), roots, catalog, freeList, blobFreeList, tree);
-            space.pend(latest(), freed);
+            space.pend(latest(), freed, droppedRecords);
             if (blobs != null) {
                 blobs.pend(latest(), freedExternal);
                 for (var unit : cut.superseded()) {
