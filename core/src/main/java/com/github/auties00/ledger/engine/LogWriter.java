@@ -27,6 +27,7 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import java.util.zip.CRC32C;
 
 /// Appends frames to the log and makes them durable in groups.
@@ -247,9 +248,12 @@ final class LogWriter {
     private volatile long groupEnd;
     // Where the frames of the last group start, for tests
     private volatile long groupStart;
-    // The preparation of the segment after the current one, run on a thread of its own, or by whichever of the flush
-    // task and a close needs it first
+    // The preparation of the segment after the current one, run on a thread of SegmentPreparers, or by whichever of
+    // the flush task and a close needs it first
     private FutureTask<LogFiles.Prepared> next;
+    /// Starts the preparations of later segments in place of [SegmentPreparers#start(FutureTask)], for tests that hold
+    /// them or start them late; the one the writer's construction starts is not passed to it.
+    volatile Consumer<FutureTask<?>> starterForTests;
     // Whether zeros were asked for the segment of next, by its preparation or after it; owned by the flush task
     private boolean nextZeroed;
     // When the current segment opened, and how long the one before it took to fill, or -1; owned by the flush task
@@ -464,11 +468,16 @@ final class LogWriter {
         }
     }
 
-    /// Prepares the segment after the current one on a platform thread of its own.
+    /// Prepares the segment after the current one on a thread of [SegmentPreparers].
     ///
     /// Not on the store's pool: creating and forcing a file costs tens of milliseconds on Windows, and a flush queued
     /// behind it would make every commit waiting on that flush wait as long.
     private void prepareNext() {
+        start(preparation());
+    }
+
+    /// {@return the preparation of the segment after the current one, made [#next] and not started}
+    private FutureTask<LogFiles.Prepared> preparation() {
         var number = segmentNumber + 1;
         var zeros = wantsZeros();
         // On the thread of the preparation: the answer of a device may take a round trip to it
@@ -476,7 +485,17 @@ final class LogWriter {
                 zeros && !closing && files.zeroFills(writeThrough.enabled()), writeThrough.kind() != null, () -> closing));
         next = preparation;
         nextZeroed = zeros;
-        Thread.ofPlatform().daemon().name("ledger-prepare").start(preparation);
+        return preparation;
+    }
+
+    /// Starts `work` on the segment after the current one, on a thread of [SegmentPreparers] unless a test holds it.
+    private void start(FutureTask<?> work) {
+        var starter = starterForTests;
+        if (starter != null) {
+            starter.accept(work);
+        } else {
+            SegmentPreparers.start(work);
+        }
     }
 
     /// {@return whether the next segment is written with zeros: commits waited for the forces of a segment that filled
@@ -488,7 +507,7 @@ final class LogWriter {
         return lastFill < 0 ? waitedGroups >= ZEROS_AFTER : lastFill > segmentSize * 1_000_000_000L / ZEROED_RATE;
     }
 
-    /// Writes the segment prepared after the current one with zeros, on a platform thread of its own, once they are
+    /// Writes the segment prepared after the current one with zeros, on a thread of [SegmentPreparers], once they are
     /// wanted and it was prepared without them.
     ///
     /// The zeros only give the file its blocks, so a preparation they fail to complete still serves as it was.
@@ -513,7 +532,7 @@ final class LogWriter {
             }
         });
         next = fill;
-        Thread.ofPlatform().daemon().name("ledger-prepare").start(fill);
+        start(fill);
     }
 
     /// {@return whether, between two groups, the log moves to the prepared segment after the current one: commits wait
@@ -540,10 +559,8 @@ final class LogWriter {
 
     /// Switches to the prepared segment after the current one, preparing it here if its thread has not.
     private void rollover() throws IOException {
-        if (next == null) {
-            prepareNext();
-        }
-        var preparation = next;
+        // Prepared here, with no thread of its own
+        var preparation = next != null ? next : preparation();
         // Runs it on this thread unless it started elsewhere, so a rollover never waits on a thread yet to start
         preparation.run();
         LogFiles.Prepared prepared;
