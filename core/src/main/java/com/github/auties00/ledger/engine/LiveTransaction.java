@@ -114,7 +114,9 @@ final class LiveTransaction implements Transaction {
         var ownValue = Segments.toBytes(value);
         var view = MemorySegment.ofArray(ownValue).asReadOnly();
         state.awaitLoaded(ownKey);
-        applier.put(state, ownKey, view, ownValue, state.resident ? keyspace.values().decode(view) : null);
+        // A byte array is its own encoding: the version holds ownValue as the value its reads return
+        var decoded = !state.resident || keyspace.values() == BuiltinCodecs.BYTES_VALUE ? null : keyspace.values().decode(view);
+        applier.put(state, ownKey, view, ownValue, decoded);
         return this;
     }
 
