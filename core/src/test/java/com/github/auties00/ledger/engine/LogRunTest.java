@@ -31,6 +31,8 @@ import java.security.GeneralSecurityException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -852,9 +854,10 @@ class LogRunTest {
                 65_537, 70_001};
 
         /// {@return a commit body of `writes` writes, built twice: `copied` holds every value itself, the returned
-        /// one refers to those of at least `referable` bytes; values of `longest` bytes at most}
-        private static FrameBody body(Random random, int writes, int referable, int longest, FrameBody copied) {
-            var referring = new FrameBody(64, referable);
+        /// one refers to those of at least `referable` bytes and keeps its own bytes past a chunk on chunks of `pool`,
+        /// if not `null`; values of `longest` bytes at most}
+        static FrameBody body(Random random, int writes, int referable, int longest, FrameBody copied, HeapPool pool) {
+            var referring = new FrameBody(64, referable, pool);
             for (var write = 0; write < writes; write++) {
                 var key = MemorySegment.ofArray(("key" + write + ":" + random.nextInt(1_000)).getBytes(StandardCharsets.US_ASCII));
                 if (random.nextInt(8) == 0) {
@@ -874,7 +877,7 @@ class LogRunTest {
         }
 
         /// Checks every frame of `log` against its bodies sealed out of place, and the bodies recovery replays.
-        private static void assertSealedAsCopied(Log log) throws Exception {
+        static void assertSealedAsCopied(Log log) throws Exception {
             var next = 1L;
             for (var segment : log.frames().entrySet()) {
                 var number = segment.getKey();
@@ -922,11 +925,11 @@ class LogRunTest {
                         // Bodies a run takes, sealed whole in the output; bodies past RUN_MAX_BODY whose pieces are
                         // long, short or a single byte each; and bodies that refer to nothing
                         var referring = switch (shape) {
-                            case 0 -> body(random, 1 + random.nextInt(3), FrameBody.RUN_REFERABLE, 4_000, copied);
-                            case 1 -> body(random, 4 + random.nextInt(30), FrameBody.RUN_REFERABLE, 70_001, copied);
-                            case 2 -> body(random, 4 + random.nextInt(30), FrameBody.SEALED_REFERABLE, 70_001, copied);
-                            case 3 -> body(random, 40 + random.nextInt(200), 1, 600, copied);
-                            default -> body(random, 1 + random.nextInt(8), FrameBody.NOT_REFERABLE, 3_000, copied);
+                            case 0 -> body(random, 1 + random.nextInt(3), FrameBody.RUN_REFERABLE, 4_000, copied, null);
+                            case 1 -> body(random, 4 + random.nextInt(30), FrameBody.RUN_REFERABLE, 70_001, copied, null);
+                            case 2 -> body(random, 4 + random.nextInt(30), FrameBody.SEALED_REFERABLE, 70_001, copied, null);
+                            case 3 -> body(random, 40 + random.nextInt(200), 1, 600, copied, null);
+                            default -> body(random, 1 + random.nextInt(8), FrameBody.NOT_REFERABLE, 3_000, copied, null);
                         };
                         assertEquals(copied.size(), referring.size());
                         assertArrayEquals(copied.toBytes(), referring.toBytes());
@@ -970,6 +973,160 @@ class LogRunTest {
                 log.close();
             }
             assertSealedAsCopied(log);
+        }
+    }
+
+    @Nested
+    @DisplayName("bodies on chunks of a pool")
+    class Chunked {
+        /// Adds to `batch` the next commit, a body of at least `size` bytes on chunks of `pool`, of writes of random sizes
+        /// so its chunk boundaries fall inside them.
+        ///
+        /// @return the arrays of the body, by identity
+        private static List<byte[]> add(Log log, LogWriter.Batch batch, HeapPool pool, int size, Random random) {
+            var body = new FrameBody(random.nextBoolean() ? 256 : size, pool);
+            while (body.size() < size) {
+                var key = new byte[1 + random.nextInt(60)];
+                random.nextBytes(key);
+                switch (random.nextInt(6)) {
+                    case 0 -> body.putExternal(1, MemorySegment.ofArray(key), 100_000 + random.nextInt(1_000_000),
+                            new PageRef(random.nextInt(), 1 + random.nextInt(9), random.nextLong(), random.nextInt()));
+                    case 1 -> body.delete(2, MemorySegment.ofArray(key));
+                    default -> {
+                        var value = new byte[random.nextInt(4_000)];
+                        random.nextBytes(value);
+                        body.put(1, MemorySegment.ofArray(key), MemorySegment.ofArray(value));
+                    }
+                }
+            }
+            log.bodies.add(body.toBytes());
+            var arrays = new ArrayList<byte[]>();
+            for (var i = 0; i < body.chunkCount(); i++) {
+                arrays.add(body.chunk(i));
+            }
+            batch.add(FrameBody.COMMIT, log.last(), body, 0, 1, false);
+            return arrays;
+        }
+
+        /// Checks that `pool` holds no chunk free twice, and holds every one of `released`.
+        private static void assertReleased(HeapPool pool, List<byte[]> released) {
+            var free = Collections.newSetFromMap(new IdentityHashMap<byte[], Boolean>());
+            for (var array : pool.freeForTests(FrameBody.CHUNK_BYTES)) {
+                assertTrue(free.add(array), "a chunk is free twice");
+            }
+            for (var array : released) {
+                if (array.length == FrameBody.CHUNK_BYTES) {
+                    assertTrue(free.contains(array), "a chunk of a sealed body did not go back");
+                }
+            }
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("seals bodies of 300 KiB, 600 KiB and 1.5 MiB on chunks as one array would, beside runs, and gives each chunk back once")
+        void sealed(boolean encrypted, @TempDir Path directory) throws Exception {
+            var log = new Log(directory, encrypted, 64L << 20);
+            var pool = new HeapPool(1L << 30, false);
+            var random = new Random(encrypted ? 7 : 8);
+            for (var round = 0; round < 3; round++) {
+                // The chunks the last round gave back go to this one's bodies
+                var batch = new LogWriter.Batch();
+                var released = new ArrayList<byte[]>();
+                released.addAll(add(log, batch, pool, 300 << 10, random));
+                for (var i = 0; i < 20; i++) {
+                    log.add(batch, 100);
+                }
+                released.addAll(add(log, batch, pool, 600 << 10, random));
+                released.addAll(add(log, batch, pool, 1_536 << 10, random));
+                // A body started on a chunk that ends small, which a run takes
+                var small = new FrameBody(FrameBody.CHUNK_BYTES, pool);
+                small.put(1, MemorySegment.ofArray(new byte[]{1, 2, 3}), MemorySegment.ofArray(new byte[1_000]));
+                log.bodies.add(small.toBytes());
+                released.add(small.array());
+                batch.add(FrameBody.COMMIT, log.last(), small, 0, 1, false);
+                for (var i = 0; i < 20; i++) {
+                    log.add(batch, 100);
+                }
+                log.writer.appendAll(batch);
+                assertReleased(pool, released);
+            }
+            log.close();
+
+            var segments = log.frames();
+            var number = segments.firstKey();
+            var bytes = Files.readAllBytes(log.files.segment(number));
+            var large = 0;
+            for (var frame : segments.get(number)) {
+                if (frame.type() != FrameBody.COMMIT) {
+                    continue;
+                }
+                var expected = log.bodies.get((int) frame.sequence() - 1);
+                assertArrayEquals(expected, log.open(number, frame), "the body of commit " + frame.sequence());
+                var header = Arrays.copyOfRange(bytes, frame.offset(), frame.bodyAt());
+                assertArrayEquals(log.seal(number, bytes, frame.offset(), header, expected), Arrays.copyOfRange(bytes, frame.bodyAt(), frame.end()),
+                        "commit " + frame.sequence() + " sealed as one call would");
+                if (expected.length > FrameBody.CHUNK_BYTES) {
+                    large++;
+                }
+            }
+            assertEquals(9, large, "the frames of bodies on more than one chunk");
+            log.assertReplayed(log.replay(0), 1, log.last());
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("seals bodies on chunks across segment rollovers, one larger than a segment, which recovery replays")
+        void rollover(boolean encrypted, @TempDir Path directory) throws Exception {
+            var log = new Log(directory, encrypted, 1L << 20);
+            var pool = new HeapPool(1L << 30, false);
+            var random = new Random(encrypted ? 9 : 10);
+            for (var size : new int[]{600 << 10, 700 << 10, 1_536 << 10, 300 << 10}) {
+                var batch = new LogWriter.Batch();
+                var released = new ArrayList<byte[]>();
+                for (var i = 0; i < 5; i++) {
+                    log.add(batch, 100);
+                }
+                released.addAll(add(log, batch, pool, size, random));
+                released.addAll(add(log, batch, pool, 400 << 10, random));
+                log.add(batch, 100);
+                log.writer.appendAll(batch);
+                assertReleased(pool, released);
+            }
+            log.close();
+            assertTrue(log.frames().values().stream().filter(frames -> !frames.isEmpty()).count() >= 4, "the segments written");
+            log.assertReplayed(log.replay(0), 1, log.last());
+        }
+
+        @ParameterizedTest(name = "seed {0}, encrypted: {1}")
+        @CsvSource({"1, true", "2, true", "1, false", "2, false"})
+        @DisplayName("seals bodies on chunks that refer to values, as a transaction's are, as it seals the same bodies holding them, and gives each chunk back once")
+        void referring(int seed, boolean encrypted, @TempDir Path directory) throws Exception {
+            var random = new Random(seed);
+            var log = new Log(directory, encrypted, 8L << 20);
+            var pool = new HeapPool(1L << 30, false);
+            try {
+                for (var group = 0; group < 4; group++) {
+                    var batch = new LogWriter.Batch();
+                    var released = new ArrayList<byte[]>();
+                    for (var commit = 1 + random.nextInt(2); commit > 0; commit--) {
+                        var copied = new FrameBody();
+                        var referring = References.body(random, 1_000 + random.nextInt(1_500), FrameBody.SEALED_REFERABLE, 4_096, copied, pool);
+                        assertTrue(referring.references() > 0 && referring.chunkCount() > 1, "a body on chunks that refers to values");
+                        assertEquals(copied.size(), referring.size());
+                        assertArrayEquals(copied.toBytes(), referring.toBytes());
+                        for (var i = 0; i < referring.chunkCount(); i++) {
+                            released.add(referring.chunk(i));
+                        }
+                        log.add(batch, referring);
+                        log.add(batch, 100);
+                    }
+                    log.writer.appendAll(batch);
+                    assertReleased(pool, released);
+                }
+            } finally {
+                log.close();
+            }
+            References.assertSealedAsCopied(log);
         }
     }
 }

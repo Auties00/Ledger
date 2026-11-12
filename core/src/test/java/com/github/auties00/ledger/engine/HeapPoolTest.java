@@ -31,7 +31,7 @@ class HeapPoolTest {
     }
 
     @Test
-    @DisplayName("frees its arrays once no array was acquired between two trims, and keeps them while one was")
+    @DisplayName("frees the arrays of a size once no array of it was acquired between two trims, and keeps them while one was")
     void trimsWhenIdle() {
         // Not the process's trimmer's, which would trim it between the calls here
         var pool = new HeapPool(1 << 20, false);
@@ -41,7 +41,7 @@ class HeapPoolTest {
         assertEquals(4_096 + 65_536, pool.pooledBytesForTests(), "acquired since the last trim");
         pool.release(pool.acquire(4_096));
         pool.trimIfIdle();
-        assertEquals(4_096 + 65_536, pool.pooledBytesForTests(), "acquired since the last trim");
+        assertEquals(4_096, pool.pooledBytesForTests(), "only the size acquired since the last trim");
         pool.trimIfIdle();
         assertEquals(0, pool.pooledBytesForTests(), "idle since the last trim");
         // A trimmed pool recycles again

@@ -192,7 +192,7 @@ class FrameReferencesTest {
         single.put(MESSAGES, "single", pattern(random, 1_000));
         single.put(MESSAGES, "small", pattern(random, FrameBody.RUN_REFERABLE - 1));
         single.prepare(false, null, Map.of());
-        var body = FrameBody.forCommit(single, null);
+        var body = FrameBody.forCommit(single, null, null);
         assertEquals(FrameBody.RUN_REFERABLE, body.referable());
         var estimate = FrameBody.capacityFor(single, null);
         assertTrue(estimate > 1_000);
@@ -200,14 +200,14 @@ class FrameReferencesTest {
 
         // The value whose unit holds it is no reference
         var units = new PageRef[]{new PageRef(1, 1, 0, 0, 0), null};
-        assertEquals(Math.max(16, FrameBody.capacityFor(single, units)), FrameBody.forCommit(single, units).pieceArray(0).length);
+        assertEquals(Math.max(16, FrameBody.capacityFor(single, units)), FrameBody.forCommit(single, units, null).pieceArray(0).length);
 
         var large = new ArrayWriteBatch(this, pool, BY_NAME);
         for (var i = 0; i < 20; i++) {
             large.put(MESSAGES, "message" + i, pattern(random, 1_000));
         }
         large.prepare(false, null, Map.of());
-        var largeBody = FrameBody.forCommit(large, null);
+        var largeBody = FrameBody.forCommit(large, null, null);
         assertEquals(FrameBody.NOT_REFERABLE, largeBody.referable());
         assertEquals(FrameBody.capacityFor(large, null), largeBody.pieceArray(0).length);
         assertTrue(FrameBody.capacityFor(large, null) > LogWriter.RUN_MAX_BODY);
