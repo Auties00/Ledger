@@ -309,7 +309,18 @@ final class ResidentLoader {
                     var refs = leaves.subList(start, end).stream().map(TreeSearch.Leaf::ref).toList();
                     reading = end == leaves.size() ? LAST_LEAF : leaves.get(end).first();
                     try {
-                        install(pages.readAll(refs, PageFile.NODE, width), from);
+                        // The entries are installed on arrays of their own, so the leaves go back to the pool
+                        var collectable = new boolean[refs.size()];
+                        var units = pages.readAll(refs, PageFile.NODE, width, collectable);
+                        try {
+                            install(units, from);
+                        } finally {
+                            for (var i = 0; i < units.length; i++) {
+                                if (collectable[i]) {
+                                    pages.releasePrefetched(units[i]);
+                                }
+                            }
+                        }
                     } finally {
                         reading = null;
                         signal();

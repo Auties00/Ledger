@@ -303,9 +303,9 @@ final class PageFile implements AutoCloseable {
         return cipher.open(sealed, offset, ref.pages(), cached ? PageFormat.cachedLength(ref.pages(), content) : length, pool);
     }
 
-    /// Reads the first `count` units `refs` names into one array of the store's pool, sealed as the file holds them,
-    /// and returns it; [#openPrefetched(PageRef, byte, byte\[\], int)] opens each, and [#releasePrefetched(byte\[\])]
-    /// gives the array back once none is needed.
+    /// Reads the first `count` units `refs` names into one [collectable][HeapPool#acquireCollectable(int)] array of
+    /// the store's pool, sealed as the file holds them, and returns it; [#openPrefetched(PageRef, byte, byte\[\], int)]
+    /// opens each, and [#releasePrefetched(byte\[\])] gives the array back once none is needed.
     ///
     /// It reads ahead of a scan whose reads are [cold][#coldReads()], which may never use what it reads, so it reports
     /// no failure: a unit it could not read has an offset of -1, and the read that needs it fails as it would have
@@ -340,7 +340,7 @@ final class PageFile implements AutoCloseable {
             bases[run] = length;
             length += plan.pages(run) * PageFormat.SIZE;
         }
-        var sealed = pool.acquire(length);
+        var sealed = pool.acquireCollectable(length);
         try {
             ClaimedIndexes.run("ledger-prefetch", plan.count, Math.min(READ_CHANNELS, plan.count) - 1,
                     run -> prefetchRun(refs, plan, run, sealed, bases[run], offsets));
@@ -348,7 +348,7 @@ final class PageFile implements AutoCloseable {
             // A thread that would not start: the units left unread are read by the reads that need them
         } catch (Throwable throwable) {
             // No thread holds the array once the run returns or throws
-            pool.release(sealed);
+            pool.releaseCollectable(sealed);
             throw throwable;
         }
         return sealed;
@@ -420,10 +420,10 @@ final class PageFile implements AutoCloseable {
         }
     }
 
-    /// {@return an array of the store's pool that the unit `ref` names opens into, which
+    /// {@return a collectable array of the store's pool that the unit `ref` names opens into, which
     /// [#releasePrefetched(byte\[\])] gives back}
     byte[] acquireOpened(PageRef ref) {
-        return pool.acquire(ref.pages() * PageFormat.SIZE - PageFormat.TAG);
+        return pool.acquireCollectable(ref.pages() * PageFormat.SIZE - PageFormat.TAG);
     }
 
     /// Gives an array of [#prefetch(PageRef\[\], int, int\[\])] or [#acquireOpened(PageRef)] back to the store's pool;
@@ -432,7 +432,7 @@ final class PageFile implements AutoCloseable {
     /// @param array the array, or `null` for none
     void releasePrefetched(byte[] array) {
         if (array != null) {
-            pool.release(array);
+            pool.releaseCollectable(array);
         }
     }
 
@@ -485,6 +485,23 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
     /// @throws LedgerIoException if the file cannot be read
     byte[][] readAll(List<PageRef> refs, byte kind, int threads) {
+        return readAll(refs, kind, threads, null);
+    }
+
+    /// {@return the plaintext of the units `refs` name, in their order, none of them cached, as
+    /// [#readAll(List, byte, int)] reads them}
+    ///
+    /// The units read with others are opened into [collectable][HeapPool#acquireCollectable(int)] arrays of the
+    /// store's pool, whole, which the caller gives back with [#releasePrefetched(byte\[\])] once it no longer reads
+    /// them: a load copies the entries of each run of leaves into memory and forgets the leaves, and an array of its
+    /// own for each was 4 KiB of the 10 a leaf of two values of 1.5 KiB cost it.
+    ///
+    /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
+    /// @param collectable receives, for each unit, whether it lies in such an array, or `null` for units in arrays of
+    ///                    their own
+    /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[][] readAll(List<PageRef> refs, byte kind, int threads, boolean[] collectable) {
         var units = new byte[refs.size()][];
         // The units read from the file, with their indexes in `refs`, and the indexes of the others
         var joined = new PageRef[refs.size()];
@@ -506,7 +523,7 @@ final class PageFile implements AutoCloseable {
         var running = Math.min(Math.min(READ_CHANNELS, threads), tasks);
         ClaimedIndexes.run("ledger-read", tasks, running - 1, task -> {
             if (task < plan.count) {
-                readRun(joined, slots, plan, task, kind, units);
+                readRun(joined, slots, plan, task, kind, units, collectable);
             } else {
                 var index = alone[task - plan.count];
                 units[index] = read(refs.get(index), kind, false);
@@ -515,26 +532,59 @@ final class PageFile implements AutoCloseable {
         return units;
     }
 
-    /// Reads the units of run `run` of `plan` with one call and opens each into `units`, at the index `slots` gives it.
+    /// Reads the units of run `run` of `plan` with one call and opens each into `units`, at the index `slots` gives it:
+    /// ending with its content as the cache keeps it, in an array of its own, or whole, in a
+    /// [collectable][HeapPool#acquireCollectable(int)] array of the store's pool that `collectable` then records, if
+    /// `collectable` is not `null`.
     ///
     /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
-    private void readRun(PageRef[] refs, int[] slots, Runs plan, int run, byte kind, byte[][] units) {
+    private void readRun(PageRef[] refs, int[] slots, Runs plan, int run, byte kind, byte[][] units,
+                         boolean[] collectable) {
         var first = plan.firsts[run];
         var length = plan.pages(run) * PageFormat.SIZE;
-        var sealed = pool.acquire(length);
+        var sealed = pool.acquireCollectable(length);
         try {
             readFully(sealed, length, PageFormat.offset(first));
             for (var i = plan.starts[run]; i < plan.starts[run + 1]; i++) {
                 var index = plan.unit(i);
                 var ref = refs[index];
-                var plain = open(ref, kind, sealed, (ref.page() - first) * PageFormat.SIZE, true);
+                var offset = (ref.page() - first) * PageFormat.SIZE;
+                var plain = collectable == null ? open(ref, kind, sealed, offset, true)
+                        : openCollectable(ref, kind, sealed, offset);
                 if (plain == null) {
                     throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
                 }
                 units[slots[index]] = plain;
+                if (collectable != null) {
+                    collectable[slots[index]] = true;
+                }
             }
         } finally {
-            pool.release(sealed);
+            pool.releaseCollectable(sealed);
+        }
+    }
+
+    /// {@return the plaintext of the unit `ref` names, sealed at `offset` of `sealed`, whole, in a
+    /// [collectable][HeapPool#acquireCollectable(int)] array of the store's pool, or `null` if it fails authentication or
+    /// is not the unit `ref` names, which leaves the pool its array}
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    private byte[] openCollectable(PageRef ref, byte kind, byte[] sealed, int offset) {
+        // The header is the additional data of the tag, so what it says holds once the unit authenticates
+        var content = Bytes.i32(sealed, offset + PageFormat.LENGTH);
+        if (!ref.describes(sealed, offset) || !kindMatches(sealed[offset + PageFormat.KIND], kind)
+                || !PageFormat.fits(ref.pages(), content)) {
+            return null;
+        }
+        var plain = pool.acquireCollectable(ref.pages() * PageFormat.SIZE);
+        var opened = false;
+        try {
+            opened = cipher.open(sealed, offset, ref.pages(), plain);
+            return opened ? plain : null;
+        } finally {
+            if (!opened) {
+                pool.releaseCollectable(plain);
+            }
         }
     }
 
