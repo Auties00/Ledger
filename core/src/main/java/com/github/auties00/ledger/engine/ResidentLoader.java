@@ -15,30 +15,34 @@ import java.util.function.IntConsumer;
 /// to pass its key ([#await(MemorySegment)]), and a read reads the key from the tree of its own checkpoint, which holds
 /// the key's value as the read sees it, since no commit changed the key and no range removal covered it while the
 /// loader had not reached it. The loader reads the leaves of the tree of a read it registers, so their pages stay
-/// that tree's while it reads them, and installs the entries of each run of leaves as chains whose only version is
-/// stamped as the checkpoint the store opened from, below the bound of every read and the stamp of every later write.
-/// The volatile store of [#below] after a run publishes it: a read or a write of a key below it finds the key's chain,
-/// or no chain if the key has no entry, as in a key space loaded while the store opened.
+/// that tree's while it reads them, and installs the entries of each leaf as chains whose only version is stamped as
+/// the checkpoint the store opened from, below the bound of every read and the stamp of every later write. The volatile
+/// store of [#below] after each leaf publishes it: a read or a write of a key below it finds the key's chain, or no
+/// chain if the key has no entry, as in a key space loaded while the store opened.
 ///
-/// It runs on a virtual thread of its own from the first use of its key space ([#start()]), and reads the leaves on
-/// [#THREADS] threads, which leave the other processors to the reads of the store and to the compiler, busy after an
-/// open; or on the opening thread ([#loadNow()]), on as many threads as the data file has read channels. Once a thread
-/// waits for it or a long scan reads beside it ([#awaitRun(MemorySegment)]), its next runs take every read channel too,
-/// since a read or a write is waiting for them.
+/// The leaves come from a [LeafStream]: workers read and open them ahead of the loader's thread, which installs them in
+/// key order as each is opened, and reads those no worker reached itself. It runs on a virtual thread of its own from
+/// the first use of its key space ([#start()]), beside one worker, which leaves the other processors to the reads of
+/// the store and to the compiler, busy after an open; or on the opening thread ([#loadNow()]), beside as many workers
+/// as the data file has read channels for. Once a thread waits for it or a long scan reads beside it
+/// ([#awaitRun(MemorySegment)]), it starts those workers too, at its next leaf, since a read or a write is waiting for
+/// them.
 final class ResidentLoader {
-    /// The threads a loader running beside the store reads the leaves on.
+    /// The threads a loader running beside the store reads the leaves on: its own and one worker.
     private static final int THREADS = 2;
-    /// The leaves of the first run a loader running beside the store installs: the first keys reach memory soon after
-    /// the first use, and each run after takes twice as many, up to one [PageFile#readAll(List, byte, int)] call per
-    /// thread.
-    private static final int FIRST_RUN = 16;
+    /// The leaves the loader installs between two wake-ups of the threads waiting for it, and between two steps: a
+    /// scan woken at every leaf would park and unpark a thousand times a load.
+    private static final int PUBLISHED = 16;
+    /// The fewest leaves installed since the last wake-up for which the loader wakes the threads waiting for it before it
+    /// waits for a leaf itself, which may take a read of the file.
+    private static final int PUBLISHED_BEFORE_WAIT = 4;
     private static final int IDLE = 0;
     private static final int RUNNING = 1;
     private static final int FAILED = 2;
     private static final int DONE = 3;
     /// Sorts before every key: a key is at least one byte.
     private static final MemorySegment NOTHING = MemorySegment.ofArray(new byte[0]).asReadOnly();
-    /// The value of [#reading] for a run that reaches the last leaf, by identity.
+    /// The value of [#reading] while the loader may read up to the last leaf, by identity.
     private static final MemorySegment LAST_LEAF = MemorySegment.ofArray(new byte[0]).asReadOnly();
 
     private final LiveLedger ledger;
@@ -50,17 +54,17 @@ final class ResidentLoader {
     // Guards the thread, the attempts and the failure, and wakes the writes waiting for a key
     private final ReentrantLock lock;
     private final Condition progress;
-    // Memory holds every entry of a key below it; only grows, written by the loader after each run it installs
+    // Memory holds every entry of a key below it; only grows, written by the loader after each leaf it installs
     private volatile MemorySegment below;
-    // The first key after the run the loader is reading, or null while it reads none; written by the loader
+    // The first key after the leaves the loader is reading, or null while it reads none; written by the loader
     private volatile MemorySegment reading;
-    // Set once a thread needs the loader to go faster: its next runs take every read channel
+    // Set once a thread needs the loader to go faster: it starts a worker for every read channel
     private volatile boolean hurried;
-    // Set once memory holds every entry, after the last run
+    // Set once memory holds every entry, after the last leaf
     private volatile boolean complete;
     // IDLE before the first use, or after a stop; written holding the lock
     private volatile int status;
-    // Set as the store closes: the loader stops before its next run, and no thread starts it again
+    // Set as the store closes: the loader stops before its next leaf, and no thread starts it again
     private volatile boolean stopping;
     // The thread of the last attempt, guarded by the lock
     private Thread thread;
@@ -68,9 +72,13 @@ final class ResidentLoader {
     private int attempts;
     private int failedAttempt;
     private RuntimeException failure;
-    /// Called after the loader registered its read, with 0, and after each run it installs, with the runs installed so
-    /// far; for tests that pause it there.
+    /// Called after the loader registered its read, with 0, and after every [#PUBLISHED] leaves it installs, with the
+    /// times it was called before, while the loader reads none of the leaves; for tests that pause it there.
     volatile IntConsumer stepHookForTests;
+    /// Receives each array of the pool the loader gives back, before it does; for tests, or `null`.
+    volatile Consumer<byte[]> releaseHookForTests;
+    // The workers of the last attempt; for tests
+    private volatile int workers;
 
     /// Creates the loader of `state`, whose tree is in `pages`.
     ///
@@ -145,12 +153,12 @@ final class ResidentLoader {
         }
     }
 
-    /// Has the next runs read on every read channel and, if the loader is reading the run that holds the keys next to
-    /// `key`, in either direction, waits until that run is in memory; for a long scan, which would read the same leaves
-    /// again one at a time.
+    /// Has the loader read on every read channel and, if it is reading the leaves that hold the keys next to `key`, in
+    /// either direction, waits until memory holds them; for a long scan, which would read the same leaves again one at
+    /// a time.
     ///
-    /// It waits for a run in flight alone, which needs no thread that waits here: it returns at once from a loader
-    /// that reads no leaves, as one that failed or stopped, or that has yet to reach the key.
+    /// It waits for leaves in flight alone, which need no thread that waits here: it returns at once from a loader that
+    /// reads no leaves, as one that failed or stopped, or that has yet to reach the key.
     ///
     /// @return whether it waited
     boolean awaitRun(MemorySegment key) {
@@ -169,7 +177,7 @@ final class ResidentLoader {
         return true;
     }
 
-    /// {@return whether the run the loader is reading holds the keys next to `key`, which memory does not hold yet}
+    /// {@return whether the leaves the loader is reading hold the keys next to `key`, which memory does not hold yet}
     private boolean readingFor(MemorySegment key) {
         var end = reading;
         return end != null && (end == LAST_LEAF || Segments.compare(key, end) < 0) && !holds(key);
@@ -195,7 +203,7 @@ final class ResidentLoader {
         return attempts;
     }
 
-    /// Stops the loader before its next run and waits for its thread, as the store closes; no thread starts it again.
+    /// Stops the loader before its next leaf and waits for its thread, as the store closes; no thread starts it again.
     void stop() {
         Thread running;
         lock.lock();
@@ -228,13 +236,13 @@ final class ResidentLoader {
     /// @throws LedgerCorruptedException if a node fails authentication
     /// @throws com.github.auties00.ledger.LedgerIoException if the file cannot be read
     void loadNow() {
-        load(PageFile.READ_CHANNELS, PageFile.READ_CHANNELS * PageFile.RUN_PAGES);
+        load(true);
     }
 
     private void run() {
         Throwable failed = null;
         try {
-            load(THREADS, FIRST_RUN);
+            load(false);
         } catch (RuntimeException | Error throwable) {
             failed = throwable;
         }
@@ -280,10 +288,9 @@ final class ResidentLoader {
         }
     }
 
-    /// Installs the entries from [#below] on, `firstRun` leaves first and twice as many each run after, up to
-    /// `threads` reads of [PageFile#RUN_PAGES] pages a run; once [#hurried], every run takes all it can on every read
-    /// channel.
-    private void load(int threads, int firstRun) {
+    /// Installs the entries from [#below] on, leaf by leaf, from a stream on [#THREADS] threads, or on every read
+    /// channel if `now` or once [#hurried].
+    private void load(boolean now) {
         var readers = ledger.readers();
         // The registration keeps the tree and its pages, which a checkpoint published meanwhile would free
         var sequence = readers.register();
@@ -292,72 +299,99 @@ final class ResidentLoader {
             var from = below;
             var trees = ledger.point(sequence).tree();
             var root = trees == null ? null : trees.root(state.id);
-            if (root != null) {
-                var leaves = TreeSearch.leaves(pages, root, from, threads);
-                var width = threads;
-                var run = firstRun;
-                var runs = 0;
-                for (var start = 0; start < leaves.size(); ) {
-                    if (stopping) {
-                        return;
-                    }
-                    if (hurried && width < PageFile.READ_CHANNELS) {
-                        width = PageFile.READ_CHANNELS;
-                        run = width * PageFile.RUN_PAGES;
-                    }
-                    var end = Math.min(leaves.size(), start + run);
-                    var refs = leaves.subList(start, end).stream().map(TreeSearch.Leaf::ref).toList();
-                    reading = end == leaves.size() ? LAST_LEAF : leaves.get(end).first();
-                    try {
-                        install(pages.readAll(refs, PageFile.NODE, width), from);
-                    } finally {
-                        reading = null;
-                        signal();
-                    }
-                    // In memory now: a read that cached one of them on its way reads memory from here on
-                    for (var ref : refs) {
-                        pages.cache().remove(ref);
-                    }
-                    start = end;
-                    run = Math.min(width * PageFile.RUN_PAGES, 2 * run);
-                    step(++runs);
-                }
+            if (root == null || stream(root, from, now)) {
+                finish();
             }
-            finish();
         } finally {
             readers.unregister(sequence);
         }
     }
 
-    /// Installs the entries of `leaves` at or after `from`, then publishes them by moving [#below] past the last.
+    /// Installs the entries at or after `from` of the leaves of the tree under `root`.
+    ///
+    /// @return whether it installed them all, rather than stopped
+    private boolean stream(TreeRoot root, MemorySegment from, boolean now) {
+        var wide = now || hurried;
+        var leaves = new LeafStream(pages, root, from, wide ? LeafStream.MAX_WORKERS : THREADS - 1, wide, releaseHookForTests);
+        try {
+            workers = leaves.workers();
+            var installed = 0;
+            var signalled = 0;
+            while (!stopping) {
+                if (!wide && hurried) {
+                    wide = true;
+                    leaves.widen();
+                    workers = leaves.workers();
+                }
+                reading = readingOf(leaves);
+                // The threads waiting for the leaves installed since the last wake-up need not wait for the next one
+                if (installed - signalled >= PUBLISHED_BEFORE_WAIT && !leaves.ready()) {
+                    signal();
+                    signalled = installed;
+                }
+                var leaf = leaves.next();
+                if (leaf == null) {
+                    return true;
+                }
+                install(leaf.unit(), from);
+                // In memory now: a read that cached it on its way reads memory from here on
+                pages.cache().remove(leaf.ref);
+                leaves.taken(leaf);
+                if (++installed % PUBLISHED == 0) {
+                    reading = null;
+                    signal();
+                    signalled = installed;
+                    step(installed / PUBLISHED);
+                }
+            }
+            return false;
+        } finally {
+            // Before the registration ends: no read of the tree outlives it
+            leaves.close();
+            reading = null;
+            signal();
+        }
+    }
+
+    /// {@return the value of [#reading] while `leaves` may read the leaves up to [LeafStream#reading()]}
+    private static MemorySegment readingOf(LeafStream leaves) {
+        var bound = leaves.reading();
+        return bound == null ? LAST_LEAF : bound;
+    }
+
+    /// Installs the entries of `leaf` at or after `from`, then publishes them by moving [#below] past the last.
     ///
     /// A key that has a chain already got it from an earlier attempt that failed, and keeps it: no commit writes the
-    /// keys at or after [#below].
-    private void install(byte[][] leaves, MemorySegment from) {
+    /// keys at or after [#below]. Nothing installed refers to `leaf`, which may go back to the pool after: the keys and
+    /// the values are copied, and a decoder keeps nothing of the memory it reads.
+    private void install(byte[] leaf, MemorySegment from) {
         var values = state.keyspace.values();
         MemorySegment last = null;
-        for (var leaf : leaves) {
-            for (var i = 0; i < TreeNodes.count(leaf); i++) {
-                var offset = TreeNodes.entry(leaf, i);
-                var key = TreeNodes.leafKey(leaf, offset);
-                if (Segments.compare(key, from) < 0) {
-                    continue;
-                }
-                var value = TreeSearch.value(pages, leaf, offset, false);
-                var decoded = values.decode(value);
-                // A version on an array of its own, not on the leaf, which would stay reachable while one of its
-                // entries does; the decoded array is the encoding, of which the version keeps one copy
-                var version = decoded instanceof byte[] bytes && values == BuiltinCodecs.BYTES_VALUE
-                        ? new Version(stamp, bytes, decoded, null)
-                        : new Version(stamp, Segments.toBytes(value), decoded, null);
-                state.install(key, version);
-                last = key;
+        for (var i = 0; i < TreeNodes.count(leaf); i++) {
+            var offset = TreeNodes.entry(leaf, i);
+            var key = TreeNodes.leafKey(leaf, offset);
+            if (Segments.compare(key, from) < 0) {
+                continue;
             }
+            var value = TreeSearch.value(pages, leaf, offset, false);
+            var decoded = values.decode(value);
+            // A version on an array of its own, not on the leaf, which would stay reachable while one of its
+            // entries does; the decoded array is the encoding, of which the version keeps one copy
+            var version = decoded instanceof byte[] bytes && values == BuiltinCodecs.BYTES_VALUE
+                    ? new Version(stamp, bytes, decoded, null)
+                    : new Version(stamp, Segments.toBytes(value), decoded, null);
+            state.install(key, version);
+            last = key;
         }
         if (last != null) {
             // Past the last key: a key between it and the next leaf's first has no entry
             below = after(last);
         }
+    }
+
+    /// {@return the workers the last attempt read on, for tests}
+    int workersForTests() {
+        return workers;
     }
 
     /// {@return the key right after `key`, on an array of its own}
@@ -390,10 +424,10 @@ final class ResidentLoader {
         }
     }
 
-    private void step(int runs) {
+    private void step(int steps) {
         var hook = stepHookForTests;
         if (hook != null) {
-            hook.accept(runs);
+            hook.accept(steps);
         }
     }
 }

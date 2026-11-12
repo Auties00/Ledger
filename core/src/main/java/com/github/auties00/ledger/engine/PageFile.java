@@ -292,6 +292,78 @@ final class PageFile implements AutoCloseable {
         }
     }
 
+    /// Receives the units [#readOwned(PageRef\[\], int, byte, OwnedUnits)] reads, one at a time.
+    @FunctionalInterface
+    interface OwnedUnits {
+        /// Takes the plaintext of the unit at `index` of the references read.
+        ///
+        /// @param pooled whether `unit` is an array of the store's pool, which the receiver owns and gives back with
+        ///               [PageFile#release(byte\[\])] once it no longer reads it, rather than the cache's own array, which may
+        ///               still be read by others and is never given back
+        void accept(int index, byte[] unit, boolean pooled);
+    }
+
+    /// Reads the first `count` units `refs` names, at most 64, which follow one another in pages and none of which is a
+    /// delta record, and passes each to `units` once it has it.
+    ///
+    /// A unit the cache holds is passed as the cache's array, and is not read; the others are read with one call and
+    /// each is opened into an array of the store's pool, passed as soon as it authenticates, so the receiver can use
+    /// the first while the rest are opened. A pooled array never goes to the cache: readers keep using the arrays the
+    /// cache evicts, so an array it held cannot go back to the pool. An array may be longer than its unit.
+    ///
+    /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
+    /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names, once the
+    ///                                  units before it were passed
+    /// @throws LedgerIoException if the file cannot be read
+    void readOwned(PageRef[] refs, int count, byte kind, OwnedUnits units) {
+        if (count > Long.SIZE) {
+            throw new IllegalArgumentException("A read of " + count + " units");
+        }
+        // The units the cache lacks, by their index
+        var missing = 0L;
+        for (var index = 0; index < count; index++) {
+            var hit = cached(refs[index], kind);
+            if (hit != null) {
+                units.accept(index, hit, false);
+            } else {
+                missing |= 1L << index;
+            }
+        }
+        if (missing == 0) {
+            return;
+        }
+        var low = Long.numberOfTrailingZeros(missing);
+        var high = Long.SIZE - 1 - Long.numberOfLeadingZeros(missing);
+        var first = refs[low].page();
+        var length = (refs[high].page() + refs[high].pages() - first) * PageFormat.SIZE;
+        var sealed = pool.acquire(length);
+        try {
+            readFully(sealed, length, PageFormat.offset(first));
+            for (var index = low; index <= high; index++) {
+                if ((missing & 1L << index) == 0) {
+                    continue;
+                }
+                var ref = refs[index];
+                var plain = pool.acquire(ref.pages() * PageFormat.SIZE);
+                if (!cipher.open(sealed, (ref.page() - first) * PageFormat.SIZE, ref.pages(), plain) || !ref.describes(plain)
+                        || !kindMatches(plain[PageFormat.KIND], kind)) {
+                    // What the open left in it is no unit's
+                    pool.release(plain);
+                    throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+                }
+                units.accept(index, plain, true);
+            }
+        } finally {
+            pool.release(sealed);
+        }
+    }
+
+    /// Gives back to the store's pool `unit`, an array [#readOwned(PageRef\[\], int, byte, OwnedUnits)] passed as
+    /// pooled, which the caller no longer reads.
+    void release(byte[] unit) {
+        pool.release(unit);
+    }
+
     /// {@return the plaintext of the unit `ref` names if the cache holds it, or `null`}
     ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch

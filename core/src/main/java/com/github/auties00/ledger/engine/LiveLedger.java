@@ -311,7 +311,7 @@ public final class LiveLedger implements Ledger {
     }
 
     /// Makes the loaders of the resident key spaces call `hook` after they register their read, with 0, and after
-    /// each run of leaves they install, with the runs installed so far; for tests that pause them there.
+    /// every 16 leaves they install, with the times they called it before; for tests that pause them there.
     void hookResidentLoadsForTests(IntConsumer hook) {
         for (var state : states.values()) {
             var loader = state.loading;

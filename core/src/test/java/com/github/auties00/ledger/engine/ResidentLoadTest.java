@@ -55,8 +55,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The load of a resident key space beside a store that opened without it: reads, counts, writes, snapshots,
-/// checkpoints, closes, crashes and failures while the loader is paused between its runs ([Pause]), and all of them
-/// at once while it runs. Values of 1,400 bytes put two entries in a leaf, so 1,200 entries take the loader seven runs.
+/// checkpoints, closes, crashes and failures while the loader is paused between its steps ([Pause]), and all of them
+/// at once while it runs. Values of 1,400 bytes put two entries in a leaf, so 1,200 entries take the loader 600 leaves,
+/// a step every 16.
 class ResidentLoadTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> SESSIONS = Keyspace.resident("sessions", KeyCodec.utf8(), ValueCodec.utf8());
@@ -245,7 +246,7 @@ class ResidentLoadTest {
         }
     }
 
-    @ParameterizedTest(name = "loader paused at run {0}")
+    @ParameterizedTest(name = "loader paused at step {0}")
     @ValueSource(ints = {0, 1, 2})
     @DisplayName("every read before, during and after the load sees what the store holds")
     void reads(int step, @TempDir Path directory) throws Exception {
@@ -396,7 +397,7 @@ class ResidentLoadTest {
     }
 
     @Test
-    @DisplayName("checkpoints while the loader is paused, before it took its tree and between its runs, hold every entry")
+    @DisplayName("checkpoints while the loader is paused, before it took its tree and between its steps, hold every entry")
     void checkpoints(@TempDir Path directory) throws Exception {
         var model = populate(directory, SESSIONS, ENTRIES);
         try (var ledger = open(directory, false)) {
@@ -433,7 +434,7 @@ class ResidentLoadTest {
     }
 
     @Test
-    @DisplayName("a close stops the loader before its next run, and the next open loads what it did not")
+    @DisplayName("a close stops the loader before its next leaf, and the next open loads what it did not")
     void closes(@TempDir Path directory) throws Exception {
         var model = populate(directory, SESSIONS, ENTRIES);
         var ledger = open(directory, false);
@@ -765,10 +766,10 @@ class ResidentLoadTest {
     }
 
     @Test
-    @DisplayName("a long scan waits for the run the loader is reading rather than read its leaves too")
+    @DisplayName("a long scan waits for the leaves the loader is reading rather than read them too")
     void scanWaitsForRun(@TempDir Path directory) throws Exception {
         var model = populate(directory, FRAGILE, ENTRIES);
-        // In the fourth run: 16, 32 and 64 leaves of two entries each come before it, and it takes 128
+        // In leaf 200: the 200 leaves of two entries each before it are in memory while the loader installs it
         var held = new Hold(value(400));
         HELD.set(held);
         try (var ledger = open(directory, false)) {
@@ -776,7 +777,7 @@ class ResidentLoadTest {
             assertEquals(Optional.of(value(0)), ledger.get(FRAGILE, key(0)));
             assertTrue(held.reached().await(60, TimeUnit.SECONDS));
             var inMemory = model.headMap(limit(live, FRAGILE)).size();
-            assertEquals(224, inMemory);
+            assertEquals(400, inMemory);
             var visited = new AtomicInteger();
             var scan = Thread.ofPlatform().start(() -> ledger.forEachEncoded(FRAGILE, KeyRange.all(), (_, _) -> {
                 visited.incrementAndGet();
@@ -820,51 +821,47 @@ class ResidentLoadTest {
     }
 
     @Test
-    @DisplayName("a long scan beside the loader makes its next runs read as wide as an open, and in as few runs")
+    @DisplayName("a long scan beside the loader makes it read as wide as an open")
     void scanHurriesLoader(@TempDir Path directory) throws Exception {
         var model = populate(directory, SESSIONS, ENTRIES);
         try (var ledger = open(directory, false)) {
             var live = (LiveLedger) ledger;
             var pause = new Pause(1);
-            var runs = new AtomicInteger();
-            live.hookResidentLoadsForTests(step -> {
-                runs.accumulateAndGet(step, Math::max);
-                pause.accept(step);
-            });
+            live.hookResidentLoadsForTests(pause);
             assertEquals(Optional.of(value(0)), ledger.get(SESSIONS, key(0)));
             pause.awaitPaused(1);
+            var loader = live.state(SESSIONS).loading;
+            // Beside the store, without a scan, it reads on one worker
+            assertEquals(1, loader.workersForTests());
             // Past the leaves a scan reads alone; the loader reads none now, so the scan does not wait
             var seen = new AtomicInteger();
             ledger.forEachEncoded(SESSIONS, KeyRange.atLeast(key(100)), (_, _) -> seen.incrementAndGet() < 40);
             pause.release(1);
             awaitLoaded(live, SESSIONS);
-            // Beside the store, without a scan, it takes seven: 16 leaves, then 512, then the 72 left of 600
-            assertEquals(3, runs.get());
+            assertEquals(LeafStream.MAX_WORKERS, loader.workersForTests());
             assertEquals(ENTRIES, live.state(SESSIONS).chains());
             checkReads(ledger, SESSIONS, model);
         }
     }
 
     @Test
-    @DisplayName("a write that waits for the loader makes its next runs read as wide as an open, and in as few runs")
+    @DisplayName("a write that waits for the loader makes it read as wide as an open")
     void writeHurriesLoader(@TempDir Path directory) throws Exception {
         populate(directory, SESSIONS, ENTRIES);
         try (var ledger = open(directory, false)) {
             var live = (LiveLedger) ledger;
             var pause = new Pause(1);
-            var runs = new AtomicInteger();
-            live.hookResidentLoadsForTests(step -> {
-                runs.accumulateAndGet(step, Math::max);
-                pause.accept(step);
-            });
+            live.hookResidentLoadsForTests(pause);
             assertEquals(Optional.of(value(0)), ledger.get(SESSIONS, key(0)));
             pause.awaitPaused(1);
+            var loader = live.state(SESSIONS).loading;
+            assertEquals(1, loader.workersForTests());
             var write = Thread.ofPlatform().start(() -> ledger.commit(ledger.newBatch().put(SESSIONS, key(ENTRIES - 1), "x")));
             awaitParked(write, new AtomicInteger());
             pause.release(1);
             write.join();
             awaitLoaded(live, SESSIONS);
-            assertEquals(3, runs.get());
+            assertEquals(LeafStream.MAX_WORKERS, loader.workersForTests());
             assertEquals(Optional.of("x"), ledger.get(SESSIONS, key(ENTRIES - 1)));
         }
     }

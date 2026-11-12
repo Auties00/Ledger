@@ -4,7 +4,6 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
 /// Point lookups and range counts in a key space's tree.
@@ -85,31 +84,63 @@ final class TreeSearch {
     record Leaf(PageRef ref, MemorySegment first) {
     }
 
-    /// {@return the leaves of the tree under `root` that may hold keys at or after `from`, in key order}
+    /// The leaves of a tree that may hold keys at or after a key, as far as the nodes on the path to that key name them.
     ///
-    /// It reads the branches a level at a time, with [PageFile#readAll(List, byte, int)] on up to `threads` threads,
-    /// and none of the leaves: a store that just opened finds its file out of the OS cache as often as not, and
-    /// reading the nodes of a level one after another made the reader wait for each read in turn.
-    static List<Leaf> leaves(PageFile pages, TreeRoot root, MemorySegment from, int threads) {
-        var top = pages.read(root.ref(), PageFile.NODE, true);
-        if (TreeNodes.isLeaf(top)) {
-            return List.of(new Leaf(root.ref(), null));
+    /// @param leaves the leaves of the lowest branch on the path, from the one that would hold the key on, in key
+    ///               order; or the root alone, if it is a leaf
+    /// @param rest   the subtrees after them, as lists of nodes of one level, each in key order: the nodes after the
+    ///               path's own in its parent, a level at a time from the lowest, so every node of a list holds keys
+    ///               after those of every list before it; empty lists for levels whose path node is its parent's
+    ///               last
+    record Path(List<Leaf> leaves, List<List<Leaf>> rest) {
+    }
+
+    /// {@return the leaves of the tree under `root` that the nodes on the path to `from` name, and the subtrees after
+    /// them}
+    ///
+    /// It reads one node a level, through the cache, so the first leaves are known after two or three reads: reading
+    /// every branch first made the leaves of a large tree wait for all of them.
+    static Path path(PageFile pages, TreeRoot root, MemorySegment from) {
+        var unit = pages.read(root.ref(), PageFile.NODE, true);
+        if (TreeNodes.isLeaf(unit)) {
+            return new Path(List.of(new Leaf(root.ref(), null)), List.of());
         }
-        var level = List.of(top);
+        var rest = new ArrayList<List<Leaf>>();
+        while (TreeNodes.level(unit) > 1) {
+            var index = TreeNodes.childFor(unit, from);
+            rest.add(children(unit, index + 1));
+            unit = pages.node(unit, index);
+        }
+        return new Path(children(unit, TreeNodes.childFor(unit, from)), rest.reversed());
+    }
+
+    /// {@return the leaves under `nodes`, nodes of one level of a tree in key order, in key order}
+    ///
+    /// It reads the nodes a level at a time, with [PageFile#readAll(List, byte, int)] on up to `threads` threads: a
+    /// store that just opened finds its file out of the OS cache as often as not, and reading the nodes of a level one
+    /// after another made the reader wait for each read in turn.
+    static List<Leaf> leavesUnder(PageFile pages, List<Leaf> nodes, int threads) {
+        var level = nodes;
         while (true) {
+            var units = pages.readAll(level.stream().map(Leaf::ref).toList(), PageFile.NODE, threads);
             var children = new ArrayList<Leaf>();
-            for (var node = 0; node < level.size(); node++) {
-                var unit = level.get(node);
-                // Only the first node of a level is on the path to `from`: those after it hold later keys alone
-                for (var i = node == 0 ? TreeNodes.childFor(unit, from) : 0; i < TreeNodes.count(unit); i++) {
-                    children.add(new Leaf(TreeNodes.childRef(unit, i), TreeNodes.childKey(unit, i)));
-                }
+            for (var unit : units) {
+                children.addAll(children(unit, 0));
             }
-            if (TreeNodes.level(level.getFirst()) == 1) {
+            if (TreeNodes.level(units[0]) == 1) {
                 return children;
             }
-            level = Arrays.asList(pages.readAll(children.stream().map(Leaf::ref).toList(), PageFile.NODE, threads));
+            level = children;
         }
+    }
+
+    /// {@return the children of branch `unit` from `from` on}
+    private static List<Leaf> children(byte[] unit, int from) {
+        var children = new ArrayList<Leaf>(Math.max(0, TreeNodes.count(unit) - from));
+        for (var i = from; i < TreeNodes.count(unit); i++) {
+            children.add(new Leaf(TreeNodes.childRef(unit, i), TreeNodes.childKey(unit, i)));
+        }
+        return children;
     }
 
     /// {@return the read-only value of leaf entry `entry` of `unit`, read from its blob if it has one}

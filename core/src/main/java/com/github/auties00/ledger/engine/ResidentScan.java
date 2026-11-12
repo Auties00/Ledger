@@ -14,15 +14,15 @@ import java.lang.foreign.MemorySegment;
 /// the scan's bound selects.
 ///
 /// The tree alone would read and decrypt the leaves one at a time on the calling thread, while the loader reads the
-/// same leaves again. So a scan reads [#OWN_LEAVES] leaves on its own, which keeps a short one from waiting for a run
-/// many times its size, and from there it [hurries the loader][ResidentLoader#awaitRun(MemorySegment)]: it waits for a
-/// run that holds the keys it needs, and reads a leaf itself only when the loader is not reading them. A scan of a whole
+/// same leaves again. So a scan reads [#OWN_LEAVES] leaves on its own, which keeps a short one from waiting for leaves
+/// many times its size, and from there it [hurries the loader][ResidentLoader#awaitRun(MemorySegment)]: it waits for
+/// the leaves that hold the keys it needs, and reads a leaf itself only when the loader is not reading them. A scan of a whole
 /// key space after an open therefore costs about what an open that loaded the key space cost, on as many threads. The
 /// wait depends on no role and never fails: a loader that stopped, failed or has yet to reach the scan's keys leaves it
 /// reading the tree.
 final class ResidentScan {
-    /// The leaves of the tree a scan reads before it waits for the loader: half the loader's first run, and the page of
-    /// chats of a first screen.
+    /// The leaves of the tree a scan reads before it waits for the loader: half the leaves the loader installs between
+    /// two wake-ups of the threads that wait for it, and the page of chats of a first screen.
     private static final int OWN_LEAVES = 8;
 
     private final KeyspaceState state;
