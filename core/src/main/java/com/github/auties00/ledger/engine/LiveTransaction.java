@@ -17,7 +17,8 @@ import java.util.function.Function;
 ///
 /// It runs alone, holding the sequencing and publishing roles once every commit given a sequence has published, and
 /// applies each write at once under a sequence no reader sees yet; its own reads
-/// use that sequence's bound, so they see the latest commit and the transaction's writes so far. Every key and value
+/// use that sequence's bound, so they see the latest commit and the transaction's writes so far, except a scan, which
+/// reads at the stamp of its call so that it passes none of the writes its visitor makes. Every key and value
 /// is encoded into memory of its own, which stays valid once the transaction publishes. A write of a key of a resident
 /// key space whose loader has not reached it waits for the loader, which takes no role.
 final class LiveTransaction implements Transaction {
@@ -56,7 +57,7 @@ final class LiveTransaction implements Transaction {
 
     @Override
     public <K, V> long forEach(Keyspace<K, V> keyspace, KeyRange<K> range, BiPredicate<? super K, ? super V> visitor) {
-        return Reads.forEach(state(keyspace), keyspace, range, ledger.writerPoint(applier.bound()), visitor);
+        return Reads.forEach(state(keyspace), keyspace, range, ledger.writerPoint(applier.scanBound()), visitor);
     }
 
     @Override
@@ -72,7 +73,7 @@ final class LiveTransaction implements Transaction {
     @Override
     public <K> long forEachEncoded(Keyspace<K, ?> keyspace, KeyRange<K> range,
                                    BiPredicate<? super MemorySegment, ? super MemorySegment> visitor) {
-        return Reads.forEachEncoded(state(keyspace), keyspace, range, ledger.writerPoint(applier.bound()), visitor);
+        return Reads.forEachEncoded(state(keyspace), keyspace, range, ledger.writerPoint(applier.scanBound()), visitor);
     }
 
     @Override

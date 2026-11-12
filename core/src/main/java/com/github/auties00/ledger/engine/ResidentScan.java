@@ -9,8 +9,9 @@ import java.lang.foreign.MemorySegment;
 /// hold what the scan sees. A commit the scan sees wrote no key at or above the position the scan first read, since a
 /// write waits for the loader to pass its key: the tree holds those keys as the scan sees them, however far the loader
 /// has moved since. Memory holds every entry below the position at a stamp below the bound of every read, and the
-/// writes since; a key of a transaction's own scan that its visitor just wrote is below the position by then, so the
-/// scan reads the write.
+/// writes since; a key a transaction's scan reaches after its visitor wrote it is below the position by then, as the
+/// write waited for the loader, and memory holds the key's version before the write, if it had one, under it, which
+/// the scan's bound selects.
 ///
 /// The tree alone would read and decrypt the leaves one at a time on the calling thread, while the loader reads the
 /// same leaves again. So a scan reads [#OWN_LEAVES] leaves on its own, which keeps a short one from waiting for a run

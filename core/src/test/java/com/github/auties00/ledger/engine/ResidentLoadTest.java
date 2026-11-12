@@ -870,8 +870,8 @@ class ResidentLoadTest {
     }
 
     @Test
-    @DisplayName("a scan of a transaction sees what its visitor writes ahead of it, past where the loader was")
-    void scanSeesOwnWrites(@TempDir Path directory) throws Exception {
+    @DisplayName("a scan of a transaction passes none of what its visitor writes ahead of it, past where the loader was, while point reads see it")
+    void scanSkipsOwnWrites(@TempDir Path directory) throws Exception {
         var model = populate(directory, SESSIONS, ENTRIES);
         try (var ledger = open(directory, false)) {
             var live = (LiveLedger) ledger;
@@ -881,18 +881,21 @@ class ResidentLoadTest {
             pause.awaitPaused(1);
             var trigger = model.ceilingKey(limit(live, SESSIONS));
             var visited = new ArrayList<Entry<String, String>>();
+            var before = entries(model);
             ledger.update(transaction -> transaction.forEach(SESSIONS, KeyRange.all(), (key, value) -> {
                 visited.add(new Entry<>(key, value));
                 if (key.equals(trigger)) {
                     pause.release(1);
                     transaction.put(SESSIONS, key(300), "own");
                     transaction.delete(SESSIONS, key(301));
+                    assertEquals(Optional.of("own"), transaction.get(SESSIONS, key(300)));
+                    assertEquals(Optional.empty(), transaction.get(SESSIONS, key(301)));
                 }
                 return true;
             }));
             model.put(key(300), "own");
             model.remove(key(301));
-            assertEquals(entries(model), visited);
+            assertEquals(before, visited);
             assertEquals(entries(model), ledger.range(SESSIONS, KeyRange.all(), Integer.MAX_VALUE));
         }
     }

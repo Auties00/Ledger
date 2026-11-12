@@ -4,9 +4,17 @@ import java.lang.foreign.MemorySegment;
 
 /// The reads and writes of a [Ledger#update] transaction.
 ///
-/// Reads see the latest state and the transaction's own writes, in the order it made them. The writes apply
+/// Reads see the latest state and the transaction's own writes, in the order it made them. A scan
+/// ([#forEach], [#forEachEncoded]) is one read, made when it is called: it passes the entries as they stood then, the
+/// writes the transaction made before the call included, and none of the writes its visitor makes, wherever they fall
+/// in the range; the visitor's own [#get] and [#size], and every read after the scan, see them. The writes apply
 /// atomically when the transaction returns, and not at all if it throws. A transaction is valid only while its
 /// function runs and only on the thread that runs it.
+///
+/// @apiNote A visitor may be handed an entry it removed or overwrote earlier in the same scan, with the value it had
+/// at the call, and the count a scan returns is of the entries it passed, which [#size] read inside the visitor or
+/// after need not match. A visitor that must skip what it already changed checks the key with [#get], which reads its
+/// writes.
 public non-sealed interface Transaction extends View {
     /// Stores `value` under `key`, replacing any value already there.
     ///

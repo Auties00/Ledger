@@ -2247,6 +2247,11 @@ public final class LiveLedger implements Ledger {
     }
 
     /// The writes of one commit or transaction, applied as they come and published together.
+    ///
+    /// Each write adds a version of its own, linked to the head it replaces, and nothing drops one before the commit
+    /// publishes. A transaction's scan relies on it: it reads at the bound of its call ([#scanBound()]) while its
+    /// visitor writes the keys ahead of it, so it needs the versions under those writes. Writes of one key within a
+    /// transaction may share a version only while none of its scans runs.
     final class Applier {
         private final long sequence;
         private int op;
@@ -2349,13 +2354,22 @@ public final class LiveLedger implements Ledger {
             return Reads.boundOf(sequence);
         }
 
+        /// {@return the bound of a read that sees the latest commit and this one's writes so far, and none it makes
+        /// after: the bound of a scan that starts now}
+        ///
+        /// After the last write a commit can hold, the next stamp would carry into the next sequence, so the bound is
+        /// then that of the whole sequence.
+        long scanBound() {
+            return op > Reads.MAX_OPS ? Reads.boundOf(sequence) : Reads.stamp(sequence, op) - 1;
+        }
+
         /// {@return the number of entries of `state` once this commit applies}
         ///
         /// It looks up the keys of the blind writes whose effect is not known yet, in the latest trees: the commits
         /// before this one have published, as this one runs alone. It counts the range removals of those commits whose
         /// count is not known yet, in the trees their reads keep.
         long count(KeyspaceState state) {
-            var point = writerPoint(Reads.stamp(sequence, op) - 1);
+            var point = writerPoint(scanBound());
             var blind = state.blind.correction(sequence - 1, key -> Reads.inTreeOnly(state, key, point));
             return state.counts.last() + blind + state.ranges.correction(sequence - 1) + delta(state);
         }
@@ -2463,7 +2477,7 @@ public final class LiveLedger implements Ledger {
             var chain = state.chain(key);
             if (chain == null || !chain.ordered()) {
                 var head = chain == null ? null : chain.head;
-                if (!Reads.exists(state, head, key, writerPoint(Reads.stamp(sequence, op) - 1), inTree)) {
+                if (!Reads.exists(state, head, key, writerPoint(scanBound()), inTree)) {
                     nextStamp();
                     return;
                 }
