@@ -58,6 +58,20 @@ final class TreeNodes {
     /// The header byte that marks a leaf made of a base leaf and a delta record, whose header names the base.
     private static final int ORIGIN = 3;
     private static final byte FROM_DELTA = 1;
+    /// The entries up to which a search of a leaf by an array key loads the first lines of all its keys before its
+    /// first compare, so that their misses overlap; a larger node, or a branch, loads those of the two probes that may
+    /// follow each compare while it runs.
+    private static final int SMALL_NODE = 16;
+    /// The last byte of a leaf entry's first two key words, from the start of the entry: the words that decide the
+    /// compares of keys that share a short prefix, such as a chat's.
+    private static final int LEAF_KEY_WORDS = 2 + 2 * Long.BYTES - 1;
+    /// The last byte of a branch entry's first two key words, from the start of the entry.
+    private static final int BRANCH_KEY_WORDS = BRANCH_FIXED + 2 * Long.BYTES - 1;
+    /// A value the bytes a search loads ahead never XOR to, as each is a sign-extended byte; not final, so that the
+    /// compiler can neither fold the test of [#keep(int)] nor drop the loads that feed it.
+    private static int untouched = Integer.MIN_VALUE;
+    /// Where [#keep(int)] would store bytes equal to [#untouched], which no search loads.
+    private static int touchSink;
 
     private TreeNodes() {
     }
@@ -116,10 +130,20 @@ final class TreeNodes {
 
     /// {@return the index of the first entry of the leaf `unit` whose key is at or after `key`, or its count}
     static int lowerBound(byte[] unit, byte[] key) {
+        var count = count(unit);
+        var last = unit.length - 1;
+        var ahead = count > SMALL_NODE;
+        if (!ahead) {
+            touchLeafKeys(unit, count, last);
+        }
         var low = 0;
-        var high = count(unit);
+        var high = count;
         while (low < high) {
             var middle = (low + high) >>> 1;
+            if (ahead) {
+                keep(touchLeafKey(unit, entry(unit, (low + middle) >>> 1), last)
+                        ^ touchLeafKey(unit, entry(unit, Math.min((middle + 1 + high) >>> 1, high - 1)), last));
+            }
             var entry = entry(unit, middle);
             if (compare(unit, leafKeyOffset(entry), leafKeyLength(unit, entry), key) < 0) {
                 low = middle + 1;
@@ -234,8 +258,14 @@ final class TreeNodes {
         // The last child whose first key is at or before the key, or the first child
         var low = 1;
         var high = count(unit);
+        var last = unit.length - 1;
+        var ahead = high > SMALL_NODE;
         while (low < high) {
             var middle = (low + high) >>> 1;
+            if (ahead) {
+                keep(touchChildKey(unit, entry(unit, (low + middle) >>> 1), last)
+                        ^ touchChildKey(unit, entry(unit, Math.min((middle + 1 + high) >>> 1, high - 1)), last));
+            }
             var entry = entry(unit, middle);
             if (compare(unit, entry + BRANCH_FIXED, Bytes.u16(unit, entry + BRANCH_FIXED - 2), key) <= 0) {
                 low = middle + 1;
@@ -250,8 +280,14 @@ final class TreeNodes {
     static int lastChildBefore(byte[] unit, byte[] key) {
         var low = 0;
         var high = count(unit);
+        var last = unit.length - 1;
+        var ahead = high > SMALL_NODE;
         while (low < high) {
             var middle = (low + high) >>> 1;
+            if (ahead) {
+                keep(touchChildKey(unit, entry(unit, (low + middle) >>> 1), last)
+                        ^ touchChildKey(unit, entry(unit, Math.min((middle + 1 + high) >>> 1, high - 1)), last));
+            }
             var entry = entry(unit, middle);
             if (compare(unit, entry + BRANCH_FIXED, Bytes.u16(unit, entry + BRANCH_FIXED - 2), key) < 0) {
                 low = middle + 1;
@@ -260,6 +296,35 @@ final class TreeNodes {
             }
         }
         return low - 1;
+    }
+
+    /// Loads the first key lines of the `count` entries of the leaf `unit`, whose last byte is at `last`, all at once.
+    private static void touchLeafKeys(byte[] unit, int count, int last) {
+        var touched = 0;
+        for (var i = 0; i < count; i++) {
+            touched ^= touchLeafKey(unit, entry(unit, i), last);
+        }
+        keep(touched);
+    }
+
+    /// {@return the XOR of the bytes of leaf entry `entry` of `unit`, whose last byte is at `last`, on the lines its key
+    /// length and its first two key words are on}
+    private static int touchLeafKey(byte[] unit, int entry, int last) {
+        return unit[entry] ^ unit[Math.min(entry + LEAF_KEY_WORDS, last)];
+    }
+
+    /// {@return the XOR of the bytes of branch entry `entry` of `unit`, whose last byte is at `last`, on the lines its key
+    /// length and its first two key words are on}
+    private static int touchChildKey(byte[] unit, int entry, int last) {
+        return unit[entry + BRANCH_FIXED - 2] ^ unit[Math.min(entry + BRANCH_KEY_WORDS, last)];
+    }
+
+    /// Keeps the loads that computed `touched` in the search, ahead of the compare that follows: a branch on them that
+    /// is never taken, so the search's result does not wait for a line it loaded but does not compare.
+    private static void keep(int touched) {
+        if (touched == untouched) {
+            touchSink = touched;
+        }
     }
 
     static PageRef childRef(byte[] unit, int index) {
