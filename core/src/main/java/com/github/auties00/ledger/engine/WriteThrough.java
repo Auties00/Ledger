@@ -56,11 +56,15 @@ import java.util.function.LongFunction;
 /// A way that fails moves the writer to the next one down, `O_DSYNC` after `O_DIRECT`, and from the last to forces; a
 /// buffer or a handle the native memory has no room for is such a failure, since a force needs neither. The first group
 /// written through a way is what tries it, with no durable write of its own first: a group it refuses is written again.
-/// Only the flush that holds the log writer writes through an instance, so one thread at a time; its buffer, aligned to
-/// [LogWriter#ALIGNMENT] as `O_DIRECT` and `FILE_FLAG_NO_BUFFERING` need, serves every segment of the writer. The thread
-/// preparing a segment may ask which way is left beside it, so the round trip of asking the device holds no commit up.
+/// The log writes through an instance on at most [#LANES] threads at once, each through handles of its own lane, whose
+/// buffer, aligned to [LogWriter#ALIGNMENT] as `O_DIRECT` and `FILE_FLAG_NO_BUFFERING` need, serves every segment of
+/// the writer: two groups in flight at once never share a handle, so an interrupt that closes one leaves the other
+/// writing. The thread preparing a segment may ask which way is left beside it, so the round trip of asking the device
+/// holds no commit up.
 final class WriteThrough {
     private static final String OS = System.getProperty("os.name", "");
+    /// The lanes that write through an instance at once, each from a buffer of its own.
+    static final int LANES = 2;
 
     /// How a store writes the groups that one write holds.
     enum Mode {
@@ -111,9 +115,10 @@ final class WriteThrough {
     // What must answer before the first segment is opened through, or null once it has or if nothing need; guarded by
     // the lock
     private BooleanSupplier proof;
-    // The buffer a group is copied into before it is written, aligned to LogWriter.ALIGNMENT, and a view of it
-    private MemorySegment buffer;
-    private ByteBuffer bufferView;
+    // The buffer of each lane a group is copied into before it is written, aligned to LogWriter.ALIGNMENT, and a view
+    // of it; each written only by the thread writing through that lane
+    private final MemorySegment[] buffers;
+    private final ByteBuffer[] bufferViews;
     // The handles opened, for tests; written by the flush that holds the log writer
     private volatile int opens;
     /// Allocates the buffer in place of the arena, by its size; for tests that refuse it.
@@ -127,6 +132,8 @@ final class WriteThrough {
         this.lock = new Object();
         this.kind = kind;
         this.proof = proof;
+        this.buffers = new MemorySegment[LANES];
+        this.bufferViews = new ByteBuffer[LANES];
     }
 
     /// {@return how a store in `directory` writes through in `mode`}
@@ -198,43 +205,61 @@ final class WriteThrough {
         return opens;
     }
 
-    /// Opens the segment at `path` to write through, the current way.
+    /// Opens the segment at `path` to write through, the current way, from the buffer of the first lane.
     ///
     /// @throws IOException if it cannot be opened that way, native memory for its handle included
     /// @throws IllegalStateException if no way is left
     Handle open(Path path) throws IOException {
+        return open(path, 0);
+    }
+
+    /// Opens the segment at `path` to write through, the current way, from the buffer of `lane`: only the thread
+    /// writing through that lane writes through the handle.
+    ///
+    /// @param lane the lane, below [#LANES]
+    /// @throws IOException if it cannot be opened that way, native memory for its handle included
+    /// @throws IllegalStateException if no way is left
+    Handle open(Path path, int lane) throws IOException {
         if (!enabled()) {
             throw new IllegalStateException("The log forces its groups");
         }
         opens++;
         try {
             return switch (kind()) {
-                case UNBUFFERED -> UnbufferedHandle.open(path, this);
+                case UNBUFFERED -> UnbufferedHandle.open(path, this, lane);
                 case DIRECT -> new ChannelHandle(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC,
-                        ExtendedOpenOption.DIRECT), this);
-                case DSYNC -> new ChannelHandle(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC), this);
+                        ExtendedOpenOption.DIRECT), this, lane);
+                case DSYNC -> new ChannelHandle(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC), this, lane);
             };
         } catch (OutOfMemoryError exception) {
             throw new IOException("A log segment could not be opened to write through", exception);
         }
     }
 
-    /// {@return the buffer holding the first `length` bytes of `bytes`, at least `capacity` bytes long and aligned to
-    /// [LogWriter#ALIGNMENT]}
+    /// Gives the buffer of `lane` back to the collector, once no handle of the lane writes; the next write of the lane
+    /// allocates one again.
+    void release(int lane) {
+        buffers[lane] = null;
+        bufferViews[lane] = null;
+    }
+
+    /// {@return the buffer of `lane` holding the first `length` bytes of `bytes`, at least `capacity` bytes long and
+    /// aligned to [LogWriter#ALIGNMENT]}
     ///
-    /// It follows the size of the log's output, which grows while groups need more and goes back once they no longer
-    /// do, so it is replaced only when that size changes.
+    /// It follows the size of the output the lane seals into, which grows while groups need more and goes back once
+    /// they no longer do, so it is replaced only when that size changes.
     ///
     /// @throws IOException if native memory has no room for it, as under a limit of direct memory
-    private MemorySegment copy(byte[] bytes, int length, int capacity) throws IOException {
+    private MemorySegment copy(int lane, byte[] bytes, int length, int capacity) throws IOException {
         var size = (long) (capacity + LogWriter.ALIGNMENT - 1) / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT;
+        var buffer = buffers[lane];
         if (buffer == null || buffer.byteSize() != size) {
             try {
                 // Given back to the collector with the view, once a later size replaces both
                 var allocator = allocatorForTests;
-                var replaced = allocator != null ? allocator.apply(size) : Arena.ofAuto().allocate(size, LogWriter.ALIGNMENT);
-                bufferView = replaced.asByteBuffer();
-                buffer = replaced;
+                buffer = allocator != null ? allocator.apply(size) : Arena.ofAuto().allocate(size, LogWriter.ALIGNMENT);
+                bufferViews[lane] = buffer.asByteBuffer();
+                buffers[lane] = buffer;
             } catch (OutOfMemoryError exception) {
                 throw new IOException("The buffer of a write through could not be allocated", exception);
             }
@@ -268,17 +293,19 @@ final class WriteThrough {
     private static final class ChannelHandle implements Handle {
         private final FileChannel channel;
         private final WriteThrough owner;
+        private final int lane;
 
-        ChannelHandle(FileChannel channel, WriteThrough owner) {
+        ChannelHandle(FileChannel channel, WriteThrough owner, int lane) {
             this.channel = channel;
             this.owner = owner;
+            this.lane = lane;
         }
 
         @Override
         public void write(byte[] bytes, int length, int capacity, long position) throws IOException {
-            owner.copy(bytes, length, capacity);
+            owner.copy(lane, bytes, length, capacity);
             // The aligned copy, which a channel opened with DIRECT would otherwise make on each write
-            var source = owner.bufferView.clear().limit(length);
+            var source = owner.bufferViews[lane].clear().limit(length);
             var at = position;
             while (source.hasRemaining()) {
                 at += channel.write(source, at);
@@ -315,14 +342,16 @@ final class WriteThrough {
 
         private final MemorySegment handle;
         private final WriteThrough owner;
+        private final int lane;
         private final MemorySegment state;
         private final MemorySegment overlapped;
         private final MemorySegment written;
         private boolean open;
 
-        private UnbufferedHandle(MemorySegment handle, WriteThrough owner, Arena arena, MemorySegment state) {
+        private UnbufferedHandle(MemorySegment handle, WriteThrough owner, int lane, Arena arena, MemorySegment state) {
             this.handle = handle;
             this.owner = owner;
+            this.lane = lane;
             this.state = state;
             this.overlapped = arena.allocate(OVERLAPPED_BYTES, Long.BYTES);
             this.written = arena.allocate(ValueLayout.JAVA_INT);
@@ -333,7 +362,7 @@ final class WriteThrough {
         ///
         /// Writes through it leave the file's times as they are: Windows writes the metadata changes a write through
         /// makes through as well, which for a time of last write would be one more write to the device each time.
-        static UnbufferedHandle open(Path path, WriteThrough owner) throws IOException {
+        static UnbufferedHandle open(Path path, WriteThrough owner, int lane) throws IOException {
             var arena = Arena.ofAuto();
             var state = arena.allocate(Kernel32.CALL_STATE);
             var name = arena.allocateFrom(win32Path(path), StandardCharsets.UTF_16LE);
@@ -347,7 +376,7 @@ final class WriteThrough {
             if (handle.address() == -1L) {
                 throw new IOException("The log segment could not be opened unbuffered: " + path + ", error " + Kernel32.lastError(state));
             }
-            var opened = new UnbufferedHandle(handle, owner, arena, state);
+            var opened = new UnbufferedHandle(handle, owner, lane, arena, state);
             // A FILETIME of all ones, which stops the writes of the handle from setting that time
             var unchanged = arena.allocate(ValueLayout.JAVA_LONG);
             unchanged.set(ValueLayout.JAVA_LONG, 0, -1L);
@@ -371,7 +400,7 @@ final class WriteThrough {
 
         @Override
         public void write(byte[] bytes, int length, int capacity, long position) throws IOException {
-            var source = owner.copy(bytes, length, capacity);
+            var source = owner.copy(lane, bytes, length, capacity);
             var done = 0;
             while (done < length) {
                 var at = position + done;

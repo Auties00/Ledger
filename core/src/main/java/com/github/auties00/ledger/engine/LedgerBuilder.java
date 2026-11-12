@@ -44,6 +44,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private WriteThrough.Mode writeThrough;
     // Null to make one from the mode
     private WriteThrough writeThroughWay;
+    // Null for the mode the system property names
+    private LogWriter.Overlap overlap;
     private boolean residentAtOpen;
 
     /// Creates a builder with the default options.
@@ -80,6 +82,14 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     /// a way their platform would not choose and from what a device reports. It serves one build.
     LedgerBuilder writeThrough(WriteThrough way) {
         this.writeThroughWay = Objects.requireNonNull(way, "way");
+        return this;
+    }
+
+    /// Sets whether the log writes a group through while the one before it is still on its way to the device, in place
+    /// of the system property `ledger.log.overlap`, so tests can have groups go beside one another without waiting for
+    /// the epochs that decide it, and keep them apart.
+    LedgerBuilder overlap(LogWriter.Overlap mode) {
+        this.overlap = Objects.requireNonNull(mode, "mode");
         return this;
     }
 
@@ -321,7 +331,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var through = writeThroughWay != null ? writeThroughWay
                     : WriteThrough.of(writeThrough != null ? writeThrough : WriteThrough.Mode.fromProperty(), logDirectory);
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
-                    segmentSize, pool.executor(), ownedPool == null ? pool::queued : null, commitWindow, empty, through);
+                    segmentSize, pool.executor(), ownedPool == null ? pool::queued : null, commitWindow, empty, through,
+                    overlap != null ? overlap : LogWriter.Overlap.fromProperty());
             var deltaTable = superblock == null ? null : superblock.deltaTable();
             var deltas = deltaTable == null ? DeltaTable.EMPTY
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));

@@ -26,8 +26,11 @@ import java.util.zip.CRC32C;
 /// of the segment ends its segment: it is the torn tail of a group whose force never completed, or what lies past the
 /// last group, and the later segments were written by later opens or after a rollover, which recovered up to the same
 /// point. If a group written after a later force follows the frame, the frame was acknowledged and then damaged, and
-/// recovery refuses the log rather than drop it. The search for such a group takes the first frame of a group of any
-/// use of the segment: at most one use writes past its first group ([LogWriter]).
+/// recovery refuses the log rather than drop it, except for the one group a segment of version
+/// [LogWriter#OVERLAPS_VERSION] or later may hold that went to the device beside the torn group and names it
+/// ([LogWriter#OVERLAPS]), which is dropped with it: damage to an acknowledged group that only such a group follows
+/// reads as a tear, as damage to the last group does. The search for such a group takes the first frame of a group of
+/// any use of the segment: at most one use writes past its first group ([LogWriter]).
 ///
 /// A segment whose first frame header is all zeros was prepared and never written, unless such a group follows, and
 /// the next open writes into it. Its name is known to be durable only if a close marked it ([LogWriter#KEPT_MARK]): a
@@ -140,6 +143,9 @@ final class LogRecovery {
                 var useTag = ByteBuffer.wrap(frame).getLong(LogWriter.USE_TAG_OFFSET);
                 var segmentKey = keys.encrypted() ? keys.segmentKey(storeId, number, salt, useTag) : null;
                 var afterPadding = false;
+                var overlaps = version >= LogWriter.OVERLAPS_VERSION;
+                // Where the last frame whose header starts a group of this use starts, its body read or not
+                var groupHeader = position;
                 while (reader.read(position, frame, 0, LogWriter.FRAME_HEADER)) {
                     if (position % LogWriter.ALIGNMENT != 0) {
                         // The padding after a group, which only a group's first frame follows; a frame never starts
@@ -153,10 +159,14 @@ final class LogRecovery {
                     }
                     if (!validFrameHeader(frame, tag, useTag, crc)
                             || (afterPadding && (frame[17] & LogWriter.GROUP_START) == 0)) {
-                        checkNoLaterGroup(reader, position, last, tag, crc, path);
+                        checkNoLaterGroup(reader, position, last, tag, crc, path,
+                                overlaps ? new Torn(useTag, position, groupHeader) : null);
                         break;
                     }
                     afterPadding = false;
+                    if ((frame[17] & LogWriter.GROUP_START) != 0) {
+                        groupHeader = position;
+                    }
                     var header32 = ByteBuffer.wrap(frame);
                     var sealedLength = header32.getInt(4);
                     var sequence = header32.getLong(8);
@@ -171,7 +181,8 @@ final class LogRecovery {
                         }
                     }
                     if (body == null) {
-                        checkNoLaterGroup(reader, position, last, tag, crc, path);
+                        checkNoLaterGroup(reader, position, last, tag, crc, path,
+                                overlaps ? new Torn(useTag, position, groupHeader) : null);
                         break;
                     }
                     lastWritten = path;
@@ -308,15 +319,60 @@ final class LogRecovery {
     /// Throws if a group written after a later force, by any use of the segment whose salt has `tag`, follows the
     /// invalid frame at `position`.
     private static void checkNoLaterGroup(SegmentReader reader, long position, long last, long tag, CRC32C crc, Path path) throws IOException {
+        checkNoLaterGroup(reader, position, last, tag, crc, path, null);
+    }
+
+    /// Throws if a group written after a later force, by any use of the segment whose salt has `tag`, follows the
+    /// invalid frame at `position`, other than one group written beside the group `torn` tells the frame belongs to.
+    ///
+    /// A group whose first frame carries [LogWriter#OVERLAPS] went to the device while the group before it, which its
+    /// first frame names by the distance back to its start, was not durable yet, and only once everything before that
+    /// group was: so it may be durable with that group torn, and the group after it was written only once that group
+    /// was durable. One such group, of the same use, that names the torn group is skipped: the group the frame belongs
+    /// starts where the frame does if the frame starts a block, or where the last frame whose header starts a group
+    /// does. No commit of it was acknowledged, as the torn group's were not; damage to an acknowledged group that only
+    /// such a group follows is then told from a tear no more than a damaged last group is.
+    ///
+    /// @param torn where the frame's group may start, and the use that wrote it, in a segment whose groups may carry
+    ///             [LogWriter#OVERLAPS]; or `null` if no group is skipped
+    private static void checkNoLaterGroup(SegmentReader reader, long position, long last, long tag, CRC32C crc, Path path,
+                                          Torn torn) throws IOException {
         var frame = new byte[LogWriter.FRAME_HEADER];
+        var skipped = false;
         for (var candidate = (position / LogWriter.ALIGNMENT + 1) * LogWriter.ALIGNMENT;
              reader.read(candidate, frame, 0, LogWriter.FRAME_HEADER);
              candidate += LogWriter.ALIGNMENT) {
             if (wholeFrameHeader(frame, tag, crc)
                     && (frame[17] & LogWriter.GROUP_START) != 0
                     && ByteBuffer.wrap(frame).getLong(8) > last) {
+                if (!skipped && torn != null && torn.names(frame, candidate)) {
+                    skipped = true;
+                    continue;
+                }
                 throw new LedgerCorruptedException(path + " is damaged at offset " + position + ", before data written after it", null);
             }
+        }
+    }
+
+    /// Where the group of an invalid frame may start, for [#checkNoLaterGroup]: at the frame itself, if it starts a
+    /// block, or at the last frame before it whose header starts a group.
+    ///
+    /// @param useTag the tag of the use that wrote the group
+    /// @param frame the offset of the invalid frame
+    /// @param groupHeader the offset of the last frame before it, or at it, whose header starts a group of the use
+    private record Torn(long useTag, long frame, long groupHeader) {
+        /// {@return whether the frame header in `header`, a group's first at `offset`, was written beside this group}
+        ///
+        /// The first group of a use never has a group beside it: a use writes past it only once it is durable.
+        boolean names(byte[] header, long offset) {
+            var fields = ByteBuffer.wrap(header);
+            if ((header[17] & LogWriter.OVERLAPS) == 0 || fields.getLong(LogWriter.USE_TAG_OFFSET) != useTag) {
+                return false;
+            }
+            var back = Short.toUnsignedInt(fields.getShort(18));
+            var named = offset - (long) back * LogWriter.ALIGNMENT;
+            return back > 0 && named > LogWriter.SEGMENT_HEADER
+                    && ((named == frame && frame % LogWriter.ALIGNMENT == 0) || named == groupHeader);
         }
     }
 

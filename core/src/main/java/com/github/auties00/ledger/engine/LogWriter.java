@@ -16,6 +16,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
@@ -82,6 +83,18 @@ import java.util.zip.CRC32C;
 /// unused; until then each group is forced. So a run of commits reaches the path within the time of one preparation,
 /// whatever the size of a segment.
 ///
+/// Two groups written through may be on the device at once ([Overlap]): while the flush's group is there, a second
+/// lane, a platform thread with a handle and an output of its own, takes the frames queued since and writes them
+/// through as the next group, so the commits one write woke come back while the other is on the device, and a device
+/// that serves two writes together serves both halves of the committers in one round trip. A group goes beside the one
+/// before it only if both are written through into the same segment, past the first group of its use, neither holds
+/// units of the file of large values nor is a commit's own, commits wait for it, and the one before is the only group
+/// not durable: the group after waits for that one. Groups are published in the order they were laid out, so a commit
+/// is acknowledged only once every group up to its own is durable. The first frame of a group written beside another
+/// carries [#OVERLAPS] and the distance back to it, which recovery reads to drop the group with that one when a crash
+/// tears it ([LogRecovery]). [Overlap#AUTO] measures the rate of commits with groups beside one another against one at
+/// a time, and keeps the faster.
+///
 /// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames. Each use of it, the writing of one
 /// open, draws a random tag, and the key of the use derives from the segment's number, a random salt of its own and
 /// that tag: the offset of a frame is a unique nonce under its key, even where an open writes into a segment that an
@@ -101,7 +114,9 @@ import java.util.zip.CRC32C;
 /// frame header     0  magic "LGF1"
 ///                  4  length of the sealed body
 ///                  8  commit sequence
-///                 16  frame type, flags (1: first frame after a force)
+///                 16  frame type
+///                 17  flags: 1 for the first frame of a group; 2 as well for one of a group written beside the last
+///                 18  with flag 2, the distance back to the start of the group before, in blocks of 4 KiB
 ///                 20  tag of the segment: the first 8 bytes of its salt
 ///                 28  tag of the use: 8 random bytes the writer drew when it began writing the segment
 ///                 36  CRC-32C of bytes 0 to 35
@@ -120,17 +135,24 @@ import java.util.zip.CRC32C;
 /// of a group never acknowledged durable.
 ///
 /// A failed write or force stops the writer for good: [#awaitDurable(long)] and every later [#append] throw. A failed
-/// write through only moves the writer to forces.
+/// write through only moves the writer to forces; one of a group beside another first waits for the other's write,
+/// then writes its group again through the cache and forces it, and groups go one at a time from then on.
 final class LogWriter {
     static final int SEGMENT_HEADER = 4_096;
     static final int ALIGNMENT = 4_096;
     static final int FRAME_HEADER = 40;
     static final int MAGIC = 0x4C474631;
     static final byte GROUP_START = 1;
+    /// The flag of the first frame of a group written while the group before it was not durable yet, whose frame
+    /// header then holds, in bytes 18 and 19, the distance back to that group's start in blocks of [#ALIGNMENT].
+    static final byte OVERLAPS = 2;
     static final long SEGMENT_MAGIC = 0x4C475345474D4E54L;
-    /// The version of the segments a writer starts: from 3 a segment may hold frames of type [FrameBody#COMMITS], so a
-    /// build that reads only earlier versions refuses it by its version and not at the first such frame.
-    static final int SEGMENT_VERSION = 3;
+    /// The version of the segments a writer starts: from 3 a segment may hold frames of type [FrameBody#COMMITS], and
+    /// from 4 groups with [#OVERLAPS], so a build that reads only earlier versions refuses it by its version and not at
+    /// the first such frame or at a crash it would read as damage.
+    static final int SEGMENT_VERSION = 4;
+    /// The oldest version whose groups may carry [#OVERLAPS].
+    static final int OVERLAPS_VERSION = 4;
     /// The oldest version recovery reads, whose frame types the current version all has.
     static final int OLDEST_SEGMENT_VERSION = 2;
     static final int TAG_BYTES = 16;
@@ -198,6 +220,13 @@ final class LogWriter {
     /// The waits in a row that ran out past which waits are turned off no longer: after the n-th, the flush writes 2
     /// to the power of n groups without one.
     private static final int MAX_COHORT_MISSES = 6;
+    /// How long the second lane waits for work before its thread ends, in nanoseconds.
+    private static final long LANE_IDLE = 1_000_000_000;
+    // The states of a lane
+    private static final int IDLE = 0;
+    private static final int WRITING = 1;
+    private static final int WRITTEN = 2;
+    private static final int FAILED = 3;
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
@@ -211,8 +240,51 @@ final class LogWriter {
     private final WriteThrough writeThrough;
     // The woken and queued commits past which a flush no longer waits for the woken ones to come back
     private final int maxCohort;
+    // Guards the layout of groups and the state of the lanes: the flush that holds running holds it while it takes,
+    // seals and, unless its group may have another beside it, writes a group; the second lane while it takes and seals
+    // one; either while it publishes
+    private final ReentrantLock laneLock;
+    // Signalled under the lane lock when a lane changes state
+    private final Condition laneChanged;
+    // The group of the flush that holds running, and the one the second lane writes beside it
+    private final Lane first;
+    private final Lane second;
+    // The groups laid out since the writer opened, which order the lanes' groups; under the lane lock
+    private long tickets;
+    // Whether a group may go beside another now, as the epochs of AUTO decide; written under the lane lock
+    private volatile boolean overlapOn;
+    // Whether a failure turned groups beside one another off for good; under the lane lock
+    private boolean overlapBroken;
+    // The thread of the second lane, or null while there is none; written under the lane lock
+    private volatile Thread laneThread;
+    // Whether a close asked the thread of the second lane to end
+    private volatile boolean laneStop;
+    // Whether the second lane waits for frames to write beside the group of the first, which an append wakes it for
+    private volatile boolean laneWanted;
+    // The output the second lane seals into, and its groups in a row that needed at most half of MIN_OUTPUT; under the
+    // lane lock
+    private byte[] laneOutput;
+    private int laneSmallGroups;
+    // The current segment opened to write through for the second lane, or null until it writes into it
+    private WriteThrough.Handle laneHandle;
+    // The emptied queue the second lane's next take reuses
+    private ArrayList<Queued> laneSpare;
+    // The commits woken and not yet taken back into a group, which a lane about to take a group waits for; written
+    // under the lane lock
+    private volatile int cohortLeft;
+    // The frames queued when the last group was taken
+    private volatile long takenFrames;
+    // Whether the last published group was written through, so the next may go beside another
+    private volatile boolean lastThrough;
+    // The blocks back from the group being sealed to the start of the one before it, which its first frame names, or 0
+    private int overlapBack;
+    // What decides, under AUTO, whether a group may go beside another; null in the other modes. Under the lane lock
+    private final OverlapGate gate;
+    // The groups written beside another, for tests
+    private volatile long overlappedGroups;
 
-    // Owned by the flush task; null until the first group opens the first segment
+    // The state of the segment below, up to the output, is the flush task's and the second lane's, under the lane lock;
+    // null until the first group opens the first segment
     private FileChannel channel;
     // The current segment opened to write through, or null until its first group that can be
     private WriteThrough.Handle throughFile;
@@ -223,7 +295,8 @@ final class LogWriter {
     // The bytes the current segment had when it was prepared, below which a write changes neither its size nor the
     // length of its data
     private long valid;
-    // The end of the bytes of the current segment a force or a write through made durable
+    // The end of the bytes of the current segment a force or a write through made durable, the groups before it
+    // published
     private long forcedPosition;
     // The file of the current segment, which an interrupted write reopens
     private java.nio.file.Path segmentPath;
@@ -243,16 +316,16 @@ final class LogWriter {
     private long useTag;
     // The segment close kept for the next open, or -1
     private volatile long kept = -1;
-    // The end of the last group's frames, before its padding, for tests
+    // The end of the last published group's frames, before its padding, for tests
     private volatile long groupEnd;
-    // Where the frames of the last group start, for tests
+    // Where the frames of the last published group start, for tests
     private volatile long groupStart;
     // The preparation of the segment after the current one, run on a thread of its own, or by whichever of the flush
     // task and a close needs it first
     private FutureTask<LogFiles.Prepared> next;
-    // Whether zeros were asked for the segment of next, by its preparation or after it; owned by the flush task
+    // Whether zeros were asked for the segment of next, by its preparation or after it; under the lane lock
     private boolean nextZeroed;
-    // When the current segment opened, and how long the one before it took to fill, or -1; owned by the flush task
+    // When the current segment opened, and how long the one before it took to fill, or -1; under the lane lock
     private long segmentOpened;
     private long lastFill = -1;
     // Whether a commit waited for a force since the segment before the current one opened
@@ -260,7 +333,7 @@ final class LogWriter {
     private boolean waitedBefore;
     // Whether a commit waited since the last group began to be written
     private volatile boolean waitedGroup;
-    // The groups written since the store opened that a commit waited for; owned by the flush task
+    // The groups written since the store opened that a commit waited for; under the lane lock
     private long waitedGroups;
     private final Cipher cipher;
     private final CRC32C crc;
@@ -272,8 +345,9 @@ final class LogWriter {
     // The groups in a row written since one needed more than half of MIN_OUTPUT
     private int smallGroups;
     // How long the write and force of a group took, or its write through, a moving average in nanoseconds of the groups
-    // after the first, each at most four times the average before it, or 0 before the second group
-    private long forceNanos;
+    // after the first that no other group was written beside, each at most four times the average before it, or 0
+    // before the second group; written under the lane lock
+    private volatile long forceNanos;
     // The commits the last published group woke, its leader included; read by commits deciding whether to lead
     private volatile int lastGroupWaiters;
     // The commits the last published group woke and those queued behind it
@@ -294,9 +368,9 @@ final class LogWriter {
     private volatile long cohortsMissed;
     // The emptied queue, which the next swap reuses
     private ArrayList<Queued> flushing;
-    // Written by the flush task only
+    // Written under the lane lock
     private volatile long forces;
-    // The groups written through, of the forces; written by the flush task only
+    // The groups written through, of the forces; written under the lane lock
     private volatile long writtenThrough;
     // The segment the flush task writes, for a checkpoint to read
     private volatile long currentSegment;
@@ -310,9 +384,9 @@ final class LogWriter {
     // The commits waiting for room in the queue; written under the queue lock
     private volatile int queueWaiters;
     private volatile long lastQueued;
-    // Frames queued since the writer opened; a catalog frame carries a sequence already durable, so close() waits on
-    // frames rather than on sequences
-    private long appended;
+    // Frames queued since the writer opened, written under the queue lock; a catalog frame carries a sequence already
+    // durable, so close() waits on frames rather than on sequences
+    private volatile long appended;
     // The bytes of the frames queued since the writer opened, and of the units of BlobFile their commits wrote, written
     // under the queue lock
     private volatile long appendedBytes;
@@ -359,10 +433,11 @@ final class LogWriter {
     /// @param empty the segment numbered `firstSegment`, which recovery found prepared and never written, to write
     ///              first; or `null`, to prepare one
     /// @param writeThrough how the segments are opened to write groups through, which the writer owns from now on
+    /// @param overlap whether a group written through may go to the device while the one before it is still there
     /// @throws IOException if the segment cannot be prepared
     LogWriter(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long durable, long segmentSize,
               Executor executor, BooleanSupplier poolQueued, Duration commitWindow, LogFiles.Prepared empty,
-              WriteThrough writeThrough) throws IOException {
+              WriteThrough writeThrough, Overlap overlap) throws IOException {
         this.files = files;
         this.keys = keys;
         this.storeId = storeId;
@@ -372,6 +447,13 @@ final class LogWriter {
         this.commitWindowNanos = commitWindow.toNanos();
         this.writeThrough = writeThrough;
         this.maxCohort = COHORT_PER_PROCESSOR * Runtime.getRuntime().availableProcessors();
+        this.laneLock = new ReentrantLock();
+        this.laneChanged = laneLock.newCondition();
+        this.first = new Lane();
+        this.second = new Lane();
+        this.laneSpare = new ArrayList<>();
+        this.overlapOn = overlap == Overlap.ON;
+        this.gate = overlap == Overlap.AUTO ? new OverlapGate(System::nanoTime, durable) : null;
         this.registered = new Padded.Count();
         try {
             this.cipher = keys.encrypted() ? Cipher.getInstance("AES/GCM/NoPadding") : null;
@@ -602,6 +684,7 @@ final class LogWriter {
         } finally {
             queueLock.unlock();
         }
+        wakeLane();
         if (scheduled.compareAndSet(false, true)) {
             executor.execute(this::flush);
         }
@@ -638,6 +721,7 @@ final class LogWriter {
             queueLock.unlock();
             batch.clear();
         }
+        wakeLane();
         if (scheduled.compareAndSet(false, true)) {
             executor.execute(this::flush);
         }
@@ -682,6 +766,7 @@ final class LogWriter {
         } finally {
             queueLock.unlock();
         }
+        wakeLane();
         if (scheduled.compareAndSet(false, true)) {
             executor.execute(this::flush);
         }
@@ -741,9 +826,10 @@ final class LogWriter {
     /// waits for its group on its own thread rather than for a thread of the pool to wake, then for its own to be woken.
     ///
     /// One flush writes at a time: another returns at once, and the one that writes looks at the queue again once it
-    /// stops, so the frames of a commit whose flush returned are never left behind. A flush for a commit hands what is
-    /// queued after its group to the pool, as a flush of the pool does when a task of another store waits for its
-    /// thread.
+    /// stops, so the frames of a commit whose flush returned are never left behind. The second lane only takes what is
+    /// queued while a group of the flush is on the device, and never stops a flush from being scheduled. A flush for a
+    /// commit hands what is queued after its group to the pool, as a flush of the pool does when a task of another
+    /// store waits for its thread.
     private void flush(long until) {
         while (running.compareAndSet(false, true)) {
             try {
@@ -851,6 +937,10 @@ final class LogWriter {
 
     /// Writes the queued groups until the queue is empty, the commit at `until` is durable or, on the pool, a task
     /// waits for this thread, holding [#running].
+    ///
+    /// A group that may have another beside it goes to the device with the lane lock let go, so the second lane can
+    /// take and write the next group meanwhile ([#runLane()]); any other is written with the lock held, as nothing else
+    /// is in flight.
     private void flushGroups(long until) {
         leading = until != Long.MAX_VALUE;
         try {
@@ -863,38 +953,82 @@ final class LogWriter {
                     // With the queue empty too: had it returned, the next flush would take the first commits back as a
                     // group of their own
                     awaitCohort();
+                } else if (!leading && overlapOn && lastThrough) {
+                    gather(second);
                 }
-                ArrayList<Queued> group;
-                long sequence;
-                long frames;
-                boolean units;
-                queueLock.lock();
+                byte[] bytes;
+                WriteThrough.Handle handle;
+                laneLock.lock();
                 try {
-                    if (queue.isEmpty() || (until != Long.MAX_VALUE && (lastQueued > until || !fitsOneWrite(queue)))) {
-                        return;
+                    ArrayList<Queued> group = null;
+                    long sequence = 0;
+                    long frames = 0;
+                    var units = false;
+                    var beside = false;
+                    while (group == null) {
+                        if (failure != null) {
+                            return;
+                        }
+                        // The output still holds a group that is not durable, which a failed write writes again
+                        if (first.state != IDLE) {
+                            laneChanged.awaitUninterruptibly();
+                            continue;
+                        }
+                        beside = second.state != IDLE;
+                        var wait = false;
+                        queueLock.lock();
+                        try {
+                            if (queue.isEmpty() || (leading && (lastQueued > until || !fitsOneWrite(queue)))) {
+                                return;
+                            }
+                            if (beside && !admitsBeside(second, queue, queuedUnits, leading)) {
+                                wait = true;
+                            } else {
+                                group = queue;
+                                sequence = lastQueued;
+                                frames = appended;
+                                units = queuedUnits;
+                                queuedUnits = false;
+                                queue = flushing;
+                                takenFrames = frames;
+                            }
+                        } finally {
+                            queueLock.unlock();
+                        }
+                        if (wait) {
+                            laneChanged.awaitUninterruptibly();
+                        }
                     }
-                    group = queue;
-                    sequence = lastQueued;
-                    frames = appended;
-                    units = queuedUnits;
-                    queuedUnits = false;
-                    queue = flushing;
+                    cohortLeft = Math.max(0, cohortLeft - group.size());
+                    var open = write(group, units, sequence, frames, beside);
+                    group.clear();
+                    flushing = group;
+                    if (!open) {
+                        if (!leading && poolWanted()) {
+                            return;
+                        }
+                        continue;
+                    }
+                    bytes = output;
+                    handle = throughFile;
+                    if (second.state == IDLE) {
+                        // Before the look at the queue below, so a frame queued after it wakes the lane itself
+                        startLane();
+                        laneWanted = true;
+                    }
                 } finally {
-                    queueLock.unlock();
+                    laneLock.unlock();
                 }
-                var bodies = write(group, units);
-                group.clear();
-                flushing = group;
-                boolean roomy;
-                queueLock.lock();
+                if (appended != takenFrames) {
+                    wakeLane();
+                }
+                writeOut(first, handle, bytes);
+                laneLock.lock();
                 try {
-                    pendingBytes -= bodies;
-                    roomy = pendingBytes < QUEUE_LIMIT / 2;
-                    queueDrained.signalAll();
+                    complete(first);
                 } finally {
-                    queueLock.unlock();
+                    laneLock.unlock();
                 }
-                publish(sequence, frames, roomy);
                 if (!leading && poolWanted()) {
                     return;
                 }
@@ -977,20 +1111,30 @@ final class LogWriter {
         }
     }
 
-    /// Seals and writes `group`, then forces it, and the file of large values if `units`; or writes it through, if
-    /// [#writesThrough(List)], and forces only that file.
+    /// Seals `group` into the output and writes it, then forces it, and the file of large values if `units`; or writes
+    /// it through, if [#writesThrough(List)], and forces only that file; or, if another group may go beside it, leaves
+    /// its write through to the caller, with the lane lock let go. Holding the lane lock, with [#first] idle.
     ///
     /// The commits of the group wrote their units before they queued their frames, so one force of that file, run
     /// beside the segment's write and force, makes them all durable before the group is. A rollover waits for it
     /// before it forces the segment: the first frame of a group in the next segment then means, as it always does,
     /// that everything before it is durable.
     ///
-    /// @return the bytes of the frame bodies written
-    private long write(List<Queued> group, boolean units) throws IOException {
-        if (channel == null) {
-            rollover();
-        } else if (rollsEarly()) {
-            rollEarly();
+    /// A group written here is published before this returns. One left to the caller is laid out in [#first], in the
+    /// state [#WRITING], with the output holding its bytes and [#position] past them: the caller writes it with
+    /// [#writeOut] and settles it with [#complete].
+    ///
+    /// @param sequence the commit up to which the group makes the log durable
+    /// @param frames the frames queued up to its last one
+    /// @param beside whether [#second] holds a group not durable yet, which [#admitsBeside] admitted this one beside
+    /// @return whether the group's write is left to the caller
+    private boolean write(List<Queued> group, boolean units, long sequence, long frames, boolean beside) throws IOException {
+        if (!beside) {
+            if (channel == null) {
+                rollover();
+            } else if (rollsEarly()) {
+                rollEarly();
+            }
         }
         // Between groups: the last drain's bytes, which an interrupted force writes again, are durable by now
         if (smallGroups >= SHRINK_AFTER && output.length > MIN_OUTPUT) {
@@ -1001,7 +1145,9 @@ final class LogWriter {
             waitedGroups++;
         }
         // Before a frame is sealed, while the output holds no byte of the group
-        var through = writesThrough(group);
+        var through = beside || writesThrough(group);
+        var open = beside || (through && overlapOn && !overlapBroken && !leading && !units && wayProven && !closing
+                && position > SEGMENT_HEADER && throughFile != null);
         var unitForce = units ? forceUnits() : null;
         var start = position;
         var groupStart = true;
@@ -1009,6 +1155,7 @@ final class LogWriter {
         for (var frame : group) {
             bodies += frame.body().size();
         }
+        overlapBack = beside ? (int) ((start - second.start) / ALIGNMENT) : 0;
         var count = group.size();
         for (var index = 0; index < count; ) {
             var frame = group.get(index);
@@ -1038,6 +1185,7 @@ final class LogWriter {
             }
             groupStart = false;
         }
+        overlapBack = 0;
         // Zeros to the next block, where the next group starts: a reused file holds older bytes there
         var end = position + used;
         var padding = (int) ((end + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT - end);
@@ -1045,6 +1193,34 @@ final class LogWriter {
         Arrays.fill(output, used, used + padding, (byte) 0);
         used += padding;
         smallGroups = position + used - start <= MIN_OUTPUT / 2 ? smallGroups + 1 : 0;
+        var lane = first;
+        lane.ticket = ++tickets;
+        lane.start = start;
+        lane.frameEnd = end;
+        lane.sequence = sequence;
+        lane.frames = frames;
+        lane.bodies = bodies;
+        lane.leading = leading;
+        lane.overlapped = beside;
+        lane.through = through;
+        lane.failure = null;
+        lane.interrupted = false;
+        if (open) {
+            lane.length = used;
+            lane.overlappable = true;
+            lane.open = true;
+            lane.state = WRITING;
+            if (beside) {
+                second.overlapped = true;
+                overlappedGroups++;
+            }
+            position = start + used;
+            used = 0;
+            return true;
+        }
+        lane.length = (int) (position + used - start);
+        lane.overlappable = false;
+        lane.open = false;
         var forceStart = System.nanoTime();
         if (through) {
             writeThrough();
@@ -1057,20 +1233,26 @@ final class LogWriter {
         // the wait for woken commits at its bound for dozens of groups: the first counts for nothing, and a later one
         // for four times the average at most
         if (forces > 0) {
-            forceNanos = forceNanos == 0 ? took : forceNanos + (Math.min(took, 4 * forceNanos) - forceNanos) / 8;
+            averageForce(took);
         }
         forces++;
         if (unitForce != null) {
             await(unitForce);
         }
-        this.groupStart = start;
-        groupEnd = end;
         if (next == null) {
             prepareNext();
         } else {
             fillNext();
         }
-        return bodies;
+        lane.state = WRITTEN;
+        publishReady();
+        return false;
+    }
+
+    /// Takes `took` nanoseconds into [#forceNanos], at most four times the average before it.
+    private void averageForce(long took) {
+        var average = forceNanos;
+        forceNanos = average == 0 ? took : average + (Math.min(took, 4 * average) - average) / 8;
     }
 
     /// {@return the bytes sealing adds to a frame body: the GCM tag, or the CRC-32C without encryption}
@@ -1153,14 +1335,16 @@ final class LogWriter {
         used = bodyAt + sealedLength;
     }
 
-    /// Writes the header of a frame at `at` of the output.
+    /// Writes the header of a frame at `at` of the output; the first of a group written beside the one before it
+    /// carries [#OVERLAPS] and [#overlapBack].
     private void writeHeader(int at, int sealedLength, long sequence, byte type, boolean groupStart) {
         Bytes.i32(output, at, MAGIC);
         Bytes.i32(output, at + 4, sealedLength);
         Bytes.i64(output, at + 8, sequence);
         output[at + 16] = type;
-        output[at + 17] = groupStart ? GROUP_START : 0;
-        Bytes.u16(output, at + 18, 0);
+        var back = groupStart ? overlapBack : 0;
+        output[at + 17] = (byte) ((groupStart ? GROUP_START : 0) | (back > 0 ? OVERLAPS : 0));
+        Bytes.u16(output, at + 18, back);
         Bytes.i64(output, at + SEGMENT_TAG_OFFSET, segmentTag);
         Bytes.i64(output, at + USE_TAG_OFFSET, useTag);
         crc.reset();
@@ -1375,14 +1559,22 @@ final class LogWriter {
     }
 
     /// Makes the commits up to `sequence`, and the first `frames` frames, durable, wakes the commits waiting for them
-    /// and, if the queue is `roomy`, has the next flush of the pool wait for the woken commits to come back.
+    /// and, if the queue is `roomy` and the flush that holds [#running] publishes, has its next group wait for the
+    /// woken commits to come back.
     ///
     /// One woken commit is waited for only while another still waits: two committers out of step wake one each, and
-    /// never merge otherwise, while a lone committer leaves no other waiting and is never held back.
-    private void publish(long sequence, long frames, boolean roomy) {
-        var arm = roomy && commitWindowNanos == 0 && skippedGroups == 0 && cohortSpan <= maxCohort && forceNanos > 0
-                && !closing;
-        if (skippedGroups > 0) {
+    /// never merge otherwise, while a lone committer leaves no other waiting and is never held back. After a group
+    /// written through while groups go beside one another, the lanes wait for the woken commits themselves
+    /// ([#gather(Lane)]); after a forced one, whose successor is forced alone too, the flush does.
+    ///
+    /// @param leader whether the group is a commit's own, whose thread comes back too
+    /// @param main whether the flush that holds [#running] publishes, which alone owns the wait for woken commits
+    /// @param through whether the group was written through
+    /// @return the commits it woke, the leader included
+    private int publish(long sequence, long frames, boolean roomy, boolean leader, boolean main, boolean through) {
+        var arm = main && (!overlapOn || !through) && roomy && commitWindowNanos == 0 && skippedGroups == 0
+                && cohortSpan <= maxCohort && forceNanos > 0 && !closing;
+        if (main && skippedGroups > 0) {
             skippedGroups--;
         }
         if (arm) {
@@ -1399,7 +1591,7 @@ final class LogWriter {
             durabilityLock.unlock();
         }
         // A commit that wrote its own group comes back too
-        var woken = wake(sequence) + (leading ? 1 : 0);
+        var woken = wake(sequence) + (leader ? 1 : 0);
         var span = woken + (int) Math.clamp(lastQueued - sequence, 0, Integer.MAX_VALUE);
         lastGroupWaiters = woken;
         cohortSpan = span;
@@ -1409,6 +1601,7 @@ final class LogWriter {
         } else if (arm) {
             cohortArmed = false;
         }
+        return woken;
     }
 
     /// Wakes the commits waiting for a sequence at or below `sequence`.
@@ -1443,6 +1636,541 @@ final class LogWriter {
         } finally {
             queueLock.unlock();
         }
+        // A flush waiting for a lane to go idle looks at the failure
+        if (laneLock.isHeldByCurrentThread()) {
+            laneChanged.signalAll();
+        } else {
+            laneLock.lock();
+            try {
+                laneChanged.signalAll();
+            } finally {
+                laneLock.unlock();
+            }
+        }
+    }
+
+    /// {@return whether `frames` may go to the device as one group while the group of `other`, the last laid out, is
+    /// still there: groups beside one another are on, both are written through into the same segment, neither is a
+    /// commit's own nor holds units of the file of large values, the group fits one write within the bytes the segment
+    /// had when it was prepared, and commits wait for durability}
+    ///
+    /// The group of `other` is the only one not published, so everything before it is durable: a crash that tears it
+    /// leaves this one the only later group, which recovery tells by the distance back to it its first frame names, and
+    /// the group after this one waits for `other`'s. Holding the lane lock and the queue lock.
+    ///
+    /// @param leader whether a commit's flush would write the group, which it writes alone
+    private boolean admitsBeside(Lane other, List<Queued> frames, boolean units, boolean leader) {
+        if (leader || units || !overlapOn || overlapBroken || closing || failure != null || !other.overlappable
+                || waiters.isEmpty() || (other == second ? throughFile : laneHandle) == null) {
+            return false;
+        }
+        var bytes = sealedBytes(frames);
+        if (bytes < 0) {
+            return false;
+        }
+        var end = (position + bytes + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT;
+        return end <= valid && position + bytes + ALIGNMENT <= segmentSize && (position - other.start) / ALIGNMENT <= 0xFFFF;
+    }
+
+    /// Waits, outside the lane lock, for the commits woken and not taken back into a group to queue their next frames:
+    /// all of them while `other` holds a group, so each lane writes the commits its own group woke, or half of them
+    /// while it does not, so the other half makes the group the second lane writes beside this one.
+    ///
+    /// It spins, then yields, for at most three quarters of a force and [#MAX_COHORT_WAIT], as [#awaitCohort()] does.
+    /// A close, a failure, a commit waiting for room in the queue, groups going back to one lane, or, for the main
+    /// flush, a task of another store waiting for the pool, ends it at once; for the second lane, so does the end of
+    /// the write of [#first], which leaves nothing to go beside.
+    private void gather(Lane other) {
+        var left = cohortLeft;
+        var average = forceNanos;
+        var budget = Math.min(average - average / 4, MAX_COHORT_WAIT);
+        if (left <= 0 || budget <= 0) {
+            return;
+        }
+        var target = other.state != IDLE ? left : (left + 1) / 2;
+        var began = System.nanoTime();
+        while (appended - takenFrames < target) {
+            var waited = System.nanoTime() - began;
+            if (waited >= budget || failure != null || closing || queueWaiters > 0 || !overlapOn
+                    || (other == first ? first.state != WRITING : poolWanted())) {
+                return;
+            }
+            if (waited < COHORT_SPIN) {
+                Thread.onSpinWait();
+            } else {
+                Thread.yield();
+            }
+        }
+    }
+
+    /// Writes the group laid out in `lane` through `handle` from `bytes`, outside the lane lock, and records how long
+    /// it took or why it failed, for [#complete(Lane)].
+    ///
+    /// An interrupt of the thread, which nothing should interrupt, closes the handle: the failure records it, and the
+    /// interrupt is cleared, so the group can be written again through the cache.
+    private void writeOut(Lane lane, WriteThrough.Handle handle, byte[] bytes) {
+        var began = System.nanoTime();
+        try {
+            handle.write(bytes, lane.length, bytes.length, lane.start);
+            lane.took = Math.max(1, System.nanoTime() - began);
+        } catch (ClosedByInterruptException exception) {
+            var _ = Thread.interrupted();
+            lane.interrupted = true;
+            lane.failure = exception;
+        } catch (IOException exception) {
+            lane.failure = exception;
+        } catch (RuntimeException | LinkageError throwable) {
+            lane.failure = new IOException("A log group could not be written through", throwable);
+        }
+    }
+
+    /// Settles the write of the group laid out in `lane`: publishes it once every group laid out before it is
+    /// published, or, if the write failed, has it written again ([#settle(Lane)]). Holding the lane lock.
+    private void complete(Lane lane) {
+        if (lane.failure == null) {
+            lane.state = WRITTEN;
+            if (failure == null) {
+                // A write beside another says nothing of the time of one alone, which the wait for woken commits takes
+                if (!lane.overlapped && forces > 0) {
+                    averageForce(lane.took);
+                }
+                forces++;
+                writtenThrough++;
+                if (next == null) {
+                    prepareNext();
+                } else {
+                    fillNext();
+                }
+                publishReady();
+            }
+        } else {
+            lane.state = FAILED;
+            laneChanged.signalAll();
+            settle(lane);
+        }
+        laneChanged.signalAll();
+    }
+
+    /// Writes the group of `lane`, whose write through failed, again into the cache and forces it, once the other
+    /// lane's write is no longer in flight, then publishes what is durable; a group of the other lane that failed as
+    /// well is written again with it.
+    ///
+    /// As [#writeThrough()] does for a group alone, the write makes each page of the group dirty again whatever the
+    /// failed write left on the device, so a force that succeeds makes it durable, and one that fails stops the writer.
+    /// No write through is in flight beside them, so no write of the cache shares a page with one. A failure other than
+    /// an interrupt moves the writer to forces and turns groups beside one another off for good; an interrupt only
+    /// closes the lane's handle, which the lane's next group opens again. Holding the lane lock.
+    private void settle(Lane lane) {
+        var other = lane == first ? second : first;
+        while (other.state == WRITING) {
+            laneChanged.awaitUninterruptibly();
+        }
+        // The other lane settled both, or the writer stopped meanwhile
+        if (lane.state != FAILED || failure != null) {
+            return;
+        }
+        try {
+            var firstFailed = first.state == FAILED;
+            var secondFailed = second.state == FAILED;
+            if ((firstFailed && !first.interrupted) || (secondFailed && !second.interrupted)) {
+                writeThrough.disable();
+                overlapBroken = true;
+                overlapOn = false;
+                throughWanted = false;
+                closeQuietly(throughFile);
+                throughFile = null;
+                closeQuietly(laneHandle);
+                laneHandle = null;
+            } else {
+                if (firstFailed) {
+                    closeQuietly(throughFile);
+                    throughFile = null;
+                }
+                if (secondFailed) {
+                    closeQuietly(laneHandle);
+                    laneHandle = null;
+                }
+            }
+            if (firstFailed) {
+                rewrite(output, first);
+            }
+            if (secondFailed) {
+                rewrite(laneOutput, second);
+            }
+            channel.force(false);
+            forces++;
+            if (firstFailed) {
+                first.failure = null;
+                first.state = WRITTEN;
+            }
+            if (secondFailed) {
+                second.failure = null;
+                second.state = WRITTEN;
+            }
+        } catch (IOException exception) {
+            stop(exception);
+            return;
+        } catch (RuntimeException | Error throwable) {
+            stop(new IOException("The log writer failed", throwable));
+            return;
+        }
+        publishReady();
+    }
+
+    /// Writes the bytes of the group of `lane`, held by `bytes`, into the cache where they belong.
+    private void rewrite(byte[] bytes, Lane lane) throws IOException {
+        var buffer = ByteBuffer.wrap(bytes, 0, lane.length);
+        var at = lane.start;
+        while (buffer.hasRemaining()) {
+            at += channel.write(buffer, at);
+        }
+    }
+
+    /// Publishes the groups at the front of the lanes that are durable, in the order they were laid out: a group whose
+    /// write ended before the write of the group laid out ahead of it waits for that one. Holding the lane lock; a
+    /// stopped writer publishes nothing more.
+    private void publishReady() {
+        while (failure == null) {
+            var lane = front();
+            if (lane == null || lane.state != WRITTEN) {
+                return;
+            }
+            publishLane(lane);
+        }
+    }
+
+    /// {@return the lane whose group was laid out first of those not published, or `null` if both are idle}
+    private Lane front() {
+        if (first.state == IDLE) {
+            return second.state == IDLE ? null : second;
+        }
+        return second.state == IDLE || first.ticket < second.ticket ? first : second;
+    }
+
+    /// Makes the group of `lane`, durable and the first not published, the last published one, and the lane idle.
+    /// Holding the lane lock.
+    private void publishLane(Lane lane) {
+        // A group written with the lane lock held moved it itself
+        if (lane.open) {
+            forcedPosition = lane.start + lane.length;
+        }
+        groupStart = lane.start;
+        groupEnd = lane.frameEnd;
+        lastThrough = lane.through;
+        boolean roomy;
+        queueLock.lock();
+        try {
+            pendingBytes -= lane.bodies;
+            roomy = pendingBytes < QUEUE_LIMIT / 2;
+            queueDrained.signalAll();
+        } finally {
+            queueLock.unlock();
+        }
+        lane.state = IDLE;
+        var main = Thread.currentThread() != laneThread;
+        var woken = publish(lane.sequence, lane.frames, roomy, lane.leading, main, lane.through);
+        cohortLeft = Math.min(maxCohort, cohortLeft + woken);
+        account(lane, woken);
+        laneChanged.signalAll();
+    }
+
+    /// Counts a published group toward the epoch of [Overlap#AUTO], whose end decides whether groups go beside one
+    /// another in the next one ([OverlapGate]). Holding the lane lock.
+    private void account(Lane lane, int woken) {
+        if (gate != null && !overlapBroken) {
+            overlapOn = gate.published(lane.sequence, lane.through, woken);
+        }
+    }
+
+    /// Starts the thread of the second lane, unless it runs or the writer closes. Holding the lane lock.
+    ///
+    /// A platform thread of its own: a thread of the pool, which a store that owns its pool has one of, would wait
+    /// behind the flush whose write it should go beside, and a virtual thread's write through on Windows holds its
+    /// carrier.
+    private void startLane() {
+        if (laneThread != null || laneStop) {
+            return;
+        }
+        var thread = Thread.ofPlatform().daemon().name("ledger-log-lane").unstarted(this::laneLoop);
+        laneThread = thread;
+        thread.start();
+    }
+
+    /// Wakes the thread of the second lane if it waits for frames to write beside the group of [#first].
+    private void wakeLane() {
+        if (laneWanted) {
+            var thread = laneThread;
+            if (thread != null) {
+                LockSupport.unpark(thread);
+            }
+        }
+    }
+
+    /// Runs the second lane until a close stops it, or until it has written nothing for [#LANE_IDLE], when it gives
+    /// its output, its buffer and its handle back and its thread ends; the next group that may have another beside it
+    /// starts one again.
+    private void laneLoop() {
+        var idleSince = System.nanoTime();
+        while (!laneStop) {
+            boolean wrote;
+            try {
+                wrote = runLane();
+            } catch (RuntimeException | Error throwable) {
+                stop(new IOException("The log writer failed", throwable));
+                wrote = false;
+            }
+            var now = System.nanoTime();
+            if (wrote) {
+                idleSince = now;
+                continue;
+            }
+            if (now - idleSince >= LANE_IDLE) {
+                laneLock.lock();
+                try {
+                    if (second.state == IDLE) {
+                        laneThread = null;
+                        laneWanted = false;
+                        laneOutput = null;
+                        closeQuietly(laneHandle);
+                        laneHandle = null;
+                        writeThrough.release(1);
+                        return;
+                    }
+                } finally {
+                    laneLock.unlock();
+                }
+            }
+            LockSupport.parkNanos(this, LANE_IDLE);
+        }
+    }
+
+    /// Takes the queued frames as a group and writes it through beside the group [#first] writes, on the thread of the
+    /// second lane, if [#admitsBeside] admits them, after waiting for the commits woken to queue theirs.
+    ///
+    /// @return whether it wrote a group
+    private boolean runLane() {
+        laneWanted = false;
+        if (overlapOn) {
+            gather(first);
+        }
+        byte[] bytes;
+        WriteThrough.Handle handle;
+        laneLock.lock();
+        try {
+            if (!overlapOn || overlapBroken || failure != null || closing || second.state != IDLE || first.state != WRITING
+                    || !first.overlappable) {
+                return false;
+            }
+            if (laneHandle == null) {
+                try {
+                    laneHandle = writeThrough.open(segmentPath, 1);
+                } catch (IOException | RuntimeException | LinkageError _) {
+                    // The writes of the first lane go on as they are; only a second handle is refused
+                    overlapBroken = true;
+                    overlapOn = false;
+                    return false;
+                }
+            }
+            ArrayList<Queued> group;
+            long sequence;
+            long frames;
+            queueLock.lock();
+            try {
+                if (queue.isEmpty() || !admitsBeside(first, queue, queuedUnits, false)) {
+                    // Frames that cannot go beside it now never can once more join them, while an empty queue may yet
+                    laneWanted = queue.isEmpty();
+                    return false;
+                }
+                group = queue;
+                sequence = lastQueued;
+                frames = appended;
+                queue = laneSpare;
+                takenFrames = frames;
+            } finally {
+                queueLock.unlock();
+            }
+            cohortLeft = Math.max(0, cohortLeft - group.size());
+            try {
+                layoutLane(group, sequence, frames);
+            } catch (IOException exception) {
+                stop(exception);
+                return false;
+            } finally {
+                group.clear();
+                laneSpare = group;
+            }
+            bytes = laneOutput;
+            handle = laneHandle;
+        } finally {
+            laneLock.unlock();
+        }
+        writeOut(second, handle, bytes);
+        laneLock.lock();
+        try {
+            complete(second);
+        } finally {
+            laneLock.unlock();
+        }
+        return true;
+    }
+
+    /// Seals `group` into the output of the second lane, at the block after the group of [#first], its first frame
+    /// naming the distance back to that group, and lays it out in [#second], in the state [#WRITING]. Holding the lane
+    /// lock.
+    ///
+    /// @param sequence the commit up to which the group makes the log durable
+    /// @param frames the frames queued up to its last one
+    private void layoutLane(List<Queued> group, long sequence, long frames) throws IOException {
+        if (laneOutput == null || (laneSmallGroups >= SHRINK_AFTER && laneOutput.length > MIN_OUTPUT)) {
+            laneOutput = new byte[MIN_OUTPUT];
+        }
+        if (waitedGroup) {
+            waitedGroup = false;
+            waitedGroups++;
+        }
+        // The output of the first lane holds its group, which the sealing below must leave alone
+        var firstOutput = output;
+        var firstUsed = used;
+        output = laneOutput;
+        used = 0;
+        var start = position;
+        overlapBack = (int) ((start - first.start) / ALIGNMENT);
+        try {
+            var bodies = 0L;
+            for (var frame : group) {
+                bodies += frame.body().size();
+            }
+            var groupStart = true;
+            for (int index = 0, count = group.size(); index < count; ) {
+                var frame = group.get(index);
+                var bodyLength = frame.body().size();
+                if (bodyLength > RUN_MAX_BODY) {
+                    seal(frame, bodyLength + sealOverhead(), groupStart);
+                    index++;
+                } else {
+                    var end = runEnd(group, index);
+                    sealRun(group, index, end, groupStart);
+                    index = end;
+                }
+                groupStart = false;
+            }
+            var end = position + used;
+            var padding = (int) ((end + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT - end);
+            room(padding);
+            Arrays.fill(output, used, used + padding, (byte) 0);
+            used += padding;
+            laneOutput = output;
+            laneSmallGroups = used <= MIN_OUTPUT / 2 ? laneSmallGroups + 1 : 0;
+            var lane = second;
+            lane.ticket = ++tickets;
+            lane.start = start;
+            lane.length = used;
+            lane.frameEnd = end;
+            lane.sequence = sequence;
+            lane.frames = frames;
+            lane.bodies = bodies;
+            lane.leading = false;
+            lane.through = true;
+            lane.overlappable = true;
+            lane.open = true;
+            lane.overlapped = true;
+            lane.failure = null;
+            lane.interrupted = false;
+            lane.state = WRITING;
+            first.overlapped = true;
+            overlappedGroups++;
+            position = start + used;
+        } finally {
+            overlapBack = 0;
+            output = firstOutput;
+            used = firstUsed;
+        }
+    }
+
+    /// Ends the thread of the second lane and waits for it, so it writes nothing once this returns.
+    private void stopLane() {
+        laneStop = true;
+        var thread = laneThread;
+        if (thread == null) {
+            return;
+        }
+        LockSupport.unpark(thread);
+        var interrupted = false;
+        while (true) {
+            try {
+                thread.join();
+                break;
+            } catch (InterruptedException _) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /// Whether a group written through may go to the device while the group before it is still there, a second lane
+    /// writing it from a thread and a handle of its own.
+    ///
+    /// Two writes in flight at once pay where the device serves them together, and where the commits a group wakes
+    /// come back while the other lane's group is on the device; where it takes one at a time, a group split in two
+    /// takes two of its round trips for the commits one took.
+    enum Overlap {
+        /// As measured: groups go beside one another in epochs whose rate of commits beat the epoch on one lane before
+        /// them, and back to one lane otherwise ([OverlapGate]). The default.
+        AUTO,
+        /// One group at a time.
+        OFF,
+        /// Beside one another wherever they may.
+        ON;
+
+        /// {@return the mode the system property `ledger.log.overlap` names, [#AUTO] if it names none}
+        ///
+        /// @throws IllegalArgumentException if it names no mode
+        static Overlap fromProperty() {
+            var value = System.getProperty("ledger.log.overlap");
+            if (value == null || value.isBlank()) {
+                return AUTO;
+            }
+            try {
+                return valueOf(value.trim().toUpperCase(Locale.ROOT));
+            } catch (IllegalArgumentException exception) {
+                throw new IllegalArgumentException("ledger.log.overlap must be auto, off or on: " + value, exception);
+            }
+        }
+    }
+
+    /// A group laid out and not yet published, with what its publication needs; a lane holds one at a time.
+    private static final class Lane {
+        // IDLE, WRITING, WRITTEN or FAILED; written under the lane lock
+        volatile int state;
+        // The order it was laid out in, among the groups of both lanes
+        long ticket;
+        // Where its bytes start in the segment, a block boundary, and how many, its padding included; where its frames
+        // end
+        long start;
+        int length;
+        long frameEnd;
+        // The commit up to which, and the frames queued up to which, it makes the log durable, and the bytes of their
+        // bodies
+        long sequence;
+        long frames;
+        long bodies;
+        // Whether it is a commit's own group, whose thread comes back too
+        boolean leading;
+        // Whether it was written through
+        boolean through;
+        // Whether a group may go beside it: written through, with no units, not a commit's own nor its use's first
+        boolean overlappable;
+        // Whether it went to the device with the lane lock let go, so its publication moves forcedPosition
+        boolean open;
+        // Whether another group was on the device beside it
+        boolean overlapped;
+        // How long its write took, in nanoseconds
+        long took;
+        // Why its write failed, and whether an interrupt closed its handle, or null
+        IOException failure;
+        boolean interrupted;
     }
 
     /// {@return whether the commit at `sequence` is durable}
@@ -1565,12 +2293,13 @@ final class LogWriter {
         return 13 + bodyBytes + unitBytes + (long) writes * WRITE_HEAP + (writes > 0 && !sharesChunk ? COMMIT_HEAP : 0);
     }
 
-    /// {@return the offset in the current segment where the frames of the last group end, before their padding}
+    /// {@return the offset in the current segment where the frames of the last published group end, before their
+    /// padding}
     long groupEnd() {
         return groupEnd;
     }
 
-    /// {@return the offset in the current segment where the frames of the last group start, a block boundary}
+    /// {@return the offset in the current segment where the frames of the last published group start, a block boundary}
     long groupStart() {
         return groupStart;
     }
@@ -1589,6 +2318,32 @@ final class LogWriter {
     /// {@return the groups written through so far, for tests}
     long writtenThrough() {
         return writtenThrough;
+    }
+
+    /// {@return the groups written while the group before them was not durable yet, for tests}
+    long overlappedGroups() {
+        return overlappedGroups;
+    }
+
+    /// {@return whether groups go beside one another now, for tests}
+    boolean overlapping() {
+        return overlapOn;
+    }
+
+    /// {@return whether the group of the second lane, if `second`, or of the flush, is durable and waits for the group
+    /// laid out before it to be published, for tests}
+    boolean laneWritten(boolean second) {
+        return (second ? this.second : first).state == WRITTEN;
+    }
+
+    /// {@return whether the second lane has a thread, for tests}
+    boolean laneRunning() {
+        return laneThread != null;
+    }
+
+    /// {@return the commits waiting for durability, for tests}
+    int waitingForTests() {
+        return waiters.size();
     }
 
     /// {@return the way later segments are opened to write through, or `null` if their groups are forced, for tests}
@@ -1745,10 +2500,12 @@ final class LogWriter {
         }
     }
 
-    /// Closes the channel of the current segment and its handle to write through.
+    /// Closes the channel of the current segment and its handles to write through, with no write in flight.
     private void closeSegment() throws IOException {
         var handle = throughFile;
         throughFile = null;
+        closeQuietly(laneHandle);
+        laneHandle = null;
         try {
             if (handle != null) {
                 handle.close();
@@ -1761,11 +2518,19 @@ final class LogWriter {
     }
 
     private void closeChannel() {
-        // No flush runs: everything queued is durable, or the writer stopped
+        // No flush takes a group any more: everything queued is durable, or the writer stopped, which may leave a write
+        // of a lane to return
+        stopLane();
+        laneLock.lock();
         try {
+            while (first.state == WRITING || second.state == WRITING) {
+                laneChanged.awaitUninterruptibly();
+            }
             closeSegment();
         } catch (IOException _) {
             // The data is durable already; nothing to recover from a failed close
+        } finally {
+            laneLock.unlock();
         }
     }
 
