@@ -74,9 +74,11 @@ final class ResidentLoader {
     private int failedAttempt;
     private RuntimeException failure;
     /// Called after the loader registered its read, with 0, and after every [#PUBLISHED] leaves it installs, with the
-    /// times it was called before, while the loader reads none of the leaves; for tests that pause it there.
+    /// times it was called before, while the loader's thread reads no leaf and [#reading] is null, though the workers
+    /// of its stream may still read and open the leaves ahead of it; for tests that pause it there.
     volatile IntConsumer stepHookForTests;
-    /// Receives each array of the pool the loader gives back, before it does; for tests, or `null`.
+    /// Receives each array of plaintext the loader is done with, before its stream writes over it or lets go of it; for
+    /// tests, or `null`.
     volatile Consumer<byte[]> releaseHookForTests;
     // The workers of the last attempt; for tests
     private volatile int workers;
@@ -363,7 +365,7 @@ final class ResidentLoader {
     /// Installs the entries of `leaf` at or after `from`, then publishes them by moving [#below] past the last.
     ///
     /// A key that has a chain already got it from an earlier attempt that failed, and keeps it: no commit writes the
-    /// keys at or after [#below]. Nothing installed refers to `leaf`, which may go back to the pool after: the keys and
+    /// keys at or after [#below]. Nothing installed refers to `leaf`, which the stream may write over after: the keys and
     /// the values are copied, and a decoder keeps nothing of the memory it reads.
     private void install(byte[] leaf, MemorySegment from) {
         var values = state.keyspace.values();

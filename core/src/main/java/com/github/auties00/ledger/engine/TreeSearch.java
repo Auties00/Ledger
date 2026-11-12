@@ -98,8 +98,8 @@ final class TreeSearch {
     /// {@return the leaves of the tree under `root` that the nodes on the path to `from` name, and the subtrees after
     /// them}
     ///
-    /// It reads one node a level, through the cache, so the first leaves are known after two or three reads: reading
-    /// every branch first made the leaves of a large tree wait for all of them.
+    /// It reads one node a level, through the cache, so the first leaves are known after two or three reads, whatever
+    /// the count of branches of the tree.
     static Path path(PageFile pages, TreeRoot root, MemorySegment from) {
         var unit = pages.read(root.ref(), PageFile.NODE, true);
         if (TreeNodes.isLeaf(unit)) {

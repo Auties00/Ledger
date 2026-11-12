@@ -314,7 +314,7 @@ final class PageFile implements AutoCloseable {
     /// read with one call on the channel of `lease`}
     ///
     /// The caller gives the array back with [#release(byte\[\])] once it opened the units in it
-    /// ([#openOwned(byte\[\], int, PageRef, byte)]). It may be longer than the pages.
+    /// ([#openInto(byte\[\], int, PageRef, byte, byte\[\])]). It may be longer than the pages.
     ///
     /// @param lease the channel to read on, or `null` to take one of the pool's, waiting for one
     /// @throws LedgerIoException if the file cannot be read
@@ -330,36 +330,24 @@ final class PageFile implements AutoCloseable {
         }
     }
 
-    /// {@return the plaintext of the unit `ref` names, opened from `sealed`, pages [#readSealed(int, int, Lease)] read,
-    /// in which the unit starts at `offset`, into an array of the store's pool}
+    /// Opens into `plain` the unit `ref` names from `sealed`, pages [#readSealed(int, int, Lease)] read, in which the
+    /// unit starts at `offset`.
     ///
-    /// The caller owns the array and gives it back with [#release(byte\[\])] once it no longer reads it. It never goes
-    /// to the cache: readers keep using the arrays the cache evicts, so an array it held cannot go back to the pool. It
-    /// may be longer than the unit.
+    /// The caller owns `plain`, which is at least as long as the unit, and keeps it out of the cache: readers keep using
+    /// the arrays the cache evicts, so an array it held cannot be written again. After a failure `plain` holds no unit.
     ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
-    byte[] openOwned(byte[] sealed, int offset, PageRef ref, byte kind) {
-        var plain = pool.acquire(ref.pages() * PageFormat.SIZE);
-        var opened = false;
-        try {
-            opened = cipher.open(sealed, offset, ref.pages(), plain) && ref.describes(plain) && kindMatches(plain[PageFormat.KIND], kind);
-        } finally {
-            if (!opened) {
-                // What the open left in it is no unit's
-                pool.release(plain);
-            }
-        }
-        if (!opened) {
+    void openInto(byte[] sealed, int offset, PageRef ref, byte kind, byte[] plain) {
+        if (!cipher.open(sealed, offset, ref.pages(), plain) || !ref.describes(plain) || !kindMatches(plain[PageFormat.KIND], kind)) {
             throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
         }
-        return plain;
     }
 
-    /// Gives back to the store's pool `unit`, an array [#readSealed(int, int, Lease)] or
-    /// [#openOwned(byte\[\], int, PageRef, byte)] returned, which the caller no longer reads.
-    void release(byte[] unit) {
-        pool.release(unit);
+    /// Gives back to the store's pool `sealed`, an array [#readSealed(int, int, Lease)] returned, once the caller opened
+    /// the units in it.
+    void release(byte[] sealed) {
+        pool.release(sealed);
     }
 
     /// {@return a read channel of the pool, which the caller reads on until it gives it back, or `null` if every one is

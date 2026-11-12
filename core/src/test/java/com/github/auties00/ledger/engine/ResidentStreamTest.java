@@ -48,8 +48,8 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/// The stream a resident key space's loader reads its leaves from ([LeafStream]): the arrays it gives back to the pool,
-/// the trees of every height, failed reads on its workers, a close while it reads on every channel, the opens of one
+/// The stream a resident key space's loader reads its leaves from ([LeafStream]): the plaintext arrays it writes over
+/// for later leaves and keeps out of the store's pool, the trees of every height, failed reads on its workers, a close while it reads on every channel, the opens of one
 /// group spread over its threads, and a taker that ends while an application's virtual threads hold every carrier,
 /// whether the stream's threads found every read channel in use or lost their carriers while they read. Values of
 /// 1,400 bytes put two entries in a leaf.
@@ -198,8 +198,8 @@ class ResidentStreamTest {
     }
 
     @Test
-    @DisplayName("the leaves that reads cached before and during the load are installed from the cache, and none of the cache's arrays goes to the pool")
-    void cachedLeavesStayOutOfThePool(@TempDir Path directory) throws Exception {
+    @DisplayName("the leaves that reads cached before and during the load are installed from the cache, and the stream writes over none of the cache's arrays")
+    void cachedLeavesAreNotReused(@TempDir Path directory) throws Exception {
         var model = populate(directory, SESSIONS);
         try (var ledger = open(directory, false)) {
             var live = (LiveLedger) ledger;
@@ -220,7 +220,8 @@ class ResidentStreamTest {
             var stop = new AtomicBoolean();
             var readers = new ArrayList<Thread>();
             // The readers keep to the first half: they would otherwise cache every leaf before the loader claims it
-            // when they outrun it, and the uncached leaves of the second half reach the loader alone, on its arrays
+            // when they outrun it, and the uncached leaves of the second half reach the loader alone, on the stream's
+            // arrays
             for (var reader = 0; reader < 4; reader++) {
                 readers.add(Thread.ofPlatform().start(() -> {
                     var random = ThreadLocalRandom.current();
@@ -243,9 +244,9 @@ class ResidentStreamTest {
                 reader.join();
             }
             assertTrue(failures.isEmpty(), failures.size() + " failures, first: " + failures.peek());
-            assertFalse(released.isEmpty(), "no array went back to the pool");
+            assertFalse(released.isEmpty(), "the stream opened no leaf into an array of its own");
             for (var array : cached) {
-                assertFalse(released.contains(array), "an array of the cache went back to the pool");
+                assertFalse(released.contains(array), "the stream reused an array of the cache");
             }
             assertEquals(ENTRIES, live.state(SESSIONS).chains());
             checkAll(ledger, SESSIONS, model);
@@ -253,7 +254,7 @@ class ResidentStreamTest {
     }
 
     @Test
-    @DisplayName("nothing the loader installs reads the arrays it gives back to the pool, which the pool hands out again")
+    @DisplayName("nothing the loader installs reads the arrays its stream writes over with later leaves")
     void installedEntriesOwnTheirMemory(@TempDir Path directory) throws Exception {
         var model = populate(directory, TRUSTED);
         READ.clear();
@@ -261,20 +262,12 @@ class ResidentStreamTest {
             var live = (LiveLedger) ledger;
             assertEquals(Optional.of(value(0)), ledger.get(TRUSTED, key(0)));
             awaitLoaded(live, TRUSTED);
-            // Whatever the pool holds now is written over, as the store's next use of it would
-            var pool = HeapPool.process();
-            var taken = new ArrayList<byte[]>();
-            for (var i = 0; i < 4_096; i++) {
-                var array = pool.acquire(PageFormat.SIZE);
-                java.util.Arrays.fill(array, (byte) 0x7F);
-                taken.add(array);
-            }
-            taken.forEach(pool::release);
+            // The stream holds a few dozen arrays for 600 leaves, so the later leaves were opened over the earlier ones
             var changed = READ.stream().anyMatch(read -> {
                 var segment = (MemorySegment) read[1];
                 return !new String(segment.toArray(ValueLayout.JAVA_BYTE), StandardCharsets.US_ASCII).equals(read[0]);
             });
-            assertTrue(changed, "the pool handed out none of the arrays the loader gave back");
+            assertTrue(changed, "the stream wrote over none of the arrays the loader was done with");
             assertEquals(ENTRIES, live.state(TRUSTED).chains());
             checkAll(ledger, TRUSTED, model);
             for (var i = 0; i < ENTRIES; i += 97) {
@@ -282,6 +275,43 @@ class ResidentStreamTest {
             }
         } finally {
             READ.clear();
+        }
+    }
+
+    @Test
+    @DisplayName("a load on every read channel holds no more plaintext arrays than the leaves it opens ahead of the loader, and gives none to the store's pool")
+    void plaintextBoundedAndKeptFromThePool(@TempDir Path directory) throws Exception {
+        var model = populate(directory, SESSIONS);
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor(); var ledger = open(directory, false)) {
+            var live = (LiveLedger) ledger;
+            var pause = new Pause(0);
+            live.hookResidentLoadsForTests(pause);
+            var released = Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<byte[], Boolean>()));
+            var loader = live.state(SESSIONS).loading;
+            loader.releaseHookForTests = released::add;
+            ledger.get(SESSIONS, key(0));
+            pause.awaitPaused();
+            // A write past every leaf waits for the whole load, which reads on every channel from its first leaf
+            var waiting = executor.submit(() -> ledger.commit(ledger.newBatch().put(SESSIONS, key(ENTRIES - 1), "last")));
+            Thread.sleep(100);
+            pause.release();
+            waiting.get(60, TimeUnit.SECONDS);
+            awaitLoaded(live, SESSIONS);
+            assertEquals(LeafStream.MAX_WORKERS, loader.workersForTests());
+            // 600 leaves, opened by the taker and its workers, each at most a leaf past the bound
+            assertFalse(released.isEmpty(), "the stream opened no leaf into an array of its own");
+            assertTrue(released.size() <= LeafStream.OPENED_AHEAD + PageFile.READ_CHANNELS + 1,
+                    released.size() + " arrays for " + ENTRIES / 2 + " leaves");
+            var pool = HeapPool.process();
+            var handed = new ArrayList<byte[]>();
+            for (var i = 0; i < 4_096; i++) {
+                var array = pool.acquire(PageFormat.SIZE);
+                assertFalse(released.contains(array), "the pool handed out an array of the stream's");
+                handed.add(array);
+            }
+            handed.forEach(pool::release);
+            model.put(key(ENTRIES - 1), "last");
+            checkAll(ledger, SESSIONS, model);
         }
     }
 
@@ -526,8 +556,16 @@ class ResidentStreamTest {
             pages.node(top, TreeNodes.childFor(top, MemorySegment.ofArray(new byte[0])));
             var sequence = live.readers().register();
             var held = new ArrayList<PageFile.Lease>();
-            for (var i = 0; i < PageFile.READ_CHANNELS; i++) {
-                held.add(pages.tryLease());
+            // A read the store runs in the background, such as a checkpoint's, gives its channel back soon
+            var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+            while (held.size() < PageFile.READ_CHANNELS) {
+                var lease = pages.tryLease();
+                if (lease != null) {
+                    held.add(lease);
+                } else {
+                    assertTrue(System.nanoTime() < deadline, "a channel stays in use before the stream");
+                    Thread.sleep(1);
+                }
             }
             assertNull(pages.tryLease());
             var stop = new AtomicBoolean();
@@ -548,9 +586,10 @@ class ResidentStreamTest {
                 taker.join(TimeUnit.SECONDS.toMillis(30));
                 assertFalse(taker.isAlive(), "the taker waits for a thread with no carrier");
             } finally {
+                // First, so the spinners end whatever fails after
+                stop.set(true);
                 held.forEach(PageFile.Lease::close);
                 proceed.countDown();
-                stop.set(true);
                 for (var spinner : spinners) {
                     spinner.join();
                 }
