@@ -17,9 +17,6 @@ import java.util.TreeMap;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 /// The data file of a store: its units, read through the page cache and verified against the reference that named
@@ -177,6 +174,19 @@ final class PageFile implements AutoCloseable {
         if (hit != null && kindMatches(hit[PageFormat.KIND], kind)) {
             return hit;
         }
+        return load(ref, kind, cached, referenced);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, from the file, for a read that found the cache without it}
+    ///
+    /// A delta record still reads its delta page and its base through the cache.
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    /// @param cached whether to keep the unit in the cache
+    /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
+    /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[] load(PageRef ref, byte kind, boolean cached, boolean referenced) {
         if (ref.isRecord()) {
             // The delta page and the base go to the cache as the entries it evicts first: the leaf they make is what a
             // read uses again, and holding all three filled the cache with each leaf twice
@@ -251,43 +261,8 @@ final class PageFile implements AutoCloseable {
         if (!run.isEmpty()) {
             runs.add(run.stream().mapToInt(Integer::intValue).toArray());
         }
-        var claimed = new AtomicInteger();
-        var failure = new AtomicReference<RuntimeException>();
-        Runnable reader = () -> {
-            for (var i = claimed.getAndIncrement(); i < runs.size() && failure.get() == null; i = claimed.getAndIncrement()) {
-                try {
-                    readRun(refs, runs.get(i), kind, units);
-                } catch (RuntimeException exception) {
-                    failure.compareAndSet(null, exception);
-                }
-            }
-        };
         var running = Math.min(Math.min(READ_CHANNELS, threads), runs.size());
-        if (running <= 1) {
-            reader.run();
-        } else {
-            var started = new Thread[running];
-            for (var i = 0; i < running; i++) {
-                started[i] = Thread.ofVirtual().name("ledger-read").start(reader);
-            }
-            var interrupted = false;
-            for (var thread : started) {
-                while (true) {
-                    try {
-                        thread.join();
-                        break;
-                    } catch (InterruptedException _) {
-                        interrupted = true;
-                    }
-                }
-            }
-            if (interrupted) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        if (failure.get() != null) {
-            throw failure.get();
-        }
+        ClaimedIndexes.run("ledger-read", runs.size(), running - 1, i -> readRun(refs, runs.get(i), kind, units));
         return units;
     }
 
@@ -333,7 +308,7 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerIoException if the file cannot be read
     byte[] node(byte[] parent, int index) {
         var hit = cachedNode(parent, index);
-        return hit != null ? hit : read(TreeNodes.childRef(parent, index), NODE, true);
+        return hit != null ? hit : load(TreeNodes.childRef(parent, index), NODE, true, true);
     }
 
     /// {@return the node child `index` of the branch `parent` names if the cache holds it, or `null`}
@@ -677,88 +652,16 @@ final class PageFile implements AutoCloseable {
         /// worker parked on a join, after the caller last looked there or above a task only a free worker can take from
         /// its base, would never run, and the checkpoint with it.
         ///
-        /// It waits for the units and not for the threads: an application's virtual threads may hold every carrier for
-        /// as long as they compute, and a thread that gets none took no unit, as this thread seals all those no other
-        /// took.
+        /// It waits for the units and not for the threads ([ClaimedIndexes]): an application's virtual threads may hold
+        /// every carrier for as long as they compute.
         private void seal(List<Staged> entries, byte[][] sealedUnits) {
-            var seals = new Seals(entries, sealedUnits);
-            try {
-                for (var i = entries.size() < PARALLEL_SEALS ? 0 : Runtime.getRuntime().availableProcessors() - 1; i > 0; i--) {
-                    Thread.ofVirtual().name("ledger-seal").start(seals);
-                }
-            } catch (Throwable throwable) {
-                // No thread seals anything more: the flush fails
-                seals.fail(throwable);
-            }
-            seals.run();
-            seals.await();
-        }
-
-        /// The seals of one window of a flush, which the threads that run it take a unit at a time.
-        ///
-        /// A thread that starts after every unit was taken ends at once and reads neither the units nor the arrays, which
-        /// a thread with no carrier would otherwise keep from the collector for as long as it waits for one.
-        private final class Seals implements Runnable {
-            private final int size;
-            private final AtomicInteger claimed;
-            private final AtomicInteger finished;
-            private final AtomicReference<Throwable> failure;
-            // Released once every unit is finished
-            private final Semaphore done;
-            // Read only by a thread that holds an unfinished unit; cleared once none does
-            private List<Staged> entries;
-            private byte[][] sealedUnits;
-
-            private Seals(List<Staged> entries, byte[][] sealedUnits) {
-                this.size = entries.size();
-                this.claimed = new AtomicInteger();
-                this.finished = new AtomicInteger();
-                this.failure = new AtomicReference<>();
-                this.done = new Semaphore(0);
-                this.entries = entries;
-                this.sealedUnits = sealedUnits;
-            }
-
-            /// Seals the units no thread took, until none is left; after a failure it only marks them finished.
-            @Override
-            public void run() {
-                for (var i = claimed.getAndIncrement(); i < size; i = claimed.getAndIncrement()) {
-                    try {
-                        if (failure.get() == null) {
-                            var entry = entries.get(i);
-                            var sealed = pool.acquire(entry.ref().pages() * PageFormat.SIZE);
-                            sealedUnits[i] = sealed;
-                            cipher.seal(entry.unit(), entry.ref().pages(), sealed, 0);
-                        }
-                    } catch (Throwable throwable) {
-                        failure.compareAndSet(null, throwable);
-                    } finally {
-                        if (finished.incrementAndGet() == size) {
-                            done.release();
-                        }
-                    }
-                }
-            }
-
-            /// Makes the seals fail with `throwable`, unless they already did.
-            private void fail(Throwable throwable) {
-                failure.compareAndSet(null, throwable);
-            }
-
-            /// Waits until every unit is finished, whatever the interrupt status of the caller, and throws the failure
-            /// of the first that failed; only after [#run()] on the same thread, which leaves no unit to take.
-            private void await() {
-                done.acquireUninterruptibly();
-                entries = null;
-                sealedUnits = null;
-                switch (failure.get()) {
-                    case null -> {
-                    }
-                    case RuntimeException exception -> throw exception;
-                    case Error error -> throw error;
-                    case Throwable other -> throw new IllegalStateException(other);
-                }
-            }
+            var helpers = entries.size() < PARALLEL_SEALS ? 0 : Runtime.getRuntime().availableProcessors() - 1;
+            ClaimedIndexes.run("ledger-seal", entries.size(), helpers, i -> {
+                var entry = entries.get(i);
+                var sealed = pool.acquire(entry.ref().pages() * PageFormat.SIZE);
+                sealedUnits[i] = sealed;
+                cipher.seal(entry.unit(), entry.ref().pages(), sealed, 0);
+            });
         }
 
         /// Starts forcing what the checkpoint wrote so far, beside its work, once it wrote [#FORCE_EVERY] bytes since

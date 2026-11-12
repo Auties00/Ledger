@@ -176,7 +176,7 @@ final class TreeCursor {
         if (hit != null) {
             return hit;
         }
-        return pages.read(TreeNodes.childRef(parent, index), PageFile.NODE, pages.cache().hasRoom(PageFormat.SIZE), false);
+        return pages.load(TreeNodes.childRef(parent, index), PageFile.NODE, pages.cache().hasRoom(PageFormat.SIZE), false);
     }
 
     /// {@return whether the leaf or blob the cursor reads next goes to the cache}

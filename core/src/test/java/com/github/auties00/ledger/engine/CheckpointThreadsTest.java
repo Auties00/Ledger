@@ -129,7 +129,7 @@ class CheckpointThreadsTest {
         }
     }
 
-    private static void assertEndsWithBusyCarriers(Runnable work) throws InterruptedException {
+    static void assertEndsWithBusyCarriers(Runnable work) throws InterruptedException {
         var carriers = Integer.getInteger("jdk.virtualThreadScheduler.parallelism", Runtime.getRuntime().availableProcessors());
         var stop = new AtomicBoolean();
         var computing = new CountDownLatch(carriers);
