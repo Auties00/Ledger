@@ -423,8 +423,9 @@ final class TreeUpdate {
     /// Updates, on every processor, each child that `plans` gives a share of the writes to.
     ///
     /// Each subtree is a task with an update of its own, whose freed and taken units join this one's; the writer and
-    /// the free space are shared, and safe for concurrent use. A checkpoint of a write rate that rewrites most leaves
-    /// would otherwise rewrite them on one processor.
+    /// the free space are shared, and safe for concurrent use. A task for a leaf only merges its writes: the leaves of
+    /// one branch are built and written by the task of the branch, as a run of siblings splits together, and the
+    /// writer seals their pages on every processor as it flushes them.
     ///
     /// It returns only once every task has ended, even if one failed, and a failure stops the tasks that have not
     /// started yet: a checkpoint that fails gives back the pages its update took and the next one retries at once, so a

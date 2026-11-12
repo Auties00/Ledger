@@ -1596,12 +1596,12 @@ final class LogWriter {
         return writeThrough.kind();
     }
 
-    /// {@return the waits for the commits a force woke that ended with all of them back}
+    /// {@return the waits for the commits a force woke that ended with all of them back, for tests}
     long cohortsGathered() {
         return cohortsGathered;
     }
 
-    /// {@return the waits for the commits a force woke that ran out}
+    /// {@return the waits for the commits a force woke that ran out, for tests}
     long cohortsMissed() {
         return cohortsMissed;
     }

@@ -115,7 +115,7 @@ class BatchTotalsTest {
                         case 2, 3 -> {
                             // A commit that fails after the preparation leaves the writes, and one again prepares them again
                             for (var round = 0; round < 2; round++) {
-                                batch.prepare(false);
+                                batch.prepare(false, null, Map.of());
                                 checkHomes(batch);
                             }
                         }

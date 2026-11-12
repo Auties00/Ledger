@@ -96,12 +96,12 @@ class BatchOwnValuesTest {
         void prepares() {
             var alone = batch();
             alone.put(MESSAGES, new byte[]{1}, value(1, OWN));
-            alone.prepare(false);
+            alone.prepare(false, null, Map.of());
             assertNull(alone.home(0));
             assertEquals(0, alone.homeOffset(0));
             var beside = batch();
             beside.put(MESSAGES, new byte[]{1}, value(1, OWN)).put(MESSAGES, new byte[]{2}, value(2, 2_000));
-            beside.prepare(false);
+            beside.prepare(false, null, Map.of());
             assertNull(beside.home(0));
             assertEquals(0, beside.homeOffset(0));
             assertNull(beside.ownValue(1));
@@ -135,7 +135,7 @@ class BatchOwnValuesTest {
             assertTrue(batch.isEmpty());
             batch.put(MESSAGES, new byte[]{1}, new byte[3]);
             assertNull(batch.ownValue(0));
-            batch.prepare(false);
+            batch.prepare(false, null, Map.of());
             assertEquals(4, batch.home(0).byteSize());
             batch.finish();
             assertTrue(batch.isEmpty());
