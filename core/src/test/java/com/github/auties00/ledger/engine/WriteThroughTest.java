@@ -703,13 +703,18 @@ class WriteThroughTest {
             var disk = CrashFileSystem.create();
             var asked = new AtomicInteger();
             var model = new TreeMap<String, String>();
-            // Reopened, as a new store queues a frame of its key spaces, which the pool may write before the open returns
-            open(disk.getPath("/store"), WriteThrough.Mode.OFF).close();
+            // An open queues a frame of the key spaces no checkpoint names, which the pool may write, asking the device,
+            // before the open returns; a close with no commit drops the segment that held it, so the store is reopened
+            // only once a commit made its checkpoint name them
+            try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.OFF)) {
+                commit(ledger, model, "seed");
+            }
             try (var ledger = open(disk.getPath("/store"), new WriteThrough(WriteThrough.Kind.DSYNC, () -> {
                 asked.incrementAndGet();
                 return false;
             }))) {
                 var log = log(ledger);
+                assertEquals(0, log.appendedBytes(), "the open queued a frame");
                 assertEquals(0, asked.get(), "the device was asked by opening a store");
                 var commits = 0;
                 while (log.currentSegment() < 4) {
