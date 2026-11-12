@@ -24,7 +24,9 @@ public non-sealed interface Transaction extends View {
     /// @param <K> the key type
     /// @param <V> the value type
     /// @return this transaction
-    /// @throws IllegalArgumentException if this store was not opened with `keyspace`
+    /// @throws IllegalArgumentException if this store was not opened with `keyspace`, or the store has a log and the
+    ///                                  transaction's writes would take more of it than one commit may, a little under
+    ///                                  2 GiB with its large values aside; the write does nothing
     /// @throws LedgerCorruptedException if the entry of `key` of a [resident][Keyspace.Residency#RESIDENT] key space could not be read
     ///                                  into memory; the next write tries again
     <K, V> Transaction put(Keyspace<K, V> keyspace, K key, V value);
@@ -38,7 +40,9 @@ public non-sealed interface Transaction extends View {
     /// @param value the encoded value
     /// @return this transaction
     /// @throws IllegalArgumentException if this store was not opened with `keyspace`, `key` is empty or longer than
-    ///                                  [KeyCodec#MAX_LENGTH], or `value` is longer than [ValueCodec#MAX_LENGTH]
+    ///                                  [KeyCodec#MAX_LENGTH], `value` is longer than [ValueCodec#MAX_LENGTH], or the store
+    ///                                  has a log and the transaction's writes would take more of it than one commit may,
+    ///                                  a little under 2 GiB with its large values aside; the write does nothing
     /// @throws LedgerCorruptedException if the entry of `key` of a [resident][Keyspace.Residency#RESIDENT] key space could not be read
     ///                                  into memory; the next write tries again
     Transaction putEncoded(Keyspace<?, ?> keyspace, MemorySegment key, MemorySegment value);
@@ -49,7 +53,9 @@ public non-sealed interface Transaction extends View {
     /// @param key the key
     /// @param <K> the key type
     /// @return this transaction
-    /// @throws IllegalArgumentException if this store was not opened with `keyspace`
+    /// @throws IllegalArgumentException if this store was not opened with `keyspace`, or the store has a log and the
+    ///                                  transaction's writes would take more of it than one commit may, a little under
+    ///                                  2 GiB with its large values aside; the write does nothing
     /// @throws LedgerCorruptedException if the entry of `key` of a [resident][Keyspace.Residency#RESIDENT] key space could not be read
     ///                                  into memory; the next write tries again
     <K> Transaction delete(Keyspace<K, ?> keyspace, K key);
@@ -63,7 +69,9 @@ public non-sealed interface Transaction extends View {
     /// @param range the keys to remove; its order does not matter
     /// @param <K> the key type
     /// @return this transaction
-    /// @throws IllegalArgumentException if this store was not opened with `keyspace`
+    /// @throws IllegalArgumentException if this store was not opened with `keyspace`, or the store has a log and the
+    ///                                  transaction's writes would take more of it than one commit may, a little under
+    ///                                  2 GiB with its large values aside; the write does nothing
     /// @throws LedgerCorruptedException if the entries of a [resident][Keyspace.Residency#RESIDENT] key space could not be read
     ///                                  into memory; the next write tries again
     <K> Transaction deleteRange(Keyspace<K, ?> keyspace, KeyRange<K> range);

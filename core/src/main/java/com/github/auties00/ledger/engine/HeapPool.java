@@ -34,6 +34,8 @@ public final class HeapPool {
     private int acquiresSeen;
     // What the idle ticker calls, which holds it weakly: the pool keeps it as long as it lives
     private final IdleTicker.Watched trimmer;
+    // What sees the arrays the pool hands out again and takes back, or null; for tests
+    private volatile Watcher watcher;
 
     // The pool the stores of the process share, made with the first; guarded by the class
     private static HeapPool process;
@@ -122,6 +124,10 @@ public final class HeapPool {
         }
         pooledBytes.addAndGet(-array.length);
         pooledBySize[shift - MIN_SHIFT].addAndGet(-array.length);
+        var watching = watcher;
+        if (watching != null) {
+            watching.acquired(array);
+        }
         return array;
     }
 
@@ -143,6 +149,10 @@ public final class HeapPool {
             pooledBySize[size].addAndGet(-length);
             return;
         }
+        var watching = watcher;
+        if (watching != null) {
+            watching.released(array);
+        }
         free[size].offer(array);
     }
 
@@ -159,6 +169,21 @@ public final class HeapPool {
             }
         }
         acquiresSeen = seen;
+    }
+
+    /// Makes `watcher` see every array the pool takes back from now on, before another thread can acquire it, and every
+    /// array it hands out again, or stops watching if `null`; for tests.
+    void watchForTests(Watcher watcher) {
+        this.watcher = watcher;
+    }
+
+    /// What sees the arrays a pool hands out again and takes back; for tests.
+    interface Watcher {
+        /// Sees `array`, which the pool held free, as it hands it out.
+        void acquired(byte[] array);
+
+        /// Sees `array` as the pool takes it back to hand it out again.
+        void released(byte[] array);
     }
 
     /// {@return the free bytes the pool keeps at most; for tests}

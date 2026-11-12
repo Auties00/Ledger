@@ -114,10 +114,10 @@ import java.util.zip.CRC32C;
 /// sequence of the first: a GCM message costs a key schedule, a check that its key and nonce differ from the last
 /// ones, and the hashing of its header whatever its length, which for the frame of a commit of one small write was most
 /// of the time a flush took, and a message below 512 bytes never reaches the vectorized GCM. A frame of at most
-/// [#RUN_MAX_BODY] bytes, a run or not, is copied into the output whole, then sealed in place in one call. A run of
-/// one commit is written as the frame of that commit. Runs never cross a group or a segment, so a group starts, ends
-/// and rolls over at the frames it would one frame per commit; a group torn by a crash drops its runs whole, commits
-/// of a group never acknowledged durable.
+/// [#RUN_MAX_BODY] bytes, a run or not, is gathered into the output whole, the values its bodies refer to included,
+/// then sealed in place in one call. A run of one commit is written as the frame of that commit. Runs never cross a
+/// group or a segment, so a group starts, ends and rolls over at the frames it would one frame per commit; a group
+/// torn by a crash drops its runs whole, commits of a group never acknowledged durable.
 ///
 /// A failed write or force stops the writer for good: [#awaitDurable(long)] and every later [#append] throw. A failed
 /// write through only moves the writer to forces.
@@ -161,6 +161,12 @@ final class LogWriter {
     private static final int SHRINK_AFTER = 256;
     /// The bytes of a frame body sealed in one call, a multiple of the AES block.
     private static final int SLICE = 64 << 10;
+    /// The shortest piece of a frame body that refers to values which [#seal] hands to the cipher as it is; shorter
+    /// ones it gathers in the output, and seals there in place: a call of the cipher costs about what copying a few
+    /// kilobytes does.
+    private static final int DIRECT_PIECE = 2 << 10;
+    /// The bytes of an AES block.
+    private static final int BLOCK = 16;
     /// The largest commit body a run takes, and the largest frame body sealed in place; a larger one is a frame of its
     /// own, whose header and tag weigh nothing beside it.
     static final int RUN_MAX_BODY = 16 << 10;
@@ -703,6 +709,20 @@ final class LogWriter {
         appendedHeap += 13 + frame.body().size();
     }
 
+    /// {@return the bodies of the frames queued and not taken by the writer yet, in order; for tests}
+    List<FrameBody> queuedForTests() {
+        queueLock.lock();
+        try {
+            var bodies = new ArrayList<FrameBody>(queue.size());
+            for (var frame : queue) {
+                bodies.add(frame.body());
+            }
+            return bodies;
+        } finally {
+            queueLock.unlock();
+        }
+    }
+
     /// Makes `blobs` the file of large values the commits write units to, which the groups force.
     void useBlobs(BlobFile blobs) {
         this.blobs = blobs;
@@ -1130,7 +1150,7 @@ final class LogWriter {
         writeHeader(at, sealedLength, frame.sequence(), single ? frame.type() : FrameBody.COMMITS, groupStart);
         var bodyAt = at + FRAME_HEADER;
         if (single) {
-            System.arraycopy(frame.body().array(), 0, output, bodyAt, plainLength);
+            frame.body().copyTo(output, bodyAt);
         } else {
             var offset = bodyAt;
             for (var index = first; index < end; index++) {
@@ -1171,15 +1191,22 @@ final class LogWriter {
     /// Seals `frame` into the output, writing the output out whenever it fills.
     ///
     /// The body goes to the cipher a slice at a time: the frame is the one GCM message a single call would make, and
-    /// the output stays at most [#OUTPUT] bytes whatever the frame's size.
+    /// the output stays at most [#OUTPUT] bytes whatever the frame's size. A body that refers to values is read piece
+    /// by piece, each byte once, from the output where it is gathered or as the cipher reads it, so the tag or checksum
+    /// of the frame covers the bytes the frame holds, whatever an array it refers to holds later.
     private void seal(Queued frame, int sealedLength, boolean groupStart) throws IOException {
         room(FRAME_HEADER);
         var at = used;
         var frameOffset = position + used;
         writeHeader(at, sealedLength, frame.sequence(), frame.type(), groupStart);
         used += FRAME_HEADER;
-        var body = frame.body().array();
-        var length = frame.body().size();
+        var frameBody = frame.body();
+        if (frameBody.references() != 0) {
+            sealPieces(frameBody, at, frameOffset);
+            return;
+        }
+        var body = frameBody.array();
+        var length = frameBody.size();
         if (cipher != null) {
             try {
                 cipher.init(Cipher.ENCRYPT_MODE, segmentKey, new GCMParameterSpec(TAG_BYTES * 8, nonce(frameOffset)));
@@ -1212,6 +1239,92 @@ final class LogWriter {
         room(Integer.BYTES);
         ByteBuffer.wrap(output, used, Integer.BYTES).putInt((int) crc.getValue());
         used += Integer.BYTES;
+    }
+
+    /// Seals `body`, which refers to values, into the output after the frame's header at `at`, at `frameOffset` of
+    /// the segment.
+    ///
+    /// Without encryption each piece is copied into the output and the CRC read from there. With it, a piece of at
+    /// least [#DIRECT_PIECE] bytes goes to the cipher as it is and shorter ones are gathered in the output and
+    /// encrypted there in place, so the cipher sees few calls; every call but the last takes whole AES blocks, a
+    /// gather that ends before a direct piece taking the first bytes of that piece to end on a block, so the cipher
+    /// never holds part of a block back between two calls, nor writes past the bytes it was given, which in place
+    /// would overwrite bytes it has not read.
+    private void sealPieces(FrameBody body, int at, long frameOffset) throws IOException {
+        if (cipher == null) {
+            crc.reset();
+            crc.update(output, at, FRAME_HEADER);
+            for (var piece = 0; piece < body.pieces(); piece++) {
+                var array = body.pieceArray(piece);
+                var offset = body.pieceOffset(piece);
+                for (var left = body.pieceLength(piece); left > 0; ) {
+                    var slice = Math.min(SLICE, left);
+                    room(slice);
+                    System.arraycopy(array, offset, output, used, slice);
+                    crc.update(output, used, slice);
+                    used += slice;
+                    offset += slice;
+                    left -= slice;
+                }
+            }
+            room(Integer.BYTES);
+            ByteBuffer.wrap(output, used, Integer.BYTES).putInt((int) crc.getValue());
+            used += Integer.BYTES;
+            return;
+        }
+        try {
+            cipher.init(Cipher.ENCRYPT_MODE, segmentKey, new GCMParameterSpec(TAG_BYTES * 8, nonce(frameOffset)));
+            // The cipher keeps the additional data, so the header may leave the output before the body is sealed
+            cipher.updateAAD(output, at, FRAME_HEADER);
+            var remaining = body.size();
+            // The bytes gathered at the end of the output and not encrypted yet; room for them was made at the first
+            var gathered = 0;
+            for (var piece = 0; piece < body.pieces(); piece++) {
+                var array = body.pieceArray(piece);
+                var offset = body.pieceOffset(piece);
+                var left = body.pieceLength(piece);
+                if (gathered != 0 && left >= DIRECT_PIECE) {
+                    // To the end of a block, which SLICE is a multiple of, so the room made for the gather holds it
+                    var taken = -gathered & (BLOCK - 1);
+                    System.arraycopy(array, offset, output, used + gathered, taken);
+                    gathered += taken;
+                    offset += taken;
+                    left -= taken;
+                    remaining -= taken;
+                    used += cipher.update(output, used, gathered, output, used);
+                    gathered = 0;
+                }
+                while (left > 0) {
+                    int taken;
+                    if (gathered == 0 && left >= DIRECT_PIECE) {
+                        taken = Math.min(SLICE, left);
+                        if (taken != remaining) {
+                            taken &= -BLOCK;
+                        }
+                        room(taken + TAG_BYTES);
+                        used += cipher.update(array, offset, taken, output, used);
+                    } else {
+                        if (gathered == 0) {
+                            room(Math.min(SLICE, remaining) + TAG_BYTES);
+                        }
+                        taken = Math.min(SLICE - gathered, left);
+                        System.arraycopy(array, offset, output, used + gathered, taken);
+                        gathered += taken;
+                        if (gathered == SLICE || taken == remaining) {
+                            used += cipher.update(output, used, gathered, output, used);
+                            gathered = 0;
+                        }
+                    }
+                    offset += taken;
+                    left -= taken;
+                    remaining -= taken;
+                }
+            }
+            room(2 * TAG_BYTES);
+            used += cipher.doFinal(output, used);
+        } catch (GeneralSecurityException exception) {
+            throw new IOException("A log frame could not be sealed", exception);
+        }
     }
 
     /// {@return the force of the file of large values, started on a thread of its own}
@@ -1328,7 +1441,7 @@ final class LogWriter {
     ///
     /// @param type the frame type
     /// @param sequence the sequence it carries
-    /// @param body its body, which the writer owns
+    /// @param body its body, which the writer owns, on arrays no one writes
     private record Queued(byte type, long sequence, FrameBody body) {
     }
 

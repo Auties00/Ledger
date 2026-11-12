@@ -606,8 +606,9 @@ class ValueSlabTest {
                             var stamp = (byte) random.nextInt();
                             Arrays.fill(value, stamp);
                             var home = slab.place(value, 0, value.length, spans, 0);
+                            var view = home == null ? null : home.view();
                             if (home != null) {
-                                window.add(new Span(home, (int) (spans[0] >>> 32), value.length, stamp));
+                                window.add(new Span(view, (int) (spans[0] >>> 32), value.length, stamp));
                                 taken.incrementAndGet();
                                 if (window.size() > 256) {
                                     window.remove().check();
