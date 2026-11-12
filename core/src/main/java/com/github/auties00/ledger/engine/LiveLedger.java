@@ -74,6 +74,12 @@ public final class LiveLedger implements Ledger {
     /// The passes of the publisher between two maintenances when nothing asks for one sooner: the counts and trees
     /// readers no longer need wait that long to go.
     private static final int MAINTAIN_EVERY = 16;
+    /// The writes from which a commit of the pipeline looks up the chains of its keys a block at a time
+    /// ([ChainIndex.Lookups]): fewer go one at a time, which a commit of one or two writes, the most common, keeps to.
+    private static final int BLOCK_OPENS = 8;
+    /// The writes up to which a commit's lookups also load the newest version of each key they find, which its writes
+    /// read once the commit has a sequence: the lines of a larger commit's first writes leave the caches before then.
+    private static final int TOUCHED_HEADS = 256;
     private static final VarHandle LAST_PUBLISHED;
     private static final VarHandle LATEST;
 
@@ -746,12 +752,21 @@ public final class LiveLedger implements Ledger {
         var decoded = writes.residentPuts() > 0 ? new Object[size] : null;
         var trees = pages == null ? null : tree;
         var found = trees == null ? null : new byte[size];
-        for (var i = 0; i < size; i++) {
-            // A decoder that throws stops the batch before it has a sequence
-            openWrite(writes, i, chains, keyspaceStates, found, decoded);
+        var keys = new MemorySegment[size];
+        // A decoder that throws stops the batch before it has a sequence, with the chains of the writes before it open
+        if (size < BLOCK_OPENS) {
+            for (var i = 0; i < size; i++) {
+                openWrite(writes, i, chains, keyspaceStates, keys, found, decoded);
+            }
+        } else {
+            var lookups = new ChainIndex.Lookups(size <= TOUCHED_HEADS);
+            for (var from = 0; from < size; from += ChainIndex.Lookups.BLOCK) {
+                openBlock(writes, from, Math.min(size, from + ChainIndex.Lookups.BLOCK), lookups, chains, keyspaceStates,
+                        keys, found, decoded);
+            }
         }
         var hints = found == null ? null : new Hints(trees, found);
-        var pending = new PendingCommit(writes, chains, keyspaceStates, decoded, units, hints);
+        var pending = new PendingCommit(writes, chains, keyspaceStates, keys, decoded, units, hints);
         if (arrivalTail.commit == arrivalCursor.commit && !sequencingWanted.held() && sequencing.tryAcquireBriefly()) {
             // No commit arrived before this one: it takes its sequence without the queue, and lets the role go with
             // a release store, looking for no arrival: one that finds the role held briefly sequences itself
@@ -776,6 +791,8 @@ public final class LiveLedger implements Ledger {
             }
         }
         pending.predecessors = null;
+        // Slices of the batch's array, which the finish gives back to the pool
+        pending.keys = null;
         if (outcome != null) {
             outcome[0] = pending.applier;
         }
@@ -802,13 +819,66 @@ public final class LiveLedger implements Ledger {
     ///
     /// @param chains receives the chain of the write's key
     /// @param keyspaceStates receives the key space of the write
+    /// @param keys receives the key of the write, which the commit reads from then on
     /// @param found receives, for a write of a paged key space, that it is blind; `null` if the store has no trees
     /// @param decoded receives the decoded value of a put to a resident key space; `null` if the batch has none
     private void openWrite(ArrayWriteBatch writes, int index, Chain[] chains, KeyspaceState[] keyspaceStates,
-                           byte[] found, Object[] decoded) {
-        var state = states.get(writes.keyspace(index).name());
-        chains[index] = state.open(writes.key(index));
+                           MemorySegment[] keys, byte[] found, Object[] decoded) {
+        var state = stateOf(writes, index, keyspaceStates);
+        var key = writes.key(index);
         keyspaceStates[index] = state;
+        keys[index] = key;
+        chains[index] = state.open(key);
+        prepareValue(writes, index, state, found, decoded);
+    }
+
+    /// Prepares writes `from` to `to`, excluded, of a commit of the pipeline, as [#openWrite] prepares each: looks up
+    /// the chains of their keys together, in `lookups`, then opens them and decodes the values in the order of the
+    /// writes, so a decoder that throws leaves open the chains of the writes before its own, and a key the block
+    /// writes twice gets one chain.
+    private void openBlock(ArrayWriteBatch writes, int from, int to, ChainIndex.Lookups lookups, Chain[] chains,
+                           KeyspaceState[] keyspaceStates, MemorySegment[] keys, byte[] found, Object[] decoded) {
+        lookups.clear();
+        for (var i = from; i < to; i++) {
+            lookUpWrite(writes, i, lookups, keyspaceStates, keys);
+        }
+        lookups.run();
+        for (var i = from; i < to; i++) {
+            openLookedUp(writes, i, lookups.found(i - from), lookups.hash(i - from), chains, keyspaceStates, keys, found, decoded);
+        }
+    }
+
+    /// Adds to `lookups` the lookup of the chain of the key of write `index`, recording its key space and its key.
+    private void lookUpWrite(ArrayWriteBatch writes, int index, ChainIndex.Lookups lookups, KeyspaceState[] keyspaceStates,
+                             MemorySegment[] keys) {
+        var state = stateOf(writes, index, keyspaceStates);
+        var key = writes.key(index);
+        keyspaceStates[index] = state;
+        keys[index] = key;
+        state.lookUp(lookups, key, Segments.hash(key));
+    }
+
+    /// Opens the chain of the key of write `index` from what its lookup found, and decodes the value it puts to a
+    /// resident key space.
+    ///
+    /// @param lookedUp the chain the lookup of the key found, or `null`
+    /// @param hash the hash of the key
+    private void openLookedUp(ArrayWriteBatch writes, int index, Chain lookedUp, int hash, Chain[] chains,
+                              KeyspaceState[] keyspaceStates, MemorySegment[] keys, byte[] found, Object[] decoded) {
+        var state = keyspaceStates[index];
+        chains[index] = state.open(keys[index], hash, lookedUp);
+        prepareValue(writes, index, state, found, decoded);
+    }
+
+    /// {@return the state of the key space of write `index`, that of the write before when both name the same
+    /// instance, as the writes of a batch mostly do}
+    private KeyspaceState stateOf(ArrayWriteBatch writes, int index, KeyspaceState[] keyspaceStates) {
+        var keyspace = writes.keyspace(index);
+        return index > 0 && writes.keyspace(index - 1) == keyspace ? keyspaceStates[index - 1] : states.get(keyspace.name());
+    }
+
+    /// Decodes the value write `index` puts to a resident key space, or records that a write of a paged one is blind.
+    private void prepareValue(ArrayWriteBatch writes, int index, KeyspaceState state, byte[] found, Object[] decoded) {
         if (state.resident) {
             if (decoded != null && writes.kind(index) == ArrayWriteBatch.PUT) {
                 decoded[index] = residentValue(state, writes.decodedValue(index), writes.value(index));
@@ -947,7 +1017,7 @@ public final class LiveLedger implements Ledger {
                 return previous instanceof PendingCommit commit && commit != pending ? commit : null;
             }
             // Dropped since the commit opened it: the key gets a chain of its own
-            chain = pending.states[index].open(pending.writes.key(index));
+            chain = pending.states[index].open(pending.keys[index]);
             pending.chains[index] = chain;
         }
     }
@@ -983,12 +1053,13 @@ public final class LiveLedger implements Ledger {
         }
         var writes = pending.writes;
         var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(index, tree);
+        var key = pending.keys[index];
         if (writes.kind(index) == ArrayWriteBatch.PUT) {
-            applier.put(pending.states[index], pending.chains[index], writes.key(index), writes.value(index), writes.ownValue(index),
+            applier.put(pending.states[index], pending.chains[index], key, writes.value(index), writes.ownValue(index),
                     writes.home(index), writes.homeOffset(index), pending.decoded == null ? null : pending.decoded[index],
                     inTree, pending.units == null ? null : pending.units[index]);
         } else {
-            applier.delete(pending.states[index], pending.chains[index], writes.key(index), inTree);
+            applier.delete(pending.states[index], pending.chains[index], key, inTree);
         }
     }
 

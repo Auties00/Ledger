@@ -172,6 +172,13 @@ final class KeyspaceState {
         return index.holdsNone() ? null : index.get(key, Segments.hash(key));
     }
 
+    /// {@return the bytes of the copies of the keys in the chunks of the key space's slab; for tests}
+    ///
+    /// @see KeySlab#usedForTests()
+    int keyBytesForTests() {
+        return keys.usedForTests();
+    }
+
     /// {@return the chains memory holds, ordered or not}
     int chains() {
         return index.size();
@@ -266,7 +273,11 @@ final class KeyspaceState {
     /// returned dropped; once the store is closing, the wait gives up and returns the chain unlisted, which a read of a
     /// range during the close may miss while the log and the final checkpoint hold its writes.
     Chain open(MemorySegment key) {
-        var hash = Segments.hash(key);
+        return open(key, Segments.hash(key));
+    }
+
+    /// {@return the chain of `key`, whose hash is `hash`, as [#open(MemorySegment)] gives it}
+    Chain open(MemorySegment key, int hash) {
         var chain = index.get(key, hash);
         if (chain != null && chain.released()) {
             // Dropped, and maybe not out of the index yet: the key gets a chain of its own
@@ -284,6 +295,31 @@ final class KeyspaceState {
                 }
             }
         }
+        return reach(chain);
+    }
+
+    /// Adds to `lookups` the lookup of `key`, whose hash is `hash`, which [#open(MemorySegment, int, Chain)] then
+    /// opens with what it found.
+    void lookUp(ChainIndex.Lookups lookups, MemorySegment key, int hash) {
+        lookups.add(index.holdsNone() ? null : index, key, hash);
+    }
+
+    /// {@return the chain of `key`, whose hash is `hash`, as [#open(MemorySegment)] gives it, from `found`, what a
+    /// lookup of the key made in a block of [ChainIndex.Lookups] found}
+    ///
+    /// The lookup may be stale: a chain it found that is dropped by now, or no chain, which a chain created since for
+    /// the key, by an earlier write of the same commit as well, may have replaced, are looked up again before a chain
+    /// is created, so the key gets no second copy in the slab.
+    Chain open(MemorySegment key, int hash, Chain found) {
+        if (found == null || found.released()) {
+            return open(key, hash);
+        }
+        return reach(found);
+    }
+
+    /// {@return `chain`, which the index holds or held, once a read of a range finds it: ordered where chains order
+    /// eagerly, or listed by its creator}
+    private Chain reach(Chain chain) {
         if (!chain.reachable()) {
             if (lazy) {
                 awaitListed(chain);
