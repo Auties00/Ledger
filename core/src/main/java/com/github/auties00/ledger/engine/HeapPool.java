@@ -20,6 +20,8 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
+    /// The longest array the pool recycles, 1 MiB; a longer one is the caller's own.
+    static final int MAX_POOLED = 1 << MAX_SHIFT;
     private final ConcurrentLinkedQueue<byte[]>[] free;
     private final AtomicLong pooledBytes;
     // The most of the stores' asks, for the process's pool
@@ -115,7 +117,7 @@ public final class HeapPool {
     ///
     /// @param capacity the least length, not negative
     public byte[] acquire(int capacity) {
-        if (capacity > 1 << MAX_SHIFT) {
+        if (capacity > MAX_POOLED) {
             return new byte[capacity];
         }
         var shift = Math.max(MIN_SHIFT, 32 - Integer.numberOfLeadingZeros(Math.max(1, capacity) - 1));

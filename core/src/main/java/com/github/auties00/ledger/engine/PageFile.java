@@ -30,9 +30,10 @@ import java.util.function.BooleanSupplier;
 /// on the one thread that writes a checkpoint, through a [Writer].
 final class PageFile implements AutoCloseable {
     static final String FILE = "ledger.data";
-    /// The channels reads take turns on, and the most threads [#readAll(List, byte, int)] reads on.
+    /// The channels reads take turns on, and the most threads [#readAll(List, byte, int)] and
+    /// [#prefetch(PageRef\[\], int, int\[\])] read on at once.
     static final int READ_CHANNELS = 8;
-    /// The most pages [#readAll(List, byte, int)] reads with one call.
+    /// The most pages [#readAll(List, byte, int)] and [#prefetch(PageRef\[\], int, int\[\])] read with one call.
     static final int RUN_PAGES = 64;
     private static final int STAGED_LIMIT = 8 << 20;
     // The staged bytes a flush seals before it writes them, which bounds the sealed arrays it holds at once
@@ -50,8 +51,9 @@ final class PageFile implements AutoCloseable {
     /// microseconds on Linux and 5 to 20 on Windows, where those of the device of a CI runner took about 145, and a
     /// Windows read out of the cache that Defender or paging slows rarely averages past 50.
     static final int COLD_READ_MICROS = 80;
-    /// The pages between two units that [#prefetch(PageRef\[\], int, int\[\])] still reads with one call, throwing the
-    /// pages between away: a device takes a few more pages in the same request for little more than one.
+    /// The pages between two units that [#readAll(List, byte, int)] and [#prefetch(PageRef\[\], int, int\[\])] still
+    /// read with one call, throwing the pages between away: a device takes a few more pages in the same request for
+    /// little more than one.
     static final int GAP_PAGES = 8;
     // The bytes of a read that count as one sample of the read time: the copy of a long read out of the OS cache must
     // not pass for a read of the device
@@ -310,8 +312,11 @@ final class PageFile implements AutoCloseable {
     /// without this one. Units at most [#GAP_PAGES] pages apart are read with one call, up to [#RUN_PAGES] pages, the
     /// pages between thrown away unopened, and the calls run on up to [#READ_CHANNELS] threads at once, the caller's
     /// among them: a scan that read its units out of the device one after another waited for each in turn, about 145
-    /// microseconds each on the Windows runner. It opens nothing, so its threads hold no array of the pool but the one
-    /// it returns, and a scan's reads ahead leave the pool no more arrays than the scan holds at once.
+    /// microseconds each on the Windows runner. The pages between joined units are read only while the array stays
+    /// within the [longest one the pool recycles][HeapPool#MAX_POOLED], or within the units' own pages if those pass
+    /// it, so a gather of a megabyte of units never takes an array of its own. It opens nothing, so its threads hold no
+    /// array of the pool but the one it returns, and a scan's reads ahead leave the pool no more arrays than the scan
+    /// holds at once.
     ///
     /// @param refs references to units, none of them a delta record, each at most [#RUN_PAGES] pages
     /// @param offsets receives, for each unit, where it starts in the array, or -1 if it could not be read
@@ -321,41 +326,24 @@ final class PageFile implements AutoCloseable {
         if (count == 0) {
             return null;
         }
-        // The references by page, each with its index in the low half
-        var order = new long[count];
+        // The pages between joined units count against what the array may take beyond the units themselves, so a
+        // gather of up to a megabyte of units reads into an array the pool recycles
+        var unitPages = 0L;
         for (var i = 0; i < count; i++) {
-            order[i] = (long) refs[i].page() << 32 | i;
+            unitPages += refs[i].pages();
         }
-        Arrays.sort(order);
-        // Where each run of `order` starts, and the end of the last one; the first page of each run and the end of it
-        var starts = new int[count + 1];
-        var firsts = new int[count];
-        var ends = new int[count];
-        var runs = 0;
-        for (var i = 0; i < count; i++) {
-            var ref = refs[(int) order[i]];
-            var unitEnd = ref.page() + ref.pages();
-            if (runs == 0 || ref.page() > ends[runs - 1] + GAP_PAGES
-                    || Math.max(ends[runs - 1], unitEnd) - firsts[runs - 1] > RUN_PAGES) {
-                starts[runs] = i;
-                firsts[runs] = ref.page();
-                ends[runs++] = unitEnd;
-            } else {
-                ends[runs - 1] = Math.max(ends[runs - 1], unitEnd);
-            }
-        }
-        starts[runs] = count;
+        var plan = new Runs(refs, count, Math.max(0, HeapPool.MAX_POOLED / PageFormat.SIZE - unitPages));
         // Where each run starts in the array
-        var bases = new int[runs];
+        var bases = new int[plan.count];
         var length = 0;
-        for (var run = 0; run < runs; run++) {
+        for (var run = 0; run < plan.count; run++) {
             bases[run] = length;
-            length += (ends[run] - firsts[run]) * PageFormat.SIZE;
+            length += plan.pages(run) * PageFormat.SIZE;
         }
         var sealed = pool.acquire(length);
         try {
-            ClaimedIndexes.run("ledger-prefetch", runs, Math.min(READ_CHANNELS, runs) - 1, run -> prefetchRun(refs,
-                    order, starts[run], starts[run + 1], firsts[run], ends[run], sealed, bases[run], offsets));
+            ClaimedIndexes.run("ledger-prefetch", plan.count, Math.min(READ_CHANNELS, plan.count) - 1,
+                    run -> prefetchRun(refs, plan, run, sealed, bases[run], offsets));
         } catch (RuntimeException _) {
             // A thread that would not start: the units left unread are read by the reads that need them
         } catch (Throwable throwable) {
@@ -366,25 +354,24 @@ final class PageFile implements AutoCloseable {
         return sealed;
     }
 
-    /// Reads the units of `refs` at `order[from]` to `order[to]`, excluded, which are sorted by page and lie in the
-    /// pages from `first` to `end`, excluded, with one call into `sealed` from `base` on, and records where each starts
+    /// Reads the units of run `run` of `plan` with one call into `sealed` from `base` on, and records where each starts
     /// in `offsets`; a unit it cannot read keeps an offset of -1.
-    private void prefetchRun(PageRef[] refs, long[] order, int from, int to, int first, int end, byte[] sealed,
-                             int base, int[] offsets) {
+    private void prefetchRun(PageRef[] refs, Runs plan, int run, byte[] sealed, int base, int[] offsets) {
+        var first = plan.firsts[run];
         try {
-            readFully(sealed, base, (end - first) * PageFormat.SIZE, PageFormat.offset(first));
-            for (var i = from; i < to; i++) {
-                var index = (int) order[i];
+            readFully(sealed, base, plan.pages(run) * PageFormat.SIZE, PageFormat.offset(first));
+            for (var i = plan.starts[run]; i < plan.starts[run + 1]; i++) {
+                var index = plan.unit(i);
                 offsets[index] = base + (refs[index].page() - first) * PageFormat.SIZE;
             }
         } catch (LedgerCorruptedException | LedgerIoException | IllegalStateException _) {
-            if (to - from == 1) {
+            if (plan.starts[run + 1] - plan.starts[run] == 1) {
                 return;
             }
             // A call that fails, or that the end of the file cuts short, fails none of its units: each is read alone,
             // into its own place
-            for (var i = from; i < to; i++) {
-                var index = (int) order[i];
+            for (var i = plan.starts[run]; i < plan.starts[run + 1]; i++) {
+                var index = plan.unit(i);
                 var ref = refs[index];
                 var offset = base + (ref.page() - first) * PageFormat.SIZE;
                 try {
@@ -486,74 +473,124 @@ final class PageFile implements AutoCloseable {
         forceColdNewForTests = cold;
     }
 
-    /// {@return the plaintext of the units `refs` name, in their order, none of them cached}
+    /// {@return the plaintext of the units `refs` name, in their order, none of them cached, each ending with its
+    /// content as the cache keeps it}
     ///
-    /// Units in consecutive pages are read with one call, up to [#RUN_PAGES] pages, and the calls run on at most
-    /// `threads` virtual threads, and no more than there are read channels: reading many units one after another out of
-    /// the OS cache made the caller wait for each read in turn.
+    /// Units at most [#GAP_PAGES] pages apart are read with one call, up to [#RUN_PAGES] pages, the pages between
+    /// thrown away unopened, and the calls run on at most `threads` virtual threads, and no more than there are read
+    /// channels: reading many units one after another out of the OS cache made the caller wait for each read in turn.
+    /// A unit the cache holds, and a delta record, are read through the cache on their own.
     ///
     /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
     /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
     /// @throws LedgerIoException if the file cannot be read
     byte[][] readAll(List<PageRef> refs, byte kind, int threads) {
         var units = new byte[refs.size()][];
-        var order = new Integer[refs.size()];
-        for (var i = 0; i < order.length; i++) {
-            order[i] = i;
-        }
-        Arrays.sort(order, (left, right) -> Integer.compare(refs.get(left).page(), refs.get(right).page()));
-        // Runs of indexes into refs, by page
-        var runs = new ArrayList<int[]>();
-        var run = new ArrayList<Integer>();
-        var runPages = 0;
-        var next = -1;
-        for (var index : order) {
-            var ref = refs.get(index);
-            var alone = ref.isRecord() || cache.peek(ref) != null;
-            if (!run.isEmpty() && (alone || ref.page() != next || runPages + ref.pages() > RUN_PAGES)) {
-                runs.add(run.stream().mapToInt(Integer::intValue).toArray());
-                run.clear();
-                runPages = 0;
+        // The units read from the file, with their indexes in `refs`, and the indexes of the others
+        var joined = new PageRef[refs.size()];
+        var slots = new int[refs.size()];
+        var alone = new int[refs.size()];
+        var count = 0;
+        var single = 0;
+        for (var i = 0; i < refs.size(); i++) {
+            var ref = refs.get(i);
+            if (ref.isRecord() || cache.peek(ref) != null) {
+                alone[single++] = i;
+            } else {
+                slots[count] = i;
+                joined[count++] = ref;
             }
-            if (alone) {
-                runs.add(new int[]{index});
-                continue;
+        }
+        var plan = new Runs(joined, count, Long.MAX_VALUE);
+        var tasks = plan.count + single;
+        var running = Math.min(Math.min(READ_CHANNELS, threads), tasks);
+        ClaimedIndexes.run("ledger-read", tasks, running - 1, task -> {
+            if (task < plan.count) {
+                readRun(joined, slots, plan, task, kind, units);
+            } else {
+                var index = alone[task - plan.count];
+                units[index] = read(refs.get(index), kind, false);
             }
-            run.add(index);
-            runPages += ref.pages();
-            next = ref.page() + ref.pages();
-        }
-        if (!run.isEmpty()) {
-            runs.add(run.stream().mapToInt(Integer::intValue).toArray());
-        }
-        var running = Math.min(Math.min(READ_CHANNELS, threads), runs.size());
-        ClaimedIndexes.run("ledger-read", runs.size(), running - 1, i -> readRun(refs, runs.get(i), kind, units));
+        });
         return units;
     }
 
-    /// Reads the units at `indexes` of `refs`, in consecutive pages, with one call, into `units`.
-    private void readRun(List<PageRef> refs, int[] indexes, byte kind, byte[][] units) {
-        if (indexes.length == 1) {
-            units[indexes[0]] = read(refs.get(indexes[0]), kind, false);
-            return;
-        }
-        var first = refs.get(indexes[0]).page();
-        var last = refs.get(indexes[indexes.length - 1]);
-        var length = (last.page() + last.pages() - first) * PageFormat.SIZE;
+    /// Reads the units of run `run` of `plan` with one call and opens each into `units`, at the index `slots` gives it.
+    ///
+    /// @throws LedgerCorruptedException if a unit fails authentication or is not the one its reference names
+    private void readRun(PageRef[] refs, int[] slots, Runs plan, int run, byte kind, byte[][] units) {
+        var first = plan.firsts[run];
+        var length = plan.pages(run) * PageFormat.SIZE;
         var sealed = pool.acquire(length);
         try {
             readFully(sealed, length, PageFormat.offset(first));
-            for (var index : indexes) {
-                var ref = refs.get(index);
-                var plain = new byte[ref.pages() * PageFormat.SIZE];
-                if (!cipher.open(sealed, (ref.page() - first) * PageFormat.SIZE, ref.pages(), plain) || !ref.describes(plain)
-                        || !kindMatches(plain[PageFormat.KIND], kind)) {
+            for (var i = plan.starts[run]; i < plan.starts[run + 1]; i++) {
+                var index = plan.unit(i);
+                var ref = refs[index];
+                var plain = open(ref, kind, sealed, (ref.page() - first) * PageFormat.SIZE, true);
+                if (plain == null) {
                     throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
                 }
-                units[index] = plain;
+                units[slots[index]] = plain;
             }
         } finally {
             pool.release(sealed);
+        }
+    }
+
+    /// The units of a set of reads, by page, in runs that one call reads each: a unit at most [#GAP_PAGES] pages past
+    /// the end of a run joins it while the run stays within [#RUN_PAGES] pages and the pages between joined units, over
+    /// every run, within a budget.
+    private static final class Runs {
+        // The units by page, each with its index among the references in the low half
+        private final long[] order;
+        // Where each run starts in `order`, and the end of the last one
+        final int[] starts;
+        // The first page of each run, and the end of it
+        final int[] firsts;
+        private final int[] ends;
+        // The runs
+        final int count;
+
+        /// Plans the reads of the first `count` units `refs` names, joining units across at most `gapPages` pages in
+        /// all.
+        Runs(PageRef[] refs, int count, long gapPages) {
+            order = new long[count];
+            for (var i = 0; i < count; i++) {
+                order[i] = (long) refs[i].page() << 32 | i;
+            }
+            Arrays.sort(order);
+            starts = new int[count + 1];
+            firsts = new int[count];
+            ends = new int[count];
+            var runs = 0;
+            var gaps = gapPages;
+            for (var i = 0; i < count; i++) {
+                var ref = refs[unit(i)];
+                var unitEnd = ref.page() + ref.pages();
+                var gap = runs == 0 ? 0 : Math.max(0, ref.page() - ends[runs - 1]);
+                if (runs == 0 || gap > GAP_PAGES || gap > gaps
+                        || Math.max(ends[runs - 1], unitEnd) - firsts[runs - 1] > RUN_PAGES) {
+                    starts[runs] = i;
+                    firsts[runs] = ref.page();
+                    ends[runs++] = unitEnd;
+                } else {
+                    gaps -= gap;
+                    ends[runs - 1] = Math.max(ends[runs - 1], unitEnd);
+                }
+            }
+            starts[runs] = count;
+            this.count = runs;
+        }
+
+        /// {@return the index among the references of the `i`th unit by page}
+        int unit(int i) {
+            return (int) order[i];
+        }
+
+        /// {@return the pages run `run` reads}
+        int pages(int run) {
+            return ends[run] - firsts[run];
         }
     }
 
