@@ -222,7 +222,7 @@ class LogRunTest {
                 body.put(1, MemorySegment.ofArray(key), MemorySegment.ofArray(value));
             }
             bodies.add(Arrays.copyOf(body.array(), body.size()));
-            batch.add(FrameBody.COMMIT, bodies.size(), body, 0, size > 0 ? 1 : 0, false);
+            batch.add(FrameBody.COMMIT, bodies.size(), body, 0, size > 0 ? 1 : 0, size > 0 ? 1 : 0, false);
         }
 
         /// {@return the sequence of the last commit given}
@@ -380,7 +380,7 @@ class LogRunTest {
             for (var size : new int[]{100, 100, 100, 100, 100, 20_000, 100, 0, 100}) {
                 log.add(batch, size);
             }
-            batch.add(FrameBody.CATALOG, log.last(), catalog, 0, 0, false);
+            batch.add(FrameBody.CATALOG, log.last(), catalog, 0, 0, 0, false);
             log.add(batch, 100);
             log.add(batch, 100);
             log.writer.appendAll(batch);

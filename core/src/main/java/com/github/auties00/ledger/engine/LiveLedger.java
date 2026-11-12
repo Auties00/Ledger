@@ -409,7 +409,10 @@ public final class LiveLedger implements Ledger {
             unitBytes += unit.length;
         }
         replayedBytes += 13 + body.length + unitBytes;
-        replayedHeap += LogWriter.heapOf(body.length, unitBytes, applier.touched.size(), false);
+        // Every write counts its chain, as if no commit before it listed one: the replay lists the chains with no log to
+        // count them in
+        var writes = applier.touched.size();
+        replayedHeap += LogWriter.heapOf(body.length, unitBytes, writes, writes, false);
         return true;
     }
 
@@ -1098,7 +1101,7 @@ public final class LiveLedger implements Ledger {
         do {
             commit = commit.next;
             if (commit.failure != null) {
-                batch.add(FrameBody.COMMIT, commit.sequence, new FrameBody(), 0, 0, false);
+                batch.add(FrameBody.COMMIT, commit.sequence, new FrameBody(), 0, 0, 0, false);
             } else {
                 commit.applier.queueFrame(batch);
             }
@@ -2639,7 +2642,7 @@ public final class LiveLedger implements Ledger {
             // Queued before it is visible, so the log holds every commit a reader can see, in order
             if (frame != null) {
                 try {
-                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, touched.size(), sharesChunk);
+                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, touched.size(), unlistedChains(), sharesChunk);
                     logged = true;
                 } catch (RuntimeException exception) {
                     rollback();
@@ -2652,8 +2655,15 @@ public final class LiveLedger implements Ledger {
         /// Adds the commit's frame, if it is journaled, to `batch`.
         void queueFrame(LogWriter.Batch batch) {
             if (frame != null) {
-                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, touched.size(), sharesChunk);
+                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, touched.size(), unlistedChains(), sharesChunk);
             }
+        }
+
+        /// {@return the chains of the commit's writes the log's estimate of its heap counts with its frame: every
+        /// write's in a store with no data file, which lists none for a checkpoint, and none in one with a data file,
+        /// whose publication counts the chains it lists ([LogWriter#listChains(int)])}
+        private int unlistedChains() {
+            return pages == null ? touched.size() : 0;
         }
 
         /// Publishes the commit as [#publishWrites()] does, once [#queueFrame(LogWriter.Batch)] queued its frame in a
@@ -2668,11 +2678,20 @@ public final class LiveLedger implements Ledger {
 
         /// Publishes what the commit adds to the units in flight, the keys the next checkpoint writes, the counts and the
         /// range removals it counts later.
+        ///
+        /// A journaled commit counts toward the log's estimate of the heap the chains it lists take, each of which no
+        /// commit listed since the last cut: an overwrite of a key a commit wrote since then takes none.
         private void publishCounted() {
             if (externals != 0 || pages != null) {
                 var size = touched.size();
+                var listed = 0;
                 for (var i = 0; i < size; i++) {
-                    publishTouched(i);
+                    if (publishTouched(i)) {
+                        listed++;
+                    }
+                }
+                if (listed > 0 && frame != null) {
+                    log.listChains(listed);
                 }
             }
             for (var i = 0; i < deltaCount; i++) {
@@ -2689,21 +2708,23 @@ public final class LiveLedger implements Ledger {
 
         /// Publishes what the commit's write `index` adds to the units in flight, the keys the next checkpoint writes
         /// and the blind writes.
-        private void publishTouched(int index) {
+        ///
+        /// @return whether it listed the write's chain among the keys the next checkpoint writes, where no commit since
+        ///         the last cut listed it
+        private boolean publishTouched(int index) {
             var write = touched.get(index);
             var version = write.version();
             if (version == null) {
-                return;
+                return false;
             }
             if (version instanceof Version.External external) {
                 inFlight.add(new InFlight(write.state(), write.chain(), external));
             }
-            if (pages != null) {
-                write.state().markDirty(write.chain());
-            }
+            var listed = pages != null && write.state().markDirty(write.chain());
             if (write.blind()) {
                 write.state().blind.add(write.chain(), sequence, version.removes());
             }
+            return listed;
         }
 
         /// Takes back every write this commit applied; no reader saw them, since the commit was never published.

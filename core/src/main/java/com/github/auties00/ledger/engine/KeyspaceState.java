@@ -804,11 +804,15 @@ final class KeyspaceState {
     }
 
     /// Lists `chain` among the keys the next checkpoint writes, holding the publishing role.
-    void markDirty(Chain chain) {
-        if (chain.dirtyCut != dirtyCut) {
-            chain.dirtyCut = dirtyCut;
-            dirty.add(chain);
+    ///
+    /// @return whether it listed it: `false` if it was listed since the last cut
+    boolean markDirty(Chain chain) {
+        if (chain.dirtyCut == dirtyCut) {
+            return false;
         }
+        chain.dirtyCut = dirtyCut;
+        dirty.add(chain);
+        return true;
     }
 
     /// {@return the number [#markDirty] gives the chains it lists, the cut's that [#cutDirty()] takes next}
@@ -816,6 +820,13 @@ final class KeyspaceState {
     /// Called holding the publishing role.
     long dirtyNumber() {
         return dirtyCut;
+    }
+
+    /// {@return the chains listed since the last cut, for tests of the log's estimate of their heap}
+    ///
+    /// Called holding the publishing role, or with no commit running.
+    int dirtyCountForTests() {
+        return dirty.size();
     }
 
     /// {@return the chains written since the last cut, and starts listing those of the next one}

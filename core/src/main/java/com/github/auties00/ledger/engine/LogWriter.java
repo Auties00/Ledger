@@ -6,6 +6,8 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.FileChannel;
@@ -170,9 +172,23 @@ final class LogWriter {
     /// The bytes of frame bodies the queue holds before commits wait for the device.
     private static final long QUEUE_LIMIT = 64L << 20;
     /// The heap a write takes in memory beside its bytes until a checkpoint takes it, as [#appendedHeap()] estimates
-    /// it: its chain, its version, its slot of the hash index and its key's copy, about 110 bytes, and a share of its
+    /// it: its version, 40 bytes, and a share of its batch's array. An overwrite of a key written since the last cut
+    /// takes no more: the chain, its key and its slots are the first write's, and the version it replaces is pruned at
+    /// once unless a reader holds it, where it takes these 40 bytes again.
+    static final int VERSION_HEAP = 48;
+    /// The heap a chain takes in memory beside its versions until a checkpoint takes its writes, as [#appendedHeap()]
+    /// estimates it, once for each interval between cuts a commit lists it in: the chain, 48 bytes, its key's copy, its
+    /// slot of the hash index, its entry of the ordered map and of the list of keys the next checkpoint writes.
+    ///
+    /// Counted on every write instead, the estimate of overwrites of 100-byte values in batches of a hundred came to 2.6
+    /// times the heap they held, 2.3 while a snapshot kept their older versions, and commits waited for a checkpoint
+    /// with heap budget to spare; counted once an interval it comes to 1.8 and 1.5, and writes of new keys, each the
+    /// first of its chain, count the same either way.
+    static final int CHAIN_HEAP = 80;
+    /// The heap of a write whose chain counts with it, as [#appendedHeap()] estimates it: [#VERSION_HEAP] and
+    /// [#CHAIN_HEAP], the cost of a write to a key no commit listed since the cut, about 110 bytes, and a share of its
     /// batch's array.
-    static final int WRITE_HEAP = 128;
+    static final int WRITE_HEAP = VERSION_HEAP + CHAIN_HEAP;
     /// The heap a commit takes beside its writes, as [#appendedHeap()] estimates it: the read-only view of the array
     /// its values are kept on and that view's session, 72 bytes, and the array's header. Without it the estimate was
     /// six tenths of what commits of one small write held, so the half of the heap the checkpoint backlog may take
@@ -198,6 +214,16 @@ final class LogWriter {
     /// The waits in a row that ran out past which waits are turned off no longer: after the n-th, the flush writes 2
     /// to the power of n groups without one.
     private static final int MAX_COHORT_MISSES = 6;
+    private static final VarHandle LISTED_HEAP;
+
+    static {
+        try {
+            LISTED_HEAP = MethodHandles.lookup().findVarHandle(LogWriter.class, "listedHeap", long.class);
+        } catch (ReflectiveOperationException exception) {
+            throw new ExceptionInInitializerError(exception);
+        }
+    }
+
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
@@ -316,8 +342,14 @@ final class LogWriter {
     // The bytes of the frames queued since the writer opened, and of the units of BlobFile their commits wrote, written
     // under the queue lock
     private volatile long appendedBytes;
-    // The heap the commits queued since the writer opened hold until a checkpoint takes them, as estimated
+    // The heap the commits queued since the writer opened hold until a checkpoint takes them, as estimated, but for
+    // the chains their publication listed
     private volatile long appendedHeap;
+    // The heap of the chains the commits published since the writer opened listed for the next checkpoint, CHAIN_HEAP
+    // each time a chain is listed after a cut; written by the store's publisher alone, holding the publishing role,
+    // with release stores
+    @SuppressWarnings("unused")
+    private long listedHeap;
     // Whether a queued frame's commit wrote a unit of BlobFile, which the next group forces; guarded by the queue lock
     private boolean queuedUnits;
     // A frame that waits to be queued before the next one, or until a thread needs it durable; guarded by the queue lock
@@ -568,7 +600,7 @@ final class LogWriter {
     ///
     /// @throws LedgerIoException if the writer has stopped
     void append(byte type, long sequence, FrameBody body) {
-        append(type, sequence, body, 0, 0, false);
+        append(type, sequence, body, 0, 0, 0, false);
     }
 
     /// Queues a frame as [#append(byte, long, FrameBody)] does, for a commit of `writes` writes that wrote `unitBytes`
@@ -578,10 +610,11 @@ final class LogWriter {
     /// starts a checkpoint, as if their values were in the frame: memory holds them until a checkpoint takes them. The
     /// writes count toward [#appendedHeap()].
     ///
+    /// @param chains the chains of the writes that count with them, as [#heapOf] takes them
     /// @param sharesChunk whether the commit's values are on one chunk of the [ValueSlab], as [#heapOf] takes it
     /// @return the frames queued since the writer opened, the new one included
     /// @throws LedgerIoException if the writer has stopped
-    long append(byte type, long sequence, FrameBody body, long unitBytes, int writes, boolean sharesChunk) {
+    long append(byte type, long sequence, FrameBody body, long unitBytes, int writes, int chains, boolean sharesChunk) {
         checkHealthy();
         var length = body.size();
         long frames;
@@ -597,7 +630,7 @@ final class LogWriter {
             lastQueued = sequence;
             frames = ++appended;
             appendedBytes += 13 + length + unitBytes;
-            appendedHeap += heapOf(length, unitBytes, writes, sharesChunk);
+            appendedHeap += heapOf(length, unitBytes, writes, chains, sharesChunk);
             queuedUnits |= unitBytes > 0;
         } finally {
             queueLock.unlock();
@@ -608,8 +641,8 @@ final class LogWriter {
         return frames;
     }
 
-    /// Queues the frames of `batch`, in its order, as [#append(byte, long, FrameBody, long, int, boolean)] queues each, and
-    /// empties it: one hold of the queue lock for a whole pass of the store's publisher.
+    /// Queues the frames of `batch`, in its order, as [#append(byte, long, FrameBody, long, int, int, boolean)] queues
+    /// each, and empties it: one hold of the queue lock for a whole pass of the store's publisher.
     ///
     /// The batch waits on a full queue as one frame of its total size would. Either every frame is queued or, if the
     /// writer has stopped, none is.
@@ -1350,12 +1383,13 @@ final class LogWriter {
         }
 
         /// Adds a frame, which the writer owns once queued, for a commit of `writes` writes that wrote `unitBytes` of
-        /// units, whose values are on one chunk of the [ValueSlab] if `sharesChunk`.
-        void add(byte type, long sequence, FrameBody body, long unitBytes, int writes, boolean sharesChunk) {
+        /// units, whose values are on one chunk of the [ValueSlab] if `sharesChunk`, and whose writes count `chains`
+        /// chains with them, as [#heapOf] takes them.
+        void add(byte type, long sequence, FrameBody body, long unitBytes, int writes, int chains, boolean sharesChunk) {
             frames.add(new Queued(type, sequence, body));
             bodyBytes += body.size();
             appendedBytes += 13 + body.size() + unitBytes;
-            appendedHeap += heapOf(body.size(), unitBytes, writes, sharesChunk);
+            appendedHeap += heapOf(body.size(), unitBytes, writes, chains, sharesChunk);
             units |= unitBytes > 0;
         }
 
@@ -1550,19 +1584,35 @@ final class LogWriter {
     }
 
     /// {@return the heap the commits queued since the writer opened hold until a checkpoint takes them, estimated: the
-    /// bytes of their frames and units, [#WRITE_HEAP] a write and [#COMMIT_HEAP] a commit}
+    /// bytes of their frames and units, [#VERSION_HEAP] a write, [#COMMIT_HEAP] a commit, and [#CHAIN_HEAP] a chain for
+    /// each interval between cuts it is written in, which [#listChains(int)] counts once the commits publish}
+    ///
+    /// Read holding the store's publishing role, it counts every chain of the commits published so far.
     long appendedHeap() {
-        return appendedHeap;
+        return appendedHeap + (long) LISTED_HEAP.getAcquire(this);
+    }
+
+    /// Counts toward [#appendedHeap()] the heap of `chains` chains a published commit listed for the next checkpoint,
+    /// none of which any commit listed since the last cut: [#CHAIN_HEAP] each.
+    ///
+    /// Called by the store's publisher, holding the publishing role, after the commit's frame is queued with no chain
+    /// counted for its writes, so a cut, which holds the role too, counts each chain it takes.
+    void listChains(int chains) {
+        LISTED_HEAP.setRelease(this, (long) LISTED_HEAP.get(this) + (long) chains * CHAIN_HEAP);
     }
 
     /// {@return the heap a commit of `writes` writes, whose frame body is `bodyBytes` and whose units are `unitBytes`,
     /// holds until a checkpoint takes it, as [#appendedHeap()] estimates it}
     ///
+    /// @param chains the chains of its writes that count with them, [#CHAIN_HEAP] each: every write's for a commit
+    ///               whose publication lists none for a checkpoint, as a replay counts it, and none for one whose
+    ///               publication counts what it lists through [#listChains(int)]
     /// @param sharesChunk whether the commit's values are on one chunk of the [ValueSlab], whose view the slab shares
     ///                    among the commits on the chunk and whose whole the slab's own estimate counts: such a commit
     ///                    allocates none of what [#COMMIT_HEAP] counts
-    static long heapOf(long bodyBytes, long unitBytes, int writes, boolean sharesChunk) {
-        return 13 + bodyBytes + unitBytes + (long) writes * WRITE_HEAP + (writes > 0 && !sharesChunk ? COMMIT_HEAP : 0);
+    static long heapOf(long bodyBytes, long unitBytes, int writes, int chains, boolean sharesChunk) {
+        return 13 + bodyBytes + unitBytes + (long) writes * VERSION_HEAP + (long) chains * CHAIN_HEAP
+                + (writes > 0 && !sharesChunk ? COMMIT_HEAP : 0);
     }
 
     /// {@return the offset in the current segment where the frames of the last group end, before their padding}
