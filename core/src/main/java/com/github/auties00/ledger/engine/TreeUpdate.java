@@ -766,10 +766,9 @@ final class TreeUpdate {
         }
         var unitPages = PageFormat.pagesFor(length);
         var page = allocate(unitPages);
-        // The header and the value: the writer seals the padding as zeros, and the page cache holds no more than this
-        var unit = new byte[PageFormat.HEADER + (int) length];
-        MemorySegment.copy(value, 0, MemorySegment.ofArray(unit), PageFormat.HEADER, length);
-        var ref = writer.write(PageFormat.VALUE, 0, page, unitPages, unit, (int) length, true);
+        // The writer builds the unit from the version's value in the array it seals it into: nothing reads it before
+        // the checkpoint is published, and a read after goes through the file
+        var ref = writer.writeValue(page, unitPages, value);
         return new LeafEntry(key, null, ref, (int) length);
     }
 

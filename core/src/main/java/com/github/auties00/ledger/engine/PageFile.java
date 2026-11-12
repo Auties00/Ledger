@@ -4,6 +4,8 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.LedgerIoException;
 
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.FileChannel;
@@ -537,15 +539,7 @@ final class PageFile implements AutoCloseable {
             }
             var ref = new PageRef(page, pages, nonceHigh, nonce);
             header(unit, kind, level, page, pages, length, ref.nonceHigh(), ref.nonceLow());
-            synchronized (lock) {
-                if (staged.put(page, new Staged(ref, unit)) != null) {
-                    throw new IllegalStateException("A checkpoint wrote page " + page + " twice");
-                }
-                stagedBytes += (long) pages * PageFormat.SIZE;
-                if (stagedBytes >= STAGED_LIMIT) {
-                    flush();
-                }
-            }
+            stage(new Staged(ref, unit, null));
             // Outside the writer's lock: the tasks of a checkpoint all pass through it, for every unit they read too,
             // so one waiting for the cache's lock, or rebuilding its table or evicting, would hold up the others
             if (cached) {
@@ -556,12 +550,59 @@ final class PageFile implements AutoCloseable {
             return ref;
         }
 
-        /// {@return the plaintext of the queued unit `ref` names, or `null` if it is not queued}
-        byte[] staged(PageRef ref) {
-            synchronized (lock) {
-                var entry = staged.get(ref.page());
-                return entry != null && entry.ref().equals(ref) ? entry.unit() : null;
+        /// Queues `value` as the content of the [PageFormat#VALUE] unit of `pages` pages at `page`, which the cache
+        /// does not keep.
+        ///
+        /// The unit is built from `value` only when it is sealed, in the array it is sealed into: a checkpoint never
+        /// reads the value units it writes, so neither a plaintext array of its own nor a cache entry, which only a
+        /// later read of the value would use, is made for it. `value`'s bytes must stay as they are until the unit is
+        /// written.
+        ///
+        /// @return the reference of the unit
+        /// @throws IllegalArgumentException if `value` does not fit in the unit
+        PageRef writeValue(int page, int pages, MemorySegment value) throws IOException {
+            var length = value.byteSize();
+            if (length > Integer.MAX_VALUE || !PageFormat.fits(pages, (int) length)) {
+                throw new IllegalArgumentException("A unit of " + pages + " pages cannot hold " + length + " bytes of content");
             }
+            var ref = new PageRef(page, pages, nonceHigh, nextNonce());
+            stage(new Staged(ref, null, value));
+            // A unit the page held before, which the cache may still hold under its own nonce
+            cache.remove(page);
+            return ref;
+        }
+
+        private void stage(Staged entry) throws IOException {
+            synchronized (lock) {
+                var page = entry.ref().page();
+                if (staged.put(page, entry) != null) {
+                    throw new IllegalStateException("A checkpoint wrote page " + page + " twice");
+                }
+                stagedBytes += (long) entry.ref().pages() * PageFormat.SIZE;
+                if (stagedBytes >= STAGED_LIMIT) {
+                    flush();
+                }
+            }
+        }
+
+        /// {@return the plaintext of the queued unit `ref` names, or `null` if it is not queued}
+        ///
+        /// The plaintext of a unit queued by [#writeValue(int, int, MemorySegment)] is built for the call, in an array
+        /// as long as its header and content.
+        byte[] staged(PageRef ref) {
+            Staged entry;
+            synchronized (lock) {
+                entry = staged.get(ref.page());
+            }
+            if (entry == null || !entry.ref().equals(ref)) {
+                return null;
+            }
+            if (entry.value() == null) {
+                return entry.unit();
+            }
+            var unit = new byte[PageFormat.HEADER + (int) entry.value().byteSize()];
+            fillValue(entry, unit);
+            return unit;
         }
 
         /// {@return the first 8 bytes of every nonce of this writer}
@@ -658,10 +699,29 @@ final class PageFile implements AutoCloseable {
             var helpers = entries.size() < PARALLEL_SEALS ? 0 : Runtime.getRuntime().availableProcessors() - 1;
             ClaimedIndexes.run("ledger-seal", entries.size(), helpers, i -> {
                 var entry = entries.get(i);
-                var sealed = pool.acquire(entry.ref().pages() * PageFormat.SIZE);
+                var pages = entry.ref().pages();
+                var sealed = pool.acquire(pages * PageFormat.SIZE);
                 sealedUnits[i] = sealed;
-                cipher.seal(entry.unit(), entry.ref().pages(), sealed, 0);
+                if (entry.value() == null) {
+                    cipher.seal(entry.unit(), pages, sealed, 0);
+                    return;
+                }
+                // The array of the pool comes back with the bytes of its last use: the padding is zeroed up to the tag
+                var end = fillValue(entry, sealed);
+                Arrays.fill(sealed, end, pages * PageFormat.SIZE - PageFormat.TAG, (byte) 0);
+                cipher.seal(sealed, pages);
             });
+        }
+
+        /// Writes the header and the content of the value unit `entry` into `unit` from its start.
+        ///
+        /// @return the end of the content in `unit`
+        private int fillValue(Staged entry, byte[] unit) {
+            var ref = entry.ref();
+            var length = (int) entry.value().byteSize();
+            header(unit, PageFormat.VALUE, 0, ref.page(), ref.pages(), length, ref.nonceHigh(), ref.nonceLow());
+            MemorySegment.copy(entry.value(), ValueLayout.JAVA_BYTE, 0, unit, PageFormat.HEADER, length);
+            return PageFormat.HEADER + length;
         }
 
         /// Starts forcing what the checkpoint wrote so far, beside its work, once it wrote [#FORCE_EVERY] bytes since
@@ -757,7 +817,8 @@ final class PageFile implements AutoCloseable {
         }
     }
 
-    /// A queued unit.
-    private record Staged(PageRef ref, byte[] unit) {
+    /// A queued unit: its plaintext, header included, in `unit`, or, for a value unit, only its content in `value`,
+    /// from which the unit is built when it is sealed.
+    private record Staged(PageRef ref, byte[] unit, MemorySegment value) {
     }
 }

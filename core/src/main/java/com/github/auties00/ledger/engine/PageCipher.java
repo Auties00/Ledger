@@ -69,6 +69,50 @@ class PageCipher {
         }
     }
 
+    /// Seals in place the unit of `pages` pages at the start of `unit`, whose header, content and zero padding are
+    /// filled in up to its tag.
+    ///
+    /// The unit is the one [#seal(byte\[\], int, byte\[\], int)] makes of the same header and content: the cipher
+    /// encrypts each slice over itself, which AES-GCM does without a copy when the output starts where the input does.
+    /// The bytes of `unit` past the unit are left as they are.
+    ///
+    /// @throws IllegalArgumentException if `unit` is shorter than the unit, or the content its header names does not
+    ///                                  fit in the unit
+    void seal(byte[] unit, int pages) {
+        var length = pages * PageFormat.SIZE;
+        var tag = length - PageFormat.TAG;
+        var content = Bytes.i32(unit, PageFormat.LENGTH);
+        if (!PageFormat.fits(pages, content) || unit.length < length) {
+            throw new IllegalArgumentException("A unit of " + pages + " pages cannot hold " + content + " bytes of content in "
+                    + unit.length + " bytes");
+        }
+        if (key == null) {
+            var crc = new CRC32C();
+            crc.update(unit, 0, tag);
+            Bytes.i32(unit, tag, (int) crc.getValue());
+            Arrays.fill(unit, tag + Integer.BYTES, length, (byte) 0);
+            return;
+        }
+        var cipher = take();
+        try {
+            cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, unit, PageFormat.NONCE, 12));
+            cipher.updateAAD(unit, 0, PageFormat.HEADER);
+            // Slices of whole blocks, each written over itself; were the cipher to hold some back, its output would
+            // only trail its input, which it encrypts in place as well
+            var consumed = PageFormat.HEADER;
+            var written = PageFormat.HEADER;
+            while (tag - consumed > SLICE) {
+                written += cipher.update(unit, consumed, SLICE, unit, written);
+                consumed += SLICE;
+            }
+            cipher.doFinal(unit, consumed, tag - consumed, unit, written);
+        } catch (GeneralSecurityException exception) {
+            throw new IllegalStateException("A unit could not be sealed", exception);
+        } finally {
+            ciphers.offer(cipher);
+        }
+    }
+
     /// Receives the bytes of a unit sealed a part at a time.
     @FunctionalInterface
     interface Output {
