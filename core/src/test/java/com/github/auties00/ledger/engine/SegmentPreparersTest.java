@@ -277,15 +277,22 @@ class SegmentPreparersTest {
         }
 
         @Test
-        @DisplayName("under group commit from several threads rolls over into segments their threads prepared ahead")
+        @DisplayName("under group commit from several threads starts the preparation of each segment before the rollover into it")
         void preparedAhead() throws Exception {
             var disk = CrashFileSystem.create();
             var model = new ConcurrentHashMap<String, String>();
+            var started = Collections.synchronizedList(new ArrayList<FutureTask<?>>());
             long rollovers;
             long unprepared;
             try (var ledger = open(disk.getPath("/store"))) {
                 var log = log(ledger);
                 awaitTrue(log::nextSettled, "the preparation of the open never settled");
+                // Each preparation runs as the log starts it, so a rollover finds its segment unprepared only if the
+                // log had not started its preparation by then, whatever the threads of the preparers are doing
+                log.starterForTests = preparation -> {
+                    started.add(preparation);
+                    preparation.run();
+                };
                 var last = log.currentSegment() + 40;
                 var failure = new AtomicReference<Throwable>();
                 var committers = new ArrayList<Thread>();
@@ -312,9 +319,9 @@ class SegmentPreparersTest {
                 unprepared = log.unpreparedRollovers();
             }
             assertTrue(rollovers >= 40, rollovers + " rollovers");
-            // A preparation takes microseconds on this file system and a segment fifteen groups, so a rollover that
-            // finds its segment unprepared means the start of its preparation came late
-            assertTrue(unprepared * 4 <= rollovers, unprepared + " of " + rollovers + " rollovers prepared their segment");
+            // The first rollover takes the preparation the open started, which the hook never saw
+            assertTrue(started.size() >= rollovers - 1, started.size() + " preparations started for " + rollovers + " rollovers");
+            assertEquals(0, unprepared, unprepared + " of " + rollovers + " rollovers found their segment unprepared");
             try (var ledger = open(disk.getPath("/store"))) {
                 assertEquals(new TreeMap<>(model), contents(ledger));
             }
