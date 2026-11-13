@@ -41,9 +41,9 @@ import java.util.concurrent.TimeUnit;
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.SingleShotTime)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
-@Warmup(iterations = 1)
-@Measurement(iterations = 3)
-@Fork(value = 1, jvmArgsAppend = {Jvm.NATIVE_ACCESS, Jvm.UNSAFE, Jvm.HEAP_GROWING, Jvm.HEAP_MAX})
+@Warmup(iterations = 0)
+@Measurement(iterations = 1)
+@Fork(value = 3, warmups = 1, jvmArgsAppend = {Jvm.NATIVE_ACCESS, Jvm.UNSAFE, Jvm.HEAP_GROWING, Jvm.HEAP_MAX})
 public class SteadyWritesMemoryBenchmark {
     private static final int MESSAGES_PER_BATCH = 100;
     private static final int DURABLE_EVERY = 10;

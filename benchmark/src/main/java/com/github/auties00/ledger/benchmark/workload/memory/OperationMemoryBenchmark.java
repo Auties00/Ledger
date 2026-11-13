@@ -60,9 +60,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /// bound of the live heap at those moments. Their time is not the point.
 @BenchmarkMode(Mode.SingleShotTime)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
-@Warmup(iterations = 1)
-@Measurement(iterations = 3)
-@Fork(value = 1, jvmArgsAppend = {Jvm.NATIVE_ACCESS, Jvm.UNSAFE, Jvm.HEAP_GROWING, Jvm.HEAP_MAX})
+@Warmup(iterations = 0)
+@Measurement(iterations = 1)
+@Fork(value = 3, warmups = 1, jvmArgsAppend = {Jvm.NATIVE_ACCESS, Jvm.UNSAFE, Jvm.HEAP_GROWING, Jvm.HEAP_MAX})
 public class OperationMemoryBenchmark {
     private static final int LOAD_WRITERS = 4;
     private static final int LOAD_MESSAGES_PER_BATCH = 10;
