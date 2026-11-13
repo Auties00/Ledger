@@ -47,7 +47,8 @@ import java.util.zip.CRC32C;
 /// later group it is a commit no one was told of. The commits of its run before it are replayed, those after it are
 /// not. A run whose frame authenticates but whose entries are malformed is damage, not a tear, and is refused.
 ///
-/// Segments are read through a buffer, a part at a time.
+/// Segments are read through a buffer, a part at a time. The frames of an encrypted log are opened ahead on the other
+/// processors ([FrameReadAhead]) while the earlier ones replay.
 final class LogRecovery {
     private static final int BUFFER = 1 << 20;
 
@@ -94,7 +95,7 @@ final class LogRecovery {
         for (var index = 0; index < segments.size(); index++) {
             var number = segments.get(index);
             var path = files.segment(number);
-            try (var reader = new SegmentReader(path)) {
+            try (var reader = new SegmentReader(path); var ahead = new FrameReadAhead(path, reader.size())) {
                 var header = new byte[LogWriter.SEGMENT_HEADER];
                 if (!reader.read(0, header, 0, header.length) || !intactSegmentHeader(header, crc)) {
                     // The header is forced before the segment takes its name, so only a file holding nothing past its
@@ -139,6 +140,7 @@ final class LogRecovery {
                 }
                 var useTag = ByteBuffer.wrap(frame).getLong(LogWriter.USE_TAG_OFFSET);
                 var segmentKey = keys.encrypted() ? keys.segmentKey(storeId, number, salt, useTag) : null;
+                ahead.begin(tag, useTag, segmentKey);
                 var afterPadding = false;
                 while (reader.read(position, frame, 0, LogWriter.FRAME_HEADER)) {
                     if (position % LogWriter.ALIGNMENT != 0) {
@@ -163,7 +165,10 @@ final class LogRecovery {
                     var type = frame[16];
                     var end = position + LogWriter.FRAME_HEADER + sealedLength;
                     byte[] body = null;
-                    if (sealedLength >= 0 && end <= reader.size()) {
+                    var opened = sealedLength >= 0 && end <= reader.size() ? ahead.take(frame, position, sealedLength) : null;
+                    if (opened != null) {
+                        body = opened.body();
+                    } else if (sealedLength >= 0 && end <= reader.size()) {
                         var sealed = new byte[LogWriter.FRAME_HEADER + sealedLength];
                         System.arraycopy(frame, 0, sealed, 0, LogWriter.FRAME_HEADER);
                         if (reader.read(position + LogWriter.FRAME_HEADER, sealed, LogWriter.FRAME_HEADER, sealedLength)) {
@@ -271,7 +276,7 @@ final class LogRecovery {
     }
 
     /// {@return whether `frame` starts with a frame header of the use `useTag` of the segment whose salt has `tag`}
-    private static boolean validFrameHeader(byte[] frame, long tag, long useTag, CRC32C crc) {
+    static boolean validFrameHeader(byte[] frame, long tag, long useTag, CRC32C crc) {
         return wholeFrameHeader(frame, tag, crc) && ByteBuffer.wrap(frame).getLong(LogWriter.USE_TAG_OFFSET) == useTag;
     }
 
