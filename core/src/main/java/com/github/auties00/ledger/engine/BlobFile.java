@@ -204,6 +204,17 @@ final class BlobFile implements AutoCloseable {
     /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     byte[] read(PageRef ref, boolean cached, boolean referenced) {
+        return read(ref, cached, referenced, false);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, from the cache or the file}
+    ///
+    /// @param cached whether to keep the unit in the cache
+    /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
+    /// @param screened whether a unit read as read goes to the cache only if it
+    ///                 [admits][PageCache#admits(long, PageRef)] it
+    /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
+    byte[] read(PageRef ref, boolean cached, boolean referenced, boolean screened) {
         var key = PageCache.key(PageCache.BLOBS, ref.page());
         var hit = cache.get(key, ref);
         if (hit != null) {
@@ -213,7 +224,9 @@ final class BlobFile implements AutoCloseable {
         if (plain == null) {
             throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
         }
-        if (cached) {
+        if (cached && referenced && screened) {
+            cache.putScreened(key, ref, plain);
+        } else if (cached) {
             cache.put(key, ref, plain, referenced);
         }
         return plain;
