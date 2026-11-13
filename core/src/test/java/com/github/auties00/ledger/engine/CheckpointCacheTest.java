@@ -904,6 +904,16 @@ class CheckpointCacheTest {
         void leaveTheCache(boolean large, @TempDir Path directory) throws Exception {
             var options = Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(VALUES)
                     .pageCache(64 * MIB).largeValues(large ? 4_096 : Long.MAX_VALUE);
+            // The read of each value caches it, so the bytes the checkpoints release are those of every value
+            PageFile.screenNewForTests(false);
+            try {
+                leaveTheCache(large, options);
+            } finally {
+                PageFile.screenNewForTests(true);
+            }
+        }
+
+        private static void leaveTheCache(boolean large, Ledger.Options options) throws Exception {
             try (var ledger = (LiveLedger) options.build()) {
                 write(ledger, 0, large);
                 ledger.checkpoint();

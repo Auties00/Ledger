@@ -63,8 +63,15 @@ final class PageFile implements AutoCloseable {
     // and only three in a row pass it, where one stretched read made a full scan of a warm store read ahead, on threads
     // of its own, for the next few misses, and the average falls below the bound three quick reads after the device's
     private static final int SAMPLE_LIMIT_MICROS = 2 * COLD_READ_MICROS;
-    // Whether every page file opened from now on reads as cold, whatever it measures; for tests
-    private static volatile boolean forceColdNewForTests;
+    // How every page file opened from now on counts its reads, MEASURED, COLD or WARM; for tests
+    private static volatile byte forceNewForTests;
+    // The ways a page file counts its reads: as they measure, or cold or warm whatever they measure, for tests
+    private static final byte MEASURED = 0;
+    private static final byte COLD = 1;
+    private static final byte WARM = 2;
+    // Whether the page files opened from now on make their caches screen what reads miss; for tests of what one read
+    // caches
+    private static volatile boolean screenNewForTests = true;
 
     private final Path path;
     private final PageCipher cipher;
@@ -78,8 +85,8 @@ final class PageFile implements AutoCloseable {
     // The moving average of the time a read of the file takes, in microseconds; racy, as a lost or stale sample only
     // moves the average less
     private int readMicros;
-    // Whether reads count as cold whatever they measure; for tests
-    private volatile boolean forcedCold;
+    // How reads count: MEASURED, or COLD or WARM whatever they measure, for tests
+    private volatile byte forced;
 
     private PageFile(Path path, PageCipher cipher, PageCache cache, HeapPool pool) throws IOException {
         this.path = path;
@@ -88,7 +95,7 @@ final class PageFile implements AutoCloseable {
         this.pool = pool;
         this.writer = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
         this.readers = new ArrayBlockingQueue<>(READ_CHANNELS);
-        this.forcedCold = forceColdNewForTests;
+        this.forced = forceNewForTests;
         try {
             for (var i = 0; i < READ_CHANNELS; i++) {
                 readers.add(FileChannel.open(path, StandardOpenOption.READ));
@@ -96,6 +103,10 @@ final class PageFile implements AutoCloseable {
         } catch (IOException exception) {
             close();
             throw exception;
+        }
+        // Last, so the measure reads fields already set
+        if (screenNewForTests) {
+            cache.screenWhile(() -> !coldReads());
         }
     }
 
@@ -216,11 +227,24 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
     byte[] read(PageRef ref, byte kind, boolean cached, boolean referenced) {
+        return read(ref, kind, cached, referenced, false);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, from the cache or the file}
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    /// @param cached whether to keep the unit in the cache
+    /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
+    /// @param screened whether a unit read from the file as read goes to the cache only if it
+    ///                 [admits][PageCache#admits(long, PageRef)] it
+    /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[] read(PageRef ref, byte kind, boolean cached, boolean referenced, boolean screened) {
         var hit = cache.get(ref);
         if (hit != null && kindMatches(hit[PageFormat.KIND], kind)) {
             return hit;
         }
-        return load(ref, kind, cached, referenced);
+        return load(ref, kind, cached, referenced, screened);
     }
 
     /// {@return the plaintext of the unit `ref` names, from the file, for a read that found the cache without it}
@@ -233,20 +257,44 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
     byte[] load(PageRef ref, byte kind, boolean cached, boolean referenced) {
+        return load(ref, kind, cached, referenced, false);
+    }
+
+    /// {@return the plaintext of the unit `ref` names, from the file, for a read that found the cache without it}
+    ///
+    /// A delta record still reads its delta page and its base through the cache. A screened read of a delta record
+    /// asks the cache first whether it takes the leaf: if not, the base is read past the cache, which the delta page,
+    /// shared by the other records of its page, still goes to.
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    /// @param cached whether to keep the unit in the cache
+    /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
+    /// @param screened whether a unit read as read goes to the cache only if it
+    ///                 [admits][PageCache#admits(long, PageRef)] it
+    /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[] load(PageRef ref, byte kind, boolean cached, boolean referenced, boolean screened) {
+        var screen = cached && referenced && screened;
         if (ref.isRecord()) {
             // The delta page and the base go to the cache as the entries it evicts first: the leaf they make is what a
-            // read uses again, and holding all three filled the cache with each leaf twice
-            var leaf = DeltaLeaves.materialize(ref, (unit, unitKind) -> read(unit, unitKind, cached, false));
+            // read uses again, and holding all three filled the cache with each leaf twice. The leaf's admission is
+            // decided before they are read: a base cached for a leaf the cache refused would be promoted by the
+            // leaf's second read, and the cache would hold both
+            var admitted = !screen || cache.admits(PageCache.dataKey(ref.page(), ref.slot()), ref);
+            var leaf = DeltaLeaves.materialize(ref, (unit, unitKind) ->
+                    read(unit, unitKind, cached && (admitted || unitKind == PageFormat.DELTA), false));
             if (!kindMatches(leaf[PageFormat.KIND], kind)) {
                 throw new LedgerCorruptedException(path + " holds a delta record where a branch belongs, at page " + ref.page(), null);
             }
-            if (cached) {
+            if (cached && admitted) {
                 cache.put(ref, leaf, referenced);
             }
             return leaf;
         }
         var plain = open(ref, kind, cached, true);
-        if (cached) {
+        if (screen) {
+            cache.putScreened(ref, plain);
+        } else if (cached) {
             cache.put(ref, plain, referenced);
         }
         return plain;
@@ -448,7 +496,8 @@ final class PageFile implements AutoCloseable {
     /// three or four reads of the device and falls below it after three quick ones, and two stretched reads in a row of
     /// the OS cache leave it below.
     boolean coldReads() {
-        return readMicros >= COLD_READ_MICROS || forcedCold;
+        var forced = this.forced;
+        return forced == MEASURED ? readMicros >= COLD_READ_MICROS : forced == COLD;
     }
 
     /// Records in the average of [#coldReads()] a read of `length` bytes that took `nanos` nanoseconds.
@@ -469,13 +518,30 @@ final class PageFile implements AutoCloseable {
 
     /// Makes reads count as cold whatever they measure, or as they measure; for tests.
     void forceColdReadsForTests(boolean cold) {
-        forcedCold = cold;
+        forced = cold ? COLD : MEASURED;
     }
 
     /// Makes every page file opened from now on count its reads as cold whatever they measure, or as they measure;
     /// for tests.
     static void forceColdNewForTests(boolean cold) {
-        forceColdNewForTests = cold;
+        forceNewForTests = cold ? COLD : MEASURED;
+    }
+
+    /// Makes every page file opened from now on leave its cache screening nothing, or screening what reads miss while
+    /// its reads are warm; for tests of what one read caches.
+    static void screenNewForTests(boolean screen) {
+        screenNewForTests = screen;
+    }
+
+    /// Makes reads count as warm whatever they measure, or as they measure; for tests.
+    void forceWarmReadsForTests(boolean warm) {
+        forced = warm ? WARM : MEASURED;
+    }
+
+    /// Makes every page file opened from now on count its reads as warm whatever they measure, or as they measure;
+    /// for tests.
+    static void forceWarmNewForTests(boolean warm) {
+        forceNewForTests = warm ? WARM : MEASURED;
     }
 
     /// {@return the plaintext of the units `refs` name, in their order, none of them cached, each ending with its
@@ -679,8 +745,18 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerCorruptedException if the node fails authentication or is not the one the branch names
     /// @throws LedgerIoException if the file cannot be read
     byte[] node(byte[] parent, int index) {
+        return node(parent, index, false);
+    }
+
+    /// {@return the node child `index` of the branch `parent` names, from the cache or the file}
+    ///
+    /// @param screened whether a leaf read from the file goes to the cache only if it
+    ///                 [admits][PageCache#admits(long, PageRef)] it
+    /// @throws LedgerCorruptedException if the node fails authentication or is not the one the branch names
+    /// @throws LedgerIoException if the file cannot be read
+    byte[] node(byte[] parent, int index, boolean screened) {
         var hit = cachedNode(parent, index);
-        return hit != null ? hit : load(TreeNodes.childRef(parent, index), NODE, true, true);
+        return hit != null ? hit : load(TreeNodes.childRef(parent, index), NODE, true, true, screened);
     }
 
     /// {@return the node child `index` of the branch `parent` names if the cache holds it, or `null`}

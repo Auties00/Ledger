@@ -16,6 +16,10 @@ import java.util.HashMap;
 /// other reads use: the PostgreSQL buffer manager holds a large sequential scan to a small ring for the same reason. A
 /// cache with room evicts nothing to take them, and keeps a key space small enough to fit for the next scan.
 ///
+/// A cursor of a paged key space's reads screens the leaves and blobs it admits: while the reads of the file are warm,
+/// the cache takes one only at its second read ([PageCache#putScreened(long, PageRef, byte\[\])]), as most of the
+/// pages of a chat a client opens are read once.
+///
 /// A cursor made to gather reads ahead while the reads of the file are [cold][PageFile#coldReads()]. When it needs a
 /// leaf that neither the cache nor its own reads ahead hold, it reads that leaf together with the next siblings under
 /// the same parent, then the blobs of the values in its range that those leaves hold, each set of reads at once
@@ -59,6 +63,8 @@ final class TreeCursor {
     private final boolean descending;
     // The entries the scan is expected to take, or 0 for a cursor that never reads ahead
     private final long wanted;
+    // Whether the leaves and blobs it admits go to the cache only if the cache admits them too
+    private final boolean screened;
     private byte[][] path;
     private int[] indexes;
     private int depth;
@@ -116,11 +122,28 @@ final class TreeCursor {
     ///               those it [took][#took()], bounds the values each gather reads; or 0 for a cursor that never reads
     ///               ahead
     TreeCursor(PageFile pages, TreeRoot root, byte[] from, byte[] to, boolean descending, long wanted) {
+        this(pages, root, from, to, descending, wanted, false);
+    }
+
+    /// Creates a cursor over the entries of the tree under `root` from `from`, included, to `to`, excluded, either
+    /// `null` for no bound.
+    ///
+    /// A cursor that cannot read the leaf it starts at gives back what it read ahead before it throws.
+    ///
+    /// @param root the root, or `null` for an empty tree
+    /// @param from the lowest key, which the cursor keeps and no one may change while it is used
+    /// @param to the first key past the range, which the cursor keeps and no one may change while it is used
+    /// @param wanted the entries the scan is expected to take, as for
+    ///               [#TreeCursor(PageFile, TreeRoot, byte\[\], byte\[\], boolean, long)]
+    /// @param screened whether the first [#ADMITTED] leaves and blobs it reads from the file go to the cache only if it
+    ///                 [admits][PageCache#admits(long, PageRef)] them
+    TreeCursor(PageFile pages, TreeRoot root, byte[] from, byte[] to, boolean descending, long wanted, boolean screened) {
         this.pages = pages;
         this.from = from;
         this.to = to;
         this.descending = descending;
         this.wanted = wanted;
+        this.screened = screened;
         this.window = FIRST_GATHER;
         this.path = new byte[8][];
         this.indexes = new int[8];
@@ -278,7 +301,9 @@ final class TreeCursor {
                 }
                 var cached = admit || pages.cache().hasRoom(blobBytes());
                 if (blob == null) {
-                    blob = pages.load(ref, PageFormat.VALUE, cached, admit);
+                    blob = pages.load(ref, PageFormat.VALUE, cached, admit, screened);
+                } else if (admit && screened) {
+                    pages.cache().putScreened(ref, blob);
                 } else if (cached) {
                     pages.cache().put(ref, blob, admit);
                 }
@@ -286,7 +311,7 @@ final class TreeCursor {
             return TreeSearch.blobValue(leaf, entry, ref, blob);
         }
         if (admit) {
-            return TreeSearch.value(pages, leaf, entry, true);
+            return TreeSearch.value(pages, leaf, entry, true, true, screened);
         }
         return TreeSearch.value(pages, leaf, entry, pages.cache().hasRoom(blobBytes()), false);
     }
@@ -322,13 +347,15 @@ final class TreeCursor {
                 unit = take(ref);
             }
             if (unit != null) {
-                if (cached) {
+                if (admit && screened) {
+                    pages.cache().putScreened(ref, unit);
+                } else if (cached) {
                     pages.cache().put(ref, unit, admit);
                 }
                 return unit;
             }
         }
-        return pages.load(ref, PageFile.NODE, cached, admit);
+        return pages.load(ref, PageFile.NODE, cached, admit, screened);
     }
 
     /// {@return whether the leaf or blob the cursor reads next goes to the cache}
