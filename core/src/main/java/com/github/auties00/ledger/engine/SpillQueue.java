@@ -540,17 +540,27 @@ final class SpillQueue {
                 crc.update(value, 0, length);
                 return new LogValue(segment, frameOffset, bodyIndex, 0, (int) crc.getValue());
             }
-            tag(value, length, stamp);
+            tag(value, 0, length, stamp);
             return new LogValue(segment, frameOffset, bodyIndex, Bytes.i64(digest, 0), Bytes.i32(digest, Long.BYTES));
         }
 
-        /// {@return the `length` bytes after the first `skip` of `sealed`, decrypted, the bytes from the block holding
-        /// the value's first byte at `bodyIndex` of the body of the frame at `frameOffset`, sealed under `key`}
+        /// {@return the `length` bytes after the first `skip` of `sealed`, decrypted into an array of their own, as
+        /// [#decrypt(SecretKeySpec, long, int, byte\[\], int, int, byte\[\], int)] decrypts them}
+        byte[] decrypt(SecretKeySpec key, long frameOffset, int bodyIndex, byte[] sealed, int skip, int length) {
+            var value = new byte[length];
+            decrypt(key, frameOffset, bodyIndex, sealed, skip, length, value, 0);
+            return value;
+        }
+
+        /// Decrypts the `length` bytes after the first `skip` of `sealed` into `target` from `offset`: the bytes from the
+        /// block holding the value's first byte at `bodyIndex` of the body of the frame at `frameOffset`, sealed under
+        /// `key`.
         ///
         /// A body is sealed from the counter block after the first, `nonce || 2`, so the block of a byte at `i` of it
         /// is `nonce || 2 + i / 16`; a body holds far fewer than 2^36 bytes, so the counter never carries into the
         /// nonce.
-        byte[] decrypt(SecretKeySpec key, long frameOffset, int bodyIndex, byte[] sealed, int skip, int length) {
+        void decrypt(SecretKeySpec key, long frameOffset, int bodyIndex, byte[] sealed, int skip, int length,
+                     byte[] target, int offset) {
             var bytes = (skip + length + BLOCK - 1) & -BLOCK;
             if (counters == null || counters.length < bytes) {
                 counters = new byte[Math.max(bytes, 2 << 10)];
@@ -572,32 +582,36 @@ final class SpillQueue {
                 blocksKey = null;
                 throw new IllegalStateException("AES failed", exception);
             }
-            var value = new byte[length];
             for (var i = 0; i < length; i++) {
-                value[i] = (byte) (sealed[skip + i] ^ keystream[skip + i]);
+                target[offset + i] = (byte) (sealed[skip + i] ^ keystream[skip + i]);
             }
-            return value;
         }
 
         /// {@return whether `value` is the value `logged` holds the tag of, of the version stamped `stamp`}
         boolean verifies(byte[] value, long stamp, LogValue logged) {
+            return verifies(value, 0, value.length, stamp, logged);
+        }
+
+        /// {@return whether the `length` bytes at `offset` of `value` are the value `logged` holds the tag of, of the
+        /// version stamped `stamp`}
+        boolean verifies(byte[] value, int offset, int length, long stamp, LogValue logged) {
             if (mac == null) {
                 crc.reset();
-                crc.update(value, 0, value.length);
+                crc.update(value, offset, length);
                 return (int) crc.getValue() == logged.tagLow();
             }
-            tag(value, value.length, stamp);
+            tag(value, offset, length, stamp);
             // Every bit compared whatever the first that differs
             return ((Bytes.i64(digest, 0) ^ logged.tagHigh()) | (Bytes.i32(digest, Long.BYTES) ^ logged.tagLow())) == 0;
         }
 
-        /// Writes to the digest the HMAC of `stamp` and the first `length` bytes of `value`, of which a tag keeps the
-        /// first 96 bits.
-        private void tag(byte[] value, int length, long stamp) {
+        /// Writes to the digest the HMAC of `stamp` and the `length` bytes at `offset` of `value`, of which a tag keeps
+        /// the first 96 bits.
+        private void tag(byte[] value, int offset, int length, long stamp) {
             Bytes.i64(this.stamp, 0, stamp);
             try {
                 mac.update(this.stamp);
-                mac.update(value, 0, length);
+                mac.update(value, offset, length);
                 mac.doFinal(digest, 0);
             } catch (GeneralSecurityException exception) {
                 mac.reset();

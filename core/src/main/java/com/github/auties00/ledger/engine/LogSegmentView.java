@@ -116,30 +116,29 @@ final class LogSegmentView {
         }
     }
 
-    /// {@return the value `logged` places here, `length` bytes of the version stamped `stamp`}
+    /// Reads the value `logged` places here, `length` bytes of the version stamped `stamp`, into `target` from
+    /// `offset`.
     ///
     /// @throws Retired if a checkpoint retired the segment
     /// @throws LedgerIoException if the segment cannot be read
     /// @throws LedgerCorruptedException if the bytes read are not the value
-    byte[] read(LogValue logged, long stamp, int length) {
+    void read(LogValue logged, long stamp, int length, byte[] target, int offset) {
         if (retired) {
             throw Retired.INSTANCE;
         }
         var crypto = spills.takeCrypto();
         try {
             var start = logged.frameOffset() + LogWriter.FRAME_HEADER + logged.bodyIndex();
-            byte[] value;
             if (key == null) {
-                value = new byte[length];
-                readFully(value, length, start);
+                readFully(target, offset, length, start);
             } else {
                 // From the first byte of the block holding the value's first, which the keystream starts from
                 var skip = logged.bodyIndex() & (SpillQueue.BLOCK - 1);
                 var sealed = crypto.scratch(skip + length);
-                readFully(sealed, skip + length, start - skip);
-                value = crypto.decrypt(key, logged.frameOffset(), logged.bodyIndex(), sealed, skip, length);
+                readFully(sealed, 0, skip + length, start - skip);
+                crypto.decrypt(key, logged.frameOffset(), logged.bodyIndex(), sealed, skip, length, target, offset);
             }
-            if (!crypto.verifies(value, stamp, logged)) {
+            if (!crypto.verifies(target, offset, length, stamp, logged)) {
                 if (retired) {
                     // Read as a preparation reused the file
                     throw Retired.INSTANCE;
@@ -147,23 +146,22 @@ final class LogSegmentView {
                 throw new LedgerCorruptedException("A value of the log segment " + path
                         + " does not match the value the store wrote", null);
             }
-            return value;
         } finally {
             spills.giveBack(crypto);
         }
     }
 
-    /// Reads `length` bytes at `position` of the file into `target`, opening the channel again after an interrupt
-    /// closed it.
-    private void readFully(byte[] target, int length, long position) {
+    /// Reads `length` bytes at `position` of the file into `target` from `offset`, opening the channel again after an
+    /// interrupt closed it.
+    private void readFully(byte[] target, int offset, int length, long position) {
         var interrupted = false;
         try {
             while (true) {
                 var open = channel();
                 try {
-                    var buffer = ByteBuffer.wrap(target, 0, length);
+                    var buffer = ByteBuffer.wrap(target, offset, length);
                     while (buffer.hasRemaining()) {
-                        if (open.read(buffer, position + buffer.position()) < 0) {
+                        if (open.read(buffer, position + buffer.position() - offset) < 0) {
                             if (retired) {
                                 throw Retired.INSTANCE;
                             }
