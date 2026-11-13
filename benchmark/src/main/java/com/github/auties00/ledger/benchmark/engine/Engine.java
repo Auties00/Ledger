@@ -66,6 +66,18 @@ public interface Engine extends AutoCloseable {
     /// @throws IOException if the engine fails to open it
     ReadView openReadView() throws IOException;
 
+    /// Moves what the engine holds of recent writes only in memory or in its log into its main files, as it does on
+    /// its own from time to time, and returns once that is done: a checkpoint.
+    ///
+    /// A workload calls it to measure what that step costs while writes go on, not for durability, which
+    /// [Durability#DURABLE] already gives.
+    ///
+    /// @implSpec The default implementation does nothing, for an engine whose writes reach its main files as they
+    /// commit.
+    /// @throws IOException if the engine fails to write
+    default void checkpoint() throws IOException {
+    }
+
     /// {@return the bytes the engine's files occupy}
     ///
     /// An engine that reserves file space before it uses it reports the space its data takes instead.

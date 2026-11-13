@@ -134,6 +134,11 @@ public final class LedgerEngine implements Engine {
     }
 
     @Override
+    public void checkpoint() {
+        ledger.checkpoint();
+    }
+
+    @Override
     public long sizeOnDisk() throws IOException {
         return Directories.size(directory);
     }

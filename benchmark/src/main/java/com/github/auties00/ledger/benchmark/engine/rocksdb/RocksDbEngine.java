@@ -11,6 +11,7 @@ import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
 import org.rocksdb.DBOptions;
+import org.rocksdb.FlushOptions;
 import org.rocksdb.LRUCache;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
@@ -185,6 +186,19 @@ public final class RocksDbEngine implements Engine {
                 database.releaseSnapshot(snapshot);
             }
         };
+    }
+
+    /// {@inheritDoc}
+    ///
+    /// @implNote This implementation flushes the memtables of every column family to sorted files and waits for the
+    /// flush; compactions it triggers go on in the background.
+    @Override
+    public void checkpoint() throws IOException {
+        try (var options = new FlushOptions().setWaitForFlush(true)) {
+            database.flush(options, handles);
+        } catch (RocksDBException exception) {
+            throw new IOException(exception);
+        }
     }
 
     @Override

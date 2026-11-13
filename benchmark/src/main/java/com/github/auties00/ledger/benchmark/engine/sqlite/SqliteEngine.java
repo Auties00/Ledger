@@ -249,6 +249,22 @@ public final class SqliteEngine implements Engine {
         };
     }
 
+    /// {@inheritDoc}
+    ///
+    /// @implNote This implementation copies the write-ahead log into the database file with a `FULL` WAL
+    /// checkpoint, holding the write lock, as SQLite itself does once the log passes 1,000 pages.
+    @Override
+    public void checkpoint() throws IOException {
+        writeLock.lock();
+        try (var statement = writer.createStatement()) {
+            statement.execute("PRAGMA wal_checkpoint(FULL)");
+        } catch (SQLException exception) {
+            throw new IOException(exception);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
     @Override
     public long sizeOnDisk() throws IOException {
         return Directories.size(directory);

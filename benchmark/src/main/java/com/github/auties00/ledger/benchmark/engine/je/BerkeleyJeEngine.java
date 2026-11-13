@@ -6,6 +6,7 @@ import com.github.auties00.ledger.benchmark.engine.EngineSettings;
 import com.github.auties00.ledger.benchmark.engine.Keyspace;
 import com.github.auties00.ledger.benchmark.engine.WriteBatch;
 import com.github.auties00.ledger.benchmark.support.Directories;
+import com.sleepycat.je.CheckpointConfig;
 import com.sleepycat.je.CursorConfig;
 import com.sleepycat.je.Database;
 import com.sleepycat.je.DatabaseConfig;
@@ -150,6 +151,15 @@ public final class BerkeleyJeEngine implements Engine {
     @Override
     public ReadView openReadView() {
         throw new UnsupportedOperationException("Berkeley DB JE has no snapshot reads");
+    }
+
+    /// {@inheritDoc}
+    ///
+    /// @implNote This implementation forces a JE checkpoint, which writes the dirty internal nodes of every tree to
+    /// the log so that recovery starts from there.
+    @Override
+    public void checkpoint() {
+        environment.checkpoint(new CheckpointConfig().setForce(true));
     }
 
     @Override
