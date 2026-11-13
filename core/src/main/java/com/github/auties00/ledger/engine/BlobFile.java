@@ -221,7 +221,7 @@ final class BlobFile implements AutoCloseable {
             return hit;
         }
         var screen = cached && referenced && screened;
-        if (screen) {
+        if (cached && referenced) {
             var recalled = cache.recall(key, ref);
             if (recalled != null) {
                 return recalled;

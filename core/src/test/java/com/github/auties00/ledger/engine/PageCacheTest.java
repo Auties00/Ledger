@@ -689,6 +689,58 @@ class PageCacheTest {
         }
 
         @Test
+        @DisplayName("grows its table of refused units with the refusals, up to its most slots, and recalls most units still reachable")
+        void refusalsGrow() {
+            var cache = screening(LIMIT);
+            var units = new ArrayList<byte[]>();
+            var count = PageCache.MAX_REFUSALS / 4;
+            for (var i = 0; i < count; i++) {
+                var unit = shortUnit(page(i));
+                units.add(unit);
+                cache.putScreened(page(i), unit);
+            }
+            assertEquals(PageCache.MAX_REFUSALS, cache.refusalSlotsForTests());
+            var recalled = 0;
+            for (var i = 0; i < count; i++) {
+                var unit = cache.recall(page(i));
+                if (unit != null) {
+                    assertSame(units.get(i), unit);
+                    recalled++;
+                }
+            }
+            assertTrue(recalled >= count * 3 / 4, recalled + " of " + count + " units recalled");
+            for (var i = count; i < 2 * count; i++) {
+                cache.putScreened(page(i), shortUnit(page(i)));
+            }
+            assertEquals(PageCache.MAX_REFUSALS, cache.refusalSlotsForTests(), "the table grew past its most slots");
+        }
+
+        @Test
+        @DisplayName("empties at a later refusal the slots of the units the collector took")
+        void refusalsForgotten() throws InterruptedException {
+            var cache = screening(LIMIT);
+            var gone = new ArrayList<WeakReference<byte[]>>();
+            for (var i = 0; i < 48; i++) {
+                var unit = unit(page(i));
+                gone.add(new WeakReference<>(unit));
+                cache.putScreened(page(i), unit);
+            }
+            assertTrue(cache.refusedForTests() > 0);
+            for (var attempt = 0; attempt < 10 && gone.stream().anyMatch(reference -> reference.get() != null); attempt++) {
+                System.gc();
+            }
+            assertTrue(gone.stream().allMatch(reference -> reference.get() == null), "an array the cache refused stayed reachable");
+            var kept = new ArrayList<byte[]>();
+            for (var attempt = 0; attempt < 200 && cache.refusedForTests() > kept.size(); attempt++) {
+                var unit = unit(page(1_000 + attempt));
+                kept.add(unit);
+                cache.putScreened(page(1_000 + attempt), unit);
+                Thread.sleep(5);
+            }
+            assertTrue(cache.refusedForTests() <= kept.size(), cache.refusedForTests() + " slots held for " + kept.size() + " units");
+        }
+
+        @Test
         @DisplayName("takes back at its first read a unit the clock evicted, and not one it never held")
         void evictedReadmitted() {
             var cache = screening(16L * PageFormat.SIZE);
