@@ -494,7 +494,7 @@ final class PageFile implements AutoCloseable {
     /// The units read with others are opened into [collectable][HeapPool#acquireCollectable(int)] arrays of the
     /// store's pool, whole, which the caller gives back with [#releasePrefetched(byte\[\])] once it no longer reads
     /// them: a load copies the entries of each run of leaves into memory and forgets the leaves, and an array of its
-    /// own for each was 4 KiB of the 10 a leaf of two values of 1.5 KiB cost it.
+    /// own for each would be 4 KiB of the 10 a leaf of two values of 1.5 KiB costs it.
     ///
     /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
     /// @param collectable receives, for each unit, whether it lies in such an array, or `null` for units in arrays of

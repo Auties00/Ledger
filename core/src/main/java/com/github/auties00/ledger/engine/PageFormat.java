@@ -69,8 +69,9 @@ final class PageFormat {
     static final int INDEX = 28;
     /// The least padding a unit the page cache takes must have for the cache to keep it without the padding. Opening
     /// a unit into an array of the pool and copying its content out costs what opening it into an array of its own
-    /// does, which the JVM zeroes first, so the bound only spares the round trip through the pool for a few bytes: a
-    /// bound of 512 kept 1,519 of the 3,791 units a warm store of chats cached whole, 364,000 bytes of padding.
+    /// does, which the JVM zeroes first, so the bound only spares the round trip through the pool for a few bytes: with
+    /// a bound of 512, a warm store of chats would keep 1,519 of the 3,791 units it caches whole, 364,000 bytes of
+    /// padding.
     static final int TRIM_LEAST = 64;
     /// The most pages of a unit the page cache keeps without its padding.
     static final int TRIMMED_PAGES = 16;
