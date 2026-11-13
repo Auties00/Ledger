@@ -35,6 +35,7 @@ import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.IntConsumer;
+import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 
 /// A store: the engine of [Ledger.Builder#memory()], and of a store in a directory, which also journals every commit
@@ -196,6 +197,9 @@ public final class LiveLedger implements Ledger {
     private volatile Executor rangeCounts;
     // The chunks the values of the fastest commits of a store with pages share
     private final ValueSlab valueSlab;
+    // What a pipelined commit calls with its sequence once it has one, before it applies, or null; for tests that hold
+    // a commit there. Plain: set before the committing threads start
+    private LongConsumer sequencedHookForTests;
 
     /// Creates an empty store with `keyspaces`.
     ///
@@ -331,6 +335,12 @@ public final class LiveLedger implements Ledger {
                 loader.stepHookForTests = hook;
             }
         }
+    }
+
+    /// Makes each pipelined commit call `hook` with its sequence once it has one, before it applies, or none if `null`;
+    /// for tests that hold a commit between the two, set before the threads that commit start.
+    void hookSequencedForTests(LongConsumer hook) {
+        sequencedHookForTests = hook;
     }
 
     /// {@return whether memory holds every entry of the key space `keyspace`, for tests of its loader}
@@ -799,6 +809,10 @@ public final class LiveLedger implements Ledger {
         if (pending.failure != null) {
             throw rethrow(pending.failure);
         }
+        var hook = sequencedHookForTests;
+        if (hook != null) {
+            hook.accept(pending.sequence);
+        }
         apply(pending);
         awaitPublished(pending);
         // Forgotten here rather than by the publisher, whose cache would have to fetch each chain's line
@@ -1130,8 +1144,9 @@ public final class LiveLedger implements Ledger {
     /// that has not applied, then maintains the store for their writes when [#maintenanceDue()].
     ///
     /// Once the log fails, no commit publishes: each fails with the log's failure, its versions above the latest
-    /// sequence, where no read sees them. Each commit moves to [PendingCommit#DONE] right after the latest sequence
-    /// covers it, with release stores; the caller wakes the parked ones after a full fence.
+    /// sequence, where no read sees them, and its frame's pooled chunks back in the pool. Each commit moves to
+    /// [PendingCommit#DONE] right after the latest sequence covers it, with release stores; the caller wakes the parked
+    /// ones after a full fence.
     ///
     /// @return the first of the commits it published, linked through [PendingCommit#publishedNext], or `null`
     private PendingCommit publishInOrder() {
@@ -1168,6 +1183,10 @@ public final class LiveLedger implements Ledger {
                 }
             }
             if (broken != null && next.failure == null) {
+                // Applied after the log stopped, or refused with this pass: the log never takes its frame
+                if (!logged && !next.light) {
+                    next.applier.discardFrame();
+                }
                 next.failure = broken;
             }
             var previous = published.last;
@@ -2877,15 +2896,21 @@ public final class LiveLedger implements Ledger {
             }
         }
 
+        /// Gives the frame's pooled chunks back to the pool, unless the log took the frame, which then gives them back
+        /// once it sealed it: for a commit taken back, or one that fails with its writes in place as the log stopped.
+        void discardFrame() {
+            if (frame != null && !logged) {
+                frame.discard();
+            }
+        }
+
         /// Takes back every write this commit applied; no reader saw them, since the commit was never published.
         ///
         /// The keys it wrote stay marked for the next checkpoint, which writes their unchanged state. The frame's pooled
         /// chunks go back to the pool unless the log took the frame, which then gives them back once it sealed it.
         void rollback() {
             assert !logged : "a commit whose frame the log queued is taken back";
-            if (frame != null) {
-                frame.discard();
-            }
+            discardFrame();
             for (var write : touched) {
                 var chain = write.chain();
                 var head = chain.head;
