@@ -1,7 +1,6 @@
 package com.github.auties00.ledger.engine;
 
 import javax.crypto.Cipher;
-import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
@@ -51,10 +50,10 @@ final class SpillQueue {
     static final int LOG_VALUE_MIN = 256;
     /// The bytes of an AES block.
     static final int BLOCK = 16;
-    /// The MAC of the tags, HMAC-SHA256, of which a tag keeps the first 96 bits.
-    private static final String TAG_ALGORITHM = "HmacSHA256";
-    /// The bytes of an HMAC-SHA256 digest, and of the key of the tags.
-    private static final int DIGEST_BYTES = 32;
+    /// The prime 2^61 - 1, the modulus of the polynomials of the tags.
+    private static final long PRIME = (1L << 61) - 1;
+    /// The bytes of a word of a tagged value: 7, so a word is below [#PRIME].
+    private static final int WORD = 7;
     /// The scratch past which a [Crypto] given back lets go of it: the values of messages take a few kilobytes.
     private static final int KEPT_SCRATCH = 16 << 10;
     private static final SecureRandom KEYS = new SecureRandom();
@@ -63,9 +62,9 @@ final class SpillQueue {
     // The held bytes the thread moves values down to
     private final long lowWater;
     private final boolean encrypted;
-    // The key of the tags, drawn for this open at the first value moved or read back and never stored; null before,
-    // and without encryption
-    private volatile SecretKeySpec tagKey;
+    // The two points the polynomials of the tags are evaluated at, from 1 to PRIME - 1, drawn for this open at the
+    // first value moved or read back and never stored; null before, and without encryption
+    private volatile long[] tagKeys;
     private final Object lock;
     // The records not taken, oldest first; guarded by the lock
     private final ArrayDeque<Record> records;
@@ -87,7 +86,7 @@ final class SpillQueue {
     /// Creates the queue of a store.
     ///
     /// @param budget the bytes of values whose frames are durable the queue holds before it moves them
-    /// @param encrypted whether the store's log is encrypted, so the values read back are authenticated by an HMAC
+    /// @param encrypted whether the store's log is encrypted, so the values read back are authenticated by a keyed hash
     SpillQueue(long budget, boolean encrypted) {
         this.budget = budget;
         this.lowWater = budget - budget / 4;
@@ -99,21 +98,19 @@ final class SpillQueue {
         this.cryptos = new AtomicReferenceArray<>(Math.max(4, 2 * Runtime.getRuntime().availableProcessors()));
     }
 
-    /// {@return the key of the tags, drawn at the first call}
-    private SecretKeySpec tagKey() {
-        var key = tagKey;
-        if (key == null) {
+    /// {@return the keys of the tags, drawn at the first call}
+    private long[] tagKeys() {
+        var keys = tagKeys;
+        if (keys == null) {
             synchronized (lock) {
-                key = tagKey;
-                if (key == null) {
-                    var bytes = new byte[DIGEST_BYTES];
-                    KEYS.nextBytes(bytes);
-                    key = new SecretKeySpec(bytes, TAG_ALGORITHM);
-                    tagKey = key;
+                keys = tagKeys;
+                if (keys == null) {
+                    keys = new long[]{1 + Math.floorMod(KEYS.nextLong(), PRIME - 1), 1 + Math.floorMod(KEYS.nextLong(), PRIME - 1)};
+                    tagKeys = keys;
                 }
             }
         }
-        return key;
+        return keys;
     }
 
     /// {@return the budget for a heap of `maxMemory` bytes: a 256th, from 4 MiB to 64 MiB}
@@ -471,42 +468,43 @@ final class SpillQueue {
 
     /// The ciphers of one thread at a time: those that authenticate a value moved to the log and decrypt it back.
     ///
-    /// Neither allocates per value but the 32-byte digest the JDK's HMAC returns: the keystream of a value is AES-ECB of
-    /// its counter blocks under a cipher keyed once per segment use, where a cipher in CTR mode takes a new IV and with
-    /// it a new initialization per value, and the tag is an HMAC under a key set once, where a GMAC takes a nonce and an
-    /// initialization per value and copies its input twice, as the JDK's GCM buffers what it authenticates.
+    /// Neither allocates per value: the keystream of a value is AES-ECB of its counter blocks under a cipher keyed once
+    /// per segment use, where a cipher in CTR mode takes a new IV and with it a new initialization per value.
+    ///
+    /// The tag of a value in an encrypted store is a pair of polynomials over the field of [#PRIME] elements, evaluated
+    /// at the two secret points of the queue: one coefficient per 7 bytes of the value, after a leading 1 and the
+    /// version's stamp and before the value's length, so distinct values, or the same value of another version, are
+    /// distinct polynomials.
+    /// Two distinct polynomials of `n` coefficients agree at a uniformly drawn point with a probability of at most
+    /// `n / (2^61 - 1)`, and the two points are independent. A tag never leaves the process, so bytes changed in the
+    /// file, whatever change the CTR keystream lets anyone make, pass for the value with a probability of at most
+    /// `n / (2^61 - 1)` times `n / (2^61 - 1) + 2^-32`, the second factor that of the 32 bits a tag keeps of the second
+    /// polynomial: below 2^-80 for a value of 12 KiB, about the bound of a 96-bit GMAC of the same value.
+    ///
+    /// @implNote This implementation tags with a universal hash of its own, not a MAC of the JDK: a store that recovers
+    /// a long log after a crash tags every value it replays while the JVM has compiled little, when the C2 compilation
+    /// of an HMAC inlined at its call site takes hundreds of milliseconds of a compiler thread, and a GMAC takes an
+    /// initialization and two copies of the value per tag; the loop of the polynomials compiles in a few.
     static final class Crypto {
-        // AES-ECB under the key of the segment use it last decrypted from, which makes keystream blocks, and
-        // HMAC-SHA256 under the queue's key, which makes the tags; null without encryption
-        private final Cipher blocks;
-        private final Mac mac;
+        // AES-ECB under the key of the segment use it last decrypted from, which makes keystream blocks; made at the
+        // first decryption, so a store that only moves values never loads it
+        private Cipher blocks;
         // The key blocks is under, or null before the first decryption
         private SecretKeySpec blocksKey;
+        // The points of the polynomials of the tags, or null without encryption
+        private final long[] keys;
         private final CRC32C crc;
-        // The stamp a tag authenticates with the value, then the digest of the tag
-        private final byte[] stamp;
-        private final byte[] digest;
+        // The two polynomials of the last tag
+        private long first;
+        private long second;
         private byte[] scratch;
         // The counter blocks of a value and the keystream they encrypt to
         private byte[] counters;
         private byte[] keystream;
 
         private Crypto(SpillQueue queue) {
-            if (queue.encrypted) {
-                try {
-                    this.blocks = Cipher.getInstance("AES/ECB/NoPadding");
-                    this.mac = Mac.getInstance(TAG_ALGORITHM);
-                    mac.init(queue.tagKey());
-                } catch (GeneralSecurityException exception) {
-                    throw new IllegalStateException("AES or HMAC-SHA256 is unavailable", exception);
-                }
-            } else {
-                this.blocks = null;
-                this.mac = null;
-            }
+            this.keys = queue.encrypted ? queue.tagKeys() : null;
             this.crc = new CRC32C();
-            this.stamp = new byte[Long.BYTES];
-            this.digest = new byte[DIGEST_BYTES];
         }
 
         /// {@return an array of at least `length` bytes, which only this holder uses until it is given back}
@@ -535,13 +533,13 @@ final class SpillQueue {
                           int offset, int length) {
             var value = scratch(length);
             MemorySegment.copy(home, offset, MemorySegment.ofArray(value), 0, length);
-            if (mac == null) {
+            if (keys == null) {
                 crc.reset();
                 crc.update(value, 0, length);
                 return new LogValue(segment, frameOffset, bodyIndex, 0, (int) crc.getValue());
             }
             tag(value, 0, length, stamp);
-            return new LogValue(segment, frameOffset, bodyIndex, Bytes.i64(digest, 0), Bytes.i32(digest, Long.BYTES));
+            return new LogValue(segment, frameOffset, bodyIndex, first, (int) second);
         }
 
         /// {@return the `length` bytes after the first `skip` of `sealed`, decrypted into an array of their own, as
@@ -573,6 +571,9 @@ final class SpillQueue {
                 Bytes.i32(counters, block + Integer.BYTES + Long.BYTES, first + (block >>> 4));
             }
             try {
+                if (blocks == null) {
+                    blocks = Cipher.getInstance("AES/ECB/NoPadding");
+                }
                 if (key != blocksKey) {
                     blocks.init(Cipher.ENCRYPT_MODE, key);
                     blocksKey = key;
@@ -595,28 +596,60 @@ final class SpillQueue {
         /// {@return whether the `length` bytes at `offset` of `value` are the value `logged` holds the tag of, of the
         /// version stamped `stamp`}
         boolean verifies(byte[] value, int offset, int length, long stamp, LogValue logged) {
-            if (mac == null) {
+            if (keys == null) {
                 crc.reset();
                 crc.update(value, offset, length);
                 return (int) crc.getValue() == logged.tagLow();
             }
             tag(value, offset, length, stamp);
             // Every bit compared whatever the first that differs
-            return ((Bytes.i64(digest, 0) ^ logged.tagHigh()) | (Bytes.i32(digest, Long.BYTES) ^ logged.tagLow())) == 0;
+            return ((first ^ logged.tagHigh()) | ((int) second ^ logged.tagLow())) == 0;
         }
 
-        /// Writes to the digest the HMAC of `stamp` and the `length` bytes at `offset` of `value`, of which a tag keeps
-        /// the first 96 bits.
+        /// Evaluates the two polynomials of the tag of the `length` bytes at `offset` of `value`, the value of the
+        /// version stamped `stamp`, into [#first] and [#second]: by Horner's rule, the coefficients 1, the stamp in two
+        /// words, the value in words of 7 bytes, the last one shorter, and the length.
         private void tag(byte[] value, int offset, int length, long stamp) {
-            Bytes.i64(this.stamp, 0, stamp);
-            try {
-                mac.update(this.stamp);
-                mac.update(value, offset, length);
-                mac.doFinal(digest, 0);
-            } catch (GeneralSecurityException exception) {
-                mac.reset();
-                throw new IllegalStateException("HMAC-SHA256 failed", exception);
+            var x = keys[0];
+            var y = keys[1];
+            // The leading coefficient 1, so no coefficient after it can be dropped as a leading zero
+            var a = x;
+            var b = y;
+            var word = stamp >>> 8;
+            a = multiply(a + word, x);
+            b = multiply(b + word, y);
+            word = stamp & 0xFF;
+            a = multiply(a + word, x);
+            b = multiply(b + word, y);
+            var end = offset + length;
+            var at = offset;
+            // A long read takes 8 bytes: the top 7 of it are a word
+            for (; at + Long.BYTES <= end; at += WORD) {
+                word = Bytes.i64(value, at) >>> 8;
+                a = multiply(a + word, x);
+                b = multiply(b + word, y);
             }
+            for (; at < end; at += WORD) {
+                word = 0;
+                var stop = Math.min(at + WORD, end);
+                for (var i = at; i < stop; i++) {
+                    word = (word << 8) | (value[i] & 0xFF);
+                }
+                a = multiply(a + word, x);
+                b = multiply(b + word, y);
+            }
+            first = multiply(a + length, x);
+            second = multiply(b + length, y);
+        }
+
+        /// {@return `a` times `b` modulo [#PRIME], both below 2^62}
+        static long multiply(long a, long b) {
+            var high = Math.unsignedMultiplyHigh(a, b);
+            var low = a * b;
+            // 2^61 is 1 modulo the prime: fold the 124 bits of the product into 64, then into 61
+            var folded = (high << 3) + (low >>> 61) + (low & PRIME);
+            var reduced = (folded & PRIME) + (folded >>> 61);
+            return reduced >= PRIME ? reduced - PRIME : reduced;
         }
     }
 }

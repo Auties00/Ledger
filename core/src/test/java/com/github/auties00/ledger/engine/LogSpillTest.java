@@ -633,6 +633,48 @@ class LogSpillTest {
     }
 
     @Test
+    @DisplayName("the product modulo 2^61 - 1 of the tags is the exact one for operands up to 2^62")
+    void multipliesModuloThePrime() {
+        var prime = java.math.BigInteger.ONE.shiftLeft(61).subtract(java.math.BigInteger.ONE);
+        var random = new Random(3);
+        long[] edges = {0, 1, 2, (1L << 61) - 2, (1L << 61) - 1, 1L << 61, (1L << 62) - 1};
+        for (var i = 0; i < 20_000; i++) {
+            var a = i < edges.length * edges.length ? edges[i / edges.length] : random.nextLong() >>> 2;
+            var b = i < edges.length * edges.length ? edges[i % edges.length] : random.nextLong() >>> 2;
+            var expected = java.math.BigInteger.valueOf(a).multiply(java.math.BigInteger.valueOf(b)).mod(prime).longValueExact();
+            assertEquals(expected, SpillQueue.Crypto.multiply(a, b), a + " * " + b);
+        }
+    }
+
+    @Test
+    @DisplayName("the tag of a value rejects every value that differs from it in one byte, in its length or in the version it belongs to, at every length up to several words")
+    void tagsRejectEveryChange() {
+        var queue = new SpillQueue(0, true);
+        var crypto = queue.takeCrypto();
+        var segment = queue.segment(1, Path.of("unused"), new SecretKeySpec(new byte[32], "AES"));
+        var random = new Random(4);
+        for (var length = 0; length <= 64; length++) {
+            var value = new byte[length];
+            random.nextBytes(value);
+            var logged = crypto.logValue(segment, 0, 0, 1_000L + length, MemorySegment.ofArray(value), 0, length);
+            assertTrue(crypto.verifies(value, 1_000L + length, logged));
+            assertFalse(crypto.verifies(value, 1_001L + length, logged), "another version, length " + length);
+            for (var at = 0; at < length; at++) {
+                for (var bit = 0; bit < 8; bit++) {
+                    var changed = value.clone();
+                    changed[at] ^= (byte) (1 << bit);
+                    assertFalse(crypto.verifies(changed, 1_000L + length, logged), "bit " + bit + " of byte " + at + " of " + length);
+                }
+            }
+            assertFalse(crypto.verifies(Arrays.copyOf(value, length + 1), 1_000L + length, logged), "a zero byte more after " + length);
+            if (length > 0) {
+                assertFalse(crypto.verifies(Arrays.copyOf(value, length - 1), 1_000L + length, logged), "a byte less than " + length);
+            }
+        }
+        queue.giveBack(crypto);
+    }
+
+    @Test
     @DisplayName("a value decrypted from the block that holds its first byte is the value AES-CTR from the body's first counter block decrypts, wherever it starts and however long it is")
     void decryptsAsCounterMode() throws Exception {
         var queue = new SpillQueue(0, true);
