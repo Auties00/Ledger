@@ -149,6 +149,8 @@ public final class LiveLedger implements Ledger {
     private final Padded.Role sweepWanted;
     private volatile boolean closed;
     private int sweepIndex;
+    // The key the sweep of an ordered map stopped after, a copy of its own made when a hold ends, or null: a chain kept
+    // here would keep, once dropped and taken out of the map with many others, those its link reaches
     private MemorySegment sweepAfter;
     // Where the sweep stands in the index of a key space it walks by index ([KeyspaceState#sweepsIndex()]), or null
     // before it starts there
@@ -2354,15 +2356,18 @@ public final class LiveLedger implements Ledger {
                 }
             } else {
                 // An apply may have put a newer version above the entry's value: the prune leaves it, and drops nothing
-                var entries = (sweepAfter == null ? state.entries : state.entries.tailMap(sweepAfter, false)).entrySet().iterator();
-                while (budget > 0 && entries.hasNext()) {
-                    var entry = entries.next();
-                    var chain = entry.getValue();
+                var chains = (sweepAfter == null ? state.entries : state.entries.tailMap(sweepAfter, false)).values().iterator();
+                Chain last = null;
+                while (budget > 0 && chains.hasNext()) {
+                    var chain = chains.next();
                     sweepFound |= prune(state, chain, chain.head, bounds, cutBound);
-                    sweepAfter = entry.getKey();
+                    last = chain;
                     budget--;
                 }
-                finished = !entries.hasNext();
+                finished = !chains.hasNext();
+                if (!finished && last != null) {
+                    sweepAfter = last.key();
+                }
             }
             if (finished) {
                 sweepIndex = (sweepIndex + 1) % sweepOrder.size();

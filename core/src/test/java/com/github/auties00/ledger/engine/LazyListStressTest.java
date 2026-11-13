@@ -45,9 +45,9 @@ class LazyListStressTest {
         state.drop(dropped, null, () -> Long.MAX_VALUE);
         var head = state.open(Segments.encodeKey(KeyCodec.utf8(), "a"));
         var pushed = new Chain[2];
-        var hooked = new java.util.concurrent.ConcurrentSkipListMap<java.lang.foreign.MemorySegment, Chain>(Segments.UNSIGNED) {
+        var hooked = new java.util.concurrent.ConcurrentSkipListMap<Object, Chain>(KeyspaceState.BY_KEY) {
             @Override
-            public Chain putIfAbsent(java.lang.foreign.MemorySegment key, Chain value) {
+            public Chain putIfAbsent(Object key, Chain value) {
                 if (pushed[0] == null) {
                     // Two commits list a chain each while the walk orders the head
                     pushed[0] = state.open(Segments.encodeKey(KeyCodec.utf8(), "b"));

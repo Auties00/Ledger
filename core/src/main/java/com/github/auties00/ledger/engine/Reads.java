@@ -159,13 +159,21 @@ final class Reads {
         var removals = state.removals;
         var root = point.root(state);
         var total = 0L;
-        for (var entry : state.slice(from, to).entrySet()) {
-            var version = KeyspaceState.resolve(entry.getValue().head, entry.getKey(), point.bound(), removals);
+        // The keys looked up in the tree, made for the chains that need one
+        KeyCopies copies = null;
+        for (var chain : state.slice(from, to).values()) {
+            var version = KeyspaceState.resolve(chain.head, chain, point.bound(), removals);
             if (version == null) {
                 // Counted with the tree
                 continue;
             }
-            var counted = root != null && inTree(state, entry.getKey(), point, removals);
+            var counted = false;
+            if (root != null) {
+                if (copies == null) {
+                    copies = new KeyCopies();
+                }
+                counted = inTree(state, copies.of(chain), point, removals);
+            }
             total += (version == Version.HIDDEN ? 0 : 1) - (counted ? 1 : 0);
         }
         if (root == null) {
@@ -346,16 +354,18 @@ final class Reads {
                     }
                 }
                 if (order <= 0) {
-                    var key = memory.key();
-                    var version = KeyspaceState.resolve(memory.chain().head, key, point.bound(), removals);
+                    var chain = memory.chain();
+                    var version = KeyspaceState.resolve(chain.head, chain, point.bound(), removals);
                     MemorySegment value = null;
                     Object decoded = null;
                     if (version != null && version != Version.HIDDEN) {
                         value = version.value();
                         decoded = version.decoded;
-                    } else if (version == null && order == 0 && !hiddenSinceTree(key, point, removals)) {
+                    } else if (version == null && order == 0 && !hiddenSinceTree(memory.key(), point, removals)) {
                         value = tree.value();
                     }
+                    // Made only for an entry passed on: a chain the reader sees nothing of needs no key
+                    var key = value != null ? memory.key() : null;
                     if (order == 0) {
                         inTree = tree.next();
                     }

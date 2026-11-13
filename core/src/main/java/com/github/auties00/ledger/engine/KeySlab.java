@@ -10,10 +10,10 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 ///
 /// A key of at most [Chain#INLINE] bytes goes into the words of its chain instead, which a comparison reads without a
 /// load that waits for the chain's own. A holder that keeps such a key as a segment for as long as the slab's other
-/// copies live takes a copy of it here ([#key(Chain)]): the ordered map of a key space, whose keys are segments, as the
-/// chain enters it, and the update of a tree, with a slab of its own, for the entries it writes. A copy only a short
-/// lookup needs is made elsewhere ([Chain#key()]), since a copy here stays reachable while another copy in its chunk
-/// does: the copies of a key space's scans and removals would stay with its map's keys.
+/// copies live takes a copy of it here ([#key(Chain)]): the update of a tree, with a slab of its own, for the entries it
+/// writes. A copy only a short read needs is made elsewhere ([Chain#key()], [KeyCopies]), since a copy here stays
+/// reachable while another copy in its chunk does. The ordered map of a key space keys its entries by the chains, and
+/// takes no copy.
 ///
 /// A key copied into an array of its own costs the array's header and, for the read-only view of it, a segment and a
 /// memory session of the segment's own: about a hundred bytes for a 16-byte key, on every key a commit writes. A copy
@@ -77,11 +77,11 @@ final class KeySlab {
         }
     }
 
-    /// {@return the key of `chain`, a read-only segment the ordered map may keep as long as it holds the chain}
+    /// {@return the key of `chain`, a read-only segment its holder may keep as long as the slab's other copies live}
     ///
     /// For a chain whose key is in a segment, a view of that segment; for one whose key is in its own words, a copy
-    /// here, which costs the map the bytes of the key and a view, as a key in a slab does, rather than an array of its
-    /// own as well. A lookup that drops the key when it returns takes [Chain#key()] instead, as a copy here stays
+    /// here, which costs the holder the bytes of the key and a view, as a key in a slab does, rather than an array of
+    /// its own as well. A lookup that drops the key when it returns takes [Chain#key()] instead, as a copy here stays
     /// reachable while any other copy in its chunk does.
     MemorySegment key(Chain chain) {
         if (!chain.inlineKey()) {

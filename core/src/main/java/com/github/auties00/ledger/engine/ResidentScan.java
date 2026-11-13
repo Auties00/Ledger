@@ -40,6 +40,8 @@ final class ResidentScan {
     private boolean stopped;
     // The leaves the scan finished reading from the tree
     private int leaves;
+    // The keys of the chains in memory passed to the consumer, made with the first
+    private KeyCopies copies;
 
     /// Creates the scan of the entries `point` sees from `from`, included, to `to`, excluded, either `null` for no
     /// bound.
@@ -110,11 +112,14 @@ final class ResidentScan {
     /// Passes the entries memory holds from `low`, included, to `high`, excluded.
     private void memory(MemorySegment low, MemorySegment high) {
         var slice = state.slice(low, high);
-        for (var entry : (descending ? slice.descendingMap() : slice).entrySet()) {
-            var version = KeyspaceState.resolve(entry.getValue().head, entry.getKey(), point.bound(), removals);
+        for (var chain : (descending ? slice.descendingMap() : slice).values()) {
+            var version = KeyspaceState.resolve(chain.head, chain, point.bound(), removals);
             if (version != null && version != Version.HIDDEN) {
                 visited++;
-                if (!consumer.visit(entry.getKey(), version.value(), version.decoded)) {
+                if (copies == null) {
+                    copies = new KeyCopies();
+                }
+                if (!consumer.visit(copies.of(chain), version.value(), version.decoded)) {
                     stopped = true;
                     return;
                 }

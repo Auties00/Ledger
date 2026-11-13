@@ -47,6 +47,14 @@ final class RangeRemoval {
         return (from == null || Segments.compare(key, from) >= 0) && (to == null || Segments.compare(key, to) < 0);
     }
 
+    /// {@return whether the key of `chain` is in the range}
+    ///
+    /// A read of the ordered map asks this of the chains it visits, which are the map's keys: it makes no segment of
+    /// the key.
+    boolean covers(Chain chain) {
+        return (from == null || chain.compareKey(from) >= 0) && (to == null || chain.compareKey(to) < 0);
+    }
+
     /// {@return whether the key whose bytes are `key` is in the range}
     ///
     /// A read by key asks this of every removal since its tree, so it makes no segment of `key`.

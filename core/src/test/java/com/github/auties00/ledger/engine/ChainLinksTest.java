@@ -10,6 +10,7 @@ import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.foreign.MemorySegment;
@@ -84,21 +85,21 @@ class ChainLinksTest {
     /// Replaces the ordered map of `state`, still empty, with one that calls `afterPut` once each insert of a chain
     /// returns, before the store links it from above.
     private static void hook(KeyspaceState state, BiConsumer<MemorySegment, Chain> afterPut) throws ReflectiveOperationException {
-        var hooked = new ConcurrentSkipListMap<MemorySegment, Chain>(Segments.UNSIGNED) {
+        var hooked = new ConcurrentSkipListMap<Object, Chain>(KeyspaceState.BY_KEY) {
             @Override
-            public Chain putIfAbsent(MemorySegment key, Chain value) {
+            public Chain putIfAbsent(Object key, Chain value) {
                 var previous = super.putIfAbsent(key, value);
                 if (previous == null) {
-                    afterPut.accept(key, value);
+                    afterPut.accept(value.key(), value);
                 }
                 return previous;
             }
 
             @Override
-            public boolean replace(MemorySegment key, Chain oldValue, Chain newValue) {
+            public boolean replace(Object key, Chain oldValue, Chain newValue) {
                 var replaced = super.replace(key, oldValue, newValue);
                 if (replaced) {
-                    afterPut.accept(key, newValue);
+                    afterPut.accept(newValue.key(), newValue);
                 }
                 return replaced;
             }
@@ -110,27 +111,27 @@ class ChainLinksTest {
     /// of a chain makes for one of its neighbours or for its place.
     private static AtomicInteger countWalks(KeyspaceState state) throws ReflectiveOperationException {
         var walks = new AtomicInteger();
-        replaceEntries(state, new ConcurrentSkipListMap<MemorySegment, Chain>(Segments.UNSIGNED) {
+        replaceEntries(state, new ConcurrentSkipListMap<Object, Chain>(KeyspaceState.BY_KEY) {
             @Override
-            public Map.Entry<MemorySegment, Chain> lowerEntry(MemorySegment key) {
+            public Map.Entry<Object, Chain> lowerEntry(Object key) {
                 walks.incrementAndGet();
                 return super.lowerEntry(key);
             }
 
             @Override
-            public Map.Entry<MemorySegment, Chain> higherEntry(MemorySegment key) {
+            public Map.Entry<Object, Chain> higherEntry(Object key) {
                 walks.incrementAndGet();
                 return super.higherEntry(key);
             }
 
             @Override
-            public Chain putIfAbsent(MemorySegment key, Chain value) {
+            public Chain putIfAbsent(Object key, Chain value) {
                 walks.incrementAndGet();
                 return super.putIfAbsent(key, value);
             }
 
             @Override
-            public boolean replace(MemorySegment key, Chain oldValue, Chain newValue) {
+            public boolean replace(Object key, Chain oldValue, Chain newValue) {
                 walks.incrementAndGet();
                 return super.replace(key, oldValue, newValue);
             }
@@ -138,7 +139,7 @@ class ChainLinksTest {
         return walks;
     }
 
-    private static void replaceEntries(KeyspaceState state, ConcurrentSkipListMap<MemorySegment, Chain> entries) throws ReflectiveOperationException {
+    private static void replaceEntries(KeyspaceState state, ConcurrentSkipListMap<Object, Chain> entries) throws ReflectiveOperationException {
         var field = KeyspaceState.class.getDeclaredField("entries");
         field.setAccessible(true);
         field.set(state, entries);
@@ -779,16 +780,17 @@ class ChainLinksTest {
     /// {@return how many of `references` the collector has not cleared, once at most `bound` or after a few
     /// collections}
     @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    @DisplayName("descending walks and removals between new keys of 20 bytes keep no copies of keys beside the map's: the key space's slab holds about the bytes of the keys it ordered")
-    void walksKeepNoKeyCopies(boolean resident) throws Exception {
+    @CsvSource({"true, 20", "false, 20", "true, 40", "false, 40"})
+    @DisplayName("descending walks and removals between new keys keep no copies of keys in the key space's slab: none for keys the chains hold in their words, about the bytes of the chains' keys for longer ones")
+    void walksKeepNoKeyCopies(boolean resident, int length) throws Exception {
         var state = lazy(resident ? RESIDENT : PAGED);
         descending(state, null, null);
         var chunks = new ArrayList<WeakReference<byte[]>>();
         var ordered = 0;
         for (var round = 0; round < 400; round++) {
-            // 20 bytes, a key a chain holds in its words, in no order, so each enters among the others
-            state.open(key("k%019d".formatted(round * 2_654_435_761L % 1_000_000_000_000L)));
+            // 20 bytes, a key a chain holds in its words, or 40, one in the slab, in no order, so each enters among the
+            // others
+            state.open(key(("k%0" + (length - 1) + "d").formatted(round * 2_654_435_761L % 1_000_000_000_000L)));
             ordered++;
             if (!resident && round % 4 == 3) {
                 // A key that leaves, as after a checkpoint: its removal and the repair of the link above it look it up
@@ -806,7 +808,13 @@ class ChainLinksTest {
             assertTrue(walked >= state.entries.size(), "the walk missed chains of the map");
             slabChunks(state, chunks);
         }
-        var keyBytes = 20L * ordered;
+        if (length <= Chain.INLINE) {
+            // The map keys its entries by the chains, which hold these keys in their words
+            assertTrue(chunks.isEmpty(), "the slab took " + chunks.size() + " chunks for keys the chains hold in their words");
+            assertEquals(0, state.keyBytesForTests());
+            return;
+        }
+        var keyBytes = (long) length * ordered;
         var held = 0L;
         for (var attempt = 0; attempt < 10; attempt++) {
             System.gc();
@@ -822,7 +830,7 @@ class ChainLinksTest {
                 break;
             }
         }
-        // The map's copies fill chunks that double up to 4 KiB, the last one partly
+        // The chains' keys fill chunks that double up to 4 KiB, the last one partly
         assertTrue(held <= 2 * keyBytes + 4_096, "the slab's chunks keep " + held + " bytes for " + keyBytes + " bytes of keys");
         Reference.reachabilityFence(state);
     }
