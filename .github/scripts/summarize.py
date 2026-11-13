@@ -16,7 +16,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-BYTE_COUNTERS = {"bytesWritten", "payloadBytes", "sizeOnDisk", "heapBytes", "residentBytes"}
+BYTE_COUNTERS = {"bytesWritten", "payloadBytes", "sizeOnDisk"}
+# Every counter of the memory workloads: heapBytes, heapBytesPeak, residentBytesFloor, ...
+BYTE_COUNTER_PREFIXES = ("heapBytes", "residentBytes")
 
 
 def number(value):
@@ -103,7 +105,7 @@ def by_result(results):
                 value = result.get("secondaryMetrics", {}).get(name, {}).get("score")
                 if isinstance(value, (int, float)):
                     value /= max(1, iterations)
-                row.append(mebibytes(value) if name in BYTE_COUNTERS else number(value))
+                row.append(mebibytes(value) if name in BYTE_COUNTERS or name.startswith(BYTE_COUNTER_PREFIXES) else number(value))
             rows.append(row)
         output.append(f"### {method_name(benchmark)}\n\n{table(rows)}\n")
     return "\n".join(output)

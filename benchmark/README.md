@@ -62,11 +62,17 @@ Workloads Ledger is not built for, in `workload.limits`:
 | `LargeValueBenchmark` | Values of 1 and 16 MiB |
 | `PinnedReaderBenchmark` | File growth while a long reader pins an old version |
 
-Design measurements, in `workload.memory`:
+Memory, in `workload.memory`:
 
-| Benchmark | What it decides |
+| Benchmark | What it measures |
 |---|---|
-| `MemoryPipelineBenchmark` | Whether Ledger keeps the bytes it encrypts and writes on the heap or in native memory: AES-GCM in the JDK is fastest on arrays, file I/O on native memory |
+| `SessionMemoryBenchmark` | The heap and resident memory a store holds after a client's session over a history of 200,000 and 1,000,000 messages |
+| `OpenStoreMemoryBenchmark` | What one open store costs, empty or nearly so, alone and with eight open at once, per store |
+| `OperationMemoryBenchmark` | The peak memory of a history ingest, a checkpoint under load, an app-state snapshot, a recovery after a crash and large values, and what each leaves |
+| `SteadyWritesMemoryBenchmark` | What a store holds of writes it has not checkpointed yet while messages keep arriving |
+| `MemoryPipelineBenchmark` | A design measurement: whether Ledger keeps the bytes it encrypts and writes on the heap or in native memory, since AES-GCM in the JDK is fastest on arrays and file I/O on native memory |
+
+`ReopenBenchmark.footprint` measures memory too, in a JVM with a fixed heap like every other workload. The other memory workloads run in a JVM whose heap starts at 64 MiB and grows up to the same 4 GiB, so the heap the JVM commits, and its resident memory, follow what the engine holds. Each records the heap after a full collection and the resident memory before the store opens (`heapBytesFloor`, `residentBytesFloor`: the JVM, the corpus and the workload's input) and with the store open at the end (`heapBytes`, `residentBytes`); the peak of the heap left by the collections the JVM ran (`heapBytesPeak`, an upper bound of the live heap) and of resident memory (`residentBytesPeak`, sampled every 5 ms, and on Linux also the kernel's peak); and the heap committed at the end (`heapBytesCommitted`). Their time is not the point.
 
 ## Running
 
@@ -95,7 +101,7 @@ On GitHub, the Benchmark workflow runs the full suite on Linux, Windows and macO
 
 - **Results move with the device and the OS.** A force on a consumer NVMe drive costs about a millisecond on Windows and less on Linux. Compare engines within one machine.
 - **On macOS, every engine's durable write empties the drive's cache.** The Java engines (Ledger, MVStore, Berkeley DB, the floor) force through `FileChannel.force`, which the JDK implements with `fcntl(F_FULLFSYNC)` there; LMDB and RocksDB call it themselves, and SQLite does with its `fullfsync` pragmas, which the adapter sets.
-- **JMH adds the secondary counters up over the measurement iterations.** In JMH's own output and JSON, `bytesWritten`, `payloadBytes`, `sizeOnDisk`, `heapBytes` and `residentBytes` are the sum of the iterations; the workflow summaries divide them back to their value per iteration.
+- **JMH adds the secondary counters up over the measurement iterations.** In JMH's own output and JSON, `bytesWritten`, `payloadBytes`, `sizeOnDisk` and every `heapBytes` and `residentBytes` counter are the sum of the iterations; the workflow summaries divide them back to their value per iteration.
 - **`bytesWritten` is not measured the same way on each OS.** On Windows and Linux it counts the bytes passed to write calls; on macOS, the bytes written to disk. See `support.ProcessProbe`.
 - **`ReopenBenchmark` measures a warm start on Linux and macOS.** The files it opens were just copied, so they are in the OS page cache. On Windows the reads after the copy reach the drive, as the profiles of the hosted runners show, so the start there is closer to a cold one.
 - **LMDB's `sizeOnDisk` counts the pages in use.** On Windows, LMDB 0.9 creates its data file at the full map size, which the adapter sets to twice the data a workload expects.

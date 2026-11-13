@@ -23,6 +23,9 @@ import java.util.Locale;
 /// | macOS | `ri_diskio_byteswritten` of `proc_pid_rusage`: bytes the process caused to be written to disk | `ri_resident_size` |
 ///
 /// Writes through a memory map are counted only on macOS.
+///
+/// Only Linux keeps a peak of resident memory that a process can reset (`VmHWM`, reset through
+/// `/proc/self/clear_refs`); elsewhere a peak is found by sampling [#residentBytes()].
 public final class ProcessProbe {
     private static final Backend BACKEND = Backend.detect();
 
@@ -39,10 +42,31 @@ public final class ProcessProbe {
         return BACKEND.residentBytes();
     }
 
+    /// Starts a new peak of resident memory, for [#residentPeakBytes()].
+    ///
+    /// @return whether the OS keeps a peak this process can reset; when it does not, [#residentPeakBytes()] returns -1
+    public static boolean resetResidentPeak() {
+        return BACKEND.resetResidentPeak();
+    }
+
+    /// {@return the most memory of this process resident in RAM since the last [#resetResidentPeak()], or -1 when the
+    /// OS keeps no such peak}
+    public static long residentPeakBytes() {
+        return BACKEND.residentPeakBytes();
+    }
+
     private sealed interface Backend {
         long bytesWritten();
 
         long residentBytes();
+
+        default boolean resetResidentPeak() {
+            return false;
+        }
+
+        default long residentPeakBytes() {
+            return -1;
+        }
 
         static Backend detect() {
             var os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
@@ -183,6 +207,22 @@ public final class ProcessProbe {
         @Override
         public long residentBytes() {
             return field(Path.of("/proc/self/status"), "VmRSS:", 1024);
+        }
+
+        // Writing 5 to clear_refs resets the peak resident set size, since Linux 4.0
+        @Override
+        public boolean resetResidentPeak() {
+            try {
+                Files.writeString(Path.of("/proc/self/clear_refs"), "5");
+                return true;
+            } catch (IOException | SecurityException exception) {
+                return false;
+            }
+        }
+
+        @Override
+        public long residentPeakBytes() {
+            return field(Path.of("/proc/self/status"), "VmHWM:", 1024);
         }
     }
 }

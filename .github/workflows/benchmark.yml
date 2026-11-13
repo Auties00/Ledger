@@ -106,7 +106,8 @@ jobs:
             read) PATTERN='cobalt\.(ChatPage|MessageLookup|Reopen)Benchmark' ;;
             limits-write) PATTERN='limits\.(RandomOverwrite|ParallelWriters|PinnedReader|LargeValue)Benchmark' ;;
             limits-query) PATTERN='limits\.(AdHocQuery|SqlIndexQuery|MultiProcessWriters)Benchmark' ;;
-            memory) PATTERN='memory\.MemoryPipelineBenchmark' ;;
+            # Every workload that measures memory, and the design measurement of the memory pipeline
+            memory) PATTERN='memory\.|cobalt\.ReopenBenchmark\.footprint' ;;
             # Ledger's large-value writes only, for sweeping the size from which they go to their own file
             large-values) PATTERN='limits\.LargeValueBenchmark\.writeValue' ;;
             *) echo "::error::Unknown group $GROUP"; exit 1 ;;

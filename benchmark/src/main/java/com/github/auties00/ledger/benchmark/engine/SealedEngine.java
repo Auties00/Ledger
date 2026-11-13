@@ -103,6 +103,11 @@ public final class SealedEngine implements Engine {
     }
 
     @Override
+    public void checkpoint() throws IOException {
+        delegate.checkpoint();
+    }
+
+    @Override
     public long sizeOnDisk() throws IOException {
         return delegate.sizeOnDisk();
     }

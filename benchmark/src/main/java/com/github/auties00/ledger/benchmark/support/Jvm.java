@@ -10,6 +10,10 @@ public final class Jvm {
     public static final String HEAP_MIN = "-Xms4g";
     /// The same bound as [#HEAP_MIN].
     public static final String HEAP_MAX = "-Xmx4g";
+    /// A heap that starts small and grows up to [#HEAP_MAX], for the workloads that measure memory: the heap the JVM
+    /// commits, and so its resident memory, then follow what the engine holds, as in an application left to the JVM's
+    /// defaults. The maximum stays that of the other workloads, from which Ledger sizes its defaults.
+    public static final String HEAP_GROWING = "-Xms64m";
 
     private Jvm() {
     }
