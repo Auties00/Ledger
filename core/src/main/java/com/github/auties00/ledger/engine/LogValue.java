@@ -4,8 +4,8 @@ package com.github.auties00.ledger.engine;
 ///
 /// The value lies at `bodyIndex` of the sealed body of the frame at `frameOffset` of its segment: a frame body is one
 /// AES-GCM message whose first byte the keystream block of counter 2 encrypts, so the bytes of the value decrypt
-/// alone, with AES-CTR from the block that holds the first of them. CTR alone authenticates nothing; the tag does: a
-/// GMAC of the plain value under a key that never leaves the process, with the stamp of the version as its nonce, or
+/// alone, with AES-CTR from the block that holds the first of them. CTR alone authenticates nothing; the tag does: an
+/// HMAC-SHA256 of the stamp of the version and its plain value, under a key that never leaves the process, or
 /// the CRC-32C of the value in a store without encryption, which seals nothing.
 ///
 /// It takes 40 bytes, a quarter of what an array of a 1.5 KiB message keeps in its place.
