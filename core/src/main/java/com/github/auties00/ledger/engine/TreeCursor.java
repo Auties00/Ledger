@@ -27,12 +27,12 @@ import java.util.HashMap;
 /// ([PageFile#prefetch(PageRef\[\], int, int\[\])]); when it needs a blob of the current leaf that neither holds, it
 /// reads the blobs of the rest of the leaf at once. A page of 50 messages read out of the device one unit after another
 /// takes about 14 reads, at about 145 microseconds each on the Windows runner, which the reads ahead turn into a few
-/// rounds of reads made at once. A unit the cache [saw][PageCache#seen(PageRef)] read before is read alone, as the OS
-/// cache holds its pages: gathered again, its second read would read again what its first one read. What it reads
-/// ahead stays with the cursor until the cursor reaches it, and then goes to the cache as the cursor's own read would
-/// have, so the cache holds what it would have held without the reads ahead, and what the cursor never reaches goes
-/// with it. The leaves are opened as they arrive, as the blobs to read are found in them; the blobs stay sealed, in
-/// arrays of the store's pool, until the cursor opens the one it reaches.
+/// rounds of reads made at once. A unit the cache [saw][PageCache#seen(PageRef)] read before is read alone when the
+/// cache cannot give back the array of its first read, as the OS cache holds its pages: a gather for it would read
+/// again what its first read gathered. What it reads ahead stays with the cursor until the cursor reaches it, and then
+/// goes to the cache as the cursor's own read would have, so the cache holds what it would have held without the reads
+/// ahead, and what the cursor never reaches goes with it. The leaves are opened as they arrive, as the blobs to read
+/// are found in them; the blobs stay sealed, in arrays of the store's pool, until the cursor opens the one it reaches.
 /// The array of a set of blobs read at once goes back to the pool once the cursor has opened all of them; that of the
 /// blobs of one leaf also once the cursor leaves the leaf, and that of a gather of leaves at the next one or at
 /// [#release()]. A cursor so holds the arrays of two sets of blobs at most, whatever the length of its scan, also when
