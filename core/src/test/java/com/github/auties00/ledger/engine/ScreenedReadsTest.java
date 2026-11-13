@@ -28,8 +28,8 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The reads the page cache screens: a leaf or a value a read of a paged key space misses goes to the cache at its
-/// second read while the reads of the file are warm, and at its first while they are cold, while branches, roots, the
-/// lookups of a commit and the reads of a resident key space cache at once. The tree tests run on a cache with a budget
+/// second read, whether the reads of the file are warm or cold, as the array the first read refused when the collector
+/// has not taken it, while branches, roots, the lookups of a commit and the reads of a resident key space cache at once. The tree tests run on a cache with a budget
 /// of its own, which only the test ticks.
 class ScreenedReadsTest {
     private static final long MIB = 1 << 20;
@@ -171,14 +171,72 @@ class ScreenedReadsTest {
         }
 
         @Test
-        @DisplayName("caches what it reads at the first read while the reads of the file are cold")
+        @DisplayName("caches at the second read the very leaf and value the first read refused")
+        void recalled(@TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory).filled(200, 3_000)) {
+                var leaf = tree.path(key(7)).getLast();
+                tree.cache.clearForTests();
+                var first = tree.leaf(7);
+                var entry = TreeSearch.entryOf(first, key(7));
+                var blob = TreeNodes.blobRef(first, entry);
+                var value = TreeSearch.value(tree.pages, first, entry, true, true, true);
+                assertNull(tree.cache.peek(leaf), "the leaf read once");
+                assertNull(tree.cache.peek(blob), "the value read once");
+                var second = tree.leaf(7);
+                assertSame(first, second, "the leaf read twice");
+                assertSame(first, tree.cache.peek(leaf));
+                assertTrue(tree.cache.referencedForTests(leaf));
+                assertEquals(value, TreeSearch.value(tree.pages, second, entry, true, true, true));
+                assertNotNull(tree.cache.peek(blob), "the value read twice");
+            }
+        }
+
+        @Test
+        @DisplayName("screens what it reads while the reads of the file are cold, as the first read leaves the unit in the OS cache, scans that read ahead included")
         void coldReads(@TempDir Path directory) throws Exception {
-            try (var tree = new Tree(directory).filled(KEYS, 150)) {
+            try (var tree = new Tree(directory).filled(2_000, 3_000)) {
                 tree.pages.forceColdReadsForTests(true);
                 var leaf = tree.path(key(100)).getLast();
                 tree.leaf(100);
-                assertNotNull(tree.cache.peek(leaf), "the leaf read once from a cold file");
-                assertEquals(0, tree.cache.doorkeeperForTests().keysForTests(), "the doorkeeper started");
+                assertNull(tree.cache.peek(leaf), "the leaf read once from a cold file");
+                assertTrue(tree.cache.doorkeeperForTests().keysForTests() > 0, "the doorkeeper never started");
+                tree.leaf(100);
+                assertNotNull(tree.cache.peek(leaf), "the leaf read twice from a cold file");
+
+                tree.cache.clearForTests();
+                var from = key(500);
+                var to = key(540);
+                var leaves = new ArrayList<PageRef>();
+                for (var i = 500; i < 540; i++) {
+                    var ref = tree.path(key(i)).getLast();
+                    if (leaves.isEmpty() || !leaves.getLast().equals(ref)) {
+                        leaves.add(ref);
+                    }
+                }
+                for (var pass = 0; pass < 2; pass++) {
+                    var cursor = new TreeCursor(tree.pages, tree.root, from, to, false, 40, true);
+                    var entries = 0;
+                    try {
+                        while (cursor.next()) {
+                            assertEquals(3_000, cursor.value().byteSize());
+                            if (pass == 1) {
+                                assertEquals(0, cursor.heldBytesForTests(), "a second scan read ahead what it read before");
+                            }
+                            entries++;
+                        }
+                    } finally {
+                        cursor.release();
+                    }
+                    assertEquals(40, entries);
+                    if (pass == 0) {
+                        for (var ref : leaves) {
+                            assertNull(tree.cache.peek(ref), "a leaf a cold scan read once");
+                        }
+                    }
+                }
+                for (var ref : leaves) {
+                    assertNotNull(tree.cache.peek(ref), "a leaf a cold scan read twice");
+                }
             }
         }
 
@@ -194,7 +252,7 @@ class ScreenedReadsTest {
         }
 
         @Test
-        @DisplayName("of a delta record caches neither its leaf nor its base at the first read, keeps its delta page, and caches them at the second")
+        @DisplayName("of a delta record caches neither its leaf nor its base at the first read, keeps its delta page, and caches the leaf the first read made at the second")
         void deltaRecords(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory).filled(KEYS, 150)) {
                 tree.apply(List.of(new TreeUpdate.Op(segment(key(100)), segment(new byte[151]))));
@@ -202,15 +260,24 @@ class ScreenedReadsTest {
                 assertTrue(record.isRecord(), "the leaf of the key is no delta record");
                 var base = TreeNodes.base(tree.pages.read(record, PageFile.NODE, false), record);
                 tree.cache.clearForTests();
-                tree.leaf(100);
+                var first = tree.leaf(100);
                 assertNull(tree.cache.peek(record), "the leaf of the record read once");
                 assertNull(tree.cache.peek(base), "the base of the record read once");
                 assertNotNull(tree.cache.peek(record.unit()), "the delta page, which the other records share");
                 assertFalse(tree.cache.referencedForTests(record.unit()), "the delta page counts as read");
                 var leaf = tree.leaf(100);
+                assertSame(first, leaf, "the leaf the first read made");
                 assertSame(leaf, tree.cache.peek(record), "the leaf of the record read twice");
                 assertTrue(tree.cache.referencedForTests(record));
-                assertNotNull(tree.cache.peek(base), "the base of the record read twice, as the first entry to evict");
+                assertNull(tree.cache.peek(base), "the base of a leaf read back from the first read");
+
+                // Once the collector took the first read's leaf, the second makes it again, its base as the first entry
+                // to evict
+                tree.cache.clearForTests();
+                assertTrue(tree.cache.doorkeeperForTests().holds(PageCache.dataKey(record.page(), record.slot()), record.nonceHigh()));
+                leaf = tree.leaf(100);
+                assertSame(leaf, tree.cache.peek(record), "the leaf of the record made again");
+                assertNotNull(tree.cache.peek(base), "the base of the record made again, as the first entry to evict");
                 assertFalse(tree.cache.referencedForTests(base), "the base counts as read");
                 var entry = TreeSearch.entryOf(leaf, key(100));
                 assertArrayEquals(new byte[151], TreeSearch.valueBytes(tree.pages, leaf, entry, true));
@@ -256,15 +323,15 @@ class ScreenedReadsTest {
     @DisplayName("the page file")
     class Files {
         @Test
-        @DisplayName("screens the reads of its cache while its own reads are warm, from its first read on")
-        void installsItsMeasure(@TempDir Path directory) throws Exception {
+        @DisplayName("turns screening on for its cache, whether its own reads are warm or cold")
+        void turnsScreeningOn(@TempDir Path directory) throws Exception {
             var cache = PageCache.isolated(64 * MIB);
             IdleTicker.unwatch(cache);
             var ref = new PageRef(10, 1, 3, 4);
             var unit = new byte[PageFormat.SIZE];
             PageFile.header(unit, PageFormat.LEAF, 0, 10, 1, 0, 3, 4);
             cache.putScreened(ref, unit);
-            assertSame(unit, cache.peek(ref), "a cache no file measures for");
+            assertSame(unit, cache.peek(ref), "a cache of no file");
             cache.clearForTests();
             try (var pages = PageFile.open(directory, new PageCipher(null), cache, new HeapPool(1 << 20))) {
                 assertEquals(0, pages.readMicrosForTests(), "the average of a file that read nothing");
@@ -275,7 +342,7 @@ class ScreenedReadsTest {
                 var otherUnit = new byte[PageFormat.SIZE];
                 PageFile.header(otherUnit, PageFormat.LEAF, 0, 11, 1, 0, 3, 5);
                 cache.putScreened(other, otherUnit);
-                assertSame(otherUnit, cache.peek(other), "a read of a cold file");
+                assertNull(cache.peek(other), "a read of a cold file");
             }
         }
     }

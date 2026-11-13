@@ -239,11 +239,18 @@ final class BlobFile implements AutoCloseable {
         if (hit != null) {
             return hit;
         }
+        var screen = cached && referenced && screened;
+        if (screen) {
+            var recalled = cache.recall(key, ref);
+            if (recalled != null) {
+                return recalled;
+            }
+        }
         var plain = readUnit(ref, cached);
         if (plain == null) {
             throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
         }
-        if (cached && referenced && screened) {
+        if (screen) {
             cache.putScreened(key, ref, plain);
         } else if (cached) {
             cache.put(key, ref, plain, referenced);
