@@ -157,6 +157,20 @@ sealed class Version permits Version.External {
         return SOURCE.compareAndSet(this, held, moved);
     }
 
+    /// {@return whether the value is in the log ([LogValue]), where it stays until the version is dropped}
+    boolean logged() {
+        return SOURCE.getAcquire(this) instanceof LogValue;
+    }
+
+    /// Reads the value, which is in the log ([#logged()]), into `target` from `offset`.
+    ///
+    /// @throws LogSegmentView.Retired as [#value()] does
+    /// @throws com.github.auties00.ledger.LedgerIoException if the log cannot be read
+    /// @throws com.github.auties00.ledger.LedgerCorruptedException if the log changed
+    void readLogged(byte[] target, int offset) {
+        ((LogValue) SOURCE.getAcquire(this)).readInto(stamp, length, target, offset);
+    }
+
     /// {@return the length of the encoded value, 0 for a removal}
     int length() {
         return length;

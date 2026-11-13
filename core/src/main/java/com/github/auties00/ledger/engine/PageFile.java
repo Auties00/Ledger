@@ -955,7 +955,7 @@ final class PageFile implements AutoCloseable {
             }
             var ref = new PageRef(page, pages, nonceHigh, nonce);
             header(unit, kind, level, page, pages, length, ref.nonceHigh(), ref.nonceLow());
-            stage(new Staged(ref, unit, null));
+            stage(new Staged(ref, unit, null, null));
             // Outside the writer's lock: the tasks of a checkpoint all pass through it, for every unit they read too,
             // so one waiting for the cache's lock, or rebuilding its table or evicting, would hold up the others
             if (cached) {
@@ -982,8 +982,25 @@ final class PageFile implements AutoCloseable {
                 throw new IllegalArgumentException("A unit of " + pages + " pages cannot hold " + length + " bytes of content");
             }
             var ref = new PageRef(page, pages, nonceHigh, nextNonce());
-            stage(new Staged(ref, null, value));
+            stage(new Staged(ref, null, value, null));
             // A unit the page held before, which the cache may still hold under its own nonce
+            cache.remove(page);
+            return ref;
+        }
+
+        /// Queues the value of `version`, which is in the log ([LogValue]), as [#writeValue(int, int, MemorySegment)]
+        /// queues a value in memory: it is read from the log only when the unit is sealed, into the array it is sealed
+        /// into, so no array of the value is made for it. The log segment that holds it must stay until the unit is
+        /// written, as it does until the checkpoint is published.
+        ///
+        /// @return the reference of the unit
+        /// @throws IllegalArgumentException if the value does not fit in the unit
+        PageRef writeLoggedValue(int page, int pages, Version version) throws IOException {
+            if (!PageFormat.fits(pages, version.length())) {
+                throw new IllegalArgumentException("A unit of " + pages + " pages cannot hold " + version.length() + " bytes of content");
+            }
+            var ref = new PageRef(page, pages, nonceHigh, nextNonce());
+            stage(new Staged(ref, null, null, version));
             cache.remove(page);
             return ref;
         }
@@ -1013,10 +1030,10 @@ final class PageFile implements AutoCloseable {
             if (entry == null || !entry.ref().equals(ref)) {
                 return null;
             }
-            if (entry.value() == null) {
+            if (entry.unit() != null) {
                 return entry.unit();
             }
-            var unit = new byte[PageFormat.HEADER + (int) entry.value().byteSize()];
+            var unit = new byte[PageFormat.HEADER + entry.contentLength()];
             fillValue(entry, unit);
             return unit;
         }
@@ -1118,7 +1135,7 @@ final class PageFile implements AutoCloseable {
                 var pages = entry.ref().pages();
                 var sealed = pool.acquire(pages * PageFormat.SIZE);
                 sealedUnits[i] = sealed;
-                if (entry.value() == null) {
+                if (entry.unit() != null) {
                     cipher.seal(entry.unit(), pages, sealed, 0);
                     return;
                 }
@@ -1134,9 +1151,13 @@ final class PageFile implements AutoCloseable {
         /// @return the end of the content in `unit`
         private int fillValue(Staged entry, byte[] unit) {
             var ref = entry.ref();
-            var length = (int) entry.value().byteSize();
+            var length = entry.contentLength();
             header(unit, PageFormat.VALUE, 0, ref.page(), ref.pages(), length, ref.nonceHigh(), ref.nonceLow());
-            MemorySegment.copy(entry.value(), ValueLayout.JAVA_BYTE, 0, unit, PageFormat.HEADER, length);
+            if (entry.value() != null) {
+                MemorySegment.copy(entry.value(), ValueLayout.JAVA_BYTE, 0, unit, PageFormat.HEADER, length);
+            } else {
+                entry.logged().readLogged(unit, PageFormat.HEADER);
+            }
             return PageFormat.HEADER + length;
         }
 
@@ -1233,8 +1254,12 @@ final class PageFile implements AutoCloseable {
         }
     }
 
-    /// A queued unit: its plaintext, header included, in `unit`, or, for a value unit, only its content in `value`,
-    /// from which the unit is built when it is sealed.
-    private record Staged(PageRef ref, byte[] unit, MemorySegment value) {
+    /// A queued unit: its plaintext, header included, in `unit`, or, for a value unit, only its content, in `value` or
+    /// in the log as the value of `logged`, from which the unit is built when it is sealed.
+    private record Staged(PageRef ref, byte[] unit, MemorySegment value, Version logged) {
+        /// {@return the bytes of the content of a value unit}
+        int contentLength() {
+            return value != null ? (int) value.byteSize() : logged.length();
+        }
     }
 }

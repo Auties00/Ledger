@@ -841,9 +841,20 @@ final class TreeUpdate {
 
     private LeafEntry entry(Op op) throws IOException {
         var key = keys.key(op.keyed());
+        var version = op.version();
+        var external = op.external();
+        if (external == null && version.logged()) {
+            // Read from the log only where it is used: into the leaf, or into the array the unit is sealed into
+            var length = version.length();
+            if (LeafEntry.fitsInline(key.byteSize(), length)) {
+                return new LeafEntry(key, version.value(), null, length);
+            }
+            var unitPages = PageFormat.pagesFor(length);
+            var ref = writer.writeLoggedValue(allocate(unitPages), unitPages, version);
+            return new LeafEntry(key, null, ref, length);
+        }
         var value = op.value();
         var length = value.byteSize();
-        var external = op.external();
         if (external != null) {
             return new LeafEntry(key, null, external, (int) length, true);
         }
