@@ -18,11 +18,15 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -241,5 +245,73 @@ class PipelineBugsTest {
             }
         }
         fail("No page whose damage fails one read and spares another");
+    }
+
+    @Test
+    @DisplayName("a virtual thread interrupted while it waits for an earlier commit to apply parks, and keeps its interrupt status")
+    void interruptedWaitForApplied() throws Exception {
+        var earlier = new PendingCommit(null, null, null, null, null, null, null);
+        assertParksInterrupted(_ -> earlier.awaitApplied(), _ -> earlier.advanceApplied());
+    }
+
+    @Test
+    @DisplayName("a virtual thread interrupted while it waits for its sequence parks, and keeps its interrupt status")
+    void interruptedWaitForSequence() throws Exception {
+        var role = new Padded.Role();
+        // Held by a sequencer that does not let it go: the wait parks rather than help
+        assertTrue(role.tryAcquire());
+        var roleWanted = new Padded.Role();
+        assertParksInterrupted(commit -> {
+            while (commit.state < PendingCommit.SEQUENCED && !commit.await(PendingCommit.SEQUENCED, role, roleWanted)) {
+                Thread.onSpinWait();
+            }
+        }, commit -> commit.advance(PendingCommit.SEQUENCED));
+    }
+
+    @Test
+    @DisplayName("a virtual thread interrupted while it waits for its commit to publish parks, helps once per park, and keeps its interrupt status")
+    void interruptedWaitForPublication() throws Exception {
+        var role = new Padded.Role();
+        // Held by a publisher that does not let it go
+        assertTrue(role.tryAcquire());
+        var roleWanted = new Padded.Role();
+        var helps = new AtomicLong();
+        assertParksInterrupted(commit -> commit.awaitHelping(PendingCommit.DONE, role, roleWanted, helps::incrementAndGet),
+                commit -> commit.advance(PendingCommit.DONE));
+        // One help after each park of at most PARK_NANOS, where a thread spinning through its parks helped millions
+        // of times
+        assertTrue(helps.get() < 1_000, () -> helps.get() + " helps");
+    }
+
+    /// Runs `wait` on a virtual thread whose interrupt status is set, with a commit that thread owns, and requires that
+    /// the thread parks, rather than spins with its carrier taken, until `move` moves the commit, and that it ends the
+    /// wait with its interrupt status set.
+    private static void assertParksInterrupted(Consumer<PendingCommit> wait, Consumer<PendingCommit> move) throws Exception {
+        var commit = new AtomicReference<PendingCommit>();
+        var created = new CountDownLatch(1);
+        var interruptedAfter = new AtomicBoolean();
+        var thread = Thread.ofVirtual().unstarted(() -> {
+            var own = new PendingCommit(null, null, null, null, null, null, null);
+            commit.set(own);
+            created.countDown();
+            Thread.currentThread().interrupt();
+            wait.accept(own);
+            interruptedAfter.set(Thread.currentThread().isInterrupted());
+        });
+        thread.start();
+        created.await();
+        try {
+            // A virtual thread whose interrupt status is set returns from each park at once, never in a timed wait
+            var deadline = System.nanoTime() + 10_000_000_000L;
+            while (thread.getState() != Thread.State.TIMED_WAITING && System.nanoTime() < deadline) {
+                Thread.sleep(1);
+            }
+            assertEquals(Thread.State.TIMED_WAITING, thread.getState(), "the interrupted thread spins instead of parking");
+        } finally {
+            move.accept(commit.get());
+            thread.join(10_000);
+        }
+        assertFalse(thread.isAlive(), "the wait did not end once the commit moved");
+        assertTrue(interruptedAfter.get(), "the wait cleared the interrupt status");
     }
 }
