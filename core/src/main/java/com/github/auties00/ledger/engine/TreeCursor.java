@@ -16,9 +16,10 @@ import java.util.HashMap;
 /// other reads use: the PostgreSQL buffer manager holds a large sequential scan to a small ring for the same reason. A
 /// cache with room evicts nothing to take them, and keeps a key space small enough to fit for the next scan.
 ///
-/// A cursor of a paged key space's reads screens the leaves and blobs it admits: while the reads of the file are warm,
-/// the cache takes one only at its second read ([PageCache#putScreened(long, PageRef, byte\[\])]), as most of the
-/// pages of a chat a client opens are read once.
+/// A cursor of a paged key space's reads screens the leaves and blobs it admits: the cache takes one only at its
+/// second read ([PageCache#putScreened(long, PageRef, byte\[\])]), as most of the pages of a chat a client opens are
+/// read once, and a unit the cache refused lately and still reaches weakly is
+/// [recalled][PageFile#recalled(PageRef, byte)] before the cursor reads anything ahead or from the file.
 ///
 /// A cursor made to gather reads ahead while the reads of the file are [cold][PageFile#coldReads()]. When it needs a
 /// leaf that neither the cache nor its own reads ahead hold, it reads that leaf together with the next siblings under
@@ -26,10 +27,12 @@ import java.util.HashMap;
 /// ([PageFile#prefetch(PageRef\[\], int, int\[\])]); when it needs a blob of the current leaf that neither holds, it
 /// reads the blobs of the rest of the leaf at once. A page of 50 messages read out of the device one unit after another
 /// takes about 14 reads, at about 145 microseconds each on the Windows runner, which the reads ahead turn into a few
-/// rounds of reads made at once. What it reads ahead stays with the cursor until the cursor reaches it, and then goes
-/// to the cache as the cursor's own read would have, so the cache holds what it would have held without the reads
-/// ahead, and what the cursor never reaches goes with it. The leaves are opened as they arrive, as the blobs to read
-/// are found in them; the blobs stay sealed, in arrays of the store's pool, until the cursor opens the one it reaches.
+/// rounds of reads made at once. A unit the cache [saw][PageCache#seen(PageRef)] read before is read alone, as the OS
+/// cache holds its pages: gathered again, its second read would read again what its first one read. What it reads
+/// ahead stays with the cursor until the cursor reaches it, and then goes to the cache as the cursor's own read would
+/// have, so the cache holds what it would have held without the reads ahead, and what the cursor never reaches goes
+/// with it. The leaves are opened as they arrive, as the blobs to read are found in them; the blobs stay sealed, in
+/// arrays of the store's pool, until the cursor opens the one it reaches.
 /// The array of a set of blobs read at once goes back to the pool once the cursor has opened all of them; that of the
 /// blobs of one leaf also once the cursor leaves the leaf, and that of a gather of leaves at the next one or at
 /// [#release()]. A cursor so holds the arrays of two sets of blobs at most, whatever the length of its scan, also when
@@ -293,9 +296,12 @@ final class TreeCursor {
         if (wanted > 0 && !TreeNodes.isExternal(leaf, entry)) {
             var ref = TreeNodes.blobRef(leaf, entry);
             var blob = pages.cached(ref, PageFormat.VALUE);
+            if (blob == null && admit && screened) {
+                blob = pages.recalled(ref, PageFormat.VALUE);
+            }
             if (blob == null) {
                 blob = takeValue(ref);
-                if (blob == null && !leafGathered && pages.coldReads()) {
+                if (blob == null && !leafGathered && pages.coldReads() && !pages.cache().seen(ref)) {
                     gatherValues();
                     blob = takeValue(ref);
                 }
@@ -339,10 +345,16 @@ final class TreeCursor {
             return hit;
         }
         var ref = TreeNodes.childRef(parent, index);
+        if (admit && screened) {
+            var recalled = pages.recalled(ref, PageFile.NODE);
+            if (recalled != null) {
+                return recalled;
+            }
+        }
         var cached = admit || pages.cache().hasRoom(PageFormat.SIZE);
         if (wanted > 0) {
             var unit = take(ref);
-            if (unit == null && !ref.isRecord() && pages.coldReads()) {
+            if (unit == null && !ref.isRecord() && pages.coldReads() && !pages.cache().seen(ref)) {
                 gatherLeaves(parent, index, ref);
                 unit = take(ref);
             }

@@ -535,11 +535,11 @@ class PageCacheTest {
     @Nested
     @DisplayName("while it screens what reads miss")
     class Screening {
-        /// {@return a cache the test alone ticks, which screens whatever its reads take}
+        /// {@return a cache the test alone ticks, which screens what its reads miss}
         private static PageCache screening(long limit) {
             var cache = PageCache.isolated(limit);
             IdleTicker.unwatch(cache);
-            cache.screenWhile(() -> true);
+            cache.screen(true);
             return cache;
         }
 
@@ -612,21 +612,80 @@ class PageCacheTest {
         }
 
         @Test
-        @DisplayName("caches at the first read when no file installed a measure, or the measure says the reads are cold, and screens no plain put")
+        @DisplayName("caches at the first read when no file turned screening on, or a file turned it off, and screens no plain put")
         void unscreened() {
-            var unmeasured = PageCache.isolated(LIMIT);
-            unmeasured.putScreened(page(0), unit(page(0)));
-            assertNotNull(unmeasured.peek(page(0)));
-            var cold = PageCache.isolated(LIMIT);
-            cold.screenWhile(() -> false);
-            cold.putScreened(page(0), unit(page(0)));
-            assertNotNull(cold.peek(page(0)));
+            var unturned = PageCache.isolated(LIMIT);
+            unturned.putScreened(page(0), unit(page(0)));
+            assertNotNull(unturned.peek(page(0)));
+            var off = PageCache.isolated(LIMIT);
+            off.screen(true);
+            off.screen(false);
+            off.putScreened(page(0), unit(page(0)));
+            assertNotNull(off.peek(page(0)));
+            assertNull(off.recall(page(1)), "a refusal of a cache that refuses nothing");
             var warm = screening(LIMIT);
             warm.put(page(0), unit(page(0)), true);
             warm.put(page(1), unit(page(1)), false);
             assertNotNull(warm.peek(page(0)));
             assertNotNull(warm.peek(page(1)));
             assertEquals(0, warm.doorkeeperForTests().keysForTests(), "a put started the doorkeeper");
+        }
+
+        @Test
+        @DisplayName("recalls the very array of a unit it refused, which its second read then neither reads nor opens, as an entry a read used")
+        void recall() {
+            var cache = screening(LIMIT);
+            var first = unit(page(0));
+            cache.putScreened(page(0), first);
+            assertNull(cache.peek(page(0)));
+            assertSame(first, cache.recall(page(0)));
+            assertSame(first, cache.peek(page(0)));
+            assertTrue(cache.referencedForTests(page(0)));
+            assertEquals(PageFormat.SIZE, cache.size());
+            assertNull(cache.recall(page(0)), "a recall of a unit the cache already took");
+            assertSame(first, cache.peek(page(0)));
+            assertEquals(1, cache.clockLengthForTests());
+        }
+
+        @Test
+        @DisplayName("recalls nothing for another nonce or length at the same page, for a unit it never refused, or after a clear or the close")
+        void recallsOnlyTheUnit() {
+            var cache = screening(LIMIT);
+            var ref = page(0);
+            var unit = unit(ref);
+            cache.putScreened(ref, unit);
+            assertNull(cache.recall(new PageRef(ref.page(), 1, 9, 9)), "another nonce");
+            assertNull(cache.recall(new PageRef(ref.page(), 2, ref.nonceHigh(), ref.nonceLow())), "other pages");
+            assertNull(cache.recall(page(1)), "a unit never refused");
+            assertEquals(0, cache.size());
+            cache.clearForTests();
+            assertNull(cache.recall(ref), "after a clear");
+            cache.putScreened(page(2), unit(page(2)));
+            var refused = unit(page(3));
+            cache.putScreened(page(3), refused);
+            cache.close();
+            assertNull(cache.recall(page(3)), "after the close");
+            assertEquals(0, cache.size());
+        }
+
+        @Test
+        @DisplayName("holds the arrays of the units it refused only weakly, so a collection takes them")
+        void refusalsWeak() {
+            var cache = screening(LIMIT);
+            var held = new ArrayList<WeakReference<byte[]>>();
+            for (var i = 0; i < 64; i++) {
+                var unit = unit(page(i));
+                held.add(new WeakReference<>(unit));
+                cache.putScreened(page(i), unit);
+            }
+            for (var attempt = 0; attempt < 10 && held.stream().anyMatch(reference -> reference.get() != null); attempt++) {
+                System.gc();
+            }
+            assertTrue(held.stream().allMatch(reference -> reference.get() == null), "an array the cache refused stayed reachable");
+            for (var i = 0; i < 64; i++) {
+                assertNull(cache.recall(page(i)));
+            }
+            assertEquals(0, cache.size());
         }
 
         @Test
@@ -697,7 +756,7 @@ class PageCacheTest {
             var caches = new PageCache[]{PageCache.in(budget, 64L * PageFormat.SIZE), PageCache.in(budget, 64L * PageFormat.SIZE)};
             for (var shared : caches) {
                 IdleTicker.unwatch(shared);
-                shared.screenWhile(() -> true);
+                shared.screen(true);
             }
             var failure = new AtomicReference<Throwable>();
             var threads = new ArrayList<Thread>();
@@ -775,7 +834,7 @@ class PageCacheTest {
                     var positives = 0;
                     var unseen = 100_000;
                     for (var probe = 0; probe < unseen; probe++) {
-                        if (doorkeeper.holdsForTests((1L << 40) + probe, 999)) {
+                        if (doorkeeper.holds((1L << 40) + probe, 999)) {
                             positives++;
                         }
                     }
