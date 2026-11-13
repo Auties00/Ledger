@@ -17,6 +17,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import javax.crypto.spec.SecretKeySpec;
 import java.lang.foreign.MemorySegment;
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
@@ -575,6 +576,91 @@ class LogSpillTest {
             assertTrue(ledger.spills().loggedValuesForTests() > 0, "no value moved to the log once judged");
             verify(ledger, expected);
         }
+    }
+
+    @ParameterizedTest(name = "encrypted {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("tagging a value, decrypting it back and checking its tag allocate the tag's place and the value read back, never a copy of the value per step")
+    void cryptoAllocatesOnlyWhatItKeeps(boolean encrypted) {
+        var queue = new SpillQueue(0, encrypted);
+        var crypto = queue.takeCrypto();
+        var key = encrypted ? new SecretKeySpec(new byte[32], "AES") : null;
+        var segment = queue.segment(1, Path.of("unused"), key);
+        var value = new byte[5_000];
+        new Random(1).nextBytes(value);
+        var home = MemorySegment.ofArray(value).asReadOnly();
+        var sealed = new byte[SpillQueue.BLOCK + value.length];
+        var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+        // Compiled first, so the counts are those of the code the store runs
+        for (var round = 0; round < 3; round++) {
+            var rounds = round < 2 ? 5_000 : 1_000;
+            var before = threads.getCurrentThreadAllocatedBytes();
+            LogValue logged = null;
+            for (var i = 0; i < rounds; i++) {
+                logged = crypto.logValue(segment, 64, 3, i, home, 0, value.length);
+            }
+            var tagging = (threads.getCurrentThreadAllocatedBytes() - before) / rounds;
+            before = threads.getCurrentThreadAllocatedBytes();
+            var verified = true;
+            for (var i = 0; i < rounds; i++) {
+                verified &= crypto.verifies(value, rounds - 1, logged);
+            }
+            var verifying = (threads.getCurrentThreadAllocatedBytes() - before) / rounds;
+            assertTrue(verified);
+            var decrypting = 0L;
+            if (encrypted) {
+                before = threads.getCurrentThreadAllocatedBytes();
+                for (var i = 0; i < rounds; i++) {
+                    crypto.decrypt(key, 64, 3, sealed, 3, value.length);
+                }
+                decrypting = (threads.getCurrentThreadAllocatedBytes() - before) / rounds;
+            }
+            if (round == 2) {
+                assertTrue(tagging < 256, "tagging allocated " + tagging + " bytes per value");
+                assertTrue(verifying < 256, "verifying allocated " + verifying + " bytes per value");
+                assertTrue(decrypting < value.length + 256, "decrypting allocated " + decrypting + " bytes per value");
+            }
+        }
+        var logged = crypto.logValue(segment, 64, 3, 7, home, 0, value.length);
+        var changed = value.clone();
+        changed[100] ^= 1;
+        assertFalse(crypto.verifies(changed, 7, logged));
+        if (encrypted) {
+            // The tag binds the version it was made for
+            assertFalse(crypto.verifies(value, 8, logged));
+        }
+        queue.giveBack(crypto);
+    }
+
+    @Test
+    @DisplayName("a value decrypted from the block that holds its first byte is the value AES-CTR from the body's first counter block decrypts, wherever it starts and however long it is")
+    void decryptsAsCounterMode() throws Exception {
+        var queue = new SpillQueue(0, true);
+        var crypto = queue.takeCrypto();
+        var random = new Random(2);
+        var bytes = new byte[32];
+        random.nextBytes(bytes);
+        var key = new SecretKeySpec(bytes, "AES");
+        var body = new byte[20_000];
+        random.nextBytes(body);
+        for (var frameOffset : new long[]{0, 4_096, 0x1_0000_1000L}) {
+            var counter = new byte[SpillQueue.BLOCK];
+            System.arraycopy(LogWriter.nonce(frameOffset), 0, counter, 0, 12);
+            Bytes.i32(counter, 12, 2);
+            var ctr = javax.crypto.Cipher.getInstance("AES/CTR/NoPadding");
+            ctr.init(javax.crypto.Cipher.ENCRYPT_MODE, key, new javax.crypto.spec.IvParameterSpec(counter));
+            var sealedBody = ctr.doFinal(body);
+            for (var trial = 0; trial < 200; trial++) {
+                var length = 1 + random.nextInt(trial % 2 == 0 ? 64 : 9_000);
+                var bodyIndex = random.nextInt(body.length - length);
+                var skip = bodyIndex & (SpillQueue.BLOCK - 1);
+                var sealed = Arrays.copyOfRange(sealedBody, bodyIndex - skip, bodyIndex + length);
+                var decrypted = crypto.decrypt(key, frameOffset, bodyIndex, sealed, skip, length);
+                assertArrayEquals(Arrays.copyOfRange(body, bodyIndex, bodyIndex + length), decrypted,
+                        "at " + bodyIndex + " for " + length + " bytes of the frame at " + frameOffset);
+            }
+        }
+        queue.giveBack(crypto);
     }
 
     @Test
