@@ -245,7 +245,7 @@ final class PageFile implements AutoCloseable {
             }
             return leaf;
         }
-        var plain = open(ref, kind, cached);
+        var plain = open(ref, kind, cached, true);
         if (cached) {
             cache.put(ref, plain, referenced);
         }
@@ -260,22 +260,27 @@ final class PageFile implements AutoCloseable {
     /// nodes and evict the new ones. A unit read from the file ends with its content, as one read for the cache does,
     /// so [#keep(PageRef, byte\[\])] can cache it.
     ///
+    /// The read is left out of the average of [#coldReads()]: a checkpoint reads what the last ones wrote, which the
+    /// OS cache mostly still holds, and quick reads of it would hide that the readers' own reads go to the device.
+    ///
     /// @param ref a unit, not a delta record
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
     byte[] readForReplace(PageRef ref, byte kind) {
         var hit = peek(ref, kind);
-        return hit != null ? hit : open(ref, kind, true);
+        return hit != null ? hit : open(ref, kind, true, false);
     }
 
     /// {@return the plaintext of the unit `ref` names, read from the file and authenticated, ending with its content if
     /// `trimmed` ([PageFormat#cachedLength(int, int)]) and holding its whole pages otherwise}
-    private byte[] open(PageRef ref, byte kind, boolean trimmed) {
+    ///
+    /// @param sampled whether the read counts in the average of [#coldReads()]
+    private byte[] open(PageRef ref, byte kind, boolean trimmed, boolean sampled) {
         var length = ref.pages() * PageFormat.SIZE;
         var sealed = pool.acquire(length);
         try {
-            readFully(sealed, length, PageFormat.offset(ref.page()));
+            readFully(sealed, 0, length, PageFormat.offset(ref.page()), sampled);
             var plain = open(ref, kind, sealed, 0, trimmed);
             if (plain == null) {
                 throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
@@ -694,6 +699,15 @@ final class PageFile implements AutoCloseable {
         return hit != null && kindMatches(hit[PageFormat.KIND], kind) ? hit : null;
     }
 
+    /// {@return whether the cache holds the leaf or branch `ref` names as an entry a read used since the clock last
+    /// passed it, without counting as a read of it}
+    ///
+    /// A unit a checkpoint wrote to the cache and no read used since does not count, nor does a hit of another kind.
+    boolean referenced(PageRef ref) {
+        var hit = cache.peekReferenced(ref);
+        return hit != null && kindMatches(hit[PageFormat.KIND], NODE);
+    }
+
     /// Counts `unit` as read, caching it if the cache does not hold it: the checkpoint that read it to replace it found
     /// it outlives the checkpoint.
     ///
@@ -714,8 +728,13 @@ final class PageFile implements AutoCloseable {
         readFully(array, 0, length, position);
     }
 
-    // Reads `length` bytes of the file from `position` into `array` from `offset` on
     private void readFully(byte[] array, int offset, int length, long position) {
+        readFully(array, offset, length, position, true);
+    }
+
+    // Reads `length` bytes of the file from `position` into `array` from `offset` on, counting the time it took in the
+    // average of coldReads() if `sampled`
+    private void readFully(byte[] array, int offset, int length, long position, boolean sampled) {
         var channel = takeChannel();
         var interrupted = false;
         try {
@@ -732,7 +751,9 @@ final class PageFile implements AutoCloseable {
                     channel = FileChannel.open(path, StandardOpenOption.READ);
                 }
             }
-            sampleRead(System.nanoTime() - start, length);
+            if (sampled) {
+                sampleRead(System.nanoTime() - start, length);
+            }
         } catch (IOException exception) {
             throw new LedgerIoException(path + " could not be read", exception);
         } finally {
@@ -855,15 +876,20 @@ final class PageFile implements AutoCloseable {
         return blobs;
     }
 
-    /// {@return a writer of the units of one checkpoint, sealed under nonces that start with `nonceHigh`}
+    /// {@return a writer of the units of one checkpoint, sealed under nonces that start with `nonceHigh`, that forces
+    /// them beside its work and lets the page cache take its leaves and delta pages from its first unit}
     Writer writer(long nonceHigh) {
-        return new Writer(nonceHigh, () -> true);
+        return new Writer(nonceHigh, () -> true, () -> true);
     }
 
     /// {@return a writer of the units of one checkpoint, sealed under nonces that start with `nonceHigh`, that forces
-    /// them beside its work only while `lagging` holds}
-    Writer writer(long nonceHigh, BooleanSupplier lagging) {
-        return new Writer(nonceHigh, lagging);
+    /// them beside its work only while `lagging` holds and lets the page cache take its leaves and delta pages once
+    /// `saturated` holds}
+    ///
+    /// @param saturated whether the next checkpoint follows this one at once, and so reads the leaves it writes; once
+    ///                  it holds, the writer asks no more
+    Writer writer(long nonceHigh, BooleanSupplier lagging, BooleanSupplier saturated) {
+        return new Writer(nonceHigh, lagging, saturated);
     }
 
     @Override
@@ -915,25 +941,61 @@ final class PageFile implements AutoCloseable {
         // The bytes of leaves and delta pages admits counted, and the most it lets evict other entries
         private final AtomicLong admitted;
         private final long admission;
+        // Whether the next checkpoint follows this one at once, asked until it first holds
+        private final BooleanSupplier saturation;
+        // Set once saturation held: the log only grows past the cut while the checkpoint runs
+        private volatile boolean saturated;
 
-        private Writer(long nonceHigh, BooleanSupplier lagging) {
+        private Writer(long nonceHigh, BooleanSupplier lagging, BooleanSupplier saturation) {
             this.lock = new Object();
             this.nonceHigh = nonceHigh;
             this.staged = new TreeMap<>();
             this.lagging = lagging;
             this.admitted = new AtomicLong();
             this.admission = cache.admission();
+            this.saturation = saturation;
+        }
+
+        /// {@return whether the next checkpoint follows this one at once, and so reads the leaves this one writes}
+        ///
+        /// Once it holds it holds for the rest of the checkpoint, without asking again.
+        boolean saturated() {
+            if (saturated) {
+                return true;
+            }
+            if (!saturation.getAsBoolean()) {
+                return false;
+            }
+            saturated = true;
+            return true;
+        }
+
+        /// {@return whether the page cache should take a delta page of `bytes` bytes this checkpoint writes}
+        ///
+        /// As [#admits(long, boolean)] for a unit that replaces none a read used.
+        boolean admits(long bytes) {
+            return admits(bytes, false);
         }
 
         /// {@return whether the page cache should take a leaf or a delta page of `bytes` bytes this checkpoint writes}
         ///
-        /// Each call counts `bytes` against what the checkpoint may cache. Past [PageCache#admission()] only what fits
-        /// in free room goes in, as a scan's leaves do: a checkpoint that writes more than the cache holds would
-        /// otherwise evict its own first units for its last ones, none read in between. A unit the cache never keeps
-        /// counts nothing. Branches never ask, as a reader and the next checkpoint's lookups need them all to reach a
-        /// leaf.
-        boolean admits(long bytes) {
-            return cache.holds(bytes) && (admitted.addAndGet(bytes) <= admission || cache.hasRoom(bytes));
+        /// Only while the checkpoints run back to back ([#saturated()]), or for a leaf that replaces one a read used in
+        /// the cache ([PageFile#referenced(PageRef)]), as the leaf of a chat a reader has open: the leaves a checkpoint
+        /// writes serve the next one's reads of what it replaces and the readers' first reads, and when the next
+        /// checkpoint is a whole interval of log away the cache would hold every one of them all that time for a read
+        /// each, which no reader may make. A leaf a checkpoint cached and no read used does not count, or each
+        /// checkpoint would cache the leaves that replace the last one's, none of them read.
+        ///
+        /// Each call that may cache the unit counts `bytes` against what the checkpoint may cache. Past
+        /// [PageCache#admission()] only what fits in free room goes in, as a scan's leaves do: a checkpoint that writes
+        /// more than the cache holds would otherwise evict its own first units for its last ones, none read in between.
+        /// A unit the cache never keeps, or that the checkpoint leaves out, counts nothing. Branches never ask, as a
+        /// reader and the next checkpoint's lookups need them all to reach a leaf.
+        ///
+        /// @param replacesRead whether the unit replaces a leaf the page cache holds as one a read used
+        boolean admits(long bytes, boolean replacesRead) {
+            return cache.holds(bytes) && (replacesRead || saturated())
+                    && (admitted.addAndGet(bytes) <= admission || cache.hasRoom(bytes));
         }
 
         /// Queues `unit`, whose content is filled in, as the unit of `pages` pages at `page`.

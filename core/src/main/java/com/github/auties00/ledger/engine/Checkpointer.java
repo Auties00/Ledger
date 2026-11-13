@@ -15,6 +15,7 @@ import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -33,6 +34,13 @@ import java.util.concurrent.locks.ReentrantLock;
 ///
 /// Every unit of a checkpoint is sealed under a nonce made of 8 random bytes drawn for the checkpoint and a counter,
 /// so no nonce repeats under the store's key, even across a checkpoint that a crash cut short.
+///
+/// The leaves and delta pages a checkpoint writes go to the page cache only while checkpoints run back to back, as the
+/// next one reads what this one wrote: from the moment a second interval of log waits behind its cut or a commit waits
+/// for it, or from its first unit if the last checkpoint ended so. A checkpoint the next one follows an interval of log
+/// later, as an idle store's or one the application asked for, leaves them out but for the leaves that replace one a
+/// read used in the cache ([PageFile.Writer#admits(long, boolean)]); the cache would otherwise hold every leaf it wrote
+/// until the idle ticker evicted them, for a read each that no one may make. Its branches go in either way.
 ///
 /// The units a checkpoint replaced, and the delta records it dropped, leave the page cache once every reader has let go
 /// of them: each checkpoint and each tick of the [IdleTicker] drops those released since the last on a virtual thread
@@ -111,6 +119,11 @@ final class Checkpointer implements IdleTicker.Watched {
     // The delta pages of the last durable checkpoint, and the blob that holds their table, or null; guarded by the lock
     private DeltaTable deltas;
     private PageRef deltaTable;
+    // Whether the last checkpoint that wrote anything ended with the next one due, so the one after it caches what it
+    // writes from its first unit; guarded by the lock
+    private boolean endedSaturated;
+    // The commits waiting in throttle() for a checkpoint; written under progressLock
+    private volatile int throttled;
 
     /// Creates the checkpointer of `ledger`.
     ///
@@ -347,8 +360,15 @@ final class Checkpointer implements IdleTicker.Watched {
         maybeStart();
         progressLock.lock();
         try {
-            while (behind() && scheduled.get() && lastFailure == null) {
-                progress.awaitUninterruptibly();
+            if (behind() && scheduled.get() && lastFailure == null) {
+                throttled++;
+                try {
+                    do {
+                        progress.awaitUninterruptibly();
+                    } while (behind() && scheduled.get() && lastFailure == null);
+                } finally {
+                    throttled--;
+                }
             }
         } finally {
             progressLock.unlock();
@@ -424,7 +444,10 @@ final class Checkpointer implements IdleTicker.Watched {
             cutBytes = cut.logBytes();
             poolHold = pages.pool().hold();
             // Lagging once a second interval of log waits behind the cut: the commits will wait for this checkpoint
-            var writer = pages.writer(random.nextLong(), () -> log.appendedBytes() - cutBytes > every);
+            BooleanSupplier lagging = () -> log.appendedBytes() - cutBytes > every;
+            // No checkpoint follows the one of a close, whose cache closes with the store
+            var followed = !closing && endedSaturated;
+            var writer = pages.writer(random.nextLong(), lagging, closing ? () -> false : () -> followed || saturated());
             space.rewindRuns();
             var update = new TreeUpdate(pages, writer, space);
             TreeRoot[] roots;
@@ -503,6 +526,7 @@ final class Checkpointer implements IdleTicker.Watched {
             publishedHeap = cut.logHeap();
             publishedSlack = slackAtCut;
             publishedChunks = chunksAtCut;
+            endedSaturated = !closing && saturated();
             signalProgress();
             ledger.pruneCut(cut);
             // While the store runs, as many as a checkpoint interval fills, so the log seldom writes into a new file
@@ -523,6 +547,12 @@ final class Checkpointer implements IdleTicker.Watched {
             Reference.reachabilityFence(poolHold);
             lock.unlock();
         }
+    }
+
+    /// {@return whether the checkpoint running now, whose cut is the last, has the next one waiting behind it: a second
+    /// interval of log is queued past its cut, or a commit waits for it}
+    private boolean saturated() {
+        return log.appendedBytes() - cutBytes > every || throttled > 0;
     }
 
     /// {@return whether an epoch of the file of large values that units may have taken is recorded only by the log}

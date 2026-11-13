@@ -169,6 +169,24 @@ final class PageCache implements IdleTicker.Watched {
         return slot < 0 ? null : table.unit(slot, key, ref.nonceHigh(), ref.nonceLow(), ref.pages());
     }
 
+    /// {@return the plaintext of the unit `ref` of the data file names, or of the leaf its delta record makes, if the
+    /// cache holds it as an entry a read used since the clock last passed it, or `null`, without counting as a read of
+    /// the entry}
+    ///
+    /// An entry cached as written ([#put(PageRef, byte\[\], boolean)] with `referenced` false) reads as a miss until a
+    /// read uses it. It takes no lock and allocates nothing; a put, removal or rebuild it races may make it answer for
+    /// the slot's next entry, which only matters to what a checkpoint caches.
+    byte[] peekReferenced(PageRef ref) {
+        var key = dataKey(ref.page(), ref.slot());
+        var table = this.table;
+        var slot = table.find(key);
+        if (slot < 0) {
+            return null;
+        }
+        var unit = table.unit(slot, key, ref.nonceHigh(), ref.nonceLow(), ref.pages());
+        return unit != null && (table.flags[slot] & REFERENCED) != 0 ? unit : null;
+    }
+
     /// Caches `unit`, the plaintext of the unit `ref` of the data file names, replacing whatever the cache held for its
     /// page.
     ///

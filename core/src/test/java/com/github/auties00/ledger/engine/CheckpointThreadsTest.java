@@ -113,7 +113,7 @@ class CheckpointThreadsTest {
     void forceOnBusyCarriers(@TempDir Path directory) throws Exception {
         try (var pages = PageFile.open(directory, new PageCipher(new SecretKeySpec(KEY, "AES")), 1 << 20, new HeapPool(1 << 20))) {
             var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
-            var writer = pages.writer(1, () -> true);
+            var writer = pages.writer(1, () -> true, () -> true);
             assertEndsWithBusyCarriers(() -> {
                 try {
                     // Past the 32 MiB from which a checkpoint that lags forces beside its work
