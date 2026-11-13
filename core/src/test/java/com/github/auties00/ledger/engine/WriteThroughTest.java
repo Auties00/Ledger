@@ -1363,4 +1363,123 @@ class WriteThroughTest {
             assertEquals(cache.lastsForProcess() ? 1 : 2, WriteThrough.WriteCache.asksForTests() - asks);
         }
     }
+
+    @Nested
+    @DisplayName("the output")
+    class Output {
+        // Room for a group of the most one write takes, and a megabyte of filler, after a spare's first group
+        private static final long SEGMENT = 4 << 20;
+        private static final int WRITES = 256;
+
+        private static Ledger open(Path directory, boolean encrypted, WriteThrough.Mode mode) {
+            var builder = Ledger.builder().directory(directory).encryption(encrypted ? Encryption.key(KEY) : Encryption.none()).keyspace(NAMES);
+            return ((LedgerBuilder) builder).segmentSize(SEGMENT).writeThrough(mode).build();
+        }
+
+        /// Commits `writes` values of `length` bytes, the last `extra` bytes longer, under the keys `prefix000`
+        /// onwards, in one batch, durably, and records them in `model`.
+        private static void commitBatch(Ledger ledger, Map<String, String> model, String prefix, int writes, int length, int extra) throws InterruptedException {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < writes; i++) {
+                var key = prefix + "%03d".formatted(i);
+                var value = "v".repeat(i == writes - 1 ? length + extra : length);
+                batch.put(NAMES, key, value);
+                model.put(key, value);
+            }
+            ledger.commit(batch).awaitDurable();
+        }
+
+        /// {@return the bytes the frames of the last group sealed into}
+        private static long lastGroup(LogWriter log) {
+            return log.groupEnd() - log.groupStart();
+        }
+
+        /// Commits until the next group starts in a segment it may be written through into with a group of
+        /// [LogWriter#ONE_WRITE] bytes: a small group was just written through, and the segment holds that many more,
+        /// their padding and room to spare.
+        private static void reachRoom(Ledger ledger, Map<String, String> model, String prefix) throws InterruptedException {
+            var log = log(ledger);
+            for (var attempt = 0; attempt < 400; attempt++) {
+                var through = log.writtenThrough();
+                commit(ledger, model, prefix + attempt);
+                var next = (log.groupEnd() + LogWriter.ALIGNMENT - 1) / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT;
+                // A spare holds the bytes of its last use, which may end a group of filler short of the segment's size
+                if (log.writtenThrough() > through && next + LogWriter.ONE_WRITE + 2L * LogWriter.ALIGNMENT <= SEGMENT - (512 << 10)) {
+                    return;
+                }
+                // On to the next segment, and to spares again once those the checkpoint left are taken
+                commitBatch(ledger, model, prefix + attempt + "-", 128, 4_000, 0);
+                if (attempt % 16 == 15) {
+                    ledger.checkpoint();
+                }
+            }
+            throw new AssertionError("no segment left room to write a group of the most one write takes through");
+        }
+
+        /// Checks that every state a loss of power now could leave of `disk` holds `model`.
+        private static void survivesPowerLoss(CrashFileSystem disk, boolean encrypted, Map<String, String> model) {
+            for (var seed = 0; seed < 4; seed++) {
+                var survivor = disk.afterPowerLoss(new Random(seed));
+                try (var ledger = open(survivor.getPath("/store"), encrypted, WriteThrough.Mode.OFF)) {
+                    assertEquals(model, contents(ledger), "seed " + seed);
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("is a multiple of a block below a megabyte by its header, and holds a group of the most one write takes with its padding and the cipher's last reservation")
+        void bounds() {
+            assertEquals(0, LogWriter.OUTPUT % LogWriter.ALIGNMENT);
+            assertEquals(0, LogWriter.ONE_WRITE % LogWriter.ALIGNMENT, "a group padded to its block ends past the bound");
+            // 16 bytes: the header of a byte array without compact object headers, the larger of the two
+            assertTrue(LogWriter.OUTPUT + 16 <= 1 << 20, "the output is humongous in a G1 region of 2 MiB");
+            assertTrue(LogWriter.ONE_WRITE + 2 * LogWriter.TAG_BYTES <= LogWriter.OUTPUT, "the last call of the cipher drains a group of one write");
+            assertTrue(LogWriter.ONE_WRITE >= LogWriter.FRAME_HEADER + LogWriter.RUN_BYTES + LogWriter.TAG_BYTES, "a run does not fit in one write");
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @CsvSource({"true", "false"})
+        @DisplayName("writes through a group that seals into exactly the most one write takes, forces one a byte larger, and both survive a loss of power")
+        void boundary(boolean encrypted) throws Exception {
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, String>();
+            try (var ledger = open(disk.getPath("/store"), encrypted, WriteThrough.Mode.DSYNC)) {
+                var log = log(ledger);
+                var fills = 0;
+                while (log.currentSegment() < 4) {
+                    commitBatch(ledger, model, "f" + fills++ + "-", 64, 4_000, 0);
+                }
+                ledger.checkpoint();
+
+                // A frame of WRITES puts under keys of four bytes seals into its values and this many bytes more
+                commitBatch(ledger, model, "c", WRITES, 3_000, 0);
+                var fixed = lastGroup(log) - (long) WRITES * 3_000;
+                var length = (int) ((LogWriter.ONE_WRITE - fixed) / WRITES);
+                var extra = (int) ((LogWriter.ONE_WRITE - fixed) % WRITES);
+
+                reachRoom(ledger, model, "p");
+                var through = log.writtenThrough();
+                var forces = log.forces();
+                commitBatch(ledger, model, "a", WRITES, length, extra);
+                assertEquals(LogWriter.ONE_WRITE, lastGroup(log));
+                assertEquals(through + 1, log.writtenThrough(), "the group of the most one write takes was not written through");
+                assertEquals(forces + 1, log.forces());
+                assertEquals(LogWriter.OUTPUT, log.outputLength());
+                survivesPowerLoss(disk, encrypted, model);
+
+                reachRoom(ledger, model, "q");
+                through = log.writtenThrough();
+                forces = log.forces();
+                commitBatch(ledger, model, "b", WRITES, length, extra + 1);
+                assertEquals(LogWriter.ONE_WRITE + 1, lastGroup(log));
+                assertEquals(through, log.writtenThrough(), "a group past the most one write takes was written through");
+                assertEquals(forces + 1, log.forces(), "a group past the most one write takes was not forced once");
+                assertEquals(LogWriter.OUTPUT, log.outputLength());
+                survivesPowerLoss(disk, encrypted, model);
+            }
+            try (var reopened = open(disk.getPath("/store"), encrypted, WriteThrough.Mode.OFF)) {
+                assertEquals(model, contents(reopened));
+            }
+        }
+    }
 }

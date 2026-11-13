@@ -156,11 +156,18 @@ final class LogWriter {
     /// What the byte at [#KEPT_MARK] holds in a segment a close kept.
     static final byte KEPT_MARK_VALUE = 1;
     private static final SecureRandom TAGS = new SecureRandom();
-    /// The largest size of the buffer frames are sealed into and written from.
-    private static final int OUTPUT = 1 << 20;
+    /// The largest size of the buffer frames are sealed into and written from: a block short of a megabyte, so the
+    /// array, header included, takes at most half of a G1 region of 2 MiB and at most one region of 1 MiB, and is not
+    /// allocated as a humongous object. One of exactly a megabyte is humongous at either size, and the collector counts
+    /// the whole region it starts, or both it spans, as used for as long as it lives: a megabyte more than its bytes.
+    /// A multiple of [#ALIGNMENT], like [#ONE_WRITE].
+    static final int OUTPUT = (1 << 20) - ALIGNMENT;
+    /// The most bytes the frames of a group seal into for the group to be written with one call, through or not: the
+    /// output then holds them, the room the last call of the cipher asks for past them and the padding to the next
+    /// block, so it writes nothing out in the middle of the group, and a group written through is written whole.
+    static final int ONE_WRITE = OUTPUT - ALIGNMENT;
     /// The size the buffer starts at, and goes back to once groups no longer need more. A buffer of [#OUTPUT] bytes
-    /// from the start cost every store a megabyte, and as much again of the heap region it took whole, which a store
-    /// of small commits never used.
+    /// from the start would cost every store a megabyte that a store of small commits never uses.
     private static final int MIN_OUTPUT = 16 << 10;
     /// The groups in a row, each fitting in half of [#MIN_OUTPUT], after which a larger buffer goes back to it.
     private static final int SHRINK_AFTER = 256;
@@ -865,12 +872,12 @@ final class LogWriter {
     }
 
     /// {@return a bound on the bytes `frames` seal into, each counted as a frame of its own, more than the run that may
-    /// hold it takes; or -1 if the output cannot hold that many and a block of padding}
+    /// hold it takes; or -1 if it is more than [#ONE_WRITE]}
     private long sealedBytes(List<Queued> frames) {
         var bytes = 0L;
         for (var frame : frames) {
             bytes += FRAME_HEADER + frame.body().size() + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
-            if (bytes > OUTPUT - ALIGNMENT) {
+            if (bytes > ONE_WRITE) {
                 return -1;
             }
         }
@@ -1754,6 +1761,11 @@ final class LogWriter {
     /// {@return the groups written through so far, for tests}
     long writtenThrough() {
         return writtenThrough;
+    }
+
+    /// {@return the bytes of the output, for tests: read after a group returned, its size once that group was written}
+    int outputLength() {
+        return output.length;
     }
 
     /// {@return the way later segments are opened to write through, or `null` if their groups are forced, for tests}
