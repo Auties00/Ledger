@@ -39,12 +39,14 @@ import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.CRC32C;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -1022,6 +1024,13 @@ class LogRunTest {
             return arrays;
         }
 
+        /// {@return a pool of 1 GiB that keeps its overflow through collections, as the chunks released are looked for in it}
+        private static HeapPool pool() {
+            var pool = new HeapPool(1L << 30, false);
+            pool.holdOverflowForTests(true);
+            return pool;
+        }
+
         /// Checks that `pool` holds no chunk free twice, and holds every one of `released`.
         private static void assertReleased(HeapPool pool, List<byte[]> released) {
             var free = Collections.newSetFromMap(new IdentityHashMap<byte[], Boolean>());
@@ -1040,7 +1049,7 @@ class LogRunTest {
         @DisplayName("seals bodies of 300 KiB, 600 KiB and 1.5 MiB on chunks as one array would, beside runs, and gives each chunk back once")
         void sealed(boolean encrypted, @TempDir Path directory) throws Exception {
             var log = new Log(directory, encrypted, 64L << 20);
-            var pool = new HeapPool(1L << 30, false);
+            var pool = pool();
             var random = new Random(encrypted ? 7 : 8);
             for (var round = 0; round < 3; round++) {
                 // The chunks the last round gave back go to this one's bodies
@@ -1093,7 +1102,7 @@ class LogRunTest {
         void refused(boolean encrypted) throws Exception {
             var disk = CrashFileSystem.create();
             var log = new Log(disk.getPath("/log"), encrypted, 64L << 20);
-            var pool = new HeapPool(1L << 30, false);
+            var pool = pool();
             var random = new Random(encrypted ? 11 : 12);
             try {
                 log.group(5, 100);
@@ -1137,10 +1146,63 @@ class LogRunTest {
 
         @ParameterizedTest(name = "encrypted: {0}")
         @ValueSource(booleans = {true, false})
+        @DisplayName("a writer that stops with bodies on chunks queued and deferred lets go of their holds on the pool and keeps their chunks")
+        void abandoned(boolean encrypted) throws Exception {
+            var disk = CrashFileSystem.create();
+            var log = new Log(disk.getPath("/log"), encrypted, 64L << 20);
+            var pool = pool();
+            var random = new Random(encrypted ? 13 : 14);
+            var queued = chunked(pool, 600 << 10, random);
+            var deferred = chunked(pool, 300 << 10, random);
+            assertTrue(queued.holdsPoolForTests() && deferred.holdsPoolForTests(), "the holds the bodies took with their chunks");
+            // The first group starts preparing the next segment on a thread of its own: held here and run once the
+            // interceptor is armed, its writes, to another file, must leave the failing write to the current segment
+            var held = Collections.synchronizedList(new ArrayList<FutureTask<?>>());
+            log.writer.starterForTests = held::add;
+            try {
+                log.group(5, 100);
+                // The next group's first write queues one body and defers the other behind it, then fails
+                var armed = new AtomicBoolean(true);
+                var segment = LogWriter.segmentName(1);
+                disk.intercept((path, kind) -> {
+                    if (kind == ChangeInterceptor.ChangeKind.WRITE && path.getFileName().toString().equals(segment)
+                            && armed.compareAndSet(true, false)) {
+                        log.writer.append(FrameBody.COMMIT, log.last() + 1, queued);
+                        log.writer.defer(FrameBody.COMMIT, log.last() + 2, deferred);
+                        throw new IOException("No space left on device");
+                    }
+                });
+                assertEquals(1, held.size(), "the preparation of the next segment");
+                held.getFirst().run();
+                assertTrue(armed.get(), "the preparation of the next segment took the failing write");
+                try {
+                    log.group(5, 100);
+                } catch (LedgerIoException _) {
+                    // The flush that failed may report it here or leave it to the next append
+                }
+                assertFalse(armed.get(), "the write that fails");
+                assertThrows(LedgerIoException.class, log.writer::checkHealthy);
+                assertFalse(queued.holdsPoolForTests(), "the queued body still holds the pool");
+                assertFalse(deferred.holdsPoolForTests(), "the deferred body still holds the pool");
+                assertEquals(List.of(), pool.freeForTests(FrameBody.CHUNK_BYTES), "the chunks of the bodies a seal may still read");
+            } catch (Throwable failure) {
+                try {
+                    log.close();
+                } catch (RuntimeException closing) {
+                    failure.addSuppressed(closing);
+                }
+                throw failure;
+            }
+            // The close of a stopped writer reports its failure
+            assertThrows(LedgerIoException.class, log::close);
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
         @DisplayName("seals bodies on chunks across segment rollovers, one larger than a segment, which recovery replays")
         void rollover(boolean encrypted, @TempDir Path directory) throws Exception {
             var log = new Log(directory, encrypted, 1L << 20);
-            var pool = new HeapPool(1L << 30, false);
+            var pool = pool();
             var random = new Random(encrypted ? 9 : 10);
             for (var size : new int[]{600 << 10, 700 << 10, 1_536 << 10, 300 << 10}) {
                 var batch = new LogWriter.Batch();
@@ -1165,7 +1227,7 @@ class LogRunTest {
         void referring(int seed, boolean encrypted, @TempDir Path directory) throws Exception {
             var random = new Random(seed);
             var log = new Log(directory, encrypted, 8L << 20);
-            var pool = new HeapPool(1L << 30, false);
+            var pool = pool();
             try {
                 for (var group = 0; group < 4; group++) {
                     var batch = new LogWriter.Batch();
