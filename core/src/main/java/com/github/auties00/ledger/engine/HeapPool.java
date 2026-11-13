@@ -22,9 +22,9 @@ import java.util.concurrent.atomic.AtomicLong;
 /// The arrays of work that comes in bursts, such as the reads ahead of a scan while the file reads from the device or
 /// the leaves a resident key space loads, are [collectable][#acquireCollectable(int)]: the pool recycles them as it
 /// does the others, but reaches the free ones only weakly, so the first collection after a burst frees them. Kept
-/// strongly, the sealed and opened arrays of a scan's reads ahead stayed in the pool for as long as scans read ahead,
-/// one of each size a round read into, 520 KiB after 1,000 cold chat pages; a burst after a collection allocates them
-/// again, once.
+/// strongly, the sealed and opened arrays of a scan's reads ahead would stay in the pool for as long as scans read
+/// ahead, one of each size a round reads into, 520 KiB after 1,000 cold chat pages; a burst after a collection
+/// allocates them again, once.
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
