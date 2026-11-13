@@ -840,6 +840,11 @@ final class PageFile implements AutoCloseable {
         return cache;
     }
 
+    /// {@return the pool the file reads and seals pages into}
+    HeapPool pool() {
+        return pool;
+    }
+
     /// Makes `blobs` the file of large values the trees point into; this file closes it.
     void useBlobs(BlobFile blobs) {
         this.blobs = blobs;

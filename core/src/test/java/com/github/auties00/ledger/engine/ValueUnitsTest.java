@@ -164,6 +164,8 @@ class ValueUnitsTest {
         var directory = disk.getPath("/store");
         Files.createDirectories(directory);
         var pool = new HeapPool(64 << 20, false);
+        // The overflow kept through collections, as the free arrays are looked for in it
+        pool.holdOverflowForTests(true);
         var writes = new AtomicInteger(-1);
         disk.intercept((path, kind) -> {
             if (kind == ChangeInterceptor.ChangeKind.WRITE && path.endsWith(PageFile.FILE) && writes.get() >= 0
@@ -256,6 +258,8 @@ class ValueUnitsTest {
     /// {@return a pool whose free arrays, of every size a value unit seals into, hold bytes of an earlier use}
     private static HeapPool dirtyPool() {
         var pool = new HeapPool(64 << 20, false);
+        // The overflow kept through collections, as the free arrays are looked for in it
+        pool.holdOverflowForTests(true);
         var arrays = new ArrayList<byte[]>();
         for (var shift = 12; shift <= 20; shift++) {
             for (var i = 0; i < 8; i++) {

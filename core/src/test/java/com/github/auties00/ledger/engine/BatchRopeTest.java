@@ -67,8 +67,11 @@ class BatchRopeTest {
                 COPIES.name(), COPIES));
     }
 
+    // Keeps its overflow through collections, as the tests count the chunks that go back to it
     private static HeapPool pool() {
-        return new HeapPool(1L << 26, false);
+        var pool = new HeapPool(1L << 26, false);
+        pool.holdOverflowForTests(true);
+        return pool;
     }
 
     private static byte[] value(int seed, int length) {
