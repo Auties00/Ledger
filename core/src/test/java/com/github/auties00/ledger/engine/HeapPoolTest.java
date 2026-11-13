@@ -3,6 +3,8 @@ package com.github.auties00.ledger.engine;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -65,7 +67,7 @@ class HeapPoolTest {
         pool.releaseCollectable(array);
         // Larger than a pooled size, or past half of what the pool keeps: left to the collector
         pool.releaseCollectable(new byte[(1 << 20) + 1]);
-        pool.releaseCollectable(new byte[1 << 20]);
+        pool.releaseCollectable(pool.acquireCollectable(1 << 20));
         assertEquals(8_192, pool.collectableBytesForTests());
         pool.trimIfIdle();
         assertEquals(8_192, pool.collectableBytesForTests(), "acquired since the last trim");
@@ -92,5 +94,31 @@ class HeapPoolTest {
         pool.releaseCollectable(array);
         pool.collectForTests();
         assertEquals(0, pool.collectableBytesForTests());
+    }
+
+    @Test
+    @DisplayName("keeps the free collectable arrays through a collection while a collectable array is out, and frees them at one once every array is back")
+    void holdsCollectableWhileOut() {
+        var pool = new HeapPool(4 << 20, false);
+        var out = pool.acquireCollectable(4_096);
+        var arrays = new ArrayList<byte[]>();
+        for (var i = 0; i < 8; i++) {
+            arrays.add(pool.acquireCollectable(256 << 10));
+        }
+        arrays.forEach(pool::releaseCollectable);
+        arrays.clear();
+        assertEquals(1, pool.collectableOutForTests());
+        var free = 8L * (256 << 10);
+        assertEquals(free, pool.collectableBytesForTests());
+        // A collection in the middle of a burst, as a young one the burst's own allocations start
+        System.gc();
+        System.gc();
+        assertEquals(free, pool.collectableBytesForTests(), "a collection freed the free arrays while one was out");
+        pool.releaseCollectable(out);
+        assertEquals(0, pool.collectableOutForTests());
+        for (var i = 0; i < 50 && pool.collectableBytesForTests() != 0; i++) {
+            System.gc();
+        }
+        assertEquals(0, pool.collectableBytesForTests(), "a collection with every array back left the free ones");
     }
 }

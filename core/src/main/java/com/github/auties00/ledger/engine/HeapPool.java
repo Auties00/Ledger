@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /// Recycled heap arrays in power-of-two sizes from 4 KiB to 1 MiB, for the memory a store fills and empties over and
@@ -21,10 +22,12 @@ import java.util.concurrent.atomic.AtomicLong;
 ///
 /// The arrays of work that comes in bursts, such as the reads ahead of a scan while the file reads from the device or
 /// the leaves a resident key space loads, are [collectable][#acquireCollectable(int)]: the pool recycles them as it
-/// does the others, but reaches the free ones only weakly, so the first collection after a burst frees them. Kept
-/// strongly, the sealed and opened arrays of a scan's reads ahead would stay in the pool for as long as scans read
-/// ahead, one of each size a round reads into, 520 KiB after 1,000 cold chat pages; a burst after a collection
-/// allocates them again, once.
+/// does the others, and holds the free ones strongly while any collectable array is out, so a collection in the middle
+/// of a scan or of a run of leaves, young or full, keeps them; once every one is back, it reaches them only weakly, so
+/// the first collection after that frees them. Kept strongly at rest, the sealed and opened arrays of a scan's reads
+/// ahead would stay in the pool for as long as scans read ahead, one of each size a round reads into, 520 KiB after
+/// 1,000 cold chat pages. A collection between two scans, of any kind, frees them, and the next scan allocates them
+/// again, once.
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
@@ -53,9 +56,13 @@ public final class HeapPool {
     // The collectable acquires so far, and the count the trimmer saw last, as for the other arrays
     private int collectableAcquires;
     private int collectableAcquiresSeen;
-    // Whether the free collectable arrays are kept strongly too, and the set so kept, guarded by the lock; for tests
-    // that count the bytes a burst allocates across collections
+    // The collectable arrays of pooled sizes handed out and not given back yet; while any is, the free ones are held
+    // strongly too. One never given back holds them until a trim of an idle pool drops them
+    private final AtomicInteger collectableOut;
+    // Whether the free collectable arrays are kept strongly whatever is out, guarded by the lock; for tests that count
+    // the bytes a burst allocates across collections
     private boolean holdCollectable;
+    // The free collectable arrays while they are kept strongly, guarded by the lock
     private Collectable heldCollectable;
 
     // The pool the stores of the process share, made with the first; guarded by the class
@@ -128,6 +135,7 @@ public final class HeapPool {
         this.acquiresSeen = new int[free.length];
         this.collectable = new WeakReference<>(null);
         this.collectableLock = new Object();
+        this.collectableOut = new AtomicInteger();
         this.trimmer = trimmed ? this::trimIfIdle : null;
         if (trimmed) {
             IdleTicker.watch(trimmer);
@@ -184,7 +192,7 @@ public final class HeapPool {
     /// {@return an array of at least `capacity` bytes for work that comes in bursts, which goes back to the pool through
     /// [#releaseCollectable(byte\[\])]}
     ///
-    /// A burst reuses the arrays of the burst before it, unless a collection ran between them.
+    /// A burst reuses the arrays of the burst before it, unless a collection ran while none was out.
     ///
     /// @param capacity the least length, not negative
     byte[] acquireCollectable(int capacity) {
@@ -193,6 +201,9 @@ public final class HeapPool {
         }
         var shift = Math.max(MIN_SHIFT, 32 - Integer.numberOfLeadingZeros(Math.max(1, capacity) - 1));
         collectableAcquires++;
+        if (collectableOut.getAndIncrement() == 0) {
+            holdCollectable();
+        }
         var set = collectable.get();
         if (set != null) {
             var array = set.free[shift - MIN_SHIFT].poll();
@@ -221,7 +232,8 @@ public final class HeapPool {
                 if (set == null) {
                     set = new Collectable(free.length);
                     collectable = new WeakReference<>(set);
-                    if (holdCollectable) {
+                    // This array is still counted out, so a set made while others are out is held as they are
+                    if (holdCollectable || collectableOut.get() > 0) {
                         heldCollectable = set;
                     }
                 }
@@ -229,9 +241,31 @@ public final class HeapPool {
         }
         if (set.bytes[size].addAndGet(length) > maxPooledBytes / 2) {
             set.bytes[size].addAndGet(-length);
-            return;
+        } else {
+            set.free[size].offer(array);
         }
-        set.free[size].offer(array);
+        // Counted back once it is free, so no collection runs between the two with the set reached only weakly
+        if (collectableOut.decrementAndGet() == 0) {
+            letGoCollectable();
+        }
+    }
+
+    // Holds the free collectable arrays strongly, as an array is out
+    private void holdCollectable() {
+        synchronized (collectableLock) {
+            if (collectableOut.get() > 0) {
+                heldCollectable = collectable.get();
+            }
+        }
+    }
+
+    // Reaches the free collectable arrays only weakly again, as none is out, unless a test holds them
+    private void letGoCollectable() {
+        synchronized (collectableLock) {
+            if (collectableOut.get() == 0 && !holdCollectable) {
+                heldCollectable = null;
+            }
+        }
     }
 
     /// Gives the free arrays of each size to the collector if no array of that size was acquired since the last call,
@@ -268,8 +302,13 @@ public final class HeapPool {
     void holdCollectableForTests(boolean hold) {
         synchronized (collectableLock) {
             holdCollectable = hold;
-            heldCollectable = hold ? collectable.get() : null;
+            heldCollectable = hold || collectableOut.get() > 0 ? collectable.get() : null;
         }
+    }
+
+    /// {@return the collectable arrays of pooled sizes handed out and not given back; for tests}
+    int collectableOutForTests() {
+        return collectableOut.get();
     }
 
     /// Drops the free collectable arrays, as a collection that found them unreachable does; for tests.
