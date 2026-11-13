@@ -275,6 +275,9 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             }
             var recovered = LogRecovery.replay(files, opened.keys(), opened.header().storeId(), firstSegment,
                     superblock == null ? 0 : superblock.sequence(), new LogRecovery.Sink() {
+                        // Of this replay alone, so nothing holds its last chunk once the open ends but the versions on it
+                        private final ReplayValues values = new ReplayValues();
+
                         @Override
                         public void catalog(int keyspace, String name) {
                             ledger.bind(keyspace, name);
@@ -282,7 +285,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
 
                         @Override
                         public boolean commit(long sequence, byte[] body) {
-                            return ledger.replay(sequence, body);
+                            return ledger.replay(sequence, body, values);
                         }
 
                         @Override
