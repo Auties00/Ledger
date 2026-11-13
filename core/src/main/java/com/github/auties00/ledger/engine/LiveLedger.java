@@ -87,6 +87,11 @@ public final class LiveLedger implements Ledger {
     /// block that found a key takes the next one back to one; a block of a batch overwriting keys that memory holds one
     /// in three of finds none about once in 600.
     private static final int SKIPPED_BLOCKS = 64;
+    /// The writes from which a commit of the pipeline lets go of itself as the pipeline's last commit once it is
+    /// published ([#forgetLastCommits()]): the commit holds about 100 bytes of state per write (its batch's arrays, its
+    /// chains, its key spaces and the writes as applied), 100 KiB at this many, against two compare-and-sets of the
+    /// roles and one small allocation.
+    static final int FORGET_AFTER_WRITES = 1_024;
     private static final VarHandle LAST_PUBLISHED;
     private static final VarHandle LATEST;
 
@@ -835,7 +840,24 @@ public final class LiveLedger implements Ledger {
         // publication can throw
         writes.finish();
         pruneWritten(pending.applier.touched);
-        return ticket(pending.sequence);
+        var commit = ticket(pending.sequence);
+        if (size >= FORGET_AFTER_WRITES) {
+            forgetPublished();
+        }
+        return commit;
+    }
+
+    /// Lets go of the last commit of the pipeline, on the thread of a large commit that published and pruned its chains,
+    /// so that its batch, chains and writes as applied go with the next collection instead of the next commit or tick.
+    ///
+    /// The commit has published: a failure of a pass of the publisher this thread runs for later commits is theirs, and
+    /// their threads, which the pass wakes, meet it; it never fails this commit.
+    private void forgetPublished() {
+        try {
+            forgetLastCommits();
+        } catch (RuntimeException _) {
+            // The commits of the pass are woken, and their threads publish them or fail with it
+        }
     }
 
     /// Prepares write `index` of a commit of the pipeline before the commit is given a sequence: opens the chain of
@@ -2170,7 +2192,9 @@ public final class LiveLedger implements Ledger {
 
     /// Lets go of the last commit the arrival list and the sequence hold on to, putting an empty one of the same
     /// sequence in its place, unless a thread holds or wants a role or a commit is under way; at a tick of the
-    /// [IdleTicker], so no commit pays for it.
+    /// [IdleTicker], and on the committing thread of a commit of [#FORGET_AFTER_WRITES] writes or more once it published
+    /// and pruned its chains, which may let go of a later commit instead. It never waits for a role: one that is held or
+    /// wanted leaves the commit for the next call.
     ///
     /// The next commit given a sequence takes the last one's place, and the next one that arrives while another
     /// sequences takes the arrival list's: until then, in a store gone quiet or one whose commits stopped meeting,
