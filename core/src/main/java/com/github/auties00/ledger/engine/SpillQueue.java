@@ -1,9 +1,7 @@
 package com.github.auties00.ledger.engine;
 
-import javax.crypto.AEADBadTagException;
 import javax.crypto.Cipher;
-import javax.crypto.spec.GCMParameterSpec;
-import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
@@ -53,8 +51,10 @@ final class SpillQueue {
     static final int LOG_VALUE_MIN = 256;
     /// The bytes of an AES block.
     static final int BLOCK = 16;
-    /// The bytes of a tag: 96 bits of GMAC.
-    private static final int TAG_BYTES = 12;
+    /// The MAC of the tags, HMAC-SHA256, of which a tag keeps the first 96 bits.
+    private static final String TAG_ALGORITHM = "HmacSHA256";
+    /// The bytes of an HMAC-SHA256 digest, and of the key of the tags.
+    private static final int DIGEST_BYTES = 32;
     /// The scratch past which a [Crypto] given back lets go of it: the values of messages take a few kilobytes.
     private static final int KEPT_SCRATCH = 16 << 10;
     private static final SecureRandom KEYS = new SecureRandom();
@@ -63,8 +63,9 @@ final class SpillQueue {
     // The held bytes the thread moves values down to
     private final long lowWater;
     private final boolean encrypted;
-    // The key of the tags, drawn for this open and never stored, or null without encryption
-    private final SecretKeySpec tagKey;
+    // The key of the tags, drawn for this open at the first value moved or read back and never stored; null before,
+    // and without encryption
+    private volatile SecretKeySpec tagKey;
     private final Object lock;
     // The records not taken, oldest first; guarded by the lock
     private final ArrayDeque<Record> records;
@@ -75,8 +76,9 @@ final class SpillQueue {
     // Whether the thread that moves values runs
     private final AtomicBoolean running;
     private volatile boolean closed;
-    // The latest sequence the log holds durably, or null until the store has a log
-    private volatile LongSupplier durable;
+    // The latest sequence the log holds durably; before the store has a log, the commits queued are those a recovery
+    // replays from it, every one durable
+    private volatile LongSupplier durable = () -> Long.MAX_VALUE;
     private final AtomicReferenceArray<Crypto> cryptos;
     // The values moved to the log and to arrays of their own, for tests
     private final AtomicLong loggedValues = new AtomicLong();
@@ -85,23 +87,33 @@ final class SpillQueue {
     /// Creates the queue of a store.
     ///
     /// @param budget the bytes of values whose frames are durable the queue holds before it moves them
-    /// @param encrypted whether the store's log is encrypted, so the values read back are authenticated by a GMAC
+    /// @param encrypted whether the store's log is encrypted, so the values read back are authenticated by an HMAC
     SpillQueue(long budget, boolean encrypted) {
         this.budget = budget;
         this.lowWater = budget - budget / 4;
         this.encrypted = encrypted;
-        if (encrypted) {
-            var key = new byte[16];
-            KEYS.nextBytes(key);
-            this.tagKey = new SecretKeySpec(key, "AES");
-        } else {
-            this.tagKey = null;
-        }
         this.lock = new Object();
         this.records = new ArrayDeque<>();
         this.segments = new ArrayList<>();
         this.running = new AtomicBoolean();
         this.cryptos = new AtomicReferenceArray<>(Math.max(4, 2 * Runtime.getRuntime().availableProcessors()));
+    }
+
+    /// {@return the key of the tags, drawn at the first call}
+    private SecretKeySpec tagKey() {
+        var key = tagKey;
+        if (key == null) {
+            synchronized (lock) {
+                key = tagKey;
+                if (key == null) {
+                    var bytes = new byte[DIGEST_BYTES];
+                    KEYS.nextBytes(bytes);
+                    key = new SecretKeySpec(bytes, TAG_ALGORITHM);
+                    tagKey = key;
+                }
+            }
+        }
+        return key;
     }
 
     /// {@return the budget for a heap of `maxMemory` bytes: a 256th, from 4 MiB to 64 MiB}
@@ -145,7 +157,7 @@ final class SpillQueue {
             records.addLast(record);
             held = held + record.bytes;
         }
-        if (over() && durable != null) {
+        if (over()) {
             start();
         }
     }
@@ -173,10 +185,7 @@ final class SpillQueue {
 
     private void run() {
         try {
-            var log = durable;
-            if (log != null) {
-                drain(log);
-            }
+            drain(durable);
         } finally {
             running.set(false);
         }
@@ -189,7 +198,7 @@ final class SpillQueue {
     /// {@return whether the queue is over its budget and its oldest record's frame is durable}
     private boolean movable() {
         var log = durable;
-        if (log == null || !over()) {
+        if (!over()) {
             return false;
         }
         synchronized (lock) {
@@ -201,13 +210,27 @@ final class SpillQueue {
     /// Moves the values of the oldest records whose commits `durableSequence` gives durable, while the queue holds more
     /// than three quarters of its budget, on the caller's thread.
     void drain(LongSupplier durableSequence) {
+        drain(durableSequence, lowWater);
+    }
+
+    /// Moves values on the caller's thread while the queue holds more than twice its budget, down to the budget: a
+    /// recovery replays commits faster than the queue's thread alone moves their values, which it then helps.
+    void keepUp() {
+        if (held - budget > budget) {
+            drain(durable, budget);
+        }
+    }
+
+    /// Moves the values of the oldest records whose commits `durableSequence` gives durable, while the queue holds more
+    /// than `downTo` bytes, on the caller's thread.
+    private void drain(LongSupplier durableSequence, long downTo) {
         var crypto = takeCrypto();
         try {
             while (!closed) {
                 Record record;
                 synchronized (lock) {
                     record = records.peekFirst();
-                    if (record == null || held <= lowWater || record.sequence > durableSequence.getAsLong()) {
+                    if (record == null || held <= downTo || record.sequence > durableSequence.getAsLong()) {
                         return;
                     }
                     records.pollFirst();
@@ -447,31 +470,43 @@ final class SpillQueue {
     }
 
     /// The ciphers of one thread at a time: those that authenticate a value moved to the log and decrypt it back.
+    ///
+    /// Neither allocates per value but the 32-byte digest the JDK's HMAC returns: the keystream of a value is AES-ECB of
+    /// its counter blocks under a cipher keyed once per segment use, where a cipher in CTR mode takes a new IV and with
+    /// it a new initialization per value, and the tag is an HMAC under a key set once, where a GMAC takes a nonce and an
+    /// initialization per value and copies its input twice, as the JDK's GCM buffers what it authenticates.
     static final class Crypto {
-        private final SpillQueue queue;
-        // AES-CTR under the key of a segment use, and AES-GCM under the queue's key, which makes the tags; null without
-        // encryption
-        private final Cipher ctr;
-        private final Cipher gcm;
+        // AES-ECB under the key of the segment use it last decrypted from, which makes keystream blocks, and
+        // HMAC-SHA256 under the queue's key, which makes the tags; null without encryption
+        private final Cipher blocks;
+        private final Mac mac;
+        // The key blocks is under, or null before the first decryption
+        private SecretKeySpec blocksKey;
         private final CRC32C crc;
-        private final byte[] tag;
+        // The stamp a tag authenticates with the value, then the digest of the tag
+        private final byte[] stamp;
+        private final byte[] digest;
         private byte[] scratch;
+        // The counter blocks of a value and the keystream they encrypt to
+        private byte[] counters;
+        private byte[] keystream;
 
         private Crypto(SpillQueue queue) {
-            this.queue = queue;
             if (queue.encrypted) {
                 try {
-                    this.ctr = Cipher.getInstance("AES/CTR/NoPadding");
-                    this.gcm = Cipher.getInstance("AES/GCM/NoPadding");
+                    this.blocks = Cipher.getInstance("AES/ECB/NoPadding");
+                    this.mac = Mac.getInstance(TAG_ALGORITHM);
+                    mac.init(queue.tagKey());
                 } catch (GeneralSecurityException exception) {
-                    throw new IllegalStateException("AES is unavailable", exception);
+                    throw new IllegalStateException("AES or HMAC-SHA256 is unavailable", exception);
                 }
             } else {
-                this.ctr = null;
-                this.gcm = null;
+                this.blocks = null;
+                this.mac = null;
             }
             this.crc = new CRC32C();
-            this.tag = new byte[TAG_BYTES];
+            this.stamp = new byte[Long.BYTES];
+            this.digest = new byte[DIGEST_BYTES];
         }
 
         /// {@return an array of at least `length` bytes, which only this holder uses until it is given back}
@@ -488,6 +523,10 @@ final class SpillQueue {
             if (scratch != null && scratch.length > KEPT_SCRATCH) {
                 scratch = null;
             }
+            if (counters != null && counters.length > KEPT_SCRATCH) {
+                counters = null;
+                keystream = null;
+            }
         }
 
         /// {@return the place in the log of the `length` bytes at `offset` of `home`, the value of the version stamped
@@ -496,20 +535,13 @@ final class SpillQueue {
                           int offset, int length) {
             var value = scratch(length);
             MemorySegment.copy(home, offset, MemorySegment.ofArray(value), 0, length);
-            if (gcm == null) {
+            if (mac == null) {
                 crc.reset();
                 crc.update(value, 0, length);
                 return new LogValue(segment, frameOffset, bodyIndex, 0, (int) crc.getValue());
             }
-            try {
-                // A stamp is unique within an open and a version moves once, so no nonce repeats under the key
-                gcm.init(Cipher.ENCRYPT_MODE, queue.tagKey, new GCMParameterSpec(TAG_BYTES * 8, nonce(stamp)));
-                gcm.updateAAD(value, 0, length);
-                var made = gcm.doFinal();
-                return new LogValue(segment, frameOffset, bodyIndex, Bytes.i64(made, 0), Bytes.i32(made, Long.BYTES));
-            } catch (GeneralSecurityException exception) {
-                throw new IllegalStateException("AES-GCM failed", exception);
-            }
+            tag(value, length, stamp);
+            return new LogValue(segment, frameOffset, bodyIndex, Bytes.i64(digest, 0), Bytes.i32(digest, Long.BYTES));
         }
 
         /// {@return the `length` bytes after the first `skip` of `sealed`, decrypted, the bytes from the block holding
@@ -517,51 +549,60 @@ final class SpillQueue {
         ///
         /// A body is sealed from the counter block after the first, `nonce || 2`, so the block of a byte at `i` of it
         /// is `nonce || 2 + i / 16`; a body holds far fewer than 2^36 bytes, so the counter never carries into the
-        /// nonce, which the JDK's CTR would.
+        /// nonce.
         byte[] decrypt(SecretKeySpec key, long frameOffset, int bodyIndex, byte[] sealed, int skip, int length) {
-            var counter = new byte[BLOCK];
-            Bytes.i64(counter, Integer.BYTES, frameOffset);
-            Bytes.i32(counter, Integer.BYTES + Long.BYTES, 2 + (bodyIndex >>> 4));
-            try {
-                ctr.init(Cipher.DECRYPT_MODE, key, new IvParameterSpec(counter));
-                if (skip > 0) {
-                    ctr.update(sealed, 0, skip, sealed, 0);
-                }
-                var value = new byte[length];
-                ctr.doFinal(sealed, skip, length, value, 0);
-                return value;
-            } catch (GeneralSecurityException exception) {
-                throw new IllegalStateException("AES-CTR failed", exception);
+            var bytes = (skip + length + BLOCK - 1) & -BLOCK;
+            if (counters == null || counters.length < bytes) {
+                counters = new byte[Math.max(bytes, 2 << 10)];
+                keystream = new byte[counters.length];
             }
+            var first = 2 + (bodyIndex >>> 4);
+            for (var block = 0; block < bytes; block += BLOCK) {
+                Bytes.i32(counters, block, 0);
+                Bytes.i64(counters, block + Integer.BYTES, frameOffset);
+                Bytes.i32(counters, block + Integer.BYTES + Long.BYTES, first + (block >>> 4));
+            }
+            try {
+                if (key != blocksKey) {
+                    blocks.init(Cipher.ENCRYPT_MODE, key);
+                    blocksKey = key;
+                }
+                blocks.update(counters, 0, bytes, keystream, 0);
+            } catch (GeneralSecurityException exception) {
+                blocksKey = null;
+                throw new IllegalStateException("AES failed", exception);
+            }
+            var value = new byte[length];
+            for (var i = 0; i < length; i++) {
+                value[i] = (byte) (sealed[skip + i] ^ keystream[skip + i]);
+            }
+            return value;
         }
 
         /// {@return whether `value` is the value `logged` holds the tag of, of the version stamped `stamp`}
         boolean verifies(byte[] value, long stamp, LogValue logged) {
-            if (gcm == null) {
+            if (mac == null) {
                 crc.reset();
                 crc.update(value, 0, value.length);
                 return (int) crc.getValue() == logged.tagLow();
             }
-            Bytes.i64(tag, 0, logged.tagHigh());
-            Bytes.i32(tag, Long.BYTES, logged.tagLow());
-            try {
-                // Decryption verifies under a nonce any number of times
-                gcm.init(Cipher.DECRYPT_MODE, queue.tagKey, new GCMParameterSpec(TAG_BYTES * 8, nonce(stamp)));
-                gcm.updateAAD(value, 0, value.length);
-                gcm.doFinal(tag, 0, TAG_BYTES);
-                return true;
-            } catch (AEADBadTagException _) {
-                return false;
-            } catch (GeneralSecurityException exception) {
-                throw new IllegalStateException("AES-GCM failed", exception);
-            }
+            tag(value, value.length, stamp);
+            // Every bit compared whatever the first that differs
+            return ((Bytes.i64(digest, 0) ^ logged.tagHigh()) | (Bytes.i32(digest, Long.BYTES) ^ logged.tagLow())) == 0;
         }
 
-        /// {@return the nonce of the tag of the version stamped `stamp`}
-        private static byte[] nonce(long stamp) {
-            var nonce = new byte[TAG_BYTES];
-            Bytes.i64(nonce, Integer.BYTES, stamp);
-            return nonce;
+        /// Writes to the digest the HMAC of `stamp` and the first `length` bytes of `value`, of which a tag keeps the
+        /// first 96 bits.
+        private void tag(byte[] value, int length, long stamp) {
+            Bytes.i64(this.stamp, 0, stamp);
+            try {
+                mac.update(this.stamp);
+                mac.update(value, 0, length);
+                mac.doFinal(digest, 0);
+            } catch (GeneralSecurityException exception) {
+                mac.reset();
+                throw new IllegalStateException("HMAC-SHA256 failed", exception);
+            }
         }
     }
 }

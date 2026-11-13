@@ -394,8 +394,9 @@ public final class LiveLedger implements Ledger {
     /// of values that may leave the heap.
     ///
     /// `body` is at `commitStart` of the body of the frame at `frameOffset` of `segment`, which holds it durably: once
-    /// the queue holds more than its budget, the copies move off the heap, so the values of a long log do not stay
-    /// there whole until the first checkpoint.
+    /// the queue holds more than its budget, the copies move off the heap on the queue's thread, beside the replay, and
+    /// on the thread of the recovery while that one falls behind ([SpillQueue#keepUp()]), so the values of a long log
+    /// do not stay in the heap whole until the first checkpoint.
     ///
     /// @param values the chunks of this open's replay
     /// @param segment the use of the segment that holds the frame, or `null` to list no value
@@ -495,10 +496,7 @@ public final class LiveLedger implements Ledger {
         if (record != null) {
             record.locate(segment, frameOffset, commitStart, false);
             queue.add(record);
-            if (queue.over()) {
-                // The log holds every replayed frame
-                queue.drain(() -> Long.MAX_VALUE);
-            }
+            queue.keepUp();
         }
         var unitBytes = 0L;
         for (var unit : units) {
