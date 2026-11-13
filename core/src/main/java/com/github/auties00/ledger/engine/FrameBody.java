@@ -46,10 +46,12 @@ import java.util.Arrays;
 /// one but the last full, rather than in one array of megabytes that the collector would give regions of their own and
 /// that the log reads once: the body of a large batch, which refers to no value, and that of a transaction, whose
 /// values of a few kilobytes it refers to. The log hands the chunks back once it sealed the frame ([#release()]); a
-/// body the log never took goes back with [#discard()]. A chunked body that refers to no value is read through
-/// [#chunkCount()], [#chunk(int)] and [#chunkLength(int)], one that refers to values through its pieces, which then
-/// never span two chunks; [#array()] serves only a body of one array. No pooled chunk is ever an array a body refers
-/// to: those are arrays the pool never hands out.
+/// body the log never took goes back with [#discard()]. From its first chunk until then the body
+/// [holds][HeapPool#hold()] the pool's overflow, where the chunks of the frames sealed before it wait, so a collection
+/// while it fills keeps them for it; a body a stopped log leaves to the collector lets go of it ([#abandon()]). A
+/// chunked body that refers to no value is read through [#chunkCount()], [#chunk(int)] and [#chunkLength(int)], one
+/// that refers to values through its pieces, which then never span two chunks; [#array()] serves only a body of one
+/// array. No pooled chunk is ever an array a body refers to: those are arrays the pool never hands out.
 ///
 /// A write checks once that the array it writes has room for its longest encoding, and takes a path that checks each
 /// field only when it may not: that path, which grows the array or goes on in the next chunk, runs at a chunk boundary
@@ -299,8 +301,26 @@ final class FrameBody {
             assert poison(data);
             pooled.pool.release(data);
         }
+        // Once every chunk is back, so no collection between the two finds the pool's overflow unheld
+        pooled.hold = null;
         pooled.spread = null;
         data = null;
+    }
+
+    /// Lets go of the [hold][HeapPool#hold()] on the pool's overflow the body took with its first chunk, and keeps its
+    /// chunks, which never go back to the pool: for a body a stopped log leaves to the collector, whose frame a seal
+    /// may still read. A body that took no chunk, or let go already, is left as it is.
+    void abandon() {
+        var pooled = this.pooled;
+        if (pooled != null) {
+            pooled.hold = null;
+        }
+    }
+
+    /// {@return whether the body holds the pool's overflow, from its first chunk until its release; for tests}
+    boolean holdsPoolForTests() {
+        var pooled = this.pooled;
+        return pooled != null && pooled.hold != null;
     }
 
     /// Fills `array`, about to go back to the pool, with a pattern, with assertions on: a frame sealed from a body after
@@ -859,13 +879,22 @@ final class FrameBody {
         private byte state;
         // The pieces of a chunked body that refers to values, as of its length then, or null
         private Spread spread;
+        // The pool's hold on its overflow from the body's first chunk until its release, or null: the chunks of the
+        // frame before it, which went back to the overflow as it was sealed, are this body's next ones, and those of a
+        // large commit's next frame once this one is sealed
+        private Object hold;
 
         Pooled(HeapPool pool) {
             this.pool = pool;
         }
 
         /// {@return a chunk of the pool, of exactly [#CHUNK_BYTES]}
+        ///
+        /// The first holds the pool's overflow for the body.
         byte[] takeChunk() {
+            if (hold == null) {
+                hold = pool.hold();
+            }
             var chunk = pool.acquire(CHUNK_BYTES);
             if (chunk.length != CHUNK_BYTES) {
                 throw new IllegalStateException("The pool gave a chunk of " + chunk.length + " bytes");

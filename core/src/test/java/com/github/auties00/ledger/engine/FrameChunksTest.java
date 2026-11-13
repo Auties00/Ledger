@@ -100,6 +100,13 @@ class FrameChunksTest {
         return IntStream.range(0, body.chunkCount()).mapToObj(body::chunk).toList();
     }
 
+    /// {@return a pool of 1 GiB that keeps its overflow through collections, as the chunks released are looked for in it}
+    private static HeapPool pool() {
+        var pool = new HeapPool(1L << 30, false);
+        pool.holdOverflowForTests(true);
+        return pool;
+    }
+
     /// Checks that `pool` holds each of `arrays` free exactly once, and no other array of a chunk.
     private static void assertFreeOnce(HeapPool pool, List<byte[]> arrays) {
         var free = pool.freeForTests(CHUNK);
@@ -117,7 +124,7 @@ class FrameChunksTest {
     @MethodSource("boundaries")
     @DisplayName("holds the bytes a body of one array holds, the chunk boundary anywhere in a write")
     void boundary(Write write, int before, int chunk) {
-        var pool = new HeapPool(1L << 30, false);
+        var pool = pool();
         var chunked = new FrameBody(1_024, FrameBody.NOT_REFERABLE, pool);
         var plain = new FrameBody(1_024);
         for (var body : List.of(chunked, plain)) {
@@ -135,7 +142,7 @@ class FrameChunksTest {
         var random = new Random(42);
         for (var target : new int[]{300 << 10, 600 << 10, 1_536 << 10}) {
             for (var capacity : new int[]{16, 256, CHUNK / 2, CHUNK, target}) {
-                var pool = new HeapPool(1L << 30, false);
+                var pool = pool();
                 var chunked = new FrameBody(capacity, FrameBody.NOT_REFERABLE, pool);
                 var plain = new FrameBody(16);
                 while (plain.size() < target) {
@@ -164,7 +171,7 @@ class FrameChunksTest {
     @DisplayName("a body on chunks that refers to values, as a transaction's does, holds the bytes a body of one array holds, its chunks given back once")
     void referring() {
         var random = new Random(11);
-        var pool = new HeapPool(1L << 30, false);
+        var pool = pool();
         var chunked = FrameBody.forTransaction(pool);
         var plain = new FrameBody(16);
         while (plain.size() < 3 * CHUNK + 1_000) {
@@ -208,7 +215,7 @@ class FrameChunksTest {
     @Test
     @DisplayName("a body started on a chunk that ends small is one array, which goes back as a run takes it")
     void overestimated() {
-        var pool = new HeapPool(1L << 30, false);
+        var pool = pool();
         var body = new FrameBody(4 * CHUNK, FrameBody.NOT_REFERABLE, pool);
         body.put(1, bytes(10, 1), bytes(1_000, 2));
         assertEquals(1, body.chunkCount());
@@ -229,7 +236,7 @@ class FrameChunksTest {
     @Test
     @DisplayName("a chunked body serves no single array, and a released one no bytes at all")
     void accessors() {
-        var pool = new HeapPool(1L << 30, false);
+        var pool = pool();
         var body = new FrameBody(256, FrameBody.NOT_REFERABLE, pool);
         fillTo(body, CHUNK + 100);
         assertEquals(2, body.chunkCount());
@@ -247,7 +254,7 @@ class FrameChunksTest {
     @Test
     @DisplayName("gives its chunks back once, however often it is released or discarded")
     void releasesOnce() {
-        var pool = new HeapPool(1L << 30, false);
+        var pool = pool();
         var body = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
         fillTo(body, 3 * CHUNK + 5);
         var arrays = arrays(body);
@@ -275,7 +282,7 @@ class FrameChunksTest {
     @Test
     @DisplayName("a body taken back before the log took it gives its chunks back at once")
     void discarded() {
-        var pool = new HeapPool(1L << 30, false);
+        var pool = pool();
         var body = new FrameBody(256, FrameBody.NOT_REFERABLE, pool);
         fillTo(body, 2 * CHUNK + 1);
         var arrays = arrays(body);

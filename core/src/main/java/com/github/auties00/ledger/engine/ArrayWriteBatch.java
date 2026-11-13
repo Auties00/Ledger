@@ -20,7 +20,10 @@ import java.util.Objects;
 /// batch copies its bytes more than that once: the values of paged key spaces go on chunks of their own, which the
 /// store's versions keep as they are, and everything the store copies goes on others, which return to the pool once the
 /// commit [ends][#finish()]. An array of over 1 MiB, which a doubling array of a batch of a thousand messages was, the
-/// pool does not recycle and the collector gives regions of its own.
+/// pool does not recycle and the collector gives regions of its own. From its move to a rope until it leaves it, at
+/// the end of the commit or at [#clear()], the batch [holds][HeapPool#hold()] the pool's overflow, where the chunks of
+/// the frames of the commits before it wait, so a collection while it fills keeps them for its rope; a batch dropped
+/// without either holds nothing once it is unreachable.
 ///
 /// A value of half a [chunk][#CHUNK_BYTES] or more never enters that array: it takes an array of its own at the put,
 /// which is private to the batch, is never written again, and is what the file of large values seals and the store's
@@ -142,6 +145,8 @@ public final class ArrayWriteBatch implements WriteBatch {
     private Chunk valueChunk;
     // The bytes of the encodings on the rope
     private long ropeBytes;
+    // The pool's hold on its overflow while the batch has a rope, or null
+    private Object ropeHold;
     private int size;
     // The totals of the writes, written only by add() and clear(): whether a write removes a range
     private boolean removesRanges;
@@ -412,6 +417,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// Moves the encodings of the batch to a rope, rewriting the spans of its writes; a value on an array of its own
     /// stays there, so only keys and values below [#OWN_BYTES] come here, and none has a span that outgrows a chunk.
     private void moveToRope() {
+        ropeHold = pool.hold();
         chunks = new Chunk[8];
         chunkCount = 1;
         for (var i = 0; i < size; i++) {
@@ -517,6 +523,13 @@ public final class ArrayWriteBatch implements WriteBatch {
         keyChunk = null;
         valueChunk = null;
         ropeBytes = 0;
+        // Once every chunk is back, so no collection between the two finds the pool's overflow unheld
+        ropeHold = null;
+    }
+
+    /// {@return whether the batch holds the pool's overflow, from its move to a rope until it leaves it; for tests}
+    boolean holdsPoolForTests() {
+        return ropeHold != null;
     }
 
     /// One array of a batch's rope.

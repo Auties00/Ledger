@@ -122,7 +122,8 @@ import java.util.zip.CRC32C;
 ///
 /// Once a frame is sealed into the output, which is all a retried write or a rewrite after an interrupt sends again,
 /// its body is never read: the writer gives the body's pooled chunks back then ([FrameBody#release()]). A stopped
-/// writer leaves the bodies it still queues to the collector.
+/// writer leaves the bodies it still queues to the collector, their holds on the pool's overflow let go
+/// ([FrameBody#abandon()]), as the writer stays reachable from its store.
 ///
 /// A failed write or force stops the writer for good: [#awaitDurable(long)] and every later [#append] throw. A failed
 /// write through only moves the writer to forces.
@@ -1604,6 +1605,13 @@ final class LogWriter {
         wake(Long.MAX_VALUE);
         queueLock.lock();
         try {
+            // No flush writes them now: an append after the failure is refused, and leaves its body to its writer
+            for (var i = 0; i < queue.size(); i++) {
+                queue.get(i).body().abandon();
+            }
+            if (deferred != null) {
+                deferred.body().abandon();
+            }
             queueDrained.signalAll();
         } finally {
             queueLock.unlock();
