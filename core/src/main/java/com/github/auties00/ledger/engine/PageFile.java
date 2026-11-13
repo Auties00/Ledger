@@ -495,7 +495,8 @@ final class PageFile implements AutoCloseable {
     /// [collectable][HeapPool#acquireCollectable(int)] arrays of the store's pool, whole, which the caller gives back
     /// with [#releasePrefetched(byte\[\])] once it no longer reads them: a load copies the entries of each run of
     /// leaves into memory and forgets the leaves, so an array of its own for each, a copy of the unit's content, would
-    /// be allocated only to be thrown away.
+    /// be allocated only to be thrown away. If it throws, it has given back the arrays of the units it did read, of
+    /// every run.
     ///
     /// @param kind the kind every unit must have, or [#NODE] for leaves and branches
     /// @param collectable receives, for each unit, whether it lies in such an array, or `null` for units in arrays of
@@ -522,14 +523,27 @@ final class PageFile implements AutoCloseable {
         var plan = new Runs(joined, count, Long.MAX_VALUE);
         var tasks = plan.count + single;
         var running = Math.min(Math.min(READ_CHANNELS, threads), tasks);
-        ClaimedIndexes.run("ledger-read", tasks, running - 1, task -> {
-            if (task < plan.count) {
-                readRun(joined, slots, plan, task, kind, units, collectable);
-            } else {
-                var index = alone[task - plan.count];
-                units[index] = read(refs.get(index), kind, false);
+        try {
+            ClaimedIndexes.run("ledger-read", tasks, running - 1, task -> {
+                if (task < plan.count) {
+                    readRun(joined, slots, plan, task, kind, units, collectable);
+                } else {
+                    var index = alone[task - plan.count];
+                    units[index] = read(refs.get(index), kind, false);
+                }
+            });
+        } catch (Throwable throwable) {
+            // Every index is done once the run throws, so no thread opens a unit into these any more
+            if (collectable != null) {
+                for (var i = 0; i < units.length; i++) {
+                    if (collectable[i]) {
+                        pool.releaseCollectable(units[i]);
+                        collectable[i] = false;
+                    }
+                }
             }
-        });
+            throw throwable;
+        }
         return units;
     }
 

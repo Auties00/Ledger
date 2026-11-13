@@ -107,6 +107,8 @@ final class TreeCursor {
     /// Creates a cursor over the entries of the tree under `root` from `from`, included, to `to`, excluded, either
     /// `null` for no bound.
     ///
+    /// A cursor that cannot read the leaf it starts at gives back what it read ahead before it throws.
+    ///
     /// @param root the root, or `null` for an empty tree
     /// @param from the lowest key, which the cursor keeps and no one may change while it is used
     /// @param to the first key past the range, which the cursor keeps and no one may change while it is used
@@ -125,7 +127,14 @@ final class TreeCursor {
         if (root == null) {
             exhausted = true;
         } else {
-            seek(pages.read(root.ref(), PageFile.NODE, true));
+            try {
+                seek(pages.read(root.ref(), PageFile.NODE, true));
+            } catch (Throwable throwable) {
+                // A leaf the seek needs that cannot be read, once it read its siblings and their blobs ahead: no
+                // caller holds the cursor to give them back
+                release();
+                throw throwable;
+            }
         }
     }
 
