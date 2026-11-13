@@ -261,8 +261,9 @@ final class PageFile implements AutoCloseable {
     ///
     /// A delta record still reads its delta page and its base through the cache. A screened read of a delta record
     /// asks the cache first whether it takes the leaf: if not, the base is read past the cache, which the delta page,
-    /// shared by the other records of its page, still goes to. A screened read first takes back a unit, or the leaf of
-    /// a delta record, the cache [refused][#recalled(PageRef, byte)] lately, reading nothing.
+    /// shared by the other records of its page, still goes to. A read that caches what it reads as read first takes
+    /// back a unit, or the leaf of a delta record, the cache [refused][#recalled(PageRef, byte)] lately, reading
+    /// nothing.
     ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     /// @param cached whether to keep the unit in the cache
@@ -273,7 +274,7 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerIoException if the file cannot be read
     byte[] load(PageRef ref, byte kind, boolean cached, boolean referenced, boolean screened) {
         var screen = cached && referenced && screened;
-        if (screen) {
+        if (cached && referenced) {
             var recalled = recalled(ref, kind);
             if (recalled != null) {
                 return recalled;
