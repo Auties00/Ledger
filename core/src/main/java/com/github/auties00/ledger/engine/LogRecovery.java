@@ -47,9 +47,14 @@ import java.util.zip.CRC32C;
 /// later group it is a commit no one was told of. The commits of its run before it are replayed, those after it are
 /// not. A run whose frame authenticates but whose entries are malformed is damage, not a tear, and is refused.
 ///
-/// Segments are read through a buffer, a part at a time.
+/// Segments are read through one buffer, a part at a time, which passes from each segment to the next. A frame is
+/// authenticated where the buffer holds it, and only its opened body is a new array: replay copies no sealed bytes, and
+/// a frame longer than the buffer is read into an array of its own, which no later frame keeps.
 final class LogRecovery {
     private static final int BUFFER = 1 << 20;
+    /// The longest sealed body a frame can declare: a body of [FrameBody#MAX_BYTES] with its tag or CRC. A longer one
+    /// is a damaged header, and its length would overflow once the frame header is added.
+    private static final int MAX_SEALED = FrameBody.MAX_BYTES + Math.max(LogWriter.TAG_BYTES, Integer.BYTES);
 
     private LogRecovery() {
     }
@@ -91,10 +96,12 @@ final class LogRecovery {
         var lastSegment = 0L;
         LogFiles.Prepared empty = null;
         Path lastWritten = null;
+        byte[] buffer = null;
         for (var index = 0; index < segments.size(); index++) {
             var number = segments.get(index);
             var path = files.segment(number);
-            try (var reader = new SegmentReader(path)) {
+            try (var reader = new SegmentReader(path, buffer)) {
+                buffer = reader.buffer();
                 var header = new byte[LogWriter.SEGMENT_HEADER];
                 if (!reader.read(0, header, 0, header.length) || !intactSegmentHeader(header, crc)) {
                     // The header is forced before the segment takes its name, so only a file holding nothing past its
@@ -163,11 +170,18 @@ final class LogRecovery {
                     var type = frame[16];
                     var end = position + LogWriter.FRAME_HEADER + sealedLength;
                     byte[] body = null;
-                    if (sealedLength >= 0 && end <= reader.size()) {
-                        var sealed = new byte[LogWriter.FRAME_HEADER + sealedLength];
-                        System.arraycopy(frame, 0, sealed, 0, LogWriter.FRAME_HEADER);
-                        if (reader.read(position + LogWriter.FRAME_HEADER, sealed, LogWriter.FRAME_HEADER, sealedLength)) {
-                            body = open(sealed, position, sealedLength, keys, segmentKey, cipher, crc);
+                    if (sealedLength >= 0 && sealedLength <= MAX_SEALED && end <= reader.size()) {
+                        byte[] sealed;
+                        int at;
+                        if (sealedLength <= reader.buffer().length) {
+                            sealed = reader.buffer();
+                            at = reader.view(position + LogWriter.FRAME_HEADER, sealedLength);
+                        } else {
+                            sealed = new byte[sealedLength];
+                            at = reader.read(position + LogWriter.FRAME_HEADER, sealed, 0, sealedLength) ? 0 : -1;
+                        }
+                        if (at >= 0) {
+                            body = open(frame, sealed, at, position, sealedLength, keys, segmentKey, cipher, crc);
                         }
                     }
                     if (body == null) {
@@ -275,18 +289,22 @@ final class LogRecovery {
         return wholeFrameHeader(frame, tag, crc) && ByteBuffer.wrap(frame).getLong(LogWriter.USE_TAG_OFFSET) == useTag;
     }
 
-    /// {@return the body of the frame in `sealed`, its header then its sealed body, at `position` of its segment, or
-    /// `null` if it fails authentication}
-    private static byte[] open(byte[] sealed, long position, int sealedLength, StoreKeys keys, SecretKeySpec segmentKey,
-                               Cipher cipher, CRC32C crc) {
+    /// {@return a new array holding the body of the frame at `position` of its segment, whose header is `header` and
+    /// whose `sealedLength` sealed bytes start at `at` of `sealed`, or `null` if it fails authentication}
+    ///
+    /// The header authenticated is the one replay parsed. The result never shares `sealed`, which may be the buffer the
+    /// next frame is read into.
+    private static byte[] open(byte[] header, byte[] sealed, int at, long position, int sealedLength, StoreKeys keys,
+                               SecretKeySpec segmentKey, Cipher cipher, CRC32C crc) {
         if (keys.encrypted()) {
             if (sealedLength < LogWriter.TAG_BYTES) {
                 return null;
             }
             try {
                 cipher.init(Cipher.DECRYPT_MODE, segmentKey, new GCMParameterSpec(LogWriter.TAG_BYTES * 8, LogWriter.nonce(position)));
-                cipher.updateAAD(sealed, 0, LogWriter.FRAME_HEADER);
-                return cipher.doFinal(sealed, LogWriter.FRAME_HEADER, sealedLength);
+                cipher.updateAAD(header, 0, LogWriter.FRAME_HEADER);
+                // Into an array the cipher allocates: decrypting in place would leave the body in the buffer
+                return cipher.doFinal(sealed, at, sealedLength);
             } catch (AEADBadTagException _) {
                 return null;
             } catch (GeneralSecurityException exception) {
@@ -298,11 +316,12 @@ final class LogRecovery {
         }
         var bodyLength = sealedLength - Integer.BYTES;
         crc.reset();
-        crc.update(sealed, 0, LogWriter.FRAME_HEADER + bodyLength);
-        if (ByteBuffer.wrap(sealed).getInt(LogWriter.FRAME_HEADER + bodyLength) != (int) crc.getValue()) {
+        crc.update(header, 0, LogWriter.FRAME_HEADER);
+        crc.update(sealed, at, bodyLength);
+        if (ByteBuffer.wrap(sealed).getInt(at + bodyLength) != (int) crc.getValue()) {
             return null;
         }
-        return Arrays.copyOfRange(sealed, LogWriter.FRAME_HEADER, LogWriter.FRAME_HEADER + bodyLength);
+        return Arrays.copyOfRange(sealed, at, at + bodyLength);
     }
 
     /// Throws if a group written after a later force, by any use of the segment whose salt has `tag`, follows the
@@ -329,22 +348,52 @@ final class LogRecovery {
         return true;
     }
 
-    /// A segment read through a buffer of [#BUFFER] bytes, refilled forward as recovery moves through it.
-    private static final class SegmentReader implements AutoCloseable {
+    /// A segment read through a buffer of at most [#BUFFER] bytes, refilled forward as recovery moves through it.
+    ///
+    /// Only bytes the reader itself filled are read from the buffer, so the buffer of another reader can be handed to it.
+    static final class SegmentReader implements AutoCloseable {
         private final FileChannel channel;
         private final long size;
         private final byte[] buffer;
         private long start;
         private int length;
 
-        SegmentReader(Path path) throws IOException {
+        /// Opens the segment at `path`, read through `buffer` if that is as long as the reader needs, otherwise through a
+        /// buffer of its own.
+        ///
+        /// @param buffer the buffer of the reader of an earlier segment, or `null`
+        SegmentReader(Path path, byte[] buffer) throws IOException {
             this.channel = FileChannel.open(path, StandardOpenOption.READ);
             this.size = channel.size();
-            this.buffer = new byte[(int) Math.min(BUFFER, Math.max(size, 1))];
+            var wanted = (int) Math.min(BUFFER, Math.max(size, 1));
+            this.buffer = buffer != null && buffer.length >= wanted ? buffer : new byte[wanted];
         }
 
         long size() {
             return size;
+        }
+
+        /// {@return the buffer the segment is read through, to hand to the reader of the next segment}
+        byte[] buffer() {
+            return buffer;
+        }
+
+        /// {@return the offset in [#buffer()] of the `count` bytes at `position`, read into it if it did not hold them,
+        /// or -1 if the segment does not hold them all}
+        ///
+        /// The bytes stay there until the next call to the reader; `count` is at most the buffer's length.
+        int view(long position, int count) throws IOException {
+            if (position < 0 || position + count > size) {
+                return -1;
+            }
+            if (position < start || position + count > start + length) {
+                fill(position);
+                if (count > length) {
+                    // The file ended before the size it had when the reader opened it
+                    return -1;
+                }
+            }
+            return (int) (position - start);
         }
 
         /// Copies the `count` bytes at `position` into `target` at `offset`.
@@ -365,6 +414,10 @@ final class LogRecovery {
                     return true;
                 }
                 fill(position);
+                if (count > length) {
+                    // The file ended before the size it had when the reader opened it
+                    return false;
+                }
             }
             System.arraycopy(buffer, (int) (position - start), target, offset, count);
             return true;
