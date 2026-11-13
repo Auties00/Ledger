@@ -1,6 +1,7 @@
 package com.github.auties00.ledger.engine;
 
 import com.github.auties00.ledger.Encryption;
+import com.github.auties00.ledger.IoPool;
 import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
@@ -9,6 +10,7 @@ import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.testkit.ChangeInterceptor;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -31,6 +33,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -307,6 +311,124 @@ class FramePoolStressTest {
                 }
                 ledger.commit(ledger.newBatch().put(NAMES, "after", "recovery")).awaitDurable();
             }
+        }
+    }
+
+    @Test
+    @DisplayName("a commit sequenced before the log stopped and applied after a pass the stopped log refused gives its frame's chunks back")
+    void appliedAfterStop() throws Exception {
+        var disk = CrashFileSystem.create();
+        try (var pool = IoPool.create(1)) {
+            var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(disk.getPath("/store"))
+                    .encryption(Encryption.key(KEY)).keyspace(NAMES).commitWindow(Duration.ZERO).ioPool(pool))
+                    .segmentSize(1L << 20)
+                    .build();
+            try {
+                ledger.commit(ledger.newBatch().put(NAMES, "first", "durable")).awaitDurable();
+                var gated = new ConcurrentHashMap<Thread, GatedCommit>();
+                ledger.hookSequencedForTests(_ -> {
+                    var commit = gated.get(Thread.currentThread());
+                    if (commit != null) {
+                        commit.hold();
+                    }
+                });
+                var first = new GatedCommit(ledger, 1, gated);
+                var second = new GatedCommit(ledger, 2, gated);
+                try (var _ = new HeldPool(pool)) {
+                    // Queued behind the held thread, whose flush of it then fails
+                    ledger.commit(ledger.newBatch().put(NAMES, "queued", "behind the held flush"));
+                    first.startAndAwaitSequenced();
+                    second.startAndAwaitSequenced();
+                    disk.stopAfter(0);
+                }
+                var log = ledger.logForTests();
+                var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+                while (true) {
+                    try {
+                        log.checkHealthy();
+                    } catch (RuntimeException _) {
+                        break;
+                    }
+                    assertTrue(System.nanoTime() < deadline, "the held flush never failed");
+                    Thread.sleep(1);
+                }
+                // Its pass is refused, which stops the store: its rollback gives its chunks back
+                first.applyAndJoin();
+                assertNotNull(first.failure, "a commit the stopped log refused succeeded");
+                var released = new ConcurrentLinkedQueue<byte[]>();
+                HeapPool.process().watchForTests(new HeapPool.Watcher() {
+                    @Override
+                    public void acquired(byte[] array) {
+                    }
+
+                    @Override
+                    public void released(byte[] array) {
+                        if (array.length == FrameBody.CHUNK_BYTES) {
+                            released.add(array);
+                        }
+                    }
+                });
+                try {
+                    // Applied after the store stopped, it fails in a later pass with its versions in place
+                    second.applyAndJoin();
+                } finally {
+                    HeapPool.process().watchForTests(null);
+                }
+                assertNotNull(second.failure, "a commit applied after the store stopped succeeded");
+                assertFalse(released.isEmpty(), "the frame of the commit applied after the store stopped kept its chunks");
+                assertNoChunkFreeTwice();
+            } finally {
+                try {
+                    ledger.close();
+                } catch (RuntimeException _) {
+                    // The file system stopped: closing only lets go of the threads
+                }
+            }
+        }
+    }
+
+    /// A commit of a frame on chunks, on a thread of its own, that waits once it has a sequence until it is let go.
+    private static final class GatedCommit {
+        private final CountDownLatch sequenced = new CountDownLatch(1);
+        private final CountDownLatch open = new CountDownLatch(1);
+        private final Thread thread;
+        volatile Throwable failure;
+
+        GatedCommit(Ledger ledger, int committer, Map<Thread, GatedCommit> gated) {
+            this.thread = new Thread(() -> {
+                try {
+                    var batch = ledger.newBatch();
+                    for (var write = 0; write < LARGE_WRITES; write++) {
+                        batch.put(NAMES, key(committer, write), value(committer, 0, write));
+                    }
+                    ledger.commit(batch);
+                } catch (Throwable throwable) {
+                    failure = throwable;
+                }
+            });
+            gated.put(thread, this);
+        }
+
+        /// Waits, on the committing thread, until the commit is let go.
+        void hold() {
+            sequenced.countDown();
+            try {
+                // Bounded, so a commit never let go fails its test where it would hang it
+                open.await(1, TimeUnit.MINUTES);
+            } catch (InterruptedException _) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        void startAndAwaitSequenced() throws InterruptedException {
+            thread.start();
+            assertTrue(sequenced.await(1, TimeUnit.MINUTES), "the commit never had a sequence");
+        }
+
+        void applyAndJoin() throws InterruptedException {
+            open.countDown();
+            thread.join(TimeUnit.MINUTES.toMillis(1));
+            assertFalse(thread.isAlive(), "the commit never ended");
         }
     }
 
