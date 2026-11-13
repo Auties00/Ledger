@@ -399,7 +399,7 @@ public final class LiveLedger implements Ledger {
                 var state = byId.get(keyspace);
                 if (state != null) {
                     var value = MemorySegment.ofArray(unit).asSlice(PageFormat.HEADER, length).asReadOnly();
-                    applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null, TreeSearch.UNKNOWN, ref);
+                    applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null, replayHint(state), ref);
                     blobs.claim(ref);
                 }
             }
@@ -410,7 +410,7 @@ public final class LiveLedger implements Ledger {
                 if (state == null) {
                     return;
                 }
-                if (!state.resident && pages != null) {
+                if (replayHint(state) == TreeSearch.BLIND) {
                     replayPaged(applier, state, key, value, values);
                 } else {
                     applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null);
@@ -421,7 +421,14 @@ public final class LiveLedger implements Ledger {
             public void delete(int keyspace, MemorySegment key) {
                 var state = byId.get(keyspace);
                 if (state != null) {
-                    applier.delete(state, key);
+                    var hint = replayHint(state);
+                    if (hint == TreeSearch.BLIND) {
+                        // On the key's chain, opened as a commit of the pipeline opens it: the other path checks first
+                        // that the key exists, which a blind hint answers no for any key memory holds no version of
+                        applier.delete(state, applier.claim(state, key), key, hint);
+                    } else {
+                        applier.delete(state, key);
+                    }
                 }
             }
 
@@ -446,19 +453,32 @@ public final class LiveLedger implements Ledger {
     }
 
     /// Applies a replayed put of `value`, a slice of a frame body, to `state`, a paged key space of a store with pages,
-    /// on a copy the version keeps: in a chunk of `values`, or on an array of its own.
+    /// on a copy the version keeps: in a chunk of `values`, or on an array of its own. The put is blind, as
+    /// [#replayHint(KeyspaceState)] gives every replayed write of such a key space.
     private static void replayPaged(Applier applier, KeyspaceState state, MemorySegment key, MemorySegment value, ReplayValues values) {
         var chain = applier.claim(state, key);
         var length = Math.toIntExact(value.byteSize());
         if (!ReplayValues.shared(length)) {
             var own = Segments.toBytes(value);
-            applier.put(state, chain, key, MemorySegment.ofArray(own).asReadOnly(), own, null, null, 0, null, TreeSearch.UNKNOWN, null);
+            applier.put(state, chain, key, MemorySegment.ofArray(own).asReadOnly(), own, null, null, 0, null, TreeSearch.BLIND, null);
             return;
         }
         var at = values.copy(value, length);
         var view = values.view();
         // No array for the frame: the replay has none, and the chunk takes more values after this one
-        applier.put(state, chain, key, view.asSlice(at, length), null, view, null, at, null, TreeSearch.UNKNOWN, null);
+        applier.put(state, chain, key, view.asSlice(at, length), null, view, null, at, null, TreeSearch.BLIND, null);
+    }
+
+    /// {@return how the replay applies a write of `state`: [TreeSearch#BLIND] for a paged key space of a store with a
+    /// data file, [TreeSearch#UNKNOWN] for any other}
+    ///
+    /// A blind write looks its key up in memory only, as the pipeline's commits write paged key spaces
+    /// ([#prepareValue(ArrayWriteBatch, int, KeyspaceState, byte\[\], Object\[\])]), so the replay reads no leaf of a
+    /// paged tree: a lookup would read one a write and leave it in the page cache until the cache's idle eviction,
+    /// every leaf the log's writes reach. The tree settles what the write does to the count ([BlindWrites]), at the
+    /// first count or checkpoint that needs it, from the trees the open found, which no replayed commit changes.
+    private byte replayHint(KeyspaceState state) {
+        return pages != null && !state.resident ? TreeSearch.BLIND : TreeSearch.UNKNOWN;
     }
 
     /// Puts in memory every entry of the key space `id` if it is a resident one whose loader has not, before the log's
