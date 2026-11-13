@@ -1346,10 +1346,13 @@ public final class LiveLedger implements Ledger {
     }
 
     /// Waits a while for a role whose holder lets it go soon: the commits leave a wanted role to the waiting thread.
+    ///
+    /// A thread whose interrupt status is set yields instead of parking, as a park would return at once: a virtual
+    /// thread spinning through its parks would keep its carrier from the commits it waits for.
     private static void pause(int spin) {
         if (spin < 256) {
             Thread.onSpinWait();
-        } else if (spin < 1_024) {
+        } else if (spin < 1_024 || Thread.currentThread().isInterrupted()) {
             Thread.yield();
         } else {
             LockSupport.parkNanos(100_000);

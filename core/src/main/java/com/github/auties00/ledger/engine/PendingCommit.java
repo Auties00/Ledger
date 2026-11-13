@@ -18,6 +18,11 @@ import java.util.concurrent.locks.LockSupport;
 /// parks, by a full fence, the mover's or one it shares with the moves of a whole pass. The sequencer and the
 /// publisher move commits with release stores and fence once per pass ([#wake()]); the committing thread moves its
 /// own to [#APPLIED] with a volatile store, since commits on its keys may wait for it.
+///
+/// No wait ends on an interrupt. A park returns at once while the thread's interrupt status is set, so a wait clears
+/// it when a park returns and sets it again when it returns itself: a thread that kept it set would spin through
+/// every park, and a virtual one would keep its carrier from the threads whose commits it waits for, which, once every
+/// carrier is so taken, never apply.
 final class PendingCommit {
     /// Waiting for a sequence.
     static final int ARRIVED = 0;
@@ -146,8 +151,12 @@ final class PendingCommit {
                         break;
                     }
                 }
+                var interrupted = false;
                 while (!applied()) {
-                    park(this);
+                    interrupted |= park(this);
+                }
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
                 }
                 return;
             }
@@ -189,11 +198,16 @@ final class PendingCommit {
             } else {
                 // Announced with a volatile store, a full fence, before the state and the role are read again
                 parking = true;
-                if (state < wanted && (role == null || (roleWanted != null && roleWanted.held())
-                        || (role.held() && !role.heldBriefly()))) {
-                    park(this);
+                var interrupted = false;
+                // A park an interrupt cut short parks again, its status cleared
+                while (state < wanted && (role == null || (roleWanted != null && roleWanted.held())
+                        || (role.held() && !role.heldBriefly())) && park(this)) {
+                    interrupted = true;
                 }
                 parking = false;
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
                 return state >= wanted;
             }
         }
@@ -211,6 +225,7 @@ final class PendingCommit {
         var virtual = Thread.currentThread().isVirtual();
         var spins = virtual ? VIRTUAL_SPINS : PLATFORM_SPINS;
         var yields = spins + (virtual ? VIRTUAL_YIELDS : PLATFORM_YIELDS);
+        var interrupted = false;
         for (var spin = 0; state < wanted; spin++) {
             if (roleWanted.held()) {
                 spin = Math.max(spin, yields);
@@ -227,23 +242,30 @@ final class PendingCommit {
                 // Announced with a volatile store, a full fence, before the state is read again
                 parking = true;
                 if (state < wanted) {
-                    park(this);
+                    interrupted |= park(this);
                 }
                 parking = false;
-                // A park that ended early, a spurious wake-up or the guard's timeout, helps once
+                // A park that ended early, a spurious wake-up, an interrupt or the guard's timeout, helps once
                 if (state < wanted) {
                     help.run();
                 }
             }
         }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
     }
 
-    private static void park(Object blocker) {
+    /// Parks the current thread until it is woken, or for [#PARK_NANOS] at most.
+    ///
+    /// @return whether the thread was interrupted, its interrupt status now cleared so the next park waits
+    private static boolean park(Object blocker) {
         if (PARK_NANOS == 0) {
             LockSupport.park(blocker);
         } else {
             LockSupport.parkNanos(blocker, PARK_NANOS);
         }
+        return Thread.interrupted();
     }
 
     /// Moves the commit to `state` with a release store, waking no thread: the mover calls [#wake()] after a full
