@@ -395,7 +395,7 @@ public final class LiveLedger implements Ledger {
                 var state = byId.get(keyspace);
                 if (state != null) {
                     var value = MemorySegment.ofArray(unit).asSlice(PageFormat.HEADER, length).asReadOnly();
-                    applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null, TreeSearch.UNKNOWN, ref);
+                    applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null, replayHint(state), ref);
                     blobs.claim(ref);
                 }
             }
@@ -404,7 +404,7 @@ public final class LiveLedger implements Ledger {
             public void put(int keyspace, MemorySegment key, MemorySegment value) {
                 var state = byId.get(keyspace);
                 if (state != null) {
-                    applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null);
+                    applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null, replayHint(state), null);
                 }
             }
 
@@ -412,7 +412,14 @@ public final class LiveLedger implements Ledger {
             public void delete(int keyspace, MemorySegment key) {
                 var state = byId.get(keyspace);
                 if (state != null) {
-                    applier.delete(state, key);
+                    var hint = replayHint(state);
+                    if (hint == TreeSearch.BLIND) {
+                        // On the key's chain, opened as a commit of the pipeline opens it: the other path checks first
+                        // that the key exists, which a blind hint answers no for any key memory holds no version of
+                        applier.delete(state, applier.claim(state, key), key, hint);
+                    } else {
+                        applier.delete(state, key);
+                    }
                 }
             }
 
@@ -433,6 +440,18 @@ public final class LiveLedger implements Ledger {
         replayedBytes += 13 + body.length + unitBytes;
         replayedHeap += LogWriter.heapOf(body.length, unitBytes, applier.touched.size(), false);
         return true;
+    }
+
+    /// {@return how the replay applies a write of `state`: [TreeSearch#BLIND] for a paged key space of a store with a
+    /// data file, [TreeSearch#UNKNOWN] for any other}
+    ///
+    /// A blind write looks its key up in memory only, as the pipeline's commits write paged key spaces
+    /// ([#prepareValue(ArrayWriteBatch, int, KeyspaceState, byte\[\], Object\[\])]), so the replay reads no leaf of a
+    /// paged tree: a lookup would read one a write and leave it in the page cache until the cache's idle eviction,
+    /// every leaf the log's writes reach. The tree settles what the write does to the count ([BlindWrites]), at the
+    /// first count or checkpoint that needs it, from the trees the open found, which no replayed commit changes.
+    private byte replayHint(KeyspaceState state) {
+        return pages != null && !state.resident ? TreeSearch.BLIND : TreeSearch.UNKNOWN;
     }
 
     /// Puts in memory every entry of the key space `id` if it is a resident one whose loader has not, before the log's
