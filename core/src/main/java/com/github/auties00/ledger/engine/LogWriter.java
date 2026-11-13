@@ -356,6 +356,12 @@ final class LogWriter {
     private volatile boolean closing;
     // The file of large values the commits write to, or null
     private volatile BlobFile blobs;
+    // The values that may leave the heap for the frames, or null; set before the first group
+    private SpillQueue spills;
+    // The use of the current segment the frames of such values are located in, or null; owned by the flush task
+    private LogSegmentView view;
+    // Whether the group being sealed is written through to stable storage; owned by the flush task
+    private boolean sealingThrough;
     private final AtomicBoolean scheduled;
     // Held by the one flush that writes groups, on the pool or on the thread of a commit waiting for its group
     private final AtomicBoolean running;
@@ -455,6 +461,7 @@ final class LogWriter {
         this.segmentTag = ByteBuffer.wrap(segment.salt()).getLong();
         this.useTag = TAGS.nextLong();
         this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt(), useTag) : null;
+        this.view = spills == null ? null : spills.segment(segment.number(), segment.path(), segmentKey);
         this.next = null;
         this.throughFile = null;
         // A segment of its header and first block holds at most one group through, which is worth a handle only as the
@@ -775,6 +782,23 @@ final class LogWriter {
         this.blobs = blobs;
     }
 
+    /// Makes `spills` the values that may leave the heap for the frames: the writer locates each frame of a commit
+    /// that has some as it seals it, and tells `spills` whenever a group becomes durable; before the first commit.
+    void useSpills(SpillQueue spills) {
+        this.spills = spills;
+    }
+
+    /// Records, for the commit of `body`, if it lists values that may leave the heap, where the frame at
+    /// `frameOffset` of the current segment holds it: its body at `commitStart` of the frame's body.
+    ///
+    /// Before the group's write, so before the durable sequence that publishes the location covers it.
+    private void locate(FrameBody body, long frameOffset, int commitStart) {
+        var record = body.spill();
+        if (record != null) {
+            record.locate(view, frameOffset, commitStart, sealingThrough);
+        }
+    }
+
     /// Waits until the first `frames` frames queued since the writer opened are durable.
     ///
     /// @throws LedgerIoException if the writer stops first
@@ -1069,6 +1093,8 @@ final class LogWriter {
         }
         // Before a frame is sealed, while the output holds no byte of the group
         var through = writesThrough(group);
+        // A write through takes the pages it writes out of the system's cache, so their values stay in the heap
+        sealingThrough = through;
         var unitForce = units ? forceUnits() : null;
         var start = position;
         var groupStart = true;
@@ -1200,11 +1226,15 @@ final class LogWriter {
         writeHeader(at, sealedLength, frame.sequence(), single ? frame.type() : FrameBody.COMMITS, groupStart);
         var bodyAt = at + FRAME_HEADER;
         if (single) {
+            locate(frame.body(), frameOffset, 0);
             frame.body().copyTo(output, bodyAt);
         } else {
             var offset = bodyAt;
             for (var index = first; index < end; index++) {
-                offset = group.get(index).body().writeRunEntry(output, offset);
+                var body = group.get(index).body();
+                offset = body.writeRunEntry(output, offset);
+                // The entry is the body's length, then the body
+                locate(body, frameOffset, offset - bodyAt - body.size());
             }
         }
         if (cipher != null) {
@@ -1253,6 +1283,7 @@ final class LogWriter {
         writeHeader(at, sealedLength, frame.sequence(), frame.type(), groupStart);
         used += FRAME_HEADER;
         var body = frame.body();
+        locate(body, frameOffset, 0);
         if (body.references() != 0) {
             sealPieces(body, at, frameOffset);
             return;
@@ -1571,6 +1602,9 @@ final class LogWriter {
         } finally {
             durabilityLock.unlock();
         }
+        if (spills != null) {
+            spills.durableAdvanced();
+        }
         // A commit that wrote its own group comes back too
         var woken = wake(sequence) + (leading ? 1 : 0);
         var span = woken + (int) Math.clamp(lastQueued - sequence, 0, Integer.MAX_VALUE);
@@ -1623,6 +1657,11 @@ final class LogWriter {
         } finally {
             queueLock.unlock();
         }
+    }
+
+    /// {@return the latest sequence the log holds durably}
+    long durableSequence() {
+        return durable;
     }
 
     /// {@return whether the commit at `sequence` is durable}

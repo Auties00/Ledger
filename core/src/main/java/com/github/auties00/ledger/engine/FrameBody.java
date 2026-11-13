@@ -115,6 +115,9 @@ final class FrameBody {
     // The pool of a body made with one, its chunks and who owns them, or null for a body of one array that grows by
     // doubling: apart, as the references are, so the body of a small commit carries one field for them
     private Pooled pooled;
+    // The values of the commit that may leave the heap for the frame once it is durable, which the log writer locates
+    // as it seals the frame, or null
+    private SpillQueue.Record spill;
 
     FrameBody() {
         this(256);
@@ -223,6 +226,16 @@ final class FrameBody {
         if (pooled != null && (pooled.chunks != null || pooled.state == RELEASED)) {
             throw new IllegalStateException("The body is not one array");
         }
+    }
+
+    /// {@return the values of the commit that may leave the heap for this frame, or `null`}
+    SpillQueue.Record spill() {
+        return spill;
+    }
+
+    /// Makes `record` the values of the commit that may leave the heap for this frame, located as it is sealed.
+    void spill(SpillQueue.Record record) {
+        this.spill = record;
     }
 
     /// {@return the length of the body, the values it refers to included}
@@ -991,6 +1004,8 @@ final class FrameBody {
     static final class RunReader {
         private final Reader reader;
         private final int length;
+        // Where the body the last next() returned starts in the run body
+        private int start;
 
         /// Reads the run body `run`.
         ///
@@ -1013,9 +1028,15 @@ final class FrameBody {
         /// @throws LedgerCorruptedException if the entry is malformed or runs past the run
         byte[] next() {
             var size = (int) reader.readLength();
+            start = reader.position;
             var body = Arrays.copyOfRange(reader.body, reader.position, reader.position + size);
             reader.position += size;
             return body;
+        }
+
+        /// {@return where the body [#next()] returned last starts in the run body}
+        int start() {
+            return start;
         }
 
         /// Passes over the body of the next commit.

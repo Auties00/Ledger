@@ -127,6 +127,15 @@ final class TreeUpdate {
             return version == null || version.removes();
         }
 
+        /// {@return whether the value is in a log segment a checkpoint retired, which only a published checkpoint's
+        /// tree holds since: the tree the update starts from holds it as it is}
+        ///
+        /// Such a version is at or below the cut of that checkpoint, so it is the key's state here only when a commit
+        /// that replaced it rolled back, leaving the key to write as it was.
+        boolean inTree() {
+            return version != null && version.inRetiredSegment();
+        }
+
         /// {@return the unit of [BlobFile] a commit wrote the value to, which the tree takes, or `null`}
         PageRef external() {
             return version == null ? null : version.external();
@@ -836,6 +845,11 @@ final class TreeUpdate {
                 // The key's state as of the checkpoint, which already takes the removals into account
                 var state = ops.get(op++);
                 state.settle(true);
+                if (state.inTree()) {
+                    // Back after a commit that replaced it rolled back, and in a retired segment: the entry holds it
+                    out.add(entry);
+                    continue;
+                }
                 // A version the tree took already, back after a commit that replaced it rolled back, keeps its unit
                 if (!(entry.external() && entry.blob().equals(state.external()))) {
                     release(entry);

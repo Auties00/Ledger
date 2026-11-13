@@ -212,6 +212,29 @@ final class ReaderTable {
         return new Scan(distinctDescending(sequences, count, current), oldest);
     }
 
+    /// {@return whether a read or snapshot is registered at a sequence from `low` to `high`, both included, as one pass
+    /// over the slots and the registry finds}
+    ///
+    /// Safe for concurrent use. Every slot is read with a volatile read, so a read that registered before the caller's
+    /// last volatile store, and has not let go since, is found; it runs once a checkpoint, not once a commit.
+    boolean readsWithin(long low, long high) {
+        if (low > high) {
+            return false;
+        }
+        for (var slot = 0; slot < slots.length; slot++) {
+            var value = (long) SLOTS.getVolatile(slots, slot);
+            if (value != 0 && value - 1 >= low && value - 1 <= high) {
+                return true;
+            }
+        }
+        if (registrations != 0) {
+            synchronized (registryLock) {
+                return !registry.subMap(low, true, high, true).isEmpty();
+            }
+        }
+        return false;
+    }
+
     /// {@return whether no read nor snapshot is registered, as one pass over the slots and the registry finds}
     ///
     /// Safe for concurrent use, under the rule of [#scanConcurrently()]: the caller reads the latest sequence first,

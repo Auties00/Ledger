@@ -124,6 +124,9 @@ final class Checkpointer implements IdleTicker.Watched {
     private boolean endedSaturated;
     // The commits waiting in throttle() for a checkpoint; written under progressLock
     private volatile int throttled;
+    // The first log segment the last published checkpoint needs, before which the segments that values moved to are
+    // retired once no reader needs them, or 0; guarded by the lock
+    private long retireTarget;
 
     /// Creates the checkpointer of `ledger`.
     ///
@@ -219,6 +222,9 @@ final class Checkpointer implements IdleTicker.Watched {
         }
         if (!closed && ledger.sweepWaiting()) {
             startSweep();
+        }
+        if (!closed) {
+            retireHeldBack();
         }
         var logged = log.appendedHeap() - publishedHeap;
         var chunks = slab.chunkBytes() - publishedChunks;
@@ -437,6 +443,7 @@ final class Checkpointer implements IdleTicker.Watched {
             if (cut == null) {
                 if (closing && !epochOnlyInLog()) {
                     // The trees hold every commit, so the segments hold nothing a reopen needs but the one kept for it
+                    retireLogged(log.nextOpenSegment(), true);
                     retire(log.nextOpenSegment(), SPARES);
                 }
                 return;
@@ -530,7 +537,7 @@ final class Checkpointer implements IdleTicker.Watched {
             signalProgress();
             ledger.pruneCut(cut);
             // While the store runs, as many as a checkpoint interval fills, so the log seldom writes into a new file
-            retire(cut.logStart(), closing ? SPARES : (int) Math.min(64, every / log.segmentSize() + 1));
+            retire(retireLogged(cut.logStart(), closing), closing ? SPARES : spares());
             try {
                 var end = space.trim();
                 if (end > 0) {
@@ -566,6 +573,45 @@ final class Checkpointer implements IdleTicker.Watched {
         }
         return Integer.compareUnsigned(loggedEpoch, durableEpoch) > 0
                 || (blobs.epochTaken() && Integer.compareUnsigned(blobs.epoch(), durableEpoch) > 0);
+    }
+
+    /// {@return the spare segments kept while the store runs: as many as a checkpoint interval fills}
+    private int spares() {
+        return (int) Math.min(64, every / log.segmentSize() + 1);
+    }
+
+    /// Retires the segments before `first` that values moved to and no reader may need any more, every one of them if
+    /// the store is `closing`, and returns the first segment the log keeps: `first`, or the oldest a reader may still
+    /// read a value from ([SpillQueue#retirableBefore(long, ReaderTable)]). Holding the lock.
+    ///
+    /// The segments it keeps wait for the next checkpoint, or for a tick of the [IdleTicker] ([#retireHeldBack()]).
+    private long retireLogged(long first, boolean closing) {
+        var spills = ledger.spills();
+        if (spills == null) {
+            return first;
+        }
+        retireTarget = first;
+        if (closing) {
+            spills.retireAll();
+            return first;
+        }
+        return spills.retirableBefore(first, ledger.readers());
+    }
+
+    /// Retires the segments a checkpoint kept for the values a reader may have needed then, if no reader needs them now
+    /// and no checkpoint runs.
+    private void retireHeldBack() {
+        var spills = ledger.spills();
+        if (spills == null || !spills.holdsBack() || !lock.tryLock()) {
+            return;
+        }
+        try {
+            if (!closed && retireTarget > 0) {
+                retire(spills.retirableBefore(retireTarget, ledger.readers()), spares());
+            }
+        } finally {
+            lock.unlock();
+        }
     }
 
     /// Retires the log segments before `first`, keeping `spares` of them to be prepared again.

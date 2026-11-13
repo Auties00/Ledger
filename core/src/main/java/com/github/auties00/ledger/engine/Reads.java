@@ -217,9 +217,25 @@ final class Reads {
             if (state.resident) {
                 return Optional.of((V) version.decoded);
             }
-            return Optional.of(bytes ? (V) version.copyBytes() : keyspace.values().decode(version.value()));
+            try {
+                return Optional.of(bytes ? (V) version.copyBytes() : keyspace.values().decode(version.value()));
+            } catch (LogSegmentView.Retired _) {
+                checkTreeHolds(version, point);
+            }
         }
         return treeGet(keyspace, encoded, point, point.root(state), removals, bytes, !state.resident);
+    }
+
+    /// Checks that the tree of `point` holds the value of `version`, which `point` sees and whose log segment a
+    /// checkpoint retired: a segment retires only once every reader that may find a version whose value moved there
+    /// reads a tree of a checkpoint that holds the version ([SpillQueue#retirableBefore(long, ReaderTable)]), and the
+    /// tree then holds the version's value under its key, as the newest the reader sees is the newest it holds.
+    ///
+    /// @throws IllegalStateException if it does not
+    private static void checkTreeHolds(Version version, ReadPoint point) {
+        if (point.tree() == null || version.stamp > point.treeBound()) {
+            throw new IllegalStateException("A value in a retired log segment is newer than the tree of its reader");
+        }
     }
 
     /// {@return the value of `key` in the tree of `point` under `root`, decoded, or empty if it holds none or a later
@@ -282,7 +298,13 @@ final class Reads {
             if (version == Version.HIDDEN) {
                 return Optional.empty();
             }
-            value = version.value();
+            try {
+                value = version.value();
+            } catch (LogSegmentView.Retired _) {
+                checkTreeHolds(version, point);
+                value = Objects.requireNonNull(treeValue(encoded, point, point.root(state), removals, !state.resident),
+                        "A value in a retired log segment is missing from the tree of its reader");
+            }
         } else {
             value = treeValue(encoded, point, loaded ? point.root(state) : point.treeRoot(state), removals,
                     !state.resident);
@@ -361,7 +383,15 @@ final class Reads {
                     MemorySegment value = null;
                     Object decoded = null;
                     if (version != null && version != Version.HIDDEN) {
-                        value = version.value();
+                        try {
+                            value = version.value();
+                        } catch (LogSegmentView.Retired _) {
+                            checkTreeHolds(version, point);
+                            if (order != 0) {
+                                throw new IllegalStateException("A value in a retired log segment is missing from the tree of its reader");
+                            }
+                            value = tree.value();
+                        }
                         decoded = version.decoded;
                     } else if (version == null && order == 0 && !hiddenSinceTree(key, point, removals)) {
                         value = tree.value();

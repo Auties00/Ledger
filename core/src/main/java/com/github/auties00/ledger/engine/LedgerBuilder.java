@@ -45,6 +45,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     // Null to make one from the mode
     private WriteThrough writeThroughWay;
     private boolean residentAtOpen;
+    private long spillBudget;
 
     /// Creates a builder with the default options.
     public LedgerBuilder() {
@@ -59,6 +60,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         };
         this.largeValues = MIB;
         this.largeValuesByKeyspace = new LinkedHashMap<>();
+        this.spillBudget = SpillQueue.defaultBudget(Runtime.getRuntime().maxMemory());
     }
 
     /// Sets the size past which the log starts a new segment, so tests can roll segments over without writing
@@ -80,6 +82,17 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     /// a way their platform would not choose and from what a device reports. It serves one build.
     LedgerBuilder writeThrough(WriteThrough way) {
         this.writeThroughWay = Objects.requireNonNull(way, "way");
+        return this;
+    }
+
+    /// Sets the bytes of paged values waiting for a checkpoint, their frames durable, that the store keeps in the heap
+    /// before it moves the oldest to the log ([SpillQueue]), so tests can move values without writing megabytes; or
+    /// [Long#MAX_VALUE] to keep every one in the heap.
+    LedgerBuilder spillBudget(long bytes) {
+        if (bytes < 0) {
+            throw new IllegalArgumentException("The budget is negative: " + bytes);
+        }
+        this.spillBudget = bytes;
         return this;
     }
 
@@ -241,6 +254,10 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             pages = PageFile.open(directory, new PageCipher(opened.keys().pageKey()), pageCache, heap);
             var ledger = new LiveLedger(keyspaces.values(), heap);
             HeapPool.join(ledger, pooledBytes());
+            var spills = spillBudget == Long.MAX_VALUE ? null : new SpillQueue(spillBudget, opened.keys().encrypted());
+            if (spills != null) {
+                ledger.useSpills(spills);
+            }
             var superblock = pages.superblock();
             var blobPages = 0;
             var blobFree = new BitSet();
@@ -289,10 +306,15 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                         }
 
                         @Override
+                        public boolean commit(long sequence, byte[] body, LogSegmentView segment, long frameOffset, int commitStart) {
+                            return ledger.replay(sequence, body, values, segment, frameOffset, commitStart);
+                        }
+
+                        @Override
                         public void epoch(int epoch) {
                             epochs[0] = Integer.compareUnsigned(epoch, epochs[0]) > 0 ? epoch : epochs[0];
                         }
-                    });
+                    }, spills);
             blobs.begin(epochs[0] + 1);
             var catalog = ledger.assignIds();
             var pool = ioPool != null ? (PlatformIoPool) ioPool : (ownedPool = new PlatformIoPool(1));
