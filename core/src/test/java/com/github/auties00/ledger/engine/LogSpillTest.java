@@ -18,6 +18,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -48,7 +49,9 @@ import static org.junit.jupiter.api.Assertions.fail;
 /// and a reopen; a damaged log is reported; the segments they are in stay while a reader of an older tree may need
 /// them, and a reader of a newer tree reads them from it once they retire; and a store that crashes recovers, moving
 /// the values it replays off the heap the same way. The stores run with a budget of 0, so every value of a durable
-/// commit moves, and a cold slab, so the values of small batches lie on arrays of their own commit.
+/// commit moves, a cold slab, so the values of small batches lie on arrays of their own commit, and, but for the tests
+/// of that verdict, key spaces whose values may leave the heap from their first commit rather than once samples of
+/// thousands of puts show that few are replaced; a key space that removes what it writes lists no value at all.
 class LogSpillTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<byte[], byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.bytes(), ValueCodec.bytes());
@@ -62,6 +65,14 @@ class LogSpillTest {
     }
 
     private static LiveLedger open(Path directory, boolean encrypted, long budget, Duration window) {
+        var ledger = openJudged(directory, encrypted, budget, window);
+        ledger.state(MESSAGES).overwrites.forceSpillsForTests();
+        ledger.state(TEXTS).overwrites.forceSpillsForTests();
+        return ledger;
+    }
+
+    /// Opens a store whose key spaces let their values leave the heap only once their samples show few are replaced.
+    private static LiveLedger openJudged(Path directory, boolean encrypted, long budget, Duration window) {
         var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(directory)
                 .encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
                 .keyspace(MESSAGES).keyspace(TEXTS).keyspace(CHATS).commitWindow(window))
@@ -324,7 +335,13 @@ class LogSpillTest {
     void readsRetiredValuesFromTheTree(@TempDir Path directory) throws Exception {
         var expected = new Expected();
         try (var ledger = open(directory, true, 0)) {
-            write(ledger, expected, 10_000, 1, 0, true);
+            // A resident value alone, which never moves. A value of the snapshot's commit that moved to the log would
+            // make the snapshot a reader of its segment, which keeps that segment and every later one, and whether it
+            // moves depends on whether the device takes the commit's group written through
+            var first = ledger.newBatch();
+            first.put(CHATS, "c-old", "before the moved values");
+            ledger.commit(first).awaitDurable();
+            expected.chats.put("c-old", "before the moved values");
             var old = ledger.snapshot();
             var seen = expected.copy();
             for (var batch = 0; batch < 6; batch++) {
@@ -493,6 +510,69 @@ class LogSpillTest {
                     "a segment of the recovery stayed");
         }
         try (var ledger = open(directory, encrypted, 0)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @Test
+    @DisplayName("a key space that removes each value 64 commits after writing it lists none, so the arrays of removed values go to the collector")
+    void removalsListNoValues(@TempDir Path directory) throws Exception {
+        // The shape of a webhook inbox: one delivery of 1 to 2 KB a commit, removed 64 deliveries later
+        var inFlight = 64;
+        var homes = new ArrayList<WeakReference<Object>>();
+        try (var ledger = openJudged(directory, true, 64L << 20, Duration.ZERO)) {
+            var spills = ledger.spills();
+            var overwrites = ledger.state(MESSAGES).overwrites;
+            // Past the 64 sampled puts, about 4,096 of them, of the first judgement
+            for (var message = 0; message < 5_000; message++) {
+                var value = new byte[1_024 + message % 1_024];
+                Arrays.fill(value, (byte) message);
+                var commit = ledger.commit(ledger.newBatch().put(MESSAGES, key(message), value));
+                if (message % 512 == 0) {
+                    commit.awaitDurable();
+                }
+                if (message < 200) {
+                    var source = head(ledger, MESSAGES, key(message)).sourceForTests();
+                    assertInstanceOf(MemorySegment.class, source, "the value of message " + message + " is on an array of its commit");
+                    homes.add(new WeakReference<>(source));
+                }
+                if (message >= inFlight) {
+                    ledger.commit(ledger.newBatch().delete(MESSAGES, key(message - inFlight)));
+                }
+                assertEquals(0, spills.heldForTests(), "a commit listed values at message " + message);
+            }
+            ledger.awaitDurable();
+            assertFalse(overwrites.worthwhile(), "the samples were never judged");
+            assertFalse(overwrites.spills());
+            assertEquals(0, spills.loggedValuesForTests() + spills.copiedValuesForTests());
+            var retained = homes.size();
+            for (var attempt = 0; attempt < 20 && retained != 0; attempt++) {
+                System.gc();
+                Thread.sleep(20);
+                retained = (int) homes.stream().filter(home -> home.get() != null).count();
+            }
+            assertEquals(0, retained, "arrays of removed values are still reachable");
+        }
+    }
+
+    @Test
+    @DisplayName("a key space that keeps what it writes lets its values leave the heap once its samples are judged")
+    void keptValuesSpillOnceJudged(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = openJudged(directory, true, 0, Duration.ZERO)) {
+            var overwrites = ledger.state(MESSAGES).overwrites;
+            assertFalse(overwrites.spills(), "the values may leave the heap before any sample");
+            var batches = 0;
+            // A batch of 64 messages judges its key spaces whenever its commit is sampled, one in 64
+            while (!overwrites.spills()) {
+                assertTrue(batches < 1_000, "the samples of values written once never let them leave the heap");
+                write(ledger, expected, batches * 64, 64, 0, false);
+                batches++;
+            }
+            assertEquals(0, ledger.spills().loggedValuesForTests() + ledger.spills().copiedValuesForTests());
+            write(ledger, expected, batches * 64, 64, 0, true);
+            spillNow(ledger);
+            assertTrue(ledger.spills().loggedValuesForTests() > 0, "no value moved to the log once judged");
             verify(ledger, expected);
         }
     }

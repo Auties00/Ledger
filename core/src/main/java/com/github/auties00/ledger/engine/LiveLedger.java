@@ -1453,20 +1453,21 @@ public final class LiveLedger implements Ledger {
         return segment == null ? null : MemorySegment.ofArray(Segments.toBytes(segment)).asReadOnly();
     }
 
-    /// {@return the decoded value of a put of `value` to the resident key space `state`: `decoded` if the put has it or
-    /// the key space is of byte arrays, whose versions the applier gives an array of the store's in place of any
-    /// decoded value, and `value` decoded otherwise}
     /// {@return whether the values `writes` keeps on its arrays may leave the heap for the log: arrays a commit
     /// allocates, not a slab's chunks, with a value long enough to move to the log, unless the queue is over its budget}
     ///
-    /// Only such a commit allocates a record of its values, so a commit of small values allocates nothing while the
-    /// queue is within its budget.
+    /// Only such a commit allocates a record of its values, and only for a key space whose samples let its values
+    /// leave ([ValueSlab.Overwrites#spills()]), so a commit of small values allocates nothing while the queue is within
+    /// its budget, nor does one of a key space that removes or replaces what it writes before a checkpoint.
     private boolean spillable(ArrayWriteBatch writes) {
         var queue = spills;
         return queue != null && writes.homesAllocated()
                 && (writes.largestValueBytes() >= SpillQueue.LOG_VALUE_MIN || queue.over());
     }
 
+    /// {@return the decoded value of a put of `value` to the resident key space `state`: `decoded` if the put has it or
+    /// the key space is of byte arrays, whose versions the applier gives an array of the store's in place of any
+    /// decoded value, and `value` decoded otherwise}
     private static Object residentValue(KeyspaceState state, Object decoded, MemorySegment value) {
         return decoded != null || state.keyspace.values() == BuiltinCodecs.BYTES_VALUE
                 ? decoded
@@ -2492,12 +2493,10 @@ public final class LiveLedger implements Ledger {
         private ArrayList<PendingRanges.Removal> deferred;
         // Whether the publication of the commit listed them with their key spaces
         private boolean deferredListed;
-        // Whether the values the commit's puts keep on their batch's arrays may leave the heap for the log
-        private final boolean spillable;
-        // The writes the commit is expected to hold
-        private final int expectedWrites;
-        // Those values, queued once the commit is published, or null before the first
-        private SpillQueue.Record spill;
+        // The room for values of the record of the values the commit's puts keep on their batch's arrays, which may
+        // leave the heap for the log, or 0 if they may not. The record, made at the first such value, is the frame's
+        // and queued once the commit is published. One int, in what is otherwise padding of the applier
+        private final int spillRoom;
 
         /// Creates the applier of a transaction, or of a commit recovery replays when nothing is `journaled`.
         Applier(long sequence, boolean journaled) {
@@ -2522,8 +2521,7 @@ public final class LiveLedger implements Ledger {
             this.frame = frame;
             this.deferredRanges = deferredRanges;
             this.sharesChunk = sharesChunk;
-            this.spillable = spillable && frame != null;
-            this.expectedWrites = writes;
+            this.spillRoom = spillable && frame != null ? Math.max(1, writes) : 0;
         }
 
         /// {@return the version the last write of the commit added}
@@ -2731,8 +2729,8 @@ public final class LiveLedger implements Ledger {
                 } else {
                     frame.put(state.id, key, value);
                 }
-                if (spillable && source != null && own == null && external == null && !state.resident
-                        && state.overwrites != null && state.overwrites.worthwhile()) {
+                if (spillRoom != 0 && source != null && own == null && external == null && !state.resident
+                        && state.overwrites != null && state.overwrites.spills()) {
                     listSpill(version, length);
                 }
             }
@@ -2741,10 +2739,9 @@ public final class LiveLedger implements Ledger {
         /// Lists `version`, whose value of `length` bytes the commit's frame now ends with, among the values that may
         /// leave the heap for the log.
         private void listSpill(Version version, int length) {
-            var record = spill;
+            var record = frame.spill();
             if (record == null) {
-                record = spills.record(sequence, expectedWrites);
-                spill = record;
+                record = spills.record(sequence, spillRoom);
                 frame.spill(record);
             }
             // A put ends with its value, whether the frame copies it or refers to it
@@ -2970,9 +2967,11 @@ public final class LiveLedger implements Ledger {
                 }
                 deferredListed = true;
             }
-            if (spill != null) {
-                spills.add(spill);
-                spill = null;
+            if (spillRoom != 0) {
+                var record = frame.spill();
+                if (record != null) {
+                    spills.add(record);
+                }
             }
         }
 
