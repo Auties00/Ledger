@@ -827,12 +827,13 @@ final class TreeUpdate {
 
     private LeafEntry entry(Op op) throws IOException {
         var key = keys.key(op.keyed());
-        var value = op.value();
-        var length = value.byteSize();
         var external = op.external();
         if (external != null) {
-            return new LeafEntry(key, null, external, (int) length, true);
+            // The unit holds the value: a split one is never joined for it
+            return new LeafEntry(key, null, external, op.version().valueLength(), true);
         }
+        var value = op.value();
+        var length = value.byteSize();
         if (LeafEntry.fitsInline(key.byteSize(), length)) {
             return new LeafEntry(key, value, null, (int) length);
         }

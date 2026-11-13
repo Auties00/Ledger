@@ -37,6 +37,7 @@ final class BlobFile implements AutoCloseable {
     /// The name of the file in the store's directory.
     static final String FILE = "ledger.blobs";
     private static final int BUFFER = 1 << 20;
+    private static final byte[] EMPTY = new byte[0];
     /// The trailing free pages, 64 MiB of them, below which [#trim()] keeps the file's length.
     private static final int TRIM_SLACK = 16_384;
 
@@ -135,26 +136,44 @@ final class BlobFile implements AutoCloseable {
     /// @return where the unit is
     /// @throws LedgerIoException if the file cannot be written; the pages are free again
     PageRef write(byte[] value, int offset, int length) {
+        return write(value, offset, length, EMPTY);
+    }
+
+    /// Seals the value whose first bytes are the whole of `head` and whose last are the whole of `tail` into free
+    /// pages and writes them, without forcing them: the unit is the one [#write(byte\[\], int, int)] makes of the
+    /// value on one array.
+    ///
+    /// The unit is in flight until a checkpoint takes it or [#release(PageRef)] frees it.
+    ///
+    /// @return where the unit is
+    /// @throws LedgerIoException if the file cannot be written; the pages are free again
+    PageRef write(byte[] head, byte[] tail) {
+        return write(head, 0, head.length, tail);
+    }
+
+    // Seals the `length` bytes of `value` at `offset` followed by the whole of `tail`
+    private PageRef write(byte[] value, int offset, int length, byte[] tail) {
+        var total = length + tail.length;
         var gate = epochGate;
         if (gate != null) {
             gate.run();
             epochGate = null;
         }
         epochTaken = true;
-        var pages = PageFormat.pagesFor(length);
+        var pages = PageFormat.pagesFor(total);
         PageRef ref;
         synchronized (lock) {
             ref = new PageRef(space.allocate(pages), pages, counter.getAndIncrement(), epoch);
             unadopted.add(ref);
         }
         var header = new byte[PageFormat.HEADER];
-        PageFile.header(header, PageFormat.EXTERNAL, 0, ref.page(), pages, length, ref.nonceHigh(), ref.nonceLow());
+        PageFile.header(header, PageFormat.EXTERNAL, 0, ref.page(), pages, total, ref.nonceHigh(), ref.nonceLow());
         var buffer = pool.acquire(BUFFER);
         var through = new FileChannel[]{takeChannel()};
         var interrupted = new boolean[1];
         try {
             var position = new long[]{PageFormat.offset(ref.page())};
-            cipher.seal(header, value, offset, length, pages, buffer, (bytes, count) -> {
+            cipher.seal(header, value, offset, length, tail, pages, buffer, (bytes, count) -> {
                 var start = position[0];
                 while (true) {
                     try {

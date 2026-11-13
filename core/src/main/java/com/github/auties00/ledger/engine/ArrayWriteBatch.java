@@ -10,6 +10,7 @@ import java.lang.foreign.MemorySegment;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.ToLongFunction;
 
 /// A [WriteBatch] that encodes into arrays and records each write as offsets into them.
 ///
@@ -28,6 +29,10 @@ import java.util.Objects;
 /// So does a byte array of [#RESIDENT_OWN_BYTES] or more put to a resident key space of byte arrays, whose version
 /// the store gives an array of its own in any case: cloned at the put, it is the one copy the store keeps, where on the
 /// batch's array it would be copied again by the store and leave the batch's bytes for the collector.
+///
+/// A byte array of a G1 region or more put to a paged key space of byte arrays whose values of that length go to the
+/// file of large values, as the store's `splitFrom` says, takes two arrays instead, a [SplitValue]: the version keeps
+/// it until a checkpoint, and on one array its last region would be almost empty.
 ///
 /// A range removal stores its bounds, each encoded or absent; the store reads them back through the accessors of
 /// this class when it applies the batch, then starts it again with [#finish()].
@@ -99,6 +104,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     private final Object owner;
     private final HeapPool pool;
     private final Map<String, Keyspace<?, ?>> keyspaces;
+    // The least bytes of a value put to a key space that the batch splits, Long.MAX_VALUE for one it never splits; or
+    // null if it splits none
+    private final ToLongFunction<Keyspace<?, ?>> splitFrom;
     private byte[] data;
     private MemorySegment memory;
     // A read-only view of memory, which the accessors slice: one object per slice, not two
@@ -130,7 +138,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     // The array of each value of OWN_BYTES or more, and of each resident byte array of RESIDENT_OWN_BYTES or more, or
     // null before the first
     private byte[][] owns;
-    // The bytes of the arrays in owns
+    // The last bytes of each value in owns that the batch split, whose first bytes owns holds, or null before the first
+    private byte[][] ownTails;
+    // The bytes of the arrays in owns and ownTails
     private long ownBytes;
     // The chunks of the rope by the number a span's offset holds in its high bits, or null while the encodings are on
     // data, whose spans hold 0 there: the number 0 is no chunk's
@@ -154,15 +164,30 @@ public final class ArrayWriteBatch implements WriteBatch {
     // The bytes of the largest value put
     private long largestValueBytes;
 
-    /// Creates an empty batch for a store.
+    /// Creates an empty batch for a store that splits no value.
     ///
     /// @param owner the store, which alone may apply the batch
     /// @param pool the store's pool, which the batch draws its memory from
     /// @param keyspaces the store's key spaces by name, which the batch may write
     public ArrayWriteBatch(Object owner, HeapPool pool, Map<String, Keyspace<?, ?>> keyspaces) {
+        this(owner, pool, keyspaces, null);
+    }
+
+    /// Creates an empty batch for a store.
+    ///
+    /// @param owner the store, which alone may apply the batch
+    /// @param pool the store's pool, which the batch draws its memory from
+    /// @param keyspaces the store's key spaces by name, which the batch may write
+    /// @param splitFrom the least bytes of a value put to a key space that the batch keeps as a [SplitValue], if a
+    ///                  region allows it, or [Long#MAX_VALUE] for a key space whose values it never splits: a key space
+    ///                  that splits is paged, of byte arrays, and writes values of that length to the file of large
+    ///                  values, so the store's version of one is always an [Version.External]; or `null` if the batch
+    ///                  splits none
+    ArrayWriteBatch(Object owner, HeapPool pool, Map<String, Keyspace<?, ?>> keyspaces, ToLongFunction<Keyspace<?, ?>> splitFrom) {
         this.owner = owner;
         this.pool = pool;
         this.keyspaces = keyspaces;
+        this.splitFrom = splitFrom;
         // Taken from the pool with the first write, and given back at the commit
         this.data = EMPTY;
         this.memory = EMPTY_MEMORY;
@@ -181,9 +206,18 @@ public final class ArrayWriteBatch implements WriteBatch {
         var valueLength = checkValueLength(keyspace.values().sizeOf(value));
         if (valueLength >= OWN_BYTES || valueLength >= RESIDENT_OWN_BYTES && residentBytes(keyspace)) {
             checkRoom(valueLength);
+            var head = splitHead(keyspace, valueLength);
+            if (head > 0) {
+                // Only a key space of byte arrays splits: the array is its own encoding
+                var array = (byte[]) value;
+                var first = Arrays.copyOf(array, head);
+                var tail = Arrays.copyOfRange(array, head, (int) valueLength);
+                addOwn(keyspace, null, encodeKey(keyspace, key, keyLength), keyLength, first, tail);
+                return this;
+            }
             var own = encodeOwn(keyspace.values(), value, (int) valueLength);
             var ownKeyOffset = encodeKey(keyspace, key, keyLength);
-            addOwn(keyspace, keyspace.residency() == Keyspace.Residency.RESIDENT ? value : null, ownKeyOffset, keyLength, own);
+            addOwn(keyspace, keyspace.residency() == Keyspace.Residency.RESIDENT ? value : null, ownKeyOffset, keyLength, own, null);
             return this;
         }
         // One reservation for both, so a batch of one write grows its array once
@@ -206,14 +240,16 @@ public final class ArrayWriteBatch implements WriteBatch {
         var valueLength = checkValueLength(value.byteSize());
         if (valueLength >= OWN_BYTES || valueLength >= RESIDENT_OWN_BYTES && residentBytes(keyspace)) {
             checkRoom(valueLength);
-            var own = copyOwn(value);
+            var head = splitHead(keyspace, valueLength);
+            var own = head > 0 ? copyOwn(value.asSlice(0, head)) : copyOwn(value);
+            var tail = head > 0 ? copyOwn(value.asSlice(head)) : null;
             var ownKeyOffset = reserve(keyLength);
             if (ownKeyOffset == ON_ROPE) {
                 checkRoom(keyLength);
                 ownKeyOffset = takeKey(keyLength);
             }
             MemorySegment.copy(key, 0, slot(ownKeyOffset, keyLength), 0, keyLength);
-            addOwn(keyspace, null, ownKeyOffset, keyLength, own);
+            addOwn(keyspace, null, ownKeyOffset, keyLength, own, tail);
             return this;
         }
         var keyOffset = reserve(keyLength + valueLength);
@@ -313,6 +349,18 @@ public final class ArrayWriteBatch implements WriteBatch {
         return length;
     }
 
+    /// {@return the bytes of the head of a value of `length` bytes put to `keyspace` if the batch splits it, as
+    /// [SplitValue#headLength(long, long)] gives them, or 0 if the value takes one array}
+    ///
+    /// Only a value of at least the smallest region G1 makes, put to a key space that splits values of its length,
+    /// asks for the region, which the first time loads the management classes.
+    private int splitHead(Keyspace<?, ?> keyspace, long length) {
+        if (length < ValueSlab.SMALLEST_REGION || splitFrom == null || length < splitFrom.applyAsLong(keyspace)) {
+            return 0;
+        }
+        return SplitValue.headLength(length, SplitValue.region());
+    }
+
     /// {@return a new array holding the encoding of `value`, of `length` bytes}
     ///
     /// A byte array is cloned, which the compiler does without zeroing the new array first.
@@ -336,19 +384,29 @@ public final class ArrayWriteBatch implements WriteBatch {
         return Segments.toBytes(value);
     }
 
-    /// Records a put of a value on an array of its own, private to the batch.
-    private void addOwn(Keyspace<?, ?> keyspace, Object value, long keyOffset, int keyLength, byte[] own) {
+    /// Records a put of a value on an array of its own, private to the batch, or on two if `tail` is not `null`.
+    ///
+    /// @param own the value, or its first bytes if it is split
+    /// @param tail the rest of a split value, or `null`
+    private void addOwn(Keyspace<?, ?> keyspace, Object value, long keyOffset, int keyLength, byte[] own, byte[] tail) {
         if (owns == null) {
             owns = new byte[kinds.length][];
         }
-        add(PUT, keyspace, value, keyOffset, keyLength, OWN, own.length);
+        if (tail != null && ownTails == null) {
+            ownTails = new byte[kinds.length][];
+        }
+        var length = tail == null ? own.length : own.length + tail.length;
+        add(PUT, keyspace, value, keyOffset, keyLength, OWN, length);
         owns[size - 1] = own;
-        ownBytes += own.length;
+        if (tail != null) {
+            ownTails[size - 1] = tail;
+        }
+        ownBytes += length;
         // The value stays where it is, so add() is left without a branch no other write takes
         if (keyspace.residency() == Keyspace.Residency.PAGED) {
-            pagedValueBytes -= own.length;
+            pagedValueBytes -= length;
         } else {
-            residentValueBytes -= own.length;
+            residentValueBytes -= length;
         }
     }
 
@@ -557,6 +615,9 @@ public final class ArrayWriteBatch implements WriteBatch {
             if (owns != null) {
                 owns = Arrays.copyOf(owns, capacity);
             }
+            if (ownTails != null) {
+                ownTails = Arrays.copyOf(ownTails, capacity);
+            }
         }
         kinds[size] = kind;
         targets[size] = keyspace;
@@ -605,6 +666,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         residentPuts = 0;
         largestValueBytes = 0;
         owns = null;
+        ownTails = null;
         ownBytes = 0;
         leaveRope();
         // What a commit that failed prepared
@@ -643,6 +705,8 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// range without an upper bound}
     ///
     /// @param index the write
+    /// @throws IllegalStateException if the batch split the value, which it never joins: [#ownValue(int)] and
+    ///                               [#ownTail(int)] hold it
     public MemorySegment value(int index) {
         return span(index, 2);
     }
@@ -683,12 +747,25 @@ public final class ArrayWriteBatch implements WriteBatch {
         return owns == null ? null : owns[index];
     }
 
+    /// {@return the last bytes of the value of write `index` if the batch split it, whose first bytes
+    /// [#ownValue(int)] holds, or `null` if it did not}
+    ///
+    /// Both arrays are private to the batch and no one writes them.
+    ///
+    /// @param index the write
+    byte[] ownTail(int index) {
+        Objects.checkIndex(index, size);
+        return ownTails == null ? null : ownTails[index];
+    }
+
     /// {@return the array that holds the value of write `index`, at [#valueArrayOffset(int)]}
     ///
     /// @param index a write that puts a value
+    /// @throws IllegalStateException if the batch split the value, which no one array holds
     byte[] valueArray(int index) {
         var offset = spans[Objects.checkIndex(index, size) * 4 + 2];
         if (offset == OWN) {
+            checkWhole(index);
             return owns[index];
         }
         var chunk = (int) (offset >>> 32);
@@ -719,11 +796,24 @@ public final class ArrayWriteBatch implements WriteBatch {
         Objects.checkIndex(index, size);
         var offset = spans[index * 4 + field];
         if (offset < 0) {
-            return offset == ABSENT ? null : MemorySegment.ofArray(owns[index]).asReadOnly();
+            if (offset == ABSENT) {
+                return null;
+            }
+            checkWhole(index);
+            return MemorySegment.ofArray(owns[index]).asReadOnly();
         }
         var length = (int) spans[index * 4 + field + 1];
         var chunk = (int) (offset >>> 32);
         return chunk == 0 ? view.asSlice(offset, length) : chunks[chunk].view.asSlice((int) offset, length);
+    }
+
+    /// Checks that the value of write `index`, on an array of its own, is not split.
+    ///
+    /// @throws IllegalStateException if it is: a value of a region or more is never joined without the caller knowing
+    private void checkWhole(int index) {
+        if (ownTails != null && ownTails[index] != null) {
+            throw new IllegalStateException("The value of write " + index + " is split");
+        }
     }
 
     /// {@return the read-only segment of the batch's array, the home of no value once the batch is on a rope; for tests}

@@ -47,9 +47,9 @@ import java.util.function.LongSupplier;
 /// is refused one takes no lock again until the next window, so a store past its limits pays a few reads a commit.
 final class ValueSlab {
     /// The bytes of a region a chunk's array leaves for its header and the alignment: enough to take exactly one region.
-    private static final int HEADROOM = 64;
+    static final int HEADROOM = 64;
     /// The smallest region G1 makes, by which the rate that makes the slab ask for the real one is set.
-    private static final long SMALLEST_REGION = 1L << 20;
+    static final long SMALLEST_REGION = 1L << 20;
     /// The chunks a second the values must fill for the slab to turn hot: the most chunks a store holds, so that the
     /// tails of those it holds fill within a second.
     private static final int FAST_CHUNKS = 8;

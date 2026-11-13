@@ -218,7 +218,8 @@ class BatchOwnValuesTest {
                 ledger.commit(batch).awaitDurable();
                 var version = head(ledger, MESSAGES, new byte[]{1});
                 assertEquals(length, version.sourceBytesForTests());
-                assertEquals(length >= OWN, version.sourceForTests() instanceof byte[]);
+                // A value of a G1 region or more may be split in two arrays of its own
+                assertEquals(length >= OWN, version.sourceForTests() instanceof byte[] || version.sourceForTests() instanceof SplitValue);
                 assertArrayEquals(expected, ledger.get(MESSAGES, new byte[]{1}).orElseThrow());
                 ledger.checkpoint();
                 assertArrayEquals(expected, ledger.get(MESSAGES, new byte[]{1}).orElseThrow());
