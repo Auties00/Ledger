@@ -16,7 +16,9 @@ import org.openjdk.jmh.annotations.TearDown;
 /// the engine and the operation added to the JVM, the benchmark's own data included in the floor.
 ///
 /// The heap counters are those of a JVM whose heap starts small and grows ([Jvm#HEAP_GROWING]): the committed heap
-/// is what the operation made the JVM take, and the resident memory follows it.
+/// is what the operation made the JVM take, and the resident memory follows it. A JVM's resident memory seldom falls
+/// back, so the workloads run one measured operation per JVM: an iteration before it would leave its peak in the
+/// floor.
 @State(Scope.Thread)
 @AuxCounters(AuxCounters.Type.EVENTS)
 public class PeakCounters {
