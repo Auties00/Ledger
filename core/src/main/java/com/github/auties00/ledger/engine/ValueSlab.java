@@ -524,6 +524,12 @@ final class ValueSlab {
     /// slab for good. One commit in 64 is [sampled][#sampled(long)], on its committing thread: the counters are racy, an
     /// estimate that only decides where a value goes, and they are touched too rarely for the threads to queue on
     /// their line.
+    ///
+    /// The same share decides whether the values of the key space may leave the heap for the log ([SpillQueue]),
+    /// where a dead value costs more: its record keeps its batch's array alive until the record leaves the queue, and
+    /// moving it takes a tag of its bytes for a value no reader can reach. So that verdict starts negative and turns
+    /// positive only once enough samples show a share under an eighth, and under the limit of the chunks; a key space
+    /// that removes what it writes, like an inbox, never lists a value.
     static final class Overwrites {
         /// The top bits of a commit's hashed sequence that are clear when it is sampled.
         private static final int SAMPLE_BITS = 6;
@@ -539,6 +545,9 @@ final class ValueSlab {
         private static final int MAX_SAMPLES = 1 << 24;
         /// The value of a share of 1.
         private static final int WHOLE = 1 << 10;
+        /// The share of replaced values under which the values may leave the heap for the log: an eighth, so the dead
+        /// values of the records queued hold at most a seventh of the bytes of the live ones.
+        private static final int SPILL_SHARE = WHOLE / 8;
 
         // The sampled puts of the interval and those that replaced a version of it, racy
         private int puts;
@@ -550,6 +559,10 @@ final class ValueSlab {
         // The bound of the last checkpoint: a version above it is in no tree
         private volatile long cutBound;
         private volatile boolean worthwhile;
+        // Whether the values may leave the heap for the log: false until a judgement on enough samples
+        private volatile boolean spills;
+        // Whether a test fixed spills to true
+        private boolean spillsForced;
 
         Overwrites() {
             this.settled = -1;
@@ -572,6 +585,19 @@ final class ValueSlab {
         /// {@return the sampled puts of the interval so far; for tests of which commits are sampled}
         int sampledPutsForTests() {
             return puts;
+        }
+
+        /// {@return whether the key space's values may leave the heap for the log: only once samples of at least
+        /// [#MIN_SAMPLES] puts show that a commit replaces or removes few of them before the next checkpoint}
+        boolean spills() {
+            return spills;
+        }
+
+        /// Lets the key space's values leave the heap for the log whatever the samples show; for tests that move
+        /// values without writing thousands of them.
+        void forceSpillsForTests() {
+            spillsForced = true;
+            spills = true;
         }
 
         /// Counts a put of a value of `length` bytes that replaced `head`, the newest version in memory, if any.
@@ -615,8 +641,11 @@ final class ValueSlab {
             cutBound = bound;
         }
 
+        /// Judges a share of at least [#MIN_SAMPLES] samples, or the share settled over past intervals.
         private void judge(int share) {
-            worthwhile = share < (long) WHOLE * TOLERATED / (Math.max(averageBytes, 0) + (long) TOLERATED);
+            var shares = share < (long) WHOLE * TOLERATED / (Math.max(averageBytes, 0) + (long) TOLERATED);
+            worthwhile = shares;
+            spills = spillsForced || shares && share < SPILL_SHARE;
         }
 
         private static int share(int sampled, int over) {
