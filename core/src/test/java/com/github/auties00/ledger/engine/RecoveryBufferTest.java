@@ -7,6 +7,8 @@ import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -34,13 +36,24 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Recovery reading the log through one buffer that passes from segment to segment and opening each frame where the
 /// buffer holds it: frames across a refill of the buffer, frames longer than it, segments shorter and longer than it,
-/// and the torn or damaged frames among them, which end their segment as before.
+/// and the torn or damaged frames among them, which end their segment as before. No frame is opened ahead
+/// ([FrameReadAhead], which FrameReadAheadTest covers), so recovery opens every encrypted frame through the buffer too.
 class RecoveryBufferTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.utf8());
     private static final int BUFFER = 1 << 20;
     private static final long LARGE_SEGMENT = 8L << 20;
     private static final long SMALL_SEGMENT = 256L << 10;
+
+    @BeforeEach
+    void noReadAhead() {
+        FrameReadAhead.framesForTests(0);
+    }
+
+    @AfterEach
+    void defaultReadAhead() {
+        FrameReadAhead.framesForTests(-1);
+    }
 
     private static Ledger open(Path directory, boolean encrypted, long segmentSize) {
         return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
