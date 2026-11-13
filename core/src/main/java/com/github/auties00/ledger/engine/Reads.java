@@ -80,13 +80,18 @@ final class Reads {
     /// hides it}
     ///
     /// @param root the root of the key space's tree, or `null` if the read uses none
-    private static MemorySegment treeValue(byte[] key, ReadPoint point, TreeRoot root, RangeRemoval[] removals) {
+    /// @param screened whether the units it reads go to the cache only if it
+    ///                 [admits][PageCache#admits(long, PageRef)] them: the leaves of a resident key space leave the
+    ///                 cache once its loader holds their entries, so screening them would only read them twice
+    private static MemorySegment treeValue(byte[] key, ReadPoint point, TreeRoot root, RangeRemoval[] removals,
+                                           boolean screened) {
         if (root == null) {
             return null;
         }
-        var unit = TreeSearch.leaf(point.pages(), root, key);
+        var unit = TreeSearch.leaf(point.pages(), root, key, screened);
         var entry = TreeSearch.entryOf(unit, key);
-        return entry == -1 || hiddenSinceTree(key, point, removals) ? null : TreeSearch.value(point.pages(), unit, entry);
+        return entry == -1 || hiddenSinceTree(key, point, removals) ? null
+                : TreeSearch.value(point.pages(), unit, entry, true, true, screened);
     }
 
     /// {@return whether the tree of `point` holds `key` and no later removal `point` sees hides it}
@@ -201,7 +206,7 @@ final class Reads {
         // Its decoder copies the encoding whole, so the copy here returns the same bytes
         var bytes = keyspace.values() == BuiltinCodecs.BYTES_VALUE;
         if (state.resident && !state.loaded(encoded)) {
-            return treeGet(keyspace, encoded, point, point.treeRoot(state), removals, bytes);
+            return treeGet(keyspace, encoded, point, point.treeRoot(state), removals, bytes, false);
         }
         var version = KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals);
         if (version != null) {
@@ -214,7 +219,7 @@ final class Reads {
             }
             return Optional.of(bytes ? (V) version.copyBytes() : keyspace.values().decode(version.value()));
         }
-        return treeGet(keyspace, encoded, point, point.root(state), removals, bytes);
+        return treeGet(keyspace, encoded, point, point.root(state), removals, bytes, !state.resident);
     }
 
     /// {@return the value of `key` in the tree of `point` under `root`, decoded, or empty if it holds none or a later
@@ -222,20 +227,23 @@ final class Reads {
     ///
     /// @param root the root of the key space's tree, or `null` if the read uses none
     /// @param bytes whether the values are byte arrays, which copy out of the array that holds them
+    /// @param screened whether the units it reads go to the cache only if it
+    ///                 [admits][PageCache#admits(long, PageRef)] them, as for
+    ///                 [#treeValue(byte\[\], ReadPoint, TreeRoot, RangeRemoval\[\], boolean)]
     @SuppressWarnings("unchecked")
     private static <V> Optional<V> treeGet(Keyspace<?, V> keyspace, byte[] key, ReadPoint point, TreeRoot root,
-                                           RangeRemoval[] removals, boolean bytes) {
+                                           RangeRemoval[] removals, boolean bytes, boolean screened) {
         if (root == null) {
             return Optional.empty();
         }
-        var unit = TreeSearch.leaf(point.pages(), root, key);
+        var unit = TreeSearch.leaf(point.pages(), root, key, screened);
         var entry = TreeSearch.entryOf(unit, key);
         if (entry == -1 || hiddenSinceTree(key, point, removals)) {
             return Optional.empty();
         }
         return Optional.of(bytes
-                ? (V) TreeSearch.valueBytes(point.pages(), unit, entry)
-                : keyspace.values().decode(TreeSearch.value(point.pages(), unit, entry)));
+                ? (V) TreeSearch.valueBytes(point.pages(), unit, entry, screened)
+                : keyspace.values().decode(TreeSearch.value(point.pages(), unit, entry, true, true, screened)));
     }
 
     static <K, V> List<Entry<K, V>> range(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, int limit, ReadPoint point) {
@@ -276,7 +284,8 @@ final class Reads {
             }
             value = version.value();
         } else {
-            value = treeValue(encoded, point, loaded ? point.root(state) : point.treeRoot(state), removals);
+            value = treeValue(encoded, point, loaded ? point.root(state) : point.treeRoot(state), removals,
+                    !state.resident);
             if (value == null) {
                 return Optional.empty();
             }
@@ -327,7 +336,8 @@ final class Reads {
         }
         var root = point.root(state);
         var memory = state.walk(from, to, descending);
-        var tree = root == null ? null : new TreeCursor(point.pages(), root, fromBytes, toBytes, descending, wanted);
+        var tree = root == null ? null
+                : new TreeCursor(point.pages(), root, fromBytes, toBytes, descending, wanted, !state.resident);
         try {
             var inTree = tree != null && tree.next();
             var held = memory.next();

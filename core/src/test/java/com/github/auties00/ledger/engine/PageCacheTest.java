@@ -1,6 +1,7 @@
 package com.github.auties00.ledger.engine;
 
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -15,6 +16,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -22,9 +24,12 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The page cache on its own: lookups by nonce, eviction order, the slots of its table, the byte limit and the budget
-/// caches share, and the memory of the entries it drops.
+/// caches share, the memory of the entries it drops, and the doorkeeper that screens what reads miss.
 class PageCacheTest {
     private static final long LIMIT = 1 << 20;
+    // The bytes of a doorkeeper's two generations of the fewest keys, at 9 bits a key: the first one, of two levels,
+    // takes about 9.6 and the later ones about 8.2
+    private static final long TWO_GENERATIONS = 2L * Doorkeeper.FIRST_KEYS * 9 / 8;
 
     @Test
     @DisplayName("finds a unit only under the nonce it was cached with")
@@ -524,6 +529,323 @@ class PageCacheTest {
             assertNull(failure.get());
             assertSame(unit, pages.cache().get(refs.get()), "the write ends with its unit cached");
             assertSame(unit, writer.staged(refs.get()));
+        }
+    }
+
+    @Nested
+    @DisplayName("while it screens what reads miss")
+    class Screening {
+        /// {@return a cache the test alone ticks, which screens whatever its reads take}
+        private static PageCache screening(long limit) {
+            var cache = PageCache.isolated(limit);
+            IdleTicker.unwatch(cache);
+            cache.screenWhile(() -> true);
+            return cache;
+        }
+
+        @Test
+        @DisplayName("caches a unit at its second read, not at its first")
+        void secondRead() {
+            var cache = screening(LIMIT);
+            cache.putScreened(page(0), unit(page(0)));
+            assertNull(cache.peek(page(0)));
+            assertEquals(0, cache.size());
+            var second = unit(page(0));
+            cache.putScreened(page(0), second);
+            assertSame(second, cache.peek(page(0)));
+            assertTrue(cache.referencedForTests(page(0)));
+            assertEquals(PageFormat.SIZE, cache.size());
+        }
+
+        @Test
+        @DisplayName("tells units apart by their nonce, so the unit a checkpoint wrote over a page read before takes two reads")
+        void byNonce() {
+            var cache = screening(LIMIT);
+            cache.putScreened(page(0), unit(page(0)));
+            var rewritten = new PageRef(page(0).page(), 1, 9, 9);
+            cache.putScreened(rewritten, unit(rewritten));
+            assertNull(cache.peek(rewritten));
+            cache.putScreened(rewritten, unit(rewritten));
+            assertNotNull(cache.peek(rewritten));
+        }
+
+        @Test
+        @DisplayName("drops at a first read the entry of another unit at the same page, by exactly its bytes, and keeps the others")
+        void dropsOtherUnit() {
+            var cache = screening(LIMIT);
+            cache.put(page(1), unit(page(1)), true);
+            var old = page(0);
+            cache.put(old, shortUnit(old), false);
+            var bytes = cache.size();
+            var length = cache.clockLengthForTests();
+            var rewritten = new PageRef(old.page(), 1, 7, 8);
+            cache.putScreened(rewritten, unit(rewritten));
+            assertEquals(bytes - PageFormat.HEADER, cache.size());
+            assertEquals(length - 1, cache.clockLengthForTests());
+            assertNull(cache.get(rewritten));
+            assertNull(cache.get(old));
+            assertNotNull(cache.peek(page(1)));
+        }
+
+        @Test
+        @DisplayName("keeps the entry of the very unit a first read missed, which a read racing it may have cached")
+        void keepsSameUnit() {
+            var cache = screening(LIMIT);
+            var written = unit(page(0));
+            // As a checkpoint writes it
+            cache.put(page(0), written, false);
+            cache.putScreened(page(0), unit(page(0)));
+            assertSame(written, cache.peek(page(0)));
+            assertEquals(PageFormat.SIZE, cache.size());
+        }
+
+        @Test
+        @DisplayName("caches a branch at its first read, recording nothing")
+        void branches() {
+            var cache = screening(LIMIT);
+            var ref = page(0);
+            var branch = new byte[PageFormat.SIZE];
+            PageFile.header(branch, PageFormat.BRANCH, 1, ref.page(), 1, 0, ref.nonceHigh(), ref.nonceLow());
+            cache.putScreened(ref, branch);
+            assertSame(branch, cache.peek(ref));
+            assertEquals(0, cache.doorkeeperForTests().keysForTests());
+        }
+
+        @Test
+        @DisplayName("caches at the first read when no file installed a measure, or the measure says the reads are cold, and screens no plain put")
+        void unscreened() {
+            var unmeasured = PageCache.isolated(LIMIT);
+            unmeasured.putScreened(page(0), unit(page(0)));
+            assertNotNull(unmeasured.peek(page(0)));
+            var cold = PageCache.isolated(LIMIT);
+            cold.screenWhile(() -> false);
+            cold.putScreened(page(0), unit(page(0)));
+            assertNotNull(cold.peek(page(0)));
+            var warm = screening(LIMIT);
+            warm.put(page(0), unit(page(0)), true);
+            warm.put(page(1), unit(page(1)), false);
+            assertNotNull(warm.peek(page(0)));
+            assertNotNull(warm.peek(page(1)));
+            assertEquals(0, warm.doorkeeperForTests().keysForTests(), "a put started the doorkeeper");
+        }
+
+        @Test
+        @DisplayName("takes back at its first read a unit the clock evicted, and not one it never held")
+        void evictedReadmitted() {
+            var cache = screening(16L * PageFormat.SIZE);
+            // Starts the doorkeeper, which records evictions only once it holds bits
+            cache.putScreened(page(100), unit(page(100)));
+            // As a checkpoint writes them, then more than the cache holds
+            for (var i = 0; i < 32; i++) {
+                cache.put(page(i), unit(page(i)), false);
+            }
+            assertNull(cache.peek(page(0)), "the cache kept the oldest written unit");
+            cache.putScreened(page(0), unit(page(0)));
+            assertNotNull(cache.peek(page(0)), "an evicted unit read again");
+            cache.putScreened(page(200), unit(page(200)));
+            assertNull(cache.peek(page(200)), "a unit read once");
+        }
+
+        @Test
+        @DisplayName("lets go of the doorkeeper's bits as it closes, and a read after it caches and records nothing")
+        void close() {
+            var cache = screening(LIMIT);
+            cache.putScreened(page(0), unit(page(0)));
+            var started = cache.doorkeeperForTests().bytesForTests();
+            assertTrue(started > 0 && started <= Doorkeeper.FIRST_KEYS, started + " bytes for its first level");
+            cache.close();
+            assertEquals(0, cache.doorkeeperForTests().bytesForTests());
+            cache.putScreened(page(1), unit(page(1)));
+            cache.putScreened(page(1), unit(page(1)));
+            assertNull(cache.peek(page(1)));
+            assertEquals(0, cache.doorkeeperForTests().bytesForTests());
+        }
+
+        @Test
+        @DisplayName("caches once a unit that several reads miss at once, and keeps the budget and the clock exact under racing reads of two caches")
+        void racingReads() throws Exception {
+            var cache = screening(LIMIT);
+            var readers = 4;
+            for (var key = 0; key < 200; key++) {
+                var ref = page(key);
+                var start = new CountDownLatch(1);
+                var threads = new ArrayList<Thread>();
+                for (var t = 0; t < readers; t++) {
+                    threads.add(Thread.ofPlatform().start(() -> {
+                        try {
+                            start.await();
+                        } catch (InterruptedException exception) {
+                            throw new IllegalStateException(exception);
+                        }
+                        for (var read = 0; read < 2; read++) {
+                            if (cache.get(ref) == null) {
+                                cache.putScreened(ref, unit(ref));
+                            }
+                        }
+                    }));
+                }
+                start.countDown();
+                for (var thread : threads) {
+                    thread.join();
+                }
+                assertNotNull(cache.peek(ref), "a unit every reader read twice, " + key);
+            }
+            assertEquals(200, cache.clockLengthForTests());
+            assertEquals(200L * PageFormat.SIZE, cache.size());
+
+            var budget = new PageCache.Budget();
+            var caches = new PageCache[]{PageCache.in(budget, 64L * PageFormat.SIZE), PageCache.in(budget, 64L * PageFormat.SIZE)};
+            for (var shared : caches) {
+                IdleTicker.unwatch(shared);
+                shared.screenWhile(() -> true);
+            }
+            var failure = new AtomicReference<Throwable>();
+            var threads = new ArrayList<Thread>();
+            for (var t = 0; t < 8; t++) {
+                var seed = t;
+                threads.add(Thread.ofPlatform().start(() -> {
+                    try {
+                        var random = new java.util.Random(seed);
+                        for (var i = 0; i < 20_000; i++) {
+                            var shared = caches[random.nextInt(2)];
+                            var ref = page(random.nextInt(300));
+                            if (shared.get(ref) == null) {
+                                shared.putScreened(ref, unit(ref));
+                            }
+                        }
+                    } catch (Throwable throwable) {
+                        failure.set(throwable);
+                    }
+                }));
+            }
+            for (var thread : threads) {
+                thread.join();
+            }
+            assertNull(failure.get());
+            assertEquals(caches[0].size() + caches[1].size(), budget.total());
+            assertTrue(budget.total() <= 64L * PageFormat.SIZE, "the caches hold " + budget.total() + " bytes");
+            for (var shared : caches) {
+                assertEquals(shared.size(), (long) shared.clockLengthForTests() * PageFormat.SIZE);
+            }
+        }
+
+        @Test
+        @DisplayName("misses no more often than a cache that takes every read, under uniform lookups of four times the units it holds")
+        void uniformLookups() {
+            var units = 1_000;
+            var screened = screening((long) units * PageFormat.HEADER);
+            var plain = PageCache.isolated((long) units * PageFormat.HEADER);
+            IdleTicker.unwatch(plain);
+            var random = new java.util.Random(3);
+            var misses = new long[2];
+            for (var i = 0; i < 400_000; i++) {
+                var ref = page(random.nextInt(4 * units));
+                var counted = i >= 200_000;
+                if (screened.get(ref) == null) {
+                    screened.putScreened(ref, shortUnit(ref));
+                    misses[0] += counted ? 1 : 0;
+                }
+                if (plain.get(ref) == null) {
+                    plain.put(ref, shortUnit(ref), true);
+                    misses[1] += counted ? 1 : 0;
+                }
+            }
+            assertTrue(misses[0] <= misses[1] * 103 / 100, misses[0] + " misses screened, " + misses[1] + " not");
+            assertTrue(screened.doorkeeperForTests().rotationsForTests() > 0, "the doorkeeper never rotated");
+            assertTrue(screened.doorkeeperForTests().bytesForTests() <= TWO_GENERATIONS,
+                    "the doorkeeper holds " + screened.doorkeeperForTests().bytesForTests() + " bytes");
+        }
+    }
+
+    @Nested
+    @DisplayName("the doorkeeper")
+    class Doorkeepers {
+        @Test
+        @DisplayName("takes at most 5% of the keys it never saw for seen ones as it grows to the most keys of a 256 MiB cache, and past two rotations")
+        void falsePositives() {
+            var doorkeeper = new Doorkeeper();
+            // One key per 4 KiB page of a 256 MiB limit
+            var most = 1 << 16;
+            var checkpoints = new int[]{1_023, 2_047, 4_095, 8_191, 16_383, 32_767, most - 1, most + most / 2,
+                    2 * most - 1, 2 * most + most / 2, 3 * most - 1};
+            var next = 0;
+            for (var i = 1; i <= 3 * most; i++) {
+                doorkeeper.admit(i * 7_919L, 12_345, most);
+                if (next < checkpoints.length && i == checkpoints[next]) {
+                    var positives = 0;
+                    var unseen = 100_000;
+                    for (var probe = 0; probe < unseen; probe++) {
+                        if (doorkeeper.holdsForTests((1L << 40) + probe, 999)) {
+                            positives++;
+                        }
+                    }
+                    assertTrue(positives <= unseen / 20, positives + " of " + unseen + " unseen keys taken for seen ones after "
+                            + i + " records, " + doorkeeper.rotationsForTests() + " rotations");
+                    next++;
+                }
+                assertTrue(doorkeeper.bytesForTests() <= 160 << 10, doorkeeper.bytesForTests() + " bytes");
+            }
+            assertEquals(checkpoints.length, next);
+            assertTrue(doorkeeper.rotationsForTests() >= 2, doorkeeper.rotationsForTests() + " rotations");
+        }
+
+        @Test
+        @DisplayName("forgets no key as it grows")
+        void growthKeepsKeys() {
+            var doorkeeper = new Doorkeeper();
+            var keys = 100_000;
+            for (var i = 0; i < keys; i++) {
+                doorkeeper.admit(i, 7, 1 << 17);
+            }
+            assertTrue(doorkeeper.keysForTests() >= keys / 2, "it holds " + doorkeeper.keysForTests() + " keys");
+            assertEquals(0, doorkeeper.rotationsForTests());
+            for (var i = 0; i < keys; i++) {
+                assertTrue(doorkeeper.admit(i, 7, 1 << 17), "key " + i);
+            }
+        }
+
+        @Test
+        @DisplayName("rotates at the most keys it may hold, bounded to two generations, and remembers every key it recorded among the last a generation holds")
+        void rotation() {
+            var doorkeeper = new Doorkeeper();
+            var most = Doorkeeper.FIRST_KEYS;
+            var keys = 10 * most;
+            // A key the filter took for one it saw, a false positive, is not recorded, and may be forgotten
+            var recorded = new boolean[keys];
+            for (var i = 0; i < keys; i++) {
+                recorded[i] = !doorkeeper.admit(i, 7, most);
+                assertTrue(doorkeeper.bytesForTests() <= TWO_GENERATIONS, doorkeeper.bytesForTests() + " bytes");
+            }
+            assertTrue(doorkeeper.rotationsForTests() >= 8, doorkeeper.rotationsForTests() + " rotations");
+            assertEquals(most, doorkeeper.keysForTests());
+            for (var i = keys - most; i < keys; i++) {
+                assertTrue(!recorded[i] || doorkeeper.admit(i, 7, most), "key " + i);
+            }
+        }
+
+        @Test
+        @DisplayName("counts a key read again and again once, so it neither grows nor rotates for it")
+        void repeatedKeys() {
+            var doorkeeper = new Doorkeeper();
+            assertFalse(doorkeeper.admit(5, 5, Doorkeeper.FIRST_KEYS));
+            for (var i = 0; i < 100_000; i++) {
+                assertTrue(doorkeeper.admit(5, 5, Doorkeeper.FIRST_KEYS));
+            }
+            assertEquals(0, doorkeeper.rotationsForTests());
+            assertEquals(Doorkeeper.LEVEL_KEYS, doorkeeper.keysForTests());
+        }
+
+        @Test
+        @DisplayName("tells apart a key under two nonces, and records an eviction only once it holds bits")
+        void noncesAndEvictions() {
+            var doorkeeper = new Doorkeeper();
+            doorkeeper.evicted(1, 1, Doorkeeper.FIRST_KEYS);
+            assertEquals(0, doorkeeper.bytesForTests(), "an eviction started the doorkeeper");
+            assertFalse(doorkeeper.admit(1, 1, Doorkeeper.FIRST_KEYS));
+            assertFalse(doorkeeper.admit(1, 2, Doorkeeper.FIRST_KEYS));
+            assertTrue(doorkeeper.admit(1, 1, Doorkeeper.FIRST_KEYS));
+            doorkeeper.evicted(2, 1, Doorkeeper.FIRST_KEYS);
+            assertTrue(doorkeeper.admit(2, 1, Doorkeeper.FIRST_KEYS));
         }
     }
 
