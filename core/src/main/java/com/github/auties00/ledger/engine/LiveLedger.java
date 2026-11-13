@@ -200,6 +200,9 @@ public final class LiveLedger implements Ledger {
     // What a pipelined commit calls with its sequence once it has one, before it applies, or null; for tests that hold
     // a commit there. Plain: set before the committing threads start
     private LongConsumer sequencedHookForTests;
+    // What a prune on a committing thread runs once it found the version a reader keeps below another it keeps, before
+    // it links the two, or null; for tests that run a maintenance there. Plain: set before the committing threads start
+    private Runnable pruneHookForTests;
 
     /// Creates an empty store with `keyspaces`.
     ///
@@ -341,6 +344,13 @@ public final class LiveLedger implements Ledger {
     /// for tests that hold a commit between the two, set before the threads that commit start.
     void hookSequencedForTests(LongConsumer hook) {
         sequencedHookForTests = hook;
+    }
+
+    /// Makes each prune on a committing thread run `hook` once it found the version a reader keeps below another it
+    /// keeps, before it links the two, or nothing if `null`; for tests that run a maintenance there, set before the
+    /// threads that commit start.
+    void hookPruneForTests(Runnable hook) {
+        pruneHookForTests = hook;
     }
 
     /// {@return whether memory holds every entry of the key space `keyspace`, for tests of its loader}
@@ -2005,20 +2015,39 @@ public final class LiveLedger implements Ledger {
         }
     }
 
-    /// Unlinks the versions of `key` that no reader can see: it keeps, for each bound of `bounds`, the newest version
-    /// at or below it, and removes the key once all it keeps is a removal. In a paged key space with a tree, it also
-    /// cuts the versions at or below `cutBound`, which every reader's tree holds.
+    /// Prunes `chain` from `head`, its newest version or one a later version of the same commit replaced, holding the
+    /// publishing role, as [#prune(KeyspaceState, Chain, Version, long\[\], long, boolean, Runnable)] does with every
+    /// link allowed.
+    ///
+    /// @return whether the chain keeps versions a later prune may drop
+    private boolean prune(KeyspaceState state, Chain chain, Version head, long[] bounds, long cutBound) {
+        return prune(state, chain, head, bounds, cutBound, true, null);
+    }
+
+    /// Unlinks the versions of `chain` below `head`, its newest version or one a later version of the same commit
+    /// replaced, that no reader can see: it keeps, for each bound of `bounds`, the newest version at or below it, and
+    /// drops the chain once all it keeps is a removal. In a paged key space with a tree, it also cuts the versions at
+    /// or below `cutBound`, which every reader's tree holds.
     ///
     /// A reader walking the chain while it changes is not disturbed: an unlinked version keeps its own link to the
     /// versions after it, and no reader needs the versions that leaves out.
     ///
-    /// @param bounds the bounds of every active reader, highest first; the first covers the newest version
-    /// @return whether the key keeps a version a later prune may drop, once the readers that need it are gone
-    /// Prunes `chain` from `head`, its newest version or one a later version of the same commit replaced, and drops
-    /// the chain once nothing in it is needed.
+    /// A prune that links a version it keeps past the versions below it, to the next one it keeps, links to what its
+    /// walk read: if the publisher cut the chain below a version meanwhile, as it does when it applies a range removal
+    /// every reader has passed, the link would put back versions the removal hid, which no record of the removal hides
+    /// once the publisher drops it. So a prune that runs beside the publisher, on a committing thread, links past
+    /// versions only while the key space holds no range removal, as read after its commit was published: a removal
+    /// that is still a record keeps it from linking, and one already applied cut the chain before the walk. Its cuts
+    /// only leave versions out, which no removal ever needs back.
     ///
-    /// @return whether the chain keeps versions a later prune may drop
-    private boolean prune(KeyspaceState state, Chain chain, Version head, long[] bounds, long cutBound) {
+    /// @param bounds the bounds of every active reader, highest first; the first covers the newest version
+    /// @param link whether it may link a version it keeps past the versions below it
+    /// @param hook what it runs once it found a version to keep below another, before it links the two, or `null`;
+    ///             for tests
+    /// @return whether the chain keeps versions a later prune may drop, once the readers that need them are gone, or
+    ///         that a prune allowed to link would leave out
+    private boolean prune(KeyspaceState state, Chain chain, Version head, long[] bounds, long cutBound, boolean link,
+                          Runnable hook) {
         if (head == null) {
             // Left empty, by a commit that rolled back, that removed a key it did not find, or that opened it and has
             // not applied it yet, which keeps it
@@ -2027,6 +2056,7 @@ public final class LiveLedger implements Ledger {
         }
         Version kept = null;
         var version = head;
+        var unlinked = false;
         for (var bound : bounds) {
             while (version != null && version.stamp > bound) {
                 version = version.older;
@@ -2036,7 +2066,14 @@ public final class LiveLedger implements Ledger {
             }
             if (version != kept) {
                 if (kept != null) {
-                    kept.link(version);
+                    if (hook != null) {
+                        hook.run();
+                    }
+                    if (link) {
+                        kept.link(version);
+                    } else {
+                        unlinked |= kept.older != version;
+                    }
                 }
                 kept = version;
             }
@@ -2051,7 +2088,7 @@ public final class LiveLedger implements Ledger {
                 state.drop(chain, head, latestSequence);
                 return false;
             }
-            return head.older != null;
+            return head.older != null || unlinked;
         }
         // A removal stays until the trees hold it, since it hides what they hold; then, like any version, it leaves
         Version previous = null;
@@ -2068,7 +2105,7 @@ public final class LiveLedger implements Ledger {
         }
         // A version the latest tree holds leaves once no reader reads an older tree
         var current = tree;
-        return head.older != null || (current != null && head.stamp <= Reads.boundOf(current.sequence));
+        return head.older != null || unlinked || (current != null && head.stamp <= Reads.boundOf(current.sequence));
     }
 
     /// Applies to the entries in memory the range removals every reader has passed, and drops the records of those
@@ -2302,9 +2339,14 @@ public final class LiveLedger implements Ledger {
 
     /// Prunes the chain of write `index` of `touched`, the writes of a published commit, and asks for a sweep if the
     /// prune leaves a chain a later one may shorten.
+    ///
+    /// It links past versions only while the key space holds no range removal, read after the latest sequence, which
+    /// covers the commit: the publisher may apply one meanwhile, and cut the chain below a version the prune is about
+    /// to link.
     private void pruneTouched(List<Touched> touched, int index, long[] bounds, long cutBound) {
         var write = touched.get(index);
-        if (prune(write.state(), write.chain(), write.version(), bounds, cutBound)) {
+        var state = write.state();
+        if (prune(state, write.chain(), write.version(), bounds, cutBound, state.removals.length == 0, pruneHookForTests)) {
             requestSweep();
         }
     }
