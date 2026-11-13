@@ -350,10 +350,14 @@ public final class LiveLedger implements Ledger {
 
     /// Replays the commit `sequence` the log holds, unless the file of large values lacks one of its units.
     ///
-    /// The units are read before anything applies, and taken again from the free pages once the commit applies.
+    /// The units are read before anything applies, and taken again from the free pages once the commit applies. What
+    /// the commit leaves in memory until a checkpoint takes it is on copies, not on `body`, which the open drops once
+    /// the commit applies: the values of paged key spaces are copied into the chunks of `values`, the bounds of range
+    /// removals into arrays of their own, and resident values as at every put.
     ///
+    /// @param values the chunks of this open's replay
     /// @return whether it replayed the commit
-    boolean replay(long sequence, byte[] body) {
+    boolean replay(long sequence, byte[] body, ReplayValues values) {
         var units = new ArrayList<byte[]>();
         var missing = new boolean[1];
         FrameBody.readCommit(body, new FrameBody.Visitor() {
@@ -387,7 +391,7 @@ public final class LiveLedger implements Ledger {
             return false;
         }
         var next = new int[1];
-        var applier = new Applier(sequence, false);
+        var applier = new Applier(sequence, null, 4, false, false, true);
         FrameBody.readCommit(body, new FrameBody.Visitor() {
             @Override
             public void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
@@ -403,7 +407,12 @@ public final class LiveLedger implements Ledger {
             @Override
             public void put(int keyspace, MemorySegment key, MemorySegment value) {
                 var state = byId.get(keyspace);
-                if (state != null) {
+                if (state == null) {
+                    return;
+                }
+                if (!state.resident && pages != null) {
+                    replayPaged(applier, state, key, value, values);
+                } else {
                     applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null);
                 }
             }
@@ -420,7 +429,8 @@ public final class LiveLedger implements Ledger {
             public void deleteRange(int keyspace, MemorySegment from, MemorySegment to) {
                 var state = byId.get(keyspace);
                 if (state != null) {
-                    applier.deleteRange(state, from, to);
+                    // The removal keeps its bounds until a checkpoint takes it
+                    applier.deleteRange(state, from == null ? null : Segments.copy(from), to == null ? null : Segments.copy(to));
                 }
             }
         });
@@ -433,6 +443,22 @@ public final class LiveLedger implements Ledger {
         replayedBytes += 13 + body.length + unitBytes;
         replayedHeap += LogWriter.heapOf(body.length, unitBytes, applier.touched.size(), false);
         return true;
+    }
+
+    /// Applies a replayed put of `value`, a slice of a frame body, to `state`, a paged key space of a store with pages,
+    /// on a copy the version keeps: in a chunk of `values`, or on an array of its own.
+    private static void replayPaged(Applier applier, KeyspaceState state, MemorySegment key, MemorySegment value, ReplayValues values) {
+        var chain = applier.claim(state, key);
+        var length = Math.toIntExact(value.byteSize());
+        if (!ReplayValues.shared(length)) {
+            var own = Segments.toBytes(value);
+            applier.put(state, chain, key, MemorySegment.ofArray(own).asReadOnly(), own, null, null, 0, null, TreeSearch.UNKNOWN, null);
+            return;
+        }
+        var at = values.copy(value, length);
+        var view = values.view();
+        // No array for the frame: the replay has none, and the chunk takes more values after this one
+        applier.put(state, chain, key, view.asSlice(at, length), null, view, null, at, null, TreeSearch.UNKNOWN, null);
     }
 
     /// Puts in memory every entry of the key space `id` if it is a resident one whose loader has not, before the log's
@@ -2425,12 +2451,14 @@ public final class LiveLedger implements Ledger {
         private final boolean deferredRanges;
         // Whether the commit's values are on one chunk of the slab, as the log's estimate of its heap takes it
         private final boolean sharesChunk;
+        // Whether recovery replays the commit, whose puts the key spaces' samples of overwrites leave out
+        private final boolean replaying;
         // The range removals this commit counts after it is published, or null before any
         private ArrayList<PendingRanges.Removal> deferred;
         // Whether the publication of the commit listed them with their key spaces
         private boolean deferredListed;
 
-        /// Creates the applier of a transaction, or of a commit recovery replays when nothing is `journaled`.
+        /// Creates the applier of a transaction, journaled in a frame if `journaled`.
         Applier(long sequence, boolean journaled) {
             this(sequence, journaled ? FrameBody.forTransaction(pool) : null, 4, false, false);
         }
@@ -2443,6 +2471,14 @@ public final class LiveLedger implements Ledger {
         /// @param sharesChunk whether the batch put the values the store keeps on one chunk of the [ValueSlab], as the
         ///                    log's estimate of the commit's heap takes it
         Applier(long sequence, FrameBody frame, int writes, boolean deferredRanges, boolean sharesChunk) {
+            this(sequence, frame, writes, deferredRanges, sharesChunk, false);
+        }
+
+        /// Creates the applier of a commit of about `writes` writes, which recovery replays if `replaying`.
+        ///
+        /// A replayed commit is not [sampled][ValueSlab.Overwrites#sampled(long)]: its overwrites are of versions an
+        /// earlier process wrote, which say nothing of the slab's chunks in this one.
+        Applier(long sequence, FrameBody frame, int writes, boolean deferredRanges, boolean sharesChunk, boolean replaying) {
             this.sequence = sequence;
             // Most commits write one or two key spaces
             this.deltaStates = new KeyspaceState[2];
@@ -2451,6 +2487,7 @@ public final class LiveLedger implements Ledger {
             this.frame = frame;
             this.deferredRanges = deferredRanges;
             this.sharesChunk = sharesChunk;
+            this.replaying = replaying;
         }
 
         /// {@return whether the commit's frame is queued in the log}
@@ -2596,7 +2633,7 @@ public final class LiveLedger implements Ledger {
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
             var length = Math.toIntExact(value.byteSize());
-            if (source != null && !state.resident && ValueSlab.Overwrites.sampled(sequence)) {
+            if (source != null && !replaying && !state.resident && ValueSlab.Overwrites.sampled(sequence)) {
                 state.overwrites.sample(head, length);
             }
             Version version;

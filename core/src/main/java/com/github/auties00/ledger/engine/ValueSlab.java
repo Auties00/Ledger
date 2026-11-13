@@ -569,6 +569,11 @@ final class ValueSlab {
             return worthwhile;
         }
 
+        /// {@return the sampled puts of the interval so far; for tests of which commits are sampled}
+        int sampledPutsForTests() {
+            return puts;
+        }
+
         /// Counts a put of a value of `length` bytes that replaced `head`, the newest version in memory, if any.
         void sample(Version head, int length) {
             var sampled = puts + 1;
