@@ -684,6 +684,63 @@ class ColdScanReadAheadTest {
         }
     }
 
+    @ParameterizedTest(name = "descending: {0}")
+    @ValueSource(booleans = {false, true})
+    @DisplayName("a cursor that cannot read the leaf it starts at, after reading its siblings and their blobs ahead, gives every array back as it throws")
+    void unreadableFirstLeaf(boolean descending, @TempDir Path directory) throws Exception {
+        try (var tree = new Tree(directory, true, descending ? 53 : 59)) {
+            var states = new TreeMap<byte[], byte[]>(UNSIGNED);
+            for (var i = 0; i < 3_000; i++) {
+                states.put(key(i), tree.bytes(6_000));
+            }
+            tree.apply(states);
+            var leaves = tree.leaves();
+            assertTrue(leaves.size() > TreeCursor.FIRST_GATHER, "too few leaves: " + leaves.size());
+            tree.damage((descending ? leaves.getLast() : leaves.getFirst()).ref());
+            tree.pages.cache().clearForTests();
+            tree.pages.forceColdReadsForTests(true);
+            try {
+                var before = tree.pool.acquiresForTests();
+                assertThrows(LedgerCorruptedException.class, () -> new TreeCursor(tree.pages, tree.root, null, null, descending, Long.MAX_VALUE));
+                // The sealed gather, its opened siblings and their blobs
+                assertTrue(tree.pool.acquiresForTests() - before > 2, "the cursor read nothing ahead");
+            } finally {
+                tree.pages.forceColdReadsForTests(false);
+            }
+            assertEquals(0, tree.pool.collectableOutForTests(), "arrays read ahead were not given back");
+        }
+    }
+
+    @Test
+    @DisplayName("a readAll that reads a unit failing authentication gives back the collectable arrays of every run, and one that does not hands out arrays each given back once")
+    void readAllCollectable(@TempDir Path directory) throws Exception {
+        try (var tree = new Tree(directory, true, 61)) {
+            tree.load(6_000);
+            var refs = tree.leaves().stream().map(Leaf::ref).toList();
+            assertTrue(refs.size() > 2 * PageFile.READ_CHANNELS, "too few leaves: " + refs.size());
+            tree.pages.cache().clearForTests();
+            var collectable = new boolean[refs.size()];
+            var units = tree.pages.readAll(refs, PageFile.NODE, PageFile.READ_CHANNELS, collectable);
+            var opened = 0;
+            for (var i = 0; i < units.length; i++) {
+                if (collectable[i]) {
+                    opened++;
+                    tree.pages.releasePrefetched(units[i]);
+                }
+            }
+            assertEquals(refs.size(), opened, "a unit read from the file is not in a collectable array");
+            assertEquals(0, tree.pool.collectableOutForTests());
+            tree.damage(refs.get(refs.size() / 2));
+            tree.pages.cache().clearForTests();
+            var damaged = new boolean[refs.size()];
+            assertThrows(LedgerCorruptedException.class, () -> tree.pages.readAll(refs, PageFile.NODE, PageFile.READ_CHANNELS, damaged));
+            assertEquals(0, tree.pool.collectableOutForTests(), "the units read before the failure were not given back");
+            for (var flag : damaged) {
+                assertFalse(flag, "a unit given back is still reported as the caller's to give back");
+            }
+        }
+    }
+
     @Test
     @DisplayName("units read ahead across gaps take an array the pool recycles, the pages between counted, and every one of them opens")
     void gapsWithinPool(@TempDir Path directory) throws Exception {
