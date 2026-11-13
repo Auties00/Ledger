@@ -63,6 +63,16 @@ final class LogRecovery {
         /// @return whether it replayed the commit; it changed nothing if not
         boolean commit(long sequence, byte[] body);
 
+        /// Replays the commit `sequence`, unless the file of large values lacks one of its units, as
+        /// [#commit(long, byte\[\])] does, `body` being at `commitStart` of the body of the frame at `frameOffset` of
+        /// the segment use `segment`.
+        ///
+        /// @param segment the use, or `null` if the recovery moves no value off the heap
+        /// @return whether it replayed the commit; it changed nothing if not
+        default boolean commit(long sequence, byte[] body, LogSegmentView segment, long frameOffset, int commitStart) {
+            return commit(sequence, body);
+        }
+
         void epoch(int epoch);
     }
 
@@ -83,6 +93,16 @@ final class LogRecovery {
     /// @throws IOException if a segment cannot be read
     /// @throws LedgerCorruptedException if a segment belongs to another store, or acknowledged data is damaged
     static Result replay(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long checkpoint, Sink sink) throws IOException {
+        return replay(files, keys, storeId, firstSegment, checkpoint, sink, null);
+    }
+
+    /// Replays the segments of `files` from `firstSegment`, retiring those before it, as
+    /// [#replay(LogFiles, StoreKeys, byte\[\], long, long, Sink)] does, telling `sink` where each commit lies.
+    ///
+    /// @param spills the queue of the values that may leave the heap, which makes the views of the segment uses the
+    ///               commits are in, or `null`
+    static Result replay(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long checkpoint, Sink sink,
+                         SpillQueue spills) throws IOException {
         files.retireBefore(firstSegment, 1);
         var segments = files.segments();
         var cipher = cipher(keys);
@@ -139,6 +159,7 @@ final class LogRecovery {
                 }
                 var useTag = ByteBuffer.wrap(frame).getLong(LogWriter.USE_TAG_OFFSET);
                 var segmentKey = keys.encrypted() ? keys.segmentKey(storeId, number, salt, useTag) : null;
+                var view = spills == null ? null : spills.segment(number, path, segmentKey);
                 var afterPadding = false;
                 while (reader.read(position, frame, 0, LogWriter.FRAME_HEADER)) {
                     if (position % LogWriter.ALIGNMENT != 0) {
@@ -182,7 +203,7 @@ final class LogRecovery {
                                 if (sequence != last + 1) {
                                     throw new LedgerCorruptedException(path + " holds commit " + sequence + " after commit " + last, null);
                                 }
-                                replayed = sink.commit(sequence, body);
+                                replayed = sink.commit(sequence, body, view, position, 0);
                                 if (replayed) {
                                     last = sequence;
                                 }
@@ -200,7 +221,8 @@ final class LogRecovery {
                                 if (next != last + 1) {
                                     throw new LedgerCorruptedException(path + " holds commit " + next + " after commit " + last, null);
                                 }
-                                replayed = sink.commit(next, commits.next());
+                                var commit = commits.next();
+                                replayed = sink.commit(next, commit, view, position, commits.start());
                                 if (replayed) {
                                     last = next;
                                 }

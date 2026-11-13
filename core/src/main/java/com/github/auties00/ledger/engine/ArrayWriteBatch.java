@@ -1001,6 +1001,12 @@ public final class ArrayWriteBatch implements WriteBatch {
         return homesMode == HOMES_SLAB;
     }
 
+    /// {@return whether the last prepare put the values the store keeps on arrays of this batch alone, which no other
+    /// commit's values share: its own, the one it packed them into, or the chunks of its rope}
+    boolean homesAllocated() {
+        return homesMode == HOMES_OWN || homesMode == HOMES_CHUNKS || homesMode == HOMES_ROPE;
+    }
+
     /// Starts the batch again, empty, once the store has applied its writes: it hands over to the store the arrays the
     /// versions slice, and gives the others back to the pool.
     void finish() {

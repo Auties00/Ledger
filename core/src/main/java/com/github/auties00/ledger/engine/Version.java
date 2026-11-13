@@ -15,13 +15,20 @@ import java.lang.invoke.VarHandle;
 ///
 /// A version whose value a unit of [BlobFile] also holds is an [External], which keeps what the file needs: 16 bytes
 /// every other buffered write would carry for nothing.
+///
+/// The value of a paged version waiting for a checkpoint may leave its batch's array for the log, which holds it too
+/// ([SpillQueue]): [#spill] replaces the source, once, with a [LogValue] or with an array of the value alone. Every
+/// read loads the source once and takes the offset only with a segment, so a read that races the replacement reads
+/// either the old source with its offset or the new one, which needs none.
 sealed class Version permits Version.External {
     // Before HIDDEN, whose constructor uses it
     private static final VarHandle OLDER;
+    private static final VarHandle SOURCE;
 
     static {
         try {
             OLDER = MethodHandles.lookup().findVarHandle(Version.class, "older", Version.class);
+            SOURCE = MethodHandles.lookup().findVarHandle(Version.class, "source", Object.class);
         } catch (ReflectiveOperationException exception) {
             throw new ExceptionInInitializerError(exception);
         }
@@ -33,11 +40,12 @@ sealed class Version permits Version.External {
     /// The commit sequence in the high bits and the position of the write in its batch in the low bits.
     final long stamp;
     // The read-only segment the encoded value is part of, the array of its batch; or the array that is the value, which
-    // a resident version keeps, as does a paged one its batch gave an array of its own, and whose segment and session,
-    // 72 bytes, a read of its encoding makes; or `null` if this version removes the key. A slice of its own per version
-    // was 40 of the bytes a buffered write took
-    private final Object source;
-    // Where the value starts in source, and its length
+    // a resident version keeps, as does a paged one its batch gave an array of its own or whose value left the batch's
+    // array, and whose segment and session, 72 bytes, a read of its encoding makes; or the place of the value in the
+    // log ([LogValue]); or `null` if this version removes the key. A slice of its own per version was 40 of the bytes a
+    // buffered write took. Changed only by spill, from a segment, with a compare-and-set
+    private Object source;
+    // Where the value starts in source if source is a segment, and its length
     private final int offset;
     private final int length;
     /// The decoded value of a resident key space, or `null`.
@@ -83,13 +91,23 @@ sealed class Version permits Version.External {
     }
 
     /// {@return the encoded value, read-only, or `null` if this version removes the key}
+    ///
+    /// A value in the log is read from it.
+    ///
+    /// @throws LogSegmentView.Retired if the value is in a segment a checkpoint retired, which the tree of every reader
+    ///                                that can still find this version holds
+    /// @throws com.github.auties00.ledger.LedgerIoException if the value is in the log and cannot be read
+    /// @throws com.github.auties00.ledger.LedgerCorruptedException if the value is in the log and the log changed
     MemorySegment value() {
-        var held = source;
+        var held = SOURCE.getAcquire(this);
         if (held == null) {
             return null;
         }
         if (held instanceof byte[] array) {
             return MemorySegment.ofArray(array).asReadOnly();
+        }
+        if (held instanceof LogValue logged) {
+            return MemorySegment.ofArray(logged.read(stamp, length)).asReadOnly();
         }
         var whole = (MemorySegment) held;
         return offset == 0 && length == whole.byteSize() ? whole : whole.asSlice(offset, length);
@@ -99,14 +117,49 @@ sealed class Version permits Version.External {
     ///
     /// A value on an array of its own is copied with an array copy, which spares the zeroing of the new array a copy
     /// of [#value] pays ([Segments#toBytes(byte\[\], int, int)]); one on a read-only segment, which hides its array,
-    /// cannot be.
+    /// cannot be. An array source is the value whole, at no offset. A value in the log is read into an array of its own.
+    ///
+    /// @throws LogSegmentView.Retired as [#value()] does
     byte[] copyBytes() {
-        var held = source;
+        var held = SOURCE.getAcquire(this);
         if (held instanceof byte[] array) {
-            return Segments.toBytes(array, offset, length);
+            return Segments.toBytes(array, 0, array.length);
+        }
+        if (held instanceof LogValue logged) {
+            return logged.read(stamp, length);
         }
         // No slice of the segment: the copy reads the value where it is
         return held == null ? null : Segments.toBytes((MemorySegment) held, offset, length);
+    }
+
+    /// {@return whether the value is in a log segment a checkpoint retired, so only the trees hold it now}
+    ///
+    /// Only a checkpoint retires segments, so the answer does not change while one runs.
+    boolean inRetiredSegment() {
+        return SOURCE.getAcquire(this) instanceof LogValue logged && logged.segment().retired();
+    }
+
+    /// Moves the value off the segment it is part of, once: to its place in the log if it is at least
+    /// [SpillQueue#LOG_VALUE_MIN] bytes, else to an array of its own.
+    ///
+    /// The frame at `frameOffset` of `segment` holds the value durably, at `bodyIndex` of its body. The tag that
+    /// authenticates the value read back is made from the bytes of the segment, which are those the frame sealed.
+    ///
+    /// @return whether the value moved: not if it had moved already, or is not on a segment
+    boolean spill(SpillQueue.Crypto crypto, LogSegmentView segment, long frameOffset, int bodyIndex) {
+        var held = SOURCE.getAcquire(this);
+        if (!(held instanceof MemorySegment home) || external() != null) {
+            return false;
+        }
+        Object moved = length >= SpillQueue.LOG_VALUE_MIN
+                ? crypto.logValue(segment, frameOffset, bodyIndex, stamp, home, offset, length)
+                : Segments.toBytes(home, offset, length);
+        return SOURCE.compareAndSet(this, held, moved);
+    }
+
+    /// {@return the length of the encoded value, 0 for a removal}
+    int length() {
+        return length;
     }
 
     /// {@return the unit of [BlobFile] that also holds [#value], or `null` if the value is in memory and the log only}
@@ -143,19 +196,22 @@ sealed class Version permits Version.External {
         OLDER.setRelease(this, older);
     }
 
-    /// {@return the bytes of the segment the value is part of, 0 for a removal; for tests of what memory keeps}
+    /// {@return the bytes of the segment the value is part of, 0 for a removal or a value in the log; for tests of what
+    /// memory keeps}
     long sourceBytesForTests() {
-        return switch (source) {
+        return switch (SOURCE.getAcquire(this)) {
             case null -> 0;
             case byte[] array -> array.length;
             case MemorySegment segment -> segment.byteSize();
+            case LogValue _ -> 0;
             default -> throw new IllegalStateException();
         };
     }
 
-    /// {@return the segment or array the value is on, `null` for a removal; for tests of what memory keeps}
+    /// {@return the segment, array or place in the log the value is on, `null` for a removal; for tests of what memory
+    /// keeps}
     Object sourceForTests() {
-        return source;
+        return SOURCE.getAcquire(this);
     }
 
     /// {@return whether this version removes the key}
