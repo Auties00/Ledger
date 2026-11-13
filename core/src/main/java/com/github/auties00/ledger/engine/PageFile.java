@@ -104,10 +104,7 @@ final class PageFile implements AutoCloseable {
             close();
             throw exception;
         }
-        // Last, so the measure reads fields already set
-        if (screenNewForTests) {
-            cache.screenWhile(() -> !coldReads());
-        }
+        cache.screen(screenNewForTests);
     }
 
     /// Opens the data file of the store in `directory`, creating it with two empty superblocks if there is none.
@@ -264,7 +261,8 @@ final class PageFile implements AutoCloseable {
     ///
     /// A delta record still reads its delta page and its base through the cache. A screened read of a delta record
     /// asks the cache first whether it takes the leaf: if not, the base is read past the cache, which the delta page,
-    /// shared by the other records of its page, still goes to.
+    /// shared by the other records of its page, still goes to. A screened read first takes back a unit, or the leaf of
+    /// a delta record, the cache [refused][#recalled(PageRef, byte)] lately, reading nothing.
     ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     /// @param cached whether to keep the unit in the cache
@@ -275,6 +273,12 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerIoException if the file cannot be read
     byte[] load(PageRef ref, byte kind, boolean cached, boolean referenced, boolean screened) {
         var screen = cached && referenced && screened;
+        if (screen) {
+            var recalled = recalled(ref, kind);
+            if (recalled != null) {
+                return recalled;
+            }
+        }
         if (ref.isRecord()) {
             // The delta page and the base go to the cache as the entries it evicts first: the leaf they make is what a
             // read uses again, and holding all three filled the cache with each leaf twice. The leaf's admission is
@@ -288,6 +292,8 @@ final class PageFile implements AutoCloseable {
             }
             if (cached && admitted) {
                 cache.put(ref, leaf, referenced);
+            } else if (screen) {
+                cache.refuse(PageCache.dataKey(ref.page(), ref.slot()), ref, leaf);
             }
             return leaf;
         }
@@ -522,8 +528,8 @@ final class PageFile implements AutoCloseable {
         forceNewForTests = cold ? COLD : MEASURED;
     }
 
-    /// Makes every page file opened from now on leave its cache screening nothing, or screening what reads miss while
-    /// its reads are warm; for tests of what one read caches.
+    /// Makes every page file opened from now on leave its cache screening nothing, or screening what reads miss; for
+    /// tests of what one read caches.
     static void screenNewForTests(boolean screen) {
         screenNewForTests = screen;
     }
@@ -760,6 +766,18 @@ final class PageFile implements AutoCloseable {
         var key = PageCache.dataKey(TreeNodes.childPage(parent, entry), TreeNodes.childSlot(parent, entry));
         var hit = cache.get(key, TreeNodes.childNonceHigh(parent, entry), TreeNodes.childNonceLow(parent, entry), 1);
         return hit != null && kindMatches(hit[PageFormat.KIND], NODE) ? hit : null;
+    }
+
+    /// {@return the unit `ref` names if the cache [refused][PageCache#recall(long, PageRef)] it lately and still
+    /// reaches it, which it then holds, or `null`}
+    ///
+    /// A recalled unit of another kind reads as a miss, so the read from the file that follows fails as it would
+    /// without it.
+    ///
+    /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
+    byte[] recalled(PageRef ref, byte kind) {
+        var unit = cache.recall(ref);
+        return unit != null && kindMatches(unit[PageFormat.KIND], kind) ? unit : null;
     }
 
     /// {@return what [#cached(PageRef, byte)] finds for `ref`, without counting as a read of the unit}

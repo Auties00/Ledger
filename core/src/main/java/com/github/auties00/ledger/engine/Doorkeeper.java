@@ -85,8 +85,9 @@ final class Doorkeeper {
         }
     }
 
-    /// {@return whether it has seen the unit at `key` sealed under `nonceHigh`, recording nothing; for tests}
-    boolean holdsForTests(long key, long nonceHigh) {
+    /// {@return whether it has seen the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh`,
+    /// recording nothing}
+    boolean holds(long key, long nonceHigh) {
         var filter = this.filter;
         return filter != null && filter.holds(hash(key, nonceHigh));
     }

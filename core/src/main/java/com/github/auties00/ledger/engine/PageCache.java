@@ -8,7 +8,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.BooleanSupplier;
 
 /// The opened units of the store's files, by file and first page, within a limit of bytes it shares with the caches of
 /// the process's other stores ([Budget]); it evicts with the CLOCK algorithm.
@@ -48,19 +47,22 @@ import java.util.function.BooleanSupplier;
 /// slots: a unit a checkpoint wrote and no one read yet waits its turn behind the older ones, wherever its key hashes,
 /// and is not the next to go because it landed just ahead of the hand.
 ///
-/// A read of a key space's tree that misses a leaf or a value is screened ([#putScreened(long, PageRef, byte\[\])]):
-/// while the reads of the file are warm, the cache takes the unit only at its second read, the first one recorded by a
-/// [Doorkeeper] of the unit's key and nonce. A unit read once costs a read of the OS cache when it is read again, a few
-/// microseconds, and caching each one, the leaves and values of every chat a client opened once, kept most of the
-/// cache's bytes for units no one read again. The doorkeeper takes at most 4% of the units it never saw for seen
-/// ones, which the cache takes at their first read. A unit the clock evicts is recorded as it leaves, so its next read
-/// caches it at once, and a branch is never screened, as every read starts from the branches. Reads are warm while the
-/// measure the data file installs ([#screenWhile(BooleanSupplier)]) says so, which it does while its reads average
-/// below [PageFile#COLD_READ_MICROS]: a read of the device costs a hundred microseconds and more, and a unit read twice
-/// out of it would cost two. The data file's average starts at 0, so its first few reads are screened whatever the
-/// device, and the values of `ledger.blobs`, whose reads it does not sample, are screened by the data file's measure.
-/// Writes, the lookups of a commit, the reads of a checkpoint and of a resident key space, the root of a tree, and the
-/// units of a scan past its first leaves and values cache as they would unscreened.
+/// A read of a key space's tree that misses a leaf or a value is screened ([#putScreened(long, PageRef, byte\[\])]): the
+/// cache takes the unit only at its second read, the first one recorded by a [Doorkeeper] of the unit's key and nonce.
+/// Caching each unit at its first read, the leaves and values of every chat a client opened once, kept most of the
+/// cache's bytes for units no one read again. The doorkeeper takes at most 4% of the units it never saw for seen ones,
+/// which the cache takes at their first read. A unit the clock evicts is recorded as it leaves, so its next read caches
+/// it at once, and a branch is never screened, as every read starts from the branches. Screening does not depend on
+/// how fast the device reads: the reads of the files go through the OS cache, so the first read of a unit, from the
+/// device or not, leaves its pages there, and its second read costs a read of the OS cache and an open, a few
+/// microseconds, on a store copied past the OS cache as much as on any other.
+///
+/// The array of a unit the cache refused stays reachable weakly ([#REFUSALS] of them, by a hash of the key and nonce),
+/// so a second read before the collector takes it caches that array rather than reading and opening the unit again:
+/// what the cache holds stays what reads used twice, and the first reads of a session allocate no more than they did
+/// when the cache took every unit at once, as long as the collector has not run between the two reads. Writes, the
+/// lookups of a commit, the reads of a checkpoint and of a resident key space, the root of a tree, and the units of a
+/// scan past its first leaves and values cache as they would unscreened.
 final class PageCache implements IdleTicker.Watched {
     /// The file of the trees, `ledger.data`.
     static final int DATA = 0;
@@ -94,8 +96,12 @@ final class PageCache implements IdleTicker.Watched {
     private static final VarHandle TAGS = MethodHandles.arrayElementVarHandle(int[].class);
     private static final VarHandle META = MethodHandles.arrayElementVarHandle(long[].class);
     private static final VarHandle UNITS = MethodHandles.arrayElementVarHandle(byte[][].class);
-    // The measure of a cache whose file installed none: reads that may come from the device, so nothing is screened
-    private static final BooleanSupplier COLD = () -> false;
+    /// The units whose arrays a cache keeps reachable weakly once it refused them, each in the slot of a hash of its
+    /// key and nonce: a second read that comes some thousands of refusals after the first finds the slot taken by
+    /// another unit, and reads the unit again. The slots and the references in them take at most about 240 KiB, also
+    /// once the collector cleared what they reached.
+    static final int REFUSALS = 4_096;
+    private static final VarHandle REFUSED = MethodHandles.arrayElementVarHandle(Refused[].class);
 
     // Guards the changes to the table and to closed
     private final Object lock;
@@ -108,8 +114,11 @@ final class PageCache implements IdleTicker.Watched {
     private volatile boolean closed;
     // The units screened reads missed and the clock evicted
     private final Doorkeeper doorkeeper;
-    // Whether the reads of the file are warm, so the cache screens what reads miss
-    private volatile BooleanSupplier warm;
+    // Whether the cache screens what reads miss, which the data file turns on
+    private volatile boolean screening;
+    // The arrays of the units the cache refused lately, held weakly, by a hash of their key and nonce; null until the
+    // first refusal and after the close
+    private volatile Refused[] refused;
 
     private PageCache(Budget budget) {
         this.lock = new Object();
@@ -117,7 +126,6 @@ final class PageCache implements IdleTicker.Watched {
         this.bytes = new AtomicLong();
         this.budget = budget;
         this.doorkeeper = new Doorkeeper();
-        this.warm = COLD;
     }
 
     /// {@return an empty cache that shares the limit of the process's caches, which `limit` raises to it if lower}
@@ -234,24 +242,26 @@ final class PageCache implements IdleTicker.Watched {
 
     /// Caches `unit`, the plaintext of the unit `ref` names, at `key`, as a read that missed it, as an entry a read
     /// used, if the cache [admits][#admits(long, PageRef)] it or it is a branch; otherwise the read that missed it
-    /// keeps the array, which the cache never holds.
+    /// keeps the array, which the cache holds only weakly, for a [recall][#recall(long, PageRef)].
     ///
     /// @param key a key of [#key(int, int)] or [#dataKey(int, int)]
     /// @param unit an array as [#put(long, PageRef, byte\[\], boolean)] requires
     void putScreened(long key, PageRef ref, byte[] unit) {
         if (unit[PageFormat.KIND] == PageFormat.BRANCH || admits(key, ref)) {
             put(key, ref, unit, true);
+        } else {
+            refuse(key, ref, unit);
         }
     }
 
     /// {@return whether a read that missed the unit `ref` names, at `key`, caches what it reads}
     ///
-    /// While the reads of the file are cold it always does. While they are warm it does if the doorkeeper saw the
-    /// unit, read or evicted, since its generations last forgot it, or takes it for one it saw, at most 4% of the units
-    /// it never saw; otherwise the doorkeeper records it and the cache drops the entry it held at `key` for another
-    /// unit, which no read finds any more. A cache that closed records nothing.
+    /// A cache the data file did not [turn screening on][#screen(boolean)] for always does. One that screens does if
+    /// the doorkeeper saw the unit, read or evicted, since its generations last forgot it, or takes it for one it saw,
+    /// at most 4% of the units it never saw; otherwise the doorkeeper records it and the cache drops the entry it held
+    /// at `key` for another unit, which no read finds any more. A cache that closed records nothing.
     boolean admits(long key, PageRef ref) {
-        if (!warm.getAsBoolean()) {
+        if (!screening) {
             return true;
         }
         if (closed) {
@@ -264,12 +274,100 @@ final class PageCache implements IdleTicker.Watched {
         return false;
     }
 
-    /// Makes the cache screen what reads miss while `warm` holds, in place of what an earlier call installed; a cache
-    /// no call reached screens nothing.
+    /// {@return whether the cache screens what reads miss and its doorkeeper saw the unit `ref` of the data file names:
+    /// a read of the file or the clock's eviction of it, which leaves its pages in the OS cache, or one of the units
+    /// it takes for seen ones}
+    boolean seen(PageRef ref) {
+        return screening && !closed && doorkeeper.holds(dataKey(ref.page(), ref.slot()), ref.nonceHigh());
+    }
+
+    /// Makes the cache screen what reads miss, or cache it at the first read; a cache no call reached screens nothing.
+    void screen(boolean screening) {
+        this.screening = screening;
+    }
+
+    /// {@return the array of the unit `ref` names, at `key`, if the cache refused it lately and the collector has not
+    /// taken it, which the cache then holds as an entry a read used; or `null`}
     ///
-    /// @param warm whether the reads of the file come from the OS cache, asked at every screened read that misses
-    void screenWhile(BooleanSupplier warm) {
-        this.warm = warm;
+    /// A read that missed the unit asks for it before it reads the file: the unit's second read, which the cache
+    /// admits, then neither reads nor opens it again, nor reads the base of a delta record's leaf. It takes no lock and
+    /// allocates nothing when it finds nothing.
+    ///
+    /// @param key a key of [#key(int, int)] or [#dataKey(int, int)]
+    byte[] recall(long key, PageRef ref) {
+        var refused = this.refused;
+        if (refused == null) {
+            return null;
+        }
+        var index = refusal(key, ref.nonceHigh(), refused.length);
+        var held = (Refused) REFUSED.getAcquire(refused, index);
+        if (held == null || !held.names(key, ref)) {
+            return null;
+        }
+        var unit = held.get();
+        if (unit == null) {
+            return null;
+        }
+        REFUSED.compareAndSet(refused, index, held, null);
+        put(key, ref, unit, true);
+        return unit;
+    }
+
+    /// {@return what [#recall(long, PageRef)] finds for the unit `ref` of the data file names, or the leaf its delta
+    /// record makes}
+    byte[] recall(PageRef ref) {
+        return recall(dataKey(ref.page(), ref.slot()), ref);
+    }
+
+    /// Keeps `unit`, which the cache refused at `key`, reachable weakly for a [recall][#recall(long, PageRef)], in
+    /// place of the refused unit whose key and nonce share its slot.
+    ///
+    /// @param unit an array as [#put(long, PageRef, byte\[\], boolean)] requires
+    void refuse(long key, PageRef ref, byte[] unit) {
+        var refused = this.refused;
+        if (refused == null) {
+            refused = refusals();
+            if (refused == null) {
+                return;
+            }
+        }
+        REFUSED.setRelease(refused, refusal(key, ref.nonceHigh(), refused.length), new Refused(unit, key, ref));
+    }
+
+    /// {@return the slots of the refused units, allocated at the first refusal, or `null` once the cache closed}
+    private Refused[] refusals() {
+        synchronized (lock) {
+            if (refused == null && !closed) {
+                refused = new Refused[REFUSALS];
+            }
+            return refused;
+        }
+    }
+
+    /// {@return the slot of [#refused] of the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh`}
+    private static int refusal(long key, long nonceHigh, int slots) {
+        return (int) Doorkeeper.hash(key, nonceHigh) & (slots - 1);
+    }
+
+    /// The array of a unit the cache refused, held weakly, and what names the unit: its key and the nonce and pages it
+    /// was sealed with, which no other unit shares, as a nonce is never used twice. Named by its fields rather than by
+    /// its header, as the leaf of a delta record has the header of its base.
+    private static final class Refused extends WeakReference<byte[]> {
+        private final long key;
+        private final long nonceHigh;
+        private final long identity;
+
+        Refused(byte[] unit, long key, PageRef ref) {
+            super(unit);
+            this.key = key;
+            this.nonceHigh = ref.nonceHigh();
+            this.identity = identity(ref.nonceLow(), ref.pages());
+        }
+
+        /// {@return whether it holds the unit `ref` names at `key`}
+        boolean names(long key, PageRef ref) {
+            return this.key == key && nonceHigh == ref.nonceHigh() && identity == identity(ref.nonceLow(), ref.pages());
+        }
     }
 
     /// {@return the most keys a generation of the doorkeeper holds: one per page of the limit, as a power of two}
@@ -465,6 +563,7 @@ final class PageCache implements IdleTicker.Watched {
     void close() {
         synchronized (lock) {
             closed = true;
+            refused = null;
             dropAll();
         }
         doorkeeper.close();
@@ -577,9 +676,10 @@ final class PageCache implements IdleTicker.Watched {
         }
     }
 
-    /// Drops every entry, so tests read units from the file.
+    /// Drops every entry and forgets the units it refused, so tests read units from the file.
     void clearForTests() {
         synchronized (lock) {
+            refused = null;
             dropAll();
         }
     }
