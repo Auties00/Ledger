@@ -6,6 +6,8 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.FileChannel;
@@ -177,7 +179,7 @@ final class LogWriter {
     /// The shortest piece of a frame body that refers to values which [#seal] hands to the cipher as it is; shorter
     /// ones it gathers in the output, and seals there in place: a call of the cipher costs about what copying a few
     /// kilobytes does.
-    private static final int DIRECT_PIECE = 2 << 10;
+    static final int DIRECT_PIECE = 2 << 10;
     /// The bytes of an AES block.
     private static final int BLOCK = 16;
     /// The largest commit body a run takes, and the largest frame body sealed in place; a larger one is a frame of its
@@ -197,6 +199,22 @@ final class LogWriter {
     /// six tenths of what commits of one small write held, so the half of the heap the checkpoint backlog may take
     /// held four fifths.
     static final int COMMIT_HEAP = 128;
+    /// The most bytes of frame bodies the queue holds, beside no commit waiting for room, for the log to be
+    /// [idle][#idle()]: those of a frame of the catalog or an epoch, or of a few small commits, which the writer seals
+    /// in a fraction of the time a large body takes.
+    private static final long IDLE_BYTES = RUN_MAX_BODY;
+    private static final VarHandle PENDING_BYTES;
+
+    static {
+        try {
+            PENDING_BYTES = MethodHandles.lookup().findVarHandle(LogWriter.class, "pendingBytes", long.class);
+        } catch (ReflectiveOperationException exception) {
+            throw new ExceptionInInitializerError(exception);
+        }
+    }
+
+    // Whether the writers made from now on take themselves for idle whatever they queue; for tests
+    private static volatile boolean idleNewForTests;
     /// The bytes a second of log below which a new segment is written with zeros first, if the commits wait for it.
     private static final long ZEROED_RATE = 64L << 20;
     /// The groups commits wait for, since the store opened, before a segment is written with zeros with no segment
@@ -331,8 +349,13 @@ final class LogWriter {
     // Signalled when a group is durable, for the commits waiting on a full queue
     private final Condition queueDrained;
     private ArrayList<Queued> queue;
-    // The bytes of the frame bodies queued and not durable yet
+    // The bytes of the frame bodies queued and not durable yet; written under the queue lock, with opaque writes, so
+    // idle() reads a whole value without it
     private long pendingBytes;
+    // Whether the writer takes itself for idle whatever it queues; for tests
+    private final boolean forcedIdle;
+    // The frames sealed piece by piece, as they refer to values; written by the flush task only, for tests
+    private volatile long piecewiseFrames;
     // The commits waiting for room in the queue; written under the queue lock
     private volatile int queueWaiters;
     private volatile long lastQueued;
@@ -411,6 +434,7 @@ final class LogWriter {
             throw new IllegalStateException("AES-GCM is unavailable", exception);
         }
         this.crc = new CRC32C();
+        this.forcedIdle = idleNewForTests;
         this.output = new byte[MIN_OUTPUT];
         this.flushing = new ArrayList<>();
         this.queueLock = new ReentrantLock();
@@ -644,7 +668,7 @@ final class LogWriter {
             queueDeferred();
             body.handOff();
             queue.add(new Queued(type, sequence, body));
-            pendingBytes += length;
+            PENDING_BYTES.setOpaque(this, pendingBytes + length);
             lastQueued = sequence;
             frames = ++appended;
             appendedBytes += 13 + length + unitBytes;
@@ -685,7 +709,7 @@ final class LogWriter {
                     frames.get(i).body().handOff();
                 }
                 queue.addAll(frames);
-                pendingBytes += batch.bodyBytes;
+                PENDING_BYTES.setOpaque(this, pendingBytes + batch.bodyBytes);
                 lastQueued = frames.getLast().sequence();
                 appended += frames.size();
                 appendedBytes += batch.appendedBytes;
@@ -700,6 +724,29 @@ final class LogWriter {
         if (scheduled.compareAndSet(false, true)) {
             executor.execute(this::flush);
         }
+    }
+
+    /// {@return whether the writer runs, its queue holds at most [#IDLE_BYTES] of frame bodies not durable yet, those
+    /// of the group being written included, and no commit waits for room in it}
+    ///
+    /// Read without the queue lock, so the answer may be stale by the time it returns: it is a hint for how a commit
+    /// builds its frame ([FrameBody#forCommit]), which no correctness depends on. A commit that finds the log idle has
+    /// its frame sealed next, with nothing else for the writer to do; commits that find it busy, as those of a sync
+    /// that outpaces the device do, wait on a writer that is already the slower side.
+    boolean idle() {
+        return forcedIdle
+                || ((long) PENDING_BYTES.getOpaque(this) <= IDLE_BYTES && queueWaiters == 0 && failure == null);
+    }
+
+    /// Makes every writer made from now on take itself for [idle][#idle()] whatever it queues, if `idle`; for tests
+    /// that queue frames which refer to their values behind a stalled writer.
+    static void forceIdleNewForTests(boolean idle) {
+        idleNewForTests = idle;
+    }
+
+    /// {@return the frames the writer sealed piece by piece, as they refer to values; for tests}
+    long piecewiseFramesForTests() {
+        return piecewiseFrames;
     }
 
     /// Waits, holding the queue lock, for a group to leave the queue, counted in [#queueWaiters] meanwhile.
@@ -756,7 +803,7 @@ final class LogWriter {
         }
         deferred = null;
         queue.add(frame);
-        pendingBytes += frame.body().size();
+        PENDING_BYTES.setOpaque(this, pendingBytes + frame.body().size());
         lastQueued = frame.sequence();
         deferredFrame = ++appended;
         appendedBytes += 13 + frame.body().size();
@@ -979,7 +1026,7 @@ final class LogWriter {
                 boolean roomy;
                 queueLock.lock();
                 try {
-                    pendingBytes -= bodies;
+                    PENDING_BYTES.setOpaque(this, pendingBytes - bodies);
                     roomy = pendingBytes < QUEUE_LIMIT / 2;
                     queueDrained.signalAll();
                 } finally {
@@ -1334,27 +1381,38 @@ final class LogWriter {
     /// Seals `body`, which refers to values, into the output after the frame's header at `at`, at `frameOffset` of
     /// the segment.
     ///
-    /// Without encryption each piece is copied into the output and the CRC read from there. With it, a piece of at
-    /// least [#DIRECT_PIECE] bytes goes to the cipher as it is and shorter ones are gathered in the output and
-    /// encrypted there in place, so the cipher sees few calls; every call but the last takes whole AES blocks, a
-    /// gather that ends before a direct piece taking the first bytes of that piece to end on a block, so the cipher
-    /// never holds part of a block back between two calls, nor writes past the bytes it was given, which in place
-    /// would overwrite bytes it has not read.
+    /// The pieces are gathered into the output a slice of up to [#SLICE] bytes at a time, each byte read once. Without
+    /// encryption the CRC is read from each slice gathered. With it, each gathered slice is encrypted in place, and a
+    /// piece of at least [#DIRECT_PIECE] bytes goes to the cipher as it is, so the cipher sees few calls; every call
+    /// but the last takes whole AES blocks, a gather that ends before a direct piece taking the first bytes of that
+    /// piece to end on a block, so the cipher never holds part of a block back between two calls, nor writes past the
+    /// bytes it was given, which in place would overwrite bytes it has not read.
     private void sealPieces(FrameBody body, int at, long frameOffset) throws IOException {
+        piecewiseFrames++;
         if (cipher == null) {
             crc.reset();
             crc.update(output, at, FRAME_HEADER);
-            for (var piece = 0; piece < body.pieces(); piece++) {
-                var array = body.pieceArray(piece);
-                var offset = body.pieceOffset(piece);
-                for (var left = body.pieceLength(piece); left > 0; ) {
-                    var slice = Math.min(SLICE, left);
-                    room(slice);
-                    System.arraycopy(array, offset, output, used, slice);
-                    crc.update(output, used, slice);
-                    used += slice;
-                    offset += slice;
-                    left -= slice;
+            var remaining = body.size();
+            // The bytes gathered at the end of the output and not read by the CRC yet, in the room made for their slice
+            var gathered = 0;
+            for (var pieces = body.pieces(); pieces.next(); ) {
+                var array = pieces.array();
+                var offset = pieces.offset();
+                for (var left = pieces.length(); left > 0; ) {
+                    if (gathered == 0) {
+                        room(Math.min(SLICE, remaining));
+                    }
+                    var taken = Math.min(SLICE - gathered, left);
+                    System.arraycopy(array, offset, output, used + gathered, taken);
+                    gathered += taken;
+                    offset += taken;
+                    left -= taken;
+                    remaining -= taken;
+                    if (gathered == SLICE || remaining == 0) {
+                        crc.update(output, used, gathered);
+                        used += gathered;
+                        gathered = 0;
+                    }
                 }
             }
             room(Integer.BYTES);
@@ -1369,10 +1427,10 @@ final class LogWriter {
             var remaining = body.size();
             // The bytes gathered at the end of the output and not encrypted yet; room for them was made at the first
             var gathered = 0;
-            for (var piece = 0; piece < body.pieces(); piece++) {
-                var array = body.pieceArray(piece);
-                var offset = body.pieceOffset(piece);
-                var left = body.pieceLength(piece);
+            for (var pieces = body.pieces(); pieces.next(); ) {
+                var array = pieces.array();
+                var offset = pieces.offset();
+                var left = pieces.length();
                 if (gathered != 0 && left >= DIRECT_PIECE) {
                     // To the end of a block, which SLICE is a multiple of, so the room made for the gather holds it
                     var taken = -gathered & (BLOCK - 1);

@@ -1324,5 +1324,122 @@ class LogRunTest {
             }
             References.assertSealedAsCopied(log);
         }
+
+        @ParameterizedTest(name = "seed {0}, encrypted: {1}")
+        @CsvSource({"1, true", "2, true", "1, false", "2, false"})
+        @DisplayName("seals bodies of large batches on chunks that refer to every value from 64 bytes, as it seals the same bodies holding them, and gives each chunk back once")
+        void largeReferring(int seed, boolean encrypted, @TempDir Path directory) throws Exception {
+            var random = new Random(seed);
+            var log = new Log(directory, encrypted, 8L << 20);
+            var pool = pool();
+            try {
+                for (var group = 0; group < 3; group++) {
+                    var batch = new LogWriter.Batch();
+                    var released = new ArrayList<byte[]>();
+                    for (var commit = 1 + random.nextInt(2); commit > 0; commit--) {
+                        var copied = new FrameBody();
+                        // Mostly values of an app-state snapshot, some short enough to copy and some the cipher takes
+                        // as they are
+                        var referring = new FrameBody(random.nextBoolean() ? 256 : FrameBody.CHUNK_BYTES, FrameBody.LARGE_REFERABLE, pool);
+                        for (var write = 0; referring.chunkCount() < 2 || write < 9_000; write++) {
+                            var key = new byte[32];
+                            random.nextBytes(key);
+                            var segment = MemorySegment.ofArray(key);
+                            if (random.nextInt(20) == 0) {
+                                copied.delete(1, segment);
+                                referring.delete(1, segment);
+                                continue;
+                            }
+                            var kind = random.nextInt(100);
+                            var length = kind < 10 ? random.nextInt(FrameBody.LARGE_REFERABLE + 1)
+                                    : kind < 14 ? LogWriter.DIRECT_PIECE - 20 + random.nextInt(40)
+                                    : kind < 15 ? 3_000 + random.nextInt(80_000)
+                                    : 100 + random.nextInt(201);
+                            var offset = random.nextInt(40);
+                            var array = new byte[offset + length + random.nextInt(40)];
+                            random.nextBytes(array);
+                            copied.put(1, segment, MemorySegment.ofArray(array).asSlice(offset, length));
+                            referring.put(1, segment, array, offset, length);
+                        }
+                        assertTrue(referring.references() > 1_000 && referring.chunkCount() > 1, "a body on chunks that refers to values");
+                        assertEquals(copied.size(), referring.size());
+                        assertArrayEquals(copied.toBytes(), referring.toBytes());
+                        for (var i = 0; i < referring.chunkCount(); i++) {
+                            released.add(referring.chunk(i));
+                        }
+                        log.add(batch, referring);
+                        log.add(batch, 100);
+                    }
+                    log.writer.appendAll(batch);
+                    assertReleased(pool, released);
+                }
+            } finally {
+                log.close();
+            }
+            assertTrue(log.writer.piecewiseFramesForTests() > 0, "no frame sealed piece by piece");
+            References.assertSealedAsCopied(log);
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("seals a body on chunks whose own bytes end a chunk exactly where it refers to a value, as it seals the same body holding it")
+        void referenceAtChunkEnd(boolean encrypted, @TempDir Path directory) throws Exception {
+            var random = new Random(9);
+            var log = new Log(directory, encrypted, 8L << 20);
+            var pool = pool();
+            try {
+                var batch = new LogWriter.Batch();
+                var copied = new FrameBody();
+                var referring = new FrameBody(FrameBody.CHUNK_BYTES, FrameBody.LARGE_REFERABLE, pool);
+                // The bytes of the values the body refers to, which its own bytes, those the chunks hold, leave out
+                var referred = 0L;
+                for (var chunk = 1; chunk <= 3; chunk++) {
+                    var end = (long) chunk * FrameBody.CHUNK_BYTES;
+                    // Values the body refers to, until its own bytes are a few hundred short of the chunk's end
+                    while (end - (referring.size() - referred) > 2_000) {
+                        var value = new byte[100 + random.nextInt(1_200)];
+                        random.nextBytes(value);
+                        var key = MemorySegment.ofArray(new byte[]{(byte) random.nextInt()});
+                        copied.put(1, key, MemorySegment.ofArray(value));
+                        referring.put(1, key, value, 0, value.length);
+                        referred += value.length;
+                    }
+                    // Removals, each 3 bytes beside a key of up to 127, until what is left is 128 to 131 bytes
+                    var left = end - (referring.size() - referred);
+                    while (left > 131) {
+                        var key = MemorySegment.ofArray(new byte[(int) Math.max(1, Math.min(127, left - 131))]);
+                        copied.delete(1, key);
+                        referring.delete(1, key);
+                        left = end - (referring.size() - referred);
+                    }
+                    // A put whose kind, key space, key length, key and value length of 2 bytes end the chunk, then its
+                    // value by reference
+                    var key = MemorySegment.ofArray(new byte[(int) left - 5]);
+                    var value = new byte[300];
+                    random.nextBytes(value);
+                    copied.put(1, key, MemorySegment.ofArray(value));
+                    referring.put(1, key, value, 0, value.length);
+                    referred += value.length;
+                    assertEquals(end, referring.size() - referred, "the own bytes end chunk " + chunk + " at the value");
+                }
+                // And bytes of its own after the last value, in the next chunk
+                copied.delete(1, MemorySegment.ofArray(new byte[]{1}));
+                referring.delete(1, MemorySegment.ofArray(new byte[]{1}));
+                assertTrue(referring.chunkCount() >= 4, "the chunks");
+                assertEquals(copied.size(), referring.size());
+                assertArrayEquals(copied.toBytes(), referring.toBytes());
+                var bytes = 0L;
+                for (var pieces = referring.pieces(); pieces.next(); ) {
+                    assertTrue(pieces.length() > 0 && pieces.offset() + pieces.length() <= pieces.array().length, "a piece past its array");
+                    bytes += pieces.length();
+                }
+                assertEquals(referring.size(), bytes);
+                log.add(batch, referring);
+                log.writer.appendAll(batch);
+            } finally {
+                log.close();
+            }
+            References.assertSealedAsCopied(log);
+        }
     }
 }

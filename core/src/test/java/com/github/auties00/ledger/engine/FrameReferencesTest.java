@@ -8,6 +8,7 @@ import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.Transaction;
 import com.github.auties00.ledger.ValueCodec;
+import com.github.auties00.ledger.WriteBatch;
 import com.github.auties00.ledger.testkit.ChangeInterceptor;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
@@ -82,8 +83,8 @@ class FrameReferencesTest {
     /// {@return the arrays `body` refers to, by identity}
     private static Set<byte[]> referenced(FrameBody body) {
         var arrays = Collections.<byte[]>newSetFromMap(new IdentityHashMap<>());
-        for (var piece = 1; piece < body.pieces(); piece += 2) {
-            arrays.add(body.pieceArray(piece));
+        for (var reference = 0; reference < body.references(); reference++) {
+            arrays.add(body.referredArrayForTests(reference));
         }
         return arrays;
     }
@@ -183,34 +184,118 @@ class FrameReferencesTest {
         assertArrayEquals(expected, body.toBytes());
     }
 
-    @Test
-    @DisplayName("of a commit the log seals whole leaves its long values out of its array; of a larger one refers to nothing")
-    void forCommit() {
+    @ParameterizedTest(name = "log idle: {0}")
+    @CsvSource({"false", "true"})
+    @DisplayName("of a commit the log seals whole leaves its long values out of its array, whether the log is idle or not")
+    void forCommit(boolean idle) {
         var random = new Random(3);
         var pool = new HeapPool(1L << 26, false);
         var single = new ArrayWriteBatch(this, pool, BY_NAME);
         single.put(MESSAGES, "single", pattern(random, 1_000));
         single.put(MESSAGES, "small", pattern(random, FrameBody.RUN_REFERABLE - 1));
         single.prepare(false, null, Map.of());
-        var body = FrameBody.forCommit(single, null, null);
+        var body = FrameBody.forCommit(single, null, null, idle);
         assertEquals(FrameBody.RUN_REFERABLE, body.referable());
         var estimate = FrameBody.capacityFor(single, null);
         assertTrue(estimate > 1_000);
-        assertEquals(Math.max(16, estimate - 1_000), body.pieceArray(0).length, "the room of the body");
+        assertEquals(Math.max(16, estimate - 1_000), body.chunk(0).length, "the room of the body");
 
         // The value whose unit holds it is no reference
         var units = new PageRef[]{new PageRef(1, 1, 0, 0, 0), null};
-        assertEquals(Math.max(16, FrameBody.capacityFor(single, units)), FrameBody.forCommit(single, units, null).pieceArray(0).length);
+        assertEquals(Math.max(16, FrameBody.capacityFor(single, units)), FrameBody.forCommit(single, units, null, idle).chunk(0).length);
 
+        // Past a run, but with less than a chunk of values: never worth the pieces
         var large = new ArrayWriteBatch(this, pool, BY_NAME);
         for (var i = 0; i < 20; i++) {
             large.put(MESSAGES, "message" + i, pattern(random, 1_000));
         }
         large.prepare(false, null, Map.of());
-        var largeBody = FrameBody.forCommit(large, null, null);
+        var largeBody = FrameBody.forCommit(large, null, null, idle);
         assertEquals(FrameBody.NOT_REFERABLE, largeBody.referable());
-        assertEquals(FrameBody.capacityFor(large, null), largeBody.pieceArray(0).length);
+        assertEquals(FrameBody.capacityFor(large, null), largeBody.chunk(0).length);
         assertTrue(FrameBody.capacityFor(large, null) > LogWriter.RUN_MAX_BODY);
+    }
+
+    @ParameterizedTest(name = "log idle: {0}")
+    @CsvSource({"false", "true"})
+    @DisplayName("of a commit of more than a chunk of values refers to those of 64 bytes or more while the log is idle, and to nothing while it is busy")
+    void forLargeCommit(boolean idle) {
+        var random = new Random(5);
+        var pool = new HeapPool(1L << 28, false);
+        var batch = new ArrayWriteBatch(this, pool, BY_NAME);
+        var referable = 0L;
+        var count = 0;
+        for (var i = 0; i < 600; i++) {
+            var length = i % 5 == 0 ? random.nextInt(FrameBody.LARGE_REFERABLE) : FrameBody.LARGE_REFERABLE + random.nextInt(1_500);
+            batch.put(MESSAGES, "message" + i, pattern(random, length));
+            if (length >= FrameBody.LARGE_REFERABLE) {
+                referable += length;
+                count++;
+            }
+            if (i % 50 == 0) {
+                batch.delete(MESSAGES, "gone" + i);
+            }
+        }
+        batch.put(SESSIONS, "session", pattern(random, 3_000));
+        referable += 3_000;
+        count++;
+        batch.prepare(false, null, Map.of());
+        assertTrue(referable >= FrameBody.CHUNK_BYTES);
+        var capacity = FrameBody.capacityFor(batch, null);
+        var body = FrameBody.forCommit(batch, null, null, idle);
+        if (!idle) {
+            assertEquals(FrameBody.NOT_REFERABLE, body.referable());
+            assertEquals(capacity, body.chunk(0).length, "the room of the body");
+            return;
+        }
+        assertEquals(FrameBody.LARGE_REFERABLE, body.referable());
+        assertEquals(capacity - referable, body.chunk(0).length, "the room of the body");
+        // Every put of a value that long refers to it, as the applier offers each on an array, and the rest are copied
+        var copied = new FrameBody();
+        var referred = 0;
+        for (var i = 0; i < batch.size(); i++) {
+            if (batch.kind(i) != ArrayWriteBatch.PUT) {
+                body.delete(0, batch.key(i));
+                copied.delete(0, batch.key(i));
+                continue;
+            }
+            var own = batch.ownValue(i);
+            var array = own != null ? own : batch.homeArray(i);
+            var offset = own != null ? 0 : batch.homeOffset(i);
+            if (array == null) {
+                array = batch.value(i).toArray(ValueLayout.JAVA_BYTE);
+                offset = 0;
+            }
+            body.put(0, batch.key(i), array, offset, (int) batch.valueBytes(i));
+            copied.put(0, batch.key(i), batch.value(i));
+            referred += batch.valueBytes(i) >= FrameBody.LARGE_REFERABLE ? 1 : 0;
+        }
+        assertEquals(count, referred);
+        assertEquals(referred, body.references());
+        assertEquals(copied.size(), body.size());
+        assertArrayEquals(copied.toBytes(), body.toBytes());
+        // Its room held what it copied, so it never grew
+        assertEquals(capacity - referable, body.chunk(0).length, "the room of the filled body");
+
+        // A value in its unit is no reference, nor counts toward the chunk of values
+        var units = new PageRef[batch.size()];
+        for (var i = 0; i < units.length; i++) {
+            if (batch.kind(i) == ArrayWriteBatch.PUT && i % 2 == 0) {
+                units[i] = new PageRef(1, 1, 0, 0, 0);
+            }
+        }
+        var inUnits = FrameBody.forCommit(batch, units, null, true);
+        var left = 0L;
+        for (var i = 0; i < units.length; i++) {
+            if (units[i] == null && batch.kind(i) == ArrayWriteBatch.PUT && batch.valueBytes(i) >= FrameBody.LARGE_REFERABLE) {
+                left += batch.valueBytes(i);
+            }
+        }
+        if (left >= FrameBody.CHUNK_BYTES) {
+            assertEquals(FrameBody.capacityFor(batch, units) - left, inUnits.chunk(0).length);
+        } else {
+            assertEquals(FrameBody.NOT_REFERABLE, inUnits.referable());
+        }
     }
 
     @Test
@@ -526,6 +611,270 @@ class FrameReferencesTest {
         });
     }
 
+    /// Opens a store as [#open(Path, boolean, long)] does, whose log takes itself for idle whatever it queues, so the
+    /// frames of every large commit refer to their values.
+    private static Ledger openIdle(Path directory, boolean encrypted) {
+        LogWriter.forceIdleNewForTests(true);
+        try {
+            return open(directory, encrypted, 1L << 20);
+        } finally {
+            LogWriter.forceIdleNewForTests(false);
+        }
+    }
+
+    /// Fills `batch` with a large commit of shape `shape`, whose values reach the store's versions in each way a batch
+    /// hands them over, recording them in `model`.
+    private static void largeBatch(WriteBatchFiller batch, int shape, String prefix, Random random, Map<String, byte[]> model) {
+        switch (shape) {
+            case 0 -> {
+                // Past a chunk of the batch: the chunks of its rope, the last one copied
+                for (var i = 0; i < 400; i++) {
+                    batch.put(MESSAGES, prefix + "r" + i, pattern(random, FrameBody.LARGE_REFERABLE + random.nextInt(1_400)), model);
+                }
+                batch.put(SESSIONS, prefix + "s", pattern(random, 3_000), model);
+            }
+            case 1 -> {
+                // Little beside the values, just past a chunk
+                for (var i = 0; i < 200; i++) {
+                    batch.put(MESSAGES, prefix + "o" + i, pattern(random, 1_300 + random.nextInt(60)), model);
+                }
+            }
+            case 2 -> {
+                // Enough beside the values to copy them into arrays of their own, and resident values the store copies
+                for (var i = 0; i < 110; i++) {
+                    batch.put(MESSAGES, prefix + "c" + i, pattern(random, 2_000 + random.nextInt(1_000)), model);
+                }
+                for (var i = 0; i < 40; i++) {
+                    batch.put(NOTES, prefix + "n" + i, pattern(random, 1_000), model);
+                }
+            }
+            case 3 -> {
+                // Values of half a chunk or more, on arrays of their own, beside short ones
+                batch.put(MESSAGES, prefix + "l0", pattern(random, 150_000), model);
+                batch.put(MESSAGES, prefix + "l1", pattern(random, 140_000), model);
+                batch.put(MESSAGES, prefix + "l2", pattern(random, 3_000), model);
+                batch.put(MESSAGES, prefix + "l3", pattern(random, 40), model);
+                batch.put(SESSIONS, prefix + "ls", pattern(random, 150_000), model);
+            }
+            case 4 -> {
+                // More writes than a chunk holds the keys and lengths of: a body on chunks of its own beside its values
+                for (var i = 0; i < 40_000; i++) {
+                    batch.put(MESSAGES, prefix + "t" + i, pattern(random, FrameBody.LARGE_REFERABLE + random.nextInt(140)), model);
+                }
+            }
+            default -> {
+                // Resident byte arrays on copies of their own, and resident values the store copies
+                for (var i = 0; i < 300; i++) {
+                    batch.put(SESSIONS, prefix + "b" + i, pattern(random, 900), model);
+                    batch.put(NOTES, prefix + "m" + i, pattern(random, 900), model);
+                }
+            }
+        }
+    }
+
+    /// A batch being filled, which records each put in the model.
+    private record WriteBatchFiller(WriteBatch batch) {
+        void put(Keyspace<String, byte[]> keyspace, String key, byte[] value, Map<String, byte[]> model) {
+            batch.put(keyspace, key, value);
+            model.put(id(keyspace, key), value);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}, hot slab: {1}")
+    @CsvSource({"true, false", "false, false", "true, true", "false, true"})
+    @DisplayName("logs the values of queued large frames that refer to them while their batches start again on pooled arrays, and recovers them after a loss of power")
+    void largeFramesQueued(boolean encrypted, boolean hot) throws Exception {
+        withSlab(hot, pool -> {
+            var disk = CrashFileSystem.create();
+            var model = new ConcurrentHashMap<String, byte[]>();
+            CrashFileSystem survivor;
+            try (var ledger = openIdle(disk.getPath("/store"), encrypted)) {
+                ledger.awaitDurable();
+                var reached = new CountDownLatch(1);
+                var open = stallLog(disk, reached);
+                var failures = new ConcurrentLinkedQueue<Throwable>();
+                var lasts = new ConcurrentLinkedQueue<Commit>();
+                try {
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "first", new byte[300]));
+                    model.put(id(MESSAGES, "first"), new byte[300]);
+                    assertTrue(reached.await(2, TimeUnit.MINUTES));
+                    var threads = new ArrayList<Thread>();
+                    for (var t = 0; t < 3; t++) {
+                        var thread = t;
+                        threads.add(Thread.ofPlatform().start(() -> {
+                            try {
+                                var random = new Random(thread * 29L + 11);
+                                // One batch, started again after each commit on the arrays it gets back
+                                var batch = ledger.newBatch();
+                                var filler = new WriteBatchFiller(batch);
+                                Commit last = null;
+                                for (var round = 0; round < 10; round++) {
+                                    largeBatch(filler, (round + thread) % 6, thread + ":" + round + ":", random, model);
+                                    last = ledger.commit(batch);
+                                    // And small commits between them on arrays of the same pool
+                                    var key = "small" + thread + ":" + round;
+                                    var value = pattern(random, 1_400);
+                                    batch.put(MESSAGES, key, value);
+                                    model.put(id(MESSAGES, key), value);
+                                    last = ledger.commit(batch);
+                                }
+                                lasts.add(last);
+                            } catch (Throwable failure) {
+                                failures.add(failure);
+                            }
+                        }));
+                    }
+                    for (var thread : threads) {
+                        thread.join();
+                    }
+                    assertTrue(failures.isEmpty(), failures::toString);
+                    var queued = ((LiveLedger) ledger).logForTests().queuedForTests();
+                    var large = queued.stream().filter(body -> body.size() > LogWriter.RUN_MAX_BODY && body.references() > 0).count();
+                    assertTrue(large >= 15, "large frames that refer to values: " + large);
+                    assertTrue(queued.stream().anyMatch(body -> body.chunkCount() > 1 && body.references() > 0), "a chunked frame that refers to values");
+                    pool.assertNoneFree(ledger);
+                    verify(ledger, model);
+                } finally {
+                    open.countDown();
+                }
+                for (var last : lasts) {
+                    last.awaitDurable();
+                }
+                assertTrue(((LiveLedger) ledger).logForTests().piecewiseFramesForTests() >= 15);
+                survivor = disk.afterPowerLoss(new Random(23));
+            }
+            try (var ledger = open(survivor.getPath("/store"), encrypted, 1L << 20)) {
+                verify(ledger, model);
+            }
+        });
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @CsvSource({"true", "false"})
+    @DisplayName("refers from the frame of a large commit to its values while the log is idle, and copies them while the log holds such a frame")
+    void largeFramesWhileBusy(boolean encrypted) throws Exception {
+        withSlab(false, pool -> {
+            var random = new Random(31);
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, byte[]>();
+            CrashFileSystem survivor;
+            try (var ledger = open(disk.getPath("/store"), encrypted, 1L << 20)) {
+                ledger.awaitDurable();
+                var reached = new CountDownLatch(1);
+                var open = stallLog(disk, reached);
+                var queue = ((LiveLedger) ledger).logForTests();
+                Commit last;
+                try {
+                    // A small frame the writer holds, which leaves the log idle
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "first", new byte[300]));
+                    model.put(id(MESSAGES, "first"), new byte[300]);
+                    assertTrue(reached.await(2, TimeUnit.MINUTES));
+                    assertTrue(queue.idle());
+
+                    var batch = ledger.newBatch();
+                    largeBatch(new WriteBatchFiller(batch), 0, "a", random, model);
+                    ledger.commit(batch);
+                    var referring = queue.queuedForTests().getLast();
+                    assertEquals(FrameBody.LARGE_REFERABLE, referring.referable());
+                    assertTrue(referring.references() >= 300, "references: " + referring.references());
+                    assertFalse(queue.idle());
+
+                    // Behind it, the next large commit copies its values
+                    largeBatch(new WriteBatchFiller(batch), 0, "b", random, model);
+                    ledger.commit(batch);
+                    var copying = queue.queuedForTests().getLast();
+                    assertEquals(FrameBody.NOT_REFERABLE, copying.referable());
+                    assertEquals(0, copying.references());
+                    last = ledger.commit(ledger.newBatch().put(MESSAGES, "after", new byte[100]));
+                    model.put(id(MESSAGES, "after"), new byte[100]);
+                    pool.assertNoneFree(ledger);
+                } finally {
+                    open.countDown();
+                }
+                last.awaitDurable();
+                survivor = disk.afterPowerLoss(new Random(37));
+            }
+            try (var ledger = open(survivor.getPath("/store"), encrypted, 1L << 20)) {
+                verify(ledger, model);
+            }
+        });
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @CsvSource({"true", "false"})
+    @DisplayName("a commit estimated past a run whose values hold less than a chunk refers to none of them on an idle log, and recovers")
+    void largeEstimateFewValues(boolean encrypted) throws Exception {
+        withSlab(false, _ -> {
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, byte[]>();
+            CrashFileSystem survivor;
+            try (var ledger = openIdle(disk.getPath("/store"), encrypted)) {
+                var value = pattern(new Random(41), 100);
+                ledger.commit(ledger.newBatch().put(MESSAGES, "x", value).put(MESSAGES, "y", value));
+                model.put(id(MESSAGES, "x"), value);
+                model.put(id(MESSAGES, "y"), value);
+                ledger.awaitDurable();
+                var reached = new CountDownLatch(1);
+                var open = stallLog(disk, reached);
+                var queue = ((LiveLedger) ledger).logForTests();
+                Commit last;
+                try {
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "first", new byte[300]));
+                    model.put(id(MESSAGES, "first"), new byte[300]);
+                    assertTrue(reached.await(2, TimeUnit.MINUTES));
+                    // 1,000 removals of keys of one character and one put of 100 bytes: estimated past a run, logged
+                    // in one
+                    var batch = ledger.newBatch();
+                    for (var i = 0; i < 1_000; i++) {
+                        batch.delete(MESSAGES, String.valueOf((char) ('a' + i % 26)));
+                    }
+                    var put = pattern(new Random(43), 100);
+                    batch.put(MESSAGES, "x", put);
+                    model.put(id(MESSAGES, "x"), put);
+                    last = ledger.commit(batch);
+                    var frame = queue.queuedForTests().getLast();
+                    assertTrue(frame.size() <= LogWriter.RUN_MAX_BODY, "the body takes " + frame.size() + " bytes");
+                    assertEquals(0, frame.references());
+                } finally {
+                    open.countDown();
+                }
+                last.awaitDurable();
+                model.remove(id(MESSAGES, "y"));
+                ledger.commit(ledger.newBatch().delete(MESSAGES, "y")).awaitDurable();
+                survivor = disk.afterPowerLoss(new Random(47));
+            }
+            try (var ledger = open(survivor.getPath("/store"), encrypted, 1L << 20)) {
+                verify(ledger, model);
+            }
+        });
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @CsvSource({"true", "false"})
+    @DisplayName("refers from the frame of a large durable commit made right after an empty store opens, as an app-state snapshot is, and recovers it")
+    void largeCommitAfterOpen(boolean encrypted) throws Exception {
+        var disk = CrashFileSystem.create();
+        var model = new TreeMap<String, byte[]>();
+        CrashFileSystem survivor;
+        try (var ledger = open(disk.getPath("/store"), encrypted, 1L << 20)) {
+            var random = new Random(53);
+            var batch = ledger.newBatch();
+            for (var i = 0; i < 20_000; i++) {
+                var key = "%032x".formatted(i * 0x9E3779B97F4A7C15L);
+                var value = pattern(random, 100 + Math.floorMod(i * 31, 201));
+                batch.put(MESSAGES, key, value);
+                model.put(id(MESSAGES, key), value);
+            }
+            ledger.commit(batch).awaitDurable();
+            assertEquals(1, ((LiveLedger) ledger).logForTests().piecewiseFramesForTests(), "the snapshot's frame sealed piece by piece");
+            verify(ledger, model);
+            survivor = disk.afterProcessCrash();
+        }
+        try (var ledger = open(survivor.getPath("/store"), encrypted, 1L << 20)) {
+            verify(ledger, model);
+        }
+    }
+
     @ParameterizedTest(name = "encrypted: {0}")
     @CsvSource({"true", "false"})
     @DisplayName("logs a valid frame for a resident byte array whose instance a reader writes before the seal, and the commits after it")
@@ -563,7 +912,7 @@ class FrameReferencesTest {
 
     private static void assertFrame(FrameBody frame, String name, int references, int maxOwn, int size) {
         assertEquals(references, frame.references(), name + ": references");
-        assertTrue(frame.pieceArray(0).length <= maxOwn, name + ": copies on an array of " + frame.pieceArray(0).length + " bytes");
+        assertTrue(frame.chunk(0).length <= maxOwn, name + ": copies on an array of " + frame.chunk(0).length + " bytes");
         assertTrue(frame.size() >= size, name + ": holds " + frame.size() + " bytes");
     }
 
@@ -728,14 +1077,14 @@ class FrameReferencesTest {
                     throw new AssertionError(exception);
                 }
                 var size = frame.size();
-                var pieces = frame.pieces();
+                var references = frame.references();
                 assertThrows(IllegalArgumentException.class, () -> transaction.put(MESSAGES, "over", new byte[3_000]));
                 assertTrue(transaction.get(MESSAGES, "over").isEmpty());
                 assertThrows(IllegalArgumentException.class, () -> transaction.delete(MESSAGES, "k".repeat(100)));
                 assertThrows(IllegalArgumentException.class, () -> transaction.deleteRange(MESSAGES, KeyRange.atLeast("k".repeat(100))));
                 assertTrue(transaction.get(MESSAGES, "kept").isPresent());
                 assertEquals(size, frame.size());
-                assertEquals(pieces, frame.pieces());
+                assertEquals(references, frame.references());
                 // The filler is no value a writer could read, so this frame must not reach the log
                 transaction.delete(MESSAGES, "other");
                 assertTrue(transaction.get(MESSAGES, "other").isEmpty());

@@ -864,7 +864,7 @@ public final class LiveLedger implements Ledger {
         try {
             ensureOpen();
             checkHealthy();
-            applier = new Applier(sequenced.next, log == null ? null : FrameBody.forCommit(writes, units, pool), writes.size(),
+            applier = new Applier(sequenced.next, log == null ? null : FrameBody.forCommit(writes, units, pool, log.idle()), writes.size(),
                     pages != null && log != null, writes.sharesChunk(), spillable(writes));
             if (outcome != null) {
                 outcome[0] = applier;
@@ -1254,7 +1254,7 @@ public final class LiveLedger implements Ledger {
     /// go on, and its committing thread throws the failure.
     private void apply(PendingCommit pending) {
         var writes = pending.writes;
-        var applier = new Applier(pending.sequence, log == null ? null : FrameBody.forCommit(writes, pending.units, pool), writes.size(), false,
+        var applier = new Applier(pending.sequence, log == null ? null : FrameBody.forCommit(writes, pending.units, pool, log.idle()), writes.size(), false,
                 writes.sharesChunk(), spillable(writes));
         try {
             var size = writes.size();

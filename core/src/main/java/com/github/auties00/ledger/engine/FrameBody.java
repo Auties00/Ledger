@@ -33,10 +33,12 @@ import java.util.Arrays;
 /// transaction encoded it into. The log writer reads the [pieces][#pieces()] in order and seals the bytes the format
 /// above says, with no trace of where they were. A body refers to values only where gathering them costs the writer
 /// nothing: in a body of a batch of at most [LogWriter#RUN_MAX_BODY] bytes, which the writer copies into its output
-/// whole before it seals it there anyway, from [#RUN_REFERABLE] bytes; and in a body of a transaction, whose length
-/// is unknown until its last write, from [#SEALED_REFERABLE] bytes, values long enough for the writer to hand to the
-/// cipher as they are. The body of a commit of one value of a kilobyte thus allocates an array for the value's key and
-/// lengths alone, where it copied the value too.
+/// whole before it seals it there anyway, from [#RUN_REFERABLE] bytes; in a body of a transaction, whose length is
+/// unknown until its last write, from [#SEALED_REFERABLE] bytes, values long enough for the writer to hand to the
+/// cipher as they are; and in a larger body of a batch made while the log is [idle][LogWriter#idle()], from
+/// [#LARGE_REFERABLE] bytes, which the writer gathers into its output slice by slice as it seals them, so the frame
+/// holds no second copy of the batch's values from the commit until the seal. The body of a commit of one value of a
+/// kilobyte thus allocates an array for the value's key and lengths alone, where it copied the value too.
 ///
 /// A referred array is one no one writes and the store's [HeapPool] never hands out, so a frame may wait in the log's
 /// queue while the batch it came from starts again on other arrays. It keeps the whole array reachable meanwhile, a
@@ -44,8 +46,8 @@ import java.util.Arrays;
 ///
 /// A body made with a [HeapPool] keeps its own bytes past [#CHUNK_BYTES] in chunks of that size from the pool, every
 /// one but the last full, rather than in one array of megabytes that the collector would give regions of their own and
-/// that the log reads once: the body of a large batch, which refers to no value, and that of a transaction, whose
-/// values of a few kilobytes it refers to. The log hands the chunks back once it sealed the frame ([#release()]); a
+/// that the log reads once: the body of a large batch, and that of a transaction, whose values of a few kilobytes it
+/// refers to. The log hands the chunks back once it sealed the frame ([#release()]); a
 /// body the log never took goes back with [#discard()]. From its first chunk until then the body
 /// [holds][HeapPool#hold()] the pool's overflow, where the chunks of the frames sealed before it wait, so a collection
 /// while it fills keeps them for it; a body a stopped log leaves to the collector lets go of it ([#abandon()]). A
@@ -80,6 +82,11 @@ final class FrameBody {
     /// slice by slice, handing each long piece to the cipher as it is, and a call of the cipher costs about what
     /// copying a few kilobytes does.
     static final int SEALED_REFERABLE = 2 << 10;
+    /// The shortest value the body of a batch larger than [LogWriter#RUN_MAX_BODY] made while the log is idle refers
+    /// to rather than copies: the writer seals such a body slice by slice, gathering each piece below
+    /// [LogWriter#DIRECT_PIECE] bytes into its output, so a value copied there at the seal rather than into the body
+    /// at the commit costs the same copy, and a shorter one would cost a reference of about its own bytes.
+    static final int LARGE_REFERABLE = 64;
     /// What [#referable()] is for a body that refers to no value.
     static final int NOT_REFERABLE = Integer.MAX_VALUE;
     /// The longest body: the longest whose frame AES-GCM can seal and recovery can read into one array, which the JVM
@@ -93,6 +100,8 @@ final class FrameBody {
     private static final byte DELETE = 1;
     private static final byte RANGE = 2;
     private static final byte EXTERNAL = 3;
+    // The most room a commit's body starts with; a larger one grows into further chunks as it fills
+    private static final long MAX_CAPACITY = 64L << 20;
     // The ints of laterSpans per reference: where in data the value belongs, where it starts in its array, its length
     private static final int SPAN_FIELDS = 3;
     // The references after the first a body makes room for when it needs a second
@@ -109,8 +118,8 @@ final class FrameBody {
     private byte[] data;
     private int used;
     // The values the body refers to and the shortest it refers to, one shared and empty while it refers to none: apart,
-    // so the body of a commit that refers to nothing, as those of small values and of large batches do, has no field
-    // of references besides this one
+    // so the body of a commit that refers to nothing, as those of small values and of large batches on a busy log do,
+    // has no field of references besides this one
     private References referred;
     // The pool of a body made with one, its chunks and who owns them, or null for a body of one array that grows by
     // doubling: apart, as the references are, so the body of a small commit carries one field for them
@@ -165,15 +174,20 @@ final class FrameBody {
     /// A commit whose body takes at most [LogWriter#RUN_MAX_BODY] bytes by [#capacityFor(ArrayWriteBatch, PageRef\[\])],
     /// which never estimates less than a body takes, refers to its values of [#RUN_REFERABLE] bytes or more, which its
     /// room leaves out: every put of a batch offers its value on an array, but one whose value is in its unit. Such a
-    /// commit has few writes, and only one with a value that long visits them. The body of any other commit refers to
-    /// nothing, as the writer seals it slice by slice from the body itself, and keeps its bytes past [#CHUNK_BYTES] in
-    /// chunks from `pool`.
+    /// commit has few writes, and only one with a value that long visits them. The body of any other commit keeps its
+    /// bytes past [#CHUNK_BYTES] in chunks from `pool`, and the writer seals it slice by slice. Made while the log is
+    /// `idle`, it refers to its values of [#LARGE_REFERABLE] bytes or more, which its room leaves out, if they hold a
+    /// chunk's bytes at least: such a commit's frame is sealed next, by a writer with nothing else to do, so gathering
+    /// the values there rather than copying them here moves the copy off the commit and spares the frame a second copy
+    /// of the batch. Made while the log is busy, as the commits of a sync that outpaces the device are, it refers to
+    /// nothing, so the writer, which those commits wait for, seals it from the body itself.
     ///
     /// @param pool the pool, or `null` for a body of one array
-    static FrameBody forCommit(ArrayWriteBatch writes, PageRef[] units, HeapPool pool) {
+    /// @param idle whether the log was [idle][LogWriter#idle()] as the commit started to apply
+    static FrameBody forCommit(ArrayWriteBatch writes, PageRef[] units, HeapPool pool, boolean idle) {
         var capacity = capacityFor(writes, units);
         if (capacity > LogWriter.RUN_MAX_BODY) {
-            return new FrameBody(capacity, NOT_REFERABLE, pool);
+            return idle ? forLargeCommit(writes, units, pool, capacity) : new FrameBody(capacity, NOT_REFERABLE, pool);
         }
         if (writes.largestValueBytes() < RUN_REFERABLE) {
             return new FrameBody(capacity, RUN_REFERABLE);
@@ -187,6 +201,32 @@ final class FrameBody {
         return new FrameBody(capacity, RUN_REFERABLE);
     }
 
+    /// {@return the empty body of the frame of a commit of `writes` larger than [LogWriter#RUN_MAX_BODY], made while
+    /// the log is idle, which takes `capacity` bytes if it refers to nothing}
+    ///
+    /// It refers to the values of [#LARGE_REFERABLE] bytes or more, with room for the rest and for as many references
+    /// as there are such values, unless they hold fewer bytes than a chunk, which then saves too little to pay for the
+    /// pieces the writer gathers.
+    private static FrameBody forLargeCommit(ArrayWriteBatch writes, PageRef[] units, HeapPool pool, int capacity) {
+        var referable = 0L;
+        var count = 0;
+        for (var i = 0; i < writes.size(); i++) {
+            var length = writes.valueBytes(i);
+            if (length >= LARGE_REFERABLE && writes.kind(i) == ArrayWriteBatch.PUT && (units == null || units[i] == null)) {
+                referable += length;
+                count++;
+            }
+        }
+        if (referable < CHUNK_BYTES) {
+            return new FrameBody(capacity, NOT_REFERABLE, pool);
+        }
+        // What is left holds the kind, key space, lengths and key of every write, so it is never below 16
+        var own = (int) Math.min(estimate(writes, units) - referable, MAX_CAPACITY);
+        var body = new FrameBody(own, LARGE_REFERABLE, pool);
+        body.referred = References.expecting(LARGE_REFERABLE, count);
+        return body;
+    }
+
     /// {@return the bytes the body of a commit of `writes` takes, its large values in their units, near enough that it
     /// seldom grows}
     ///
@@ -196,6 +236,11 @@ final class FrameBody {
     /// The encodings of the batch hold its keys, values and bounds, and the bytes a write whose codec threw had
     /// reserved, which only make the estimate larger: only a commit with large values visits its writes.
     static int capacityFor(ArrayWriteBatch writes, PageRef[] units) {
+        return (int) Math.min(estimate(writes, units), MAX_CAPACITY);
+    }
+
+    /// {@return the bytes [#capacityFor] estimates, before its bound}
+    private static long estimate(ArrayWriteBatch writes, PageRef[] units) {
         // The kind, the key space and the lengths of each write, as variable-length numbers, and what they encode
         var bytes = 16 + 16L * writes.size() + writes.encodedBytes();
         if (units != null) {
@@ -206,7 +251,7 @@ final class FrameBody {
                 }
             }
         }
-        return (int) Math.min(bytes, 64L << 20);
+        return bytes;
     }
 
     /// {@return the bytes of a body of one array that refers to no value; only the first [#size()] are meaningful}
@@ -316,7 +361,6 @@ final class FrameBody {
         }
         // Once every chunk is back, so no collection between the two finds the pool's overflow unheld
         pooled.hold = null;
-        pooled.spread = null;
         data = null;
     }
 
@@ -365,48 +409,21 @@ final class FrameBody {
         return referred.count;
     }
 
-    /// {@return the number of pieces whose bytes, in order, are the body: a run of its own bytes, then for each value
-    /// it refers to that value and the run after it}
+    /// {@return the array of the value the body refers to `reference`th, below [#references()]; for tests}
+    byte[] referredArrayForTests(int reference) {
+        return referred.array(reference);
+    }
+
+    /// {@return a cursor over the pieces whose bytes, in order, are the body: a run of its own bytes, then for each
+    /// value it refers to that value and the run after it, with no empty piece}
     ///
-    /// The runs of a chunked body are split at its chunks' ends, so no piece spans two arrays.
-    int pieces() {
-        var spread = spread();
-        return spread == null ? 2 * references() + 1 : spread.count;
-    }
-
-    /// {@return the array piece `piece` is part of, which no one writes while the body is queued}
-    byte[] pieceArray(int piece) {
-        var spread = spread();
-        if (spread != null) {
-            return spread.arrays[piece];
-        }
-        return (piece & 1) == 0 ? data : referred.array(piece >> 1);
-    }
-
-    /// {@return where piece `piece` starts in its array}
-    int pieceOffset(int piece) {
-        var spread = spread();
-        if (spread != null) {
-            return spread.offsets[piece];
-        }
-        var reference = piece >> 1;
-        if ((piece & 1) != 0) {
-            return referred.offset(reference);
-        }
-        return reference == 0 ? 0 : referred.at(reference - 1);
-    }
-
-    /// {@return the bytes of piece `piece`, maybe 0}
-    int pieceLength(int piece) {
-        var spread = spread();
-        if (spread != null) {
-            return spread.lengths[piece];
-        }
-        var reference = piece >> 1;
-        if ((piece & 1) != 0) {
-            return referred.length(reference);
-        }
-        return (reference == references() ? used : referred.at(reference)) - pieceOffset(piece);
+    /// The runs of a chunked body are split at its chunks' ends, so no piece spans two arrays. The cursor reads the
+    /// body as it stands when it moves: a write to the body meanwhile leaves it undefined.
+    ///
+    /// @throws IllegalStateException if the body is released
+    Pieces pieces() {
+        checkHeld();
+        return new Pieces(this);
     }
 
     /// Copies the body into `target` at `offset`, the values it refers to gathered.
@@ -427,27 +444,106 @@ final class FrameBody {
             }
             return offset;
         }
-        for (var piece = 0; piece < pieces(); piece++) {
-            var length = pieceLength(piece);
-            System.arraycopy(pieceArray(piece), pieceOffset(piece), target, offset, length);
-            offset += length;
+        var pooled = this.pooled;
+        if (pooled == null || pooled.chunks == null) {
+            // The own runs are in data, between the places the references record
+            var references = referred;
+            var from = 0;
+            for (var reference = 0; reference < references.count; reference++) {
+                var at = references.at(reference);
+                System.arraycopy(data, from, target, offset, at - from);
+                offset += at - from;
+                var length = references.length(reference);
+                System.arraycopy(references.array(reference), references.offset(reference), target, offset, length);
+                offset += length;
+                from = at;
+            }
+            System.arraycopy(data, from, target, offset, used - from);
+            return offset + used - from;
+        }
+        for (var pieces = pieces(); pieces.next(); ) {
+            System.arraycopy(pieces.array(), pieces.offset(), target, offset, pieces.length());
+            offset += pieces.length();
         }
         return offset;
     }
 
-    /// {@return the pieces of a chunked body that refers to values, as its bytes stand, or `null` for any other body}
-    private Spread spread() {
-        var pooled = this.pooled;
-        if (pooled == null || pooled.chunks == null || referred.count == 0) {
-            return null;
+    /// The pieces of a body, one at a time: [#next()] moves to the next one, whose array, offset and length the
+    /// accessors then return.
+    static final class Pieces {
+        private final References references;
+        // The chunks of the own bytes, or null for a body of one array
+        private final byte[][] chunks;
+        // The one array of the own bytes, or the last chunk
+        private final byte[] data;
+        // Where the own bytes end, counted over the chunks
+        private final int ownEnd;
+        // The next reference to move to once the own run before it is done
+        private int reference;
+        // Where the own run left to read starts and ends, counted over the chunks: it ends where the next reference
+        // belongs, or with the own bytes
+        private int from;
+        private int to;
+        private byte[] array;
+        private int offset;
+        private int length;
+
+        private Pieces(FrameBody body) {
+            this.references = body.referred;
+            var pooled = body.pooled;
+            this.chunks = pooled == null ? null : pooled.chunks;
+            this.data = body.data;
+            this.ownEnd = body.ownBytes();
+            this.to = references.count == 0 ? ownEnd : references.at(0);
         }
-        var spread = pooled.spread;
-        // A write adds at least its kind byte, so the length tells whether the pieces still stand
-        if (spread == null || spread.size != size()) {
-            spread = new Spread(this);
-            pooled.spread = spread;
+
+        /// Moves to the next piece.
+        ///
+        /// @return whether there is one
+        boolean next() {
+            while (true) {
+                if (from < to) {
+                    if (chunks == null) {
+                        array = data;
+                        offset = from;
+                        length = to - from;
+                    } else {
+                        array = chunks[from / CHUNK_BYTES];
+                        offset = from % CHUNK_BYTES;
+                        length = Math.min(to - from, CHUNK_BYTES - offset);
+                    }
+                    from += length;
+                    return true;
+                }
+                var next = reference;
+                if (next == references.count) {
+                    return false;
+                }
+                reference = next + 1;
+                to = reference == references.count ? ownEnd : references.at(reference);
+                length = references.length(next);
+                if (length != 0) {
+                    array = references.array(next);
+                    offset = references.offset(next);
+                    return true;
+                }
+            }
         }
-        return spread;
+
+        /// {@return the array of the piece, which no one writes while the body is queued}
+        byte[] array() {
+            return array;
+        }
+
+        /// {@return where the piece starts in its array}
+        int offset() {
+            return offset;
+        }
+
+        /// {@return the bytes of the piece, never 0}
+        int length() {
+            return length;
+        }
     }
 
     /// {@return the bytes of the body, gathered into an array of their length}
@@ -531,7 +627,7 @@ final class FrameBody {
     private void refer(byte[] array, int offset, int length) {
         var references = referred;
         var at = ownBytes();
-        if (references.count == 0) {
+        if (references.count == 0 && references.laterArrays == null) {
             referred = new References(references.referable, array, at, offset, length);
         } else {
             references.add(array, at, offset, length);
@@ -544,6 +640,7 @@ final class FrameBody {
         private static final References NONE = new References(NOT_REFERABLE);
         private static final References RUN = new References(RUN_REFERABLE);
         private static final References SEALED = new References(SEALED_REFERABLE);
+        private static final References LARGE = new References(LARGE_REFERABLE);
 
         // The shortest value the body refers to
         private final int referable;
@@ -553,21 +650,24 @@ final class FrameBody {
         // The first, in fields of its own, as the body of a commit of one value has no other: its array, where in the
         // body's own bytes its value belongs, counted over the chunks, and where in its array the value starts and how
         // long it is
-        private final byte[] firstArray;
-        private final int firstAt;
-        private final int firstOffset;
-        private final int firstLength;
-        // The references after the first, in order, or null before the second
+        private byte[] firstArray;
+        private int firstAt;
+        private int firstOffset;
+        private int firstLength;
+        // The references after the first, in order, or null before the second unless made with room for them
         private byte[][] laterArrays;
         private int[] laterSpans;
 
         /// Makes the references of a body that refers to no value yet.
         private References(int referable) {
             this.referable = referable;
-            this.firstArray = null;
-            this.firstAt = 0;
-            this.firstOffset = 0;
-            this.firstLength = 0;
+        }
+
+        /// Makes the references of a body that refers to no value yet, with room for `expected` of them.
+        private References(int referable, int expected) {
+            this.referable = referable;
+            this.laterArrays = new byte[expected - 1][];
+            this.laterSpans = new int[(expected - 1) * SPAN_FIELDS];
         }
 
         /// Makes the references of a body whose first reference is the `length` bytes at `offset` of `array`, which
@@ -589,12 +689,29 @@ final class FrameBody {
                 case NOT_REFERABLE -> NONE;
                 case RUN_REFERABLE -> RUN;
                 case SEALED_REFERABLE -> SEALED;
+                case LARGE_REFERABLE -> LARGE;
                 default -> new References(referable);
             };
         }
 
-        /// Records the reference after the first, whose value belongs at `at` of the body's own bytes.
+        /// {@return the references of a body that refers to no value yet, and to at most `expected` values of at least
+        /// `referable` bytes later, with room for them all}
+        static References expecting(int referable, int expected) {
+            return expected < 2 ? none(referable) : new References(referable, expected);
+        }
+
+        /// Records the next reference, whose value belongs at `at` of the body's own bytes: the first only in
+        /// references made with room for later ones.
         void add(byte[] array, int at, int offset, int length) {
+            if (count == 0) {
+                firstArray = array;
+                firstAt = at;
+                firstOffset = offset;
+                firstLength = length;
+                count = 1;
+                bytes = length;
+                return;
+            }
             var later = count - 1;
             if (laterArrays == null) {
                 laterArrays = new byte[LATER_REFERENCES][];
@@ -890,8 +1007,6 @@ final class FrameBody {
         private int chunkCount;
         // OPEN, HANDED or RELEASED; written by the body's writer until it hands the body off, then by the log alone
         private byte state;
-        // The pieces of a chunked body that refers to values, as of its length then, or null
-        private Spread spread;
         // The pool's hold on its overflow from the body's first chunk until its release, or null: the chunks of the
         // frame before it, which went back to the overflow as it was sealed, are this body's next ones, and those of a
         // large commit's next frame once this one is sealed
@@ -913,56 +1028,6 @@ final class FrameBody {
                 throw new IllegalStateException("The pool gave a chunk of " + chunk.length + " bytes");
             }
             return chunk;
-        }
-    }
-
-    /// The pieces of a chunked body that refers to values: its own runs split at the ends of its chunks, and the values
-    /// it refers to, in order, with no empty piece.
-    private static final class Spread {
-        // The body's length the pieces are of
-        private final int size;
-        private final byte[][] arrays;
-        private final int[] offsets;
-        private final int[] lengths;
-        private int count;
-
-        Spread(FrameBody body) {
-            var pooled = body.pooled;
-            var references = body.referred;
-            // A run of the body's own bytes takes a piece per chunk it touches, and each chunk end splits one run
-            var most = 2 * references.count + pooled.chunkCount + 1;
-            this.arrays = new byte[most][];
-            this.offsets = new int[most];
-            this.lengths = new int[most];
-            var from = 0;
-            for (var reference = 0; reference < references.count; reference++) {
-                var at = references.at(reference);
-                addOwn(pooled, from, at);
-                add(references.array(reference), references.offset(reference), references.length(reference));
-                from = at;
-            }
-            addOwn(pooled, from, pooled.base + body.used);
-            this.size = body.size();
-        }
-
-        /// Adds the body's own bytes from `from` to `to`, a piece per chunk.
-        private void addOwn(Pooled pooled, int from, int to) {
-            while (from < to) {
-                var offset = from % CHUNK_BYTES;
-                var length = Math.min(to - from, CHUNK_BYTES - offset);
-                add(pooled.chunks[from / CHUNK_BYTES], offset, length);
-                from += length;
-            }
-        }
-
-        private void add(byte[] array, int offset, int length) {
-            if (length == 0) {
-                return;
-            }
-            arrays[count] = array;
-            offsets[count] = offset;
-            lengths[count] = length;
-            count++;
         }
     }
 

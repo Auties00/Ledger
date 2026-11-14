@@ -261,6 +261,31 @@ class LogSpillTest {
         }
     }
 
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("the values of a large commit whose frame refers to them rather than copies them read back from where the frame holds them once moved to the log")
+    void readsBackFromReferringFrames(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, encrypted, 0)) {
+            // Right after the open, the log holds no frame but the catalog's, so the commit's frame refers to its values
+            write(ledger, expected, 0, 400, 0, true);
+            assertEquals(1, ledger.log().piecewiseFramesForTests(), "the frame sealed piece by piece");
+            spillNow(ledger);
+            assertTrue(ledger.spills().loggedValuesForTests() > 0, "no value moved to the log");
+            for (var entry : expected.messages.entrySet()) {
+                if (entry.getValue().length >= SpillQueue.LOG_VALUE_MIN) {
+                    assertInstanceOf(LogValue.class, head(ledger, MESSAGES, key(entry.getKey())).sourceForTests(), "message " + entry.getKey());
+                }
+            }
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            verify(ledger, expected);
+        }
+    }
+
     @Test
     @DisplayName("the values of commits the log wrote as runs of several commits read back from where each commit lies in the run")
     void readsBackFromRuns(@TempDir Path directory) throws Exception {

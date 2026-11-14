@@ -199,10 +199,11 @@ class FrameChunksTest {
         assertArrayEquals(Arrays.copyOf(plain.array(), plain.size()), chunked.toBytes());
         var gathered = new byte[chunked.size()];
         var at = 0;
-        for (var piece = 0; piece < chunked.pieces(); piece++) {
-            var length = chunked.pieceLength(piece);
+        for (var pieces = chunked.pieces(); pieces.next(); ) {
+            var length = pieces.length();
             assertTrue(length > 0, "an empty piece");
-            System.arraycopy(chunked.pieceArray(piece), chunked.pieceOffset(piece), gathered, at, length);
+            assertTrue(pieces.offset() + length <= pieces.array().length, "a piece past its array");
+            System.arraycopy(pieces.array(), pieces.offset(), gathered, at, length);
             at += length;
         }
         assertArrayEquals(Arrays.copyOf(plain.array(), plain.size()), gathered);
