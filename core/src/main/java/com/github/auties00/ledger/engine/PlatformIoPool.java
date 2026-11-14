@@ -8,6 +8,7 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
 
 /// An [IoPool] of daemon platform threads named `ledger-io-N`.
 ///
@@ -18,16 +19,20 @@ import java.util.concurrent.TimeUnit;
 /// have been idle for that long; it hands a task to the thread that waited the least, which for one busy store is the
 /// thread of its last flush.
 ///
-/// A task that finds no thread waiting while the flusher has threads waits up to [#HANDOFF_NANOS] for one to come
-/// back before a thread is made for it: a commit that writes its own group hands the store's flush a task that ends at
-/// once, and the thread woken for it may not be waiting again by the store's next commit, which with a fast device
-/// comes sooner than the system wakes a thread. Without the wait, each such commit would make a thread that then waits
-/// a minute for work.
+/// A task that finds no thread waiting while a thread of the flusher is between two tasks spins up to
+/// [#HANDOFF_NANOS] for it to come back before a thread is made for it: a commit that writes its own group hands the
+/// store's flush a task that ends at once, and the thread woken for it may not be waiting again by the store's next
+/// commit, which with a fast device comes sooner than the system wakes a thread. Without the wait, each such commit
+/// would make a thread that then waits a minute for work. The wait never parks, as the system may round a timed park up
+/// to its timer resolution (a millisecond or more on Windows), and it is skipped when every thread runs a task: a thread
+/// writing another store's flush does not come back in time, so the task gets a new thread at once. The task's caller
+/// may hold its store's publishing role, which every other commit of that store waits for.
 public final class PlatformIoPool implements IoPool {
     /// How long a thread of the process's flusher waits for another flush before it ends.
     static final long KEEP_ALIVE_SECONDS = 60;
-    /// How long a task of the process's flusher waits for a thread of it to come back before one is made: several
-    /// times what the system takes to wake a thread, and a fraction of the start of a new one.
+    /// How long a task of the process's flusher spins for a thread of it between two tasks to come back before one is
+    /// made: several times what a running thread takes to finish a task and wait for the next, and a fraction of the
+    /// start of a new thread.
     static final long HANDOFF_NANOS = TimeUnit.MICROSECONDS.toNanos(100);
     // Guards process
     private static final Object PROCESS_LOCK = new Object();
@@ -111,14 +116,23 @@ public final class PlatformIoPool implements IoPool {
         return executor.getPoolSize();
     }
 
+    /// {@return how many tasks of a pool shaped as the process's flusher spun for a thread to come back, for tests; 0
+    /// for any other pool}
+    long handoffWaitsForTests() {
+        return executor.getQueue() instanceof Handoff handoff ? handoff.waits.sum() : 0;
+    }
+
     /// Sets how long a thread of a pool shaped as the process's flusher waits for a task before it ends, for tests.
     void keepAliveForTests(long time, TimeUnit unit) {
         executor.setKeepAliveTime(time, unit);
     }
 
-    /// The hand-off of the process's flusher: a task that finds no thread waiting waits [#HANDOFF_NANOS] for one while
-    /// the flusher has threads, which are then running a task or about to wait for the next.
+    /// The hand-off of the process's flusher: a task that finds no thread waiting spins up to [#HANDOFF_NANOS] for one
+    /// while a thread of the flusher is between two tasks, and is refused at once, so that the executor makes a thread
+    /// for it, while every thread runs a task.
     private static final class Handoff extends SynchronousQueue<Runnable> {
+        // The tasks that spun for a thread, for tests
+        private final LongAdder waits = new LongAdder();
         // The executor that takes from it, set once it is built
         private volatile ThreadPoolExecutor executor;
 
@@ -128,15 +142,18 @@ public final class PlatformIoPool implements IoPool {
                 return true;
             }
             var pool = executor;
-            if (pool == null || pool.getPoolSize() == 0) {
+            if (pool == null || pool.getActiveCount() >= pool.getPoolSize()) {
                 return false;
             }
-            try {
-                return super.offer(task, HANDOFF_NANOS, TimeUnit.NANOSECONDS);
-            } catch (InterruptedException _) {
-                Thread.currentThread().interrupt();
-                return false;
-            }
+            waits.increment();
+            var deadline = System.nanoTime() + HANDOFF_NANOS;
+            do {
+                Thread.onSpinWait();
+                if (super.offer(task)) {
+                    return true;
+                }
+            } while (System.nanoTime() - deadline < 0);
+            return false;
         }
     }
 

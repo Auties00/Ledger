@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -130,6 +131,57 @@ class ProcessFlusherTest {
         for (var store = 0; store < 8; store++) {
             try (var ledger = open(disk.afterPowerLoss(new Random(store)).getPath("/store" + store), flusher)) {
                 assertEquals(models.get(store), contents(ledger), "store " + store);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("makes a thread at once for a store's flush while every thread runs another store's, without waiting for one to come back")
+    void busyThreads() throws Exception {
+        var made = new AtomicInteger();
+        var flusher = PlatformIoPool.sharedForTests(counting(made));
+        var disk = CrashFileSystem.create();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (var first = open(disk.getPath("/storeA"), flusher); var second = open(disk.getPath("/storeB"), flusher)) {
+            try {
+                flusher.keepAliveForTests(1, TimeUnit.MILLISECONDS);
+                awaitThreads(flusher, 0);
+                flusher.keepAliveForTests(PlatformIoPool.KEEP_ALIVE_SECONDS, TimeUnit.SECONDS);
+                // The threads the opens made
+                var opens = made.get();
+                // The force of the first store's log holds the only thread until the second store's flush has a thread
+                disk.intercept((path, kind) -> {
+                    var name = path.toString();
+                    if (kind == ChangeInterceptor.ChangeKind.FORCE && name.startsWith("/storeA") && name.endsWith(".log")) {
+                        entered.countDown();
+                        try {
+                            release.await();
+                        } catch (InterruptedException exception) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                });
+                // Neither commit waits for its durability, so neither writes its own group: the flusher's threads do
+                var held = first.commit(first.newBatch().put(NAMES, "held", "v".repeat(500)));
+                assertTrue(entered.await(30, TimeUnit.SECONDS), "the first store's flush never forced");
+                assertEquals(1, flusher.threadsForTests());
+                var waits = flusher.handoffWaitsForTests();
+                var value = "v".repeat(500) + "k";
+                var other = second.commit(second.newBatch().put(NAMES, "k", value));
+                var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+                while (made.get() < opens + 2) {
+                    assertTrue(System.nanoTime() < deadline, "the second store's flush got no thread of its own");
+                    Thread.sleep(1);
+                }
+                assertTrue(other.awaitDurable(Duration.ofSeconds(30)), "the second store's commit never became durable");
+                assertEquals(waits, flusher.handoffWaitsForTests(), "the second store's flush waited for the busy thread");
+                assertEquals(opens + 2, made.get());
+                release.countDown();
+                held.awaitDurable();
+                assertEquals(Map.of("k", value), contents(second));
+            } finally {
+                release.countDown();
             }
         }
     }
