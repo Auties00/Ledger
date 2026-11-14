@@ -16,10 +16,11 @@ import java.util.HashMap;
 /// other reads use: the PostgreSQL buffer manager holds a large sequential scan to a small ring for the same reason. A
 /// cache with room evicts nothing to take them, and keeps a key space small enough to fit for the next scan.
 ///
-/// A cursor of a paged key space's reads screens the leaves and blobs it admits: the cache takes one only at its
-/// second read ([PageCache#putScreened(long, PageRef, byte\[\])]), as most of the pages of a chat a client opens are
-/// read once, and a unit the cache refused lately and still reaches weakly is
-/// [recalled][PageFile#recalled(PageRef, byte)] before the cursor reads anything ahead or from the file.
+/// A cursor of a paged key space's reads screens the leaves and blobs it admits, and the branches of level 1 it reads
+/// while it admits: the cache takes one only at its second read ([PageCache#putScreened(long, PageRef, byte\[\])]), as
+/// most of the pages of a chat a client opens are read once, and a unit the cache refused lately and still reaches
+/// weakly is [recalled][PageFile#recalled(PageRef, byte)] before the cursor reads anything ahead or from the file. The
+/// cursor keeps the branches on its path, so it never reads a branch the cache refused twice in one scan.
 ///
 /// A cursor made to gather reads ahead while the reads of the file are [cold][PageFile#coldReads()]. When it needs a
 /// leaf that neither the cache nor its own reads ahead hold, it reads that leaf together with the next siblings under
@@ -330,10 +331,14 @@ final class TreeCursor {
 
     /// {@return child `index` of the branch `parent`, read through the cache}
     ///
-    /// Branches are always cached: a scan reads one for every few hundred leaves, and every read starts from them.
+    /// Branches of level 2 or more are always cached: a scan reads one for every few thousand leaves, and the reads of
+    /// every key under them cross them. A branch of level 1 is screened as the leaves are while the cursor still admits
+    /// what it reads, without counting against [#ADMITTED], as the reads of a chat rarely come back to the other leaves
+    /// under it; past them it is cached at once, as a long scan reads one for every 60 leaves or so.
     private byte[] child(byte[] parent, int index) {
-        if (TreeNodes.level(parent) > 1) {
-            return pages.node(parent, index);
+        var level = TreeNodes.level(parent);
+        if (level > 1) {
+            return pages.node(parent, index, level == 2 && screened && admitted < ADMITTED);
         }
         leafGathered = false;
         if (leafValues != null) {

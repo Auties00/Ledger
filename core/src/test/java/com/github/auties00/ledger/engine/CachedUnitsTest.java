@@ -2,6 +2,7 @@ package com.github.auties00.ledger.engine;
 
 import com.github.auties00.ledger.LedgerCorruptedException;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -268,6 +269,48 @@ class CachedUnitsTest {
             }
             assertTrue(deltas.size() > 0, "no delta page is in use");
         }
+    }
+
+    @Test
+    @DisplayName("screens a branch of level 1 as a leaf and caches one of level 2 at once, and gives a refused unit back weakly only under its key, nonce and pages, leaving it refused")
+    void screensBranchesAndRecallsWeakly() {
+        var cache = PageCache.isolated(64L << 20);
+        IdleTicker.unwatch(cache);
+        try {
+            cache.screen(true);
+            var parent = new PageRef(10, 1, 7, 1);
+            var parentUnit = unit(PageFormat.BRANCH, 1, parent);
+            cache.putScreened(parent, parentUnit);
+            assertNull(cache.peek(parent), "a branch of level 1 read once");
+            var upper = new PageRef(11, 1, 7, 2);
+            var upperUnit = unit(PageFormat.BRANCH, 2, upper);
+            cache.putScreened(upper, upperUnit);
+            assertSame(upperUnit, cache.peek(upper), "a branch of level 2 read once");
+
+            var key = PageCache.dataKey(parent.page(), parent.slot());
+            var refusals = cache.refusalsForTests();
+            assertSame(parentUnit, cache.recallWeak(key, parent));
+            assertNull(cache.peek(parent), "a unit a weak recall found");
+            assertNull(cache.recallWeak(key, new PageRef(10, 1, 7, 3)), "another nonce");
+            assertNull(cache.recallWeak(key, new PageRef(10, 1, 8, 1)), "another nonce");
+            assertNull(cache.recallWeak(key, new PageRef(10, 2, 7, 1)), "other pages");
+            assertNull(cache.recallWeak(new PageRef(10, 1, 7, 1, 0)), "the leaf of a record of the page");
+            assertSame(parentUnit, cache.recallWeak(parent), "a unit a weak recall left refused");
+            assertEquals(refusals, cache.refusalsForTests(), "refusals of weak recalls");
+
+            // The second read takes it back for good
+            assertSame(parentUnit, cache.recall(key, parent));
+            assertSame(parentUnit, cache.peek(parent), "a branch of level 1 read twice");
+            assertNull(cache.recallWeak(key, parent), "a unit the cache took back");
+        } finally {
+            cache.close();
+        }
+    }
+
+    private static byte[] unit(byte kind, int level, PageRef ref) {
+        var unit = new byte[PageFormat.SIZE];
+        PageFile.header(unit, kind, level, ref.page(), ref.pages(), 0, ref.nonceHigh(), ref.nonceLow());
+        return unit;
     }
 
     @ParameterizedTest(name = "encrypted: {0}")

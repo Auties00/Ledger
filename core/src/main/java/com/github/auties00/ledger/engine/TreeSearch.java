@@ -53,8 +53,9 @@ final class TreeSearch {
 
     /// {@return the leaf of the tree under `root` that would hold `key`}
     ///
-    /// @param screened whether a leaf under the root read from the file goes to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef)] it; the root always does
+    /// @param screened whether a leaf or a branch of level 1 under the root read from the file goes to the cache only
+    ///                 if it [admits][PageCache#admits(long, PageRef)] it; the root and the branches of level 2 or more
+    ///                 always do
     static byte[] leaf(PageFile pages, TreeRoot root, byte[] key, boolean screened) {
         var unit = pages.read(root.ref(), PageFile.NODE, true);
         while (!TreeNodes.isLeaf(unit)) {
