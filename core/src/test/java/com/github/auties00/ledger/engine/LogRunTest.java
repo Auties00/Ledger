@@ -334,19 +334,19 @@ class LogRunTest {
                 }
 
                 @Override
-                public boolean commit(long sequence, byte[] body) {
+                public boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset) {
                     if (sequence == missing) {
                         return false;
                     }
                     replayed.sequences().add(sequence);
-                    replayed.bodies().add(body);
+                    replayed.bodies().add(Arrays.copyOfRange(body, start, start + length));
                     return true;
                 }
 
                 @Override
                 public void epoch(int epoch) {
                 }
-            });
+            }, null);
             replayed.last()[0] = result.lastSequence();
             return replayed;
         }
