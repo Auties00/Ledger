@@ -290,24 +290,18 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             if (crashed) {
                 pages.force();
             }
+            // Of this replay alone, so nothing holds its last chunk once the open ends but the versions on it
+            var values = new ReplayValues();
             var recovered = LogRecovery.replay(files, opened.keys(), opened.header().storeId(), firstSegment,
                     superblock == null ? 0 : superblock.sequence(), new LogRecovery.Sink() {
-                        // Of this replay alone, so nothing holds its last chunk once the open ends but the versions on it
-                        private final ReplayValues values = new ReplayValues();
-
                         @Override
                         public void catalog(int keyspace, String name) {
                             ledger.bind(keyspace, name);
                         }
 
                         @Override
-                        public boolean commit(long sequence, byte[] body) {
-                            return ledger.replay(sequence, body, values);
-                        }
-
-                        @Override
-                        public boolean commit(long sequence, byte[] body, LogSegmentView segment, long frameOffset, int commitStart) {
-                            return ledger.replay(sequence, body, values, segment, frameOffset, commitStart);
+                        public boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset) {
+                            return ledger.replay(sequence, body, start, length, values, segment, frameOffset);
                         }
 
                         @Override
@@ -315,6 +309,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                             epochs[0] = Integer.compareUnsigned(epoch, epochs[0]) > 0 ? epoch : epochs[0];
                         }
                     }, spills);
+            ledger.endReplay(values);
             blobs.begin(epochs[0] + 1);
             var catalog = ledger.assignIds();
             var pool = ioPool != null ? (PlatformIoPool) ioPool : (ownedPool = new PlatformIoPool(1));

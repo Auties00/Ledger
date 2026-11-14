@@ -376,38 +376,40 @@ public final class LiveLedger implements Ledger {
         return states.get(keyspace.name()).loading == null;
     }
 
-    /// Replays the commit `sequence` the log holds, unless the file of large values lacks one of its units.
+    /// Replays the commit `sequence` the log holds, the `length` bytes at `start` of `body`, unless the file of large
+    /// values lacks one of its units.
     ///
     /// The units are read before anything applies, and taken again from the free pages once the commit applies. What
-    /// the commit leaves in memory until a checkpoint takes it is on copies, not on `body`, which the open drops once
-    /// the commit applies: the values of paged key spaces are copied into the chunks of `values`, the bounds of range
-    /// removals into arrays of their own, and resident values as at every put.
-    ///
-    /// @param values the chunks of this open's replay
-    /// @return whether it replayed the commit
-    boolean replay(long sequence, byte[] body, ReplayValues values) {
-        return replay(sequence, body, values, null, 0, 0);
-    }
-
-    /// Replays the commit `sequence` the log holds, unless the file of large values lacks one of its units, as
-    /// [#replay(long, byte\[\], ReplayValues)] does, and lists the values it copies for paged key spaces in the queue
-    /// of values that may leave the heap.
-    ///
-    /// `body` is at `commitStart` of the body of the frame at `frameOffset` of `segment`, which holds it durably: once
-    /// the queue holds more than its budget, the copies move off the heap on the queue's thread, beside the replay, and
-    /// on the thread of the recovery while that one falls behind ([SpillQueue#keepUp()]), so the values of a long log
-    /// do not stay in the heap whole until the first checkpoint.
+    /// the commit leaves in memory until a checkpoint takes it keeps nothing of `body` once the open ends
+    /// ([#endReplay(ReplayValues)]): the bounds of range removals are copied into arrays of their own, resident values
+    /// as at every put, and the values of paged key spaces into the chunks of `values`, unless the store moves values
+    /// off the heap. Then the values stay on `body`, listed in the queue of values that may leave the heap: `body` is
+    /// that of the frame at `frameOffset` of `segment`, which holds it durably, so once the queue holds more than its
+    /// budget they move to the log on the queue's thread, beside the replay, and on the thread of the recovery while
+    /// that one falls behind ([SpillQueue#keepUp()]), each tagged where it lies in `body`; the open copies those the
+    /// queue keeps into the chunks as it ends. The values of a long log neither stay in the heap whole until the first
+    /// checkpoint nor are copied.
     ///
     /// @param values the chunks of this open's replay
     /// @param segment the use of the segment that holds the frame, or `null` to list no value
     /// @return whether it replayed the commit
-    boolean replay(long sequence, byte[] body, ReplayValues values, LogSegmentView segment, long frameOffset, int commitStart) {
+    boolean replay(long sequence, byte[] body, int start, int length, ReplayValues values, LogSegmentView segment, long frameOffset) {
+        var view = values.frame(body);
+        var queue = segment == null ? null : spills;
         var units = new ArrayList<byte[]>();
         var missing = new boolean[1];
-        FrameBody.readCommit(body, new FrameBody.Visitor() {
+        // The puts the queue lists, for the room of the commit's record
+        var listed = new int[1];
+        FrameBody.readCommit(body, view, start, length, new FrameBody.Visitor() {
             @Override
             public void put(int keyspace, MemorySegment key, MemorySegment value) {
                 loadForReplay(keyspace);
+                if (queue != null) {
+                    var state = byId.get(keyspace);
+                    if (state != null && replayHint(state) == TreeSearch.BLIND) {
+                        listed[0]++;
+                    }
+                }
             }
 
             @Override
@@ -436,9 +438,9 @@ public final class LiveLedger implements Ledger {
         }
         var next = new int[1];
         var applier = new Applier(sequence, null, 4, false, false, false, true);
-        var queue = segment == null ? null : spills;
-        var record = queue == null ? null : queue.record(sequence, 8);
-        FrameBody.readCommit(body, new FrameBody.Visitor() {
+        // Made at the first put the queue lists, so a commit with none allocates no record
+        var record = new SpillQueue.Record[1];
+        FrameBody.readCommit(body, view, start, length, new FrameBody.Visitor() {
             @Override
             public void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
                 var unit = units.get(next[0]++);
@@ -456,14 +458,19 @@ public final class LiveLedger implements Ledger {
                 if (state == null) {
                     return;
                 }
-                if (replayHint(state) == TreeSearch.BLIND) {
-                    replayPaged(applier, state, key, value, values);
-                    if (record != null) {
-                        // A slice of the body: its address is where it starts in the body
-                        record.add(applier.lastVersion(), Math.toIntExact(value.address()), Math.toIntExact(value.byteSize()));
-                    }
-                } else {
+                if (replayHint(state) != TreeSearch.BLIND) {
                     applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null);
+                } else if (queue == null) {
+                    replayPaged(applier, state, key, value, values);
+                } else {
+                    // A slice of the body's view: its address is where it starts in the body
+                    var at = Math.toIntExact(value.address());
+                    var bytes = Math.toIntExact(value.byteSize());
+                    applier.put(state, applier.claim(state, key), key, value, null, null, view, null, at, null, TreeSearch.BLIND, null);
+                    if (record[0] == null) {
+                        record[0] = queue.replayed(sequence, listed[0], body, length);
+                    }
+                    record[0].add(applier.lastVersion(), at, bytes);
                 }
             }
 
@@ -493,22 +500,34 @@ public final class LiveLedger implements Ledger {
         });
         applier.publish();
         sequenced.next = sequence + 1;
-        if (record != null) {
-            record.locate(segment, frameOffset, commitStart, false);
-            queue.add(record);
+        var listing = record[0];
+        if (listing != null) {
+            // The values lie at their addresses in the frame's body, so the commit's body starts at 0 of it
+            listing.locate(segment, frameOffset, 0, false);
+            queue.add(listing);
             queue.keepUp();
         }
         var unitBytes = 0L;
         for (var unit : units) {
             unitBytes += unit.length;
         }
-        replayedBytes += 13 + body.length + unitBytes;
-        replayedHeap += LogWriter.heapOf(body.length, unitBytes, applier.touched.size(), false);
+        replayedBytes += 13 + length + unitBytes;
+        replayedHeap += LogWriter.heapOf(length, unitBytes, applier.touched.size(), false);
         return true;
     }
 
-    /// Applies a replayed put of `value`, a slice of a frame body, to `state`, a paged key space of a store with pages,
-    /// on a copy the version keeps: in a chunk of `values`, or on an array of its own. The put is blind, as
+    /// Ends the open's replay: the queue of values that may leave the heap moves what it holds past its budget and
+    /// copies the values it still lists on frame bodies into the chunks of `values`
+    /// ([SpillQueue#settleReplay(ReplayValues)]), so no version keeps a body, and `values` forgets the last body.
+    void endReplay(ReplayValues values) {
+        if (spills != null) {
+            spills.settleReplay(values);
+        }
+        values.endFrames();
+    }
+
+    /// Applies a replayed put of `value`, a slice of a frame body, to `state`, a paged key space of a store with pages
+    /// that moves no value off the heap, on a copy the version keeps: in a chunk of `values`, or on an array of its own. The put is blind, as
     /// [#replayHint(KeyspaceState)] gives every replayed write of such a key space.
     private static void replayPaged(Applier applier, KeyspaceState state, MemorySegment key, MemorySegment value, ReplayValues values) {
         var chain = applier.claim(state, key);
@@ -518,7 +537,7 @@ public final class LiveLedger implements Ledger {
             applier.put(state, chain, key, MemorySegment.ofArray(own).asReadOnly(), own, null, null, null, 0, null, TreeSearch.BLIND, null);
             return;
         }
-        var at = values.copy(value, length);
+        var at = values.copy(value, 0, length);
         var view = values.view();
         // No array for the frame: the replay has none, and the chunk takes more values after this one
         applier.put(state, chain, key, view.asSlice(at, length), null, null, view, null, at, null, TreeSearch.BLIND, null);

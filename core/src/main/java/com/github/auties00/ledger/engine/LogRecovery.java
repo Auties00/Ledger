@@ -51,9 +51,16 @@ import java.util.zip.CRC32C;
 /// authenticated where the buffer holds it, and only its opened body is a new array: replay copies no sealed bytes, and
 /// a frame longer than the buffer is read into an array of its own, which no later frame keeps. The frames of an
 /// encrypted log are opened ahead on the other processors ([FrameReadAhead]) while the earlier ones replay, each read
-/// into an array of the read-ahead's own that the frames after it reuse.
+/// into an array of the read-ahead's own that the frames after it reuse: recovery then reads only the headers and the
+/// padding of such a segment itself, through a window of a page and a header, and fills the buffer only for a frame the
+/// read-ahead does not hold, so each byte of the log is read once. The commits of a run are passed where they lie in
+/// their frame's body, never copied out of it.
 final class LogRecovery {
-    private static final int BUFFER = 1 << 20;
+    /// The bytes of the buffer: below half a G1 region of 2 MiB, as [LogWriter#OUTPUT] is, so not humongous.
+    private static final int BUFFER = LogWriter.OUTPUT;
+    /// The bytes a peek reads ([SegmentReader#read(long, byte\[\], int, int, boolean)]): a frame header, and the
+    /// padding after it up to the next page with the header of the next group's first frame there.
+    private static final int PEEK = LogWriter.ALIGNMENT + LogWriter.FRAME_HEADER;
     /// The longest sealed body a frame can declare: a body of [FrameBody#MAX_BYTES] with its tag or CRC. A longer one
     /// is a damaged header, and its length would overflow once the frame header is added.
     private static final int MAX_SEALED = FrameBody.MAX_BYTES + Math.max(LogWriter.TAG_BYTES, Integer.BYTES);
@@ -65,20 +72,15 @@ final class LogRecovery {
     interface Sink {
         void catalog(int keyspace, String name);
 
-        /// Replays the commit `sequence`, unless the file of large values lacks one of its units.
+        /// Replays the commit `sequence`, whose body is the `length` bytes at `start` of `body`, the opened body of
+        /// the frame at `frameOffset` of the segment use `segment`, unless the file of large values lacks one of its
+        /// units.
         ///
-        /// @return whether it replayed the commit; it changed nothing if not
-        boolean commit(long sequence, byte[] body);
-
-        /// Replays the commit `sequence`, unless the file of large values lacks one of its units, as
-        /// [#commit(long, byte\[\])] does, `body` being at `commitStart` of the body of the frame at `frameOffset` of
-        /// the segment use `segment`.
+        /// `body` is a new array no one else writes, which the commits of a run share.
         ///
         /// @param segment the use, or `null` if the recovery moves no value off the heap
         /// @return whether it replayed the commit; it changed nothing if not
-        default boolean commit(long sequence, byte[] body, LogSegmentView segment, long frameOffset, int commitStart) {
-            return commit(sequence, body);
-        }
+        boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset);
 
         void epoch(int epoch);
     }
@@ -94,20 +96,14 @@ final class LogRecovery {
     record Result(long lastSequence, long lastSegment, LogFiles.Prepared empty, Path lastWritten) {
     }
 
-    /// Replays the segments of `files` from `firstSegment`, retiring those before it.
+    /// Replays the segments of `files` from `firstSegment`, retiring those before it, telling `sink` where each commit
+    /// lies.
     ///
     /// @param checkpoint the sequence of the last commit the checkpoint holds, or 0; commits up to it are skipped
-    /// @throws IOException if a segment cannot be read
-    /// @throws LedgerCorruptedException if a segment belongs to another store, or acknowledged data is damaged
-    static Result replay(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long checkpoint, Sink sink) throws IOException {
-        return replay(files, keys, storeId, firstSegment, checkpoint, sink, null);
-    }
-
-    /// Replays the segments of `files` from `firstSegment`, retiring those before it, as
-    /// [#replay(LogFiles, StoreKeys, byte\[\], long, long, Sink)] does, telling `sink` where each commit lies.
-    ///
     /// @param spills the queue of the values that may leave the heap, which makes the views of the segment uses the
     ///               commits are in, or `null`
+    /// @throws IOException if a segment cannot be read
+    /// @throws LedgerCorruptedException if a segment belongs to another store, or acknowledged data is damaged
     static Result replay(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long checkpoint, Sink sink,
                          SpillQueue spills) throws IOException {
         files.retireBefore(firstSegment, 1);
@@ -118,14 +114,15 @@ final class LogRecovery {
         var lastSegment = 0L;
         LogFiles.Prepared empty = null;
         Path lastWritten = null;
-        byte[] buffer = null;
+        var buffer = new SegmentReader.Buffer();
         for (var index = 0; index < segments.size(); index++) {
             var number = segments.get(index);
             var path = files.segment(number);
             try (var reader = new SegmentReader(path, buffer); var ahead = new FrameReadAhead(path, reader.size())) {
-                buffer = reader.buffer();
+                // The read-ahead reads the frames' bodies, so recovery peeks only at what lies around them
+                var peek = keys.encrypted() && ahead.opensFrames();
                 var header = new byte[LogWriter.SEGMENT_HEADER];
-                if (!reader.read(0, header, 0, header.length) || !intactSegmentHeader(header, crc)) {
+                if (!reader.read(0, header, 0, header.length, peek) || !intactSegmentHeader(header, crc)) {
                     // The header is forced before the segment takes its name, so only a file holding nothing past its
                     // header can be a crash during its creation; the next open writes a segment in its place
                     if (index == segments.size() - 1 && (reader.size() <= LogWriter.SEGMENT_HEADER
@@ -149,7 +146,7 @@ final class LogRecovery {
                 var tag = ByteBuffer.wrap(salt).getLong();
                 var frame = new byte[LogWriter.FRAME_HEADER];
                 long position = LogWriter.SEGMENT_HEADER;
-                if (!reader.read(position, frame, 0, LogWriter.FRAME_HEADER) || isZero(frame, 0, LogWriter.FRAME_HEADER)) {
+                if (!reader.read(position, frame, 0, LogWriter.FRAME_HEADER, peek) || isZero(frame, 0, LogWriter.FRAME_HEADER)) {
                     // Prepared and never written, unless damage zeroed the first frame before groups a later force made
                     // durable, whose first frames may carry the sequence of the commit before them
                     checkNoLaterGroup(reader, position, Long.MIN_VALUE, tag, crc, path);
@@ -171,7 +168,7 @@ final class LogRecovery {
                 ahead.begin(tag, useTag, segmentKey);
                 var view = spills == null ? null : spills.segment(number, path, segmentKey);
                 var afterPadding = false;
-                while (reader.read(position, frame, 0, LogWriter.FRAME_HEADER)) {
+                while (reader.read(position, frame, 0, LogWriter.FRAME_HEADER, peek)) {
                     if (position % LogWriter.ALIGNMENT != 0) {
                         // The padding after a group, which only a group's first frame follows; a frame never starts
                         // with a zero byte, and the padding can be shorter than a frame header
@@ -201,9 +198,10 @@ final class LogRecovery {
                     } else if (whole) {
                         byte[] sealed;
                         int at;
-                        if (sealedLength <= reader.buffer().length) {
-                            sealed = reader.buffer();
+                        if (sealedLength <= reader.capacity()) {
+                            // The buffer after the view, which may have grown it
                             at = reader.view(position + LogWriter.FRAME_HEADER, sealedLength);
+                            sealed = reader.buffer();
                         } else {
                             sealed = new byte[sealedLength];
                             at = reader.read(position + LogWriter.FRAME_HEADER, sealed, 0, sealedLength) ? 0 : -1;
@@ -224,7 +222,7 @@ final class LogRecovery {
                                 if (sequence != last + 1) {
                                     throw new LedgerCorruptedException(path + " holds commit " + sequence + " after commit " + last, null);
                                 }
-                                replayed = sink.commit(sequence, body, view, position, 0);
+                                replayed = sink.commit(sequence, body, 0, body.length, view, position);
                                 if (replayed) {
                                     last = sequence;
                                 }
@@ -242,8 +240,8 @@ final class LogRecovery {
                                 if (next != last + 1) {
                                     throw new LedgerCorruptedException(path + " holds commit " + next + " after commit " + last, null);
                                 }
-                                var commit = commits.next();
-                                replayed = sink.commit(next, commit, view, position, commits.start());
+                                var length = commits.next();
+                                replayed = sink.commit(next, body, commits.start(), length, view, position);
                                 if (replayed) {
                                     last = next;
                                 }
@@ -380,43 +378,50 @@ final class LogRecovery {
     /// A segment read through a buffer of at most [#BUFFER] bytes, refilled forward as recovery moves through it.
     ///
     /// Only bytes the reader itself filled are read from the buffer, so the buffer of another reader can be handed to it.
+    /// The buffer is made at the first read, as long as that read needs: a recovery that only peeks holds a window of
+    /// [#PEEK] bytes.
     static final class SegmentReader implements AutoCloseable {
         private final FileChannel channel;
         private final long size;
-        private final byte[] buffer;
+        private final Buffer shared;
+        // The most bytes the buffer holds of this segment: BUFFER, or the segment's size if smaller
+        private final int capacity;
         private long start;
         private int length;
 
-        /// Opens the segment at `path`, read through `buffer` if that is as long as the reader needs, otherwise through a
-        /// buffer of its own.
-        ///
-        /// @param buffer the buffer of the reader of an earlier segment, or `null`
-        SegmentReader(Path path, byte[] buffer) throws IOException {
+        /// Opens the segment at `path`, read through the buffer `shared` holds, which it replaces with a longer one
+        /// when a read needs it.
+        SegmentReader(Path path, Buffer shared) throws IOException {
             this.channel = FileChannel.open(path, StandardOpenOption.READ);
             this.size = channel.size();
-            var wanted = (int) Math.min(BUFFER, Math.max(size, 1));
-            this.buffer = buffer != null && buffer.length >= wanted ? buffer : new byte[wanted];
+            this.shared = shared;
+            this.capacity = (int) Math.min(BUFFER, Math.max(size, 1));
         }
 
         long size() {
             return size;
         }
 
-        /// {@return the buffer the segment is read through, to hand to the reader of the next segment}
+        /// {@return the buffer the last read filled}
         byte[] buffer() {
-            return buffer;
+            return shared.bytes;
+        }
+
+        /// {@return the most bytes [#view(long, int)] takes}
+        int capacity() {
+            return capacity;
         }
 
         /// {@return the offset in [#buffer()] of the `count` bytes at `position`, read into it if it did not hold them,
         /// or -1 if the segment does not hold them all}
         ///
-        /// The bytes stay there until the next call to the reader; `count` is at most the buffer's length.
+        /// The bytes stay there until the next call to the reader; `count` is at most [#capacity()].
         int view(long position, int count) throws IOException {
             if (position < 0 || position + count > size) {
                 return -1;
             }
             if (position < start || position + count > start + length) {
-                fill(position);
+                fill(position, capacity);
                 if (count > length) {
                     // The file ended before the size it had when the reader opened it
                     return -1;
@@ -425,15 +430,26 @@ final class LogRecovery {
             return (int) (position - start);
         }
 
-        /// Copies the `count` bytes at `position` into `target` at `offset`.
+        /// Copies the `count` bytes at `position` into `target` at `offset`, filling the buffer from there if it does
+        /// not hold them.
         ///
         /// @return whether the segment holds them all
         boolean read(long position, byte[] target, int offset, int count) throws IOException {
+            return read(position, target, offset, count, false);
+        }
+
+        /// Copies the `count` bytes at `position` into `target` at `offset`, filling the buffer from there if it does
+        /// not hold them: with [#PEEK] bytes if `peek`, which is what replay reads around a frame whose body another
+        /// reader read, its header and the padding after it with the next group's first header; with as many as it
+        /// holds if not.
+        ///
+        /// @return whether the segment holds them all
+        boolean read(long position, byte[] target, int offset, int count, boolean peek) throws IOException {
             if (position < 0 || position + count > size) {
                 return false;
             }
             if (position < start || position + count > start + length) {
-                if (count > buffer.length) {
+                if (count > capacity) {
                     var direct = ByteBuffer.wrap(target, offset, count);
                     while (direct.hasRemaining()) {
                         if (channel.read(direct, position + direct.position() - offset) < 0) {
@@ -442,22 +458,24 @@ final class LogRecovery {
                     }
                     return true;
                 }
-                fill(position);
+                fill(position, peek ? Math.min(Math.max(count, PEEK), capacity) : capacity);
                 if (count > length) {
                     // The file ended before the size it had when the reader opened it
                     return false;
                 }
             }
-            System.arraycopy(buffer, (int) (position - start), target, offset, count);
+            System.arraycopy(shared.bytes, (int) (position - start), target, offset, count);
             return true;
         }
 
         /// {@return whether the `count` bytes at `position` are all zero; bytes past the end count as zero}
         boolean isZero(long position, long count) throws IOException {
             var end = Math.min(size, position + count);
+            var buffer = shared.bytes;
             for (var at = position; at < end; ) {
                 if (at < start || at >= start + length) {
-                    fill(at);
+                    fill(at, capacity);
+                    buffer = shared.bytes;
                     if (length == 0) {
                         // The file ended early, as a torn write leaves it
                         return true;
@@ -474,10 +492,16 @@ final class LogRecovery {
             return true;
         }
 
-        private void fill(long position) throws IOException {
+        /// Fills the buffer with up to `window` bytes from `position`, `window` at most [#capacity], replacing a
+        /// buffer shorter than `window`: with one of [#capacity] bytes unless `window` is a peek's.
+        private void fill(long position, int window) throws IOException {
             start = position;
             length = 0;
-            var wanted = (int) Math.min(buffer.length, size - position);
+            var buffer = shared.bytes;
+            if (buffer == null || buffer.length < window) {
+                buffer = shared.bytes = new byte[window <= PEEK ? window : capacity];
+            }
+            var wanted = (int) Math.min(window, size - position);
             var target = ByteBuffer.wrap(buffer, 0, wanted);
             while (target.hasRemaining()) {
                 if (channel.read(target, position + target.position()) < 0) {
@@ -490,6 +514,12 @@ final class LogRecovery {
         @Override
         public void close() throws IOException {
             channel.close();
+        }
+
+        /// The buffer the readers of one recovery read through, which passes from each segment's reader to the next.
+        static final class Buffer {
+            // Null before the first read
+            private byte[] bytes;
         }
     }
 }
