@@ -294,6 +294,56 @@ class LogSpillTest {
         }
     }
 
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("values read back in turn from several segments into a caller's array allocate nothing per value, as a checkpoint reads them")
+    void readsBackInPlace(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, encrypted, 0)) {
+            // Segments of 64 KiB: the values of 1,800 messages fill several
+            for (var batch = 0; batch < 60; batch++) {
+                write(ledger, expected, batch * 30, 30, 0, true);
+            }
+            spillNow(ledger);
+            var logged = new ArrayList<Version>();
+            var lengths = new ArrayList<byte[]>();
+            var segments = new java.util.HashSet<Long>();
+            for (var entry : expected.messages.entrySet()) {
+                var version = head(ledger, MESSAGES, key(entry.getKey()));
+                if (version.sourceForTests() instanceof LogValue value) {
+                    logged.add(version);
+                    lengths.add(entry.getValue());
+                    segments.add(value.segment().number());
+                }
+            }
+            assertTrue(segments.size() >= 3, "values in " + segments.size() + " segments");
+            // The first half and the second in turn, as a checkpoint's key order interleaves the segments
+            var order = new ArrayList<Integer>();
+            var half = logged.size() / 2;
+            for (var i = 0; i < half; i++) {
+                order.add(i);
+                order.add(half + i);
+            }
+            var target = new byte[8_192];
+            var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+            var perValue = 0L;
+            for (var round = 0; round < 4; round++) {
+                var before = threads.getCurrentThreadAllocatedBytes();
+                for (var index : order) {
+                    logged.get(index).readLogged(target, 16);
+                }
+                perValue = (threads.getCurrentThreadAllocatedBytes() - before) / order.size();
+            }
+            for (var index : order) {
+                var value = lengths.get(index);
+                logged.get(index).readLogged(target, 16);
+                assertArrayEquals(value, Arrays.copyOfRange(target, 16, 16 + value.length));
+            }
+            // Before, each read wrapped its array in a buffer and, switching segments, initialized a key schedule
+            assertTrue(perValue < 32, "a value read back allocated " + perValue + " bytes");
+        }
+    }
+
     @Test
     @DisplayName("the segments of moved values stay while a snapshot of the tree before the checkpoint reads them, and retire once it closes")
     void keepsSegmentsForOlderTrees(@TempDir Path directory) throws Exception {
