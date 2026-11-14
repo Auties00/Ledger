@@ -10,6 +10,7 @@ import java.security.SecureRandom;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceArray;
@@ -27,6 +28,14 @@ import java.util.zip.CRC32C;
 /// batch's array no version needs any more is then garbage. The newest values, those of the budget, stay where they
 /// are, so reads of recent writes do not change; a read of a value in the log reads it back with one positioned read.
 ///
+/// The values of a group the log wrote through past the system's cache move too, once the thread read the frames that
+/// hold them back from the device ([#WARM_SPAN]): that write left none of their pages in the cache, and a read of each
+/// value from the device, as a checkpoint reads them one at a time in key order, would stall it. The read brings the
+/// pages back into the cache, so later reads find the values there as they find those of a group that was forced. A
+/// read of the frames that fails, or finds the segment retired, leaves the record's values where they are. Each value
+/// read back is checked against its tag as any other: in an encrypted store a page that does not hold what was written
+/// fails it; without encryption the check is the CRC-32C of the value, as for every value that moved.
+///
 /// A record leaves the queue once its values moved, or once a published checkpoint holds its commit. Values are not
 /// moved:
 /// - of a key space until samples of its commits show that it replaces or removes few of its values before a
@@ -34,8 +43,6 @@ import java.util.zip.CRC32C;
 ///   the record leaves the queue, and moving a value no reader can reach any more costs a tag of its bytes for
 ///   nothing. A version listed and then replaced counts in the held bytes until its record leaves, a share of them
 ///   the samples keep under an eighth;
-/// - of a group the log wrote through to stable storage, whose pages that write took out of the system's cache, so a
-///   read back would go to the device;
 /// - of a batch on a [ValueSlab]'s chunks, which the slab bounds already, of a transaction, of a value a batch put on
 ///   an array of its own, or of one with a unit of [BlobFile]. A value a recovery copied to an array of its own moves,
 ///   to the log only.
@@ -56,6 +63,15 @@ final class SpillQueue {
     /// The shortest value that moves to the log: a [LogValue] takes 40 bytes, an array of the value 16 more than the
     /// value; below it, the array costs less than a read back from the file.
     static final int LOG_VALUE_MIN = 256;
+    /// The most bytes of log one read of frames written through covers, from the first it reads: the frames of the
+    /// records after the one the thread is about to move are read with it while they are durable, in the same segment
+    /// use, and among those the drain will take, so a drain reads them in a few sequential reads; the thread starts the
+    /// read of the next span before it moves the values of the current one.
+    static final int WARM_SPAN = 256 << 10;
+    /// The bytes a read of frames written through takes at a time: the size of its direct buffer, so the read takes no
+    /// temporary buffer of the JDK, and of the hold one read takes on a channel that serializes positioned reads, as
+    /// on Windows, which a reader of a value of the segment may wait behind.
+    private static final int WARM_PIECE = 64 << 10;
     /// The bytes of an AES block.
     static final int BLOCK = 16;
     /// The prime 2^61 - 1, the modulus of the polynomials of the tags.
@@ -95,10 +111,27 @@ final class SpillQueue {
     // the writer's locating of a record before the thread reads it
     private final LongSupplier current = () -> durable.getAsLong();
     private final AtomicReferenceArray<Crypto> cryptos;
-    // The values moved to the log and to arrays of their own, and the records drained, for tests
+    // Guards what the reads of frames written through left: taken before the lock of the queue, never while holding it
+    private final Object warmLock;
+    // The segment use the last read of frames written through read, and where the bytes it read in order end; guarded
+    // by warmLock
+    private LogSegmentView warmView;
+    private long warmedTo;
+    // The read of frames written through in flight, or done and not yet taken into warmView and warmedTo: one at a
+    // time, so they share one buffer; guarded by warmLock
+    private Warm warming;
+    // The buffer of those reads, direct and of WARM_PIECE bytes, made at the first; guarded by warmLock
+    private ByteBuffer warmBuffer;
+    // Whether every record whose values go to the log has its frames read first, as if its group bypassed the cache;
+    // for tests
+    private volatile boolean warmsEveryRecord;
+    // The values moved to the log and to arrays of their own, the records drained, the bytes of frames read back, and
+    // the records released unmoved after that read failed, for tests
     private final AtomicLong loggedValues = new AtomicLong();
     private final AtomicLong copiedValues = new AtomicLong();
     private final AtomicLong drainedRecords = new AtomicLong();
+    private final AtomicLong warmedBytes = new AtomicLong();
+    private final AtomicLong unwarmedRecords = new AtomicLong();
 
     /// Creates the queue of a store.
     ///
@@ -109,6 +142,7 @@ final class SpillQueue {
         this.lowWater = budget - budget / 4;
         this.encrypted = encrypted;
         this.lock = new Object();
+        this.warmLock = new Object();
         this.records = new ArrayDeque<>();
         this.segments = new ArrayList<>();
         this.running = new AtomicBoolean();
@@ -272,6 +306,8 @@ final class SpillQueue {
         try {
             while (!closed) {
                 Record record;
+                // Where the frames of a record that are read back before its values move end, or -1 if none are
+                var extent = -1L;
                 synchronized (lock) {
                     record = records.peekFirst();
                     if (record == null || held <= downTo || record.sequence > durableSequence.getAsLong()) {
@@ -281,17 +317,154 @@ final class SpillQueue {
                     held = held - record.bytes;
                     drainedRecords.incrementAndGet();
                     if (record.logs()) {
-                        // Before any value moves there, so a checkpoint that retires segments sees the commit
+                        // Before any value moves there, and before a read of its frames opens its channel, so a
+                        // checkpoint that retires segments sees the commit and closes the channel
                         var segment = record.segment;
                         if (segment.note(record.sequence)) {
                             segments.add(segment);
                         }
+                        if (warms(record)) {
+                            extent = record.extent();
+                        }
                     }
+                }
+                if (extent >= 0 && !warm(record, extent, durableSequence, downTo)) {
+                    // The values stay on their arrays rather than leave for a place that a read would fetch from the
+                    // device; a retired segment's commit is in a published checkpoint, which drops the record anyway
+                    unwarmedRecords.incrementAndGet();
+                    record.release();
+                    continue;
                 }
                 record.spill(this, crypto);
             }
         } finally {
             giveBack(crypto);
+        }
+    }
+
+    /// {@return whether the values of `record` move only once its frames are read back: some go to the log, and its
+    /// group bypassed the system's cache}
+    private boolean warms(Record record) {
+        return record.logs() && (record.uncached || warmsEveryRecord);
+    }
+
+    /// Reads the frames of `record`, which [#warms(Record)] and which the drain took, back from its segment up to
+    /// `extent`, unless an earlier read did; then, if no read is in flight, starts reading the frames of the records
+    /// after it on a thread of its own, so they are in the cache by the time the drain moves their values.
+    ///
+    /// @param downTo the held bytes the drain stops at, past which no record's frames are read
+    /// @return whether every byte up to `extent` was read: not if the read failed or found the segment retired
+    private boolean warm(Record record, long extent, LongSupplier durableSequence, long downTo) {
+        var view = record.segment;
+        while (true) {
+            Warm wait;
+            Warm ahead = null;
+            var inline = false;
+            synchronized (warmLock) {
+                if (warmView == view && warmedTo >= extent) {
+                    // Once half a span is left before the drain, the next is read while it moves the rest
+                    if (warming == null && !closed && warmedTo - extent <= WARM_SPAN / 2) {
+                        ahead = span(view, warmedTo, warmedTo, true, durableSequence, downTo);
+                        warming = ahead;
+                    }
+                    wait = null;
+                } else {
+                    wait = warming;
+                    if (wait == null) {
+                        var from = warmView == view ? Math.max(record.frameOffset, warmedTo) : record.frameOffset;
+                        wait = span(view, from, extent, false, durableSequence, downTo);
+                        warming = wait;
+                        inline = true;
+                    }
+                }
+            }
+            if (wait == null) {
+                if (ahead != null) {
+                    start(ahead);
+                }
+                return true;
+            }
+            if (inline) {
+                wait.run(this);
+            }
+            var read = wait.await();
+            synchronized (warmLock) {
+                if (warming == wait) {
+                    warming = null;
+                }
+                if (read) {
+                    warmedTo = warmView == wait.view ? Math.max(warmedTo, wait.to) : wait.to;
+                    warmView = wait.view;
+                } else {
+                    if (warmView == wait.view && wait.view.retired()) {
+                        warmView = null;
+                    }
+                    // The bytes of the record were among those the failed read was to read
+                    if (wait.view == view && wait.to >= extent) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// {@return the read of the frames of `view` from `from` to at least `end`, and on over the frames of the records
+    /// the queue holds that are durable and in `view`, as far as [#WARM_SPAN] from its first byte reaches; `null` if
+    /// it would read nothing}
+    ///
+    /// The durable sequence is read before the location of any record, which it publishes; the locations and values
+    /// of the records are read holding the lock of the queue, which a checkpoint takes to release them. Holding
+    /// `warmLock`.
+    ///
+    /// @param ahead whether the read starts at the first frame of a record that ends past `from` rather than at `from`,
+    ///              as a read ahead of the drain does, which so leaves out frames no record needs read
+    /// @param downTo the held bytes the drain stops at: the frames of the records it will not take are not read
+    private Warm span(LogSegmentView view, long from, long end, boolean ahead, LongSupplier durableSequence, long downTo) {
+        var durable = durableSequence.getAsLong();
+        var started = !ahead;
+        synchronized (lock) {
+            var left = held - downTo;
+            for (var next : records) {
+                if (left <= 0 || closed || next.sequence > durable) {
+                    break;
+                }
+                left -= next.bytes;
+                if (!warms(next)) {
+                    continue;
+                }
+                // Compared by use, not by number: a file is reused under a new use and key
+                if (next.segment != view) {
+                    break;
+                }
+                var nextEnd = next.extent();
+                if (nextEnd <= end) {
+                    continue;
+                }
+                if (!started) {
+                    from = Math.max(from, next.frameOffset);
+                    started = true;
+                } else if (nextEnd - from > WARM_SPAN) {
+                    break;
+                }
+                end = nextEnd;
+            }
+        }
+        if (end <= from) {
+            return null;
+        }
+        if (warmBuffer == null) {
+            warmBuffer = ByteBuffer.allocateDirect(WARM_PIECE);
+        }
+        return new Warm(view, from, end, warmBuffer);
+    }
+
+    /// Starts `ahead` on a thread of its own, or runs it on this one if the system refuses a thread, since a drain may
+    /// wait for it.
+    private void start(Warm ahead) {
+        try {
+            Thread.ofVirtual().name("ledger-warm").start(() -> ahead.run(this));
+        } catch (Throwable _) {
+            ahead.run(this);
         }
     }
 
@@ -395,6 +568,23 @@ final class SpillQueue {
         return drainedRecords.get();
     }
 
+    /// {@return the bytes of frames read back so far before their values moved; for tests}
+    long warmedBytesForTests() {
+        return warmedBytes.get();
+    }
+
+    /// {@return the records released with their values in place because their frames could not be read back; for
+    /// tests}
+    long unwarmedRecordsForTests() {
+        return unwarmedRecords.get();
+    }
+
+    /// Reads back the frames of every record whose values go to the log before they move, as if every group bypassed
+    /// the system's cache; for tests.
+    void warmEveryRecordForTests() {
+        warmsEveryRecord = true;
+    }
+
     /// {@return the segments values moved to that no checkpoint retired, by number; for tests}
     long[] segmentsForTests() {
         synchronized (lock) {
@@ -445,11 +635,11 @@ final class SpillQueue {
         private long bytes;
         private boolean large;
         // Set by the log writer as it seals the frame: the segment use, the frame's offset, where the commit's body
-        // starts in the frame's body, and whether the group was written through
+        // starts in the frame's body, and whether the group was written past the system's cache
         private LogSegmentView segment;
         private long frameOffset;
         private int commitStart;
-        private boolean through;
+        private boolean uncached;
 
         private Record(long sequence, int capacity) {
             this.sequence = sequence;
@@ -470,14 +660,15 @@ final class SpillQueue {
         }
 
         /// Records where the log wrote the frame of the commit: at `frameOffset` of the use `segment`, the commit's body
-        /// at `commitStart` of the frame's body, written through to stable storage if `through`.
+        /// at `commitStart` of the frame's body, written through past the system's cache if `uncached`, so its frames
+        /// are read back before its values move.
         ///
         /// @param segment the use, or `null` if the store moves no value
-        void locate(LogSegmentView segment, long frameOffset, int commitStart, boolean through) {
+        void locate(LogSegmentView segment, long frameOffset, int commitStart, boolean uncached) {
             this.segment = segment;
             this.frameOffset = frameOffset;
             this.commitStart = commitStart;
-            this.through = through;
+            this.uncached = uncached;
         }
 
         /// {@return the sequence of the commit}
@@ -485,9 +676,22 @@ final class SpillQueue {
             return sequence;
         }
 
-        /// {@return whether values move to the log: some are long enough, and its frame is in a segment's cache}
+        /// {@return whether values move to the log: some are long enough, and a segment holds its frame; one written
+        /// past the system's cache moves once a read of the frame brings its pages back there}
         private boolean logs() {
-            return large && segment != null && !through;
+            return large && segment != null;
+        }
+
+        /// {@return where the last value the record lists ends in its segment}
+        ///
+        /// Read by the drain that took the record, or holding the lock of the queue, which a checkpoint takes to
+        /// release the values.
+        private long extent() {
+            var end = 0L;
+            for (var i = 0; i < count; i++) {
+                end = Math.max(end, (long) offsets[i] + versions[i].valueLength());
+            }
+            return frameOffset + LogWriter.FRAME_HEADER + commitStart + end;
         }
 
         /// Moves the values, unless a long one cannot move to the log, then forgets them.
@@ -516,6 +720,59 @@ final class SpillQueue {
             versions = null;
             offsets = null;
             count = 0;
+        }
+    }
+
+    /// A read of the frames from `from` to `to` of a segment use, which brings their pages into the system's cache.
+    ///
+    /// It runs once, on the thread of the drain that needs it or on one of its own, and any number of drains wait for
+    /// it.
+    private static final class Warm {
+        private final LogSegmentView view;
+        private final long from;
+        private final long to;
+        private final ByteBuffer buffer;
+        private final CountDownLatch done;
+        // Whether every byte was read; written before done counts down
+        private boolean read;
+
+        private Warm(LogSegmentView view, long from, long to, ByteBuffer buffer) {
+            this.view = view;
+            this.from = from;
+            this.to = to;
+            this.buffer = buffer;
+            this.done = new CountDownLatch(1);
+        }
+
+        /// Reads the frames, unless `queue` closes first.
+        private void run(SpillQueue queue) {
+            try {
+                read = view.warm(from, to - from, buffer, () -> queue.closed);
+                if (read) {
+                    queue.warmedBytes.addAndGet(to - from);
+                }
+            } finally {
+                done.countDown();
+            }
+        }
+
+        /// {@return whether every byte was read, once the read ran}
+        private boolean await() {
+            var interrupted = false;
+            try {
+                while (true) {
+                    try {
+                        done.await();
+                        return read;
+                    } catch (InterruptedException _) {
+                        interrupted = true;
+                    }
+                }
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
     }
 

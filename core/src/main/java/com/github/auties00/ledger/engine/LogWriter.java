@@ -360,8 +360,9 @@ final class LogWriter {
     private SpillQueue spills;
     // The use of the current segment the frames of such values are located in, or null; owned by the flush task
     private LogSegmentView view;
-    // Whether the group being sealed is written through to stable storage; owned by the flush task
-    private boolean sealingThrough;
+    // Whether the group being sealed is written through past the system's cache, so no page of it stays there; owned
+    // by the flush task
+    private boolean sealingUncached;
     private final AtomicBoolean scheduled;
     // Held by the one flush that writes groups, on the pool or on the thread of a commit waiting for its group
     private final AtomicBoolean running;
@@ -795,7 +796,7 @@ final class LogWriter {
     private void locate(FrameBody body, long frameOffset, int commitStart) {
         var record = body.spill();
         if (record != null) {
-            record.locate(view, frameOffset, commitStart, sealingThrough);
+            record.locate(view, frameOffset, commitStart, sealingUncached);
         }
     }
 
@@ -1093,8 +1094,9 @@ final class LogWriter {
         }
         // Before a frame is sealed, while the output holds no byte of the group
         var through = writesThrough(group);
-        // A write through takes the pages it writes out of the system's cache, so their values stay in the heap
-        sealingThrough = through;
+        // A write through that bypasses the system's cache leaves no page of the group there: the values of its
+        // commits leave the heap once the queue reads its frames back once, which brings those pages back
+        sealingUncached = through && !throughFile.cached();
         var unitForce = units ? forceUnits() : null;
         var start = position;
         var groupStart = true;

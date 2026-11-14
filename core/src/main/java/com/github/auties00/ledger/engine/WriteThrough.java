@@ -223,8 +223,8 @@ final class WriteThrough {
             return switch (kind()) {
                 case UNBUFFERED -> UnbufferedHandle.open(path, this);
                 case DIRECT -> new ChannelHandle(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC,
-                        ExtendedOpenOption.DIRECT), this);
-                case DSYNC -> new ChannelHandle(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC), this);
+                        ExtendedOpenOption.DIRECT), this, false);
+                case DSYNC -> new ChannelHandle(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC), this, true);
             };
         } catch (OutOfMemoryError exception) {
             throw new IOException("A log segment could not be opened to write through", exception);
@@ -270,6 +270,10 @@ final class WriteThrough {
         /// {@return whether the handle is open; an interrupt of a write closes a channel}
         boolean isOpen();
 
+        /// {@return whether the pages a write writes stay in the system's cache: `false` where the write bypasses it,
+        /// so a read of them goes to the device until something reads them again}
+        boolean cached();
+
         /// Closes the handle.
         void close() throws IOException;
     }
@@ -280,10 +284,13 @@ final class WriteThrough {
     private static final class ChannelHandle implements Handle {
         private final FileChannel channel;
         private final WriteThrough owner;
+        // Whether the channel writes into the system's cache: opened without DIRECT
+        private final boolean cached;
 
-        ChannelHandle(FileChannel channel, WriteThrough owner) {
+        ChannelHandle(FileChannel channel, WriteThrough owner, boolean cached) {
             this.channel = channel;
             this.owner = owner;
+            this.cached = cached;
         }
 
         @Override
@@ -300,6 +307,11 @@ final class WriteThrough {
         @Override
         public boolean isOpen() {
             return channel.isOpen();
+        }
+
+        @Override
+        public boolean cached() {
+            return cached;
         }
 
         @Override
@@ -410,6 +422,11 @@ final class WriteThrough {
         @Override
         public boolean isOpen() {
             return open;
+        }
+
+        @Override
+        public boolean cached() {
+            return false;
         }
 
         @Override

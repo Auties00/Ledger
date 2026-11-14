@@ -87,16 +87,31 @@ class LogSpillTest {
     }
 
     private static LiveLedger openJudged(Path directory, boolean encrypted, long budget, Duration window, long segmentSize) {
+        return openJudged(directory, encrypted, budget, window, segmentSize, WriteThrough.Mode.OFF);
+    }
+
+    private static LiveLedger openJudged(Path directory, boolean encrypted, long budget, Duration window, long segmentSize,
+                                         WriteThrough.Mode writeThrough) {
         var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(directory)
                 .encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
                 .keyspace(MESSAGES).keyspace(TEXTS).keyspace(CHATS).commitWindow(window))
                 .segmentSize(segmentSize)
                 .spillBudget(budget)
-                // Values of a group written through stay on the heap, and whether a group goes through depends on
-                // whether a spare segment is ready; writtenThroughValuesStay covers them
-                .writeThrough(WriteThrough.Mode.OFF)
+                // Whether a group goes through depends on whether a spare segment is ready, and the values of one that
+                // bypasses the system's cache move only after a read of its frames; the tests of groups written
+                // through ask for it
+                .writeThrough(writeThrough)
                 .build();
         ledger.valueSlab().forceColdForTests();
+        return ledger;
+    }
+
+    /// Opens a store as [#open(Path, boolean, long)] does, with a budget of 0 and segments of 64 KiB, that writes
+    /// groups through in `writeThrough`.
+    private static LiveLedger openThrough(Path directory, boolean encrypted, WriteThrough.Mode writeThrough) {
+        var ledger = openJudged(directory, encrypted, 0, Duration.ZERO, 64 << 10, writeThrough);
+        ledger.state(MESSAGES).overwrites.forceSpillsForTests();
+        ledger.state(TEXTS).overwrites.forceSpillsForTests();
         return ledger;
     }
 
@@ -770,21 +785,267 @@ class LogSpillTest {
         assertEquals(1, queue.loggedValuesForTests(), "values moved to the log");
     }
 
+    /// {@return a record of the commit at `sequence` listing `version`, whose value of `length` bytes is the commit's
+    /// body, located at `frameOffset` of `view`, written past the system's cache if `uncached`}
+    private static SpillQueue.Record located(SpillQueue queue, long sequence, Version version, int length,
+                                             LogSegmentView view, long frameOffset, boolean uncached) {
+        var record = queue.record(sequence, 1);
+        record.add(version, 0, length);
+        record.locate(view, frameOffset, 0, uncached);
+        return record;
+    }
+
+    /// Writes the value of `version`, of `length` bytes, where a frame at `frameOffset` holds it as a commit's body,
+    /// to the file at `path` without encryption, which the reads of a view without a key take as it is.
+    private static void writeFrame(Path path, long frameOffset, Version version, int length) throws Exception {
+        try (var channel = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+            var bytes = version.value().toArray(java.lang.foreign.ValueLayout.JAVA_BYTE);
+            assertEquals(length, bytes.length);
+            channel.write(ByteBuffer.wrap(bytes), frameOffset + LogWriter.FRAME_HEADER);
+        }
+    }
+
+    /// {@return the end, in its segment, of the value of `length` bytes that is the body of the frame at `frameOffset`}
+    private static long extent(long frameOffset, int length) {
+        return frameOffset + LogWriter.FRAME_HEADER + length;
+    }
+
+    /// Checks that `version` moved to the log, and reads back as the value of `length` bytes [#spillable(long, int)]
+    /// made.
+    private static void assertMovedAndReads(Version version, int length) {
+        assertInstanceOf(LogValue.class, version.sourceForTests());
+        var read = new byte[length];
+        version.readLogged(read, 0);
+        for (var i = 0; i < length; i++) {
+            assertEquals((byte) i, read[i], "byte " + i);
+        }
+    }
+
     @Test
-    @DisplayName("the values of a commit whose group the log wrote through stay on the heap, and its record leaves the queue")
-    void writtenThroughValuesStay(@TempDir Path directory) throws Exception {
+    @DisplayName("the values of a commit whose group the log wrote past the system's cache move to the log once its frame is read back, and read back as written")
+    void writtenThroughValuesMove(@TempDir Path directory) throws Exception {
         var queue = new SpillQueue(0, true);
-        var view = queue.segment(1, directory.resolve("1.log"), null);
+        var path = directory.resolve("1.log");
         var through = spillable(1L << 20, 4_000);
-        var record = queue.record(1, 1);
-        record.add(through, 0, 4_000);
-        record.locate(view, 64, 0, true);
-        queue.add(record);
+        writeFrame(path, 4_096, through, 4_000);
+        var view = queue.segment(1, path, null);
+        queue.add(located(queue, 1, through, 4_000, view, 4_096, true));
         queue.drain(() -> 1);
         queue.awaitIdleForTests();
-        assertInstanceOf(MemorySegment.class, through.sourceForTests(), "a value of a group written through");
-        assertEquals(0, queue.loggedValuesForTests(), "values moved to the log");
+        assertMovedAndReads(through, 4_000);
+        assertEquals(1, queue.loggedValuesForTests(), "values moved to the log");
+        assertEquals(extent(4_096, 4_000) - 4_096, queue.warmedBytesForTests(), "bytes of the frame read back");
+        assertEquals(0, queue.unwarmedRecordsForTests());
         assertEquals(0, queue.heldForTests());
+        queue.close();
+    }
+
+    @Test
+    @DisplayName("the values of a commit whose group the log forced, or wrote through into the system's cache, move with no read of its frame")
+    void cachedValuesMoveUnread(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(0, true);
+        var path = directory.resolve("1.log");
+        var forced = spillable(1L << 20, 4_000);
+        writeFrame(path, 4_096, forced, 4_000);
+        var view = queue.segment(1, path, null);
+        queue.add(located(queue, 1, forced, 4_000, view, 4_096, false));
+        queue.drain(() -> 1);
+        queue.awaitIdleForTests();
+        assertMovedAndReads(forced, 4_000);
+        assertEquals(0, queue.warmedBytesForTests(), "bytes of frames read back");
+        queue.close();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"missing", "short", "retired"})
+    @DisplayName("a commit whose frame written past the system's cache cannot be read back, or is in a retired segment, keeps its values on the heap, and its record leaves the queue")
+    void unreadFramesKeepTheirValues(String failure, @TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(0, true);
+        var path = directory.resolve("1.log");
+        var through = spillable(1L << 20, 4_000);
+        switch (failure) {
+            case "short" -> Files.write(path, new byte[4_096 + LogWriter.FRAME_HEADER + 100]);
+            case "retired" -> writeFrame(path, 4_096, through, 4_000);
+            default -> {
+            }
+        }
+        var view = queue.segment(1, path, null);
+        if (failure.equals("retired")) {
+            view.retire();
+        }
+        queue.add(located(queue, 1, through, 4_000, view, 4_096, true));
+        queue.drain(() -> 1);
+        queue.awaitIdleForTests();
+        assertInstanceOf(MemorySegment.class, through.sourceForTests(), "a value whose frame was not read back");
+        assertEquals(0, queue.loggedValuesForTests(), "values moved to the log");
+        assertEquals(1, queue.unwarmedRecordsForTests(), "records released unmoved");
+        assertEquals(0, queue.heldForTests());
+        queue.close();
+    }
+
+    @Test
+    @DisplayName("a read of frames written past the system's cache covers the durable records after the drain's in its segment use, and stops at one not durable yet")
+    void readsAheadOnlyDurableRecords(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(0, true);
+        var durable = new java.util.concurrent.atomic.AtomicLong();
+        queue.useDurable(durable::get);
+        var path = directory.resolve("1.log");
+        var view = queue.segment(1, path, null);
+        long[] frames = {4_096, 12_288, 20_480};
+        var versions = new Version[frames.length];
+        for (var i = 0; i < frames.length; i++) {
+            versions[i] = spillable((i + 1L) << 20, 4_000);
+            writeFrame(path, frames[i], versions[i], 4_000);
+            queue.add(located(queue, i + 1, versions[i], 4_000, view, frames[i], true));
+        }
+        // No commit is durable yet, so the queue's thread moved nothing
+        queue.awaitIdleForTests();
+        assertEquals(0, queue.drainedRecordsForTests());
+        durable.set(2);
+        queue.drain(durable::get);
+        assertMovedAndReads(versions[0], 4_000);
+        assertMovedAndReads(versions[1], 4_000);
+        assertInstanceOf(MemorySegment.class, versions[2].sourceForTests(), "the value of a commit not durable yet");
+        // One read from the first frame to the end of the second
+        assertEquals(extent(frames[1], 4_000) - frames[0], queue.warmedBytesForTests());
+        durable.set(3);
+        queue.drain(durable::get);
+        assertMovedAndReads(versions[2], 4_000);
+        assertEquals(extent(frames[1], 4_000) - frames[0] + extent(frames[2], 4_000) - frames[2], queue.warmedBytesForTests());
+        queue.close();
+    }
+
+    @Test
+    @DisplayName("a read of frames written past the system's cache stops at a record of another use of the segment, which a read of its own covers")
+    void readsAheadWithinOneUse(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(0, true);
+        var durable = new java.util.concurrent.atomic.AtomicLong();
+        queue.useDurable(durable::get);
+        var path = directory.resolve("1.log");
+        // Two uses of the same file and number, as a segment reused under a new key
+        var first = queue.segment(1, path, null);
+        var second = queue.segment(1, path, null);
+        var older = spillable(1L << 20, 4_000);
+        var newer = spillable(2L << 20, 4_000);
+        writeFrame(path, 4_096, older, 4_000);
+        writeFrame(path, 12_288, newer, 4_000);
+        queue.add(located(queue, 1, older, 4_000, first, 4_096, true));
+        queue.add(located(queue, 2, newer, 4_000, second, 12_288, true));
+        queue.awaitIdleForTests();
+        durable.set(2);
+        queue.drain(durable::get);
+        assertMovedAndReads(older, 4_000);
+        assertMovedAndReads(newer, 4_000);
+        // Not one read from the first frame to the end of the second
+        assertEquals(extent(4_096, 4_000) - 4_096 + extent(12_288, 4_000) - 12_288, queue.warmedBytesForTests());
+        queue.close();
+    }
+
+    @Test
+    @DisplayName("the frames of hundreds of records written past the system's cache are read in spans, one ahead of the values the drain moves, and every value moves and reads back")
+    void readsManySpans(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(0, true);
+        var durable = new java.util.concurrent.atomic.AtomicLong();
+        queue.useDurable(durable::get);
+        var path = directory.resolve("1.log");
+        var view = queue.segment(1, path, null);
+        var records = 300;
+        var versions = new Version[records];
+        for (var i = 0; i < records; i++) {
+            versions[i] = spillable((i + 1L) << 20, 4_000);
+            writeFrame(path, 4_096 + i * 8_192L, versions[i], 4_000);
+        }
+        for (var i = 0; i < records; i++) {
+            queue.add(located(queue, i + 1, versions[i], 4_000, view, 4_096 + i * 8_192L, true));
+        }
+        // Drained on this thread alone, once the queue's thread found nothing durable
+        queue.awaitIdleForTests();
+        durable.set(records);
+        queue.drain(durable::get);
+        for (var version : versions) {
+            assertMovedAndReads(version, 4_000);
+        }
+        assertEquals(0, queue.unwarmedRecordsForTests());
+        var warmed = queue.warmedBytesForTests();
+        assertTrue(warmed >= records * 4_000L && warmed <= extent(4_096 + (records - 1) * 8_192L, 4_000) - 4_096,
+                "bytes read back: " + warmed);
+        queue.close();
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("the values of durable commits a store wrote through into the system's cache move to the log with no read of their frames, and read back as written through a checkpoint and a reopen")
+    void dsyncValuesMoveUnread(boolean encrypted) throws Exception {
+        var disk = CrashFileSystem.create();
+        var directory = disk.getPath("/store");
+        var expected = new Expected();
+        try (var ledger = openThrough(directory, encrypted, WriteThrough.Mode.DSYNC)) {
+            assertEquals(WriteThrough.Kind.DSYNC, ledger.log().writeThroughKind());
+            var message = 0;
+            // Segments enough for a checkpoint to leave spares, which the log writes groups through into
+            while (ledger.log().currentSegment() < 12) {
+                write(ledger, expected, message++, 1, 0, true);
+            }
+            ledger.checkpoint();
+            var through = ledger.log().writtenThrough();
+            for (var attempt = 0; attempt < 200 && ledger.log().writtenThrough() == through; attempt++) {
+                write(ledger, expected, message++, 1, 0, true);
+            }
+            assertTrue(ledger.log().writtenThrough() > through, "no group was written through");
+            for (var attempt = 0; attempt < 20; attempt++) {
+                write(ledger, expected, message++, 1, 0, true);
+            }
+            spillNow(ledger);
+            assertTrue(ledger.spills().loggedValuesForTests() > 0, "no value moved to the log");
+            assertEquals(0, ledger.spills().warmedBytesForTests(), "bytes of frames read back");
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = openThrough(directory, encrypted, WriteThrough.Mode.DSYNC)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("the values of durable commits a store wrote through past the system's cache move to the log after a read of their frames, and read back as written through a checkpoint and a reopen")
+    void directValuesMoveAfterARead(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = openThrough(directory, encrypted, WriteThrough.Mode.DIRECT)) {
+            var kind = ledger.log().writeThroughKind();
+            // macOS forces, and a file system that refuses O_DIRECT writes through its cache
+            org.junit.jupiter.api.Assumptions.assumeTrue(kind == WriteThrough.Kind.DIRECT || kind == WriteThrough.Kind.UNBUFFERED,
+                    "the store writes through past the cache: " + kind);
+            var message = 0;
+            while (ledger.log().currentSegment() < 12) {
+                write(ledger, expected, message, 30, 0, true);
+                message += 30;
+            }
+            ledger.checkpoint();
+            var through = ledger.log().writtenThrough();
+            for (var attempt = 0; attempt < 200 && ledger.log().writtenThrough() == through; attempt++) {
+                write(ledger, expected, message, 1, 0, true);
+                message++;
+            }
+            org.junit.jupiter.api.Assumptions.assumeTrue(ledger.log().writeThroughKind() == kind,
+                    "the store moved down to " + ledger.log().writeThroughKind());
+            assertTrue(ledger.log().writtenThrough() > through, "no group was written through");
+            for (var attempt = 0; attempt < 20; attempt++) {
+                write(ledger, expected, message, 1, 0, true);
+                message++;
+            }
+            spillNow(ledger);
+            assertTrue(ledger.spills().loggedValuesForTests() > 0, "no value moved to the log");
+            assertTrue(ledger.spills().warmedBytesForTests() > 0, "no frame was read back");
+            assertEquals(0, ledger.spills().unwarmedRecordsForTests());
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = openThrough(directory, encrypted, WriteThrough.Mode.DIRECT)) {
+            verify(ledger, expected);
+        }
     }
 
     @ParameterizedTest(name = "encrypted: {0}, segment of {1} bytes")
@@ -961,12 +1222,15 @@ class LogSpillTest {
     @DisplayName("a store that moves every value it can recovers a state between its last durable commit and its last visible one, whatever point a crash or a loss of power stops it at")
     void recoversAfterCrash(int seed) throws Exception {
         var encrypted = seed % 2 == 0;
+        // A quarter of the seeds read the frames of every record back before its values move, as for groups written
+        // past the system's cache
+        var warms = seed % 4 == 1;
         var dry = CrashFileSystem.create();
-        new Workload(seed, encrypted).run(dry.getPath("/store"));
+        new Workload(seed, encrypted, warms).run(dry.getPath("/store"));
         var disk = CrashFileSystem.create();
         var random = new Random(seed * 7919L + 3);
         disk.stopAfter(random.nextLong(dry.changes() + 1));
-        var workload = new Workload(seed, encrypted);
+        var workload = new Workload(seed, encrypted, warms);
         workload.run(disk.getPath("/store"));
         var survivor = seed % 3 == 0 ? disk.afterProcessCrash() : disk.afterPowerLoss(new Random(random.nextLong()));
         try (var ledger = open(survivor.getPath("/store"), encrypted, 0)) {
@@ -981,6 +1245,9 @@ class LogSpillTest {
                 fail("The store recovered a state no commit from " + workload.durable + " to " + workload.visible + " left");
             }
             verify(ledger, match);
+            if (warms) {
+                ledger.spills().warmEveryRecordForTests();
+            }
             var after = match.copy();
             write(ledger, after, 50_000, 10, 0, true);
             spillNow(ledger);
@@ -1026,14 +1293,16 @@ class LogSpillTest {
     private static final class Workload {
         private final Random random;
         private final boolean encrypted;
+        private final boolean warms;
         final List<Expected> history;
         Expected state;
         int visible;
         int durable;
 
-        Workload(int seed, boolean encrypted) {
+        Workload(int seed, boolean encrypted, boolean warms) {
             this.random = new Random(seed);
             this.encrypted = encrypted;
+            this.warms = warms;
             this.history = new ArrayList<>();
             this.state = new Expected();
             history.add(state.copy());
@@ -1043,6 +1312,9 @@ class LogSpillTest {
             LiveLedger ledger = null;
             try {
                 ledger = open(directory, encrypted, 0);
+                if (warms) {
+                    ledger.spills().warmEveryRecordForTests();
+                }
                 for (var step = 0; step < 40; step++) {
                     var choice = random.nextInt(20);
                     if (choice == 0) {
@@ -1052,6 +1324,9 @@ class LogSpillTest {
                         ledger.close();
                         durable = visible;
                         ledger = open(directory, encrypted, 0);
+                        if (warms) {
+                            ledger.spills().warmEveryRecordForTests();
+                        }
                     } else if (choice == 2 && !state.messages.isEmpty()) {
                         var next = state.copy();
                         var removed = next.messages.firstKey();

@@ -15,6 +15,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.InvalidKeyException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 /// One use of a log segment, the writing of one open or the frames one recovery replayed, as the values that left the
 /// heap for it are read back from ([LogValue]).
@@ -168,6 +169,32 @@ final class LogSegmentView {
             }
         } finally {
             spills.giveBack(crypto);
+        }
+    }
+
+    /// Reads the `length` bytes at `position` and drops them, a piece of `buffer`'s capacity at a time, so the system's
+    /// cache holds the pages of frames that a write bypassing it left on the device only, and later reads of their
+    /// values find them there.
+    ///
+    /// Only a use whose commits the queue noted is read, so the retirement that closes its channel sees it; the
+    /// channel is the one values are read through, and an interrupt of the reading thread would close it for them.
+    ///
+    /// @param stop whether to stop before the next piece, as the store closes
+    /// @return whether every byte was read: not if `stop` stopped it, a checkpoint retired the segment, or it cannot be
+    ///         read
+    boolean warm(long position, long length, ByteBuffer buffer, BooleanSupplier stop) {
+        try {
+            for (var at = 0L; at < length; ) {
+                if (retired || stop.getAsBoolean()) {
+                    return false;
+                }
+                var piece = (int) Math.min(buffer.capacity(), length - at);
+                readFully(buffer, 0, piece, position + at);
+                at += piece;
+            }
+            return true;
+        } catch (Retired | LedgerIoException _) {
+            return false;
         }
     }
 
