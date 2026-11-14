@@ -118,10 +118,10 @@ final class LogRecovery {
         LogFiles.Prepared empty = null;
         Path lastWritten = null;
         var buffer = new SegmentReader.Buffer();
-        // The bytes of the segments after each one, for how much log at most follows a frame
+        // The bytes of the segments after each one that hold frames, for how much log at most follows a frame
         var after = new long[segments.size()];
         for (var index = segments.size() - 2; spills != null && index >= 0; index--) {
-            after[index] = after[index + 1] + Files.size(files.segment(segments.get(index + 1)));
+            after[index] = after[index + 1] + written(files.segment(segments.get(index + 1)));
         }
         for (var index = 0; index < segments.size(); index++) {
             var number = segments.get(index);
@@ -175,10 +175,11 @@ final class LogRecovery {
                 var segmentKey = keys.encrypted() ? keys.segmentKey(storeId, number, salt, useTag) : null;
                 ahead.begin(tag, useTag, segmentKey);
                 var view = spills == null ? null : spills.segment(number, path, segmentKey);
-                // Where the segment's frames end at most: the last segment of a recovery that moves values ends where
-                // its chain of frame headers does, unless all of it falls in the part of the log the heap keeps
+                // Where the segment's frames end at most: the last segment that holds frames ends, in a recovery that
+                // moves values, where its chain of frame headers does, unless all of it falls in the part of the log
+                // the heap keeps
                 var segmentEnd = reader.size();
-                if (spills != null && index == segments.size() - 1 && !spills.keepsReplayed(segmentEnd - position)) {
+                if (spills != null && after[index] == 0 && !spills.keepsReplayed(segmentEnd - position)) {
                     segmentEnd = chainEnd(reader, position, tag, useTag, crc);
                 }
                 var afterPadding = false;
@@ -365,6 +366,21 @@ final class LogRecovery {
             return null;
         }
         return Arrays.copyOfRange(sealed, at, at + bodyLength);
+    }
+
+    /// {@return the bytes of the segment at `path` that may hold frames: none if it was prepared and never written, its
+    /// first frame header all zeros, or it is no longer than its header; its size otherwise}
+    private static long written(Path path) throws IOException {
+        try (var channel = FileChannel.open(path, StandardOpenOption.READ)) {
+            var size = channel.size();
+            var frame = ByteBuffer.allocate(LogWriter.FRAME_HEADER);
+            while (frame.hasRemaining()) {
+                if (channel.read(frame, LogWriter.SEGMENT_HEADER + frame.position()) < 0) {
+                    return 0;
+                }
+            }
+            return isZero(frame.array(), 0, LogWriter.FRAME_HEADER) ? 0 : size;
+        }
     }
 
     /// {@return where the frames of the use `useTag` of the segment whose salt has `tag` stop following each other from
