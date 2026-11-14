@@ -4,26 +4,34 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/// The units a cache's reads missed recently, by key and nonce, which [PageCache] asks before it caches a unit a
-/// screened read missed: a unit it has not seen is recorded rather than cached, and cached at its next read.
+/// The units a cache's reads missed recently, by key and nonce, and whether they missed them once or twice, which
+/// [PageCache] asks before it caches a unit a screened read missed: a unit it has not seen often enough is recorded
+/// rather than cached, and cached at the read that follows the reads it asks for ([#admit(long, long, int, int)]).
 ///
-/// It keeps two generations, a young one that takes the records and the old one before it, and a key is seen when
-/// either holds it. A generation is a scalable Bloom filter: a list of levels, each a Bloom filter of its own sized
-/// for a number of keys, of which only the last takes records. The first generation starts with one level of
-/// [#LEVEL_KEYS] keys, so a store that reads little holds about 2 KiB, and while it holds fewer keys than the cache
-/// asks for it grows by a new, empty level of as many keys as the levels before it, keeping theirs: growing forgets no
-/// key and leaves the bits of the earlier levels as sparse as they were. Each level is given a share of
-/// [#FALSE_POSITIVES] in proportion to its keys, which takes the fewest bits for the whole, so a full generation takes
-/// at most that share of keys it never saw for seen ones, however many times it grew. A generation that holds the
-/// most keys the cache asks for becomes the old one, and the young one starts as a single level of that many keys,
-/// as the cache has shown it reads them: the filter remembers every key recorded since the last rotation and in the
-/// generation before it, takes at most twice [#FALSE_POSITIVES] of the keys it never saw for seen ones, and holds
-/// about 8 bits a key of each generation, or 11 for the first one, whose small levels take a small share each: at
-/// most 160 KiB for a cache of 256 MiB.
+/// It counts to two with two filters of the same design: one takes the units read at least once, and the other the
+/// units read at least twice, which a scan asks for. A unit the cache evicted after a read used it goes to the first,
+/// and to the second once a scan started it ([#remember(long, long, int)]); the first also takes, each under a nonce
+/// salted its own way, the units a checkpoint wrote in place of units reads used, which need one read fewer, or two,
+/// but count as seen by none of the reads that ask what the doorkeeper saw. Each filter keeps two generations, a young
+/// one that takes the records and the old one before it, and a key is in the filter when either holds it. A generation
+/// is a scalable Bloom filter: a list of levels, each a Bloom filter of its own sized for a number of keys, of which
+/// only the last takes records. The first generation starts with one level of [#LEVEL_KEYS] keys, so a store that reads
+/// little holds about 2 KiB, and while it holds fewer keys than the cache asks for it grows by a new, empty level of as
+/// many keys as the levels before it, keeping theirs: growing forgets no key and leaves the bits of the earlier levels
+/// as sparse as they were. Each level is given a share of [#FALSE_POSITIVES] in proportion to its keys, which takes the
+/// fewest bits for the whole, so a full generation takes at most that share of keys it never saw for seen ones, however
+/// many times it grew. A generation that holds the most keys the cache asks for becomes the old one, and the young one
+/// starts as a single level of that many keys, as the cache has shown it reads them: a filter remembers every key
+/// recorded since its last rotation and in the generation before it, takes at most twice [#FALSE_POSITIVES] of the keys
+/// it never saw for seen ones, and holds about 8 bits a key of each generation, or 11 for the first one, whose small
+/// levels take a small share each. Each filter grows and rotates on its own, and the second starts only at its first
+/// record, a scan's second read of a unit, so a store read by point reads alone holds one: at most 160 KiB a filter,
+/// 320 KiB in all, for a cache of 256 MiB.
 ///
 /// Records and tests take no lock: a bit is set with an atomic or, and a test reads the words as they are. A record
 /// that races a growth or a rotation may lose its bits, which costs the unit one more read before it is cached, and a
-/// test that races one may miss a key, the same. The filter is never persisted.
+/// test that races one may miss a key, the same; of two reads of a unit that race, each may count the unit as the
+/// other found it, which costs or saves the unit one read. The filters are never persisted.
 final class Doorkeeper {
     /// The fewest keys a generation holds before it rotates, which a cache asks for at the least.
     static final int FIRST_KEYS = 2_048;
@@ -33,71 +41,116 @@ final class Doorkeeper {
     static final int LEVEL_KEYS = 1_024;
     /// The share of the keys it never saw that a full generation takes for seen ones.
     static final double FALSE_POSITIVES = 0.02;
-    /// The salt of the nonce under which a unit is recorded as expected rather than seen ([#expect(long, long, int)]):
-    /// the fractional part of the golden ratio, which no nonce of the unit's page is but by chance.
+    /// The salt of the nonce under which a unit is recorded as expected after two reads of the unit it replaces
+    /// ([#expect(long, long, int, int)]): the fractional part of the golden ratio, which no nonce of the unit's page is
+    /// but by chance.
     private static final long EXPECTED = 0x9E3779B97F4A7C15L;
+    /// The salt of the nonce under which a unit is recorded as expected after one read of the unit it replaces: the
+    /// second prime of xxHash64, which no nonce of the unit's page is but by chance, nor the other salt.
+    private static final long EXPECTED_ONCE = 0xC2B2AE3D27D4EB4FL;
     private static final VarHandle WORDS = MethodHandles.arrayElementVarHandle(long[].class);
 
-    // Guards the growths, the rotations, the first record and the close
+    // Guards the growths, the rotations, the first record of each filter and the close
     private final Object lock;
-    // The generations, replaced whole by a growth or a rotation; null until the first record and after the close
-    private volatile Filter filter;
-    // Set once the cache closes: no record allocates a filter after it
+    // The units read at least once, and the salted records of the expected ones
+    private final Counted once;
+    // The units read at least twice
+    private final Counted twice;
+    // Set once the cache closes, under the lock: no record allocates a filter after it
     private boolean closed;
 
     /// Makes a doorkeeper that has seen no key and holds no bits until its first record.
     Doorkeeper() {
         this.lock = new Object();
+        this.once = new Counted();
+        this.twice = new Counted();
     }
 
-    /// {@return whether it has seen the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh`, or
-    /// expects it, and records it as seen if neither}
+    /// {@return whether the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh` had `reads` reads
+    /// before this one, or is expected, and records this read if not}
     ///
-    /// A unit admitted because it was expected is not recorded as seen: the cache takes it as an entry a read used,
-    /// which is what tells the next checkpoint that a read used it.
+    /// A read that needs one read before it is admitted if either filter holds the unit, or it is expected after one
+    /// read or two of the unit it replaces; otherwise the first filter records it. A read that needs two is admitted if
+    /// the second filter holds the unit, or it is expected after two reads of the unit it replaces; otherwise, if the
+    /// first filter holds it or it is expected after one read, the second filter records it, and if neither, the first
+    /// does. A unit admitted because it was expected is not recorded as seen: the cache takes it as an entry a read
+    /// used, which is what tells the next checkpoint that a read used it.
     ///
     /// @param most the most keys a generation may hold, at which it rotates rather than grow
-    boolean admit(long key, long nonceHigh, int most) {
+    /// @param reads the reads before this one the unit needs, 1 or 2
+    boolean admit(long key, long nonceHigh, int most, int reads) {
         var hash = hash(key, nonceHigh);
-        var filter = this.filter;
-        if (filter == null) {
-            filter = start(most);
-            if (filter == null) {
+        var once = this.once.filter;
+        if (once == null) {
+            once = this.once.start(most);
+            if (once == null) {
                 return false;
             }
-        } else if (filter.holds(hash) || filter.holds(hash(key, nonceHigh ^ EXPECTED))) {
-            return true;
+        } else if (reads < 2) {
+            var twice = this.twice.filter;
+            if (once.holds(hash) || twice != null && twice.holds(hash) || once.holds(hash(key, nonceHigh ^ EXPECTED))
+                    || once.holds(hash(key, nonceHigh ^ EXPECTED_ONCE))) {
+                return true;
+            }
+        } else {
+            var twice = this.twice.filter;
+            if (twice != null && twice.holds(hash) || once.holds(hash(key, nonceHigh ^ EXPECTED))) {
+                return true;
+            }
+            if (once.holds(hash) || once.holds(hash(key, nonceHigh ^ EXPECTED_ONCE))) {
+                if (twice == null) {
+                    twice = this.twice.start(most);
+                }
+                if (twice != null) {
+                    this.twice.add(twice, hash, most);
+                }
+                return false;
+            }
         }
-        add(filter, hash, most);
+        this.once.add(once, hash, most);
         return false;
     }
 
-    /// Records the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh` as seen, if the doorkeeper
-    /// recorded any unit before: the cache evicted it, and takes it back at its next read.
+    /// Records the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh` as read twice, if the
+    /// doorkeeper recorded any unit before: the cache evicted it after a read used it, and takes it back at its next
+    /// read, a scan's too.
+    ///
+    /// The second filter takes it only once a scan's second read of a unit started it, so a store read by point reads
+    /// alone, whose cache evicts, still holds a single filter; a scan that starts after evictions takes the units the
+    /// cache evicted before at their second read.
     ///
     /// @param most the most keys a generation may hold, at which it rotates rather than grow
     void remember(long key, long nonceHigh, int most) {
-        var filter = this.filter;
-        if (filter != null) {
-            add(filter, hash(key, nonceHigh), most);
+        var once = this.once.filter;
+        if (once == null) {
+            return;
+        }
+        var hash = hash(key, nonceHigh);
+        this.once.add(once, hash, most);
+        var twice = this.twice.filter;
+        if (twice != null) {
+            this.twice.add(twice, hash, most);
         }
     }
 
     /// Records the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh` as expected, if the
-    /// doorkeeper recorded any unit before: a checkpoint wrote it in place of a unit a read used and left it out of
-    /// the cache, which takes it at its first read ([#admit(long, long, int)]).
+    /// doorkeeper recorded any unit before: a checkpoint wrote it in place of a unit that reads used `reads` times, and
+    /// left it out of the cache, which takes it after one read fewer than [#admit(long, long, int, int)] asks for. A
+    /// point read so caches it at its first read, as does a scan after two reads of the unit it replaces; after one, a
+    /// scan caches it at its second read.
     ///
-    /// The record is kept apart from those of the units it saw, under a salted nonce, so [#holds(long, long)] does not
-    /// find it. A checkpoint that asks whether a read used the unit it replaces would otherwise take an expected unit
-    /// for a read one and expect its replacement in turn, at every checkpoint that rewrites it with no read between
-    /// them, and each such record would take a key of the generations that no read touched, rotating them so that
-    /// they forget the first reads they hold.
+    /// The record is kept in the first filter apart from those of the units it saw, under a salted nonce, so neither
+    /// [#holds(long, long)] nor [#reads(long, long)] finds it. A checkpoint that asks whether reads used the unit it
+    /// replaces would otherwise take an expected unit for a read one and expect its replacement in turn, at every
+    /// checkpoint that rewrites it with no read between them, and each such record would take a key of the generations
+    /// that no read touched, rotating them so that they forget the first reads they hold.
     ///
     /// @param most the most keys a generation may hold, at which it rotates rather than grow
-    void expect(long key, long nonceHigh, int most) {
-        var filter = this.filter;
-        if (filter != null) {
-            add(filter, hash(key, nonceHigh ^ EXPECTED), most);
+    /// @param reads the reads of the unit it replaces, 1 or 2; 2 also for one the cache held as read
+    void expect(long key, long nonceHigh, int most, int reads) {
+        var once = this.once.filter;
+        if (once != null) {
+            this.once.add(once, hash(key, nonceHigh ^ (reads < 2 ? EXPECTED_ONCE : EXPECTED)), most);
         }
     }
 
@@ -105,73 +158,62 @@ final class Doorkeeper {
     void close() {
         synchronized (lock) {
             closed = true;
-            filter = null;
+            once.filter = null;
+            twice.filter = null;
         }
     }
 
     /// {@return whether it has seen the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh`,
     /// recording nothing; a unit it only expects is not one it has seen}
     boolean holds(long key, long nonceHigh) {
-        var filter = this.filter;
-        return filter != null && filter.holds(hash(key, nonceHigh));
+        return reads(key, nonceHigh) > 0;
     }
 
-    /// {@return the bytes the generations take, for tests that bound them}
-    long bytesForTests() {
-        var filter = this.filter;
-        if (filter == null) {
+    /// {@return the reads it has seen of the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh`: 2
+    /// for two or more, 1 or 0, recording nothing; a unit it only expects has none}
+    int reads(long key, long nonceHigh) {
+        var once = this.once.filter;
+        if (once == null) {
             return 0;
         }
-        var bytes = 0L;
-        for (var level : filter.young) {
-            bytes += 8L * level.words.length;
+        var hash = hash(key, nonceHigh);
+        var twice = this.twice.filter;
+        if (twice != null && twice.holds(hash)) {
+            return 2;
         }
-        if (filter.old != null) {
-            for (var level : filter.old) {
-                bytes += 8L * level.words.length;
-            }
-        }
-        return bytes;
+        return once.holds(hash) ? 1 : 0;
     }
 
-    /// {@return the keys the young generation holds before it grows or rotates, or 0 before the first record; for
-    /// tests}
+    /// {@return the bytes the generations of both filters take, for tests that bound them}
+    long bytesForTests() {
+        return once.bytes() + twice.bytes();
+    }
+
+    /// {@return the keys the young generations of both filters hold before they grow or rotate, or 0 before the first
+    /// record; for tests}
     int keysForTests() {
-        var filter = this.filter;
-        return filter == null ? 0 : filter.keys;
+        return onceKeysForTests() + twiceKeysForTests();
     }
 
-    /// {@return the rotations so far, for tests that count them}
+    /// {@return the keys the young generation of the filter of the units read once holds before it grows or rotates,
+    /// or 0 before its first record; for tests}
+    int onceKeysForTests() {
+        var once = this.once.filter;
+        return once == null ? 0 : once.keys;
+    }
+
+    /// {@return the keys the young generation of the filter of the units read twice holds before it grows or rotates,
+    /// or 0 before its first record; for tests}
+    int twiceKeysForTests() {
+        var twice = this.twice.filter;
+        return twice == null ? 0 : twice.keys;
+    }
+
+    /// {@return the rotations of both filters so far, for tests that count them}
     int rotationsForTests() {
-        var filter = this.filter;
-        return filter == null ? 0 : filter.rotations;
-    }
-
-    /// {@return the filter of the first record, or `null` once the cache closed}
-    private Filter start(int most) {
-        synchronized (lock) {
-            if (filter == null && !closed) {
-                var level = Level.of(LEVEL_KEYS, Math.max(LEVEL_KEYS, cap(most)));
-                filter = new Filter(new Level[]{level}, null, LEVEL_KEYS, 0, 0);
-            }
-            return filter;
-        }
-    }
-
-    /// Sets the bits of the key whose hash is `hash` in the last level of the young generation of `filter`, and grows
-    /// or rotates the generations once that set the bits of the level's last key.
-    private void add(Filter filter, long hash, int most) {
-        var last = filter.young[filter.young.length - 1];
-        if (last.set(hash) && filter.added.incrementAndGet() == last.keys) {
-            // Only the record that filled the level gets here; one that adds the same key again sets no bit and does
-            // not count, or keys read again and again would rotate the generations early and forget the others
-            synchronized (lock) {
-                if (this.filter == filter) {
-                    var cap = cap(most);
-                    this.filter = filter.keys < cap ? filter.grown(cap) : filter.rotated(cap);
-                }
-            }
-        }
+        var once = this.once.filter;
+        var twice = this.twice.filter;
+        return (once == null ? 0 : once.rotations) + (twice == null ? 0 : twice.rotations);
     }
 
     /// {@return the most keys a generation holds, out of the most the cache asks for}
@@ -188,7 +230,59 @@ final class Doorkeeper {
         return hash ^ hash >>> 31;
     }
 
-    /// The two generations of a [Doorkeeper].
+    /// One of the two filters of a [Doorkeeper], whose generations a growth or a rotation replaces whole.
+    private final class Counted {
+        // The generations; null until the filter's first record and after the close
+        private volatile Filter filter;
+
+        /// {@return the filter of the first record, or `null` once the cache closed}
+        Filter start(int most) {
+            synchronized (lock) {
+                if (filter == null && !closed) {
+                    var level = Level.of(LEVEL_KEYS, Math.max(LEVEL_KEYS, cap(most)));
+                    filter = new Filter(new Level[]{level}, null, LEVEL_KEYS, 0, 0);
+                }
+                return filter;
+            }
+        }
+
+        /// Sets the bits of the key whose hash is `hash` in the last level of the young generation of `filter`, and
+        /// grows or rotates the generations once that set the bits of the level's last key.
+        void add(Filter filter, long hash, int most) {
+            var last = filter.young[filter.young.length - 1];
+            if (last.set(hash) && filter.added.incrementAndGet() == last.keys) {
+                // Only the record that filled the level gets here; one that adds the same key again sets no bit and
+                // does not count, or keys read again and again would rotate the generations early and forget the
+                // others
+                synchronized (lock) {
+                    if (this.filter == filter) {
+                        var cap = cap(most);
+                        this.filter = filter.keys < cap ? filter.grown(cap) : filter.rotated(cap);
+                    }
+                }
+            }
+        }
+
+        /// {@return the bytes its generations take}
+        long bytes() {
+            var filter = this.filter;
+            if (filter == null) {
+                return 0;
+            }
+            var bytes = 0L;
+            for (var level : filter.young) {
+                bytes += 8L * level.words.length;
+            }
+            if (filter.old != null) {
+                for (var level : filter.old) {
+                    bytes += 8L * level.words.length;
+                }
+            }
+            return bytes;
+        }
+    }
+
+    /// The two generations of a filter of a [Doorkeeper].
     ///
     /// @param young the levels of the generation records set bits in, the last of which takes them
     /// @param old the levels of the generation before it, which tests still read, or `null` before the first rotation

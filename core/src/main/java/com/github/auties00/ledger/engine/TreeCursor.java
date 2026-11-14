@@ -16,10 +16,12 @@ import java.util.HashMap;
 /// other reads use: the PostgreSQL buffer manager holds a large sequential scan to a small ring for the same reason. A
 /// cache with room evicts nothing to take them, and keeps a key space small enough to fit for the next scan.
 ///
-/// A cursor of a paged key space's reads screens the leaves and blobs it admits: the cache takes one only at its
-/// second read ([PageCache#putScreened(long, PageRef, byte\[\])]), as most of the pages of a chat a client opens are
-/// read once, and a unit the cache refused lately and still reaches weakly is
-/// [recalled][PageFile#recalled(PageRef, byte)] before the cursor reads anything ahead or from the file.
+/// A cursor of a paged key space's reads screens the leaves and blobs it admits as a scan: the cache takes one only at
+/// its third read ([PageCache#putScreened(long, PageRef, byte\[\], int)] with [PageCache#SCAN]), as most of the pages
+/// of a chat a client opens are read once, and most of those read twice are not read again. A unit the cache refused
+/// lately and still reaches weakly is [recalled][PageFile#recalled(PageRef, byte, int)] before the cursor reads
+/// anything ahead or from the file: its second read reads nothing and leaves the array where it was, and its third
+/// caches that array.
 ///
 /// A cursor made to gather reads ahead while the reads of the file are [cold][PageFile#coldReads()]. When it needs a
 /// leaf that neither the cache nor its own reads ahead hold, it reads that leaf together with the next siblings under
@@ -66,8 +68,9 @@ final class TreeCursor implements StoredCursor {
     private final boolean descending;
     // The entries the scan is expected to take, or 0 for a cursor that never reads ahead
     private final long wanted;
-    // Whether the leaves and blobs it admits go to the cache only if the cache admits them too
-    private final boolean screened;
+    // The screening of the leaves and blobs it admits, PageCache.SCAN, or PageCache.UNSCREENED if they go to the cache
+    // at once
+    private final int screen;
     private byte[][] path;
     private int[] indexes;
     private int depth;
@@ -139,14 +142,14 @@ final class TreeCursor implements StoredCursor {
     /// @param wanted the entries the scan is expected to take, as for
     ///               [#TreeCursor(PageFile, TreeRoot, byte\[\], byte\[\], boolean, long)]
     /// @param screened whether the first [#ADMITTED] leaves and blobs it reads from the file go to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef)] them
+    ///                 [admits][PageCache#admits(long, PageRef, int)] them as a [scan's][PageCache#SCAN]
     TreeCursor(PageFile pages, TreeRoot root, byte[] from, byte[] to, boolean descending, long wanted, boolean screened) {
         this.pages = pages;
         this.from = from;
         this.to = to;
         this.descending = descending;
         this.wanted = wanted;
-        this.screened = screened;
+        this.screen = screened ? PageCache.SCAN : PageCache.UNSCREENED;
         this.window = FIRST_GATHER;
         this.path = new byte[8][];
         this.indexes = new int[8];
@@ -301,8 +304,8 @@ final class TreeCursor implements StoredCursor {
         if (wanted > 0 && !TreeNodes.isExternal(leaf, entry)) {
             var ref = TreeNodes.blobRef(leaf, entry);
             var blob = pages.cached(ref, PageFormat.VALUE);
-            if (blob == null && admit && screened) {
-                blob = pages.recalled(ref, PageFormat.VALUE);
+            if (blob == null && admit && screen != PageCache.UNSCREENED) {
+                blob = pages.recalled(ref, PageFormat.VALUE, screen);
             }
             if (blob == null) {
                 blob = takeValue(ref);
@@ -312,9 +315,9 @@ final class TreeCursor implements StoredCursor {
                 }
                 var cached = admit || pages.cache().hasRoom(blobBytes());
                 if (blob == null) {
-                    blob = pages.load(ref, PageFormat.VALUE, cached, admit, screened);
-                } else if (admit && screened) {
-                    pages.cache().putScreened(ref, blob);
+                    blob = pages.load(ref, PageFormat.VALUE, cached, admit, screen);
+                } else if (admit && screen != PageCache.UNSCREENED) {
+                    pages.cache().putScreened(ref, blob, screen);
                 } else if (cached) {
                     pages.cache().put(ref, blob, admit);
                 }
@@ -322,7 +325,7 @@ final class TreeCursor implements StoredCursor {
             return TreeSearch.blobValue(leaf, entry, ref, blob);
         }
         if (admit) {
-            return TreeSearch.value(pages, leaf, entry, true, true, screened);
+            return TreeSearch.value(pages, leaf, entry, true, true, screen);
         }
         return TreeSearch.value(pages, leaf, entry, pages.cache().hasRoom(blobBytes()), false);
     }
@@ -350,8 +353,8 @@ final class TreeCursor implements StoredCursor {
             return hit;
         }
         var ref = TreeNodes.childRef(parent, index);
-        if (admit && screened) {
-            var recalled = pages.recalled(ref, PageFile.NODE);
+        if (admit && screen != PageCache.UNSCREENED) {
+            var recalled = pages.recalled(ref, PageFile.NODE, screen);
             if (recalled != null) {
                 return recalled;
             }
@@ -364,15 +367,15 @@ final class TreeCursor implements StoredCursor {
                 unit = take(ref);
             }
             if (unit != null) {
-                if (admit && screened) {
-                    pages.cache().putScreened(ref, unit);
+                if (admit && screen != PageCache.UNSCREENED) {
+                    pages.cache().putScreened(ref, unit, screen);
                 } else if (cached) {
                     pages.cache().put(ref, unit, admit);
                 }
                 return unit;
             }
         }
-        return pages.load(ref, PageFile.NODE, cached, admit, screened);
+        return pages.load(ref, PageFile.NODE, cached, admit, screen);
     }
 
     /// {@return whether the leaf or blob the cursor reads next goes to the cache}

@@ -40,10 +40,11 @@ import java.util.concurrent.atomic.AtomicReference;
 /// all, and a leaf keeps the state its readers gave it. What the update writes goes to the page cache as the first
 /// entries the clock evicts: the branches, the leaves and delta pages the writer admits
 /// ([PageFile.Writer#admits(long, boolean)]), a leaf the more readily if one a read used in the cache is among those
-/// it replaces, and the units of values not at all. A leaf the writer leaves out in place of one a read used
-/// ([PageFile#seen(PageRef)]) is recorded as expected by the page cache's doorkeeper ([PageFile#expect(PageRef)]), so a
-/// reader that reads it once caches it, as it would have cached the leaf it replaces at that read; one rewritten
-/// before any read is not expected in turn.
+/// it replaces, and the units of values not at all. A leaf the writer leaves out in place of one reads used
+/// ([PageFile#reads(PageRef)]) is recorded as expected by the page cache's doorkeeper, with the most reads of any leaf
+/// it replaces ([PageFile#expect(PageRef, int)]): a point reader that reads it once caches it, as it would have cached
+/// the leaf it replaces at that read, and a scan that reads each version once caches it at its first read once it read
+/// the two versions before it; one rewritten before any read is not expected in turn.
 final class TreeUpdate {
     /// The writes below a branch from which its children's subtrees are updated on every processor.
     private static final int PARALLEL_OPS = 4_096;
@@ -604,8 +605,9 @@ final class TreeUpdate {
             // A leaf a former use of the page left at the record's place, which no read finds under the new nonce,
             // still counts against the limit
             pages.cache().remove(PageCache.dataKey(record.page(), record.slot()));
-            if (pages.seen(ref)) {
-                pages.expect(record);
+            var reads = pages.reads(ref);
+            if (reads > 0) {
+                pages.expect(record, reads);
             }
         }
         return List.of(new Child(merged.getFirst().key(), record, merged.size(), blobs, 0, fill));
@@ -674,8 +676,8 @@ final class TreeUpdate {
 
         /// {@inheritDoc} The leaf `ref` gave every entry.
         @Override
-        public boolean seen(PageFile pages, int from, int to) {
-            return pages.seen(ref);
+        public int reads(PageFile pages, int from, int to) {
+            return pages.reads(ref);
         }
     }
 
@@ -696,9 +698,9 @@ final class TreeUpdate {
         /// read used ([PageFile#referenced(PageRef)])}
         boolean read(PageFile pages, int from, int to);
 
-        /// {@return whether the page cache screens what reads miss and a read used one of the leaves that gave the
-        /// entries from `from` to `to` ([PageFile#seen(PageRef)])}
-        boolean seen(PageFile pages, int from, int to);
+        /// {@return the most reads that used one of the leaves that gave the entries from `from` to `to` while the page
+        /// cache screens what reads miss ([PageFile#reads(PageRef)]): 2, 1, or 0 if none or if the cache does not}
+        int reads(PageFile pages, int from, int to);
     }
 
     /// One leaf, which gave every entry.
@@ -709,8 +711,8 @@ final class TreeUpdate {
         }
 
         @Override
-        public boolean seen(PageFile pages, int from, int to) {
-            return pages.seen(ref);
+        public int reads(PageFile pages, int from, int to) {
+            return pages.reads(ref);
         }
     }
 
@@ -731,18 +733,19 @@ final class TreeUpdate {
         }
 
         @Override
-        public boolean seen(PageFile pages, int from, int to) {
+        public int reads(PageFile pages, int from, int to) {
             if (refs.length == 0 || !pages.cache().screens()) {
-                return false;
+                return 0;
             }
+            var most = 0;
             var start = 0;
-            for (var i = 0; i < refs.length && start < to; i++) {
-                if (ends[i] > from && pages.seen(refs[i])) {
-                    return true;
+            for (var i = 0; i < refs.length && start < to && most < 2; i++) {
+                if (ends[i] > from) {
+                    most = Math.max(most, pages.reads(refs[i]));
                 }
                 start = ends[i];
             }
-            return false;
+            return most;
         }
     }
 
@@ -1015,8 +1018,11 @@ final class TreeUpdate {
             }
             var admitted = writer.admits(unit.length, !writer.saturated() && replaced.read(pages, run[0], run[1]));
             var ref = writer.write(PageFormat.LEAF, 0, page, 1, unit, unit.length - PageFormat.HEADER, admitted);
-            if (!admitted && replaced.seen(pages, run[0], run[1])) {
-                pages.expect(ref);
+            if (!admitted) {
+                var reads = replaced.reads(pages, run[0], run[1]);
+                if (reads > 0) {
+                    pages.expect(ref, reads);
+                }
             }
             out.add(new Child(TreeNodes.leafKey(unit, TreeNodes.entry(unit, 0)), ref, run[1] - run[0], blobs, 0,
                     TreeNodes.fill(sizes, run[0], run[1])));
