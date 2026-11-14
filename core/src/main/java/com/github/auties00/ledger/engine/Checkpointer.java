@@ -46,9 +46,11 @@ import java.util.concurrent.locks.ReentrantLock;
 /// of them: each checkpoint and each tick of the [IdleTicker] drops those released since the last on a virtual thread
 /// ([#dropReleased()]). The clock would otherwise keep them, unread, until it evicted them or two ticks passed.
 ///
-/// A checkpoint [holds][HeapPool#hold()] the overflow of the store's pool from its cut until it ends, so the arrays it
-/// reads and seals its pages into, which its flushes give back many at once, stay in the pool while it runs, through
-/// collections; once it ends, the first collection frees those past the pool's reserve.
+/// A checkpoint [holds][HeapPool#hold(int)] the overflow of the store's pool of the arrays of up to [#HELD_ARRAY] bytes
+/// from its cut until it ends, so the arrays it reads and seals its pages into, which its flushes give back many at
+/// once, stay in the pool while it runs, through collections; once it ends, the first collection frees those past the
+/// pool's reserve. The overflow of longer arrays, where the chunks of a bulk write's frames wait once they are sealed,
+/// stays to the first collection, as the checkpoint never takes them.
 ///
 /// A checkpoint that fails before its superblock gives its pages back, and the next one retries. One that fails while
 /// it writes its superblock leaves it unknown whether that superblock is durable, so the pages it wrote stay in use and
@@ -69,6 +71,13 @@ final class Checkpointer implements IdleTicker.Watched {
     /// [IdleTicker] without a commit checkpoints them: below it, a store that writes now and then would checkpoint
     /// after almost every write.
     static final long IDLE_BACKLOG = 1L << 20;
+    /// The longest arrays of the store's pool whose overflow a checkpoint holds while it runs: those of a unit of
+    /// [PageFormat#TRIMMED_PAGES] pages, the longest of the units a checkpoint reads and seals many of, as its nodes and
+    /// delta pages are a page each, and its catalog and free lists rarely longer. The units of the values of over 64 KiB
+    /// the store keeps in its pages are longer, and sealed a window of 1 MiB at a time, within the reserve the pool holds
+    /// strongly of every size: past it, their arrays may be allocated again after a collection. The chunks of the
+    /// commits' frames and batches, which a checkpoint never takes and their own holds keep, are longer still.
+    static final int HELD_ARRAY = PageFormat.SIZE * PageFormat.TRIMMED_PAGES;
     // The checkpointers of the open stores of the process, whose writes the trees lack share one heap budget: a budget
     // of half the heap for each store let a process of several busy stores buffer more than the heap
     private static final Set<Checkpointer> OPEN = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
@@ -449,7 +458,7 @@ final class Checkpointer implements IdleTicker.Watched {
                 return;
             }
             cutBytes = cut.logBytes();
-            poolHold = pages.pool().hold();
+            poolHold = pages.pool().hold(HELD_ARRAY);
             // Lagging once a second interval of log waits behind the cut: the commits will wait for this checkpoint
             BooleanSupplier lagging = () -> log.appendedBytes() - cutBytes > every;
             // No checkpoint follows the one of a close, whose cache closes with the store

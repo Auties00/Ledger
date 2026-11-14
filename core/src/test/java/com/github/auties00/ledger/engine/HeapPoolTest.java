@@ -253,6 +253,57 @@ class HeapPoolTest {
     }
 
     @Test
+    @DisplayName("a hold of the arrays of up to 64 KiB keeps their overflow through collections, one made after it too, and leaves that of longer arrays to the first collection")
+    void holdsSizes() {
+        var pool = new HeapPool(64L << 20, false);
+        // Taken before any array went past the reserve: the overflows the releases go to are the ones it holds
+        var hold = pool.hold(64 << 10);
+        releaseNew(pool, (int) (HeapPool.RESERVE_PER_SIZE / 4_096) + 40, 4_096);
+        releaseNew(pool, (int) (HeapPool.RESERVE_PER_SIZE / (64 << 10)) + 3, 64 << 10);
+        var chunks = releaseNew(pool, 12, CHUNK);
+        assertEquals(40L * 4_096 + 3L * (64 << 10) + 8L * CHUNK, pool.overflowBytesForTests());
+        var probe = new WeakReference<>(chunks.getLast());
+        chunks.clear();
+        for (var i = 0; i < 50 && probe.get() != null; i++) {
+            System.gc();
+        }
+        assertNull(probe.get(), "a collection left the overflow of chunks, which the hold does not reach");
+        assertNull(pool.overflowForTests(CHUNK));
+        assertEquals(40L * 4_096 + 3L * (64 << 10), pool.overflowBytesForTests(), "a collection freed the overflow of a held size");
+        assertEquals(HeapPool.RESERVE_PER_SIZE / CHUNK, pool.freeForTests(CHUNK).size(), "the reserve of chunks");
+        // The overflow of chunks is made again, reached only weakly
+        releaseNew(pool, 2, CHUNK);
+        assertEquals(40L * 4_096 + 3L * (64 << 10) + 2L * CHUNK, pool.overflowBytesForTests());
+        Reference.reachabilityFence(hold);
+        hold = null;
+        collectOverflow(pool);
+        assertEquals(0, pool.overflowBytesForTests(), "a collection with no hold left the overflow");
+        assertEquals(HeapPool.RESERVE_PER_SIZE, pool.freeForTests(4_096).size() * 4_096L, "the reserve of pages");
+    }
+
+    @Test
+    @DisplayName("a hold of arrays shorter than a page holds the overflow of the shortest arrays, and one of arrays longer than the longest pooled that of every size")
+    void holdBounds() {
+        var pool = new HeapPool(64L << 20, false);
+        var hold = pool.hold(1);
+        releaseNew(pool, (int) (HeapPool.RESERVE_PER_SIZE / 4_096) + 1, 4_096);
+        releaseNew(pool, (int) (HeapPool.RESERVE_PER_SIZE / 8_192) + 1, 8_192);
+        System.gc();
+        System.gc();
+        assertEquals(4_096, pool.overflowBytesForTests(), "the overflow of the shortest arrays");
+        Reference.reachabilityFence(hold);
+        var every = pool.hold(Integer.MAX_VALUE);
+        releaseNew(pool, 1, 8_192);
+        System.gc();
+        System.gc();
+        for (var shift = 12; shift <= 20; shift++) {
+            assertTrue(pool.overflowForTests(1 << shift) != null, "the overflow of arrays of " + (1 << shift) + " bytes");
+        }
+        assertEquals(4_096 + 8_192, pool.overflowBytesForTests(), "the overflow of every size");
+        Reference.reachabilityFence(every);
+    }
+
+    @Test
     @DisplayName("a trim gives the collector the overflow's arrays of a size idle since the last trim, held or not, and keeps those of a size taken since")
     void trimsOverflow() {
         var pool = new HeapPool(64L << 20, false);
@@ -381,7 +432,7 @@ class HeapPoolTest {
                 try {
                     start.await();
                     for (var round = 0; round < 200 && failures.isEmpty(); round++) {
-                        var hold = random.nextBoolean() ? pool.hold() : null;
+                        var hold = random.nextBoolean() ? pool.hold(1 << (12 + random.nextInt(9))) : null;
                         var taken = new ArrayList<byte[]>();
                         for (var i = random.nextInt(12); i >= 0; i--) {
                             var array = pool.acquire(1 << (12 + random.nextInt(7)));

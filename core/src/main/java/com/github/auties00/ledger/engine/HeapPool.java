@@ -8,6 +8,7 @@ import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 /// Recycled heap arrays in power-of-two sizes from 4 KiB to 1 MiB, for the memory a store fills and empties over and
 /// over: write batches, log buffers and pages.
@@ -19,13 +20,16 @@ import java.util.concurrent.atomic.AtomicLong;
 ///
 /// The pool holds strongly a reserve of free arrays, at most [#RESERVE_PER_SIZE] of each size and [#RESERVE] in all,
 /// enough for the arrays the commits, reads and writes of large values of a few stores take and give back one at a
-/// time. It keeps the free arrays past the reserve, up to the bytes the stores ask it for, in an overflow it reaches
-/// only weakly, unless work that takes many arrays at once [holds][#hold()] it: a large batch's rope, the body of a
-/// large commit's frame, a checkpoint. While any such work holds it, a collection, young or full, keeps it; once none
-/// does, the first collection frees it. A large commit gives back tens of megabytes of chunks as its frame is sealed,
-/// which a pool that held every free array strongly kept for as long as the store went on taking an array of their
-/// size, and after the last store closed; the next large batch holds what is left of them from its first chunk, so
-/// large commits that follow one another reuse them, unless a collection ran between the two.
+/// time. It keeps the free arrays past the reserve, up to the bytes the stores ask it for, in an overflow of each size
+/// it reaches only weakly, unless work that takes many arrays at once [holds][#hold(int)] it: a large batch's rope and
+/// the body of a large commit's frame hold the overflow of every size, a checkpoint those of the sizes of its pages.
+/// While any such work holds the overflow of a size, a collection, young or full, keeps it; once none does, the first
+/// collection frees it. A large commit gives back tens of megabytes of chunks as its frame is sealed, which a pool that
+/// held every free array strongly kept for as long as the store went on taking an array of their size, and after the
+/// last store closed; the next large batch holds what is left of them from its first chunk, so large commits that
+/// follow one another reuse them, unless a collection ran between the two. A checkpoint, which never takes a chunk,
+/// leaves them to that collection: one that held them kept the chunks of a bulk write, tens of megabytes, for as long as
+/// it wrote the pages of that write.
 ///
 /// The free arrays of a size none was taken of for a tick of the [IdleTicker], between one and two of its periods, go
 /// to the collector, the reserve's and the overflow's alike, so neither a store idle after a checkpoint, in a process
@@ -62,15 +66,17 @@ public final class HeapPool {
     // hold more than half of maxPooledBytes: a checkpoint's flush releases its many small arrays at once, and would
     // otherwise leave no room for the large ones
     private final AtomicLong[] pooledBySize;
-    // The free arrays past the reserve, which only this reference and the holds of work reach; replaced, holding the
-    // overflow's lock, once the collector cleared it. Its counts are its own, so a cleared one needs no fix-up
-    private volatile WeakReference<Overflow> overflow;
+    // The free arrays past the reserve, of each size, each set of them reached through a reference of its own, which
+    // only the holds of work reach strongly besides; replaced, holding the overflow's lock, once the collector cleared
+    // it. Its count is its own and read through the reference without reaching the set, so a cleared one needs no
+    // fix-up and a sum over the sizes keeps none alive
+    private final AtomicReferenceArray<OverflowReference> overflow;
     private final Object overflowLock;
     // Whether the overflow is kept strongly whatever holds it, guarded by the overflow's lock; for tests that find a
     // released array again, or count the arrays a run of work allocates, across collections
     private boolean holdOverflow;
-    // The overflow while a test keeps it strongly, guarded by the overflow's lock
-    private Overflow heldOverflow;
+    // The overflow of each size while a test keeps it strongly, guarded by the overflow's lock
+    private final Overflow[] heldOverflow;
     // The acquires of each size so far, plain counts: a stale read only delays a trim, or trims a size just used,
     // whose next acquire then allocates
     private final int[] acquires;
@@ -125,7 +131,7 @@ public final class HeapPool {
 
     /// Records that the store `owner` no longer shares the process's pool, as it closes, which keeps no more free arrays
     /// than the stores still open ask for, as [#limit(long)] does: once the last leaves, every free array is in the
-    /// overflow, which the next collection frees unless a store opened before then takes them again.
+    /// overflow of its size, which the next collection frees unless a store opened before then takes them again.
     static void leave(Object owner) {
         synchronized (HeapPool.class) {
             OWNERS.remove(owner);
@@ -164,8 +170,12 @@ public final class HeapPool {
         for (var i = 0; i < free.length; i++) {
             pooledBySize[i] = new AtomicLong();
         }
-        this.overflow = new WeakReference<>(null);
+        this.overflow = new AtomicReferenceArray<>(free.length);
+        for (var i = 0; i < free.length; i++) {
+            overflow.set(i, new OverflowReference(null));
+        }
         this.overflowLock = new Object();
+        this.heldOverflow = new Overflow[free.length];
         this.acquires = new int[free.length];
         this.acquiresSeen = new int[free.length];
         this.collectable = new WeakReference<>(null);
@@ -189,38 +199,37 @@ public final class HeapPool {
         var perSize = maxPooledBytes / 2;
         var sizeReserve = Math.min(RESERVE_PER_SIZE, perSize);
         var reserve = Math.min(RESERVE, maxPooledBytes);
-        var set = overflow.get();
         for (var i = 0; i < free.length; i++) {
+            Overflow set = null;
             while (pooledBySize[i].get() > sizeReserve) {
                 var array = pollFree(i);
                 if (array == null) {
                     break;
                 }
-                set = set == null ? overflow() : set;
-                set.offer(i, array);
+                set = set == null ? overflow(i) : set;
+                set.offer(array);
             }
         }
         for (var i = free.length - 1; i >= 0; i--) {
+            Overflow set = null;
             while (pooledBytes.get() > reserve) {
                 var array = pollFree(i);
                 if (array == null) {
                     break;
                 }
-                set = set == null ? overflow() : set;
-                set.offer(i, array);
+                set = set == null ? overflow(i) : set;
+                set.offer(array);
             }
         }
-        if (set == null) {
-            return;
-        }
         for (var i = 0; i < free.length; i++) {
-            while (pooledBySize[i].get() < sizeReserve && pooledBytes.get() < reserve) {
-                var array = set.poll(i);
+            var set = overflow.get(i).get();
+            while (set != null && pooledBySize[i].get() < sizeReserve && pooledBytes.get() < reserve) {
+                var array = set.poll();
                 if (array == null) {
                     break;
                 }
                 if (!offerReserve(i, array, sizeReserve, reserve)) {
-                    set.offer(i, array);
+                    set.offer(array);
                     break;
                 }
             }
@@ -229,13 +238,20 @@ public final class HeapPool {
             return;
         }
         for (var i = 0; i < free.length; i++) {
-            while (set.bytes[i].get() + pooledBySize[i].get() > perSize && set.drop(i)) {
+            var set = overflow.get(i).get();
+            while (set != null && set.bytes.get() + pooledBySize[i].get() > perSize && set.drop()) {
                 // Dropped one more
             }
         }
-        for (var i = free.length - 1; i >= 0; i--) {
-            while (set.total.get() + pooledBytes.get() > maxPooledBytes && set.drop(i)) {
-                // Dropped one more
+        var total = overflowBytes();
+        for (var i = free.length - 1; i >= 0 && total + pooledBytes.get() > maxPooledBytes; i--) {
+            var set = overflow.get(i).get();
+            while (set != null && total + pooledBytes.get() > maxPooledBytes) {
+                var array = set.poll();
+                if (array == null) {
+                    break;
+                }
+                total -= array.length;
             }
         }
     }
@@ -283,7 +299,7 @@ public final class HeapPool {
         if (capacity > MAX_POOLED) {
             return new byte[capacity];
         }
-        var shift = Math.max(MIN_SHIFT, 32 - Integer.numberOfLeadingZeros(Math.max(1, capacity) - 1));
+        var shift = shift(capacity);
         var size = shift - MIN_SHIFT;
         acquires[size]++;
         var array = free[size].poll();
@@ -291,12 +307,10 @@ public final class HeapPool {
             pooledBytes.addAndGet(-array.length);
             pooledBySize[size].addAndGet(-array.length);
         } else {
-            var set = overflow.get();
-            if (set == null || (array = set.free[size].poll()) == null) {
+            var set = overflow.get(size).get();
+            if (set == null || (array = set.poll()) == null) {
                 return new byte[1 << shift];
             }
-            set.bytes[size].addAndGet(-array.length);
-            set.total.addAndGet(-array.length);
         }
         var watching = watcher;
         if (watching != null) {
@@ -307,8 +321,10 @@ public final class HeapPool {
 
     /// Returns `array` to the pool, unless it is not one of the pooled sizes or the pool is full.
     ///
-    /// It goes to the reserve while the reserve has room, and to the overflow past it, which the next collection frees
-    /// unless work [holds][#hold()] it.
+    /// It goes to the reserve while the reserve has room, and to the overflow of its size past it, which the next
+    /// collection frees unless work [holds][#hold(int)] it. The bound on the free bytes in all is checked against a sum
+    /// of the counts of the reserve and of the overflow of every size that is no snapshot, so it is not enforced
+    /// exactly: releases at the same moment, to the reserve or of other sizes, may pass it by an array each.
     ///
     /// @param array an array [#acquire] returned, which the caller no longer uses
     public void release(byte[] array) {
@@ -333,54 +349,85 @@ public final class HeapPool {
         if (pooledBySize[size].addAndGet(-length) + length > perSize) {
             return;
         }
-        var set = overflow();
-        if (set.bytes[size].addAndGet(length) + pooledBySize[size].get() > perSize) {
-            set.bytes[size].addAndGet(-length);
-            return;
-        }
-        if (set.total.addAndGet(length) + pooledBytes.get() > max) {
-            set.total.addAndGet(-length);
-            set.bytes[size].addAndGet(-length);
+        var set = overflow(size);
+        // Counted in its overflow before the sum over the sizes, so of two releases at once the later sum sees both
+        if (set.bytes.addAndGet(length) + pooledBySize[size].get() > perSize || overflowBytes() + pooledBytes.get() > max) {
+            set.bytes.addAndGet(-length);
             return;
         }
         var watching = watcher;
         if (watching != null) {
             watching.released(array);
         }
-        set.free[size].offer(array);
+        set.free.offer(array);
     }
 
-    /// {@return what keeps the pool's overflow from the collector for as long as the caller holds it}
+    /// {@return what keeps the pool's overflow of every size from the collector for as long as the caller holds it}
     ///
-    /// Work that takes many arrays of the pool and gives them back as it goes or as it ends holds the overflow from
-    /// before its first array until after its last is back, then drops the reference: a collection in the middle of
-    /// the work, or one between its end and the start of the next work that holds the overflow, keeps the arrays the
-    /// work takes again. Work whose holder becomes unreachable without dropping the reference holds nothing from then
-    /// on.
-    ///
-    /// A hold reaches the overflow the pool keeps its arrays in for as long as it is held: the collector clears the
-    /// pool's reference to an overflow only once nothing holds it.
+    /// The same as [#hold(int)] for the longest pooled arrays.
     Object hold() {
-        return overflow();
+        return hold(MAX_POOLED);
     }
 
-    /// {@return the overflow, made if the collector cleared the last}
-    private Overflow overflow() {
-        var set = overflow.get();
+    /// {@return what keeps the pool's overflow of the arrays of up to `longest` bytes from the collector for as long as
+    /// the caller holds it}
+    ///
+    /// Work that takes many arrays of the pool and gives them back as it goes or as it ends holds the overflow of their
+    /// sizes from before its first array until after its last is back, then drops the reference: a collection in the
+    /// middle of the work, or one between its end and the start of the next work that holds the overflow, keeps the
+    /// arrays the work takes again. The overflow of longer arrays stays reached only weakly, so the first collection
+    /// frees it unless other work holds it. Work whose holder becomes unreachable without dropping the reference holds
+    /// nothing from then on.
+    ///
+    /// A hold reaches the overflow of each of its sizes the pool keeps their arrays in for as long as it is held, made
+    /// now for a size that has none: the collector clears the pool's reference to an overflow only once nothing holds
+    /// it, and the pool makes another only once it did.
+    ///
+    /// @param longest the length of the longest arrays whose overflow the caller holds, at least 1; arrays of over
+    ///                1 MiB have none
+    Object hold(int longest) {
+        var sizes = Math.min(MAX_SHIFT, shift(longest)) - MIN_SHIFT + 1;
+        var sets = new Overflow[sizes];
+        for (var i = 0; i < sizes; i++) {
+            sets[i] = overflow(i);
+        }
+        return sets;
+    }
+
+    /// {@return the exponent of the least power of two that is at least `capacity` and 4 KiB}
+    private static int shift(int capacity) {
+        return Math.max(MIN_SHIFT, 32 - Integer.numberOfLeadingZeros(Math.max(1, capacity) - 1));
+    }
+
+    /// {@return the overflow of the size `index`, made if the collector cleared the last}
+    private Overflow overflow(int index) {
+        var set = overflow.get(index).get();
         if (set != null) {
             return set;
         }
         synchronized (overflowLock) {
-            set = overflow.get();
+            set = overflow.get(index).get();
             if (set == null) {
-                set = new Overflow(free.length);
-                overflow = new WeakReference<>(set);
+                set = new Overflow();
+                overflow.set(index, new OverflowReference(set));
                 if (holdOverflow) {
-                    heldOverflow = set;
+                    heldOverflow[index] = set;
                 }
             }
             return set;
         }
+    }
+
+    /// {@return the bytes of the overflow's free arrays of every size, those of an overflow the collector cleared aside}
+    ///
+    /// It reads the count of each size through its reference, so the sum keeps no overflow alive through a collection
+    /// that marks the heap while it runs.
+    private long overflowBytes() {
+        var total = 0L;
+        for (var i = 0; i < free.length; i++) {
+            total += overflow.get(i).bytes();
+        }
+        return total;
     }
 
     /// {@return an array of at least `capacity` bytes for work that comes in bursts, which goes back to the pool through
@@ -393,7 +440,7 @@ public final class HeapPool {
         if (capacity > 1 << MAX_SHIFT) {
             return new byte[capacity];
         }
-        var shift = Math.max(MIN_SHIFT, 32 - Integer.numberOfLeadingZeros(Math.max(1, capacity) - 1));
+        var shift = shift(capacity);
         collectableAcquires++;
         if (collectableOut.getAndIncrement() == 0) {
             holdCollectable();
@@ -465,17 +512,17 @@ public final class HeapPool {
     /// Gives the free arrays of each size to the collector if no array of that size was acquired since the last call,
     /// and the free collectable arrays if no collectable one was.
     ///
-    /// The overflow's free arrays of such a size go too, whether work holds the overflow or not: work that held it a
-    /// whole tick without taking an array of that size does not need them.
+    /// The overflow's free arrays of such a size go too, whether work holds that overflow or not: work that held it a
+    /// whole tick without taking an array of its size does not need them.
     void trimIfIdle() {
-        var set = overflow.get();
         for (var i = 0; i < free.length; i++) {
             var seen = acquires[i];
             if (seen == acquiresSeen[i]) {
                 while (dropFree(i)) {
                     // Dropped one more
                 }
-                while (set != null && set.drop(i)) {
+                var set = overflow.get(i).get();
+                while (set != null && set.drop()) {
                     // Dropped one more
                 }
             }
@@ -528,19 +575,26 @@ public final class HeapPool {
         return total;
     }
 
-    /// Keeps the overflow strongly too, so that no collection frees it, or only as holds keep it again; for tests that
-    /// find a released array again, or count the arrays a run of work allocates, across collections.
+    /// Keeps the overflow of every size strongly too, so that no collection frees it, or only as holds keep it again;
+    /// for tests that find a released array again, or count the arrays a run of work allocates, across collections.
     void holdOverflowForTests(boolean hold) {
         synchronized (overflowLock) {
             holdOverflow = hold;
-            heldOverflow = hold ? overflow() : null;
+            for (var i = 0; i < free.length; i++) {
+                heldOverflow[i] = hold ? overflow(i) : null;
+            }
         }
     }
 
-    /// {@return the bytes of the overflow's free arrays; for tests}
+    /// {@return the bytes of the overflow's free arrays, of every size; for tests}
     long overflowBytesForTests() {
-        var set = overflow.get();
-        return set == null ? 0 : set.total.get();
+        return overflowBytes();
+    }
+
+    /// {@return the overflow of the arrays of `length` bytes, a pooled size, or `null` if it has none; for tests that
+    /// look for its collection through a weak reference}
+    Object overflowForTests(int length) {
+        return overflow.get(Integer.numberOfTrailingZeros(length) - MIN_SHIFT).get();
     }
 
     /// {@return the bytes of the reserve's free arrays; for tests}
@@ -548,45 +602,53 @@ public final class HeapPool {
         return pooledBytes.get();
     }
 
-    /// The free arrays past the reserve, of each size, and the bytes they hold, of each size and in all.
+    /// The free arrays of one size past the reserve, and the bytes they hold.
     private static final class Overflow {
-        final ConcurrentLinkedQueue<byte[]>[] free;
-        final AtomicLong[] bytes;
-        final AtomicLong total;
+        final ConcurrentLinkedQueue<byte[]> free;
+        final AtomicLong bytes;
 
-        @SuppressWarnings("unchecked")
-        Overflow(int sizes) {
-            this.free = new ConcurrentLinkedQueue[sizes];
-            this.bytes = new AtomicLong[sizes];
-            for (var i = 0; i < sizes; i++) {
-                free[i] = new ConcurrentLinkedQueue<>();
-                bytes[i] = new AtomicLong();
-            }
-            this.total = new AtomicLong();
+        Overflow() {
+            this.free = new ConcurrentLinkedQueue<>();
+            this.bytes = new AtomicLong();
         }
 
-        /// Gives the collector a free array of the size `index`.
+        /// Gives the collector one of the free arrays.
         ///
         /// @return whether there was one
-        boolean drop(int index) {
-            return poll(index) != null;
+        boolean drop() {
+            return poll() != null;
         }
 
-        /// {@return a free array of the size `index`, taken out of the overflow, or `null` if it has none}
-        byte[] poll(int index) {
-            var array = free[index].poll();
+        /// {@return one of the free arrays, taken out of the overflow, or `null` if it has none}
+        byte[] poll() {
+            var array = free.poll();
             if (array != null) {
-                bytes[index].addAndGet(-array.length);
-                total.addAndGet(-array.length);
+                bytes.addAndGet(-array.length);
             }
             return array;
         }
 
-        /// Puts the free `array` of the size `index` in the overflow, whatever it holds.
-        void offer(int index, byte[] array) {
-            bytes[index].addAndGet(array.length);
-            total.addAndGet(array.length);
-            free[index].offer(array);
+        /// Puts the free `array` in the overflow, whatever it holds.
+        void offer(byte[] array) {
+            bytes.addAndGet(array.length);
+            free.offer(array);
+        }
+    }
+
+    /// The pool's weak reference to the overflow of one size, which carries the overflow's count of bytes, so a sum over
+    /// the sizes reads it without reaching the overflow.
+    private static final class OverflowReference extends WeakReference<Overflow> {
+        private final AtomicLong bytes;
+
+        /// Creates a reference to `set`, or one already cleared if `null`.
+        OverflowReference(Overflow set) {
+            super(set);
+            this.bytes = set == null ? new AtomicLong() : set.bytes;
+        }
+
+        /// {@return the bytes of the overflow's free arrays, or 0 once the collector cleared it}
+        long bytes() {
+            return refersTo(null) ? 0 : bytes.get();
         }
     }
 
@@ -646,9 +708,9 @@ public final class HeapPool {
     List<byte[]> freeForTests(int length) {
         var size = Integer.numberOfTrailingZeros(length) - MIN_SHIFT;
         var arrays = new ArrayList<>(free[size]);
-        var set = overflow.get();
+        var set = overflow.get(size).get();
         if (set != null) {
-            arrays.addAll(set.free[size]);
+            arrays.addAll(set.free);
         }
         return List.copyOf(arrays);
     }

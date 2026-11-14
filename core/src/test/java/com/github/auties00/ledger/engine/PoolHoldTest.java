@@ -182,23 +182,37 @@ class PoolHoldTest {
     }
 
     @Test
-    @DisplayName("a checkpoint holds the overflow of the store's pool while it writes its pages, and lets go of it once it ends")
+    @DisplayName("a checkpoint holds the overflow of the store's pool of the arrays of its pages while it writes them, not that of the chunks of commits, and lets go of it once it ends")
     void checkpointHolds() throws Exception {
         var disk = CrashFileSystem.create();
         var directory = disk.getPath("/store");
         var armed = new AtomicBoolean();
         var probes = new AtomicInteger();
         var held = new AtomicInteger();
+        var chunksMissing = new AtomicInteger();
+        var chunksFreed = new AtomicInteger();
         disk.intercept((path, kind) -> {
             // The first writes of the checkpoint: a collection at each of them takes a while
             if (armed.get() && kind == ChangeInterceptor.ChangeKind.WRITE && path.endsWith(PageFile.FILE) && probes.get() < 3) {
                 probes.incrementAndGet();
-                // Reached from here only through the probe
-                var probe = new WeakReference<>(HeapPool.process().hold());
+                var pool = HeapPool.process();
+                // The chunks of a bulk write's frames, sealed while the checkpoint runs, past the reserve
+                for (var i = 0; i < 12; i++) {
+                    pool.release(new byte[CHUNK]);
+                }
+                // Reached from here only through the probes
+                var pages = new WeakReference<>(pool.overflowForTests(PageFormat.SIZE));
+                var chunks = new WeakReference<>(pool.overflowForTests(CHUNK));
+                if (chunks.refersTo(null)) {
+                    chunksMissing.incrementAndGet();
+                }
                 System.gc();
                 System.gc();
-                if (probe.get() != null) {
+                if (!pages.refersTo(null)) {
                     held.incrementAndGet();
+                }
+                if (chunks.refersTo(null)) {
+                    chunksFreed.incrementAndGet();
                 }
             }
         });
@@ -216,13 +230,15 @@ class PoolHoldTest {
             ledger.checkpoint();
             armed.set(false);
             assertTrue(probes.get() > 0, "the checkpoint wrote no page");
-            assertEquals(probes.get(), held.get(), "the writes of the checkpoint the overflow was free at");
-            var after = new WeakReference<>(HeapPool.process().hold());
-            for (var i = 0; i < 100 && after.get() != null; i++) {
+            assertEquals(probes.get(), held.get(), "the writes of the checkpoint the overflow of its pages was free at");
+            assertEquals(0, chunksMissing.get(), "the writes of the checkpoint the chunks went past the reserve at");
+            assertEquals(probes.get(), chunksFreed.get(), "the writes of the checkpoint the overflow of chunks was held at");
+            var after = new WeakReference<>(HeapPool.process().overflowForTests(PageFormat.SIZE));
+            for (var i = 0; i < 100 && !after.refersTo(null); i++) {
                 System.gc();
                 LockSupport.parkNanos(10_000_000);
             }
-            assertNull(after.get(), "the overflow held once the checkpoint ended");
+            assertTrue(after.refersTo(null), "the overflow held once the checkpoint ended");
         }
     }
 
