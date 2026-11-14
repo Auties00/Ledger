@@ -674,6 +674,11 @@ public final class LiveLedger implements Ledger {
         return log;
     }
 
+    /// {@return the data file of a store in a directory, or `null` for a store in memory; for tests}
+    PageFile pagesForTests() {
+        return pages;
+    }
+
     /// {@return the checkpointer of a store in a directory, or `null` for a store in memory}
     Checkpointer checkpointer() {
         return checkpointer;

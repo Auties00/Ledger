@@ -49,7 +49,8 @@ import java.util.zip.CRC32C;
 ///
 /// A flush of the pool whose store shares the pool writes one group at a time while a task of another store waits for
 /// a thread: it submits itself again behind that task, so the stores on a pool take turns a group each. A store whose
-/// queue never drains would otherwise hold a thread for as long as its commits keep coming.
+/// queue never drains would otherwise hold a thread for as long as its commits keep coming. On the process's flusher,
+/// which makes a thread for every task that finds none waiting, no task waits, and a flush keeps its thread.
 ///
 /// Segments come from [LogFiles] prepared: once a segment takes its first group, the next one is prepared on a thread
 /// of its own, so a rollover only forces the full segment and switches to the next, and no file is created or renamed
@@ -167,10 +168,13 @@ final class LogWriter {
     /// output then holds them, the room the last call of the cipher asks for past them and the padding to the next
     /// block, so it writes nothing out in the middle of the group, and a group written through is written whole.
     static final int ONE_WRITE = OUTPUT - ALIGNMENT;
-    /// The size the buffer starts at, and goes back to once groups no longer need more. A buffer of [#OUTPUT] bytes
-    /// from the start would cost every store a megabyte that a store of small commits never uses.
-    private static final int MIN_OUTPUT = 16 << 10;
-    /// The groups in a row, each fitting in half of [#MIN_OUTPUT], after which a larger buffer goes back to it.
+    /// The size the buffer starts at: one block, which the first group of a store of small commits fills. A buffer of
+    /// [#OUTPUT] bytes from the start would cost every store a megabyte that a store of small commits never uses.
+    private static final int MIN_OUTPUT = ALIGNMENT;
+    /// The most bytes a group asks the buffer for to count as small: [#SHRINK_AFTER] small groups in a row take a
+    /// larger buffer back to the smallest power of two, at least [#MIN_OUTPUT], that held each of them.
+    private static final int SMALL_GROUP = 8 << 10;
+    /// The small groups in a row after which a larger buffer goes back to the size they needed.
     private static final int SHRINK_AFTER = 256;
     /// The bytes of a frame body sealed in one call, a multiple of the AES block.
     private static final int SLICE = 64 << 10;
@@ -222,8 +226,8 @@ final class LogWriter {
     private final byte[] storeId;
     private final long segmentSize;
     private final Executor executor;
-    // Whether a task waits for a thread of the pool, which a flush of the pool gives up its thread to, or null if the
-    // store owns its pool
+    // Whether a task waits for a thread of the pool, which a flush of the pool gives up its thread to, or null on the
+    // process's flusher, where no task waits
     private final BooleanSupplier poolQueued;
     private final long commitWindowNanos;
     // How the flush task opens segments to write groups through; owned by it
@@ -291,8 +295,12 @@ final class LogWriter {
     private byte[] output;
     // The bytes of output not written yet
     private int used;
-    // The groups in a row written since one needed more than half of MIN_OUTPUT
+    // The groups in a row written since one asked the output for more than SMALL_GROUP bytes
     private int smallGroups;
+    // The most bytes a group of that run asked the output for
+    private int smallPeak;
+    // The most bytes the group being written asked the output for so far
+    private int groupPeak;
     // How long the write and force of a group took, or its write through, a moving average in nanoseconds of the groups
     // after the first, each at most four times the average before it, or 0 before the second group
     private long forceNanos;
@@ -384,7 +392,8 @@ final class LogWriter {
     /// @param durable the sequence the log already holds durably
     /// @param segmentSize the size past which a new segment starts
     /// @param executor runs the flush task on platform threads
-    /// @param poolQueued whether a task waits for a thread of the pool, or `null` if the store owns its pool: a flush
+    /// @param poolQueued whether a task waits for a thread of the pool, or `null` if no task of another store waits behind
+    ///                   this store's flush, as on the process's flusher, which makes a thread for each: a flush
     ///                   waiting for the commits a force woke stops waiting once one does, and a flush of the pool
     ///                   gives up its thread after the group it wrote
     /// @param commitWindow how long a flush waits for more commits before it starts
@@ -654,7 +663,7 @@ final class LogWriter {
             queueLock.unlock();
         }
         if (scheduled.compareAndSet(false, true)) {
-            executor.execute(this::flush);
+            schedule();
         }
         return frames;
     }
@@ -698,7 +707,7 @@ final class LogWriter {
             batch.clear();
         }
         if (scheduled.compareAndSet(false, true)) {
-            executor.execute(this::flush);
+            schedule();
         }
     }
 
@@ -743,7 +752,7 @@ final class LogWriter {
             queueLock.unlock();
         }
         if (scheduled.compareAndSet(false, true)) {
-            executor.execute(this::flush);
+            schedule();
         }
         return frames;
     }
@@ -856,13 +865,22 @@ final class LogWriter {
                 return;
             }
             if (until != Long.MAX_VALUE || poolWanted()) {
-                try {
-                    executor.execute(this::flush);
-                } catch (RejectedExecutionException exception) {
-                    stop(new IOException("The log's pool refused a flush: it was closed with the store open", exception));
-                }
+                schedule();
                 return;
             }
+        }
+    }
+
+    /// Hands a flush to the executor, with [#scheduled] raised.
+    ///
+    /// An executor that refuses it, as a pool closed with the store open does, or that cannot start a thread for it,
+    /// stops the writer: with [#scheduled] raised no other flush would start, so every commit waiting for durability,
+    /// and the close, would wait forever.
+    private void schedule() {
+        try {
+            executor.execute(this::flush);
+        } catch (RejectedExecutionException | OutOfMemoryError exception) {
+            stop(new IOException("The log's flush could not be started", exception));
         }
     }
 
@@ -1084,9 +1102,16 @@ final class LogWriter {
             rollEarly();
         }
         // Between groups: the last drain's bytes, which an interrupted force writes again, are durable by now
-        if (smallGroups >= SHRINK_AFTER && output.length > MIN_OUTPUT) {
-            output = new byte[MIN_OUTPUT];
+        if (smallGroups >= SHRINK_AFTER) {
+            // The size every group of the run fitted in, so the next ones of the same sizes do not grow it again
+            var size = Math.max(MIN_OUTPUT, Integer.highestOneBit(smallPeak - 1) << 1);
+            if (output.length > size) {
+                output = new byte[size];
+            }
+            smallGroups = 0;
+            smallPeak = 0;
         }
+        groupPeak = used;
         if (waitedGroup) {
             waitedGroup = false;
             waitedGroups++;
@@ -1140,7 +1165,13 @@ final class LogWriter {
         room(padding);
         Arrays.fill(output, used, used + padding, (byte) 0);
         used += padding;
-        smallGroups = position + used - start <= MIN_OUTPUT / 2 ? smallGroups + 1 : 0;
+        if (groupPeak <= SMALL_GROUP) {
+            smallGroups++;
+            smallPeak = Math.max(smallPeak, groupPeak);
+        } else {
+            smallGroups = 0;
+            smallPeak = 0;
+        }
         var forceStart = System.nanoTime();
         if (through) {
             writeThrough();
@@ -1450,6 +1481,9 @@ final class LogWriter {
 
     /// Makes room for `bytes` more in the output: grows it while it is smaller than [#OUTPUT], else writes it out.
     private void room(int bytes) throws IOException {
+        if (used + bytes > groupPeak) {
+            groupPeak = used + bytes;
+        }
         if (used + bytes > output.length) {
             if (output.length < OUTPUT) {
                 var grown = Math.min(OUTPUT, Math.max(2 * output.length, used + bytes));

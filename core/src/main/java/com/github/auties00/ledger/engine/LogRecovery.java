@@ -59,10 +59,10 @@ import java.util.zip.CRC32C;
 /// A recovery that moves values off the heap bounds the log that follows each frame before it replays
 /// ([Sink#commit(long, byte\[\], int, int, LogSegmentView, long, long)]): it reads the header and the first frame
 /// header of every segment, and the chain of frame headers of the last segment that holds frames
-/// ([#framesEnd(Path, boolean, CRC32C)]), through a window of a page and a header that a buffer of its own fills at
-/// each header the window does not hold. That segment is read twice, once by this pass and once by the replay: where
-/// its frames are shorter than a page, as the groups of a group-committed log are, the pass reads all of it a window
-/// at a time, up to a whole segment; where they are longer, a window for each frame.
+/// ([#framesEnd(Path, boolean, CRC32C, SegmentReader.Buffer, byte\[\])]), through a window of a page and a header in
+/// the replay's buffer, filled at each header the window does not hold. That segment is read twice, once by this pass
+/// and once by the replay: where its frames are shorter than a page, as the groups of a group-committed log are, the
+/// pass reads all of it a window at a time, up to a whole segment; where they are longer, a window for each frame.
 final class LogRecovery {
     /// The bytes of the buffer: below half a G1 region of 2 MiB, as [LogWriter#OUTPUT] is, so not humongous.
     private static final int BUFFER = LogWriter.OUTPUT;
@@ -126,6 +126,8 @@ final class LogRecovery {
         LogFiles.Prepared empty = null;
         Path lastWritten = null;
         var buffer = new SegmentReader.Buffer();
+        // Each segment's header, read and checked before the next segment's
+        var header = new byte[LogWriter.SEGMENT_HEADER];
         // Where the frames of each segment end at most, and the bytes of those of the segments after each one, for how
         // much log at most follows a frame; only a recovery that moves values needs them
         var ends = new long[segments.size()];
@@ -133,7 +135,7 @@ final class LogRecovery {
         if (spills != null) {
             var lastWrittenFound = false;
             for (var index = segments.size() - 1; index >= 0; index--) {
-                ends[index] = framesEnd(files.segment(segments.get(index)), !lastWrittenFound, crc);
+                ends[index] = framesEnd(files.segment(segments.get(index)), !lastWrittenFound, crc, buffer, header);
                 lastWrittenFound |= ends[index] > LogWriter.SEGMENT_HEADER;
                 if (index > 0) {
                     after[index - 1] = after[index] + Math.max(0, ends[index] - LogWriter.SEGMENT_HEADER);
@@ -146,7 +148,6 @@ final class LogRecovery {
             try (var reader = new SegmentReader(path, buffer); var ahead = new FrameReadAhead(path, reader.size())) {
                 // The read-ahead reads the frames' bodies, so recovery peeks only at what lies around them
                 var peek = keys.encrypted() && ahead.opensFrames();
-                var header = new byte[LogWriter.SEGMENT_HEADER];
                 if (!reader.read(0, header, 0, header.length, peek) || !intactSegmentHeader(header, crc)) {
                     // The header is forced before the segment takes its name, so only a file holding nothing past its
                     // header can be a crash during its creation; the next open writes a segment in its place
@@ -385,9 +386,12 @@ final class LogRecovery {
     /// or its first frame header is damaged. One that holds frames ends at its size, or, if `chase`, where the chain of
     /// frame headers from its first frame ends ([#chainEnd(SegmentReader, long, long, long, CRC32C)]): a bound of the
     /// last segment written, which a writer prepared at its full length.
-    private static long framesEnd(Path path, boolean chase, CRC32C crc) throws IOException {
-        try (var reader = new SegmentReader(path, new SegmentReader.Buffer())) {
-            var header = new byte[LogWriter.SEGMENT_HEADER];
+    ///
+    /// @param buffer the buffer of the replay's readers, which a reader fills before it reads from it
+    /// @param header room for the segment's header, overwritten
+    private static long framesEnd(Path path, boolean chase, CRC32C crc, SegmentReader.Buffer buffer, byte[] header)
+            throws IOException {
+        try (var reader = new SegmentReader(path, buffer)) {
             var frame = new byte[LogWriter.FRAME_HEADER];
             if (!reader.read(0, header, 0, header.length, true)
                     || !intactSegmentHeader(header, crc)

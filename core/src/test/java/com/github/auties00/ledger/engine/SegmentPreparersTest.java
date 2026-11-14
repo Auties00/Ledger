@@ -284,9 +284,18 @@ class SegmentPreparersTest {
             var started = Collections.synchronizedList(new ArrayList<FutureTask<?>>());
             long rollovers;
             long unprepared;
+            long rolloversBefore;
+            long unpreparedBefore;
             try (var ledger = open(disk.getPath("/store"))) {
                 var log = log(ledger);
-                awaitTrue(log::nextSettled, "the preparation of the open never settled");
+                // A durable commit has the first group written, so the preparation it starts after it is the last one
+                // the hook does not see; a flush thread already waiting writes it while the open returns
+                var warm = "v".repeat(500);
+                ledger.commit(ledger.newBatch().put(NAMES, "warm", warm)).awaitDurable();
+                model.put("warm", warm);
+                awaitTrue(log::nextSettled, "the preparation after the first group never settled");
+                rolloversBefore = log.rollovers();
+                unpreparedBefore = log.unpreparedRollovers();
                 // Each preparation runs as the log starts it, so a rollover finds its segment unprepared only if the
                 // log had not started its preparation by then, whatever the threads of the preparers are doing
                 log.starterForTests = preparation -> {
@@ -315,11 +324,11 @@ class SegmentPreparersTest {
                     committer.join();
                 }
                 assertNull(failure.get());
-                rollovers = log.rollovers();
-                unprepared = log.unpreparedRollovers();
+                rollovers = log.rollovers() - rolloversBefore;
+                unprepared = log.unpreparedRollovers() - unpreparedBefore;
             }
             assertTrue(rollovers >= 40, rollovers + " rollovers");
-            // The first rollover takes the preparation the open started, which the hook never saw
+            // The first rollover takes the preparation the first group started, which the hook never saw
             assertTrue(started.size() >= rollovers - 1, started.size() + " preparations started for " + rollovers + " rollovers");
             assertEquals(0, unprepared, unprepared + " of " + rollovers + " rollovers found their segment unprepared");
             try (var ledger = open(disk.getPath("/store"))) {
