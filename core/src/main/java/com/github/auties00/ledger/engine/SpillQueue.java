@@ -35,15 +35,16 @@ import java.util.zip.CRC32C;
 ///   the samples keep under an eighth;
 /// - of a group the log wrote through to stable storage, whose pages that write took out of the system's cache, so a
 ///   read back would go to the device;
-/// - of a batch on a [ValueSlab]'s chunks, which the slab bounds already, of a transaction, or of a value with an
-///   array of its own or a unit of [BlobFile].
+/// - of a batch on a [ValueSlab]'s chunks, which the slab bounds already, of a transaction, of a value a batch put on
+///   an array of its own, or of one with a unit of [BlobFile]. A value a recovery copied to an array of its own moves,
+///   to the log only.
 ///
 /// A segment holding such values stays in place past the checkpoint that makes it obsolete while a reader that may
 /// still need them reads a tree older than that checkpoint ([#retirableBefore(long, ReaderTable)]): log disk use then
 /// grows where the heap grew before. Once it retires, a reader that finds such a value reads it from its own tree.
 ///
 /// Nothing of this is durable: a recovery replays the commits as ever, and moves the values it replays the same way
-/// ([LiveLedger#replay(long, byte\[\], LogSegmentView, long, int)]).
+/// ([LiveLedger#replay(long, byte\[\], ReplayValues, LogSegmentView, long, int)]).
 final class SpillQueue {
     /// The shortest value that moves to the log: a [LogValue] takes 40 bytes, an array of the value 16 more than the
     /// value; below it, the array costs less than a read back from the file.
@@ -445,7 +446,7 @@ final class SpillQueue {
                 for (var i = 0; i < count; i++) {
                     var version = versions[i];
                     if (version.spill(crypto, segment, frameOffset, commitStart + offsets[i])) {
-                        if (version.length() >= LOG_VALUE_MIN) {
+                        if (version.valueLength() >= LOG_VALUE_MIN) {
                             logged++;
                         } else {
                             copied++;

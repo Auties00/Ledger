@@ -515,6 +515,41 @@ class LogSpillTest {
         }
     }
 
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a recovery moves to the log the values it replays onto arrays of their own, too long to share a chunk")
+    void recoveryMovesOwnReplayedValues(boolean encrypted, @TempDir Path directory) throws Exception {
+        var lengths = new int[]{ReplayValues.SHARED_BYTES + 1, 20_000, 100_000};
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            for (var message = 0; message < lengths.length * 2; message++) {
+                var value = new byte[lengths[message % lengths.length]];
+                for (var i = 0; i < value.length; i++) {
+                    value[i] = (byte) (message * 13 + i);
+                }
+                ledger.commit(ledger.newBatch().put(MESSAGES, key(message), value)).awaitDurable();
+                expected.put(message, value);
+            }
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            for (var entry : expected.entrySet()) {
+                var source = head(ledger, MESSAGES, key(entry.getKey())).sourceForTests();
+                assertInstanceOf(LogValue.class, source, "message " + entry.getKey() + " stayed in the heap");
+                assertArrayEquals(entry.getValue(), ledger.get(MESSAGES, key(entry.getKey())).orElseThrow());
+            }
+            ledger.checkpoint();
+            for (var entry : expected.entrySet()) {
+                assertArrayEquals(entry.getValue(), ledger.get(MESSAGES, key(entry.getKey())).orElseThrow());
+            }
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            for (var entry : expected.entrySet()) {
+                assertArrayEquals(entry.getValue(), ledger.get(MESSAGES, key(entry.getKey())).orElseThrow());
+            }
+        }
+    }
+
     @Test
     @DisplayName("a key space that removes each value 64 commits after writing it lists none, so the arrays of removed values go to the collector")
     void removalsListNoValues(@TempDir Path directory) throws Exception {
