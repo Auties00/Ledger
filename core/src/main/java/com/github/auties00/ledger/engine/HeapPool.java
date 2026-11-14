@@ -22,14 +22,14 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 /// enough for the arrays the commits, reads and writes of large values of a few stores take and give back one at a
 /// time. It keeps the free arrays past the reserve, up to the bytes the stores ask it for, in an overflow of each size
 /// it reaches only weakly, unless work that takes many arrays at once [holds][#hold(int)] it: a large batch's rope and
-/// the body of a large commit's frame hold the overflow of every size, a checkpoint those of the sizes of its pages.
-/// While any such work holds the overflow of a size, a collection, young or full, keeps it; once none does, the first
-/// collection frees it. A large commit gives back tens of megabytes of chunks as its frame is sealed, which a pool that
-/// held every free array strongly kept for as long as the store went on taking an array of their size, and after the
-/// last store closed; the next large batch holds what is left of them from its first chunk, so large commits that
-/// follow one another reuse them, unless a collection ran between the two. A checkpoint, which never takes a chunk,
-/// leaves them to that collection: one that held them kept the chunks of a bulk write, tens of megabytes, for as long as
-/// it wrote the pages of that write.
+/// the body of a large commit's frame hold the overflow of every size, a checkpoint those of the sizes of its pages and
+/// of the units it writes. While any such work holds the overflow of a size, a collection, young or full, keeps it;
+/// once none does, the first collection frees it. A large commit gives back tens of megabytes of chunks as its frame is
+/// sealed, which a pool that held every free array strongly kept for as long as the store went on taking an array of
+/// their size, and after the last store closed; the next large batch holds what is left of them from its first chunk,
+/// so large commits that follow one another reuse them, unless a collection ran between the two. A checkpoint that
+/// writes no unit of a chunk's size leaves them to that collection: one that held them kept the chunks of a bulk write,
+/// tens of megabytes, for as long as it wrote the pages of that write.
 ///
 /// The free arrays of a size none was taken of for a tick of the [IdleTicker], between one and two of its periods, go
 /// to the collector, the reserve's and the overflow's alike, so neither a store idle after a checkpoint, in a process
@@ -49,6 +49,8 @@ public final class HeapPool {
     private static final int MAX_SHIFT = 20;
     /// The longest array the pool recycles, 1 MiB; a longer one is the caller's own.
     static final int MAX_POOLED = 1 << MAX_SHIFT;
+    /// The count of the sizes the pool recycles, from 4 KiB to 1 MiB, the bound of every [#size(int)].
+    static final int SIZES = MAX_SHIFT - MIN_SHIFT + 1;
     /// The most bytes of free arrays of one size the pool holds strongly, 1 MiB: 256 of the smallest arrays, which
     /// reads and small commits take, four chunks of a rope, one of the longest arrays.
     static final long RESERVE_PER_SIZE = 1L << 20;
@@ -160,7 +162,7 @@ public final class HeapPool {
     /// `trimmed`; for tests that trim it themselves.
     @SuppressWarnings("unchecked")
     HeapPool(long maxPooledBytes, boolean trimmed) {
-        this.free = new ConcurrentLinkedQueue[MAX_SHIFT - MIN_SHIFT + 1];
+        this.free = new ConcurrentLinkedQueue[SIZES];
         for (var i = 0; i < free.length; i++) {
             free[i] = new ConcurrentLinkedQueue<>();
         }
@@ -392,6 +394,26 @@ public final class HeapPool {
             sets[i] = overflow(i);
         }
         return sets;
+    }
+
+    /// {@return what keeps the pool's overflow of the size of the arrays [#acquire(int)] hands out for `capacity`
+    /// bytes from the collector for as long as the caller holds it, or `null` if they are the caller's own}
+    ///
+    /// The same as [#hold(int)] for that size alone: work that takes arrays of a few sizes, which it knows only as it
+    /// goes, holds the overflow of each from before it takes the first array of it.
+    ///
+    /// @param capacity the least length of the arrays, not negative
+    Object holdSize(int capacity) {
+        var size = size(capacity);
+        return size < 0 ? null : overflow(size);
+    }
+
+    /// {@return the index of the size of the arrays [#acquire(int)] hands out for `capacity` bytes, below [#SIZES], or
+    /// -1 if they are over 1 MiB and not recycled}
+    ///
+    /// @param capacity the least length of the arrays, not negative
+    static int size(int capacity) {
+        return capacity > MAX_POOLED ? -1 : shift(capacity) - MIN_SHIFT;
     }
 
     /// {@return the exponent of the least power of two that is at least `capacity` and 4 KiB}

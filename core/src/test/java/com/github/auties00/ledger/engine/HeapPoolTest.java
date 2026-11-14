@@ -304,6 +304,27 @@ class HeapPoolTest {
     }
 
     @Test
+    @DisplayName("a hold of one size holds the overflow of the arrays acquire hands out for that length and no other, and an array longer than the longest pooled has none")
+    void holdsOneSize() {
+        var pool = new HeapPool(64L << 20, false);
+        // A unit of 65 pages is sealed into an array of 512 KiB
+        var hold = pool.holdSize(65 * 4_096);
+        assertNull(pool.holdSize(HeapPool.MAX_POOLED + 1), "the hold of arrays the pool does not recycle");
+        assertEquals(-1, HeapPool.size(HeapPool.MAX_POOLED + 1));
+        assertEquals(HeapPool.SIZES - 2, HeapPool.size(65 * 4_096));
+        releaseNew(pool, (int) (HeapPool.RESERVE_PER_SIZE / (512 << 10)) + 2, 512 << 10);
+        var chunks = releaseNew(pool, 12, CHUNK);
+        var probe = new WeakReference<>(chunks.getLast());
+        chunks.clear();
+        for (var i = 0; i < 50 && probe.get() != null; i++) {
+            System.gc();
+        }
+        assertNull(probe.get(), "a collection left the overflow of chunks, which the hold does not reach");
+        assertEquals(2L * (512 << 10), pool.overflowBytesForTests(), "a collection freed the overflow of the held size");
+        Reference.reachabilityFence(hold);
+    }
+
+    @Test
     @DisplayName("a trim gives the collector the overflow's arrays of a size idle since the last trim, held or not, and keeps those of a size taken since")
     void trimsOverflow() {
         var pool = new HeapPool(64L << 20, false);

@@ -1041,6 +1041,13 @@ final class PageFile implements AutoCloseable {
     ///
     /// It is safe for concurrent use, as the tasks of a checkpoint that rewrites its trees in parallel use it; a flush
     /// seals its units on every processor.
+    ///
+    /// From the first unit of each length it queues, it [holds][HeapPool#holdSize(int)] the overflow of the pool of the
+    /// size of the arrays that unit is sealed into, until it is no longer reachable: a flush seals a window of units at
+    /// a time and gives their arrays back before it seals the next, so a collection between two windows, or between two
+    /// flushes, keeps the arrays the next takes again, the 512 KiB arrays of the units of values of 256 KiB as those of
+    /// the pages of leaves. The overflow of the sizes it queues no unit of, such as that of the chunks of the commits'
+    /// frames, stays reached only weakly.
     final class Writer {
         /// The queued units from which a flush seals them on every processor.
         private static final int PARALLEL_SEALS = 16;
@@ -1064,6 +1071,9 @@ final class PageFile implements AutoCloseable {
         private final BooleanSupplier saturation;
         // Set once saturation held: the log only grows past the cut while the checkpoint runs
         private volatile boolean saturated;
+        // What holds the overflow of the pool of each size of the units queued so far, by its index; guarded by the
+        // lock
+        private final Object[] poolHolds;
 
         private Writer(long nonceHigh, BooleanSupplier lagging, BooleanSupplier saturation) {
             this.lock = new Object();
@@ -1073,6 +1083,7 @@ final class PageFile implements AutoCloseable {
             this.admitted = new AtomicLong();
             this.admission = cache.admission();
             this.saturation = saturation;
+            this.poolHolds = new Object[HeapPool.SIZES];
         }
 
         /// {@return whether the next checkpoint follows this one at once, and so reads the leaves this one writes}
@@ -1197,7 +1208,12 @@ final class PageFile implements AutoCloseable {
                 if (staged.put(page, entry) != null) {
                     throw new IllegalStateException("A checkpoint wrote page " + page + " twice");
                 }
-                stagedBytes += (long) entry.ref().pages() * PageFormat.SIZE;
+                var length = entry.ref().pages() * PageFormat.SIZE;
+                var size = HeapPool.size(length);
+                if (size >= 0 && poolHolds[size] == null) {
+                    poolHolds[size] = pool.holdSize(length);
+                }
+                stagedBytes += length;
                 if (stagedBytes >= STAGED_LIMIT) {
                     flush();
                 }

@@ -243,6 +243,49 @@ class PoolHoldTest {
     }
 
     @Test
+    @DisplayName("a checkpoint that writes the units of values of 256 KiB holds the overflow of the 512 KiB arrays it seals them into while it writes them")
+    void checkpointHoldsUnitSizes() throws Exception {
+        var disk = CrashFileSystem.create();
+        var directory = disk.getPath("/store");
+        // A value of 256 KiB kept in the pages is a unit of 65 pages, sealed into an array of 512 KiB
+        var sealed = HeapPool.MAX_POOLED / 2;
+        var armed = new AtomicBoolean();
+        var probes = new AtomicInteger();
+        var held = new AtomicInteger();
+        disk.intercept((path, kind) -> {
+            if (armed.get() && kind == ChangeInterceptor.ChangeKind.WRITE && path.endsWith(PageFile.FILE) && probes.get() < 3) {
+                probes.incrementAndGet();
+                var pool = HeapPool.process();
+                // Past the reserve of the size, as the windows of the flush give theirs back
+                for (var i = 0; i < 4; i++) {
+                    pool.release(new byte[sealed]);
+                }
+                // Reached from here only through the probe
+                var units = new WeakReference<>(pool.overflowForTests(sealed));
+                System.gc();
+                System.gc();
+                if (!units.refersTo(null)) {
+                    held.incrementAndGet();
+                }
+            }
+        });
+        try (var ledger = options(directory).build()) {
+            var key = new byte[8];
+            for (var i = 0; i < 8; i++) {
+                ByteBuffer.wrap(key).putInt(0, i);
+                var batch = ledger.newBatch();
+                batch.put(MESSAGES, key.clone(), new byte[256 << 10]);
+                ledger.commit(batch).awaitDurable();
+            }
+            armed.set(true);
+            ledger.checkpoint();
+            armed.set(false);
+            assertTrue(probes.get() > 0, "the checkpoint wrote no page");
+            assertEquals(probes.get(), held.get(), "the writes of the checkpoint the overflow of its units was free at");
+        }
+    }
+
+    @Test
     @DisplayName("once a store's large commit is durable, the first collection leaves the process's pool no more than its reserve")
     void largeCommitLeavesReserve() throws Exception {
         var disk = CrashFileSystem.create();
