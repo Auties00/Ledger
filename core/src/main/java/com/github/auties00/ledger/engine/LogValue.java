@@ -10,6 +10,11 @@ package com.github.auties00.ledger.engine;
 ///
 /// It takes 40 bytes, a quarter of what an array of a 1.5 KiB message keeps in its place.
 ///
+/// A value leaves the heap once the log wrote its frame, which a force may not have made durable yet. If that force
+/// fails, the log writer stops and the value is lost with the commit the log never made durable: a read throws
+/// [com.github.auties00.ledger.LedgerIoException] with the writer's failure, as a commit does, where a value kept on
+/// the heap would still read back. A reopen recovers the store from the durable log, without it.
+///
 /// @param segment the segment use that wrote the frame
 /// @param frameOffset where the frame starts in its segment
 /// @param bodyIndex where the value starts in the frame's body
@@ -19,7 +24,8 @@ record LogValue(LogSegmentView segment, long frameOffset, int bodyIndex, long ta
     /// {@return the value, the `length` bytes this place holds, of the version stamped `stamp`, in an array of its own}
     ///
     /// @throws LogSegmentView.Retired if a checkpoint retired the segment
-    /// @throws com.github.auties00.ledger.LedgerIoException if the segment cannot be read
+    /// @throws com.github.auties00.ledger.LedgerIoException if the segment cannot be read, or the value is lost with a
+    ///                                                      commit the log never made durable
     /// @throws com.github.auties00.ledger.LedgerCorruptedException if the bytes read are not the value
     byte[] read(long stamp, int length) {
         var value = new byte[length];
@@ -31,7 +37,8 @@ record LogValue(LogSegmentView segment, long frameOffset, int bodyIndex, long ta
     /// `offset`.
     ///
     /// @throws LogSegmentView.Retired if a checkpoint retired the segment
-    /// @throws com.github.auties00.ledger.LedgerIoException if the segment cannot be read
+    /// @throws com.github.auties00.ledger.LedgerIoException if the segment cannot be read, or the value is lost with a
+    ///                                                      commit the log never made durable
     /// @throws com.github.auties00.ledger.LedgerCorruptedException if the bytes read are not the value
     void readInto(long stamp, int length, byte[] target, int offset) {
         segment.read(this, stamp, length, target, offset);

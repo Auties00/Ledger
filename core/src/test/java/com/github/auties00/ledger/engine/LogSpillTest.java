@@ -6,8 +6,11 @@ import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.LedgerCorruptedException;
+import com.github.auties00.ledger.LedgerException;
+import com.github.auties00.ledger.LedgerIoException;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.View;
+import com.github.auties00.ledger.testkit.ChangeInterceptor;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -21,6 +24,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import javax.crypto.spec.SecretKeySpec;
 import java.lang.foreign.MemorySegment;
 import java.lang.ref.WeakReference;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -33,9 +37,12 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -744,7 +751,7 @@ class LogSpillTest {
     }
 
     @Test
-    @DisplayName("a thread that started moving values during a recovery stops at the log's durable sequence once the store attaches its log")
+    @DisplayName("a thread that started moving values during a recovery stops at the sequence the log wrote once the store attaches its log")
     void recoveryThreadFollowsTheLog(@TempDir Path directory) throws Exception {
         var queue = new SpillQueue(0, true);
         var view = queue.segment(1, directory.resolve("1.log"), null);
@@ -757,16 +764,16 @@ class LogSpillTest {
         while (queue.heldForTests() != 0) {
             Thread.onSpinWait();
         }
-        // The store attaches its log, which holds commits up to 1 durably, while the thread still tags
-        queue.useDurable(() -> 1);
-        // A live commit 2, published, its frame sealed but not durable
+        // The store attaches its log, which wrote the frames of the commits up to 1, while the thread still tags
+        queue.useReadable(() -> 1);
+        // A live commit 2, published, its frame sealed but not written
         var live = spillable(2L << 20, 4_000);
         var record = queue.record(2, 1);
         record.add(live, 0, 4_000);
         record.locate(view, 1 << 20, 0, false);
         queue.add(record);
         queue.awaitIdleForTests();
-        assertInstanceOf(MemorySegment.class, live.sourceForTests(), "the value of a commit the log does not hold durably");
+        assertInstanceOf(MemorySegment.class, live.sourceForTests(), "the value of a commit the log has not written");
         assertEquals(1, queue.loggedValuesForTests(), "values moved to the log");
     }
 
@@ -785,6 +792,230 @@ class LogSpillTest {
         assertInstanceOf(MemorySegment.class, through.sourceForTests(), "a value of a group written through");
         assertEquals(0, queue.loggedValuesForTests(), "values moved to the log");
         assertEquals(0, queue.heldForTests());
+    }
+
+    /// Holds the next force of a segment of `disk` once `armed` is set, until `release` counts down, counting `reached`
+    /// down as it starts, then fails it if `fails`.
+    private static void holdNextForce(CrashFileSystem disk, AtomicBoolean armed, CountDownLatch reached,
+                                      CountDownLatch release, boolean fails) {
+        disk.intercept((path, kind) -> {
+            if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log") && armed.compareAndSet(true, false)) {
+                reached.countDown();
+                try {
+                    if (!release.await(60, TimeUnit.SECONDS)) {
+                        throw new IOException("Held for too long");
+                    }
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException(exception);
+                }
+                if (fails) {
+                    throw new IOException("The device failed the force");
+                }
+            }
+        });
+    }
+
+    /// Waits until `condition` holds, failing after a minute.
+    private static void awaitUntil(BooleanSupplier condition, String what) throws InterruptedException {
+        var deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(1);
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() > deadline) {
+                fail("timed out waiting until " + what);
+            }
+            Thread.sleep(1);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("the values of a group leave the heap once the log wrote it, while its force runs, and read back as written before and after it")
+    void movesValuesDuringTheForce(boolean encrypted) throws Exception {
+        var disk = CrashFileSystem.create();
+        var armed = new AtomicBoolean();
+        var reached = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        holdNextForce(disk, armed, reached, release, false);
+        var expected = new Expected();
+        // Segments a group fits in, so the only force of the group's segment is the one held
+        try (var ledger = openSized(disk.getPath("/store"), encrypted, 0, Duration.ZERO, 1 << 20)) {
+            try {
+                write(ledger, expected, 0, 30, 0, true);
+                spillNow(ledger);
+                var spills = ledger.spills();
+                var logged = spills.loggedValuesForTests();
+                armed.set(true);
+                var sequence = write(ledger, expected, 1_000, 30, 0, false);
+                assertTrue(reached.await(60, TimeUnit.SECONDS), "the force of the group never started");
+                awaitUntil(() -> spills.heldForTests() == 0 && spills.loggedValuesForTests() > logged,
+                        "the values of the written group moved");
+                spills.awaitIdleForTests();
+                var log = ledger.log();
+                assertTrue(log.durableSequence() < sequence, "the group is durable while its force is held");
+                assertTrue(log.readableSequence() >= sequence, "the group is not readable");
+                for (var message = 1_000; message < 1_030; message++) {
+                    if (expected.messages.get(message).length >= SpillQueue.LOG_VALUE_MIN) {
+                        assertInstanceOf(LogValue.class, head(ledger, MESSAGES, key(message)).sourceForTests(), "message " + message);
+                    }
+                }
+                verify(ledger, expected);
+            } finally {
+                release.countDown();
+            }
+            ledger.awaitDurable();
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = openSized(disk.getPath("/store"), encrypted, 0, Duration.ZERO, 1 << 20)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @Test
+    @DisplayName("a group the log writes through is readable only once that write made it durable, a group it forces once its write returned, before the force")
+    void readableBeforeTheForceOnly() throws Exception {
+        var disk = CrashFileSystem.create();
+        var armed = new AtomicBoolean();
+        // The segment of each force while armed, and the readable sequence then
+        var forces = new java.util.concurrent.ConcurrentLinkedQueue<long[]>();
+        var ledgerHolder = new AtomicReference<LiveLedger>();
+        // A write through is seen as a write and then a force of the segment, before the write is made
+        disk.intercept((path, kind) -> {
+            if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log") && armed.get()) {
+                forces.add(new long[]{LogFiles.segmentNumber(path.getFileName().toString()),
+                        ledgerHolder.get().log().readableSequence()});
+            }
+        });
+        var expected = new Expected();
+        var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(disk.getPath("/store"))
+                .encryption(Encryption.key(KEY))
+                .keyspace(MESSAGES).keyspace(TEXTS).keyspace(CHATS).commitWindow(Duration.ZERO))
+                .segmentSize(64 << 10)
+                .spillBudget(0)
+                .writeThrough(WriteThrough.Mode.DSYNC)
+                .build();
+        try (ledger) {
+            ledgerHolder.set(ledger);
+            ledger.valueSlab().forceColdForTests();
+            ledger.state(MESSAGES).overwrites.forceSpillsForTests();
+            ledger.state(TEXTS).overwrites.forceSpillsForTests();
+            var log = ledger.log();
+            var message = 0;
+            // Segments enough for a checkpoint to leave spares, which the log writes groups through into
+            while (log.currentSegment() < 12) {
+                write(ledger, expected, message++, 1, 0, true);
+            }
+            ledger.checkpoint();
+            var through = 0;
+            var forced = 0;
+            for (var attempt = 0; attempt < 400 && (through < 4 || forced < 4); attempt++) {
+                var writtenThrough = log.writtenThrough();
+                forces.clear();
+                armed.set(true);
+                // Two messages, which the log writes through into a spare, or more than a segment holds, which it
+                // writes into the cache, rolls over and forces
+                var count = attempt % 2 == 0 ? 2 : 30;
+                var sequence = write(ledger, expected, message, count, 0, true);
+                message += count;
+                armed.set(false);
+                // The last force of the segment the group ended in: a force of the segment it rolled over from, or of
+                // one prepared after it, is not the group's
+                long[] seen = null;
+                for (var force : forces) {
+                    if (force[0] == log.currentSegment()) {
+                        seen = force;
+                    }
+                }
+                if (seen == null) {
+                    continue;
+                }
+                if (log.writtenThrough() > writtenThrough) {
+                    through++;
+                    assertTrue(seen[1] < sequence, "a group written through was readable before its write returned");
+                } else {
+                    forced++;
+                    assertTrue(seen[1] >= sequence, "a forced group was not readable at its force");
+                }
+            }
+            assertTrue(through >= 4, "groups written through: " + through);
+            assertTrue(forced >= 4, "groups forced: " + forced);
+            ledger.spills().awaitIdleForTests();
+            verify(ledger, expected);
+        }
+        try (var reopened = openJudged(disk.getPath("/store"), true, 0, Duration.ZERO, 64 << 10)) {
+            verify(reopened, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a value that left the heap before the force of its group failed is lost with it: its read reports the failure of the log, whatever bytes the file holds, never a damaged store, and the values of durable groups still read back")
+    void losesValuesOfAFailedForce(boolean encrypted) throws Exception {
+        var disk = CrashFileSystem.create();
+        var armed = new AtomicBoolean();
+        var reached = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        holdNextForce(disk, armed, reached, release, true);
+        var expected = new Expected();
+        var durable = new Expected();
+        var ledger = openSized(disk.getPath("/store"), encrypted, 0, Duration.ZERO, 1 << 20);
+        try {
+            write(ledger, expected, 0, 30, 0, true);
+            spillNow(ledger);
+            durable = expected.copy();
+            var spills = ledger.spills();
+            var logged = spills.loggedValuesForTests();
+            armed.set(true);
+            write(ledger, expected, 1_000, 30, 0, false);
+            assertTrue(reached.await(60, TimeUnit.SECONDS), "the force of the group never started");
+            awaitUntil(() -> spills.heldForTests() == 0 && spills.loggedValuesForTests() > logged,
+                    "the values of the written group moved");
+            spills.awaitIdleForTests();
+            var lost = new ArrayList<Integer>();
+            for (var message = 1_000; message < 1_030; message++) {
+                if (head(ledger, MESSAGES, key(message)).sourceForTests() instanceof LogValue) {
+                    lost.add(message);
+                }
+            }
+            assertFalse(lost.isEmpty(), "no value of the group moved to the log");
+            release.countDown();
+            var failure = assertThrows(LedgerIoException.class, ledger::awaitDurable);
+            assertEquals("The device failed the force", failure.getCause().getMessage());
+            // Zeros where the values were, as a system that dropped the pages after the failed force leaves the file
+            for (var message : lost) {
+                var place = (LogValue) head(ledger, MESSAGES, key(message)).sourceForTests();
+                try (var channel = FileChannel.open(place.segment().path(), StandardOpenOption.WRITE)) {
+                    var zeros = ByteBuffer.allocate(expected.messages.get(message).length);
+                    var at = place.frameOffset() + LogWriter.FRAME_HEADER + place.bodyIndex();
+                    while (zeros.hasRemaining()) {
+                        at += channel.write(zeros, at);
+                    }
+                }
+            }
+            for (var message : lost) {
+                var read = assertThrows(LedgerIoException.class, () -> ledger.get(MESSAGES, key(message)),
+                        "message " + message);
+                assertEquals("The device failed the force", read.getCause().getMessage());
+            }
+            for (var entry : durable.messages.entrySet()) {
+                assertArrayEquals(entry.getValue(), ledger.get(MESSAGES, key(entry.getKey())).orElseThrow(),
+                        "message " + entry.getKey());
+            }
+            // A checkpoint that would write a lost value fails as the log did
+            assertThrows(LedgerIoException.class, ledger::checkpoint);
+        } finally {
+            release.countDown();
+            try {
+                ledger.close();
+            } catch (LedgerException _) {
+                // The log stopped with a group it could not make durable
+            }
+        }
+        // The commits the log made durable, and none of the lost group
+        try (var reopened = openSized(disk.getPath("/store"), encrypted, 0, Duration.ZERO, 1 << 20)) {
+            verify(reopened, durable);
+        }
     }
 
     @ParameterizedTest(name = "encrypted: {0}, segment of {1} bytes")

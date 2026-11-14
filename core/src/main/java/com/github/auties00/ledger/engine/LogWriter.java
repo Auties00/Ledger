@@ -126,7 +126,11 @@ import java.util.zip.CRC32C;
 /// ([FrameBody#abandon()]), as the writer stays reachable from its store.
 ///
 /// A failed write or force stops the writer for good: [#awaitDurable(long)] and every later [#append] throw. A failed
-/// write through only moves the writer to forces.
+/// write through only moves the writer to forces. The values that left the heap for the frames a group wrote before its
+/// force ([SpillQueue]) are lost with that group: the stop marks every frame of the current segment past the last force
+/// as lost ([LogSegmentView#lose(long, IOException)]), and a read of such a value throws
+/// [com.github.auties00.ledger.LedgerIoException], as the failure of the log it reports, never a damaged store or
+/// bytes the system's cache may no longer hold.
 final class LogWriter {
     static final int SEGMENT_HEADER = 4_096;
     static final int ALIGNMENT = 4_096;
@@ -371,6 +375,10 @@ final class LogWriter {
     private final ReentrantLock durabilityLock;
     private final Condition durabilityChanged;
     private volatile long durable;
+    // The latest sequence whose frames the segments hold, in the system's cache if not durably yet: at least durable,
+    // written by the flush task alone after the last write of a group, so the volatile write publishes the locations
+    // its sealing recorded to whatever reads it after
+    private volatile long readable;
     private long written;
     private volatile LedgerIoException failure;
 
@@ -422,6 +430,7 @@ final class LogWriter {
         this.durabilityLock = new ReentrantLock();
         this.durabilityChanged = durabilityLock.newCondition();
         this.durable = durable;
+        this.readable = durable;
         this.lastQueued = durable;
         // The first group switches to it, as a rollover does
         this.segmentNumber = firstSegment - 1;
@@ -449,6 +458,10 @@ final class LogWriter {
         segmentOpened = now;
         waitedBefore = waited;
         waited = false;
+        // Before any field of the segment changes: a failure leaves the use and its forced bytes those of the last one
+        var useTag = TAGS.nextLong();
+        var segmentKey = keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt(), useTag) : null;
+        var view = spills == null ? null : spills.segment(segment.number(), segment.path(), segmentKey);
         this.channel = FileChannel.open(segment.path(), StandardOpenOption.READ, StandardOpenOption.WRITE);
         this.segmentPath = segment.path();
         this.segmentNumber = segment.number();
@@ -459,9 +472,9 @@ final class LogWriter {
         this.valid = segment.valid();
         this.groupEnd = SEGMENT_HEADER;
         this.segmentTag = ByteBuffer.wrap(segment.salt()).getLong();
-        this.useTag = TAGS.nextLong();
-        this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt(), useTag) : null;
-        this.view = spills == null ? null : spills.segment(segment.number(), segment.path(), segmentKey);
+        this.useTag = useTag;
+        this.segmentKey = segmentKey;
+        this.view = view;
         this.next = null;
         this.throughFile = null;
         // A segment of its header and first block holds at most one group through, which is worth a handle only as the
@@ -783,7 +796,12 @@ final class LogWriter {
     }
 
     /// Makes `spills` the values that may leave the heap for the frames: the writer locates each frame of a commit
-    /// that has some as it seals it, and tells `spills` whenever a group becomes durable; before the first commit.
+    /// that has some as it seals it, and tells `spills` whenever the segments hold the frames of more commits
+    /// ([#readableSequence()]); before the first commit.
+    ///
+    /// The values of a group the log writes into the system's cache may leave the heap while its force runs. If that
+    /// force fails, the writer stops and those values are lost: a read of one throws
+    /// [com.github.auties00.ledger.LedgerIoException].
     void useSpills(SpillQueue spills) {
         this.spills = spills;
     }
@@ -791,7 +809,7 @@ final class LogWriter {
     /// Records, for the commit of `body`, if it lists values that may leave the heap, where the frame at
     /// `frameOffset` of the current segment holds it: its body at `commitStart` of the frame's body.
     ///
-    /// Before the group's write, so before the durable sequence that publishes the location covers it.
+    /// Before the group's write, so before the readable sequence that publishes the location covers it.
     private void locate(FrameBody body, long frameOffset, int commitStart) {
         var record = body.spill();
         if (record != null) {
@@ -973,7 +991,7 @@ final class LogWriter {
                 } finally {
                     queueLock.unlock();
                 }
-                var bodies = write(group, units);
+                var bodies = write(group, units, sequence);
                 group.clear();
                 flushing = group;
                 boolean roomy;
@@ -991,9 +1009,9 @@ final class LogWriter {
                 }
             }
         } catch (IOException exception) {
-            stop(exception);
+            fail(exception);
         } catch (RuntimeException | Error throwable) {
-            stop(new IOException("The log writer failed", throwable));
+            fail(new IOException("The log writer failed", throwable));
         } finally {
             leading = false;
             // A commit's thread gets its interrupt back; a thread of the pool, which nothing should interrupt, not
@@ -1076,8 +1094,12 @@ final class LogWriter {
     /// before it forces the segment: the first frame of a group in the next segment then means, as it always does,
     /// that everything before it is durable.
     ///
+    /// A group written into the cache makes the commits up to `sequence` readable once its last write returns, before
+    /// its force, so the values of its commits may leave the heap while the force runs; a group written through, only
+    /// once it is published.
+    ///
     /// @return the bytes of the frame bodies written
-    private long write(List<Queued> group, boolean units) throws IOException {
+    private long write(List<Queued> group, boolean units, long sequence) throws IOException {
         if (channel == null) {
             rollover();
         } else if (rollsEarly()) {
@@ -1146,6 +1168,8 @@ final class LogWriter {
             writeThrough();
         } else {
             drain();
+            // Never on the drain of a rollover: the frames after it are not written yet
+            advanceReadable(sequence);
             force();
         }
         var took = Math.max(1, System.nanoTime() - forceStart);
@@ -1594,6 +1618,11 @@ final class LogWriter {
             cohortBase = registered.get();
             cohortArmed = true;
         }
+        // A group written through, or one a failed write through forced, is readable only now
+        var raised = readable < sequence;
+        if (raised) {
+            readable = sequence;
+        }
         durable = sequence;
         durabilityLock.lock();
         try {
@@ -1602,8 +1631,8 @@ final class LogWriter {
         } finally {
             durabilityLock.unlock();
         }
-        if (spills != null) {
-            spills.durableAdvanced();
+        if (raised && spills != null) {
+            spills.readableAdvanced();
         }
         // A commit that wrote its own group comes back too
         var woken = wake(sequence) + (leading ? 1 : 0);
@@ -1635,6 +1664,31 @@ final class LogWriter {
         return woken;
     }
 
+    /// Makes the commits up to `sequence` readable, if they were not, and tells the values that may leave the heap.
+    private void advanceReadable(long sequence) {
+        if (readable < sequence) {
+            readable = sequence;
+            if (spills != null) {
+                spills.readableAdvanced();
+            }
+        }
+    }
+
+    /// Stops the writer for good after the flush that holds [#running] failed with `cause`.
+    ///
+    /// Every frame of the current segment past the bytes a force or a write through made durable is lost first, before
+    /// any commit waiting on the log wakes: the frames of the group that failed start there, as each group starts at
+    /// the block after the last one, and the values that left the heap for them may no longer be in the system's
+    /// cache. A segment before the current one was forced whole before the log moved on.
+    private void fail(IOException cause) {
+        var use = view;
+        if (use != null) {
+            use.lose(forcedPosition, cause);
+        }
+        stop(cause);
+    }
+
+    /// Stops the writer for good after `cause`: every later [#append] and every wait for durability throws.
     private void stop(IOException cause) {
         failure = new LedgerIoException("The log could not be written: commits since the last force may be lost", cause);
         durabilityLock.lock();
@@ -1662,6 +1716,15 @@ final class LogWriter {
     /// {@return the latest sequence the log holds durably}
     long durableSequence() {
         return durable;
+    }
+
+    /// {@return the latest sequence whose frames the segments hold, in the system's cache if not durably yet; at least
+    /// [#durableSequence()]}
+    ///
+    /// The frames of a group the log writes through count only once it is durable: the write took their pages out of
+    /// the cache.
+    long readableSequence() {
+        return readable;
     }
 
     /// {@return whether the commit at `sequence` is durable}

@@ -25,6 +25,12 @@ import java.util.concurrent.atomic.AtomicReference;
 /// the retirement overtakes, as the file closes, is renamed or is prepared again under it, throws [Retired] too, never
 /// a failure of the store.
 ///
+/// A value moves here once the log wrote its frame, which may be before a force made the frame durable. If that force
+/// fails, the log writer marks the frames past its last force lost ([#lose(long, IOException)]), and a read of a value
+/// there throws [LedgerIoException] with the writer's failure: the system may have dropped the pages of the frames
+/// after the failed force, so their bytes are not read, and a read is never reported as a damaged store, which a
+/// reopen recovers from the durable log as after any failed force.
+///
 /// The file is read through one channel, opened at the first read. An interrupt of a reading thread closes the
 /// channel for every thread; the read then opens it again, reads again, and gives the thread its interrupt back.
 ///
@@ -43,6 +49,11 @@ final class LogSegmentView {
     // encryption; a read that finds it taken makes one of its own, which it leaves here if the place is empty
     private final AtomicReference<Cipher> blocks;
     private volatile boolean retired;
+    // The offset from which the frames of this use are lost, as the log writer stopped before a force made them
+    // durable, or Long.MAX_VALUE; written once, after lostCause
+    private volatile long lostFrom;
+    // The failure that stopped the log writer, or null while no frame is lost
+    private IOException lostCause;
     // The lowest and highest sequence of the commits whose values were moved here, written holding the lock of the
     // queue; Long.MAX_VALUE and -1 before any
     private long lowest;
@@ -61,6 +72,7 @@ final class LogSegmentView {
         this.lowest = Long.MAX_VALUE;
         this.highest = -1;
         this.coveredAt = -1;
+        this.lostFrom = Long.MAX_VALUE;
     }
 
     /// {@return the number of the segment}
@@ -111,6 +123,30 @@ final class LogSegmentView {
         }
     }
 
+    /// Marks the frames of this use from `from` lost, as the log writer stopped after `cause` before a force made them
+    /// durable, unless an earlier stop did; from then on a read of a value there throws [LedgerIoException].
+    ///
+    /// @param from the end of the bytes a force made durable, where the first frame no force made durable starts, or
+    ///             a negative offset if no force made the use's name durable
+    void lose(long from, IOException cause) {
+        synchronized (lock) {
+            if (lostFrom == Long.MAX_VALUE) {
+                lostCause = cause;
+                lostFrom = from;
+            }
+        }
+    }
+
+    /// Throws if the frame of `logged` is lost ([#lose(long, IOException)]).
+    ///
+    /// @throws LedgerIoException if it is
+    private void checkLost(LogValue logged) {
+        if (logged.frameOffset() >= lostFrom) {
+            throw new LedgerIoException("A value of a commit the log never made durable is lost: the log segment "
+                    + path + " could not be written", lostCause);
+        }
+    }
+
     /// Retires the segment: closes its channel, and every later read throws [Retired].
     void retire() {
         synchronized (lock) {
@@ -132,12 +168,14 @@ final class LogSegmentView {
     /// `offset`.
     ///
     /// @throws Retired if a checkpoint retired the segment
-    /// @throws LedgerIoException if the segment cannot be read
+    /// @throws LedgerIoException if the segment cannot be read, or the value's frame is lost
+    ///                           ([#lose(long, IOException)])
     /// @throws LedgerCorruptedException if the bytes read are not the value
     void read(LogValue logged, long stamp, int length, byte[] target, int offset) {
         if (retired) {
             throw Retired.INSTANCE;
         }
+        checkLost(logged);
         var crypto = spills.takeCrypto();
         try {
             var start = logged.frameOffset() + LogWriter.FRAME_HEADER + logged.bodyIndex();
@@ -163,6 +201,8 @@ final class LogSegmentView {
                     // Read as a preparation reused the file
                     throw Retired.INSTANCE;
                 }
+                // Read after the failed force dropped the pages, before the writer marked them lost
+                checkLost(logged);
                 throw new LedgerCorruptedException("A value of the log segment " + path
                         + " does not match the value the store wrote", null);
             }

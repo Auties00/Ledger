@@ -21,11 +21,12 @@ import java.util.zip.CRC32C;
 /// A value a batch put to a paged key space stays on its batch's array until a checkpoint writes it, and the array
 /// with it: up to six intervals of log, hundreds of megabytes after a history sync. Each commit with such values
 /// queues a [Record] of them once it is published, which the log writer locates in the frame it seals. Once the queue
-/// holds more than its budget of values whose frames are durable, a virtual thread moves the values of the oldest
-/// records off their arrays, until three quarters of the budget is left: a value of at least [#LOG_VALUE_MIN] bytes to
-/// its place in the log ([LogValue]), with a tag that authenticates it, a shorter one to an array of its own. A
-/// batch's array no version needs any more is then garbage. The newest values, those of the budget, stay where they
-/// are, so reads of recent writes do not change; a read of a value in the log reads it back with one positioned read.
+/// holds more than its budget of values whose frames the log wrote ([LogWriter#readableSequence()]), a virtual thread
+/// moves the values of the oldest records off their arrays, until three quarters of the budget is left: a value of at
+/// least [#LOG_VALUE_MIN] bytes to its place in the log ([LogValue]), with a tag that authenticates it, a shorter one
+/// to an array of its own. A batch's array no version needs any more is then garbage. The newest values, those of the
+/// budget, stay where they are, so reads of recent writes do not change; a read of a value in the log reads it back
+/// with one positioned read.
 ///
 /// A record leaves the queue once its values moved, or once a published checkpoint holds its commit. Values are not
 /// moved:
@@ -52,6 +53,13 @@ import java.util.zip.CRC32C;
 ///
 /// Nothing of this is durable: a recovery replays the commits as ever, and moves the values it replays the same way
 /// ([LiveLedger#replay(long, byte\[\], int, int, ReplayValues, LogSegmentView, long, long)]).
+///
+/// A frame the log wrote into the system's cache is read back from there while its force runs, so the values of the
+/// last group of a burst leave the heap during that force rather than after it. If the force fails, the log writer
+/// stops, and the values of its group that moved are lost with it: a read of one throws
+/// [com.github.auties00.ledger.LedgerIoException] with the writer's failure
+/// ([LogSegmentView#lose(long, java.io.IOException)]), where a value kept on the heap would still read back. A reopen
+/// recovers the store from the durable log.
 final class SpillQueue {
     /// The shortest value that moves to the log: a [LogValue] takes 40 bytes, an array of the value 16 more than the
     /// value; below it, the array costs less than a read back from the file.
@@ -86,14 +94,14 @@ final class SpillQueue {
     // Whether the thread that moves values runs
     private final AtomicBoolean running;
     private volatile boolean closed;
-    // The latest sequence the log holds durably; before the store has a log, the commits queued are those a recovery
-    // replays from it, every one durable
-    private volatile LongSupplier durable = () -> Long.MAX_VALUE;
+    // The latest sequence whose frames the log wrote; before the store has a log, the commits queued are those a
+    // recovery replays from it, every one durable
+    private volatile LongSupplier readable = () -> Long.MAX_VALUE;
     // Reads the supplier the queue holds at each call: a thread that started moving values during a recovery goes on
     // after the store attaches its log, and a supplier it took at its start would let it move the values of live
-    // commits the log does not hold durably yet, and skip the volatile read of the log's durable sequence that orders
-    // the writer's locating of a record before the thread reads it
-    private final LongSupplier current = () -> durable.getAsLong();
+    // commits the log has not written yet, and skip the volatile read of the log's readable sequence that orders the
+    // writer's locating of a record before the thread reads it
+    private final LongSupplier readableNow = () -> readable.getAsLong();
     private final AtomicReferenceArray<Crypto> cryptos;
     // The values moved to the log and to arrays of their own, and the records drained, for tests
     private final AtomicLong loggedValues = new AtomicLong();
@@ -102,7 +110,7 @@ final class SpillQueue {
 
     /// Creates the queue of a store.
     ///
-    /// @param budget the bytes of values whose frames are durable the queue holds before it moves them
+    /// @param budget the bytes of values whose frames the log wrote the queue holds before it moves them
     /// @param encrypted whether the store's log is encrypted, so the values read back are authenticated by a keyed hash
     SpillQueue(long budget, boolean encrypted) {
         this.budget = budget;
@@ -135,15 +143,16 @@ final class SpillQueue {
         return Math.clamp(maxMemory / 256, 4L << 20, 64L << 20);
     }
 
-    /// Reads the latest durable sequence from `log` from now on, and moves values whenever the queue is over budget.
+    /// Reads the latest sequence whose frames the log wrote from `log` from now on, and moves values whenever the queue
+    /// is over budget.
     void useLog(LogWriter log) {
-        useDurable(log::durableSequence);
+        useReadable(log::readableSequence);
     }
 
-    /// Reads the latest durable sequence from `durableSequence` from now on, a thread moving values included, and moves
-    /// values whenever the queue is over budget.
-    void useDurable(LongSupplier durableSequence) {
-        this.durable = durableSequence;
+    /// Reads the latest sequence whose frames the log wrote from `readableSequence` from now on, a thread moving values
+    /// included, and moves values whenever the queue is over budget.
+    void useReadable(LongSupplier readableSequence) {
+        this.readable = readableSequence;
         if (over()) {
             start();
         }
@@ -214,9 +223,9 @@ final class SpillQueue {
         }
     }
 
-    /// Starts moving values if the queue is over its budget; called by the log as a group becomes durable, which may
-    /// make the oldest record's values movable.
-    void durableAdvanced() {
+    /// Starts moving values if the queue is over its budget; called by the log as it writes the frames of more commits,
+    /// which may make the oldest record's values movable.
+    void readableAdvanced() {
         if (over() && !running.get()) {
             start();
         }
@@ -237,19 +246,19 @@ final class SpillQueue {
 
     private void run() {
         try {
-            drain(current);
+            drain(readableNow);
         } finally {
             running.set(false);
         }
-        // A group that became durable as the thread stopped found it running
+        // A group the log wrote as the thread stopped found it running
         if (movable()) {
             start();
         }
     }
 
-    /// {@return whether the queue is over its budget and its oldest record's frame is durable}
+    /// {@return whether the queue is over its budget and the log wrote its oldest record's frame}
     private boolean movable() {
-        var log = durable;
+        var log = readable;
         if (!over()) {
             return false;
         }
@@ -259,22 +268,22 @@ final class SpillQueue {
         }
     }
 
-    /// Moves the values of the oldest records whose commits `durableSequence` gives durable, while the queue holds more
-    /// than three quarters of its budget, on the caller's thread.
-    void drain(LongSupplier durableSequence) {
-        drain(durableSequence, lowWater);
+    /// Moves the values of the oldest records whose commits the log wrote up to `readableSequence`, while the queue
+    /// holds more than three quarters of its budget, on the caller's thread.
+    void drain(LongSupplier readableSequence) {
+        drain(readableSequence, lowWater);
     }
 
-    /// Moves the values of the oldest records whose commits `durableSequence` gives durable, while the queue holds more
-    /// than `downTo` bytes, on the caller's thread.
-    private void drain(LongSupplier durableSequence, long downTo) {
+    /// Moves the values of the oldest records whose commits the log wrote up to `readableSequence`, while the queue
+    /// holds more than `downTo` bytes, on the caller's thread.
+    private void drain(LongSupplier readableSequence, long downTo) {
         var crypto = takeCrypto();
         try {
             while (!closed) {
                 Record record;
                 synchronized (lock) {
                     record = records.peekFirst();
-                    if (record == null || held <= downTo || record.sequence > durableSequence.getAsLong()) {
+                    if (record == null || held <= downTo || record.sequence > readableSequence.getAsLong()) {
                         return;
                     }
                     records.pollFirst();
@@ -433,8 +442,8 @@ final class SpillQueue {
     /// The values of one commit that may move, where its frame lies in the log, and whether they can.
     ///
     /// It lists versions, not their chains: a version a later write replaced moves too, which costs its tag and
-    /// spares a walk of the chain per value. The log writer locates it while it seals the frame, before the frame is
-    /// durable, which publishes the location to whatever reads the durable sequence after.
+    /// spares a walk of the chain per value. The log writer locates it while it seals the frame, before it writes the
+    /// frame, which publishes the location to whatever reads the readable sequence after.
     static final class Record {
         private final long sequence;
         private Version[] versions;
