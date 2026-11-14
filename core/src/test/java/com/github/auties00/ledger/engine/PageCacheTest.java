@@ -181,7 +181,7 @@ class PageCacheTest {
             }
         }
         assertTrue(cache.clockLengthForTests() <= 4, "the clock holds " + cache.clockLengthForTests() + " entries");
-        assertEquals(64, cache.capacityForTests(), "the slots of departed entries are reused or cleared");
+        assertEquals(PageCache.MIN_CAPACITY, cache.capacityForTests(), "the slots of departed entries are reused or cleared");
     }
 
     @Test
@@ -379,12 +379,12 @@ class PageCacheTest {
         var cache = PageCache.isolated(48L * PageFormat.SIZE);
         for (var i = 0; i < 48; i++) {
             cache.put(page(i), unit(page(i)), false);
-            if (i == 10) {
-                assertEquals(64, cache.capacityForTests());
+            if (i == PageCache.MIN_CAPACITY / 2 - 2) {
+                assertEquals(PageCache.MIN_CAPACITY, cache.capacityForTests());
                 assertNotNull(cache.get(page(1)));
             }
         }
-        assertTrue(cache.capacityForTests() > 64, "the table holds " + cache.capacityForTests() + " slots");
+        assertTrue(cache.capacityForTests() >= 4 * PageCache.MIN_CAPACITY, "the table holds " + cache.capacityForTests() + " slots");
         for (var i = 0; i < 48; i++) {
             assertNotNull(cache.peek(page(i)), "page " + i + " survived the growth");
         }
@@ -400,10 +400,16 @@ class PageCacheTest {
     @DisplayName("holds its table to one size under steady eviction, however many keys pass through")
     void churn() {
         var cache = PageCache.isolated(8L * PageFormat.SIZE);
+        var capacity = -1;
         for (var i = 0; i < 100_000; i++) {
             cache.put(page(i), unit(page(i)), i % 3 == 0);
-            assertEquals(64, cache.capacityForTests());
-            assertTrue(cache.tombstonesForTests() <= 48, "the table holds " + cache.tombstonesForTests() + " departed slots");
+            if (i == 64) {
+                capacity = cache.capacityForTests();
+            } else if (i > 64) {
+                assertEquals(capacity, cache.capacityForTests());
+            }
+            assertTrue(cache.capacityForTests() <= 32, "the table holds " + cache.capacityForTests() + " slots");
+            assertTrue(cache.tombstonesForTests() <= cache.capacityForTests() * 3 / 4, "the table holds " + cache.tombstonesForTests() + " departed slots");
         }
         assertEquals(8, cache.clockLengthForTests());
         assertEquals(8L * PageFormat.SIZE, cache.size());
@@ -425,7 +431,8 @@ class PageCacheTest {
         }
         assertEquals(990, cache.tombstonesForTests());
         cache.tick();
-        assertEquals(64, cache.capacityForTests());
+        // Eight slots an entry at most, and never below the smallest table
+        assertEquals(Math.max(PageCache.MIN_CAPACITY, 64), cache.capacityForTests());
         assertEquals(0, cache.tombstonesForTests());
         for (var i = 0; i < 10; i++) {
             assertSame(units[i], cache.get(page(i)));
@@ -436,7 +443,7 @@ class PageCacheTest {
             cache.tick();
         }
         assertEquals(0, cache.size());
-        assertEquals(64, cache.capacityForTests());
+        assertEquals(PageCache.MIN_CAPACITY, cache.capacityForTests());
     }
 
     @Test

@@ -22,9 +22,13 @@ import java.util.function.LongSupplier;
 /// latest sequence, which the writer stored with a volatile store: they cannot see the table as it was before either.
 final class ReaderTable {
     private static final VarHandle SLOTS = MethodHandles.arrayElementVarHandle(long[].class);
+    // All zeros, never written: the free table of every table of at most this many slots
+    private static final long[] ZEROS = new long[256];
+    // The first capacity of what scan() collects into; a scan that finds more grows it
+    private static final int SCANNED_CAPACITY = 16;
 
     private final long[] slots;
-    // As long as slots, and all zeros
+    // At least as long as slots, and all zeros
     private final long[] free;
     private final int mask;
     private final LongSupplier latest;
@@ -46,12 +50,12 @@ final class ReaderTable {
             throw new IllegalArgumentException("slots must be a power of two: " + slots);
         }
         this.slots = new long[slots];
-        this.free = new long[slots];
+        this.free = slots <= ZEROS.length ? ZEROS : new long[slots];
         this.mask = slots - 1;
         this.latest = latest;
         this.registryLock = new Object();
         this.registry = new TreeMap<>();
-        this.scanned = new long[slots + 1];
+        this.scanned = new long[SCANNED_CAPACITY];
     }
 
     /// Registers a read at the latest sequence.
@@ -139,6 +143,10 @@ final class ReaderTable {
             if (value != 0) {
                 oldest = Math.min(oldest, value - 1);
                 if (value - 1 < current) {
+                    if (count == sequences.length) {
+                        sequences = Arrays.copyOf(sequences, count * 2);
+                        scanned = sequences;
+                    }
                     sequences[count++] = value - 1;
                 }
             }
