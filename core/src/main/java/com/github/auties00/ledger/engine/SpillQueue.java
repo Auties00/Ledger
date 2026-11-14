@@ -3,6 +3,7 @@ package com.github.auties00.ledger.engine;
 import javax.crypto.Cipher;
 import javax.crypto.spec.SecretKeySpec;
 import java.lang.foreign.MemorySegment;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
@@ -57,6 +58,9 @@ final class SpillQueue {
     private static final int WORD = 7;
     /// The scratch past which a [Crypto] given back lets go of it: the values of messages take a few kilobytes.
     private static final int KEPT_SCRATCH = 16 << 10;
+    /// The keystream a [Crypto] makes in one call, a multiple of [#BLOCK]: its arrays of counter blocks and keystream
+    /// keep this size, and a longer value is decrypted a piece at a time.
+    private static final int KEYSTREAM = 4 << 10;
     private static final SecureRandom KEYS = new SecureRandom();
 
     private final long budget;
@@ -498,10 +502,10 @@ final class SpillQueue {
     /// of an HMAC inlined at its call site takes hundreds of milliseconds of a compiler thread, and a GMAC takes an
     /// initialization and two copies of the value per tag; the loop of the polynomials compiles in a few.
     static final class Crypto {
-        // AES-ECB under the key of the segment use it last decrypted from, which makes keystream blocks; made at the
-        // first decryption, so a store that only moves values never loads it
+        // AES-ECB under the key it last decrypted from by key rather than with a segment use's cipher; made at the first
+        // such decryption
         private Cipher blocks;
-        // The key blocks is under, or null before the first decryption
+        // The key blocks is under, or null before the first such decryption
         private SecretKeySpec blocksKey;
         // The points of the polynomials of the tags, or null without encryption
         private final long[] keys;
@@ -510,7 +514,10 @@ final class SpillQueue {
         private long first;
         private long second;
         private byte[] scratch;
-        // The counter blocks of a value and the keystream they encrypt to
+        // A buffer over scratch, which a read of the log fills, or null before the first
+        private ByteBuffer scratchBuffer;
+        // The counter blocks of a piece of a value and the keystream they encrypt to, of KEYSTREAM bytes each, or null
+        // before the first decryption
         private byte[] counters;
         private byte[] keystream;
 
@@ -525,17 +532,26 @@ final class SpillQueue {
             if (array == null || array.length < length) {
                 array = new byte[Math.max(length, 2 << 10)];
                 scratch = array;
+                scratchBuffer = null;
             }
             return array;
+        }
+
+        /// {@return a buffer over the whole of the array [#scratch(int)] last returned, made once per array, whose
+        /// position and limit the caller sets}
+        ByteBuffer scratchBuffer() {
+            var buffer = scratchBuffer;
+            if (buffer == null) {
+                buffer = ByteBuffer.wrap(scratch);
+                scratchBuffer = buffer;
+            }
+            return buffer;
         }
 
         private void trim() {
             if (scratch != null && scratch.length > KEPT_SCRATCH) {
                 scratch = null;
-            }
-            if (counters != null && counters.length > KEPT_SCRATCH) {
-                counters = null;
-                keystream = null;
+                scratchBuffer = null;
             }
         }
 
@@ -571,32 +587,67 @@ final class SpillQueue {
         /// nonce.
         void decrypt(SecretKeySpec key, long frameOffset, int bodyIndex, byte[] sealed, int skip, int length,
                      byte[] target, int offset) {
-            var bytes = (skip + length + BLOCK - 1) & -BLOCK;
-            if (counters == null || counters.length < bytes) {
-                counters = new byte[Math.max(bytes, 2 << 10)];
-                keystream = new byte[counters.length];
-            }
-            var first = 2 + (bodyIndex >>> 4);
-            for (var block = 0; block < bytes; block += BLOCK) {
-                Bytes.i32(counters, block, 0);
-                Bytes.i64(counters, block + Integer.BYTES, frameOffset);
-                Bytes.i32(counters, block + Integer.BYTES + Long.BYTES, first + (block >>> 4));
-            }
             try {
                 if (blocks == null) {
-                    blocks = Cipher.getInstance("AES/ECB/NoPadding");
+                    blocks = newBlocks();
                 }
                 if (key != blocksKey) {
+                    blocksKey = null;
                     blocks.init(Cipher.ENCRYPT_MODE, key);
                     blocksKey = key;
                 }
-                blocks.update(counters, 0, bytes, keystream, 0);
             } catch (GeneralSecurityException exception) {
-                blocksKey = null;
                 throw new IllegalStateException("AES failed", exception);
             }
-            for (var i = 0; i < length; i++) {
-                target[offset + i] = (byte) (sealed[skip + i] ^ keystream[skip + i]);
+            try {
+                decrypt(blocks, frameOffset, bodyIndex, sealed, skip, length, target, offset);
+            } catch (IllegalStateException exception) {
+                blocksKey = null;
+                throw exception;
+            }
+        }
+
+        /// Decrypts as [#decrypt(SecretKeySpec, long, int, byte\[\], int, int, byte\[\], int)] does, with `cipher`, an
+        /// AES-ECB cipher ([#newBlocks()]) initialized to encrypt under the key of the value's segment use.
+        ///
+        /// The keystream is made a piece of [#KEYSTREAM] bytes at a time, so the holder's arrays keep their size
+        /// whatever the value's.
+        ///
+        /// @throws IllegalStateException if the cipher fails, which leaves its state unknown
+        void decrypt(Cipher cipher, long frameOffset, int bodyIndex, byte[] sealed, int skip, int length, byte[] target,
+                     int offset) {
+            if (counters == null) {
+                counters = new byte[KEYSTREAM];
+                keystream = new byte[KEYSTREAM];
+            }
+            var bytes = (skip + length + BLOCK - 1) & -BLOCK;
+            var first = 2 + (bodyIndex >>> 4);
+            for (var start = 0; start < bytes; start += KEYSTREAM) {
+                var piece = Math.min(KEYSTREAM, bytes - start);
+                for (var block = 0; block < piece; block += BLOCK) {
+                    Bytes.i32(counters, block, 0);
+                    Bytes.i64(counters, block + Integer.BYTES, frameOffset);
+                    Bytes.i32(counters, block + Integer.BYTES + Long.BYTES, first + ((start + block) >>> 4));
+                }
+                try {
+                    cipher.update(counters, 0, piece, keystream, 0);
+                } catch (GeneralSecurityException exception) {
+                    throw new IllegalStateException("AES failed", exception);
+                }
+                // The value's bytes in this piece: from skip in the first, up to skip + length in the last
+                var to = Math.min(start + piece, skip + length);
+                for (var i = Math.max(start, skip); i < to; i++) {
+                    target[offset + i - skip] = (byte) (sealed[i] ^ keystream[i - start]);
+                }
+            }
+        }
+
+        /// {@return a new AES-ECB cipher, which makes the keystream blocks of a value once initialized under a key}
+        static Cipher newBlocks() {
+            try {
+                return Cipher.getInstance("AES/ECB/NoPadding");
+            } catch (GeneralSecurityException exception) {
+                throw new IllegalStateException("AES is not available", exception);
             }
         }
 
