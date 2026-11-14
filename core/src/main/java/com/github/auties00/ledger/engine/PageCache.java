@@ -325,6 +325,24 @@ final class PageCache implements IdleTicker.Watched {
         this.screening = screening;
     }
 
+    /// {@return whether the cache screens what reads miss}
+    boolean screens() {
+        return screening;
+    }
+
+    /// Records the unit `ref` of the data file names, or the leaf its delta record makes, in the doorkeeper as seen, so
+    /// the first read that misses it caches it: a checkpoint wrote it, left it out of the cache, and a read used the
+    /// leaf it replaces.
+    ///
+    /// The doorkeeper knows a unit by its nonce, which every checkpoint that rewrites a leaf changes, so a leaf a
+    /// reader reads once between two checkpoints would otherwise be refused at every read of every version. It records
+    /// nothing unless the cache screens and the doorkeeper recorded a unit before.
+    void expect(PageRef ref) {
+        if (screening && !closed) {
+            doorkeeper.remember(dataKey(ref.page(), ref.slot()), ref.nonceHigh(), doorkeeperKeys());
+        }
+    }
+
     /// {@return the array of the unit `ref` names, at `key`, if the cache refused it lately and the collector has not
     /// taken it, which the cache then holds as an entry a read used; or `null`}
     ///
@@ -850,7 +868,7 @@ final class PageCache implements IdleTicker.Watched {
                 // A unit a read used that the clock pushed out goes back in at its next read. One the ticker found idle
                 // needs none: its bits stay set unless the doorkeeper forgot them since
                 if ((state & READ) != 0) {
-                    doorkeeper.evicted(table.meta[3 * slot], table.meta[3 * slot + 1], doorkeeperKeys());
+                    doorkeeper.remember(table.meta[3 * slot], table.meta[3 * slot + 1], doorkeeperKeys());
                 }
                 drop(table, slot);
                 return true;

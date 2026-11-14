@@ -67,10 +67,11 @@ final class Doorkeeper {
     }
 
     /// Records the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh` as seen, if the doorkeeper
-    /// recorded any unit before: the cache evicted it, and takes it back at its next read.
+    /// recorded any unit before: the cache evicted it, or a checkpoint wrote it in place of a unit a read used and left
+    /// it out of the cache, and the cache takes it at its next read.
     ///
     /// @param most the most keys a generation may hold, at which it rotates rather than grow
-    void evicted(long key, long nonceHigh, int most) {
+    void remember(long key, long nonceHigh, int most) {
         var filter = this.filter;
         if (filter != null) {
             add(filter, hash(key, nonceHigh), most);
