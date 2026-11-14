@@ -92,6 +92,12 @@ sealed class Version permits Version.External {
         return new External(stamp, value, 0, value.length(), null, older, external);
     }
 
+    /// {@return a version of the `length` bytes `logged` holds in the log, stamped `stamp`, the stamp its tag binds; for
+    /// a checkpoint that writes a value of a [PackedRun]}
+    static Version ofLogged(long stamp, LogValue logged, int length) {
+        return new Version(stamp, logged, 0, length, null, null);
+    }
+
     /// {@return a version of the `length` bytes at `offset` of `source`, a read-only segment, or of no value if
     /// `source` is `null`, which the unit `external` of [BlobFile] also holds if it is not `null`}
     static Version of(long stamp, MemorySegment source, int offset, int length, Object decoded, Version older, PageRef external) {

@@ -42,6 +42,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -167,6 +168,20 @@ class LogSpillTest {
     private static Version head(LiveLedger ledger, Keyspace<?, ?> keyspace, byte[] key) {
         var chain = ledger.state(keyspace).chain(MemorySegment.ofArray(key));
         return chain == null ? null : chain.head;
+    }
+
+    /// {@return where the value of `key` lies: on its newest version in memory, or in the run the open replayed it
+    /// into, as [PackedRun#sourceForTests(int)] gives it}
+    private static Object source(LiveLedger ledger, Keyspace<?, ?> keyspace, byte[] key) {
+        var version = head(ledger, keyspace, key);
+        if (version != null) {
+            return version.sourceForTests();
+        }
+        var run = ledger.state(keyspace).run;
+        assertNotNull(run, "no version nor run holds the key");
+        var entry = run.find(MemorySegment.ofArray(key));
+        assertTrue(entry >= 0, "the run lacks the key");
+        return run.sourceForTests(entry);
     }
 
     /// Checks every way a read returns the values of `expected`.
@@ -570,7 +585,7 @@ class LogSpillTest {
         try (var ledger = open(directory, encrypted, 0)) {
             assertTrue(ledger.spills().loggedValuesForTests() > 0, "the recovery moved no value to the log");
             for (var entry : expected.messages.entrySet()) {
-                var source = head(ledger, MESSAGES, key(entry.getKey())).sourceForTests();
+                var source = source(ledger, MESSAGES, key(entry.getKey()));
                 if (entry.getValue().length >= SpillQueue.LOG_VALUE_MIN) {
                     assertInstanceOf(LogValue.class, source, "message " + entry.getKey());
                 } else {
@@ -610,7 +625,7 @@ class LogSpillTest {
         }
         try (var ledger = open(directory, encrypted, 0)) {
             for (var entry : expected.entrySet()) {
-                var source = head(ledger, MESSAGES, key(entry.getKey())).sourceForTests();
+                var source = source(ledger, MESSAGES, key(entry.getKey()));
                 assertInstanceOf(LogValue.class, source, "message " + entry.getKey() + " stayed in the heap");
                 assertArrayEquals(entry.getValue(), ledger.get(MESSAGES, key(entry.getKey())).orElseThrow());
             }
@@ -819,7 +834,7 @@ class LogSpillTest {
             assertEquals(0, ledger.spills().drainedRecordsForTests(), "records drained");
             var logged = 0;
             for (var message : expected.messages.keySet()) {
-                var source = head(ledger, MESSAGES, key(message)).sourceForTests();
+                var source = source(ledger, MESSAGES, key(message));
                 switch (source) {
                     case LogValue _ -> logged++;
                     case MemorySegment chunk -> assertEquals(ReplayValues.CHUNK_BYTES, chunk.byteSize(),

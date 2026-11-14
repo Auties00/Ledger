@@ -47,9 +47,15 @@ import java.util.function.LongSupplier;
 /// scan that steps onto it reads the tree for its key, as for an empty chain still in the map, and one that finds its
 /// link cleared asks the map for the next chain.
 ///
+/// A paged key space of a store that crashed may also hold the writes its open replayed as a [PackedRun], which the
+/// readers of the tree the store opened from read as part of it ([Reads#runOf(KeyspaceState, ReadPoint)]), until every
+/// reader reads a later tree, which holds them.
+///
 /// Readers use it concurrently with the commits. Commits create chains before they are given a sequence; everything
 /// else changes only under it.
 final class KeyspaceState {
+    /// What [#replayed] holds while the change a run makes to the count is not known yet.
+    private static final long UNCOUNTED = Long.MIN_VALUE;
     /// The dropped chains from which [#removeDropped()] spreads the removals over the processors.
     private static final int PARALLEL_REMOVALS = 4_096;
     /// The dropped chains the list may hold, at least, before a commit sweeps them off it; past it, as many as memory
@@ -89,6 +95,13 @@ final class KeyspaceState {
     final CountHistory counts;
     // The writes whose effect on the count the trees settle
     final BlindWrites blind;
+    /// The writes the open replayed into the key space as a run, which the readers of the tree the store opened from
+    /// read as part of it, or `null`: none was replayed, or every reader reads a later tree. Published by the open's
+    /// replay, before any reader exists, and cleared holding the publishing role.
+    volatile PackedRun run;
+    // The change the run makes to the count, against the tree the store opened from: 0 without one, UNCOUNTED until
+    // known. Kept once the run is gone, as the counts of the commits leave the run's writes out
+    private volatile long replayed;
     // The range removals whose count is not known yet
     final PendingRanges ranges;
     // The copies of the keys the chains hold, and of the map's keys of the chains that hold their keys in words of
@@ -972,11 +985,51 @@ final class KeyspaceState {
     ///
     /// It looks up in the trees of `point` the keys of the blind writes up to its sequence whose effect is not known
     /// yet, which reads the file for those of a tree larger than the page cache, and counts the range removals up to
-    /// its sequence whose count is not known yet, which reads the nodes on the paths to their bounds.
+    /// its sequence whose count is not known yet, which reads the nodes on the paths to their bounds. Before the first
+    /// checkpoint after an open that replayed writes into a run, the first count also looks up each key of the run in
+    /// the tree the store opened from ([#replayCorrection()]).
     long count(ReadPoint point) {
         var sequence = point.bound() >>> Reads.OP_BITS;
-        return known(sequence) + blind.correction(sequence, key -> Reads.inTreeOnly(this, key, point))
+        return known(sequence) + replayCorrection() + blind.correction(sequence, key -> Reads.inTreeOnly(this, key, point))
                 + ranges.correction(sequence);
+    }
+
+    /// Makes `run`, the writes the open replayed into the key space, part of the tree every reader of the tree the store
+    /// opened from reads; called by the replay, before any reader exists.
+    ///
+    /// The blind writes listed so far whose keys the run holds were replayed after the run's write of their keys, as a
+    /// key the replay wrote to a chain never goes to the run again: what they did is settled from the run's entries
+    /// ([BlindWrites#settle]). Every later write of such a key finds the run's entry instead of a blind lookup.
+    void publishRun(PackedRun run) {
+        replayed = UNCOUNTED;
+        this.run = run;
+        blind.settle(key -> {
+            var entry = run.find(key);
+            return entry < 0 ? TreeSearch.UNKNOWN : run.removes(entry) ? TreeSearch.ABSENT : TreeSearch.FOUND;
+        });
+    }
+
+    /// {@return the change the writes the open replayed as a run make to the count of the key space, against the tree
+    /// the store opened from, counted at the first call; 0 if there are none}
+    ///
+    /// Only a reader of the tree the store opened from, or the checkpoint that merges the run into it, counts it: the
+    /// run is released once every reader reads a later tree, and only after it is counted.
+    long replayCorrection() {
+        var correction = replayed;
+        if (correction == UNCOUNTED) {
+            correction = run.correction();
+            replayed = correction;
+        }
+        return correction;
+    }
+
+    /// Releases the run of the writes the open replayed, once every reader's tree is at or above `cutBound`, the bound of
+    /// the checkpoint every reader's tree holds, and that tree holds the run; holding the publishing role.
+    void releaseRun(long cutBound) {
+        var current = run;
+        if (current != null && cutBound >= current.maxStamp() && replayed != UNCOUNTED) {
+            run = null;
+        }
     }
 
     /// The chains of a range in memory, one at a time, in the order of a scan.
