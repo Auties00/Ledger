@@ -897,10 +897,11 @@ final class TreeUpdate {
         var version = op.version();
         var external = op.external();
         if (external == null && version.logged()) {
-            // Read from the log only where it is used: into the leaf, or into the array the unit is sealed into
+            // Read from the log only where it is used: into the leaf or delta record that holds it inline, or into the
+            // array the unit is sealed into
             var length = version.valueLength();
             if (LeafEntry.fitsInline(key.byteSize(), length)) {
-                return new LeafEntry(key, version.value(), null, length);
+                return new LeafEntry(key, version, null, length);
             }
             var unitPages = PageFormat.pagesFor(length);
             var ref = writer.writeLoggedValue(allocate(unitPages), unitPages, version);
@@ -909,6 +910,11 @@ final class TreeUpdate {
         if (external != null) {
             // The unit holds the value: a split one is never joined for it
             return new LeafEntry(key, null, external, version.valueLength(), true);
+        }
+        var array = version.ownArray();
+        if (array != null && LeafEntry.fitsInline(key.byteSize(), array.length)) {
+            // Copied into the leaf with an array copy, without a view of it
+            return new LeafEntry(key, array, null, array.length);
         }
         var value = op.value();
         var length = value.byteSize();
