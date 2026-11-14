@@ -312,6 +312,29 @@ class LogRunTest {
             Files.write(path, rewritten);
         }
 
+        /// {@return the segment, the frame offset and the bytes of log at most from that frame that a recovery that
+        /// moves values tells each commit it replays, by sequence}
+        TreeMap<Long, long[]> logFrom() throws IOException {
+            var told = new TreeMap<Long, long[]>();
+            LogRecovery.replay(files, keys, STORE_ID, 0, 0, new LogRecovery.Sink() {
+                @Override
+                public void catalog(int keyspace, String name) {
+                }
+
+                @Override
+                public boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset,
+                                      long logFrom) {
+                    told.put(sequence, new long[]{segment.number(), frameOffset, logFrom});
+                    return true;
+                }
+
+                @Override
+                public void epoch(int epoch) {
+                }
+            }, new SpillQueue(0, keys.encrypted()));
+            return told;
+        }
+
         /// {@return what recovery replays of the log, skipping the commits up to `checkpoint`}
         Replayed replay(long checkpoint) throws IOException {
             return replay(checkpoint, -1);
@@ -512,6 +535,54 @@ class LogRunTest {
     @Nested
     @DisplayName("recovery")
     class Recovery {
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("tells each replayed frame no fewer bytes of log than start at it, and the last frame its own length, whatever segment was prepared after it")
+        void boundsTheLogFromEachFrame(boolean encrypted, @TempDir Path directory) throws Exception {
+            var log = new Log(directory, encrypted, 64L << 10);
+            var random = new Random(3);
+            for (var group = 0; group < 60; group++) {
+                log.group(1 + random.nextInt(6), 100 + random.nextInt(3_000));
+            }
+            var next = log.writer.currentSegment() + 1;
+            log.close();
+            // A segment prepared ahead, as a writer leaves one, which holds no frame
+            log.files.prepare(next, 64L << 10, true, false, () -> false);
+            var frames = new ArrayList<long[]>();
+            for (var entry : log.frames().entrySet()) {
+                for (var frame : entry.getValue()) {
+                    frames.add(new long[]{entry.getKey(), frame.offset(), frame.end() - frame.offset()});
+                }
+            }
+            assertTrue(frames.stream().mapToLong(frame -> frame[0]).distinct().count() > 2, "the log takes too few segments");
+            var told = log.logFrom();
+            assertEquals(log.last(), told.size());
+            for (var commit : told.values()) {
+                var at = 0;
+                while (frames.get(at)[0] != commit[0] || frames.get(at)[1] != commit[1]) {
+                    at++;
+                }
+                var remaining = 0L;
+                for (var later = at; later < frames.size(); later++) {
+                    remaining += frames.get(later)[2];
+                }
+                assertTrue(commit[2] >= remaining, "the frame at " + commit[1] + " of segment " + commit[0] + " is told "
+                        + commit[2] + " bytes of log, and " + remaining + " start there");
+            }
+            var lastFrame = frames.getLast();
+            assertArrayEquals(new long[]{lastFrame[0], lastFrame[1], lastFrame[2]}, told.lastEntry().getValue(),
+                    "the bytes of log the last frame is told");
+            // The segment before the last counts the last one as far as its last frame, not at its full length
+            var lastWritten = lastFrame[1] + lastFrame[2] - LogWriter.SEGMENT_HEADER;
+            var before = lastFrame[0] - 1;
+            var size = Files.size(log.files.segment(before));
+            for (var commit : told.values()) {
+                if (commit[0] == before) {
+                    assertEquals(size - commit[1] + lastWritten, commit[2], "the frame at " + commit[1] + " of segment " + before);
+                }
+            }
+        }
+
         @ParameterizedTest(name = "encrypted: {0}, checkpoint at {1}")
         @CsvSource({"true, 0", "true, 4", "false, 4", "true, 10", "false, 11", "true, 12"})
         @DisplayName("skips the commits of a run up to the checkpoint and replays the rest")
