@@ -95,9 +95,10 @@ final class SpillQueue {
     // the writer's locating of a record before the thread reads it
     private final LongSupplier current = () -> durable.getAsLong();
     private final AtomicReferenceArray<Crypto> cryptos;
-    // The values moved to the log and to arrays of their own, for tests
+    // The values moved to the log and to arrays of their own, and the records drained, for tests
     private final AtomicLong loggedValues = new AtomicLong();
     private final AtomicLong copiedValues = new AtomicLong();
+    private final AtomicLong drainedRecords = new AtomicLong();
 
     /// Creates the queue of a store.
     ///
@@ -278,6 +279,7 @@ final class SpillQueue {
                     }
                     records.pollFirst();
                     held = held - record.bytes;
+                    drainedRecords.incrementAndGet();
                     if (record.logs()) {
                         // Before any value moves there, so a checkpoint that retires segments sees the commit
                         var segment = record.segment;
@@ -386,6 +388,11 @@ final class SpillQueue {
     /// {@return the values moved to arrays of their own so far; for tests}
     long copiedValuesForTests() {
         return copiedValues.get();
+    }
+
+    /// {@return the records whose values a drain took to move so far; for tests}
+    long drainedRecordsForTests() {
+        return drainedRecords.get();
     }
 
     /// {@return the segments values moved to that no checkpoint retired, by number; for tests}

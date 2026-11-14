@@ -789,16 +789,20 @@ class LogSpillTest {
 
     @ParameterizedTest(name = "encrypted: {0}, segment of {1} bytes")
     @CsvSource({"true,65536", "false,65536", "true,1048576", "false,1048576"})
-    @DisplayName("a recovery over its budget moves the values it replays from runs and frames of their own before the log's last budget to the log at once, and keeps those of the last budget, as far as the last segment's frames reach, on chunks, never on a body")
+    @DisplayName("a recovery over its budget moves the values it replays from runs and frames of their own before the log's last budget to the log at once, and keeps those of the last budget, as far as the last segment's frames reach, on chunks the queue lists, never on a body, without draining the queue")
     void recoveryKeepsTheLastBudgetOnChunks(boolean encrypted, int segmentSize, @TempDir Path directory) throws Exception {
         var expected = new Expected();
-        var newest = 0;
+        // The messages of the last commits, long enough for the log: 1,500 and 5,000 bytes
+        var newest = List.of(16_000, 16_001);
         try (var ledger = openSized(directory, encrypted, Long.MAX_VALUE, Duration.ofMillis(20), segmentSize)) {
             long last = 0;
             for (var message = 0; message < 400; message++) {
                 // Commits of one message share runs, those of 30 take frames of their own
                 last = write(ledger, expected, message * 40, message % 10 == 0 ? 30 : 1, 0, false);
-                newest = message * 40;
+            }
+            for (var message : newest) {
+                assertTrue(value(message, 0).length >= SpillQueue.LOG_VALUE_MIN, "message " + message);
+                last = write(ledger, expected, message, 1, 0, false);
             }
             ledger.awaitDurable();
             assertTrue(ledger.log().durableSequence() >= last);
@@ -806,6 +810,13 @@ class LogSpillTest {
         }
         var budget = 64L << 10;
         try (var ledger = openSized(directory, encrypted, budget, Duration.ZERO, segmentSize)) {
+            // The values of the last budget are listed, and never more than the budget, so no drain started: one that
+            // listed every value would have drained the excess, one that listed none would hold nothing
+            var held = ledger.spills().heldForTests();
+            ledger.spills().awaitIdleForTests();
+            assertTrue(held > 0, "the recovery listed no value");
+            assertTrue(held <= budget, "the queue holds " + held + " bytes");
+            assertEquals(0, ledger.spills().drainedRecordsForTests(), "records drained");
             var logged = 0;
             for (var message : expected.messages.keySet()) {
                 var source = head(ledger, MESSAGES, key(message)).sourceForTests();
@@ -820,8 +831,10 @@ class LogSpillTest {
             }
             assertTrue(logged > 0, "the recovery moved no value to the log");
             // The last segment is longer than the budget when it is 1 MiB, and only partly written
-            assertFalse(head(ledger, MESSAGES, key(newest)).sourceForTests() instanceof LogValue, "the newest message left the heap");
-            assertTrue(ledger.spills().heldForTests() <= budget, "the queue holds " + ledger.spills().heldForTests() + " bytes");
+            for (var message : newest) {
+                assertInstanceOf(MemorySegment.class, head(ledger, MESSAGES, key(message)).sourceForTests(),
+                        "message " + message + " of the last budget");
+            }
             verify(ledger, expected);
             ledger.checkpoint();
             verify(ledger, expected);
