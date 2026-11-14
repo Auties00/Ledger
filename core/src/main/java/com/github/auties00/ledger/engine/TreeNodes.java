@@ -2,6 +2,7 @@ package com.github.auties00.ledger.engine;
 
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /// The nodes of a key space's tree in the data file: copy-on-write B+tree nodes of one page each.
@@ -474,7 +475,13 @@ final class TreeNodes {
         if (entry.blob() == null) {
             unit[position] = INLINE;
             Bytes.u16(unit, position + 1, entry.length());
-            MemorySegment.copy(entry.value(), 0, target, position + 3, entry.length());
+            if (entry.held() instanceof Version logged) {
+                logged.readLogged(unit, position + 3);
+            } else if (entry.held() instanceof byte[] array) {
+                System.arraycopy(array, 0, unit, position + 3, entry.length());
+            } else {
+                MemorySegment.copy(entry.value(), 0, target, position + 3, entry.length());
+            }
             return position + 3 + entry.length();
         }
         unit[position] = entry.external() ? EXTERNAL : BLOB;
@@ -590,14 +597,37 @@ final class TreeNodes {
     /// An entry of a leaf: a key and its value, inline, in a blob, or in a unit of [BlobFile]; in a delta record, also
     /// the removal of a key.
     ///
+    /// An inline value is held as a read-only segment; as the array that is the value, for a version that keeps its
+    /// value on an array of its own, which [#writeEntry(byte\[\], int, LeafEntry)] copies with an array copy and no view
+    /// of it; or, for the value of a version that left the heap for the log ([SpillQueue]), as that version, whose value
+    /// [#writeEntry(byte\[\], int, LeafEntry)] reads from the log straight into the unit it writes. A checkpoint then
+    /// copies such a value once, into its leaf or delta record, with nothing of its own in between.
+    ///
     /// @param key the key
-    /// @param value the inline value, or `null` if it is in a blob or a unit, or the entry is a removal
+    /// @param held the inline value: a read-only segment, an array no one writes that is the value whole, or a
+    ///             [Version] whose value is in the log ([Version#logged()]); or `null` if the value is in a blob or a
+    ///             unit, or the entry is a removal
     /// @param blob the blob or unit of the value, or `null` if it is inline, or the entry is a removal
     /// @param length the bytes of the value, or -1 for a removal
     /// @param external whether `blob` is a unit of [BlobFile] rather than a blob of the data file
-    record LeafEntry(MemorySegment key, MemorySegment value, PageRef blob, int length, boolean external) {
-        LeafEntry(MemorySegment key, MemorySegment value, PageRef blob, int length) {
-            this(key, value, blob, length, false);
+    record LeafEntry(MemorySegment key, Object held, PageRef blob, int length, boolean external) {
+        LeafEntry(MemorySegment key, Object held, PageRef blob, int length) {
+            this(key, held, blob, length, false);
+        }
+
+        /// {@return the inline value, or `null` if it is in a blob or a unit, or the entry is a removal}
+        ///
+        /// A value held as an array is viewed anew at each call.
+        ///
+        /// @throws ClassCastException if the value is in the log ([#logged()]), which no segment holds
+        MemorySegment value() {
+            return held instanceof byte[] array ? MemorySegment.ofArray(array) : (MemorySegment) held;
+        }
+
+        /// {@return the version whose value, in the log, is the entry's inline value, or `null` if the value is not
+        /// in the log}
+        Version logged() {
+            return held instanceof Version version ? version : null;
         }
 
         /// {@return the removal of `key`, as a delta record holds it}
@@ -618,7 +648,15 @@ final class TreeNodes {
             if (blob != null || other.blob != null) {
                 return blob != null && blob.equals(other.blob);
             }
-            return value == null || MemorySegment.mismatch(value, 0, length, other.value, 0, length) == -1;
+            if (held instanceof Version || other.held instanceof Version) {
+                // Not read back to compare: a value in the log is that of a write since the last checkpoint, which
+                // a delta record then holds even if it wrote the bytes the base holds
+                return held == other.held;
+            }
+            if (held instanceof byte[] array && other.held instanceof byte[] otherArray) {
+                return Arrays.equals(array, 0, length, otherArray, 0, length);
+            }
+            return held == null || MemorySegment.mismatch(value(), 0, length, other.value(), 0, length) == -1;
         }
 
         /// {@return the bytes the entry takes in a leaf, its offset and the head of its key included}

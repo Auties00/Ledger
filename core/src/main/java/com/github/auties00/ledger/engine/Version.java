@@ -152,6 +152,14 @@ sealed class Version permits Version.External {
         return Segments.toBytes((MemorySegment) held, offset, length);
     }
 
+    /// {@return the array that is the value whole, if the version keeps its value on an array of its own, or `null`}
+    ///
+    /// The array is never written, and it stays the value's: a later spill moves only a value on a segment to an
+    /// array, and never moves a value off an array but to the log.
+    byte[] ownArray() {
+        return SOURCE.getAcquire(this) instanceof byte[] array ? array : null;
+    }
+
     /// {@return the bytes of the value, 0 for a removal}
     int valueLength() {
         return length;
