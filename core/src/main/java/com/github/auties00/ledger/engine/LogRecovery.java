@@ -118,10 +118,19 @@ final class LogRecovery {
         LogFiles.Prepared empty = null;
         Path lastWritten = null;
         var buffer = new SegmentReader.Buffer();
-        // The bytes of the segments after each one that hold frames, for how much log at most follows a frame
+        // Where the frames of each segment end at most, and the bytes of those of the segments after each one, for how
+        // much log at most follows a frame; only a recovery that moves values needs them
+        var ends = new long[segments.size()];
         var after = new long[segments.size()];
-        for (var index = segments.size() - 2; spills != null && index >= 0; index--) {
-            after[index] = after[index + 1] + written(files.segment(segments.get(index + 1)));
+        if (spills != null) {
+            var lastWrittenFound = false;
+            for (var index = segments.size() - 1; index >= 0; index--) {
+                ends[index] = framesEnd(files.segment(segments.get(index)), !lastWrittenFound, crc);
+                lastWrittenFound |= ends[index] > LogWriter.SEGMENT_HEADER;
+                if (index > 0) {
+                    after[index - 1] = after[index] + Math.max(0, ends[index] - LogWriter.SEGMENT_HEADER);
+                }
+            }
         }
         for (var index = 0; index < segments.size(); index++) {
             var number = segments.get(index);
@@ -175,13 +184,7 @@ final class LogRecovery {
                 var segmentKey = keys.encrypted() ? keys.segmentKey(storeId, number, salt, useTag) : null;
                 ahead.begin(tag, useTag, segmentKey);
                 var view = spills == null ? null : spills.segment(number, path, segmentKey);
-                // Where the segment's frames end at most: the last segment that holds frames ends, in a recovery that
-                // moves values, where its chain of frame headers does, unless all of it falls in the part of the log
-                // the heap keeps
-                var segmentEnd = reader.size();
-                if (spills != null && after[index] == 0 && !spills.keepsReplayed(segmentEnd - position)) {
-                    segmentEnd = chainEnd(reader, position, tag, useTag, crc);
-                }
+                var segmentEnd = Math.max(ends[index], position);
                 var afterPadding = false;
                 while (reader.read(position, frame, 0, LogWriter.FRAME_HEADER, peek)) {
                     if (position % LogWriter.ALIGNMENT != 0) {
@@ -368,18 +371,31 @@ final class LogRecovery {
         return Arrays.copyOfRange(sealed, at, at + bodyLength);
     }
 
-    /// {@return the bytes of the segment at `path` that may hold frames: none if it was prepared and never written, its
-    /// first frame header all zeros, or it is no longer than its header; its size otherwise}
-    private static long written(Path path) throws IOException {
-        try (var channel = FileChannel.open(path, StandardOpenOption.READ)) {
-            var size = channel.size();
-            var frame = ByteBuffer.allocate(LogWriter.FRAME_HEADER);
-            while (frame.hasRemaining()) {
-                if (channel.read(frame, LogWriter.SEGMENT_HEADER + frame.position()) < 0) {
-                    return 0;
-                }
+    /// {@return where the frames of the segment at `path` end at most, [LogWriter#SEGMENT_HEADER] if it holds none}
+    ///
+    /// A segment holds none if it was prepared and never written, its first frame header all zeros, or if its header
+    /// or its first frame header is damaged. One that holds frames ends at its size, or, if `chase`, where the chain of
+    /// frame headers from its first frame ends ([#chainEnd(SegmentReader, long, long, long, CRC32C)]): a bound of the
+    /// last segment written, which a writer prepared at its full length.
+    private static long framesEnd(Path path, boolean chase, CRC32C crc) throws IOException {
+        try (var reader = new SegmentReader(path, new SegmentReader.Buffer())) {
+            var header = new byte[LogWriter.SEGMENT_HEADER];
+            var frame = new byte[LogWriter.FRAME_HEADER];
+            if (!reader.read(0, header, 0, header.length, true)
+                    || !intactSegmentHeader(header, crc)
+                    || !reader.read(LogWriter.SEGMENT_HEADER, frame, 0, LogWriter.FRAME_HEADER, true)
+                    || isZero(frame, 0, LogWriter.FRAME_HEADER)) {
+                return LogWriter.SEGMENT_HEADER;
             }
-            return isZero(frame.array(), 0, LogWriter.FRAME_HEADER) ? 0 : size;
+            if (!chase) {
+                return reader.size();
+            }
+            var tag = ByteBuffer.wrap(header).getLong(LogWriter.SALT_OFFSET);
+            if (!wholeFrameHeader(frame, tag, crc)) {
+                return LogWriter.SEGMENT_HEADER;
+            }
+            var useTag = ByteBuffer.wrap(frame).getLong(LogWriter.USE_TAG_OFFSET);
+            return chainEnd(reader, LogWriter.SEGMENT_HEADER, tag, useTag, crc);
         }
     }
 
