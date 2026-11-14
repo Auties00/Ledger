@@ -24,7 +24,14 @@ import java.nio.file.StandardOpenOption;
 ///
 /// The file is read through one channel, opened at the first read. An interrupt of a reading thread closes the
 /// channel for every thread; the read then opens it again, reads again, and gives the thread its interrupt back.
+///
+/// A value longer than the scratch a [SpillQueue.Crypto] keeps is read straight into the caller's array and decrypted
+/// there, [#SLICE] bytes per read of the channel at most: the JDK reads into a heap buffer through a temporary direct
+/// buffer of the read's size, which it keeps for the thread, so a read of a whole value of a mebibyte or more would
+/// keep that much native memory per reading thread, a checkpoint's included.
 final class LogSegmentView {
+    /// The most bytes one read of the channel takes, the size of the temporary direct buffer the JDK keeps per thread.
+    static final int SLICE = 1 << 20;
     private final long number;
     private final Path path;
     // The key of the use, or null for a store without encryption
@@ -129,7 +136,13 @@ final class LogSegmentView {
         var crypto = spills.takeCrypto();
         try {
             var start = logged.frameOffset() + LogWriter.FRAME_HEADER + logged.bodyIndex();
-            if (key == null) {
+            if (length > SpillQueue.KEPT_SCRATCH) {
+                // A scratch of the value's size would be dropped at the give-back: one buffer over the target instead
+                readFully(ByteBuffer.wrap(target), offset, length, start);
+                if (key != null) {
+                    crypto.decryptInPlace(key, logged.frameOffset(), logged.bodyIndex(), target, offset, length);
+                }
+            } else if (key == null) {
                 // Through the holder's buffer, which a read wraps once, rather than a buffer of the target per read
                 var read = crypto.scratch(length);
                 readFully(crypto.scratchBuffer(), 0, length, start);
@@ -155,15 +168,17 @@ final class LogSegmentView {
     }
 
     /// Reads `length` bytes at `position` of the file into `buffer` from `offset`, whatever the buffer's position and
-    /// limit, opening the channel again after an interrupt closed it.
+    /// limit, [#SLICE] bytes per read at most, opening the channel again after an interrupt closed it.
     private void readFully(ByteBuffer buffer, int offset, int length, long position) {
         var interrupted = false;
+        var end = offset + length;
         try {
             while (true) {
                 var open = channel();
                 try {
-                    buffer.limit(offset + length).position(offset);
-                    while (buffer.hasRemaining()) {
+                    buffer.limit(end).position(offset);
+                    while (buffer.position() < end) {
+                        buffer.limit(Math.min(end, buffer.position() + SLICE));
                         if (open.read(buffer, position + buffer.position() - offset) < 0) {
                             if (retired) {
                                 throw Retired.INSTANCE;

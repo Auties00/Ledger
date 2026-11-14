@@ -92,6 +92,14 @@ public final class LiveLedger implements Ledger {
     /// chains, its key spaces and the writes as applied), 100 KiB at this many, against two compare-and-sets of the
     /// roles and one small allocation.
     static final int FORGET_AFTER_WRITES = 1_024;
+    /// The bit of [#spillable(ArrayWriteBatch)] that lets the values a commit puts on arrays of their own leave the
+    /// heap for the log.
+    private static final int SPILL_OWN = 1;
+    /// The bit of [#spillable(ArrayWriteBatch)] that lets the values a commit keeps on the arrays it allocates leave
+    /// the heap for the log.
+    private static final int SPILL_HOMES = 2;
+    /// The spill room of the [Applier] of a commit a recovery replays.
+    private static final int REPLAYED = -1;
     private static final VarHandle LAST_PUBLISHED;
     private static final VarHandle LATEST;
 
@@ -474,7 +482,7 @@ public final class LiveLedger implements Ledger {
             return false;
         }
         var next = new int[1];
-        var applier = new Applier(sequence, null, 4, false, false, false, true);
+        var applier = new Applier(sequence, null, 4, false, false, 0, true);
         // The writes that went to runs rather than to chains
         var runWrites = new int[1];
         // Made at the first put the queue lists, so a commit with none allocates no record
@@ -1703,16 +1711,26 @@ public final class LiveLedger implements Ledger {
         return segment == null ? null : MemorySegment.ofArray(Segments.toBytes(segment)).asReadOnly();
     }
 
-    /// {@return whether the values `writes` keeps on its arrays may leave the heap for the log: arrays a commit
-    /// allocates, not a slab's chunks, with a value long enough to move to the log, unless the queue is over its budget}
+    /// {@return which values `writes` keeps may leave the heap for the log, as bits: [#SPILL_OWN] for the values of
+    /// paged key spaces it put on arrays of their own, [#SPILL_HOMES] for those on arrays a commit allocates, not a
+    /// slab's chunks, with a value long enough to move to the log, unless the queue is over its budget; 0 for none}
     ///
-    /// Only such a commit allocates a record of its values, and only for a key space whose samples let its values
-    /// leave ([ValueSlab.Overwrites#spills()]), so a commit of small values allocates nothing while the queue is within
-    /// its budget, nor does one of a key space that removes or replaces what it writes before a checkpoint.
-    private boolean spillable(ArrayWriteBatch writes) {
+    /// Only such a commit allocates a record of its values: for a value on an array of its own, at least half a
+    /// chunk, whatever the key space's samples say, and for one on an array the commit allocates only in a key space
+    /// whose samples let its values leave ([ValueSlab.Overwrites#spills()]). So a commit of small values allocates
+    /// nothing while the queue is within its budget, nor does one of a key space that removes or replaces what it
+    /// writes before a checkpoint, and the values of a batch on a slab's chunk stay there even beside one on an array
+    /// of its own.
+    private int spillable(ArrayWriteBatch writes) {
         var queue = spills;
-        return queue != null && writes.homesAllocated()
-                && (writes.largestValueBytes() >= SpillQueue.LOG_VALUE_MIN || queue.over());
+        if (queue == null) {
+            return 0;
+        }
+        var kinds = writes.ownsPagedValues() ? SPILL_OWN : 0;
+        if (writes.homesAllocated() && (writes.largestValueBytes() >= SpillQueue.LOG_VALUE_MIN || queue.over())) {
+            kinds |= SPILL_HOMES;
+        }
+        return kinds;
     }
 
     /// {@return the decoded value of a put of `value` to the resident key space `state`: `decoded` if the put has it or
@@ -2805,17 +2823,19 @@ public final class LiveLedger implements Ledger {
         // Whether the publication of the commit listed them with their key spaces
         private boolean deferredListed;
         // The room for values of the record of the values the commit's puts keep on their batch's arrays, which may
-        // leave the heap for the log, or 0 if they may not; or -1 for a commit recovery replays, which lists none and
-        // whose puts the key spaces' samples of overwrites leave out. From ValueSlab.Overwrites.BULK_WRITES, the commit
-        // samples every put to a key space not yet judged, so a store of few large commits lists values from its first.
-        // The record, made at the first such value, is the frame's and queued once the commit is published. One int,
-        // which with the flags above fills the applier's last eight bytes, where a flag of its own for a replayed commit
-        // took eight more
+        // leave the heap for the log: positive if those on the arrays the commit allocates may, besides those on arrays
+        // of their own, -1 - room if only those on arrays of their own may, 0 if none may; or REPLAYED for a commit
+        // recovery replays, which lists none and whose puts the key spaces' samples of overwrites leave out. From
+        // ValueSlab.Overwrites.BULK_WRITES of positive room, the commit samples every put to a key space not yet judged,
+        // so a store of few large commits lists values from its first. The record, made at the first such value, is the
+        // frame's and queued once the commit is published. One int, which with the flags above fills the applier's last
+        // eight bytes, where a flag of its own for a replayed commit, or for the arrays the commit allocates, took eight
+        // more
         private final int spillRoom;
 
         /// Creates the applier of a transaction, journaled in a frame if `journaled`.
         Applier(long sequence, boolean journaled) {
-            this(sequence, journaled ? FrameBody.forTransaction(pool) : null, 4, false, false, false);
+            this(sequence, journaled ? FrameBody.forTransaction(pool) : null, 4, false, false, 0);
         }
 
         /// Creates the applier of a commit of about `writes` writes.
@@ -2825,9 +2845,9 @@ public final class LiveLedger implements Ledger {
         ///                       commit: only for a batch that runs alone in a store in a directory
         /// @param sharesChunk whether the batch put the values the store keeps on one chunk of the [ValueSlab], as the
         ///                    log's estimate of the commit's heap takes it
-        /// @param spillable whether the values its puts keep on their batch's arrays may leave the heap for the log
-        ///                  ([#spillable(ArrayWriteBatch)])
-        Applier(long sequence, FrameBody frame, int writes, boolean deferredRanges, boolean sharesChunk, boolean spillable) {
+        /// @param spillable which values its puts keep on their batch's arrays may leave the heap for the log, as
+        ///                  [#spillable(ArrayWriteBatch)] gives them
+        Applier(long sequence, FrameBody frame, int writes, boolean deferredRanges, boolean sharesChunk, int spillable) {
             this(sequence, frame, writes, deferredRanges, sharesChunk, spillable, false);
         }
 
@@ -2835,7 +2855,7 @@ public final class LiveLedger implements Ledger {
         ///
         /// A replayed commit is not [sampled][ValueSlab.Overwrites#sampled(long)]: its overwrites are of versions an
         /// earlier process wrote, which say nothing of the slab's chunks in this one.
-        Applier(long sequence, FrameBody frame, int writes, boolean deferredRanges, boolean sharesChunk, boolean spillable,
+        Applier(long sequence, FrameBody frame, int writes, boolean deferredRanges, boolean sharesChunk, int spillable,
                 boolean replaying) {
             this.sequence = sequence;
             // Most commits write one or two key spaces
@@ -2845,7 +2865,10 @@ public final class LiveLedger implements Ledger {
             this.frame = frame;
             this.deferredRanges = deferredRanges;
             this.sharesChunk = sharesChunk;
-            this.spillRoom = replaying ? -1 : spillable && frame != null ? Math.max(1, writes) : 0;
+            this.spillRoom = replaying ? REPLAYED
+                    : spillable == 0 || frame == null ? 0
+                    : (spillable & SPILL_HOMES) != 0 ? Math.max(1, writes)
+                    : -1 - Math.max(1, writes);
         }
 
         /// {@return the version the last write of the commit added}
@@ -3027,7 +3050,7 @@ public final class LiveLedger implements Ledger {
             var stamp = nextStamp();
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
-            if (source != null && spillRoom >= 0 && !state.resident && (ValueSlab.Overwrites.sampled(stamp)
+            if (source != null && spillRoom != REPLAYED && !state.resident && (ValueSlab.Overwrites.sampled(stamp)
                     || spillRoom >= ValueSlab.Overwrites.BULK_WRITES && !state.overwrites.judged())) {
                 state.overwrites.sample(head, length);
             }
@@ -3090,8 +3113,11 @@ public final class LiveLedger implements Ledger {
                 } else {
                     frame.put(state.id, key, value);
                 }
-                if (spillRoom > 0 && source != null && own == null && external == null && !state.resident
-                        && state.overwrites != null && state.overwrites.spills()) {
+                // A value on an array of its own lists without the key space's samples, which spare a batch's shared
+                // array kept alive for a value replaced before it moves: that array lives as long as its version anyway
+                if (spillRoom != 0 && spillRoom != REPLAYED && external == null && !state.resident && (own != null
+                        ? length >= SpillQueue.LOG_VALUE_MIN
+                        : spillRoom > 0 && source != null && state.overwrites.spills())) {
                     listSpill(version, length);
                 }
             }
@@ -3102,7 +3128,7 @@ public final class LiveLedger implements Ledger {
         private void listSpill(Version version, int length) {
             var record = frame.spill();
             if (record == null) {
-                record = spills.record(sequence, spillRoom);
+                record = spills.record(sequence, spillRoom > 0 ? spillRoom : -1 - spillRoom);
                 frame.spill(record);
             }
             // A put ends with its value, whether the frame copies it or refers to it
@@ -3328,7 +3354,7 @@ public final class LiveLedger implements Ledger {
                 }
                 deferredListed = true;
             }
-            if (spillRoom > 0) {
+            if (spillRoom != 0 && spillRoom != REPLAYED) {
                 var record = frame.spill();
                 if (record != null) {
                     spills.add(record);
