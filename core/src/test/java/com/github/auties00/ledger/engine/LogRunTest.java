@@ -227,13 +227,13 @@ class LogRunTest {
                 body.put(1, MemorySegment.ofArray(key), MemorySegment.ofArray(value));
             }
             bodies.add(Arrays.copyOf(body.array(), body.size()));
-            batch.add(FrameBody.COMMIT, bodies.size(), body, 0, size > 0 ? 1 : 0, false);
+            batch.add(FrameBody.COMMIT, bodies.size(), body, 0, 0, size > 0 ? 1 : 0, false);
         }
 
         /// Adds `body` to `batch` as the next commit, recording the bytes it holds.
         void add(LogWriter.Batch batch, FrameBody body) {
             bodies.add(body.toBytes());
-            batch.add(FrameBody.COMMIT, bodies.size(), body, 0, body.size() > 0 ? 1 : 0, false);
+            batch.add(FrameBody.COMMIT, bodies.size(), body, 0, 0, body.size() > 0 ? 1 : 0, false);
         }
 
         /// {@return the sequence of the last commit given}
@@ -415,7 +415,7 @@ class LogRunTest {
             for (var size : new int[]{100, 100, 100, 100, 100, 20_000, 100, 0, 100}) {
                 log.add(batch, size);
             }
-            batch.add(FrameBody.CATALOG, log.last(), catalog, 0, 0, false);
+            batch.add(FrameBody.CATALOG, log.last(), catalog, 0, 0, 0, false);
             log.add(batch, 100);
             log.add(batch, 100);
             log.writer.appendAll(batch);
@@ -1092,7 +1092,7 @@ class LogRunTest {
             for (var i = 0; i < body.chunkCount(); i++) {
                 arrays.add(body.chunk(i));
             }
-            batch.add(FrameBody.COMMIT, log.last(), body, 0, 1, false);
+            batch.add(FrameBody.COMMIT, log.last(), body, 0, 0, 1, false);
             return arrays;
         }
 
@@ -1138,7 +1138,7 @@ class LogRunTest {
                 small.put(1, MemorySegment.ofArray(new byte[]{1, 2, 3}), MemorySegment.ofArray(new byte[1_000]));
                 log.bodies.add(small.toBytes());
                 released.add(small.array());
-                batch.add(FrameBody.COMMIT, log.last(), small, 0, 1, false);
+                batch.add(FrameBody.COMMIT, log.last(), small, 0, 0, 1, false);
                 for (var i = 0; i < 20; i++) {
                     log.add(batch, 100);
                 }

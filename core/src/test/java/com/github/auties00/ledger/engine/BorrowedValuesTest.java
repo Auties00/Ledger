@@ -74,6 +74,14 @@ class BorrowedValuesTest {
         return ((LiveLedger) ledger).state(keyspace).chain(MemorySegment.ofArray(key.getBytes())).head;
     }
 
+    // Asserts that the version of a borrowed value names its unit alone, with no copy of the value in memory
+    private static void assertUnitOnly(Version version, int length) {
+        assertInstanceOf(BlobFile.class, version.sourceForTests());
+        assertInstanceOf(Version.External.class, version);
+        assertEquals(0, version.sourceBytesForTests());
+        assertEquals(length, version.valueLength());
+    }
+
     private static void assertReads(Ledger ledger, String key, byte[] expected) {
         assertArrayEquals(expected, ledger.get(FILES, key).orElseThrow());
         assertArrayEquals(expected, ledger.readEncoded(FILES, key, segment -> segment.toArray(ValueLayout.JAVA_BYTE)).orElseThrow());
@@ -197,7 +205,7 @@ class BorrowedValuesTest {
             var buffer = exact.clone();
             try (var ledger = options(directory, encrypted).build()) {
                 ledger.commit(ledger.newBatch().put(FILES, "exact", buffer)).awaitDurable();
-                assertNotSame(buffer, head(ledger, FILES, "exact").sourceForTests());
+                assertUnitOnly(head(ledger, FILES, "exact"), EXACT);
                 scribble(buffer);
                 assertReads(ledger, "exact", exact);
                 buffer = odd.clone();
@@ -230,6 +238,7 @@ class BorrowedValuesTest {
             var buffer = exact.clone();
             var ledger = options(directory, true).build();
             ledger.commit(ledger.newBatch().put(FILES, "exact", buffer).put(FILES, "small", new byte[]{1})).awaitDurable();
+            assertUnitOnly(head(ledger, FILES, "exact"), EXACT);
             scribble(buffer);
             assertReads(ledger, "exact", exact);
             ((LiveLedger) ledger).closeWithoutCheckpoint();
@@ -254,6 +263,8 @@ class BorrowedValuesTest {
                 scribble(encoded);
                 sealed = caller.clone();
                 ledger.commit(batch).awaitDurable();
+                assertUnitOnly(head(ledger, FILES, "borrowed"), ODD);
+                assertUnitOnly(head(ledger, FILES, "copied"), ODD);
                 assertReads(ledger, "borrowed", sealed);
                 assertReads(ledger, "copied", expectedEncoded);
                 ledger.checkpoint();
@@ -262,6 +273,35 @@ class BorrowedValuesTest {
             try (var ledger = options(directory, true).build()) {
                 assertReads(ledger, "borrowed", sealed);
                 assertReads(ledger, "copied", expectedEncoded);
+            }
+        }
+
+        @ParameterizedTest(name = "removing a range: {0}")
+        @ValueSource(booleans = {false, true})
+        @DisplayName("commits a borrowed value with no copy of it: the put and the commit allocate a small part of its length on the committing thread, and its version names the unit alone")
+        void noCopy(boolean alone, @TempDir Path directory) throws Exception {
+            var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+            var length = 8 << 20;
+            try (var ledger = options(directory, true).build()) {
+                // The first commit of each kind fills the pools the seal and the frame take from
+                for (var round = 0; round < 2; round++) {
+                    var caller = value(21 + round, length);
+                    var expected = caller.clone();
+                    var batch = ledger.newBatch();
+                    if (alone) {
+                        batch.deleteRange(NOTES, KeyRange.between("a", "b"));
+                    }
+                    var before = threads.getCurrentThreadAllocatedBytes();
+                    var commit = ledger.commit(batch.put(FILES, "k" + round, caller));
+                    var allocated = threads.getCurrentThreadAllocatedBytes() - before;
+                    commit.awaitDurable();
+                    if (round == 1) {
+                        assertTrue(allocated < length / 4, allocated + " bytes allocated by a commit of " + length);
+                    }
+                    assertUnitOnly(head(ledger, FILES, "k" + round), length);
+                    scribble(caller);
+                    assertReads(ledger, "k" + round, expected);
+                }
             }
         }
 
@@ -350,6 +390,7 @@ class BorrowedValuesTest {
                 assertThrows(IllegalStateException.class, () -> ledger.commit(batch));
                 fails.set(false);
                 ledger.commit(batch).awaitDurable();
+                assertUnitOnly(head(ledger, FILES, "odd"), ODD);
                 scribble(buffer);
                 assertReads(ledger, "odd", odd);
                 ledger.checkpoint();
@@ -366,6 +407,7 @@ class BorrowedValuesTest {
             try (var ledger = options(directory, true).build()) {
                 ledger.commit(ledger.newBatch().put(FILES, "a", new byte[]{1}).put(FILES, "b", new byte[]{2})).awaitDurable();
                 ledger.commit(ledger.newBatch().deleteRange(FILES, KeyRange.between("a", "c")).put(FILES, "c", buffer)).awaitDurable();
+                assertUnitOnly(head(ledger, FILES, "c"), EXACT);
                 scribble(buffer);
                 assertTrue(ledger.get(FILES, "a").isEmpty());
                 assertReads(ledger, "c", exact);
