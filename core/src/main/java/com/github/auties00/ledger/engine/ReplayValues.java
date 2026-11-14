@@ -4,7 +4,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.Collections;
 import java.util.IdentityHashMap;
-import java.util.Map;
+import java.util.List;
 import java.util.Set;
 
 /// The arrays an open copies the values it replays to paged key spaces into, so their versions keep none of the
@@ -109,11 +109,15 @@ final class ReplayValues {
         return runs.remove(state);
     }
 
-    /// {@return the builders of the runs of every key space that has one, which the replay no longer builds}
-    Map<KeyspaceState, PackedRun.Builder> takeRuns() {
-        var taken = new IdentityHashMap<>(runs);
-        runs.clear();
-        return taken;
+    /// {@return the builder of the run of `state`, or `null` if it has none: no write went to it yet, or the key space
+    /// replays to chains}
+    PackedRun.Builder building(KeyspaceState state) {
+        return runs.get(state);
+    }
+
+    /// {@return the key spaces whose runs are being built, a copy}
+    List<KeyspaceState> runStates() {
+        return List.copyOf(runs.keySet());
     }
 
     /// Forgets the last frame body and gives the [SpillQueue.Crypto] it took back to `queue`, as the replay ends.
