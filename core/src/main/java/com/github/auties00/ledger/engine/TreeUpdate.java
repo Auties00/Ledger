@@ -236,7 +236,7 @@ final class TreeUpdate {
                 case Written written -> result = new ArrayList<>(written.nodes());
                 case Rewrite rewrite -> {
                     retire(rewrite.ref(), rewrite.base());
-                    result = writeLeaves(rewrite.merged(), new One(rewrite.ref()));
+                    result = writeLeaves(rewrite.merged(), rewrite);
                 }
             }
         }
@@ -384,24 +384,28 @@ final class TreeUpdate {
         }
         if (run.size() > 1) {
             var entries = new ArrayList<LeafEntry>();
-            var refs = new PageRef[run.size()];
-            var ends = new int[run.size()];
-            for (var i = 0; i < run.size(); i++) {
-                var rewrite = run.get(i);
+            for (var rewrite : run) {
                 entries.addAll(rewrite.merged());
-                refs[i] = rewrite.ref();
-                ends[i] = entries.size();
             }
             var sizes = sizes(entries);
             var target = target(run);
             if (splitsTogether(run, sizes, target)) {
+                var refs = new PageRef[run.size()];
+                var ends = new int[run.size()];
+                var end = 0;
+                for (var i = 0; i < refs.length; i++) {
+                    var rewrite = run.get(i);
+                    refs[i] = rewrite.ref();
+                    end += rewrite.merged().size();
+                    ends[i] = end;
+                }
                 out.addAll(writeLeaves(entries, sizes, TreeNodes.split(sizes, sizes.length, target), new Run(refs, ends)));
                 run.clear();
                 return;
             }
         }
         for (var rewrite : run) {
-            out.addAll(writeLeaves(rewrite.merged(), new One(rewrite.ref())));
+            out.addAll(writeLeaves(rewrite.merged(), rewrite));
         }
         run.clear();
     }
@@ -633,7 +637,13 @@ final class TreeUpdate {
     /// @param inserted the keys the writes added
     /// @param gaps the places between two old keys that new keys landed in, the one past the last old key included
     /// @param resized whether the entries take other bytes than the leaf's did
-    private record Rewrite(PageRef ref, PageRef base, List<LeafEntry> merged, int inserted, int gaps, boolean resized) implements Replacement {
+    private record Rewrite(PageRef ref, PageRef base, List<LeafEntry> merged, int inserted, int gaps, boolean resized)
+            implements Replacement, Replaced {
+        /// {@inheritDoc} The leaf `ref` gave every entry.
+        @Override
+        public boolean read(PageFile pages, int from, int to) {
+            return pages.referenced(ref);
+        }
     }
 
     /// The entries of a leaf after the writes that change it.
