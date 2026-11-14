@@ -3,6 +3,7 @@ package com.github.auties00.ledger.engine;
 import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.LedgerIoException;
 
+import javax.crypto.Cipher;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.EOFException;
 import java.io.IOException;
@@ -12,6 +13,8 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.security.InvalidKeyException;
+import java.util.concurrent.atomic.AtomicReference;
 
 /// One use of a log segment, the writing of one open or the frames one recovery replayed, as the values that left the
 /// heap for it are read back from ([LogValue]).
@@ -24,6 +27,10 @@ import java.nio.file.StandardOpenOption;
 ///
 /// The file is read through one channel, opened at the first read. An interrupt of a reading thread closes the
 /// channel for every thread; the read then opens it again, reads again, and gives the thread its interrupt back.
+///
+/// The keystream of a value comes from an AES-ECB cipher initialized under the key of the use once, at the first read,
+/// and kept for the next: a checkpoint reads values back in key order, which interleaves the uses they moved to, and an
+/// initialization per value allocated the key schedule of each.
 final class LogSegmentView {
     private final long number;
     private final Path path;
@@ -32,6 +39,9 @@ final class LogSegmentView {
     private final SpillQueue spills;
     private final Object lock;
     private volatile FileChannel channel;
+    // The cipher that makes the keystream under key, or null before the first read, while a read holds it, and without
+    // encryption; a read that finds it taken makes one of its own, which it leaves here if the place is empty
+    private final AtomicReference<Cipher> blocks;
     private volatile boolean retired;
     // The lowest and highest sequence of the commits whose values were moved here, written holding the lock of the
     // queue; Long.MAX_VALUE and -1 before any
@@ -47,6 +57,7 @@ final class LogSegmentView {
         this.key = key;
         this.spills = spills;
         this.lock = new Object();
+        this.blocks = new AtomicReference<>();
         this.lowest = Long.MAX_VALUE;
         this.highest = -1;
         this.coveredAt = -1;
@@ -104,6 +115,7 @@ final class LogSegmentView {
     void retire() {
         synchronized (lock) {
             retired = true;
+            blocks.set(null);
             var open = channel;
             channel = null;
             if (open != null) {
@@ -130,13 +142,21 @@ final class LogSegmentView {
         try {
             var start = logged.frameOffset() + LogWriter.FRAME_HEADER + logged.bodyIndex();
             if (key == null) {
-                readFully(target, offset, length, start);
+                // Through the holder's buffer, which a read wraps once, rather than a buffer of the target per read
+                var read = crypto.scratch(length);
+                readFully(crypto.scratchBuffer(), 0, length, start);
+                System.arraycopy(read, 0, target, offset, length);
             } else {
                 // From the first byte of the block holding the value's first, which the keystream starts from
                 var skip = logged.bodyIndex() & (SpillQueue.BLOCK - 1);
                 var sealed = crypto.scratch(skip + length);
-                readFully(sealed, 0, skip + length, start - skip);
-                crypto.decrypt(key, logged.frameOffset(), logged.bodyIndex(), sealed, skip, length, target, offset);
+                readFully(crypto.scratchBuffer(), 0, skip + length, start - skip);
+                var cipher = takeBlocks();
+                // Not given back if it failed, which leaves its state unknown
+                crypto.decrypt(cipher, logged.frameOffset(), logged.bodyIndex(), sealed, skip, length, target, offset);
+                if (!retired) {
+                    blocks.compareAndSet(null, cipher);
+                }
             }
             if (!crypto.verifies(target, offset, length, stamp, logged)) {
                 if (retired) {
@@ -151,15 +171,31 @@ final class LogSegmentView {
         }
     }
 
-    /// Reads `length` bytes at `position` of the file into `target` from `offset`, opening the channel again after an
-    /// interrupt closed it.
-    private void readFully(byte[] target, int offset, int length, long position) {
+    /// {@return the cipher that makes the keystream under the use's key, which the caller alone holds until it gives
+    /// it back: the one kept here, or a new one if another read holds it}
+    private Cipher takeBlocks() {
+        var cipher = blocks.getAndSet(null);
+        if (cipher != null) {
+            return cipher;
+        }
+        cipher = SpillQueue.Crypto.newBlocks();
+        try {
+            cipher.init(Cipher.ENCRYPT_MODE, key);
+        } catch (InvalidKeyException exception) {
+            throw new IllegalStateException("AES failed", exception);
+        }
+        return cipher;
+    }
+
+    /// Reads `length` bytes at `position` of the file into `buffer` from `offset`, whatever the buffer's position and
+    /// limit, opening the channel again after an interrupt closed it.
+    private void readFully(ByteBuffer buffer, int offset, int length, long position) {
         var interrupted = false;
         try {
             while (true) {
                 var open = channel();
                 try {
-                    var buffer = ByteBuffer.wrap(target, offset, length);
+                    buffer.limit(offset + length).position(offset);
                     while (buffer.hasRemaining()) {
                         if (open.read(buffer, position + buffer.position() - offset) < 0) {
                             if (retired) {
