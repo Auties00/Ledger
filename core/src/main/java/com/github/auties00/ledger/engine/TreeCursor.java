@@ -42,7 +42,7 @@ import java.util.HashMap;
 /// 188 megabytes rather than 103, which the process keeps resident as heap until it collects. The reads ahead run on
 /// the calling thread and on threads it waits for, so none outlives the call that made it, and a unit they cannot read
 /// is read again, by the cursor, when it reaches it.
-final class TreeCursor {
+final class TreeCursor implements StoredCursor {
     /// The leaves and blobs a cursor adds to the page cache, enough for the pages of a chat a reader scrolls through.
     static final int ADMITTED = 64;
     /// The leaves the first gather of a cursor reads, the one it needs among them; each later one reads twice as many
@@ -204,7 +204,8 @@ final class TreeCursor {
     /// Moves to the next entry in the cursor's order.
     ///
     /// @return whether there is one
-    boolean next() {
+    @Override
+    public boolean next() {
         if (exhausted) {
             return false;
         }
@@ -232,7 +233,8 @@ final class TreeCursor {
     ///
     /// Entries the cursor moved to that the scan hid or took from memory instead count nothing, so a scan whose first
     /// entries in the tree are hidden still reads ahead only what it may take.
-    void took() {
+    @Override
+    public void took() {
         taken++;
     }
 
@@ -277,18 +279,21 @@ final class TreeCursor {
     }
 
     /// {@return the key of the current entry, a read-only view of the leaf}
-    MemorySegment key() {
+    @Override
+    public MemorySegment key() {
         return TreeNodes.leafKey(leaf, entry);
     }
 
     /// {@return a negative number, zero or a positive number as the current entry's key sorts before, with or after
     /// `key`}
-    int compareKey(MemorySegment key) {
+    @Override
+    public int compareKey(MemorySegment key) {
         return TreeNodes.compare(leaf, TreeNodes.leafKeyOffset(entry), TreeNodes.leafKeyLength(leaf, entry), key);
     }
 
     /// {@return the value of the current entry, read-only, read from its blob if it has one}
-    MemorySegment value() {
+    @Override
+    public MemorySegment value() {
         if (TreeNodes.isInline(leaf, entry)) {
             return TreeNodes.inlineValue(leaf, entry);
         }
@@ -381,7 +386,8 @@ final class TreeCursor {
 
     /// Gives back to the store's pool the arrays the cursor read leaves and blobs ahead into, which it no longer uses:
     /// once its scan is done, as it reads nothing afterwards.
-    void release() {
+    @Override
+    public void release() {
         if (held != null) {
             letGo();
         }

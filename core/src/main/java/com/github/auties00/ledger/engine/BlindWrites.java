@@ -2,6 +2,7 @@ package com.github.auties00.ledger.engine;
 
 import java.lang.foreign.MemorySegment;
 import java.util.function.Predicate;
+import java.util.function.ToIntFunction;
 
 /// The writes of one key space whose effect on its count is not known yet.
 ///
@@ -111,6 +112,25 @@ final class BlindWrites {
             total += effect(state, write);
         }
         return total;
+    }
+
+    /// Settles each listed write whose effect is not known yet and whose key `prior` knows the state of before the
+    /// write, as [TreeSearch#FOUND] or [TreeSearch#ABSENT]; [TreeSearch#UNKNOWN] leaves the write to the trees.
+    ///
+    /// For the writes the open replayed after a write of the same key it kept in a [PackedRun]: the trees lack that
+    /// write, which the run holds instead.
+    void settle(ToIntFunction<MemorySegment> prior) {
+        var current = run;
+        var end = current.end;
+        for (var i = current.start; i < end; i++) {
+            var chain = current.chains[i];
+            if (chain.blindState() == TreeSearch.UNKNOWN) {
+                var state = prior.applyAsInt(chain.key());
+                if (state != TreeSearch.UNKNOWN) {
+                    chain.settle(state == TreeSearch.FOUND);
+                }
+            }
+        }
     }
 
     /// {@return a chain of no key whose blind write's effect is known to be `state`}

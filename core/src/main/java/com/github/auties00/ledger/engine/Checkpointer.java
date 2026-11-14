@@ -633,6 +633,12 @@ final class Checkpointer implements IdleTicker.Watched {
 
     /// {@return the roots of every key space's tree after the cut, by id}
     ///
+    /// A checkpoint of the trees the store opened from merges the run of the writes the open replayed into each paged key
+    /// space ([PackedRun]) with the keys written since: a key's version at the cut wins over the run's entry, which
+    /// is the key's state where no version is at or below the cut. The update records whether the tree held each key of
+    /// the run, which counts the run's writes. A checkpoint that fails leaves the run to the next one, which merges it
+    /// again, over the same trees.
+    ///
     /// @param adopted receives the units of the file of large values the trees take
     private TreeRoot[] build(LiveLedger.Cut cut, TreeUpdate update, Set<PageRef> adopted) throws IOException {
         var roots = cut.base() == null ? new TreeRoot[cut.maxId() + 1] : cut.base().roots(cut.maxId() + 1);
@@ -643,14 +649,39 @@ final class Checkpointer implements IdleTicker.Watched {
             // Listed in the order of their writes, off the publishing role: sorted here
             var chains = keyspace.dirty().toArray(Chain[]::new);
             ChainSort.sort(chains);
-            var ops = new ArrayList<TreeUpdate.Op>(chains.length);
+            // The run the open replayed, if the trees the checkpoint updates are those the store opened from
+            var run = state.run;
+            if (run != null && run.maxStamp() <= treeBound) {
+                run = null;
+            }
+            var runEntries = run == null ? 0 : run.size();
+            var settles = run == null ? null : run.settles();
+            var ops = new ArrayList<TreeUpdate.Op>(chains.length + runEntries);
             var removals = keyspace.removals();
+            // The next entry of the run in the order of the keys
+            var position = 0;
             Chain previous = null;
             for (var chain : chains) {
                 if (previous != null && Chain.sameKey(previous, chain)) {
                     continue;
                 }
                 previous = chain;
+                // The run's entries of the keys before the chain's go first; one of the chain's key goes with the chain
+                var entry = -1;
+                while (position < runEntries) {
+                    var next = run.entryAt(position);
+                    var runKey = run.key(next);
+                    var order = chain.compareKey(runKey);
+                    if (order < 0) {
+                        break;
+                    }
+                    position++;
+                    if (order == 0) {
+                        entry = next;
+                        break;
+                    }
+                    ops.add(runOp(run, next, runKey, settles, removals, treeBound, bound));
+                }
                 // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
                 // otherwise another one, or none
                 var current = chain.released() ? state.chain(chain.key()) : chain;
@@ -659,21 +690,29 @@ final class Checkpointer implements IdleTicker.Watched {
                 var version = KeyspaceState.resolve(current == null ? null : current.head, key, bound, removals);
                 if (version == null && !state.resident) {
                     // No version at the cut in a paged key space: a commit that wrote the key rolled back, so the
-                    // tree is right. A resident one holds every entry, so there the key is gone
+                    // tree is right, with the run's entry if it has one. A resident one holds every entry, so there the
+                    // key is gone
+                    if (entry >= 0) {
+                        ops.add(runOp(run, entry, run.key(entry), settles, removals, treeBound, bound));
+                    }
                     continue;
                 }
                 // A blind write the cut takes, the chain's first and so at or below the cut, which sees a version of it:
                 // the leaf the update merges tells whether the tree held the key
                 var blind = current != null && current.blindState() == TreeSearch.UNKNOWN ? current : null;
                 if (version == null || version == Version.HIDDEN) {
-                    ops.add(new TreeUpdate.Op(chain, null, blind));
+                    ops.add(new TreeUpdate.Op(chain, null, blind, settles, entry));
                 } else {
-                    ops.add(new TreeUpdate.Op(chain, version, blind));
+                    ops.add(new TreeUpdate.Op(chain, version, blind, settles, entry));
                     var external = version.external();
                     if (external != null) {
                         adopted.add(external);
                     }
                 }
+            }
+            for (; position < runEntries; position++) {
+                var next = run.entryAt(position);
+                ops.add(runOp(run, next, run.key(next), settles, removals, treeBound, bound));
             }
             var ranges = new ArrayList<TreeUpdate.Range>();
             for (var removal : keyspace.removals()) {
@@ -686,10 +725,19 @@ final class Checkpointer implements IdleTicker.Watched {
             var pendingRanges = state.ranges.correction(cut.sequence());
             var base = roots[state.id];
             var root = update.apply(base, ops, TreeUpdate.merge(ranges));
-            // The update settled the blind writes up to the cut but those of keys it skipped, looked up here
-            var blind = state.blind.correction(cut.sequence(), key -> base != null && TreeSearch.contains(pages, base, key));
+            // The update settled the blind writes up to the cut but those of keys it skipped, looked up here, in the run
+            // first: its writes are older than the blind ones of its keys
+            var merged = run;
+            var blind = state.blind.correction(cut.sequence(), key -> {
+                var entry = merged == null ? -1 : merged.find(key);
+                if (entry >= 0) {
+                    return !merged.removes(entry);
+                }
+                return base != null && TreeSearch.contains(pages, base, key);
+            });
             var count = root == null ? 0 : root.count();
-            var expected = keyspace.count() + blind + pendingRanges;
+            // Counted from what the update settled, and kept once the run is gone
+            var expected = keyspace.count() + state.replayCorrection() + blind + pendingRanges;
             if (count != expected) {
                 throw new IllegalStateException("The checkpoint of " + state.keyspace.name() + " holds " + count
                         + " entries where the store counts " + expected);
@@ -697,6 +745,25 @@ final class Checkpointer implements IdleTicker.Watched {
             roots[state.id] = root;
         }
         return roots;
+    }
+
+    /// {@return the state of the key of `entry` of `run`, `key`, as of the cut: the run's value, or none if the entry
+    /// removes the key or a range removal since the trees `treeBound` holds, and within `bound`, covers it, every such
+    /// removal being newer than the run's writes}
+    ///
+    /// @param settles where the update records whether the tree held the key ([PackedRun#settles()])
+    private static TreeUpdate.Op runOp(PackedRun run, int entry, MemorySegment key, byte[] settles, RangeRemoval[] removals,
+                                       long treeBound, long bound) {
+        var version = run.version(entry);
+        if (version != null) {
+            for (var removal : removals) {
+                if (removal.stamp() > treeBound && removal.stamp() <= bound && removal.covers(key)) {
+                    version = null;
+                    break;
+                }
+            }
+        }
+        return new TreeUpdate.Op(new Chain(key, 0), version, null, settles, entry);
     }
 
     private PageRef writeCatalog(LiveLedger.Cut cut, TreeRoot[] roots, PageFile.Writer writer, TreeUpdate update) throws IOException {

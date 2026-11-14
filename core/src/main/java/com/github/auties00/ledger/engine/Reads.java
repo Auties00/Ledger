@@ -22,6 +22,11 @@ import java.util.function.Function;
 /// A key with a version in memory at or below the bound reads that version; any other key reads the tree, unless a
 /// range removal stamped after the tree's checkpoint and within the bound covers it.
 ///
+/// A paged key space of a store that crashed may hold the writes its open replayed as a [PackedRun], which a reader
+/// whose tree is the one the store opened from reads as part of that tree ([#runOf(KeyspaceState, ReadPoint)]): a key
+/// of the run reads the run's entry instead of the tree's, which the same range removals hide. A reader of a later tree
+/// reads that tree alone. Without a run, a read pays one load of a field and a test for `null`.
+///
 /// A resident key space reads memory alone, but for the keys its loader has not put there yet ([ResidentLoader]):
 /// those it reads from the tree alone, where every read finds them as it sees them. A read checks where a key is
 /// before it reads memory, so the chains the loader installed before it moved past the key are there. A scan does so
@@ -51,6 +56,15 @@ final class Reads {
     @SuppressWarnings("unchecked")
     private static <V> V value(KeyspaceState state, Keyspace<?, V> keyspace, MemorySegment value, Object decoded) {
         return state.resident && decoded != null ? (V) decoded : keyspace.values().decode(value);
+    }
+
+    /// {@return the run of the writes the open replayed into `state` that `point` reads as part of its tree, or `null`}
+    ///
+    /// The run is part of the tree a reader reads while that tree is the one the store opened from, or the reader
+    /// reads none: every checkpoint after the open holds every write of the run.
+    static PackedRun runOf(KeyspaceState state, ReadPoint point) {
+        var run = state.run;
+        return run == null || run.maxStamp() <= point.treeBound() ? null : run;
     }
 
     /// {@return whether a range removal the tree of `point` does not hold, and `point` sees, covers `key`}
@@ -94,14 +108,35 @@ final class Reads {
                 : TreeSearch.value(point.pages(), unit, entry, true, true, screened);
     }
 
-    /// {@return whether the tree of `point` holds `key` and no later removal `point` sees hides it}
-    static boolean inTree(KeyspaceState state, MemorySegment key, ReadPoint point, RangeRemoval[] removals) {
-        var root = point.root(state);
-        return root != null && TreeSearch.contains(point.pages(), root, key) && !hiddenSinceTree(key, point, removals);
+    /// {@return the value of `key` in the tree of `point`, with the run it reads over it, or `null` if they hold none or
+    /// a later removal hides it}
+    private static MemorySegment storedValue(KeyspaceState state, byte[] key, ReadPoint point, RangeRemoval[] removals) {
+        var run = runOf(state, point);
+        if (run != null) {
+            var entry = run.find(key);
+            if (entry >= 0) {
+                return run.removes(entry) || hiddenSinceTree(key, point, removals) ? null : run.value(entry);
+            }
+        }
+        return treeValue(key, point, point.root(state), removals, !state.resident);
     }
 
-    /// {@return whether the tree of `point` holds `key`, whatever range removal since hides it}
+    /// {@return whether the tree of `point`, with the run it reads over it, holds `key` and no later removal `point`
+    /// sees hides it}
+    static boolean inTree(KeyspaceState state, MemorySegment key, ReadPoint point, RangeRemoval[] removals) {
+        return inTreeOnly(state, key, point) && !hiddenSinceTree(key, point, removals);
+    }
+
+    /// {@return whether the tree of `point`, with the run it reads over it, holds `key`, whatever range removal since
+    /// hides it}
     static boolean inTreeOnly(KeyspaceState state, MemorySegment key, ReadPoint point) {
+        var run = runOf(state, point);
+        if (run != null) {
+            var entry = run.find(key);
+            if (entry >= 0) {
+                return !run.removes(entry);
+            }
+        }
         var root = point.root(state);
         return root != null && TreeSearch.contains(point.pages(), root, key);
     }
@@ -114,6 +149,13 @@ final class Reads {
         var version = KeyspaceState.resolve(head, key, point.bound(), removals);
         if (version != null) {
             return version != Version.HIDDEN ? TreeSearch.FOUND : TreeSearch.ABSENT;
+        }
+        var run = runOf(state, point);
+        if (run != null) {
+            var entry = run.find(key);
+            if (entry >= 0) {
+                return run.removes(entry) || hiddenSinceTree(key, point, removals) ? TreeSearch.ABSENT : TreeSearch.FOUND;
+            }
         }
         if (point.root(state) == null || hiddenSinceTree(key, point, removals)) {
             return TreeSearch.ABSENT;
@@ -142,8 +184,8 @@ final class Reads {
     /// {@return whether `point` sees `key`, whose newest version in memory is `head`}
     ///
     /// @param head the newest version of `key` in memory, or `null` if there is none
-    /// @param inTree whether the tree `point` reads holds `key`, as a lookup of that same tree found it, or
-    ///               [TreeSearch#UNKNOWN] to look it up
+    /// @param inTree whether the tree `point` reads holds `key`, with the run it reads over it, as a lookup of that same
+    ///               tree found it, or [TreeSearch#UNKNOWN] to look it up
     static boolean exists(KeyspaceState state, Version head, MemorySegment key, ReadPoint point, byte inTree) {
         var removals = state.removals;
         var version = KeyspaceState.resolve(head, key, point.bound(), removals);
@@ -159,10 +201,11 @@ final class Reads {
     /// {@return the entries `point` sees from `from`, included, to `to`, excluded, either `null` for no bound}
     ///
     /// It reads the tree's nodes on the paths to the bounds, and looks up in the tree each key of the range that has a
-    /// version in memory.
+    /// version in memory, and each key of the range of the run it reads over the tree.
     static long count(KeyspaceState state, MemorySegment from, MemorySegment to, ReadPoint point) {
         var removals = state.removals;
         var root = point.root(state);
+        var run = runOf(state, point);
         var total = 0L;
         for (var entry : state.slice(from, to).entrySet()) {
             var version = KeyspaceState.resolve(entry.getValue().head, entry.getKey(), point.bound(), removals);
@@ -170,13 +213,13 @@ final class Reads {
                 // Counted with the tree
                 continue;
             }
-            var counted = root != null && inTree(state, entry.getKey(), point, removals);
+            var counted = inTree(state, entry.getKey(), point, removals);
             total += (version == Version.HIDDEN ? 0 : 1) - (counted ? 1 : 0);
         }
-        if (root == null) {
+        if (root == null && run == null) {
             return total;
         }
-        total += TreeSearch.count(point.pages(), root, from, to);
+        total += storedCount(point, root, run, from, to);
         var hidden = new ArrayList<TreeUpdate.Range>();
         var treeBound = point.treeBound();
         for (var removal : removals) {
@@ -188,10 +231,17 @@ final class Reads {
             var low = from == null ? range.from() : range.from() == null || Segments.compare(range.from(), from) < 0 ? from : range.from();
             var high = to == null ? range.to() : range.to() == null || Segments.compare(range.to(), to) > 0 ? to : range.to();
             if (low == null || high == null || Segments.compare(low, high) < 0) {
-                total -= TreeSearch.count(point.pages(), root, low, high);
+                total -= storedCount(point, root, run, low, high);
             }
         }
         return total;
+    }
+
+    /// {@return the entries from `from`, included, to `to`, excluded, either `null` for no bound, of the tree under
+    /// `root`, or none if `null`, with `run` over it, or none if `null`}
+    private static long storedCount(ReadPoint point, TreeRoot root, PackedRun run, MemorySegment from, MemorySegment to) {
+        var count = root == null ? 0 : TreeSearch.count(point.pages(), root, from, to);
+        return run == null ? count : count + run.correction(from, to);
     }
 
     /// {@return the value `point` sees under `key`}
@@ -221,6 +271,16 @@ final class Reads {
                 return Optional.of(bytes ? (V) version.copyBytes() : keyspace.values().decode(version.value()));
             } catch (LogSegmentView.Retired _) {
                 checkTreeHolds(version, point);
+            }
+        }
+        var run = runOf(state, point);
+        if (run != null) {
+            var entry = run.find(encoded);
+            if (entry >= 0) {
+                if (run.removes(entry) || hiddenSinceTree(encoded, point, removals)) {
+                    return Optional.empty();
+                }
+                return Optional.of(bytes ? (V) run.valueBytes(entry) : keyspace.values().decode(run.value(entry)));
             }
         }
         return treeGet(keyspace, encoded, point, point.root(state), removals, bytes, !state.resident);
@@ -306,8 +366,8 @@ final class Reads {
                         "A value in a retired log segment is missing from the tree of its reader");
             }
         } else {
-            value = treeValue(encoded, point, loaded ? point.root(state) : point.treeRoot(state), removals,
-                    !state.resident);
+            value = loaded ? storedValue(state, encoded, point, removals)
+                    : treeValue(encoded, point, point.treeRoot(state), removals, false);
             if (value == null) {
                 return Optional.empty();
             }
@@ -324,7 +384,8 @@ final class Reads {
     /// Passes the entries of `range` `point` sees to `consumer`, in the order of the range, until it returns `false`.
     ///
     /// It merges the versions in memory with the tree: a key with a version in memory at or below the bound takes it,
-    /// and shadows the tree's entry for the same key. A descending scan steps down the chains in memory along their
+    /// and shadows the tree's entry for the same key. The tree's entries come with those of the run `point` reads over
+    /// the tree, if there is one ([PackedRun.Cursor]). A descending scan steps down the chains in memory along their
     /// links ([KeyspaceState#walk]). A resident key space whose loader has not put every entry in memory reads through a
     /// [ResidentScan].
     ///
@@ -357,9 +418,11 @@ final class Reads {
             return new ResidentScan(state, loader, point, removals, from, to, descending, consumer).run();
         }
         var root = point.root(state);
+        var run = runOf(state, point);
         var memory = state.walk(from, to, descending);
-        var tree = root == null ? null
+        var cursor = root == null ? null
                 : new TreeCursor(point.pages(), root, fromBytes, toBytes, descending, wanted, !state.resident);
+        StoredCursor tree = run == null ? cursor : new PackedRun.Cursor(run, cursor, from, to, descending);
         try {
             var inTree = tree != null && tree.next();
             var held = memory.next();

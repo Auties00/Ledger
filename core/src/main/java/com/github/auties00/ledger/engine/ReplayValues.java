@@ -2,6 +2,10 @@ package com.github.auties00.ledger.engine;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Map;
+import java.util.Set;
 
 /// The arrays an open copies the values it replays to paged key spaces into, so their versions keep none of the
 /// decrypted frame bodies they came in.
@@ -18,8 +22,11 @@ import java.lang.foreign.ValueLayout;
 /// the log: it moves the others to the log at once, tagged where they lie in their bodies with the [SpillQueue.Crypto]
 /// this holds for the replay, so the bytes of most of a long log's values are never copied.
 ///
+/// It also holds the [PackedRun]s the replay builds of the writes of paged key spaces before the log's last budget, whose
+/// shorter values lie in the same chunks.
+///
 /// One open makes one for its replay, which runs on the opening thread before the store starts its threads, and drops
-/// it after: the last chunk is then reachable through its versions alone.
+/// it after: the last chunk is then reachable through its versions and runs alone.
 final class ReplayValues {
     /// The bytes of a chunk: below half a G1 region of a 4 GiB heap, as the batches' chunks are, so not humongous.
     static final int CHUNK_BYTES = FrameBody.CHUNK_BYTES;
@@ -36,6 +43,9 @@ final class ReplayValues {
     private MemorySegment frameView;
     // The ciphers that tag the values moved to the log, taken at the first, or null
     private SpillQueue.Crypto crypto;
+    // The runs being built, by key space, and the key spaces that replay to chains from a range removal on
+    private final IdentityHashMap<KeyspaceState, PackedRun.Builder> runs = new IdentityHashMap<>();
+    private final Set<KeyspaceState> toChains = Collections.newSetFromMap(new IdentityHashMap<>());
 
     /// {@return whether a value of `length` bytes shares a chunk, rather than taking an array of its own}
     static boolean shared(int length) {
@@ -78,6 +88,31 @@ final class ReplayValues {
         if (taken == null) {
             taken = crypto = queue.takeCrypto();
         }
+        return taken;
+    }
+
+    /// {@return the builder of the run of `state`, made at the first call, or `null` once the key space replays to
+    /// chains ([#stopRun(KeyspaceState)])}
+    PackedRun.Builder run(KeyspaceState state) {
+        var run = runs.get(state);
+        if (run == null && !toChains.contains(state)) {
+            run = new PackedRun.Builder();
+            runs.put(state, run);
+        }
+        return run;
+    }
+
+    /// {@return the builder of the run of `state`, or `null` if it has none, which no write goes to from now on: the
+    /// key space replays to chains}
+    PackedRun.Builder stopRun(KeyspaceState state) {
+        toChains.add(state);
+        return runs.remove(state);
+    }
+
+    /// {@return the builders of the runs of every key space that has one, which the replay no longer builds}
+    Map<KeyspaceState, PackedRun.Builder> takeRuns() {
+        var taken = new IdentityHashMap<>(runs);
+        runs.clear();
         return taken;
     }
 

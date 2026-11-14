@@ -284,16 +284,21 @@ final class Segments {
     /// Chains are indexed by the hash of their segments, so a lookup by an array that hashed its bytes otherwise would
     /// miss them and read the tree.
     static int hash(byte[] array) {
-        var length = array.length;
+        return hash(array, 0, array.length);
+    }
+
+    /// {@return the hash of the `length` bytes at `from` of `array`, the one [#hash(MemorySegment)] gives a segment of
+    /// the same bytes}
+    static int hash(byte[] array, int from, int length) {
         var hash = HASH_SEED ^ length * 0x9E3779B97F4A7C15L;
         var offset = 0;
         for (; offset + Long.BYTES <= length; offset += Long.BYTES) {
-            hash = fold(hash ^ (long) NATIVE_LONG.get(array, offset), HASH_KEY);
+            hash = fold(hash ^ (long) NATIVE_LONG.get(array, from + offset), HASH_KEY);
         }
         if (offset < length) {
             var tail = 0L;
             for (var shift = 0; offset < length; offset++, shift += 8) {
-                tail |= (array[offset] & 0xFFL) << shift;
+                tail |= (array[from + offset] & 0xFFL) << shift;
             }
             hash = fold(hash ^ tail, HASH_KEY);
         }
