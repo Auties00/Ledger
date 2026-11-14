@@ -954,12 +954,12 @@ class PageCacheTest {
         @DisplayName("tells apart a key under two nonces, and records an eviction only once it holds bits")
         void noncesAndEvictions() {
             var doorkeeper = new Doorkeeper();
-            doorkeeper.evicted(1, 1, Doorkeeper.FIRST_KEYS);
+            doorkeeper.remember(1, 1, Doorkeeper.FIRST_KEYS);
             assertEquals(0, doorkeeper.bytesForTests(), "an eviction started the doorkeeper");
             assertFalse(doorkeeper.admit(1, 1, Doorkeeper.FIRST_KEYS));
             assertFalse(doorkeeper.admit(1, 2, Doorkeeper.FIRST_KEYS));
             assertTrue(doorkeeper.admit(1, 1, Doorkeeper.FIRST_KEYS));
-            doorkeeper.evicted(2, 1, Doorkeeper.FIRST_KEYS);
+            doorkeeper.remember(2, 1, Doorkeeper.FIRST_KEYS);
             assertTrue(doorkeeper.admit(2, 1, Doorkeeper.FIRST_KEYS));
         }
     }
