@@ -53,8 +53,16 @@ import java.util.zip.CRC32C;
 /// encrypted log are opened ahead on the other processors ([FrameReadAhead]) while the earlier ones replay, each read
 /// into an array of the read-ahead's own that the frames after it reuse: recovery then reads only the headers and the
 /// padding of such a segment itself, through a window of a page and a header, and fills the buffer only for a frame the
-/// read-ahead does not hold, so each byte of the log is read once. The commits of a run are passed where they lie in
-/// their frame's body, never copied out of it.
+/// read-ahead does not hold, so the replay reads each byte of the log once. The commits of a run are passed where they
+/// lie in their frame's body, never copied out of it.
+///
+/// A recovery that moves values off the heap bounds the log that follows each frame before it replays
+/// ([Sink#commit(long, byte\[\], int, int, LogSegmentView, long, long)]): it reads the header and the first frame
+/// header of every segment, and the chain of frame headers of the last segment that holds frames
+/// ([#framesEnd(Path, boolean, CRC32C)]), through a window of a page and a header that a buffer of its own fills at
+/// each header the window does not hold. That segment is read twice, once by this pass and once by the replay: where
+/// its frames are shorter than a page, as the groups of a group-committed log are, the pass reads all of it a window
+/// at a time, up to a whole segment; where they are longer, a window for each frame.
 final class LogRecovery {
     /// The bytes of the buffer: below half a G1 region of 2 MiB, as [LogWriter#OUTPUT] is, so not humongous.
     private static final int BUFFER = LogWriter.OUTPUT;
