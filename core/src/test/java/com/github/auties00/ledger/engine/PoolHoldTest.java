@@ -196,16 +196,23 @@ class PoolHoldTest {
             if (armed.get() && kind == ChangeInterceptor.ChangeKind.WRITE && path.endsWith(PageFile.FILE) && probes.get() < 3) {
                 probes.incrementAndGet();
                 var pool = HeapPool.process();
-                // The chunks of a bulk write's frames, sealed while the checkpoint runs, past the reserve
-                for (var i = 0; i < 12; i++) {
-                    pool.release(new byte[CHUNK]);
+                // The chunks of a bulk write's frames, sealed while the checkpoint runs, past the reserve; a collection
+                // the allocations start after the last release frees their overflow before it is probed, so they are
+                // released again
+                Object set = null;
+                for (var round = 0; round < 3 && set == null; round++) {
+                    for (var i = 0; i < 12; i++) {
+                        pool.release(new byte[CHUNK]);
+                    }
+                    set = pool.overflowForTests(CHUNK);
+                }
+                if (set == null) {
+                    chunksMissing.incrementAndGet();
                 }
                 // Reached from here only through the probes
                 var pages = new WeakReference<>(pool.overflowForTests(PageFormat.SIZE));
-                var chunks = new WeakReference<>(pool.overflowForTests(CHUNK));
-                if (chunks.refersTo(null)) {
-                    chunksMissing.incrementAndGet();
-                }
+                var chunks = new WeakReference<>(set);
+                set = null;
                 System.gc();
                 System.gc();
                 if (!pages.refersTo(null)) {

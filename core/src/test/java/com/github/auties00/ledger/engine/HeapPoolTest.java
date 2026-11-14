@@ -260,9 +260,14 @@ class HeapPoolTest {
         var hold = pool.hold(64 << 10);
         releaseNew(pool, (int) (HeapPool.RESERVE_PER_SIZE / 4_096) + 40, 4_096);
         releaseNew(pool, (int) (HeapPool.RESERVE_PER_SIZE / (64 << 10)) + 3, 64 << 10);
+        // A young collection in the middle of the releases would free the overflow of chunks, which the hold does not
+        // reach, before it is counted: a hold of its own keeps it until then
+        var chunkHold = pool.holdSize(CHUNK);
         var chunks = releaseNew(pool, 12, CHUNK);
         assertEquals(40L * 4_096 + 3L * (64 << 10) + 8L * CHUNK, pool.overflowBytesForTests());
         var probe = new WeakReference<>(chunks.getLast());
+        Reference.reachabilityFence(chunkHold);
+        chunkHold = null;
         chunks.clear();
         for (var i = 0; i < 50 && probe.get() != null; i++) {
             System.gc();
@@ -271,9 +276,12 @@ class HeapPoolTest {
         assertNull(pool.overflowForTests(CHUNK));
         assertEquals(40L * 4_096 + 3L * (64 << 10), pool.overflowBytesForTests(), "a collection freed the overflow of a held size");
         assertEquals(HeapPool.RESERVE_PER_SIZE / CHUNK, pool.freeForTests(CHUNK).size(), "the reserve of chunks");
-        // The overflow of chunks is made again, reached only weakly
+        // The overflow of chunks is made again, reached only weakly, so a hold of its own keeps it until it is counted
+        chunkHold = pool.holdSize(CHUNK);
         releaseNew(pool, 2, CHUNK);
         assertEquals(40L * 4_096 + 3L * (64 << 10) + 2L * CHUNK, pool.overflowBytesForTests());
+        Reference.reachabilityFence(chunkHold);
+        chunkHold = null;
         Reference.reachabilityFence(hold);
         hold = null;
         collectOverflow(pool);
