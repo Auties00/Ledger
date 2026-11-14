@@ -49,6 +49,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -887,11 +888,14 @@ class LogSpillTest {
                         ledgerHolder.get().log().readableSequence()});
             }
         });
+        // Long enough to hold every group after the move to the segment written with zeros, so the log never rolls
+        // over again and every group of a few messages goes through
+        var segmentSize = 8L << 20;
         var expected = new Expected();
         var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(disk.getPath("/store"))
                 .encryption(Encryption.key(KEY))
                 .keyspace(MESSAGES).keyspace(TEXTS).keyspace(CHATS).commitWindow(Duration.ZERO))
-                .segmentSize(64 << 10)
+                .segmentSize(segmentSize)
                 .spillBudget(0)
                 .writeThrough(WriteThrough.Mode.DSYNC)
                 .build();
@@ -902,34 +906,37 @@ class LogSpillTest {
             ledger.state(TEXTS).overwrites.forceSpillsForTests();
             var log = ledger.log();
             var message = 0;
-            // Segments enough for a checkpoint to leave spares, which the log writes groups through into
-            while (log.currentSegment() < 12) {
+            // Commits that wait for the log, until it moves to the next segment, which it writes with zeros once
+            // enough groups waited and writes every group through after, whatever the speed of the device
+            var segment = log.currentSegment();
+            var deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(1);
+            while (log.currentSegment() == segment) {
+                if (System.nanoTime() > deadline) {
+                    fail("the log never moved to the segment written with zeros");
+                }
                 write(ledger, expected, message++, 1, 0, true);
+                Thread.sleep(1);
             }
-            ledger.checkpoint();
             var through = 0;
             var forced = 0;
-            for (var attempt = 0; attempt < 400 && (through < 4 || forced < 4); attempt++) {
+            for (var round = 0; round < 8; round++) {
                 var writtenThrough = log.writtenThrough();
                 forces.clear();
                 armed.set(true);
-                // Two messages, which the log writes through into a spare, or more than a segment holds, which it
-                // writes into the cache, rolls over and forces
-                var count = attempt % 2 == 0 ? 2 : 30;
+                // Two messages, which the log writes through, or more than one write takes, which it writes into the
+                // cache and forces
+                var count = round % 2 == 0 ? 2 : 500;
                 var sequence = write(ledger, expected, message, count, 0, true);
                 message += count;
                 armed.set(false);
-                // The last force of the segment the group ended in: a force of the segment it rolled over from, or of
-                // one prepared after it, is not the group's
+                // The last force of the segment the group ended in, not of one prepared after it
                 long[] seen = null;
                 for (var force : forces) {
                     if (force[0] == log.currentSegment()) {
                         seen = force;
                     }
                 }
-                if (seen == null) {
-                    continue;
-                }
+                assertNotNull(seen, "no force of the segment of group " + round);
                 if (log.writtenThrough() > writtenThrough) {
                     through++;
                     assertTrue(seen[1] < sequence, "a group written through was readable before its write returned");
@@ -938,12 +945,12 @@ class LogSpillTest {
                     assertTrue(seen[1] >= sequence, "a forced group was not readable at its force");
                 }
             }
-            assertTrue(through >= 4, "groups written through: " + through);
-            assertTrue(forced >= 4, "groups forced: " + forced);
+            assertEquals(4, through, "groups written through");
+            assertEquals(4, forced, "groups forced");
             ledger.spills().awaitIdleForTests();
             verify(ledger, expected);
         }
-        try (var reopened = openJudged(disk.getPath("/store"), true, 0, Duration.ZERO, 64 << 10)) {
+        try (var reopened = openJudged(disk.getPath("/store"), true, 0, Duration.ZERO, segmentSize)) {
             verify(reopened, expected);
         }
     }
