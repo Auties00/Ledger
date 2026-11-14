@@ -41,7 +41,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class RecoveryBufferTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.utf8());
-    private static final int BUFFER = 1 << 20;
+    private static final int BUFFER = LogWriter.OUTPUT;
     private static final long LARGE_SEGMENT = 8L << 20;
     private static final long SMALL_SEGMENT = 256L << 10;
 
@@ -379,8 +379,8 @@ class RecoveryBufferTest {
             var disk = CrashFileSystem.create();
             var path = disk.getPath("/segment");
             var data = write(path, 3 * BUFFER, 7);
-            try (var reader = new LogRecovery.SegmentReader(path, null)) {
-                assertEquals(BUFFER, reader.buffer().length);
+            try (var reader = new LogRecovery.SegmentReader(path, new LogRecovery.SegmentReader.Buffer())) {
+                assertEquals(BUFFER, reader.capacity());
                 var cases = new long[][]{{0, 100}, {500, 1_000}, {BUFFER - 10, 100}, {BUFFER + 5, BUFFER}, {2 * BUFFER + 4, BUFFER - 4},
                         {BUFFER, 1}};
                 for (var span : cases) {
@@ -402,7 +402,7 @@ class RecoveryBufferTest {
             var disk = CrashFileSystem.create();
             var path = disk.getPath("/segment");
             write(path, 2 * BUFFER, 3);
-            try (var reader = new LogRecovery.SegmentReader(path, null)) {
+            try (var reader = new LogRecovery.SegmentReader(path, new LogRecovery.SegmentReader.Buffer())) {
                 assertTrue(reader.view(0, 16) >= 0);
                 truncate(path, BUFFER + BUFFER / 2);
                 assertEquals(-1, reader.view(BUFFER + BUFFER / 4, BUFFER / 2));
@@ -424,35 +424,65 @@ class RecoveryBufferTest {
             var smallData = new byte[3];
             Files.write(small, smallData);
             var largerData = write(larger, BUFFER + 100, 13);
+            var shared = new LogRecovery.SegmentReader.Buffer();
             byte[] buffer;
-            try (var reader = new LogRecovery.SegmentReader(full, null)) {
+            try (var reader = new LogRecovery.SegmentReader(full, shared)) {
                 assertTrue(reader.view(10, BUFFER - 20) >= 0);
                 buffer = reader.buffer();
+                assertEquals(BUFFER, buffer.length);
             }
-            try (var reader = new LogRecovery.SegmentReader(small, buffer)) {
-                assertSame(buffer, reader.buffer());
+            try (var reader = new LogRecovery.SegmentReader(small, shared)) {
                 var read = new byte[3];
                 assertTrue(reader.read(0, read, 0, 3));
+                assertSame(buffer, reader.buffer());
                 assertArrayEquals(smallData, read);
                 assertTrue(reader.isZero(0, 4096), "bytes past the end count as zero, whatever the buffer held");
                 assertFalse(reader.read(1, new byte[3], 0, 3));
                 assertEquals(-1, reader.view(0, 4));
             }
+            var fresh = new LogRecovery.SegmentReader.Buffer();
             byte[] shorter;
-            try (var reader = new LogRecovery.SegmentReader(small, null)) {
+            try (var reader = new LogRecovery.SegmentReader(small, fresh)) {
+                assertTrue(reader.read(0, new byte[3], 0, 3));
                 shorter = reader.buffer();
                 assertEquals(3, shorter.length);
             }
-            try (var reader = new LogRecovery.SegmentReader(larger, shorter)) {
+            try (var reader = new LogRecovery.SegmentReader(larger, fresh)) {
+                var at = reader.view(BUFFER - 50, 150);
                 assertNotSame(shorter, reader.buffer());
                 assertEquals(BUFFER, reader.buffer().length);
-                var at = reader.view(BUFFER - 50, 150);
                 assertTrue(at >= 0);
                 assertArrayEquals(Arrays.copyOfRange(largerData, BUFFER - 50, BUFFER + 100),
                         Arrays.copyOfRange(reader.buffer(), at, at + 150));
                 var direct = new byte[BUFFER + 100];
                 assertTrue(reader.read(0, direct, 0, direct.length), "a read longer than the buffer goes to the file");
                 assertArrayEquals(largerData, direct);
+            }
+        }
+
+        @Test
+        @DisplayName("peeks through a window of a page and a header, which holds the padding after a frame and the next page's first header, and makes the buffer whole only for a view")
+        void peeks() throws IOException {
+            var disk = CrashFileSystem.create();
+            var path = disk.getPath("/segment");
+            var data = write(path, 3 * BUFFER, 5);
+            try (var reader = new LogRecovery.SegmentReader(path, new LogRecovery.SegmentReader.Buffer())) {
+                var position = 10_000;
+                var header = new byte[LogWriter.FRAME_HEADER];
+                assertTrue(reader.read(position, header, 0, header.length, true));
+                assertArrayEquals(Arrays.copyOfRange(data, position, position + header.length), header);
+                var window = reader.buffer();
+                assertEquals(LogWriter.ALIGNMENT + LogWriter.FRAME_HEADER, window.length);
+                // Read from the window alone: the file no longer holds them
+                truncate(path, position + 1);
+                var boundary = (position / LogWriter.ALIGNMENT + 1) * LogWriter.ALIGNMENT;
+                assertFalse(reader.isZero(position + header.length, boundary - position - header.length));
+                var next = new byte[LogWriter.FRAME_HEADER];
+                assertTrue(reader.read(boundary, next, 0, next.length, true));
+                assertArrayEquals(Arrays.copyOfRange(data, boundary, boundary + next.length), next);
+                assertSame(window, reader.buffer());
+                assertEquals(-1, reader.view(boundary + LogWriter.ALIGNMENT, 100), "a view past the window reads the file");
+                assertEquals(BUFFER, reader.buffer().length);
             }
         }
     }

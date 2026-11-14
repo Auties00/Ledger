@@ -4,7 +4,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 /// The arrays an open copies the values it replays to paged key spaces into, so their versions keep none of the
-/// decrypted frame bodies they came in.
+/// decrypted frame bodies they came in once the open ends.
 ///
 /// A body also holds the commit's keys, which the chains copy, its resident values, which the resident versions copy,
 /// and its own encoding: a version on a slice of it would keep about twice the bytes of its value, and the slice, until
@@ -13,6 +13,10 @@ import java.lang.foreign.ValueLayout;
 /// one, takes an array of its own, so a chunk leaves fewer than that many bytes unused at its end. A chunk is a new array
 /// no pool hands out or takes back, and nothing writes again where a value was copied, so it stays as the copy left it
 /// until a checkpoint takes the last version on it.
+///
+/// A store that moves values off the heap copies here only those its queue keeps once the replay ends: the others stay
+/// on their bodies until they move to the log ([SpillQueue#settleReplay(ReplayValues)]), so the bytes of most of a long
+/// log's values are never copied.
 ///
 /// One open makes one for its replay, which runs on the opening thread before the store starts its threads, and drops
 /// it after: the last chunk is then reachable through its versions alone.
@@ -26,30 +30,49 @@ final class ReplayValues {
     private byte[] chunk;
     private MemorySegment view;
     private int fill;
+    // The frame body the last commit replayed came in and its read-only view, which its commits share; null once the
+    // replay ends
+    private byte[] frame;
+    private MemorySegment frameView;
 
     /// {@return whether a value of `length` bytes shares a chunk, rather than taking an array of its own}
     static boolean shared(int length) {
         return length > 0 && length <= SHARED_BYTES;
     }
 
-    /// Copies the `length` bytes of `value`, which [#shared(int)] lets share a chunk, into the current chunk, after
-    /// the values copied there before, or into a new chunk if it has no room for them.
+    /// Copies the `length` bytes at `offset` of `value`, which [#shared(int)] lets share a chunk, into the current
+    /// chunk, after the values copied there before, or into a new chunk if it has no room for them.
     ///
     /// @return where the copy starts in [#view()]
-    int copy(MemorySegment value, int length) {
+    int copy(MemorySegment value, long offset, int length) {
         if (chunk == null || fill > CHUNK_BYTES - length) {
             chunk = new byte[CHUNK_BYTES];
             view = MemorySegment.ofArray(chunk).asReadOnly();
             fill = 0;
         }
         var at = fill;
-        MemorySegment.copy(value, ValueLayout.JAVA_BYTE, 0, chunk, at, length);
+        MemorySegment.copy(value, ValueLayout.JAVA_BYTE, offset, chunk, at, length);
         fill = at + length;
         return at;
     }
 
-    /// {@return the read-only view of the chunk the last [#copy(MemorySegment, int)] copied into}
+    /// {@return the read-only view of the chunk the last [#copy(MemorySegment, long, int)] copied into}
     MemorySegment view() {
         return view;
+    }
+
+    /// {@return a read-only segment of the whole of `body`, a frame body, the same for the commits of a run}
+    MemorySegment frame(byte[] body) {
+        if (frame != body) {
+            frame = body;
+            frameView = MemorySegment.ofArray(body).asReadOnly();
+        }
+        return frameView;
+    }
+
+    /// Forgets the last frame body, as the replay ends.
+    void endFrames() {
+        frame = null;
+        frameView = null;
     }
 }

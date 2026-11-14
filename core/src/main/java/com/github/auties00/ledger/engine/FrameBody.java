@@ -966,14 +966,15 @@ final class FrameBody {
         }
     }
 
-    /// Reads a commit body, passing each write to `visitor`.
+    /// Reads the commit body that is the `length` bytes at `start` of `body`, passing each write to `visitor`.
     ///
-    /// The segments the visitor receives are read-only slices of `body`, which the caller must not change afterward.
+    /// The segments the visitor receives are slices of `view`, a read-only segment of the whole of `body`, which the
+    /// caller must not change afterward: the address of each is where it starts in `body`.
     ///
     /// @throws LedgerCorruptedException if the body is malformed
-    static void readCommit(byte[] body, Visitor visitor) {
-        var reader = new Reader(body);
-        while (reader.position < body.length) {
+    static void readCommit(byte[] body, MemorySegment view, int start, int length, Visitor visitor) {
+        var reader = new Reader(body, view, start, start + length);
+        while (reader.position < reader.end) {
             var kind = reader.readByte();
             var keyspace = Math.toIntExact(reader.readVarInt());
             switch (kind) {
@@ -1004,7 +1005,7 @@ final class FrameBody {
     static final class RunReader {
         private final Reader reader;
         private final int length;
-        // Where the body the last next() returned starts in the run body
+        // Where the body of the commit the last next() passed over starts in the run body
         private int start;
 
         /// Reads the run body `run`.
@@ -1023,18 +1024,18 @@ final class FrameBody {
             return reader.position < length;
         }
 
-        /// {@return a copy of the body of the next commit, an array of its own as the body of a commit frame is}
+        /// Passes over the body of the next commit, which then starts at [#start()] of the run body.
         ///
+        /// @return the bytes of that body
         /// @throws LedgerCorruptedException if the entry is malformed or runs past the run
-        byte[] next() {
+        int next() {
             var size = (int) reader.readLength();
             start = reader.position;
-            var body = Arrays.copyOfRange(reader.body, reader.position, reader.position + size);
             reader.position += size;
-            return body;
+            return size;
         }
 
-        /// {@return where the body [#next()] returned last starts in the run body}
+        /// {@return where the body of the commit [#next()] passed over last starts in the run body}
         int start() {
             return start;
         }
@@ -1069,15 +1070,24 @@ final class FrameBody {
     private static final class Reader {
         private final byte[] body;
         private final MemorySegment memory;
+        // Where the bytes read end in body
+        private final int end;
         private int position;
 
         Reader(byte[] body) {
+            this(body, MemorySegment.ofArray(body).asReadOnly(), 0, body.length);
+        }
+
+        /// Reads the bytes of `body` from `start` to `end`, `memory` being a read-only segment of the whole of it.
+        Reader(byte[] body, MemorySegment memory, int start, int end) {
             this.body = body;
-            this.memory = MemorySegment.ofArray(body).asReadOnly();
+            this.memory = memory;
+            this.end = end;
+            this.position = start;
         }
 
         void check(long length) {
-            if (length < 0 || length > body.length - position) {
+            if (length < 0 || length > end - position) {
                 throw new LedgerCorruptedException("A log frame holds a field longer than the frame", null);
             }
         }

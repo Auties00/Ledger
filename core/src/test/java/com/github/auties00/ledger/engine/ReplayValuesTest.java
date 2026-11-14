@@ -300,7 +300,7 @@ class ReplayValuesTest {
         frame.put(ledger.state(SESSIONS).id, MemorySegment.ofArray(new byte[]{1}), MemorySegment.ofArray(filled(2_000, 2)));
         frame.put(ledger.state(MESSAGES).id, MemorySegment.ofArray(new byte[]{8}), MemorySegment.ofArray(filled(1_000, 3)));
         var body = frame.toBytes();
-        assertTrue(ledger.replay(ledger.latest() + 1, body, new ReplayValues()));
+        assertTrue(ledger.replay(ledger.latest() + 1, body, 0, body.length, new ReplayValues(), null, 0));
         return new WeakReference<>(body);
     }
 

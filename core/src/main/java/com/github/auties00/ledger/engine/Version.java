@@ -19,7 +19,8 @@ import java.lang.invoke.VarHandle;
 /// The value of a paged version waiting for a checkpoint may leave its batch's array for the log, which holds it too
 /// ([SpillQueue]): [#spill] replaces the source, once, with a [LogValue] or with an array of the value alone. Every
 /// read loads the source once and takes the offset only with a segment, so a read that races the replacement reads
-/// either the old source with its offset or the new one, which needs none.
+/// either the old source with its offset or the new one, which needs none. A value a recovery replayed onto its frame
+/// body that is still there as the recovery ends is copied off it by [#settle], before any read.
 sealed class Version permits Version.External {
     // Before HIDDEN, whose constructor uses it
     private static final VarHandle OLDER;
@@ -44,10 +45,11 @@ sealed class Version permits Version.External {
     // array, and whose segment and session, 72 bytes, a read of its encoding makes; or the SplitValue of a large value
     // its batch kept in two arrays, which only an External holds; or the place of the value in the log ([LogValue]); or
     // `null` if this version removes the key. A slice of its own per version was 40 of the bytes a buffered write took.
-    // Changed only by spill, from a segment or an array a recovery copied the value to, with a compare-and-set
+    // Changed by spill, from a segment or an array a recovery copied the value to, with a compare-and-set; and by
+    // settle, from a frame body to the copy a recovery ends with, before the store opens
     private Object source;
-    // Where the value starts in source if source is a segment, and its length
-    private final int offset;
+    // Where the value starts in source if source is a segment, changed with it only by settle; and its length
+    private int offset;
     private final int length;
     /// The decoded value of a resident key space, or `null`.
     final Object decoded;
@@ -179,24 +181,50 @@ sealed class Version permits Version.External {
     /// The frame at `frameOffset` of `segment` holds the value durably, at `bodyIndex` of its body. The tag that
     /// authenticates the value read back is made from the bytes the version holds, which are those the frame sealed.
     ///
+    /// @param frame the array the segment the value is on views, a frame body a recovery replayed the value from, so
+    ///              the tag reads the value where it lies; or `null` if the segment is another
     /// @return whether the value moved: not if it had moved already, is not on a segment nor an array of its own long
     ///         enough for the log, or has a unit of [BlobFile]
-    boolean spill(SpillQueue.Crypto crypto, LogSegmentView segment, long frameOffset, int bodyIndex) {
+    boolean spill(SpillQueue.Crypto crypto, LogSegmentView segment, long frameOffset, int bodyIndex, byte[] frame) {
         var held = SOURCE.getAcquire(this);
         if (external() != null) {
             return false;
         }
         Object moved;
         if (held instanceof MemorySegment home) {
-            moved = length >= SpillQueue.LOG_VALUE_MIN
-                    ? crypto.logValue(segment, frameOffset, bodyIndex, stamp, home, offset, length)
-                    : Segments.toBytes(home, offset, length);
+            if (length < SpillQueue.LOG_VALUE_MIN) {
+                moved = Segments.toBytes(home, offset, length);
+            } else if (frame != null) {
+                moved = crypto.logValue(segment, frameOffset, bodyIndex, stamp, frame, offset, length);
+            } else {
+                moved = crypto.logValue(segment, frameOffset, bodyIndex, stamp, home, offset, length);
+            }
         } else if (held instanceof byte[] own && length >= SpillQueue.LOG_VALUE_MIN) {
-            moved = crypto.logValue(segment, frameOffset, bodyIndex, stamp, MemorySegment.ofArray(own), 0, length);
+            moved = crypto.logValue(segment, frameOffset, bodyIndex, stamp, own, 0, length);
         } else {
             return false;
         }
         return SOURCE.compareAndSet(this, held, moved);
+    }
+
+    /// Copies the value off the frame body a recovery replayed it onto, the segment it is on, into a chunk of `values`,
+    /// or into an array of its own if [ReplayValues#shared(int)] gives it none, as the recovery ends.
+    ///
+    /// It changes where the value starts as well as its source, so it runs only while no other thread can read the
+    /// version: before the store opens, on a version no thread that moves values holds
+    /// ([SpillQueue#settleReplay(ReplayValues)]). A value that left its segment already stays where it is.
+    void settle(ReplayValues values) {
+        if (!(SOURCE.getAcquire(this) instanceof MemorySegment home)) {
+            return;
+        }
+        if (ReplayValues.shared(length)) {
+            offset = values.copy(home, offset, length);
+            SOURCE.setRelease(this, values.view());
+        } else {
+            var own = Segments.toBytes(home, offset, length);
+            offset = 0;
+            SOURCE.setRelease(this, own);
+        }
     }
 
     /// {@return whether the value is in the log ([LogValue]), where it stays until the version is dropped}

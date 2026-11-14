@@ -79,9 +79,17 @@ class LogSpillTest {
                 .keyspace(MESSAGES).keyspace(TEXTS).keyspace(CHATS).commitWindow(window))
                 .segmentSize(64 << 10)
                 .spillBudget(budget)
+                // Values of a group written through stay on the heap, and whether a group goes through depends on
+                // whether a spare segment is ready; writtenThroughValuesStay covers them
+                .writeThrough(WriteThrough.Mode.OFF)
                 .build();
         ledger.valueSlab().forceColdForTests();
         return ledger;
+    }
+
+    /// {@return whether `value` is the value `logged` holds the tag of, of the version stamped `stamp`}
+    private static boolean verifies(SpillQueue.Crypto crypto, byte[] value, long stamp, LogValue logged) {
+        return crypto.verifies(value, 0, value.length, stamp, logged);
     }
 
     private static byte[] key(int message) {
@@ -688,7 +696,7 @@ class LogSpillTest {
             before = threads.getCurrentThreadAllocatedBytes();
             var verified = true;
             for (var i = 0; i < rounds; i++) {
-                verified &= crypto.verifies(value, rounds - 1, logged);
+                verified &= verifies(crypto, value, rounds - 1, logged);
             }
             var verifying = (threads.getCurrentThreadAllocatedBytes() - before) / rounds;
             assertTrue(verified);
@@ -696,7 +704,7 @@ class LogSpillTest {
             if (encrypted) {
                 before = threads.getCurrentThreadAllocatedBytes();
                 for (var i = 0; i < rounds; i++) {
-                    crypto.decrypt(key, 64, 3, sealed, 3, value.length);
+                    crypto.decrypt(key, 64, 3, sealed, 3, value.length, new byte[value.length], 0);
                 }
                 decrypting = (threads.getCurrentThreadAllocatedBytes() - before) / rounds;
             }
@@ -709,10 +717,10 @@ class LogSpillTest {
         var logged = crypto.logValue(segment, 64, 3, 7, home, 0, value.length);
         var changed = value.clone();
         changed[100] ^= 1;
-        assertFalse(crypto.verifies(changed, 7, logged));
+        assertFalse(verifies(crypto, changed, 7, logged));
         if (encrypted) {
             // The tag binds the version it was made for
-            assertFalse(crypto.verifies(value, 8, logged));
+            assertFalse(verifies(crypto, value, 8, logged));
         }
         queue.giveBack(crypto);
     }
@@ -742,6 +750,67 @@ class LogSpillTest {
         queue.awaitIdleForTests();
         assertInstanceOf(MemorySegment.class, live.sourceForTests(), "the value of a commit the log does not hold durably");
         assertEquals(1, queue.loggedValuesForTests(), "values moved to the log");
+    }
+
+    @Test
+    @DisplayName("the values of a commit whose group the log wrote through stay on the heap, and its record leaves the queue")
+    void writtenThroughValuesStay(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(0, true);
+        var view = queue.segment(1, directory.resolve("1.log"), null);
+        var through = spillable(1L << 20, 4_000);
+        var record = queue.record(1, 1);
+        record.add(through, 0, 4_000);
+        record.locate(view, 64, 0, true);
+        queue.add(record);
+        queue.drain(() -> 1);
+        queue.awaitIdleForTests();
+        assertInstanceOf(MemorySegment.class, through.sourceForTests(), "a value of a group written through");
+        assertEquals(0, queue.loggedValuesForTests(), "values moved to the log");
+        assertEquals(0, queue.heldForTests());
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a recovery over its budget moves the oldest values it replays from runs and frames of their own to the log, tagged on their frame bodies, and copies the newest off those bodies into chunks")
+    void recoveryKeepsTheNewestOnChunks(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, Duration.ofMillis(20))) {
+            long last = 0;
+            for (var message = 0; message < 400; message++) {
+                // Commits of one message share runs, those of 30 take frames of their own
+                last = write(ledger, expected, message * 40, message % 10 == 0 ? 30 : 1, 0, false);
+            }
+            ledger.awaitDurable();
+            assertTrue(ledger.log().durableSequence() >= last);
+            ledger.closeWithoutCheckpoint();
+        }
+        var budget = 64L << 10;
+        try (var ledger = open(directory, encrypted, budget)) {
+            var logged = 0;
+            var chunked = 0;
+            for (var message : expected.messages.keySet()) {
+                var source = head(ledger, MESSAGES, key(message)).sourceForTests();
+                switch (source) {
+                    case LogValue _ -> logged++;
+                    case MemorySegment chunk -> {
+                        assertEquals(ReplayValues.CHUNK_BYTES, chunk.byteSize(), "message " + message + " is on its frame body");
+                        chunked++;
+                    }
+                    case byte[] _ -> {
+                    }
+                    default -> fail("message " + message + " is on " + source);
+                }
+            }
+            assertTrue(logged > 0, "the recovery moved no value to the log");
+            assertTrue(chunked > 0, "the recovery kept no value on a chunk");
+            assertTrue(ledger.spills().heldForTests() <= budget, "the queue holds " + ledger.spills().heldForTests() + " bytes");
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = open(directory, encrypted, budget)) {
+            verify(ledger, expected);
+        }
     }
 
     /// {@return a version of a value of `length` bytes on an array of its own, stamped `stamp`}
@@ -778,18 +847,18 @@ class LogSpillTest {
             var value = new byte[length];
             random.nextBytes(value);
             var logged = crypto.logValue(segment, 0, 0, 1_000L + length, MemorySegment.ofArray(value), 0, length);
-            assertTrue(crypto.verifies(value, 1_000L + length, logged));
-            assertFalse(crypto.verifies(value, 1_001L + length, logged), "another version, length " + length);
+            assertTrue(verifies(crypto, value, 1_000L + length, logged));
+            assertFalse(verifies(crypto, value, 1_001L + length, logged), "another version, length " + length);
             for (var at = 0; at < length; at++) {
                 for (var bit = 0; bit < 8; bit++) {
                     var changed = value.clone();
                     changed[at] ^= (byte) (1 << bit);
-                    assertFalse(crypto.verifies(changed, 1_000L + length, logged), "bit " + bit + " of byte " + at + " of " + length);
+                    assertFalse(verifies(crypto, changed, 1_000L + length, logged), "bit " + bit + " of byte " + at + " of " + length);
                 }
             }
-            assertFalse(crypto.verifies(Arrays.copyOf(value, length + 1), 1_000L + length, logged), "a zero byte more after " + length);
+            assertFalse(verifies(crypto, Arrays.copyOf(value, length + 1), 1_000L + length, logged), "a zero byte more after " + length);
             if (length > 0) {
-                assertFalse(crypto.verifies(Arrays.copyOf(value, length - 1), 1_000L + length, logged), "a byte less than " + length);
+                assertFalse(verifies(crypto, Arrays.copyOf(value, length - 1), 1_000L + length, logged), "a byte less than " + length);
             }
         }
         queue.giveBack(crypto);
@@ -818,7 +887,8 @@ class LogSpillTest {
                 var bodyIndex = random.nextInt(body.length - length);
                 var skip = bodyIndex & (SpillQueue.BLOCK - 1);
                 var sealed = Arrays.copyOfRange(sealedBody, bodyIndex - skip, bodyIndex + length);
-                var decrypted = crypto.decrypt(key, frameOffset, bodyIndex, sealed, skip, length);
+                var decrypted = new byte[length];
+                crypto.decrypt(key, frameOffset, bodyIndex, sealed, skip, length, decrypted, 0);
                 assertArrayEquals(Arrays.copyOfRange(body, bodyIndex, bodyIndex + length), decrypted,
                         "at " + bodyIndex + " for " + length + " bytes of the frame at " + frameOffset);
             }

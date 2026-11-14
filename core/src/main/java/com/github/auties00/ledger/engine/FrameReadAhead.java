@@ -85,6 +85,11 @@ final class FrameReadAhead implements AutoCloseable {
         return TAKEN.sum();
     }
 
+    /// {@return whether it opens the frames of an encrypted segment ahead once it begins, rather than none}
+    boolean opensFrames() {
+        return frames > 0;
+    }
+
     /// Starts reading ahead the frames of the use whose tag is `useTag` of the segment whose salt has `tag`, opened
     /// under `segmentKey`; a segment of a plain log, `segmentKey` `null`, is not read ahead.
     void begin(long tag, long useTag, SecretKeySpec segmentKey) {
