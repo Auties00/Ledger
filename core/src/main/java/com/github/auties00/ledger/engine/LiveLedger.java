@@ -400,7 +400,10 @@ public final class LiveLedger implements Ledger {
     /// of, to a [PackedRun] of the key space rather than to chains: a value in the log, or in a chunk if shorter, and the
     /// key, in arrays with no object per write. [#endReplay(ReplayValues)] publishes the runs. A key space's first range
     /// removal publishes its run before it counts what it removes, and the key space's later writes go to chains, so
-    /// every range removal stamped after the run's writes is newer than all of them.
+    /// every range removal stamped after the run's writes is newer than all of them. A write that goes to a chain while
+    /// the run of its key space is still being built, of the log's last budget, of a value in the file of large values or
+    /// refused by the run, takes what the run holds of its key as the tree's state of it
+    /// ([#replayHint(KeyspaceState, MemorySegment, ReplayValues)]), as the trees the open found lack the run's writes.
     ///
     /// @param values the chunks and the state of this open's replay
     /// @param segment the use of the segment that holds the frame, or `null` to move no value
@@ -466,7 +469,8 @@ public final class LiveLedger implements Ledger {
                 var state = byId.get(keyspace);
                 if (state != null) {
                     var value = MemorySegment.ofArray(unit).asSlice(PageFormat.HEADER, length).asReadOnly();
-                    applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null, replayHint(state), ref);
+                    applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null,
+                            replayHint(state, key, values), ref);
                     blobs.claim(ref);
                 }
             }
@@ -507,7 +511,8 @@ public final class LiveLedger implements Ledger {
                     // On the body for as long as it takes to tag it there: a slice of the body's view, whose address
                     // is where it starts in the body
                     var at = Math.toIntExact(value.address());
-                    applier.put(state, applier.claim(state, key), key, value, null, null, view, null, at, null, TreeSearch.BLIND, null);
+                    applier.put(state, applier.claim(state, key), key, value, null, null, view, null, at, null,
+                            replayHint(state, key, values), null);
                     if (!noted[0]) {
                         queue.noteReplayed(sequence, segment);
                         noted[0] = true;
@@ -515,7 +520,7 @@ public final class LiveLedger implements Ledger {
                     queue.moveReplayed(values.crypto(queue), applier.lastVersion(), segment, frameOffset, at, body);
                     return;
                 }
-                var at = replayPaged(applier, state, key, value, values);
+                var at = replayPaged(applier, state, key, value, values, replayHint(state, key, values));
                 if (queue != null && !moves) {
                     if (record[0] == null) {
                         record[0] = queue.record(sequence, listed[0]);
@@ -539,7 +544,7 @@ public final class LiveLedger implements Ledger {
                         }
                         // On the key's chain, opened as a commit of the pipeline opens it: the other path checks first
                         // that the key exists, which a blind hint answers no for any key memory holds no version of
-                        applier.delete(state, applier.claim(state, key), key, hint);
+                        applier.delete(state, applier.claim(state, key), key, replayHint(state, key, values));
                     } else {
                         applier.delete(state, key);
                     }
@@ -579,8 +584,9 @@ public final class LiveLedger implements Ledger {
     /// Ends the open's replay: publishes the runs of the writes it kept in arrays, and `values` gives back what it took
     /// of the queue of values that may leave the heap and forgets the last frame body.
     void endReplay(ReplayValues values) {
-        for (var entry : values.takeRuns().entrySet()) {
-            publishRun(entry.getKey(), entry.getValue());
+        // One at a time, each builder let go of before the next run is built
+        for (var state : values.runStates()) {
+            publishRun(state, values.stopRun(state));
         }
         values.end(spills);
     }
@@ -612,22 +618,24 @@ public final class LiveLedger implements Ledger {
     }
 
     /// Applies a replayed put of `value`, a slice of a frame body, to `state`, a paged key space of a store with pages,
-    /// on a copy the version keeps: in a chunk of `values`, or on an array of its own. The put is blind, as
-    /// [#replayHint(KeyspaceState)] gives every replayed write of such a key space.
+    /// on a copy the version keeps: in a chunk of `values`, or on an array of its own.
     ///
+    /// @param inTree the state of `key` before the put, as [#replayHint(KeyspaceState, MemorySegment, ReplayValues)]
+    ///               gives it
     /// @return where the copy starts in the chunk, or 0 on an array of its own
-    private static int replayPaged(Applier applier, KeyspaceState state, MemorySegment key, MemorySegment value, ReplayValues values) {
+    private static int replayPaged(Applier applier, KeyspaceState state, MemorySegment key, MemorySegment value,
+                                   ReplayValues values, byte inTree) {
         var chain = applier.claim(state, key);
         var length = Math.toIntExact(value.byteSize());
         if (!ReplayValues.shared(length)) {
             var own = Segments.toBytes(value);
-            applier.put(state, chain, key, MemorySegment.ofArray(own).asReadOnly(), own, null, null, null, 0, null, TreeSearch.BLIND, null);
+            applier.put(state, chain, key, MemorySegment.ofArray(own).asReadOnly(), own, null, null, null, 0, null, inTree, null);
             return 0;
         }
         var at = values.copy(value, 0, length);
         var view = values.view();
         // No array for the frame: the replay has none, and the chunk takes more values after this one
-        applier.put(state, chain, key, view.asSlice(at, length), null, null, view, null, at, null, TreeSearch.BLIND, null);
+        applier.put(state, chain, key, view.asSlice(at, length), null, null, view, null, at, null, inTree, null);
         return at;
     }
 
@@ -641,6 +649,25 @@ public final class LiveLedger implements Ledger {
     /// first count or checkpoint that needs it, from the trees the open found, which no replayed commit changes.
     private byte replayHint(KeyspaceState state) {
         return pages != null && !state.resident ? TreeSearch.BLIND : TreeSearch.UNKNOWN;
+    }
+
+    /// {@return how the replay applies a write of `key` to `state` that goes to a chain: as
+    /// [#replayHint(KeyspaceState)] gives, unless the run `values` is building of `state` holds `key`, whose entry then
+    /// gives the key's state before the write: [TreeSearch#FOUND] after a put, [TreeSearch#ABSENT] after a removal}
+    ///
+    /// The run is no part of the trees until [#endReplay(ReplayValues)] publishes it, so a blind write of such a key
+    /// would take the trees' state of the key instead: a put of a key the trees lack would count twice, and a removal
+    /// would be dropped as a removal of nothing when no tree holds the key space.
+    private byte replayHint(KeyspaceState state, MemorySegment key, ReplayValues values) {
+        var hint = replayHint(state);
+        if (hint == TreeSearch.BLIND) {
+            var run = values.building(state);
+            var entry = run == null ? -1 : run.find(key);
+            if (entry >= 0) {
+                return run.removes(entry) ? TreeSearch.ABSENT : TreeSearch.FOUND;
+            }
+        }
+        return hint;
     }
 
     /// Puts in memory every entry of the key space `id` if it is a resident one whose loader has not, before the log's

@@ -997,16 +997,11 @@ final class KeyspaceState {
     /// Makes `run`, the writes the open replayed into the key space, part of the tree every reader of the tree the store
     /// opened from reads; called by the replay, before any reader exists.
     ///
-    /// The blind writes listed so far whose keys the run holds were replayed after the run's write of their keys, as a
-    /// key the replay wrote to a chain never goes to the run again: what they did is settled from the run's entries
-    /// ([BlindWrites#settle]). Every later write of such a key finds the run's entry instead of a blind lookup.
+    /// No blind write of a key the run holds is listed: the replay's writes of such a key that went to chains took the
+    /// run's entry as the key's state, and every later write finds the run's entry in place of a blind lookup.
     void publishRun(PackedRun run) {
         replayed = UNCOUNTED;
         this.run = run;
-        blind.settle(key -> {
-            var entry = run.find(key);
-            return entry < 0 ? TreeSearch.UNKNOWN : run.removes(entry) ? TreeSearch.ABSENT : TreeSearch.FOUND;
-        });
     }
 
     /// {@return the change the writes the open replayed as a run make to the count of the key space, against the tree

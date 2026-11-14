@@ -23,8 +23,8 @@ import java.util.Arrays;
 /// The writes of the run are listed in no [BlindWrites]: the run's effect on the count of the key space, against the
 /// open's tree, is [#correction()], which the first checkpoint finds as a by-product of merging the run into the tree
 /// ([#settle(int, boolean)]), and a count before then by looking each key up. A write the replay sent to a chain whose key
-/// the run holds learns from the run's entry what it did ([BlindWrites#settle]); later writes of such a key read the run
-/// as their tree.
+/// the run holds takes the run's entry as the key's state before it, as the builder's entry while the replay runs and the
+/// run's after, so it is exact, never blind.
 ///
 /// Per entry it keeps the key's bytes and their end, a word of the value's place and kind, a slot of the hash table and an
 /// index of the key order; a value shorter than [SpillQueue#LOG_VALUE_MIN] lies in the replay's chunks
@@ -99,23 +99,34 @@ final class PackedRun {
     // Per entry, whether `base` holds its key, as TreeSearch.FOUND or ABSENT, or UNKNOWN; made at the first need
     private volatile byte[] inBase;
 
+    /// Creates the run of the writes `builder` recorded, which lets go of its arrays as it copies each, so the arrays
+    /// the builder grew and their trimmed copies are never all live at once.
     private PackedRun(Builder builder, TreeRoot base, PageFile pages) {
         var size = builder.size;
         this.size = size;
         this.keys = Arrays.copyOf(builder.keys, builder.keyBytes);
+        builder.keys = null;
         this.keyEnds = Arrays.copyOf(builder.keyEnds, size);
+        builder.keyEnds = null;
         this.keyView = MemorySegment.ofArray(keys).asReadOnly();
         this.values = Arrays.copyOf(builder.values, size);
+        builder.values = null;
         this.chunks = builder.chunks.toArray(MemorySegment[]::new);
         var logged = builder.logged;
         this.logStamps = Arrays.copyOf(builder.logStamps, logged);
+        builder.logStamps = null;
         this.logPlaces = Arrays.copyOf(builder.logPlaces, logged);
+        builder.logPlaces = null;
         this.logBodies = Arrays.copyOf(builder.logBodies, logged);
+        builder.logBodies = null;
         this.tagHighs = Arrays.copyOf(builder.tagHighs, logged);
+        builder.tagHighs = null;
         this.tagLows = Arrays.copyOf(builder.tagLows, logged);
+        builder.tagLows = null;
         this.segments = builder.segments.toArray(LogSegmentView[]::new);
         // Kept as the builder filled it: the entries keep their indexes, and the table is at most three quarters full
         this.slots = builder.slots;
+        builder.slots = null;
         this.maxStamp = builder.maxStamp;
         this.base = base;
         this.pages = pages;
@@ -421,7 +432,8 @@ final class PackedRun {
 
     /// Collects the writes of one paged key space as the open replays them, the newest of each key, into a [PackedRun].
     ///
-    /// Used by the replay alone, on the opening thread.
+    /// Used by the replay alone, on the opening thread, which builds the run once and uses the builder no more: the run
+    /// takes its arrays or copies of them, and the builder lets go of them.
     static final class Builder {
         private static final int FIRST_ENTRIES = 64;
         private byte[] keys;
@@ -458,6 +470,17 @@ final class PackedRun {
         /// {@return whether the builder holds no entry}
         boolean isEmpty() {
             return size == 0;
+        }
+
+        /// {@return the entry of `key`, or -1 if the builder holds none}
+        int find(MemorySegment key) {
+            var slot = slots[slotOf(key, Segments.hash(key))];
+            return slot == 0 ? -1 : (slot & ENTRY_MASK) - 1;
+        }
+
+        /// {@return whether `entry`, the newest write of its key so far, removes it}
+        boolean removes(int entry) {
+            return values[entry] < 0;
         }
 
         /// {@return whether the builder takes a write of a value of `length` bytes in `segment`, or of no segment if
@@ -526,27 +549,36 @@ final class PackedRun {
             values[entry] = REMOVES;
         }
 
-        // The entry of `key`, added if the builder holds none, whose write stamped `stamp` is the newest
-        private int entry(MemorySegment key, long stamp) {
-            maxStamp = Math.max(maxStamp, stamp);
-            var hash = Segments.hash(key);
+        // The slot of the hash table that holds the entry of `key`, whose hash is `hash`, or the empty one it would take
+        private int slotOf(MemorySegment key, int hash) {
             var mask = slots.length - 1;
             var tag = hash & TAG_MASK;
-            var i = hash & mask;
-            for (; ; i = (i + 1) & mask) {
+            for (var i = hash & mask; ; i = (i + 1) & mask) {
                 var slot = slots[i];
                 if (slot == 0) {
-                    break;
+                    return i;
                 }
                 if ((slot & TAG_MASK) == tag) {
                     var entry = (slot & ENTRY_MASK) - 1;
                     var start = entry == 0 ? 0 : keyEnds[entry - 1];
                     var length = keyEnds[entry] - start;
                     if (length == key.byteSize() && Segments.compare(keys, start, length, key) == 0) {
-                        return entry;
+                        return i;
                     }
                 }
             }
+        }
+
+        // The entry of `key`, added if the builder holds none, whose write stamped `stamp` is the newest
+        private int entry(MemorySegment key, long stamp) {
+            maxStamp = Math.max(maxStamp, stamp);
+            var hash = Segments.hash(key);
+            var i = slotOf(key, hash);
+            var found = slots[i];
+            if (found != 0) {
+                return (found & ENTRY_MASK) - 1;
+            }
+            var tag = hash & TAG_MASK;
             var entry = size;
             if (entry == values.length) {
                 var capacity = 2 * entry;
@@ -586,6 +618,8 @@ final class PackedRun {
 
         /// {@return the run of the writes recorded, counted against `base`, the root of the key space's tree the store
         /// opened from in `pages`, or `null`}
+        ///
+        /// The builder holds nothing after.
         PackedRun build(TreeRoot base, PageFile pages) {
             return new PackedRun(this, base, pages);
         }
