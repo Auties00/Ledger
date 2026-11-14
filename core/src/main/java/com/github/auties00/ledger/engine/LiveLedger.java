@@ -2175,12 +2175,12 @@ public final class LiveLedger implements Ledger {
     }
 
     /// Prunes `chain` from `head`, its newest version or one a later version of the same commit replaced, holding the
-    /// publishing role, as [#prune(KeyspaceState, Chain, Version, long\[\], long, boolean, Runnable)] does with every
-    /// link allowed.
+    /// publishing role, as [#prune(KeyspaceState, Chain, Version, long\[\], long, long, boolean, Runnable)] does with
+    /// every link allowed.
     ///
     /// @return whether the chain keeps versions a later prune may drop
     private boolean prune(KeyspaceState state, Chain chain, Version head, long[] bounds, long cutBound) {
-        return prune(state, chain, head, bounds, cutBound, true, null);
+        return prune(state, chain, head, bounds, 0, cutBound, true, null);
     }
 
     /// Unlinks the versions of `chain` below `head`, its newest version or one a later version of the same commit
@@ -2199,14 +2199,17 @@ public final class LiveLedger implements Ledger {
     /// that is still a record keeps it from linking, and one already applied cut the chain before the walk. Its cuts
     /// only leave versions out, which no removal ever needs back.
     ///
-    /// @param bounds the bounds of every active reader, highest first; the first covers the newest version
+    /// @param bounds the bounds of every active reader, highest first; the first covers the newest version. Or `null`
+    ///               for the one bound `bound`, which a prune of a store no reader reads at an older sequence than
+    ///               the latest takes without an array, as one the compiler no longer removes once this is not inlined
+    /// @param bound the one bound if `bounds` is `null`; ignored otherwise
     /// @param link whether it may link a version it keeps past the versions below it
     /// @param hook what it runs once it found a version to keep below another, before it links the two, or `null`;
     ///             for tests
     /// @return whether the chain keeps versions a later prune may drop, once the readers that need them are gone, or
     ///         that a prune allowed to link would leave out
-    private boolean prune(KeyspaceState state, Chain chain, Version head, long[] bounds, long cutBound, boolean link,
-                          Runnable hook) {
+    private boolean prune(KeyspaceState state, Chain chain, Version head, long[] bounds, long bound, long cutBound,
+                          boolean link, Runnable hook) {
         if (head == null) {
             // Left empty, by a commit that rolled back, that removed a key it did not find, or that opened it and has
             // not applied it yet, which keeps it
@@ -2216,8 +2219,10 @@ public final class LiveLedger implements Ledger {
         Version kept = null;
         var version = head;
         var unlinked = false;
-        for (var bound : bounds) {
-            while (version != null && version.stamp > bound) {
+        var count = bounds == null ? 1 : bounds.length;
+        for (var i = 0; i < count; i++) {
+            var at = bounds == null ? bound : bounds[i];
+            while (version != null && version.stamp > at) {
                 version = version.older;
             }
             if (version == null) {
@@ -2480,12 +2485,14 @@ public final class LiveLedger implements Ledger {
             return;
         }
         long[] bounds;
+        var bound = 0L;
         long cutBound;
         // Read before the reader table, as a scan reads it
         var current = latest();
         if (readers.idle()) {
-            // The usual case, without the scan's arrays: every read is at the latest sequence or later
-            bounds = new long[]{Reads.boundOf(current)};
+            // The usual case, without the scan's arrays nor one of its own: every read is at the latest sequence or later
+            bounds = null;
+            bound = Reads.boundOf(current);
             cutBound = Reads.boundOf(floor(Long.MAX_VALUE));
         } else {
             var scan = readers.scanConcurrently();
@@ -2494,7 +2501,7 @@ public final class LiveLedger implements Ledger {
         }
         var size = touched.size();
         for (var i = 0; i < size; i++) {
-            pruneTouched(touched, i, bounds, cutBound);
+            pruneTouched(touched, i, bounds, bound, cutBound);
         }
     }
 
@@ -2504,10 +2511,13 @@ public final class LiveLedger implements Ledger {
     /// It links past versions only while the key space holds no range removal, read after the latest sequence, which
     /// covers the commit: the publisher may apply one meanwhile, and cut the chain below a version the prune is about
     /// to link.
-    private void pruneTouched(List<Touched> touched, int index, long[] bounds, long cutBound) {
+    ///
+    /// @param bounds the bounds of every active reader, highest first, or `null` for the one bound `bound`
+    private void pruneTouched(List<Touched> touched, int index, long[] bounds, long bound, long cutBound) {
         var write = touched.get(index);
         var state = write.state();
-        if (prune(state, write.chain(), write.version(), bounds, cutBound, state.removals.length == 0, pruneHookForTests)) {
+        if (prune(state, write.chain(), write.version(), bounds, bound, cutBound, state.removals.length == 0,
+                pruneHookForTests)) {
             requestSweep();
         }
     }
@@ -2628,15 +2638,15 @@ public final class LiveLedger implements Ledger {
         private final boolean deferredRanges;
         // Whether the commit's values are on one chunk of the slab, as the log's estimate of its heap takes it
         private final boolean sharesChunk;
-        // Whether recovery replays the commit, whose puts the key spaces' samples of overwrites leave out
-        private final boolean replaying;
         // The range removals this commit counts after it is published, or null before any
         private ArrayList<PendingRanges.Removal> deferred;
         // Whether the publication of the commit listed them with their key spaces
         private boolean deferredListed;
         // The room for values of the record of the values the commit's puts keep on their batch's arrays, which may
-        // leave the heap for the log, or 0 if they may not. The record, made at the first such value, is the frame's
-        // and queued once the commit is published. One int, in what is otherwise padding of the applier
+        // leave the heap for the log, or 0 if they may not; or -1 for a commit recovery replays, which lists none and
+        // whose puts the key spaces' samples of overwrites leave out. The record, made at the first such value, is the
+        // frame's and queued once the commit is published. One int, which with the flags above fills the applier's last
+        // eight bytes, where a flag of its own for a replayed commit took eight more
         private final int spillRoom;
 
         /// Creates the applier of a transaction, journaled in a frame if `journaled`.
@@ -2671,8 +2681,7 @@ public final class LiveLedger implements Ledger {
             this.frame = frame;
             this.deferredRanges = deferredRanges;
             this.sharesChunk = sharesChunk;
-            this.replaying = replaying;
-            this.spillRoom = spillable && frame != null ? Math.max(1, writes) : 0;
+            this.spillRoom = replaying ? -1 : spillable && frame != null ? Math.max(1, writes) : 0;
         }
 
         /// {@return the version the last write of the commit added}
@@ -2836,7 +2845,7 @@ public final class LiveLedger implements Ledger {
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
             var length = ownTail == null ? Math.toIntExact(value.byteSize()) : own.length + ownTail.length;
-            if (source != null && !replaying && !state.resident && ValueSlab.Overwrites.sampled(sequence)) {
+            if (source != null && spillRoom >= 0 && !state.resident && ValueSlab.Overwrites.sampled(sequence)) {
                 state.overwrites.sample(head, length);
             }
             Version version;
@@ -2895,7 +2904,7 @@ public final class LiveLedger implements Ledger {
                 } else {
                     frame.put(state.id, key, value);
                 }
-                if (spillRoom != 0 && source != null && own == null && external == null && !state.resident
+                if (spillRoom > 0 && source != null && own == null && external == null && !state.resident
                         && state.overwrites != null && state.overwrites.spills()) {
                     listSpill(version, length);
                 }
@@ -3133,7 +3142,7 @@ public final class LiveLedger implements Ledger {
                 }
                 deferredListed = true;
             }
-            if (spillRoom != 0) {
+            if (spillRoom > 0) {
                 var record = frame.spill();
                 if (record != null) {
                     spills.add(record);
