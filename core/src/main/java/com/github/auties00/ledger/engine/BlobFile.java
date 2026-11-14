@@ -223,25 +223,26 @@ final class BlobFile implements AutoCloseable {
     /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     byte[] read(PageRef ref, boolean cached, boolean referenced) {
-        return read(ref, cached, referenced, false);
+        return read(ref, cached, referenced, PageCache.UNSCREENED);
     }
 
     /// {@return the plaintext of the unit `ref` names, from the cache or the file}
     ///
     /// @param cached whether to keep the unit in the cache
     /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
-    /// @param screened whether a unit read as read goes to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef)] it
+    /// @param screen the screening of a unit read as read, which goes to the cache only if it
+    ///               [admits][PageCache#admits(long, PageRef, int)] it: [PageCache#UNSCREENED], [PageCache#POINT] or
+    ///               [PageCache#SCAN]
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
-    byte[] read(PageRef ref, boolean cached, boolean referenced, boolean screened) {
+    byte[] read(PageRef ref, boolean cached, boolean referenced, int screen) {
         var key = PageCache.key(PageCache.BLOBS, ref.page());
         var hit = cache.get(key, ref);
         if (hit != null) {
             return hit;
         }
-        var screen = cached && referenced && screened;
+        var screened = cached && referenced ? screen : PageCache.UNSCREENED;
         if (cached && referenced) {
-            var recalled = cache.recall(key, ref);
+            var recalled = cache.recall(key, ref, screen);
             if (recalled != null) {
                 return recalled;
             }
@@ -250,8 +251,8 @@ final class BlobFile implements AutoCloseable {
         if (plain == null) {
             throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
         }
-        if (screen) {
-            cache.putScreened(key, ref, plain);
+        if (screened != PageCache.UNSCREENED) {
+            cache.putScreened(key, ref, plain, screened);
         } else if (cached) {
             cache.put(key, ref, plain, referenced);
         }

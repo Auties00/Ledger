@@ -48,17 +48,18 @@ final class TreeSearch {
     /// With [#entryOf(byte\[\], byte\[\])], the lookup of a read by key: the key in an array, which the nodes compare
     /// with their own word by word, and no object for what it finds.
     static byte[] leaf(PageFile pages, TreeRoot root, byte[] key) {
-        return leaf(pages, root, key, false);
+        return leaf(pages, root, key, PageCache.UNSCREENED);
     }
 
     /// {@return the leaf of the tree under `root` that would hold `key`}
     ///
-    /// @param screened whether a leaf under the root read from the file goes to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef)] it; the root always does
-    static byte[] leaf(PageFile pages, TreeRoot root, byte[] key, boolean screened) {
+    /// @param screen the screening of a leaf under the root read from the file, which goes to the cache only if it
+    ///               [admits][PageCache#admits(long, PageRef, int)] it: [PageCache#UNSCREENED], [PageCache#POINT] or
+    ///               [PageCache#SCAN]; the root always does
+    static byte[] leaf(PageFile pages, TreeRoot root, byte[] key, int screen) {
         var unit = pages.read(root.ref(), PageFile.NODE, true);
         while (!TreeNodes.isLeaf(unit)) {
-            unit = pages.node(unit, TreeNodes.childFor(unit, key), screened);
+            unit = pages.node(unit, TreeNodes.childFor(unit, key), screen);
         }
         return unit;
     }
@@ -138,22 +139,23 @@ final class TreeSearch {
     /// @param referenced whether a blob the cache takes counts as read, rather than as the first it evicts
     /// @throws LedgerCorruptedException if the leaf records a value longer than its blob's content
     static MemorySegment value(PageFile pages, byte[] unit, int entry, boolean cached, boolean referenced) {
-        return value(pages, unit, entry, cached, referenced, false);
+        return value(pages, unit, entry, cached, referenced, PageCache.UNSCREENED);
     }
 
     /// {@return the read-only value of leaf entry `entry` of `unit`, read from its blob if it has one}
     ///
     /// @param cached whether a blob read from the file goes to the cache
     /// @param referenced whether a blob the cache takes counts as read, rather than as the first it evicts
-    /// @param screened whether a blob read as read goes to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef)] it
+    /// @param screen the screening of a blob read as read, which goes to the cache only if it
+    ///               [admits][PageCache#admits(long, PageRef, int)] it: [PageCache#UNSCREENED], [PageCache#POINT] or
+    ///               [PageCache#SCAN]
     /// @throws LedgerCorruptedException if the leaf records a value longer than its blob's content
     static MemorySegment value(PageFile pages, byte[] unit, int entry, boolean cached, boolean referenced,
-                               boolean screened) {
+                               int screen) {
         if (TreeNodes.isInline(unit, entry)) {
             return TreeNodes.inlineValue(unit, entry);
         }
-        return MemorySegment.ofArray(blob(pages, unit, entry, cached, referenced, screened))
+        return MemorySegment.ofArray(blob(pages, unit, entry, cached, referenced, screen))
                 .asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry))
                 .asReadOnly();
     }
@@ -166,20 +168,21 @@ final class TreeSearch {
     ///
     /// @throws LedgerCorruptedException if the leaf records a value longer than its blob's content
     static byte[] valueBytes(PageFile pages, byte[] unit, int entry) {
-        return valueBytes(pages, unit, entry, false);
+        return valueBytes(pages, unit, entry, PageCache.UNSCREENED);
     }
 
     /// {@return the value of leaf entry `entry` of `unit` in a new array, as [#valueBytes(PageFile, byte\[\], int)]
     /// copies it}
     ///
-    /// @param screened whether a blob read from the file goes to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef)] it
+    /// @param screen the screening of a blob read from the file, which goes to the cache only if it
+    ///               [admits][PageCache#admits(long, PageRef, int)] it: [PageCache#UNSCREENED], [PageCache#POINT] or
+    ///               [PageCache#SCAN]
     /// @throws LedgerCorruptedException if the leaf records a value longer than its blob's content
-    static byte[] valueBytes(PageFile pages, byte[] unit, int entry, boolean screened) {
+    static byte[] valueBytes(PageFile pages, byte[] unit, int entry, int screen) {
         if (TreeNodes.isInline(unit, entry)) {
             return TreeNodes.inlineValueBytes(unit, entry);
         }
-        return Segments.toBytes(blob(pages, unit, entry, true, true, screened), PageFormat.HEADER,
+        return Segments.toBytes(blob(pages, unit, entry, true, true, screen), PageFormat.HEADER,
                 TreeNodes.blobLength(unit, entry));
     }
 
@@ -187,14 +190,15 @@ final class TreeSearch {
     ///
     /// @param cached whether a blob read from the file goes to the cache
     /// @param referenced whether a blob the cache takes counts as read, rather than as the first it evicts
-    /// @param screened whether a blob read as read goes to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef)] it
+    /// @param screen the screening of a blob read as read, which goes to the cache only if it
+    ///               [admits][PageCache#admits(long, PageRef, int)] it: [PageCache#UNSCREENED], [PageCache#POINT] or
+    ///               [PageCache#SCAN]
     /// @throws LedgerCorruptedException if the leaf records a value longer than the blob's content
     private static byte[] blob(PageFile pages, byte[] unit, int entry, boolean cached, boolean referenced,
-                               boolean screened) {
+                               int screen) {
         var ref = TreeNodes.blobRef(unit, entry);
-        var blob = TreeNodes.isExternal(unit, entry) ? pages.blobs().read(ref, cached, referenced, screened)
-                : pages.read(ref, PageFormat.VALUE, cached, referenced, screened);
+        var blob = TreeNodes.isExternal(unit, entry) ? pages.blobs().read(ref, cached, referenced, screen)
+                : pages.read(ref, PageFormat.VALUE, cached, referenced, screen);
         checkBlob(unit, entry, ref, blob);
         return blob;
     }

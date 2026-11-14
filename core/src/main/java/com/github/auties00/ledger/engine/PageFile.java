@@ -224,7 +224,7 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
     byte[] read(PageRef ref, byte kind, boolean cached, boolean referenced) {
-        return read(ref, kind, cached, referenced, false);
+        return read(ref, kind, cached, referenced, PageCache.UNSCREENED);
     }
 
     /// {@return the plaintext of the unit `ref` names, from the cache or the file}
@@ -232,16 +232,17 @@ final class PageFile implements AutoCloseable {
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     /// @param cached whether to keep the unit in the cache
     /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
-    /// @param screened whether a unit read from the file as read goes to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef)] it
+    /// @param screen the screening of a unit read from the file as read, which goes to the cache only if it
+    ///               [admits][PageCache#admits(long, PageRef, int)] it: [PageCache#UNSCREENED], [PageCache#POINT] or
+    ///               [PageCache#SCAN]
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
-    byte[] read(PageRef ref, byte kind, boolean cached, boolean referenced, boolean screened) {
+    byte[] read(PageRef ref, byte kind, boolean cached, boolean referenced, int screen) {
         var hit = cache.get(ref);
         if (hit != null && kindMatches(hit[PageFormat.KIND], kind)) {
             return hit;
         }
-        return load(ref, kind, cached, referenced, screened);
+        return load(ref, kind, cached, referenced, screen);
     }
 
     /// {@return the plaintext of the unit `ref` names, from the file, for a read that found the cache without it}
@@ -254,28 +255,30 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
     byte[] load(PageRef ref, byte kind, boolean cached, boolean referenced) {
-        return load(ref, kind, cached, referenced, false);
+        return load(ref, kind, cached, referenced, PageCache.UNSCREENED);
     }
 
     /// {@return the plaintext of the unit `ref` names, from the file, for a read that found the cache without it}
     ///
     /// A delta record still reads its delta page and its base through the cache. A screened read of a delta record
     /// asks the cache first whether it takes the leaf: if not, the base is read past the cache, which the delta page,
-    /// shared by the other records of its page, still goes to. A read that caches what it reads as read first takes
-    /// back a unit, or the leaf of a delta record, the cache [refused][#recalled(PageRef, byte)] lately, reading
-    /// nothing.
+    /// shared by the other records of its page, still goes to, and the leaf is
+    /// [refused][PageCache#refuse(long, PageRef, byte\[\])]. A read that caches what it reads as read first takes back
+    /// a unit, or the leaf of a delta record, the cache [refused][#recalled(PageRef, byte, int)] lately, reading
+    /// nothing; the doorkeeper counts that recall as the read, and a recall that finds nothing as none.
     ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     /// @param cached whether to keep the unit in the cache
     /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
-    /// @param screened whether a unit read as read goes to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef)] it
+    /// @param screen the screening of a unit read as read, which goes to the cache only if it
+    ///               [admits][PageCache#admits(long, PageRef, int)] it: [PageCache#UNSCREENED], [PageCache#POINT] or
+    ///               [PageCache#SCAN]
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
-    byte[] load(PageRef ref, byte kind, boolean cached, boolean referenced, boolean screened) {
-        var screen = cached && referenced && screened;
+    byte[] load(PageRef ref, byte kind, boolean cached, boolean referenced, int screen) {
+        var screened = cached && referenced ? screen : PageCache.UNSCREENED;
         if (cached && referenced) {
-            var recalled = recalled(ref, kind);
+            var recalled = recalled(ref, kind, screen);
             if (recalled != null) {
                 return recalled;
             }
@@ -284,8 +287,8 @@ final class PageFile implements AutoCloseable {
             // The delta page and the base go to the cache as the entries it evicts first: the leaf they make is what a
             // read uses again, and holding all three filled the cache with each leaf twice. The leaf's admission is
             // decided before they are read: a base cached for a leaf the cache refused would be promoted by the
-            // leaf's second read, and the cache would hold both
-            var admitted = !screen || cache.admits(PageCache.dataKey(ref.page(), ref.slot()), ref);
+            // leaf's next read, and the cache would hold both
+            var admitted = cache.admits(PageCache.dataKey(ref.page(), ref.slot()), ref, screened);
             var leaf = DeltaLeaves.materialize(ref, (unit, unitKind) ->
                     read(unit, unitKind, cached && (admitted || unitKind == PageFormat.DELTA), false));
             if (!kindMatches(leaf[PageFormat.KIND], kind)) {
@@ -293,14 +296,14 @@ final class PageFile implements AutoCloseable {
             }
             if (cached && admitted) {
                 cache.put(ref, leaf, referenced);
-            } else if (screen) {
+            } else if (screened != PageCache.UNSCREENED) {
                 cache.refuse(PageCache.dataKey(ref.page(), ref.slot()), ref, leaf);
             }
             return leaf;
         }
         var plain = open(ref, kind, cached, true);
-        if (screen) {
-            cache.putScreened(ref, plain);
+        if (screened != PageCache.UNSCREENED) {
+            cache.putScreened(ref, plain, screened);
         } else if (cached) {
             cache.put(ref, plain, referenced);
         }
@@ -752,18 +755,19 @@ final class PageFile implements AutoCloseable {
     /// @throws LedgerCorruptedException if the node fails authentication or is not the one the branch names
     /// @throws LedgerIoException if the file cannot be read
     byte[] node(byte[] parent, int index) {
-        return node(parent, index, false);
+        return node(parent, index, PageCache.UNSCREENED);
     }
 
     /// {@return the node child `index` of the branch `parent` names, from the cache or the file}
     ///
-    /// @param screened whether a leaf read from the file goes to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef)] it
+    /// @param screen the screening of a leaf read from the file, which goes to the cache only if it
+    ///               [admits][PageCache#admits(long, PageRef, int)] it: [PageCache#UNSCREENED], [PageCache#POINT] or
+    ///               [PageCache#SCAN]
     /// @throws LedgerCorruptedException if the node fails authentication or is not the one the branch names
     /// @throws LedgerIoException if the file cannot be read
-    byte[] node(byte[] parent, int index, boolean screened) {
+    byte[] node(byte[] parent, int index, int screen) {
         var hit = cachedNode(parent, index);
-        return hit != null ? hit : load(TreeNodes.childRef(parent, index), NODE, true, true, screened);
+        return hit != null ? hit : load(TreeNodes.childRef(parent, index), NODE, true, true, screen);
     }
 
     /// {@return the node child `index` of the branch `parent` names if the cache holds it, or `null`}
@@ -774,15 +778,16 @@ final class PageFile implements AutoCloseable {
         return hit != null && kindMatches(hit[PageFormat.KIND], NODE) ? hit : null;
     }
 
-    /// {@return the unit `ref` names if the cache [refused][PageCache#recall(long, PageRef)] it lately and still
-    /// reaches it, which it then holds, or `null`}
+    /// {@return the unit `ref` names if the cache [refused][PageCache#recall(long, PageRef, int)] it lately and still
+    /// reaches it, which it then holds unless it does not admit a scan's read of it yet, or `null`}
     ///
     /// A recalled unit of another kind reads as a miss, so the read from the file that follows fails as it would
     /// without it.
     ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
-    byte[] recalled(PageRef ref, byte kind) {
-        var unit = cache.recall(ref);
+    /// @param screen the read's screening: [PageCache#UNSCREENED], [PageCache#POINT] or [PageCache#SCAN]
+    byte[] recalled(PageRef ref, byte kind, int screen) {
+        var unit = cache.recall(ref, screen);
         return unit != null && kindMatches(unit[PageFormat.KIND], kind) ? unit : null;
     }
 
@@ -798,7 +803,7 @@ final class PageFile implements AutoCloseable {
     /// passed it, without counting as a read of it}
     ///
     /// A unit a checkpoint wrote to the cache and no read used since does not count, nor does a hit of another kind, nor
-    /// a leaf a screened read [refused][PageCache#putScreened(PageRef, byte\[\])] until a second read admits it.
+    /// a leaf a screened read [refused][PageCache#putScreened(PageRef, byte\[\], int)] until a later read admits it.
     boolean referenced(PageRef ref) {
         var hit = cache.peekReferenced(ref);
         return hit != null && kindMatches(hit[PageFormat.KIND], NODE);
@@ -826,17 +831,24 @@ final class PageFile implements AutoCloseable {
         }
     }
 
-    /// {@return whether the cache screens what reads miss and a read used the leaf `ref` names: the doorkeeper saw it,
-    /// or the cache holds it as an entry a read used ([#referenced(PageRef)])}
-    boolean seen(PageRef ref) {
-        return cache.screens() && (cache.seen(ref) || referenced(ref));
+    /// {@return the reads that used the leaf `ref` names while the cache screens what reads miss, or 0 if it does not:
+    /// 2 if the cache holds it as an entry a read used ([#referenced(PageRef)]), else the reads its doorkeeper saw, 2
+    /// for two or more, 1 or 0 ([PageCache#reads(PageRef)])}
+    int reads(PageRef ref) {
+        if (!cache.screens()) {
+            return 0;
+        }
+        return referenced(ref) ? 2 : cache.reads(ref);
     }
 
-    /// Records the leaf `ref` names, which a checkpoint wrote and left out of the cache in place of one a read used
-    /// ([#seen(PageRef)]), as expected by the doorkeeper, so the cache takes it at its first read
-    /// ([PageCache#expect(PageRef)]).
-    void expect(PageRef ref) {
-        cache.expect(ref);
+    /// Records the leaf `ref` names, which a checkpoint wrote and left out of the cache in place of one reads used
+    /// `reads` times ([#reads(PageRef)]), as expected by the doorkeeper, so the cache takes it a read sooner than the
+    /// read's screening asks for, or two sooner for a scan after two reads of the leaf it replaces
+    /// ([PageCache#expect(PageRef, int)]).
+    ///
+    /// @param reads the reads of the leaf it replaces, 1 or 2
+    void expect(PageRef ref, int reads) {
+        cache.expect(ref, reads);
     }
 
     private static boolean kindMatches(byte actual, byte expected) {
