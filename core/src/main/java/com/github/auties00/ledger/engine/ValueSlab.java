@@ -521,17 +521,21 @@ final class ValueSlab {
     ///
     /// A share is that of a whole interval between two checkpoints, since it grows over one, from none right after a
     /// checkpoint; the last interval counts for half of what is settled, so a burst of overwrites does not stop the
-    /// slab for good. One commit in 64 is [sampled][#sampled(long)], on its committing thread: the counters are racy, an
-    /// estimate that only decides where a value goes, and they are touched too rarely for the threads to queue on
-    /// their line.
+    /// slab for good. One put or removal in 64 is [sampled][#sampled(long)] by its stamp, on its committing thread,
+    /// and so is every put of a commit of at least [#BULK_WRITES] writes whose values may leave the heap for the log
+    /// until the key space is first [judged][#judged()]: a store that writes a few large commits, like an import, would
+    /// otherwise wait for dozens of them before its values could leave the heap. Its removals are sampled one in 64
+    /// still, so a first verdict taken inside such a commit counts few of them. The counters are racy, an estimate
+    /// that only decides where a value goes, and they are touched too rarely for the threads to queue on their line.
     ///
     /// The same share decides whether the values of the key space may leave the heap for the log ([SpillQueue]),
     /// where a dead value costs more: its record keeps its batch's array alive until the record leaves the queue, and
     /// moving it takes a tag of its bytes for a value no reader can reach. So that verdict starts negative and turns
     /// positive only once enough samples show a share under an eighth, and under the limit of the chunks; a key space
-    /// that removes what it writes, like an inbox, never lists a value.
+    /// that removes what it writes, like an inbox, lists no value but from a first bulk commit of fresh puts, which
+    /// judges it positive until its next judgement.
     static final class Overwrites {
-        /// The top bits of a commit's hashed sequence that are clear when it is sampled.
+        /// The top bits of a write's hashed stamp that are clear when it is sampled.
         private static final int SAMPLE_BITS = 6;
         /// The bytes the dead values may cost each value left at the limit of the share: twice the 120 or so an array
         /// of its own, its view and the view's session cost.
@@ -539,6 +543,10 @@ final class ValueSlab {
         /// The samples at which the share so far is judged, so one too high stops the slab before the interval ends:
         /// about 4,096 puts, which a key space of large values passes before the slab can turn hot on it.
         private static final int JUDGE_EVERY = 64;
+        /// The writes of a commit whose values may leave the heap for the log and whose puts are then all sampled
+        /// until the key space is first judged: as many as the samples of a judgement, so one such commit of puts to a
+        /// single key space judges it by itself.
+        static final int BULK_WRITES = JUDGE_EVERY;
         /// The samples an interval needs to count.
         private static final int MIN_SAMPLES = 64;
         /// The samples at which the counters halve, so a store whose checkpoints fail does not overflow them.
@@ -561,6 +569,8 @@ final class ValueSlab {
         private volatile boolean worthwhile;
         // Whether the values may leave the heap for the log: false until a judgement on enough samples
         private volatile boolean spills;
+        // Whether a judgement ran since the store opened; never cleared
+        private volatile boolean judged;
         // Whether a test fixed spills to true
         private boolean spillsForced;
 
@@ -569,12 +579,21 @@ final class ValueSlab {
             this.worthwhile = true;
         }
 
-        /// {@return whether a commit with this sequence is sampled}
+        /// {@return whether the write with this stamp ([Reads#stamp(long, int)]) is sampled}
         ///
-        /// The sequence is hashed so the sample does not follow a pattern of the commits: of a store that alternates a
-        /// put and a removal, the multiples of 64 would all be puts, or all removals.
-        static boolean sampled(long sequence) {
-            return (sequence * 0x9E3779B97F4A7C15L) >>> Long.SIZE - SAMPLE_BITS == 0;
+        /// The stamp is rotated so the position of the write in its commit lands in the high bits, above the sequence,
+        /// and hashed, so the sample does not follow a pattern of the commits: of a store that alternates a put and a
+        /// removal, the multiples of 64 would all be puts, or all removals. The first write of a commit hashes as its
+        /// sequence alone, and the writes of a large commit are sampled one in 64 like those of single-write commits.
+        static boolean sampled(long stamp) {
+            return (Long.rotateRight(stamp, Reads.OP_BITS) * 0x9E3779B97F4A7C15L) >>> Long.SIZE - SAMPLE_BITS == 0;
+        }
+
+        /// {@return whether the samples were judged at least once since the store opened, at the [#JUDGE_EVERY]th
+        /// sampled put of an interval or at a checkpoint that ends one of at least [#MIN_SAMPLES]: until then, every put
+        /// of a commit of at least [#BULK_WRITES] writes whose values may leave the heap is sampled}
+        boolean judged() {
+            return judged;
         }
 
         /// {@return whether the key space's values may share chunks}
@@ -594,7 +613,8 @@ final class ValueSlab {
         }
 
         /// Lets the key space's values leave the heap for the log whatever the samples show; for tests that move
-        /// values without writing thousands of them.
+        /// values without writing thousands of them. The key space is not [#judged()] by this, so the puts of its
+        /// commits of at least [#BULK_WRITES] writes are still all sampled until a judgement.
         void forceSpillsForTests() {
             spillsForced = true;
             spills = true;
@@ -646,6 +666,7 @@ final class ValueSlab {
             var shares = share < (long) WHOLE * TOLERATED / (Math.max(averageBytes, 0) + (long) TOLERATED);
             worthwhile = shares;
             spills = spillsForced || shares && share < SPILL_SHARE;
+            judged = true;
         }
 
         private static int share(int sampled, int over) {

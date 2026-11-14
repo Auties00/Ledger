@@ -2791,9 +2791,11 @@ public final class LiveLedger implements Ledger {
         private boolean deferredListed;
         // The room for values of the record of the values the commit's puts keep on their batch's arrays, which may
         // leave the heap for the log, or 0 if they may not; or -1 for a commit recovery replays, which lists none and
-        // whose puts the key spaces' samples of overwrites leave out. The record, made at the first such value, is the
-        // frame's and queued once the commit is published. One int, which with the flags above fills the applier's last
-        // eight bytes, where a flag of its own for a replayed commit took eight more
+        // whose puts the key spaces' samples of overwrites leave out. From ValueSlab.Overwrites.BULK_WRITES, the commit
+        // samples every put to a key space not yet judged, so a store of few large commits lists values from its first.
+        // The record, made at the first such value, is the frame's and queued once the commit is published. One int,
+        // which with the flags above fills the applier's last eight bytes, where a flag of its own for a replayed commit
+        // took eight more
         private final int spillRoom;
 
         /// Creates the applier of a transaction, journaled in a frame if `journaled`.
@@ -2993,7 +2995,8 @@ public final class LiveLedger implements Ledger {
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
             var length = ownTail == null ? Math.toIntExact(value.byteSize()) : own.length + ownTail.length;
-            if (source != null && spillRoom >= 0 && !state.resident && ValueSlab.Overwrites.sampled(sequence)) {
+            if (source != null && spillRoom >= 0 && !state.resident && (ValueSlab.Overwrites.sampled(stamp)
+                    || spillRoom >= ValueSlab.Overwrites.BULK_WRITES && !state.overwrites.judged())) {
                 state.overwrites.sample(head, length);
             }
             Version version;
@@ -3107,7 +3110,7 @@ public final class LiveLedger implements Ledger {
                 return;
             }
             // A recovery's removals count for nothing: the puts of its commits are not sampled either
-            if (frame != null && !state.resident && ValueSlab.Overwrites.sampled(sequence)) {
+            if (frame != null && !state.resident && ValueSlab.Overwrites.sampled(stamp)) {
                 state.overwrites.sampleRemoval(head);
             }
             var version = new Version(stamp, (MemorySegment) null, null, head);

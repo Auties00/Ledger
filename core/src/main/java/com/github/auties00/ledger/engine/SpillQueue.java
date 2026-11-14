@@ -29,7 +29,7 @@ import java.util.zip.CRC32C;
 ///
 /// A record leaves the queue once its values moved, or once a published checkpoint holds its commit. Values are not
 /// moved:
-/// - of a key space until samples of its commits show that it replaces or removes few of its values before a
+/// - of a key space until samples of its puts show that it replaces or removes few of its values before a
 ///   checkpoint ([ValueSlab.Overwrites#spills()]): a record lists versions, which keep their batch's arrays alive until
 ///   the record leaves the queue, and moving a value no reader can reach any more costs a tag of its bytes for
 ///   nothing. A version listed and then replaced counts in the held bytes until its record leaves, a share of them

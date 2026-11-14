@@ -32,8 +32,10 @@ import static org.junit.jupiter.api.Assertions.*;
 /// them at once: writers that overwrite, delete and remove ranges of groups of keys, transactions, commits of 1,280
 /// writes that forget their values once published, snapshots scanned both ways, gets, ranges and encoded reads,
 /// checkpoints every 15 ms, collections every 20 ms that empty the weak pools, and reopens that alternate a crash-like
-/// close without a checkpoint and a clean one. The store runs with a budget of 0, key spaces that move values from their
-/// first commit and a cold slab, so every value of 256 bytes or more of a durable commit moves to the log. Each value
+/// close without a checkpoint and a clean one. The store runs with a budget of 0 and a cold slab, so every value of 256
+/// bytes or more of a durable commit moves to the log, and a key space that moves values from its first commit, or one
+/// that waits for the samples of its overwrites to be judged, at the 64th put of its first commit of 1,280 writes,
+/// while other writers overwrite and remove. Each value
 /// names its key, generation and length and fills its bytes from them, and the 8 keys of a group always change
 /// together at one generation, so a value read from a wrong place, a released array or a torn snapshot shows as a
 /// corrupt value, a group of mixed generations or a group partly present.
@@ -45,7 +47,7 @@ class LogSpillStressTest {
     private static final int PER = 8;
     private static final int[] LENGTHS = {24, 200, 256, 300, 700, 1_500, 5_000, 20_000};
 
-    private static LiveLedger open(Path dir, boolean encrypted) {
+    private static LiveLedger open(Path dir, boolean encrypted, boolean forced) {
         var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(dir)
                 .encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
                 .keyspace(MSG).keyspace(RES).commitWindow(Duration.ZERO))
@@ -54,7 +56,9 @@ class LogSpillStressTest {
                 .writeThrough(WriteThrough.Mode.OFF)
                 .build();
         ledger.valueSlab().forceColdForTests();
-        ledger.state(MSG).overwrites.forceSpillsForTests();
+        if (forced) {
+            ledger.state(MSG).overwrites.forceSpillsForTests();
+        }
         return ledger;
     }
 
@@ -134,17 +138,17 @@ class LogSpillStressTest {
         }
     }
 
-    @ParameterizedTest(name = "encrypted={0} cold={1}")
-    @CsvSource({"true,false", "true,true", "false,true"})
+    @ParameterizedTest(name = "encrypted={0} cold={1} forced={2}")
+    @CsvSource({"true,false,true", "true,true,true", "false,true,true", "true,false,false"})
     @Timeout(300)
     @DisplayName("snapshots stay isolated and values intact while values move to the log, pools empty, large commits forget their values and the store reopens")
-    void stress(boolean encrypted, boolean cold, @TempDir Path dir) throws Exception {
+    void stress(boolean encrypted, boolean cold, boolean forced, @TempDir Path dir) throws Exception {
         PageFile.forceColdNewForTests(cold);
         try {
             var gens = new AtomicLong(1);
             List<Map.Entry<byte[], byte[]>> carried = null;
             for (var phase = 0; phase < 4; phase++) {
-                var ledger = open(dir, encrypted);
+                var ledger = open(dir, encrypted, forced);
                 if (carried != null) {
                     sameEntries(carried, scan(ledger, false), "after reopen " + phase);
                     checkAtomic(scan(ledger, true), "reversed after reopen " + phase);
@@ -298,14 +302,18 @@ class LogSpillStressTest {
                 ledger.awaitDurable();
                 carried = scan(ledger, false);
                 checkAtomic(carried, "end of phase " + phase);
-                assertTrue(ledger.spills().loggedValuesForTests() > 0, "values moved to the log in phase " + phase);
+                if (forced) {
+                    assertTrue(ledger.spills().loggedValuesForTests() > 0, "values moved to the log in phase " + phase);
+                } else {
+                    assertTrue(ledger.state(MSG).overwrites.judged(), "no judgement in phase " + phase);
+                }
                 if (phase % 2 == 0) {
                     ledger.closeWithoutCheckpoint();
                 } else {
                     ledger.close();
                 }
             }
-            try (var ledger = open(dir, encrypted)) {
+            try (var ledger = open(dir, encrypted, forced)) {
                 sameEntries(carried, scan(ledger, false), "final reopen");
             }
         } finally {
