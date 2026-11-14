@@ -49,31 +49,44 @@ import java.util.concurrent.atomic.AtomicLong;
 /// slots: a unit a checkpoint wrote and no one read yet waits its turn behind the older ones, wherever its key hashes,
 /// and is not the next to go because it landed just ahead of the hand.
 ///
-/// A read of a key space's tree that misses a leaf or a value is screened ([#putScreened(long, PageRef, byte\[\])]): the
-/// cache takes the unit only at its second read, the first one recorded by a [Doorkeeper] of the unit's key and nonce.
-/// Caching each unit at its first read, the leaves and values of every chat a client opened once, kept most of the
-/// cache's bytes for units no one read again. The doorkeeper takes at most 4% of the units it never saw for seen ones,
-/// which the cache takes at their first read. A unit a read used that the clock evicts is recorded as it leaves, so its
-/// next read caches it at once; one a checkpoint cached as written that the clock evicts unread leaves no trace, as a
-/// saturated checkpoint caches leaves at every run, and recording each one the clock evicts would fill the
-/// doorkeeper's generations with keys no read touched, so that they rotate and forget the first reads they hold. A
-/// branch is never screened, as every read starts from the branches. Screening does not depend on
-/// how fast the device reads: the reads of the files go through the OS cache, so the first read of a unit, from the
-/// device or not, leaves its pages there, and its second read costs a read of the OS cache and an open, a few
+/// A read of a key space's tree that misses a leaf or a value is screened
+/// ([#putScreened(long, PageRef, byte\[\], int)]): the cache takes the unit only once a [Doorkeeper] of the unit's key
+/// and nonce recorded the reads before it, one for a point read ([#POINT]), which takes the unit at its second read,
+/// and two for a scan ([#SCAN]), which takes it at its third. Caching each unit at its first read, the leaves and
+/// values of every chat a client opened once, kept most of the cache's bytes for units no one read again; and of the
+/// units a scan read twice, the pages of a chat a client opened twice, most were not read again either, while the
+/// second read of a unit is the cheapest of all. Point reads keep the second read, as a store looked up by key reads
+/// most of its units about once in each pass over a working set larger than the cache, which a third read would take
+/// that much longer to fill. The doorkeeper takes a few percent at most of the units it never saw for seen ones, which
+/// the cache takes a read early. A unit a read used that the clock evicts is recorded as read twice as it leaves, so
+/// its next read caches it at once, a scan's too once a scan read a unit twice; one a checkpoint cached as written that
+/// the clock evicts unread leaves no trace, as a saturated checkpoint caches leaves at every run, and recording each one
+/// the clock evicts would fill the doorkeeper's generations with keys no read touched, so that they rotate and forget
+/// the first reads they hold. A branch is never screened, as every read starts from the branches. Screening does not
+/// depend on how fast the device reads: the reads of the files go through the OS cache, so the first read of a unit,
+/// from the device or not, leaves its pages there, and its later reads cost a read of the OS cache and an open, a few
 /// microseconds, on a store copied past the OS cache as much as on any other.
 ///
 /// The array of a unit the cache refused stays reachable weakly, in one of two slots of a table of up to
-/// [#MAX_REFUSALS] by a hash of the key and nonce, so a read that misses the unit before the collector takes it caches
-/// that array rather than reading and opening the unit again, whether it is the second read of a screened read or a
-/// lookup of a commit: what the cache holds stays what reads used twice, and the first reads of a session allocate no
-/// more than they did when the cache took every unit at once, as long as the collector has not run between the two
-/// reads. Writes, the lookups of a commit, the reads of a checkpoint and of a resident key space, the root of a tree,
-/// and the units of a scan past its first leaves and values cache as they would unscreened.
+/// [#MAX_REFUSALS] by a hash of the key and nonce, so a read that misses the unit before the collector takes it uses
+/// that array rather than reading and opening the unit again ([#recall(long, PageRef, int)]): the second read of a
+/// point read and a lookup of a commit cache it, and a scan leaves it where it is at its second read and caches it at
+/// its third. What the cache holds stays what reads used often enough, and the first reads of a session allocate no
+/// more than they did when the cache took every unit at once, as long as the collector has not run between the reads.
+/// Writes, the lookups of a commit, the reads of a checkpoint and of a resident key space, the root of a tree, and the
+/// units of a scan past its first leaves and values cache as they would unscreened.
 final class PageCache implements IdleTicker.Watched {
     /// The file of the trees, `ledger.data`.
     static final int DATA = 0;
     /// The file of the values written at commit, `ledger.blobs`.
     static final int BLOBS = 1;
+    /// The screening of a read whose units the cache takes at their first read: a write, a lookup of a commit, a read
+    /// of a checkpoint or of a resident key space.
+    static final int UNSCREENED = 0;
+    /// The screening of a point read, whose leaves and values the cache takes at their second read.
+    static final int POINT = 1;
+    /// The screening of a scan, whose leaves and values the cache takes at their third read.
+    static final int SCAN = 2;
     /// The first of the keys of the leaves delta records make, one per slot of a delta page of `ledger.data`.
     private static final int RECORDS = 2;
     /// The least bytes [#admission()] gives while the limit allows it: 4,096 leaves.
@@ -272,21 +285,23 @@ final class PageCache implements IdleTicker.Watched {
     }
 
     /// Caches `unit`, the plaintext of the unit `ref` of the data file names, as a read that missed it, if the cache
-    /// [admits][#admits(long, PageRef)] it or it is a branch.
+    /// [admits][#admits(long, PageRef, int)] it or it is a branch.
     ///
     /// @param unit an array as [#put(long, PageRef, byte\[\], boolean)] requires
-    void putScreened(PageRef ref, byte[] unit) {
-        putScreened(dataKey(ref.page(), ref.slot()), ref, unit);
+    /// @param screen the read's screening: [#UNSCREENED], [#POINT] or [#SCAN]
+    void putScreened(PageRef ref, byte[] unit, int screen) {
+        putScreened(dataKey(ref.page(), ref.slot()), ref, unit, screen);
     }
 
     /// Caches `unit`, the plaintext of the unit `ref` names, at `key`, as a read that missed it, as an entry a read
-    /// used, if the cache [admits][#admits(long, PageRef)] it or it is a branch; otherwise the read that missed it
-    /// keeps the array, which the cache holds only weakly, for a [recall][#recall(long, PageRef)].
+    /// used, if the cache [admits][#admits(long, PageRef, int)] it or it is a branch; otherwise the read that missed
+    /// it keeps the array, which the cache holds only weakly, for a [recall][#recall(long, PageRef, int)].
     ///
     /// @param key a key of [#key(int, int)] or [#dataKey(int, int)]
     /// @param unit an array as [#put(long, PageRef, byte\[\], boolean)] requires
-    void putScreened(long key, PageRef ref, byte[] unit) {
-        if (unit[PageFormat.KIND] == PageFormat.BRANCH || admits(key, ref)) {
+    /// @param screen the read's screening: [#UNSCREENED], [#POINT] or [#SCAN]
+    void putScreened(long key, PageRef ref, byte[] unit, int screen) {
+        if (unit[PageFormat.KIND] == PageFormat.BRANCH || admits(key, ref, screen)) {
             put(key, ref, unit, true);
         } else {
             refuse(key, ref, unit);
@@ -295,19 +310,22 @@ final class PageCache implements IdleTicker.Watched {
 
     /// {@return whether a read that missed the unit `ref` names, at `key`, caches what it reads}
     ///
-    /// A cache the data file did not [turn screening on][#screen(boolean)] for always does. One that screens does if
-    /// the doorkeeper saw the unit, read or evicted, or [expects][#expect(PageRef)] it, since its generations last
-    /// forgot it, or takes it for one it saw, at most 4% of the units it never saw; otherwise the doorkeeper records it
-    /// and the cache drops the entry it held at `key` for another unit, which no read finds any more. A cache that
-    /// closed records nothing.
-    boolean admits(long key, PageRef ref) {
-        if (!screening) {
+    /// A cache the data file did not [turn screening on][#screen(boolean)] for always does, as does an unscreened
+    /// read. One that screens does if the doorkeeper saw as many reads of the unit before this one as the read's
+    /// screening asks for ([#reads(PageRef)]), or [expects][#expect(PageRef, int)] it, since its generations last
+    /// forgot it, or takes it for one it saw, a few percent at most of the units it never saw; otherwise the doorkeeper
+    /// records the read and the cache drops the entry it held at `key` for another unit, which no read finds any more.
+    /// A cache that closed records nothing.
+    ///
+    /// @param screen the read's screening: [#UNSCREENED], [#POINT] or [#SCAN]
+    boolean admits(long key, PageRef ref, int screen) {
+        if (!screening || screen == UNSCREENED) {
             return true;
         }
         if (closed) {
             return false;
         }
-        if (doorkeeper.admit(key, ref.nonceHigh(), doorkeeperKeys())) {
+        if (doorkeeper.admit(key, ref.nonceHigh(), doorkeeperKeys(), screen)) {
             return true;
         }
         removeOther(key, ref);
@@ -318,7 +336,16 @@ final class PageCache implements IdleTicker.Watched {
     /// a read of the file or the clock's eviction of it, which leaves its pages in the OS cache, or one of the units
     /// it takes for seen ones}
     boolean seen(PageRef ref) {
-        return screening && !closed && doorkeeper.holds(dataKey(ref.page(), ref.slot()), ref.nonceHigh());
+        return reads(ref) > 0;
+    }
+
+    /// {@return the reads of the unit `ref` of the data file names, or of the leaf its delta record makes, that the
+    /// doorkeeper saw: 2 for two or more, 1 or 0; 0 also when the cache does not screen}
+    ///
+    /// The clock's eviction of a unit a read used counts as two reads once a scan read a unit twice, and as one
+    /// before, and an [expected][#expect(PageRef, int)] unit has none.
+    int reads(PageRef ref) {
+        return screening && !closed ? doorkeeper.reads(dataKey(ref.page(), ref.slot()), ref.nonceHigh()) : 0;
     }
 
     /// Makes the cache screen what reads miss, or cache it at the first read; a cache no call reached screens nothing.
@@ -332,29 +359,39 @@ final class PageCache implements IdleTicker.Watched {
     }
 
     /// Records the unit `ref` of the data file names, or the leaf its delta record makes, in the doorkeeper as
-    /// expected, so the first read that misses it caches it as an entry a read used: a checkpoint wrote it, left it
-    /// out of the cache, and a read used the leaf it replaces.
+    /// expected, so a read that misses it caches it as an entry a read used one read sooner than its screening asks
+    /// for, or two sooner for a scan after two reads of the leaf it replaces: a checkpoint wrote it, left it out of the
+    /// cache, and reads used the leaf it replaces `reads` times.
     ///
     /// The doorkeeper knows a unit by its nonce, which every checkpoint that rewrites a leaf changes, so a leaf a
-    /// reader reads once between two checkpoints would otherwise be refused at every read of every version. An
-    /// expected unit is not [seen][#seen(PageRef)] ([Doorkeeper#expect(long, long, int)]), so a checkpoint that
-    /// rewrites it before any read expects nothing in its place: the record lasts one version, and only a read
-    /// carries it to the next. It records nothing unless the cache screens and the doorkeeper recorded a unit before.
-    void expect(PageRef ref) {
+    /// reader reads once between two checkpoints would otherwise be refused at every read of every version: a point
+    /// reader caches it at its first read of the next version, and a scan at its second read of the next version
+    /// and its first of the one after. An expected unit is not [seen][#seen(PageRef)]
+    /// ([Doorkeeper#expect(long, long, int, int)]), so a checkpoint that rewrites it before any read expects nothing in
+    /// its place: the record lasts one version, and only a read carries it to the next. It records nothing unless the
+    /// cache screens and the doorkeeper recorded a unit before.
+    ///
+    /// @param reads the reads of the leaf it replaces, 1 or 2, as [PageFile#reads(PageRef)] counts them
+    void expect(PageRef ref, int reads) {
         if (screening && !closed) {
-            doorkeeper.expect(dataKey(ref.page(), ref.slot()), ref.nonceHigh(), doorkeeperKeys());
+            doorkeeper.expect(dataKey(ref.page(), ref.slot()), ref.nonceHigh(), doorkeeperKeys(), reads);
         }
     }
 
     /// {@return the array of the unit `ref` names, at `key`, if the cache refused it lately and the collector has not
-    /// taken it, which the cache then holds as an entry a read used; or `null`}
+    /// taken it, or `null`}
     ///
-    /// A read that missed the unit and would cache what it reads as read asks for it before it reads the file: the
-    /// unit's second read, which the cache admits, or a lookup of a commit, then neither reads nor opens it again, nor
-    /// reads the base of a delta record's leaf. It takes no lock and allocates nothing when it finds nothing.
+    /// A read that missed the unit and would cache what it reads as read asks for it before it reads the file, and
+    /// then neither reads nor opens it again, nor reads the base of a delta record's leaf. The cache then holds the
+    /// array as an entry a read used, unless the read is a scan the cache does not
+    /// [admit][#admits(long, PageRef, int)] it for: the array then stays where it was for the scan's next read. A
+    /// point read and a lookup of a commit take it as they would at the unit's second read. Only a recall that finds
+    /// the array counts as a read of the unit, so a read that recalls before it reads the file counts once. It takes no
+    /// lock and allocates nothing when it finds nothing.
     ///
     /// @param key a key of [#key(int, int)] or [#dataKey(int, int)]
-    byte[] recall(long key, PageRef ref) {
+    /// @param screen the read's screening: [#UNSCREENED], [#POINT] or [#SCAN]
+    byte[] recall(long key, PageRef ref, int screen) {
         var refused = this.refused;
         if (refused == null) {
             return null;
@@ -371,18 +408,23 @@ final class PageCache implements IdleTicker.Watched {
         if (unit == null) {
             return null;
         }
+        if (screen == SCAN && !admits(key, ref, SCAN)) {
+            return unit;
+        }
         REFUSED.compareAndSet(refused, index, held, null);
         put(key, ref, unit, true);
         return unit;
     }
 
-    /// {@return what [#recall(long, PageRef)] finds for the unit `ref` of the data file names, or the leaf its delta
-    /// record makes}
-    byte[] recall(PageRef ref) {
-        return recall(dataKey(ref.page(), ref.slot()), ref);
+    /// {@return what [#recall(long, PageRef, int)] finds for the unit `ref` of the data file names, or the leaf its
+    /// delta record makes}
+    ///
+    /// @param screen the read's screening: [#UNSCREENED], [#POINT] or [#SCAN]
+    byte[] recall(PageRef ref, int screen) {
+        return recall(dataKey(ref.page(), ref.slot()), ref, screen);
     }
 
-    /// Keeps `unit`, which the cache refused at `key`, reachable weakly for a [recall][#recall(long, PageRef)], in
+    /// Keeps `unit`, which the cache refused at `key`, reachable weakly for a [recall][#recall(long, PageRef, int)], in
     /// the first of the two slots of its key and nonce, whose unit moves to the second in place of the one there,
     /// unless either is free.
     ///
@@ -396,8 +438,10 @@ final class PageCache implements IdleTicker.Watched {
             }
         }
         forgetCollected();
-        place(refused, new Refused(unit, key, ref, collected));
-        if (refusals.incrementAndGet() > refused.length / 4 && refused.length < MAX_REFUSALS) {
+        // A unit refused again, a scan's second read once the collector took the first read's array, takes its own
+        // slot back and does not count: the table holds it once
+        if (place(refused, new Refused(unit, key, ref, collected))
+                && refusals.incrementAndGet() > refused.length / 4 && refused.length < MAX_REFUSALS) {
             grow(refused);
         }
     }
@@ -455,14 +499,23 @@ final class PageCache implements IdleTicker.Watched {
     }
 
     /// Puts `unit` in the first slot of its pair in `refused`, moving the unit there to the second slot unless the
-    /// first is free or holds a unit the collector took; races lose a unit at worst, which costs it one more read.
-    private static void place(Refused[] refused, Refused unit) {
+    /// first is free, holds a unit the collector took or holds the same unit; races lose a unit at worst, which costs
+    /// it one more read.
+    ///
+    /// @return whether neither slot held the same unit before
+    private static boolean place(Refused[] refused, Refused unit) {
         var slot = refusal(unit.key, unit.nonceHigh, refused.length);
         var first = (Refused) REFUSED.getAcquire(refused, slot);
+        if (first != null && first.names(unit)) {
+            REFUSED.setRelease(refused, slot, unit);
+            return false;
+        }
+        var second = (Refused) REFUSED.getAcquire(refused, slot + 1);
         if (first != null && !first.refersTo(null)) {
             REFUSED.setRelease(refused, slot + 1, first);
         }
         REFUSED.setRelease(refused, slot, unit);
+        return second == null || !second.names(unit);
     }
 
     /// {@return the first of the two slots, in a table of `slots` slots, of the unit at `key` sealed under a nonce
@@ -489,6 +542,11 @@ final class PageCache implements IdleTicker.Watched {
         /// {@return whether it holds the unit `ref` names at `key`}
         boolean names(long key, PageRef ref) {
             return this.key == key && nonceHigh == ref.nonceHigh() && identity == identity(ref.nonceLow(), ref.pages());
+        }
+
+        /// {@return whether it names the unit `other` names}
+        boolean names(Refused other) {
+            return key == other.key && nonceHigh == other.nonceHigh && identity == other.identity;
         }
     }
 

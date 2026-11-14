@@ -95,17 +95,19 @@ final class Reads {
     ///
     /// @param root the root of the key space's tree, or `null` if the read uses none
     /// @param screened whether the units it reads go to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef)] them: the leaves of a resident key space leave the
-    ///                 cache once its loader holds their entries, so screening them would only read them twice
+    ///                 [admits][PageCache#admits(long, PageRef, int)] them, at their second read as a point read's:
+    ///                 the leaves of a resident key space leave the cache once its loader holds their entries, so
+    ///                 screening them would only read them twice
     private static MemorySegment treeValue(byte[] key, ReadPoint point, TreeRoot root, RangeRemoval[] removals,
                                            boolean screened) {
         if (root == null) {
             return null;
         }
-        var unit = TreeSearch.leaf(point.pages(), root, key, screened);
+        var screen = screened ? PageCache.POINT : PageCache.UNSCREENED;
+        var unit = TreeSearch.leaf(point.pages(), root, key, screen);
         var entry = TreeSearch.entryOf(unit, key);
         return entry == -1 || hiddenSinceTree(key, point, removals) ? null
-                : TreeSearch.value(point.pages(), unit, entry, true, true, screened);
+                : TreeSearch.value(point.pages(), unit, entry, true, true, screen);
     }
 
     /// {@return the value of `key` in the tree of `point`, with the run it reads over it, or `null` if they hold none or
@@ -304,7 +306,7 @@ final class Reads {
     /// @param root the root of the key space's tree, or `null` if the read uses none
     /// @param bytes whether the values are byte arrays, which copy out of the array that holds them
     /// @param screened whether the units it reads go to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef)] them, as for
+    ///                 [admits][PageCache#admits(long, PageRef, int)] them, as for
     ///                 [#treeValue(byte\[\], ReadPoint, TreeRoot, RangeRemoval\[\], boolean)]
     @SuppressWarnings("unchecked")
     private static <V> Optional<V> treeGet(Keyspace<?, V> keyspace, byte[] key, ReadPoint point, TreeRoot root,
@@ -312,14 +314,15 @@ final class Reads {
         if (root == null) {
             return Optional.empty();
         }
-        var unit = TreeSearch.leaf(point.pages(), root, key, screened);
+        var screen = screened ? PageCache.POINT : PageCache.UNSCREENED;
+        var unit = TreeSearch.leaf(point.pages(), root, key, screen);
         var entry = TreeSearch.entryOf(unit, key);
         if (entry == -1 || hiddenSinceTree(key, point, removals)) {
             return Optional.empty();
         }
         return Optional.of(bytes
-                ? (V) TreeSearch.valueBytes(point.pages(), unit, entry, screened)
-                : keyspace.values().decode(TreeSearch.value(point.pages(), unit, entry, true, true, screened)));
+                ? (V) TreeSearch.valueBytes(point.pages(), unit, entry, screen)
+                : keyspace.values().decode(TreeSearch.value(point.pages(), unit, entry, true, true, screen)));
     }
 
     static <K, V> List<Entry<K, V>> range(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, int limit, ReadPoint point) {
