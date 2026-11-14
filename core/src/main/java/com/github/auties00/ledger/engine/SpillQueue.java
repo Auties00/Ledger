@@ -18,27 +18,31 @@ import java.util.zip.CRC32C;
 
 /// The paged values waiting for a checkpoint that may leave the heap for the log, which holds them durably too.
 ///
-/// A value a batch put to a paged key space stays on its batch's array until a checkpoint writes it, and the array
-/// with it: up to six intervals of log, hundreds of megabytes after a history sync. Each commit with such values
-/// queues a [Record] of them once it is published, which the log writer locates in the frame it seals. Once the queue
-/// holds more than its budget of values whose frames are durable, a virtual thread moves the values of the oldest
-/// records off their arrays, until three quarters of the budget is left: a value of at least [#LOG_VALUE_MIN] bytes to
-/// its place in the log ([LogValue]), with a tag that authenticates it, a shorter one to an array of its own. A
-/// batch's array no version needs any more is then garbage. The newest values, those of the budget, stay where they
-/// are, so reads of recent writes do not change; a read of a value in the log reads it back with one positioned read.
+/// A value a batch put to a paged key space stays on its batch's array, or on the array of its own a value of half a
+/// chunk or more takes, until a checkpoint writes it, and the array with it: up to six intervals of log, hundreds of
+/// megabytes after a history sync. Each commit with such values queues a [Record] of them once it is published, which
+/// the log writer locates in the frame it seals. Once the queue holds more than its budget of values whose frames are
+/// durable, a virtual thread moves the values of the oldest records off their arrays, until three quarters of the
+/// budget is left: a value of at least [#LOG_VALUE_MIN] bytes to its place in the log ([LogValue]), with a tag that
+/// authenticates it, a shorter one to an array of its own. An array no version needs any more is then garbage. The
+/// newest values, those of the budget, stay where they are, so reads of recent writes do not change; a read of a value
+/// in the log reads it back with one positioned read.
 ///
 /// A record leaves the queue once its values moved, or once a published checkpoint holds its commit. Values are not
 /// moved:
-/// - of a key space until samples of its commits show that it replaces or removes few of its values before a
-///   checkpoint ([ValueSlab.Overwrites#spills()]): a record lists versions, which keep their batch's arrays alive until
-///   the record leaves the queue, and moving a value no reader can reach any more costs a tag of its bytes for
-///   nothing. A version listed and then replaced counts in the held bytes until its record leaves, a share of them
-///   the samples keep under an eighth;
+/// - of a batch's shared arrays in a key space until samples of its commits show that it replaces or removes few of
+///   its values before a checkpoint ([ValueSlab.Overwrites#spills()]): a record lists versions, which keep their
+///   batch's arrays alive until the record leaves the queue, and moving a value no reader can reach any more costs a
+///   tag of its bytes for nothing. A version listed and then replaced counts in the held bytes until its record
+///   leaves, a share of them the samples keep under an eighth. A value on an array of its own moves without them: the
+///   array is the value's alone and lives as long as its version in any case, so the record keeps no other bytes
+///   alive. In a key space that replaces such values before a checkpoint, the arrays it replaced stay until their
+///   records leave, at most the budget of them, and the thread tags some of them for nothing;
 /// - of a group the log wrote through to stable storage, whose pages that write took out of the system's cache, so a
-///   read back would go to the device;
-/// - of a batch on a [ValueSlab]'s chunks, which the slab bounds already, of a transaction, of a value a batch put on
-///   an array of its own, or of one with a unit of [BlobFile]. A value a recovery copied to an array of its own moves,
-///   to the log only.
+///   read back would go to the device, unless every value the record lists is at least [#THROUGH_VALUE_MIN] bytes;
+/// - of a batch on a [ValueSlab]'s chunks, which the slab bounds already, even beside a value on an array of its
+///   own, of a transaction, or of one with a unit of [BlobFile]. A value a recovery copied to an array of its own
+///   moves, to the log only.
 ///
 /// A recovery moves a value it replays that the log holds before its last budget of bytes at once, on its own thread,
 /// tagged where it lies in the frame body it came in
@@ -56,6 +60,10 @@ final class SpillQueue {
     /// The shortest value that moves to the log: a [LogValue] takes 40 bytes, an array of the value 16 more than the
     /// value; below it, the array costs less than a read back from the file.
     static final int LOG_VALUE_MIN = 256;
+    /// The shortest values whose record moves to the log although the log wrote its group through: a value that long
+    /// comes back with one positioned read even from the device, as long as the write of it took, where a record of
+    /// small values would take a random read of the device per value.
+    static final int THROUGH_VALUE_MIN = 128 << 10;
     /// The bytes of an AES block.
     static final int BLOCK = 16;
     /// The prime 2^61 - 1, the modulus of the polynomials of the tags.
@@ -63,7 +71,7 @@ final class SpillQueue {
     /// The bytes of a word of a tagged value: 7, so a word is below [#PRIME].
     private static final int WORD = 7;
     /// The scratch past which a [Crypto] given back lets go of it: the values of messages take a few kilobytes.
-    private static final int KEPT_SCRATCH = 16 << 10;
+    static final int KEPT_SCRATCH = 16 << 10;
     /// The keystream a [Crypto] makes in one call, a multiple of [#BLOCK]: its arrays of counter blocks and keystream
     /// keep this size, and a longer value is decrypted a piece at a time.
     private static final int KEYSTREAM = 4 << 10;
@@ -441,9 +449,10 @@ final class SpillQueue {
         // Where each value starts in the body of its commit
         private int[] offsets;
         private int count;
-        // The bytes of the values, and whether one is at least LOG_VALUE_MIN
+        // The bytes of the values, whether one is at least LOG_VALUE_MIN, and the bytes of the shortest
         private long bytes;
         private boolean large;
+        private int shortest = Integer.MAX_VALUE;
         // Set by the log writer as it seals the frame: the segment use, the frame's offset, where the commit's body
         // starts in the frame's body, and whether the group was written through
         private LogSegmentView segment;
@@ -467,6 +476,7 @@ final class SpillQueue {
             offsets[count++] = offset;
             bytes += length;
             large |= length >= LOG_VALUE_MIN;
+            shortest = Math.min(shortest, length);
         }
 
         /// Records where the log wrote the frame of the commit: at `frameOffset` of the use `segment`, the commit's body
@@ -485,9 +495,10 @@ final class SpillQueue {
             return sequence;
         }
 
-        /// {@return whether values move to the log: some are long enough, and its frame is in a segment's cache}
+        /// {@return whether values move to the log: some are long enough, and its frame is in a segment's cache or every
+        /// value is long enough to read back from the device}
         private boolean logs() {
-            return large && segment != null && !through;
+            return large && segment != null && (!through || shortest >= THROUGH_VALUE_MIN);
         }
 
         /// Moves the values, unless a long one cannot move to the log, then forgets them.
@@ -532,7 +543,9 @@ final class SpillQueue {
     /// `n / (2^61 - 1)`, and the two points are independent. A tag never leaves the process, so bytes changed in the
     /// file, whatever change the CTR keystream lets anyone make, pass for the value with a probability of at most
     /// `n / (2^61 - 1)` times `n / (2^61 - 1) + 2^-32`, the second factor that of the 32 bits a tag keeps of the second
-    /// polynomial: below 2^-80 for a value of 12 KiB, about the bound of a 96-bit GMAC of the same value.
+    /// polynomial: below 2^-80 for a value of 12 KiB, about the bound of a 96-bit GMAC of the same value, below 2^-75
+    /// for one of 1 MiB, the longest that moves with the default large values, and below 2^-64 for the longest a frame
+    /// holds, which a store without a file of large values may move.
     ///
     /// @implNote This implementation tags with a universal hash of its own, not a MAC of the JDK: a store that recovers
     /// a long log after a crash tags every value it replays while the JVM has compiled little, when the C2 compilation
@@ -655,6 +668,25 @@ final class SpillQueue {
         /// @throws IllegalStateException if the cipher fails, which leaves its state unknown
         void decrypt(Cipher cipher, long frameOffset, int bodyIndex, byte[] sealed, int skip, int length, byte[] target,
                      int offset) {
+            decrypt(cipher, frameOffset, bodyIndex, sealed, 0, skip, length, target, offset);
+        }
+
+        /// Decrypts in place, as [#decrypt(Cipher, long, int, byte\[\], int, int, byte\[\], int)] does, the `length`
+        /// sealed bytes at `offset` of `value`, the value at `bodyIndex` of the body of the frame at `frameOffset`: the
+        /// keystream comes from the counter blocks alone, so the bytes before the value in its first block are not
+        /// needed.
+        ///
+        /// @throws IllegalStateException if the cipher fails, which leaves its state unknown
+        void decryptInPlace(Cipher cipher, long frameOffset, int bodyIndex, byte[] value, int offset, int length) {
+            var skip = bodyIndex & (BLOCK - 1);
+            // The byte at i of the blocks is at offset - skip + i of the value, read only from i = skip on
+            decrypt(cipher, frameOffset, bodyIndex, value, offset - skip, skip, length, value, offset);
+        }
+
+        /// Decrypts as [#decrypt(Cipher, long, int, byte\[\], int, int, byte\[\], int)] does, the byte at `i` of the
+        /// blocks being at `sealedBase + i` of `sealed`, which may be `target` itself.
+        private void decrypt(Cipher cipher, long frameOffset, int bodyIndex, byte[] sealed, int sealedBase, int skip,
+                             int length, byte[] target, int offset) {
             if (counters == null) {
                 counters = new byte[KEYSTREAM];
                 keystream = new byte[KEYSTREAM];
@@ -676,7 +708,7 @@ final class SpillQueue {
                 // The value's bytes in this piece: from skip in the first, up to skip + length in the last
                 var to = Math.min(start + piece, skip + length);
                 for (var i = Math.max(start, skip); i < to; i++) {
-                    target[offset + i - skip] = (byte) (sealed[i] ^ keystream[i - start]);
+                    target[offset + i - skip] = (byte) (sealed[sealedBase + i] ^ keystream[i - start]);
                 }
             }
         }

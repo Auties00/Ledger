@@ -10,6 +10,9 @@ package com.github.auties00.ledger.engine;
 ///
 /// It takes 40 bytes, a quarter of what an array of a 1.5 KiB message keeps in its place.
 ///
+/// A value of a group the log wrote through to stable storage, which moves only when it is long
+/// ([SpillQueue#THROUGH_VALUE_MIN]), is read back from the device the first time, not from the system's cache.
+///
 /// @param segment the segment use that wrote the frame
 /// @param frameOffset where the frame starts in its segment
 /// @param bodyIndex where the value starts in the frame's body

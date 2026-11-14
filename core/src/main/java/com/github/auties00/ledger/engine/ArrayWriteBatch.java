@@ -144,6 +144,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     private byte[][] owns;
     // The bytes of the arrays in owns
     private long ownBytes;
+    // The values in owns put to paged key spaces that the batch did not borrow, which only a value bound for the file
+    // of large values is
+    private int pagedOwns;
     // The chunks of the rope by the number a span's offset holds in its high bits, or null while the encodings are on
     // data, whose spans hold 0 there: the number 0 is no chunk's
     private Chunk[] chunks;
@@ -395,6 +398,9 @@ public final class ArrayWriteBatch implements WriteBatch {
         // The value stays where it is, so add() is left without a branch no other write takes
         if (keyspace.residency() == Keyspace.Residency.PAGED) {
             pagedValueBytes -= length;
+            if (!borrowed) {
+                pagedOwns++;
+            }
         } else {
             residentValueBytes -= length;
         }
@@ -663,6 +669,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         // Every borrowed array with them: the batch keeps no caller's array past the end of a commit or a clear
         owns = null;
         ownBytes = 0;
+        pagedOwns = 0;
         leaveRope();
         // What a commit that failed prepared
         packedHome = null;
@@ -1076,6 +1083,14 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// commit's values share: its own, the one it packed them into, or the chunks of its rope}
     boolean homesAllocated() {
         return homesMode == HOMES_OWN || homesMode == HOMES_CHUNKS || homesMode == HOMES_ROPE;
+    }
+
+    /// {@return whether the batch puts a value to a paged key space on an array of its own that it did not borrow}
+    ///
+    /// Such an array is the value's alone, so it may leave the heap for the log whatever the batch's other values lie
+    /// on; one of them may still go to the file of large values instead, as the store finds when it applies the put.
+    boolean ownsPagedValues() {
+        return pagedOwns > 0;
     }
 
     /// Starts the batch again, empty, once the store has applied its writes: it hands over to the store the arrays the

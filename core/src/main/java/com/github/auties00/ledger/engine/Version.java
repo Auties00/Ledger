@@ -18,8 +18,9 @@ import java.lang.invoke.VarHandle;
 /// source is the [BlobFile] itself ([#ofUnit]), and a read opens the unit, through the page cache. Its unit therefore
 /// stays until every reader that may find it is past the commit that replaced it ([External#replacedAt]).
 ///
-/// The value of a paged version waiting for a checkpoint may leave its batch's array for the log, which holds it too
-/// ([SpillQueue]): [#spill] replaces the source, once, with a [LogValue] or with an array of the value alone. Every
+/// The value of a paged version waiting for a checkpoint may leave its batch's array, or the array of its own it came
+/// on, for the log, which holds it too ([SpillQueue]): [#spill] replaces the source, once, with a [LogValue] or with an
+/// array of the value alone. Every
 /// read loads the source once and takes the offset only with a segment, so a read that races the replacement reads
 /// either the old source with its offset or the new one, which needs none.
 sealed class Version permits Version.External {
@@ -176,8 +177,8 @@ sealed class Version permits Version.External {
     }
 
     /// Moves the value off the segment it is part of, once: to its place in the log if it is at least
-    /// [SpillQueue#LOG_VALUE_MIN] bytes, else to an array of its own. A value on an array of its own, which only a
-    /// recovery lists ([ReplayValues]), moves only to the log.
+    /// [SpillQueue#LOG_VALUE_MIN] bytes, else to an array of its own. A value on an array of its own, which a batch
+    /// gave it or a recovery copied it to ([ReplayValues]), moves only to the log.
     ///
     /// The frame at `frameOffset` of `segment` holds the value durably, at `bodyIndex` of its body. The tag that
     /// authenticates the value read back is made from the bytes the version holds, which are those the frame sealed.
