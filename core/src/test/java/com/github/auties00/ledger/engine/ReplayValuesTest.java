@@ -44,6 +44,8 @@ class ReplayValuesTest {
     /// The lengths around the bounds of a shared value and of a quarter of a chunk.
     private static final int[] BOUNDARY_LENGTHS = {0, 1, ReplayValues.SHARED_BYTES - 1, ReplayValues.SHARED_BYTES,
             ReplayValues.SHARED_BYTES + 1, 64 * 1024, 64 * 1024 + 1, ReplayValues.CHUNK_BYTES - 1, ReplayValues.CHUNK_BYTES};
+    /// The spill budget of every store these tests open.
+    private static final long REPLAY_BUDGET = 64L << 20;
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
@@ -436,8 +438,12 @@ class ReplayValuesTest {
     }
 
     private static Ledger open(Path directory, Encryption encryption) {
-        return Ledger.builder().directory(directory).encryption(encryption).keyspace(SESSIONS).keyspace(MESSAGES)
-                .checkpointEvery(1L << 40).build();
+        // The largest default budget: the logs of these tests, about 4 MiB, stay within it, so a recovery keeps every
+        // value it replays on the heap whatever the heap of the test JVM
+        return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(encryption).keyspace(SESSIONS)
+                .keyspace(MESSAGES).checkpointEvery(1L << 40))
+                .spillBudget(REPLAY_BUDGET)
+                .build();
     }
 
     private static void assertContents(Ledger ledger, TreeMap<ByteBuffer, byte[]> expected) {

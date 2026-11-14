@@ -261,6 +261,22 @@ class LogSpillTest {
         }
     }
 
+    @ParameterizedTest(name = "{0} bytes of heap: {1}")
+    @CsvSource({
+            "0, 4194304",
+            "1073741824, 4194304",
+            "4294967296, 4194304",
+            "8589934592, 8388608",
+            "17179869184, 16777216",
+            "68719476736, 67108864",
+            "137438953472, 67108864",
+            "9223372036854775807, 67108864"
+    })
+    @DisplayName("the default budget is a 1,024th of the heap, never under 4 MiB nor over 64 MiB")
+    void defaultBudget(long maxMemory, long budget) {
+        assertEquals(budget, SpillQueue.defaultBudget(maxMemory));
+    }
+
     @Test
     @DisplayName("the values of commits the log wrote as runs of several commits read back from where each commit lies in the run")
     void readsBackFromRuns(@TempDir Path directory) throws Exception {
