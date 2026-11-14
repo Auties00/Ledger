@@ -104,12 +104,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     // What reserve returns once the batch's encodings are on a rope: every span of a write then has its own place
     private static final long ON_ROPE = -1;
 
-    private final Object owner;
-    private final HeapPool pool;
-    private final Map<String, Keyspace<?, ?>> keyspaces;
-    // The least bytes of a value put to a key space that the batch splits, Long.MAX_VALUE for one it never splits; or
-    // null if it splits none
-    private final ToLongFunction<Keyspace<?, ?>> splitFrom;
+    // What every batch of the store shares, in one object a batch refers to: one field where four took 12 bytes more
+    // of every commit
+    private final Scope scope;
     private byte[] data;
     private MemorySegment memory;
     // A read-only view of memory, which the accessors slice: one object per slice, not two
@@ -175,7 +172,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// @param pool the store's pool, which the batch draws its memory from
     /// @param keyspaces the store's key spaces by name, which the batch may write
     public ArrayWriteBatch(Object owner, HeapPool pool, Map<String, Keyspace<?, ?>> keyspaces) {
-        this(owner, pool, keyspaces, null);
+        this(new Scope(owner, pool, keyspaces, null));
     }
 
     /// Creates an empty batch for a store.
@@ -189,10 +186,12 @@ public final class ArrayWriteBatch implements WriteBatch {
     ///                  values, so the store's version of one is always an [Version.External]; or `null` if the batch
     ///                  splits none
     ArrayWriteBatch(Object owner, HeapPool pool, Map<String, Keyspace<?, ?>> keyspaces, ToLongFunction<Keyspace<?, ?>> splitFrom) {
-        this.owner = owner;
-        this.pool = pool;
-        this.keyspaces = keyspaces;
-        this.splitFrom = splitFrom;
+        this(new Scope(owner, pool, keyspaces, splitFrom));
+    }
+
+    /// Creates an empty batch for the store `scope` describes, which makes `scope` once and passes it to every batch.
+    ArrayWriteBatch(Scope scope) {
+        this.scope = scope;
         // Taken from the pool with the first write, and given back at the commit
         this.data = EMPTY;
         this.memory = EMPTY_MEMORY;
@@ -335,7 +334,7 @@ public final class ArrayWriteBatch implements WriteBatch {
 
     private void checkOpened(Keyspace<?, ?> keyspace) {
         Objects.requireNonNull(keyspace, "keyspace");
-        if (!keyspace.equals(keyspaces.get(keyspace.name()))) {
+        if (!keyspace.equals(scope.keyspaces().get(keyspace.name()))) {
             throw new IllegalArgumentException("The store was not opened with " + keyspace);
         }
     }
@@ -360,6 +359,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// Only a value of at least the smallest region G1 makes, put to a key space that splits values of its length,
     /// asks for the region, which the first time loads the management classes.
     private int splitHead(Keyspace<?, ?> keyspace, long length) {
+        var splitFrom = scope.splitFrom();
         if (length < ValueSlab.SMALLEST_REGION || splitFrom == null || length < splitFrom.applyAsLong(keyspace)) {
             return 0;
         }
@@ -458,10 +458,10 @@ public final class ArrayWriteBatch implements WriteBatch {
         var capacity = Math.min(CHUNK_BYTES, Math.max(needed, (long) data.length * 2));
         // Below the pool's smallest array, an array of the size the batch needs: the store keeps it without the
         // copy compact() would make. The pool takes back only its own sizes, so it ignores these arrays
-        var grown = capacity < INITIAL_CAPACITY ? new byte[(int) capacity] : pool.acquire((int) capacity);
+        var grown = capacity < INITIAL_CAPACITY ? new byte[(int) capacity] : scope.pool().acquire((int) capacity);
         System.arraycopy(data, 0, grown, 0, (int) used);
         if (!exposed) {
-            pool.release(data);
+            scope.pool().release(data);
         }
         exposed = false;
         data = grown;
@@ -475,7 +475,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// Moves the encodings of the batch to a rope, rewriting the spans of its writes; a value on an array of its own
     /// stays there, so only keys and values below [#OWN_BYTES] come here, and none has a span that outgrows a chunk.
     private void moveToRope() {
-        ropeHold = pool.hold();
+        ropeHold = scope.pool().hold();
         chunks = new Chunk[8];
         chunkCount = 1;
         for (var i = 0; i < size; i++) {
@@ -553,7 +553,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         if (chunkCount == chunks.length) {
             chunks = Arrays.copyOf(chunks, chunkCount * 2);
         }
-        var chunk = new Chunk(chunkCount, pool.acquire(CHUNK_BYTES), values);
+        var chunk = new Chunk(chunkCount, scope.pool().acquire(CHUNK_BYTES), values);
         chunks[chunkCount++] = chunk;
         return chunk;
     }
@@ -573,7 +573,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         for (var i = 1; i < chunkCount; i++) {
             var chunk = chunks[i];
             if (chunk.home != chunk.view) {
-                pool.release(chunk.array);
+                scope.pool().release(chunk.array);
             }
         }
         chunks = null;
@@ -836,7 +836,7 @@ public final class ArrayWriteBatch implements WriteBatch {
 
     /// {@return the store that created the batch}
     public Object owner() {
-        return owner;
+        return scope.owner();
     }
 
     /// {@return the bytes the encodings occupy, on whichever arrays}
@@ -1121,11 +1121,11 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// before [#compact()], which does.
     private void dropData() {
         if (spare != null) {
-            pool.release(spare);
+            scope.pool().release(spare);
             spare = null;
         }
         if (!exposed) {
-            pool.release(data);
+            scope.pool().release(data);
         }
         exposed = false;
         data = EMPTY;
@@ -1148,5 +1148,17 @@ public final class ArrayWriteBatch implements WriteBatch {
         data = Arrays.copyOf(data, (int) used);
         memory = MemorySegment.ofArray(data);
         view = memory.asReadOnly();
+    }
+
+    /// What every batch of a store shares.
+    ///
+    /// @param owner the store, which alone may apply the batch
+    /// @param pool the store's pool, which the batch draws its memory from
+    /// @param keyspaces the store's key spaces by name, which the batch may write
+    /// @param splitFrom the least bytes of a value put to a key space that the batch keeps as a [SplitValue], if a
+    ///                  region allows it, or [Long#MAX_VALUE] for a key space whose values it never splits; or `null`
+    ///                  if the batch splits none
+    record Scope(Object owner, HeapPool pool, Map<String, Keyspace<?, ?>> keyspaces,
+                 ToLongFunction<Keyspace<?, ?>> splitFrom) {
     }
 }
