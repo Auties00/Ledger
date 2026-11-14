@@ -37,6 +37,7 @@ import java.util.function.Function;
 import java.util.function.IntConsumer;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
+import java.util.function.ToLongFunction;
 
 /// A store: the engine of [Ledger.Builder#memory()], and of a store in a directory, which also journals every commit
 /// to a [LogWriter] and checkpoints it into the trees of a [PageFile].
@@ -139,6 +140,8 @@ public final class LiveLedger implements Ledger {
     private final Padded.Role checkpointWaiting;
     // publishApplied, which waiting commits run to help, made once
     private final Runnable publishHelper;
+    // splitFrom, which every batch asks, made once rather than with each batch
+    private final ToLongFunction<Keyspace<?, ?>> splitThreshold;
     // The frames of a pass of the publisher, queued in the log together; guarded by the publishing role
     private final LogWriter.Batch passFrames;
     // The passes of the publisher since the last maintenance; guarded by the publishing role
@@ -241,6 +244,7 @@ public final class LiveLedger implements Ledger {
         this.requests = new ReentrantLock();
         this.checkpointWaiting = new Padded.Role();
         this.publishHelper = this::publishApplied;
+        this.splitThreshold = this::splitFrom;
         this.passFrames = new LogWriter.Batch();
         sequenced.next = 1;
         this.byId = new HashMap<>();
@@ -749,7 +753,7 @@ public final class LiveLedger implements Ledger {
     @Override
     public WriteBatch newBatch() {
         ensureOpen();
-        return new ArrayWriteBatch(this, pool, keyspaces, this::splitFrom);
+        return new ArrayWriteBatch(this, pool, keyspaces, splitThreshold);
     }
 
     /// {@return the least bytes of a value put to `keyspace` that a batch keeps as a [SplitValue], or [Long#MAX_VALUE]
