@@ -127,6 +127,10 @@ final class Checkpointer implements IdleTicker.Watched {
     // The first log segment the last published checkpoint needs, before which the segments that values moved to are
     // retired once no reader needs them, or 0; guarded by the lock
     private long retireTarget;
+    // What a checkpoint runs once it wrote the trees of the resident key spaces, before and after it lets their keys
+    // drop the versions its read kept, or null; for tests that hold a checkpoint there
+    private volatile Runnable beforeResidentReleaseForTests;
+    private volatile Runnable afterResidentReleaseForTests;
 
     /// Creates the checkpointer of `ledger`.
     ///
@@ -286,6 +290,14 @@ final class Checkpointer implements IdleTicker.Watched {
     /// {@return whether a thread is finishing the sweep of the store; for tests}
     boolean sweepingForTests() {
         return sweeping.get();
+    }
+
+    /// Makes each checkpoint run `before` once it wrote the trees of the resident key spaces, and `after` once it let
+    /// their keys drop the versions its read kept ([LiveLedger#residentTreesWritten(LiveLedger.Cut)]), or nothing for
+    /// `null`; for tests that hold a checkpoint there.
+    void hookResidentReleaseForTests(Runnable before, Runnable after) {
+        beforeResidentReleaseForTests = before;
+        afterResidentReleaseForTests = after;
     }
 
     /// Starts a checkpoint on a thread of its own if the log has grown enough since the last, and none is running.
@@ -525,7 +537,7 @@ final class Checkpointer implements IdleTicker.Watched {
                 abandon(cut, writer, update);
                 throw throwable;
             } finally {
-                ledger.readers().unregister(cut.sequence());
+                ledger.readers().unregisterCheckpoint(cut.sequence());
             }
             ledger.publish(cut, number, roots, catalog, freeList, blobFreeList, freed, update.droppedRecords(),
                     update.freedExternal(), adopted);
@@ -633,70 +645,103 @@ final class Checkpointer implements IdleTicker.Watched {
 
     /// {@return the roots of every key space's tree after the cut, by id}
     ///
+    /// The trees of the resident key spaces come first: once they are written, their keys need keep no version for
+    /// this checkpoint's read ([LiveLedger#residentTreesWritten(LiveLedger.Cut)]), so a key a commit writes while the
+    /// paged trees, which take nearly all of the update's time, are written keeps one version rather than two.
+    ///
     /// @param adopted receives the units of the file of large values the trees take
     private TreeRoot[] build(LiveLedger.Cut cut, TreeUpdate update, Set<PageRef> adopted) throws IOException {
         var roots = cut.base() == null ? new TreeRoot[cut.maxId() + 1] : cut.base().roots(cut.maxId() + 1);
         var bound = Reads.boundOf(cut.sequence());
         var treeBound = cut.base() == null ? -1 : Reads.boundOf(cut.base().sequence);
+        var resident = false;
         for (var keyspace : cut.keyspaces()) {
-            var state = keyspace.state();
-            // Listed in the order of their writes, off the publishing role: sorted here
-            var chains = keyspace.dirty().toArray(Chain[]::new);
-            ChainSort.sort(chains);
-            var ops = new ArrayList<TreeUpdate.Op>(chains.length);
-            var removals = keyspace.removals();
-            Chain previous = null;
-            for (var chain : chains) {
-                if (previous != null && Chain.sameKey(previous, chain)) {
-                    continue;
-                }
-                previous = chain;
-                // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
-                // otherwise another one, or none
-                var current = chain.released() ? state.chain(chain.key()) : chain;
-                // The key, a segment of its own, only for the range removals to cover
-                var key = removals.length == 0 ? null : chain.key();
-                var version = KeyspaceState.resolve(current == null ? null : current.head, key, bound, removals);
-                if (version == null && !state.resident) {
-                    // No version at the cut in a paged key space: a commit that wrote the key rolled back, so the
-                    // tree is right. A resident one holds every entry, so there the key is gone
-                    continue;
-                }
-                // A blind write the cut takes, the chain's first and so at or below the cut, which sees a version of it:
-                // the leaf the update merges tells whether the tree held the key
-                var blind = current != null && current.blindState() == TreeSearch.UNKNOWN ? current : null;
-                if (version == null || version == Version.HIDDEN) {
-                    ops.add(new TreeUpdate.Op(chain, null, blind));
-                } else {
-                    ops.add(new TreeUpdate.Op(chain, version, blind));
-                    var external = version.external();
-                    if (external != null) {
-                        adopted.add(external);
-                    }
-                }
+            if (keyspace.state().resident) {
+                build(cut, keyspace, update, adopted, roots, bound, treeBound);
+                resident = true;
             }
-            var ranges = new ArrayList<TreeUpdate.Range>();
-            for (var removal : keyspace.removals()) {
-                if (removal.stamp() > treeBound && removal.stamp() <= bound) {
-                    ranges.add(new TreeUpdate.Range(removal.from(), removal.to()));
-                }
+        }
+        if (resident) {
+            var before = beforeResidentReleaseForTests;
+            if (before != null) {
+                before.run();
             }
-            // Counted here, on the trees their reads keep, the range removals up to the cut whose count is not known
-            // yet: one that fails fails the checkpoint with its own failure
-            var pendingRanges = state.ranges.correction(cut.sequence());
-            var base = roots[state.id];
-            var root = update.apply(base, ops, TreeUpdate.merge(ranges));
-            // The update settled the blind writes up to the cut but those of keys it skipped, looked up here
-            var blind = state.blind.correction(cut.sequence(), key -> base != null && TreeSearch.contains(pages, base, key));
-            var count = root == null ? 0 : root.count();
-            var expected = keyspace.count() + blind + pendingRanges;
-            if (count != expected) {
-                throw new IllegalStateException("The checkpoint of " + state.keyspace.name() + " holds " + count
-                        + " entries where the store counts " + expected);
+            ledger.residentTreesWritten(cut);
+            var after = afterResidentReleaseForTests;
+            if (after != null) {
+                after.run();
             }
-            roots[state.id] = root;
+        }
+        for (var keyspace : cut.keyspaces()) {
+            if (!keyspace.state().resident) {
+                build(cut, keyspace, update, adopted, roots, bound, treeBound);
+            }
         }
         return roots;
+    }
+
+    /// Updates the tree of `keyspace` to the cut, in `roots`.
+    ///
+    /// @param bound the bound of the cut
+    /// @param treeBound the bound of the trees the checkpoint updates, or -1
+    private void build(LiveLedger.Cut cut, LiveLedger.KeyspaceCut keyspace, TreeUpdate update, Set<PageRef> adopted,
+                       TreeRoot[] roots, long bound, long treeBound) throws IOException {
+        var state = keyspace.state();
+        // Listed in the order of their writes, off the publishing role: sorted here
+        var chains = keyspace.dirty().toArray(Chain[]::new);
+        ChainSort.sort(chains);
+        var ops = new ArrayList<TreeUpdate.Op>(chains.length);
+        var removals = keyspace.removals();
+        Chain previous = null;
+        for (var chain : chains) {
+            if (previous != null && Chain.sameKey(previous, chain)) {
+                continue;
+            }
+            previous = chain;
+            // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
+            // otherwise another one, or none
+            var current = chain.released() ? state.chain(chain.key()) : chain;
+            // The key, a segment of its own, only for the range removals to cover
+            var key = removals.length == 0 ? null : chain.key();
+            var version = KeyspaceState.resolve(current == null ? null : current.head, key, bound, removals);
+            if (version == null && !state.resident) {
+                // No version at the cut in a paged key space: a commit that wrote the key rolled back, so the
+                // tree is right. A resident one holds every entry, so there the key is gone
+                continue;
+            }
+            // A blind write the cut takes, the chain's first and so at or below the cut, which sees a version of it:
+            // the leaf the update merges tells whether the tree held the key
+            var blind = current != null && current.blindState() == TreeSearch.UNKNOWN ? current : null;
+            if (version == null || version == Version.HIDDEN) {
+                ops.add(new TreeUpdate.Op(chain, null, blind));
+            } else {
+                ops.add(new TreeUpdate.Op(chain, version, blind));
+                var external = version.external();
+                if (external != null) {
+                    adopted.add(external);
+                }
+            }
+        }
+        var ranges = new ArrayList<TreeUpdate.Range>();
+        for (var removal : keyspace.removals()) {
+            if (removal.stamp() > treeBound && removal.stamp() <= bound) {
+                ranges.add(new TreeUpdate.Range(removal.from(), removal.to()));
+            }
+        }
+        // Counted here, on the trees their reads keep, the range removals up to the cut whose count is not known
+        // yet: one that fails fails the checkpoint with its own failure
+        var pendingRanges = state.ranges.correction(cut.sequence());
+        var base = roots[state.id];
+        var root = update.apply(base, ops, TreeUpdate.merge(ranges));
+        // The update settled the blind writes up to the cut but those of keys it skipped, looked up here
+        var blind = state.blind.correction(cut.sequence(), key -> base != null && TreeSearch.contains(pages, base, key));
+        var count = root == null ? 0 : root.count();
+        var expected = keyspace.count() + blind + pendingRanges;
+        if (count != expected) {
+            throw new IllegalStateException("The checkpoint of " + state.keyspace.name() + " holds " + count
+                    + " entries where the store counts " + expected);
+        }
+        roots[state.id] = root;
     }
 
     private PageRef writeCatalog(LiveLedger.Cut cut, TreeRoot[] roots, PageFile.Writer writer, TreeUpdate update) throws IOException {

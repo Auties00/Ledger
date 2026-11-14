@@ -31,6 +31,9 @@ final class ReaderTable {
     private final Object registryLock;
     // Sequence to the number of registrations at it
     private final TreeMap<Long, Integer> registry;
+    // The sequence of the registration a checkpoint made, once it needs none of the versions only that registration
+    // keeps, or -1; guarded by registryLock, and cleared together with that registration ([#unregisterCheckpoint(long)])
+    private long exempt;
     // The registrations in the registry, or about to be: raised before a registration reads the latest sequence, so a
     // writer that reads it zero after reading the latest sequence skips the registry, as it would skip a free slot
     private volatile int registrations;
@@ -51,6 +54,7 @@ final class ReaderTable {
         this.latest = latest;
         this.registryLock = new Object();
         this.registry = new TreeMap<>();
+        this.exempt = -1;
         this.scanned = new long[slots + 1];
     }
 
@@ -117,12 +121,37 @@ final class ReaderTable {
         }
     }
 
+    /// Marks the registration a checkpoint made at `sequence` as one the resident key spaces need keep no version for,
+    /// until [#unregisterCheckpoint(long)] lets go of it: a scan then reports `sequence` as [Scan#exempt()] while that
+    /// registration is the only read at it.
+    ///
+    /// The checkpoint calls it once it wrote the trees of the resident key spaces, holding its registration.
+    void exempt(long sequence) {
+        synchronized (registryLock) {
+            exempt = sequence;
+        }
+    }
+
+    /// Releases the registration a checkpoint made at `sequence` with [#register()], and ends what [#exempt(long)]
+    /// started for it in the same step: no scan sees the exemption without the registration, so none takes another
+    /// read left alone at `sequence` for the checkpoint's.
+    void unregisterCheckpoint(long sequence) {
+        synchronized (registryLock) {
+            if (exempt == sequence) {
+                exempt = -1;
+            }
+            unregister(sequence);
+        }
+    }
+
     /// What one pass over the table found.
     ///
     /// @param active every sequence a read or snapshot may be reading at, distinct, highest first; the first is the
     ///               latest
     /// @param oldest the lowest sequence a read or snapshot is reading at, the latest included, or [Long#MAX_VALUE]
-    record Scan(long[] active, long oldest) {
+    /// @param exempt the sequence [#exempt(long)] marked, below the latest, if the checkpoint's registration is the
+    ///               only read the pass found at it, so the resident key spaces may leave its bound out; or -1
+    record Scan(long[] active, long oldest, long exempt) {
     }
 
     /// {@return [#active()] and [#oldest()] from one pass over the slots and the registry}
@@ -143,24 +172,32 @@ final class ReaderTable {
                 }
             }
         }
+        var exempted = -1L;
         if (registrations != 0) {
             synchronized (registryLock) {
                 if (!registry.isEmpty()) {
                     oldest = Math.min(oldest, registry.firstKey());
                 }
-                for (var sequence : registry.keySet()) {
+                var slotted = count;
+                var alone = false;
+                for (var entry : registry.entrySet()) {
+                    long sequence = entry.getKey();
                     if (sequence >= current) {
                         break;
                     }
+                    alone |= sequence == exempt && entry.getValue() == 1;
                     if (count == sequences.length) {
                         sequences = Arrays.copyOf(sequences, count * 2);
                         scanned = sequences;
                     }
                     sequences[count++] = sequence;
                 }
+                if (alone && !holds(sequences, slotted, exempt)) {
+                    exempted = exempt;
+                }
             }
         }
-        return new Scan(distinctDescending(sequences, count, current), oldest);
+        return new Scan(distinctDescending(sequences, count, current), oldest, exempted);
     }
 
     /// {@return [#active()] and [#oldest()] from one pass over the slots and the registry, safe for concurrent use}
@@ -187,15 +224,20 @@ final class ReaderTable {
                 }
             }
         }
+        var exempted = -1L;
         if (registrations != 0) {
             synchronized (registryLock) {
                 if (!registry.isEmpty()) {
                     oldest = Math.min(oldest, registry.firstKey());
                 }
-                for (var sequence : registry.keySet()) {
+                var slotted = count;
+                var alone = false;
+                for (var entry : registry.entrySet()) {
+                    long sequence = entry.getKey();
                     if (sequence >= current) {
                         break;
                     }
+                    alone |= sequence == exempt && entry.getValue() == 1;
                     if (sequences == null) {
                         sequences = new long[8];
                         sequences[0] = current;
@@ -204,12 +246,26 @@ final class ReaderTable {
                     }
                     sequences[count++] = sequence;
                 }
+                if (alone && !holds(sequences, slotted, exempt)) {
+                    exempted = exempt;
+                }
             }
         }
         if (sequences == null) {
-            return new Scan(new long[]{current}, oldest);
+            return new Scan(new long[]{current}, oldest, exempted);
         }
-        return new Scan(distinctDescending(sequences, count, current), oldest);
+        return new Scan(distinctDescending(sequences, count, current), oldest, exempted);
+    }
+
+    /// {@return whether `sequence` is one of the sequences below the latest a scan collected from the slots, those of
+    /// `sequences` from the second up to `slotted`}
+    private static boolean holds(long[] sequences, int slotted, long sequence) {
+        for (var i = 1; i < slotted; i++) {
+            if (sequences[i] == sequence) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// {@return whether a read or snapshot is registered at a sequence from `low` to `high`, both included, as one pass

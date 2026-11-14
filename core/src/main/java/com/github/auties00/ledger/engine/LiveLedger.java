@@ -169,12 +169,15 @@ public final class LiveLedger implements Ledger {
     private boolean sweepFound;
     // The passes the sweep has ended; guarded by the publishing role
     private long sweepEnds;
-    // The reader bounds and floor the current pass started under
+    // The reader bounds, floor and exempt checkpoint read ([ReaderTable.Scan#exempt()]) the current pass started under
     private long[] passBounds;
     private long passCutBound;
-    // The bounds and floor of the last complete pass that left chains, or null: under the same ones a pass frees nothing
+    private long passExempt;
+    // The bounds, floor and exempt checkpoint read of the last complete pass that left chains, or null bounds: under
+    // the same ones a pass frees nothing
     private long[] sweptBounds;
     private long sweptCutBound;
+    private long sweptExempt;
     private final Map<Integer, KeyspaceState> byId;
     private int maxId;
     private LogWriter log;
@@ -2017,13 +2020,14 @@ public final class LiveLedger implements Ledger {
                 try {
                     var scan = readers.scan();
                     var bounds = bounds(scan.active());
+                    var kept = state.resident ? residentBounds(bounds, scan) : bounds;
                     var floor = floor(scan.oldest());
                     for (var i = 0; i < PRUNE_CHUNK && chains.hasNext(); i++) {
                         var chain = chains.next();
                         // A chain dropped since the cut may have been followed by another for the same key
                         var current = chain.dropped() ? state.chain(chain.key()) : chain;
                         if (current != null) {
-                            if (prune(state, current, current.head, bounds, Reads.boundOf(floor))) {
+                            if (prune(state, current, current.head, kept, bounds[0], Reads.boundOf(floor))) {
                                 requestSweep();
                             }
                         }
@@ -2035,6 +2039,83 @@ public final class LiveLedger implements Ledger {
             state.removeDropped();
             state.pruneListed(keyspace.number());
         }
+    }
+
+    /// Lets the resident key spaces drop the versions that only the read of the running checkpoint, whose cut is `cut`,
+    /// keeps, once the checkpoint wrote their trees: from now on their prunes leave the bound of its sequence out while
+    /// no other read is at it ([ReaderTable#exempt(long)]), and the chains written since the cut, the only ones that
+    /// can hold such a version below a newer one, are pruned now, a few per hold of the publishing role.
+    ///
+    /// The trees took what the checkpoint read through the versions its update holds itself, which a prune unlinks from
+    /// their chains without changing them; a resident value is on an array no pool takes back while a version holds it,
+    /// and never leaves the heap. A key first written after the cut has no version at its sequence; one written before
+    /// it and not since keeps its newest version, as for every reader. The checkpoint ends the exemption as it lets go of its read
+    /// ([ReaderTable#unregisterCheckpoint(long)]).
+    void residentTreesWritten(Cut cut) {
+        readers.exempt(cut.sequence());
+        for (var keyspace : cut.keyspaces()) {
+            var state = keyspace.state();
+            if (!state.resident) {
+                continue;
+            }
+            var next = 0;
+            var more = true;
+            while (more) {
+                enterPublishing();
+                try {
+                    // As in a maintenance: the scan must not miss a read that saw the latest sequence before
+                    VarHandle.fullFence();
+                    var scan = readers.scan();
+                    if (scan.exempt() < 0) {
+                        // Another read at the cut keeps its versions, or no commit came after it: nothing to drop
+                        return;
+                    }
+                    var bounds = bounds(scan.active());
+                    var kept = residentBounds(bounds, scan);
+                    // Listed since the cut under the publishing role, and only appended to: its size is read at each hold
+                    var dirty = state.dirty;
+                    var end = Math.min(dirty.size(), next + PRUNE_CHUNK);
+                    for (; next < end; next++) {
+                        var chain = dirty.get(next);
+                        // A chain dropped since its write may have been followed by another for the same key
+                        var current = chain.dropped() ? state.chain(chain.key()) : chain;
+                        if (current != null && prune(state, current, current.head, kept, bounds[0], 0)) {
+                            requestSweep();
+                        }
+                    }
+                    more = next < dirty.size();
+                } finally {
+                    exitPublishing();
+                }
+            }
+        }
+    }
+
+    /// {@return the bounds a prune of a resident key space keeps versions for, given `bounds`, those of every read
+    /// `scan` found: `bounds` without the bound of the checkpoint read the scan exempts ([ReaderTable.Scan#exempt()]),
+    /// `null` when that leaves only the latest bound, `bounds[0]`, or `bounds` itself when the scan exempts none}
+    ///
+    /// The exempt read is never the latest one, so the bound of a read that starts at the latest sequence is never
+    /// left out; and no read starts at an older sequence. It allocates only when a read below the latest other than the
+    /// checkpoint's is found.
+    private static long[] residentBounds(long[] bounds, ReaderTable.Scan scan) {
+        var exempt = scan.exempt();
+        if (exempt < 0 || bounds == null) {
+            return bounds;
+        }
+        var at = Reads.boundOf(exempt);
+        for (var i = 1; i < bounds.length; i++) {
+            if (bounds[i] == at) {
+                if (bounds.length == 2) {
+                    return null;
+                }
+                var kept = new long[bounds.length - 1];
+                System.arraycopy(bounds, 0, kept, 0, i);
+                System.arraycopy(bounds, i + 1, kept, i, bounds.length - i - 1);
+                return kept;
+            }
+        }
+        return bounds;
     }
 
     /// Prepares the writes of `writes`, a batch that runs alone, before its turn: opens the chain of every key the
@@ -2214,9 +2295,10 @@ public final class LiveLedger implements Ledger {
     /// publishing role, as [#prune(KeyspaceState, Chain, Version, long\[\], long, long, boolean, Runnable)] does with
     /// every link allowed.
     ///
+    /// @param bounds the bounds of every active reader, highest first, or `null` for the one bound `bound`
     /// @return whether the chain keeps versions a later prune may drop
-    private boolean prune(KeyspaceState state, Chain chain, Version head, long[] bounds, long cutBound) {
-        return prune(state, chain, head, bounds, 0, cutBound, true, null);
+    private boolean prune(KeyspaceState state, Chain chain, Version head, long[] bounds, long bound, long cutBound) {
+        return prune(state, chain, head, bounds, bound, cutBound, true, null);
     }
 
     /// Unlinks the versions of `chain` below `head`, its newest version or one a later version of the same commit
@@ -2374,8 +2456,11 @@ public final class LiveLedger implements Ledger {
         // Without a data file a record goes once applied; with one, once every reader's tree holds it
         var dropBound = pages == null ? Long.MAX_VALUE : cutBound;
         var oldest = active[active.length - 1];
+        var residentBounds = residentBounds(bounds, scan);
         for (var write : touched) {
-            if (prune(write.state(), write.chain(), write.version(), bounds, cutBound)) {
+            var state = write.state();
+            if (prune(state, write.chain(), write.version(), state.resident ? residentBounds : bounds, bounds[0],
+                    cutBound)) {
                 requestSweep();
             }
         }
@@ -2387,7 +2472,7 @@ public final class LiveLedger implements Ledger {
             state.blind.fold(oldest);
             state.ranges.fold(oldest);
         }
-        sweep(bounds, cutBound, SWEEP_BUDGET);
+        sweep(bounds, residentBounds, scan.exempt(), cutBound, SWEEP_BUDGET);
     }
 
     /// Asks the sweep for a pass over the store, for a chain a prune left that a later one may shorten.
@@ -2482,9 +2567,10 @@ public final class LiveLedger implements Ledger {
                 var scan = readers.scan();
                 var bounds = bounds(scan.active());
                 var cutBound = Reads.boundOf(floor(scan.oldest()));
-                sweep(bounds, cutBound, SWEEP_CHUNK);
+                sweep(bounds, residentBounds(bounds, scan), scan.exempt(), cutBound, SWEEP_CHUNK);
                 more = sweepEnds - endsBefore < SWEEP_PASSES && (sweepPending
-                        ? sweptBounds == null || !sameReaders(bounds, cutBound, sweptBounds, sweptCutBound)
+                        ? sweptBounds == null || !sameReaders(bounds, cutBound, scan.exempt(), sweptBounds,
+                                sweptCutBound, sweptExempt)
                         : sweepWanted.held());
             } finally {
                 publishing.release();
@@ -2521,6 +2607,7 @@ public final class LiveLedger implements Ledger {
             return;
         }
         long[] bounds;
+        long[] residentBounds;
         var bound = 0L;
         long cutBound;
         // Read before the reader table, as a scan reads it
@@ -2528,16 +2615,19 @@ public final class LiveLedger implements Ledger {
         if (readers.idle()) {
             // The usual case, without the scan's arrays nor one of its own: every read is at the latest sequence or later
             bounds = null;
+            residentBounds = null;
             bound = Reads.boundOf(current);
             cutBound = Reads.boundOf(floor(Long.MAX_VALUE));
         } else {
             var scan = readers.scanConcurrently();
             bounds = bounds(scan.active());
+            residentBounds = residentBounds(bounds, scan);
+            bound = bounds[0];
             cutBound = Reads.boundOf(floor(scan.oldest()));
         }
         var size = touched.size();
         for (var i = 0; i < size; i++) {
-            pruneTouched(touched, i, bounds, bound, cutBound);
+            pruneTouched(touched, i, bounds, residentBounds, bound, cutBound);
         }
     }
 
@@ -2549,18 +2639,26 @@ public final class LiveLedger implements Ledger {
     /// to link.
     ///
     /// @param bounds the bounds of every active reader, highest first, or `null` for the one bound `bound`
-    private void pruneTouched(List<Touched> touched, int index, long[] bounds, long bound, long cutBound) {
+    /// @param residentBounds the bounds of a resident key space ([#residentBounds(long\[\], ReaderTable.Scan)]), or
+    ///                       `null` for the one bound `bound`
+    /// @param bound the latest bound
+    private void pruneTouched(List<Touched> touched, int index, long[] bounds, long[] residentBounds, long bound,
+                              long cutBound) {
         var write = touched.get(index);
         var state = write.state();
-        if (prune(state, write.chain(), write.version(), bounds, bound, cutBound, state.removals.length == 0,
-                pruneHookForTests)) {
+        if (prune(state, write.chain(), write.version(), state.resident ? residentBounds : bounds, bound, cutBound,
+                state.removals.length == 0, pruneHookForTests)) {
             requestSweep();
         }
     }
 
     /// Prunes up to `budget` keys, resuming where the last sweep stopped, while some prune left a chain a later one may
     /// shorten; a whole pass over the store that finds none ends the sweeping.
-    private void sweep(long[] bounds, long cutBound, int budget) {
+    ///
+    /// @param residentBounds the bounds of the resident key spaces ([#residentBounds(long\[\], ReaderTable.Scan)]),
+    ///                       or `null` for the latest bound alone
+    /// @param exempt the checkpoint read whose bound `residentBounds` leaves out, or -1
+    private void sweep(long[] bounds, long[] residentBounds, long exempt, long cutBound, int budget) {
         if (sweepOrder.isEmpty()) {
             return;
         }
@@ -2575,7 +2673,7 @@ public final class LiveLedger implements Ledger {
         }
         // A chain a pass left is left again under the same readers and floor, such as while a checkpoint's own read
         // holds the floor back
-        if (sweptBounds != null && sameReaders(bounds, cutBound, sweptBounds, sweptCutBound)) {
+        if (sweptBounds != null && sameReaders(bounds, cutBound, exempt, sweptBounds, sweptCutBound, sweptExempt)) {
             return;
         }
         var visitedKeyspaces = 0;
@@ -2584,8 +2682,10 @@ public final class LiveLedger implements Ledger {
                 sweepFound = false;
                 passBounds = bounds;
                 passCutBound = cutBound;
+                passExempt = exempt;
             }
             var state = sweepOrder.get(sweepIndex % sweepOrder.size());
+            var kept = state.resident ? residentBounds : bounds;
             boolean finished;
             if (state.sweepsIndex()) {
                 if (sweepCursor == null) {
@@ -2598,7 +2698,7 @@ public final class LiveLedger implements Ledger {
                         finished = true;
                         break;
                     }
-                    sweepFound |= prune(state, chain, chain.head, bounds, cutBound);
+                    sweepFound |= prune(state, chain, chain.head, kept, bounds[0], cutBound);
                     budget--;
                 }
             } else {
@@ -2607,7 +2707,7 @@ public final class LiveLedger implements Ledger {
                 while (budget > 0 && entries.hasNext()) {
                     var entry = entries.next();
                     var chain = entry.getValue();
-                    sweepFound |= prune(state, chain, chain.head, bounds, cutBound);
+                    sweepFound |= prune(state, chain, chain.head, kept, bounds[0], cutBound);
                     sweepAfter = entry.getKey();
                     budget--;
                 }
@@ -2627,7 +2727,8 @@ public final class LiveLedger implements Ledger {
                     }
                     sweptBounds = passBounds;
                     sweptCutBound = passCutBound;
-                    if (sameReaders(bounds, cutBound, sweptBounds, sweptCutBound)) {
+                    sweptExempt = passExempt;
+                    if (sameReaders(bounds, cutBound, exempt, sweptBounds, sweptCutBound, sweptExempt)) {
                         return;
                     }
                 }
@@ -2635,13 +2736,15 @@ public final class LiveLedger implements Ledger {
         }
     }
 
-    /// {@return whether a prune under `bounds` and `cutBound` keeps what one under `otherBounds` and `otherCutBound`
-    /// keeps, for a chain no commit has touched since}
+    /// {@return whether a prune under `bounds`, `cutBound` and the exempt checkpoint read `exempt` keeps what one under
+    /// `otherBounds`, `otherCutBound` and `otherExempt` keeps, for a chain no commit has touched since}
     ///
     /// The first bound is the latest commit's: a commit prunes the keys it writes, so it changes nothing for the
     /// others.
-    private static boolean sameReaders(long[] bounds, long cutBound, long[] otherBounds, long otherCutBound) {
-        return cutBound == otherCutBound && Arrays.equals(bounds, 1, bounds.length, otherBounds, 1, otherBounds.length);
+    private static boolean sameReaders(long[] bounds, long cutBound, long exempt, long[] otherBounds, long otherCutBound,
+                                       long otherExempt) {
+        return cutBound == otherCutBound && exempt == otherExempt
+                && Arrays.equals(bounds, 1, bounds.length, otherBounds, 1, otherBounds.length);
     }
 
     /// The writes of one commit or transaction, applied as they come and published together.

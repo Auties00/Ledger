@@ -1122,6 +1122,434 @@ class CheckpointTest {
         }
     }
 
+    @Nested
+    @DisplayName("resident trees first")
+    class ResidentFirst {
+        private static final int CHAT_COUNT = 1_500;
+        private static final long WAIT_SECONDS = 30;
+
+        private static String chat(int index) {
+            return "c%05d".formatted(index);
+        }
+
+        private static int versions(LiveLedger ledger, String key) {
+            var version = ledger.state(CHATS).head(Segments.encodeKey(KeyCodec.utf8(), key));
+            var length = 0;
+            for (; version != null; version = version.older) {
+                length++;
+            }
+            return length;
+        }
+
+        private static Ledger open(Path directory) {
+            return Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(MESSAGES)
+                    .keyspace(CHATS).checkpointEvery(1L << 30).build();
+        }
+
+        /// Writes every chat as `prefix` plus its index, and messages from `from`, so the next checkpoint has paged and
+        /// resident keys to write.
+        private static void write(Ledger ledger, String prefix, int from) {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < CHAT_COUNT; i++) {
+                batch.put(CHATS, chat(i), prefix + i);
+            }
+            for (var i = from; i < from + 2_000; i++) {
+                batch.put(MESSAGES, "m%05d".formatted(i), "message " + i);
+            }
+            ledger.commit(batch);
+        }
+
+        /// Rewrites every chat as `prefix` plus its index, a few per commit.
+        private static void rewrite(Ledger ledger, String prefix) {
+            for (var start = 0; start < CHAT_COUNT; start += 100) {
+                var batch = ledger.newBatch();
+                for (var i = start; i < start + 100; i++) {
+                    batch.put(CHATS, chat(i), prefix + i);
+                }
+                ledger.commit(batch);
+            }
+        }
+
+        private static void assertChats(View view, String prefix, int count) {
+            for (var i = 0; i < count; i++) {
+                assertEquals(Optional.of(prefix + i), view.get(CHATS, chat(i)), chat(i));
+            }
+        }
+
+        /// A checkpoint on a thread of its own that stops at each of its two resident hooks until the test lets it go.
+        private static final class HeldCheckpoint implements AutoCloseable {
+            private final java.util.concurrent.CountDownLatch atBefore = new java.util.concurrent.CountDownLatch(1);
+            private final java.util.concurrent.CountDownLatch goBefore = new java.util.concurrent.CountDownLatch(1);
+            private final java.util.concurrent.CountDownLatch atAfter = new java.util.concurrent.CountDownLatch(1);
+            private final java.util.concurrent.CountDownLatch goAfter = new java.util.concurrent.CountDownLatch(1);
+            private final java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+            private final LiveLedger ledger;
+            private final Thread thread;
+
+            HeldCheckpoint(LiveLedger ledger) {
+                this.ledger = ledger;
+                ledger.checkpointer().hookResidentReleaseForTests(() -> hold(atBefore, goBefore), () -> hold(atAfter, goAfter));
+                this.thread = Thread.ofPlatform().start(() -> {
+                    try {
+                        ledger.checkpoint();
+                    } catch (Throwable throwable) {
+                        failure.set(throwable);
+                    }
+                });
+            }
+
+            private void hold(java.util.concurrent.CountDownLatch at, java.util.concurrent.CountDownLatch go) {
+                at.countDown();
+                try {
+                    if (!go.await(WAIT_SECONDS, TimeUnit.SECONDS)) {
+                        throw new AssertionError("the test never let the checkpoint go on");
+                    }
+                } catch (InterruptedException exception) {
+                    throw new AssertionError(exception);
+                }
+            }
+
+            void awaitBefore() throws InterruptedException {
+                assertTrue(atBefore.await(WAIT_SECONDS, TimeUnit.SECONDS), "the checkpoint never wrote the resident trees");
+            }
+
+            void release() {
+                goBefore.countDown();
+            }
+
+            void awaitAfter() throws InterruptedException {
+                goBefore.countDown();
+                assertTrue(atAfter.await(WAIT_SECONDS, TimeUnit.SECONDS), "the checkpoint never let the resident keys go");
+            }
+
+            void finish() throws InterruptedException {
+                goBefore.countDown();
+                goAfter.countDown();
+                thread.join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                assertFalse(thread.isAlive(), "the checkpoint never ended");
+                ledger.checkpointer().hookResidentReleaseForTests(null, null);
+                if (failure.get() != null) {
+                    throw new AssertionError("the checkpoint failed", failure.get());
+                }
+            }
+
+            @Override
+            public void close() throws InterruptedException {
+                goBefore.countDown();
+                goAfter.countDown();
+                thread.join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                ledger.checkpointer().hookResidentReleaseForTests(null, null);
+            }
+        }
+
+        @Test
+        @DisplayName("a checkpoint held after its resident trees keeps one version per resident key rewritten since its cut, and the trees it writes hold the cut")
+        void oneVersionPerKey(@TempDir Path directory) throws Exception {
+            try (var ledger = (LiveLedger) open(directory)) {
+                write(ledger, "seed ", 0);
+                ledger.checkpoint();
+                write(ledger, "cut ", 2_000);
+                // Not written since the last checkpoint, so not among the keys the cut takes
+                ledger.commit(ledger.newBatch().put(CHATS, "late", "before cut"));
+                ledger.checkpoint();
+                write(ledger, "cut ", 4_000);
+                try (var held = new HeldCheckpoint(ledger)) {
+                    held.awaitBefore();
+                    // Written before the release, which its own prune knew nothing of: the release walks it
+                    ledger.commit(ledger.newBatch().put(CHATS, "late", "between"));
+                    rewrite(ledger, "early ");
+                    assertEquals(2, versions(ledger, "late"), "the cut's version goes only with the release");
+                    held.awaitAfter();
+                    assertEquals(1, versions(ledger, "late"));
+                    for (var i = 0; i < CHAT_COUNT; i++) {
+                        assertEquals(1, versions(ledger, chat(i)), chat(i));
+                    }
+                    rewrite(ledger, "new ");
+                    ledger.commit(ledger.newBatch().put(CHATS, "fresh", "after cut").delete(CHATS, chat(7)));
+                    for (var i = 0; i < CHAT_COUNT; i++) {
+                        if (i != 7) {
+                            assertEquals(1, versions(ledger, chat(i)), chat(i));
+                        }
+                    }
+                    assertEquals(Optional.of("new 3"), ledger.get(CHATS, chat(3)));
+                    held.finish();
+                }
+                assertEquals(CHAT_COUNT + 1, ledger.size(CHATS));
+                assertEquals(6_000, ledger.size(MESSAGES));
+                // The tree of the checkpoint holds the cut: what the log adds over it is replayed after a crash
+                ledger.awaitDurable();
+                crash(ledger);
+            }
+            try (var ledger = open(directory)) {
+                assertEquals(Optional.empty(), ledger.get(CHATS, chat(7)));
+                assertEquals(Optional.of("after cut"), ledger.get(CHATS, "fresh"));
+                assertEquals(Optional.of("between"), ledger.get(CHATS, "late"));
+                for (var i = 0; i < CHAT_COUNT; i++) {
+                    if (i != 7) {
+                        assertEquals(Optional.of("new " + i), ledger.get(CHATS, chat(i)), chat(i));
+                    }
+                }
+                assertEquals(CHAT_COUNT + 1, ledger.size(CHATS));
+                assertEquals(6_000, ledger.size(MESSAGES));
+                ledger.checkpoint();
+            }
+            verifyPages(directory, true);
+            // The trees alone, with nothing left in the log over them
+            try (var ledger = open(directory)) {
+                assertEquals(Optional.of("new 4"), ledger.get(CHATS, chat(4)));
+                assertEquals(CHAT_COUNT + 1, ledger.size(CHATS));
+            }
+        }
+
+        @Test
+        @DisplayName("a snapshot at the cut keeps the cut's resident versions through the checkpoint and after it ends")
+        void snapshotAtCut(@TempDir Path directory) throws Exception {
+            try (var ledger = (LiveLedger) open(directory)) {
+                write(ledger, "seed ", 0);
+                ledger.checkpoint();
+                write(ledger, "cut ", 2_000);
+                // At the latest sequence, which the checkpoint cuts at
+                try (var snapshot = ledger.snapshot()) {
+                    try (var held = new HeldCheckpoint(ledger)) {
+                        held.awaitAfter();
+                        rewrite(ledger, "new ");
+                        assertChats(snapshot, "cut ", CHAT_COUNT);
+                        assertEquals(2, versions(ledger, chat(11)));
+                        held.finish();
+                    }
+                    // The checkpoint's read is gone, the snapshot's is the only one at its sequence: it is not exempt
+                    rewrite(ledger, "newer ");
+                    for (var i = 0; i < 200; i++) {
+                        ledger.commit(ledger.newBatch().put(MESSAGES, "x%05d".formatted(i), "x"));
+                    }
+                    assertChats(snapshot, "cut ", CHAT_COUNT);
+                    assertChats(ledger, "newer ", CHAT_COUNT);
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("a snapshot at the cut that outlives the checkpoint while a commit prunes keeps the cut's resident versions")
+        void snapshotAtCutBesidePrune(@TempDir Path directory) throws Exception {
+            try (var ledger = (LiveLedger) open(directory)) {
+                write(ledger, "seed ", 0);
+                ledger.checkpoint();
+                write(ledger, "cut ", 2_000);
+                try (var snapshot = ledger.snapshot()) {
+                    var held = new HeldCheckpoint(ledger);
+                    held.awaitAfter();
+                    var committer = Thread.currentThread();
+                    var forced = new AtomicBoolean();
+                    // The prune of a commit's chat finds the snapshot's version below its own; there the checkpoint
+                    // ends and lets go of its read, leaving the snapshot's alone at the cut
+                    ledger.hookPruneForTests(() -> {
+                        if (Thread.currentThread() != committer || !forced.compareAndSet(false, true)) {
+                            return;
+                        }
+                        try {
+                            held.finish();
+                        } catch (InterruptedException exception) {
+                            throw new AssertionError(exception);
+                        }
+                    });
+                    try {
+                        ledger.commit(ledger.newBatch().put(CHATS, chat(0), "new 0"));
+                    } finally {
+                        ledger.hookPruneForTests(null);
+                        held.close();
+                    }
+                    assertTrue(forced.get(), "the prune reached the link");
+                    rewrite(ledger, "new ");
+                    assertChats(snapshot, "cut ", CHAT_COUNT);
+                    assertEquals(2, versions(ledger, chat(0)));
+                }
+                assertChats(ledger, "new ", CHAT_COUNT);
+            }
+        }
+
+        @Test
+        @DisplayName("a read in a slot at the cut sees the cut's resident values while the checkpoint lets them go")
+        void slotReadAtCut(@TempDir Path directory) throws Exception {
+            try (var ledger = (LiveLedger) open(directory)) {
+                write(ledger, "seed ", 0);
+                ledger.checkpoint();
+                write(ledger, "cut ", 2_000);
+                var started = new java.util.concurrent.CountDownLatch(1);
+                var resume = new java.util.concurrent.CountDownLatch(1);
+                var seen = new ConcurrentLinkedQueue<String>();
+                // A short read, which holds a slot at the latest sequence for as long as it visits
+                var reader = Thread.ofPlatform().start(() -> ledger.forEach(CHATS, KeyRange.all(), (key, value) -> {
+                    if (started.getCount() > 0) {
+                        started.countDown();
+                        try {
+                            resume.await(WAIT_SECONDS, TimeUnit.SECONDS);
+                        } catch (InterruptedException exception) {
+                            throw new AssertionError(exception);
+                        }
+                    }
+                    seen.add(key + "=" + value);
+                    return true;
+                }));
+                assertTrue(started.await(WAIT_SECONDS, TimeUnit.SECONDS));
+                try (var held = new HeldCheckpoint(ledger)) {
+                    held.awaitAfter();
+                    rewrite(ledger, "new ");
+                    assertEquals(2, versions(ledger, chat(5)), "the read's version stays");
+                    resume.countDown();
+                    reader.join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                    held.finish();
+                }
+                assertEquals(CHAT_COUNT, seen.size());
+                for (var entry : seen) {
+                    var parts = entry.split("=");
+                    assertEquals("cut " + Integer.parseInt(parts[0].substring(1)), parts[1], entry);
+                }
+                assertChats(ledger, "new ", CHAT_COUNT);
+            }
+        }
+
+        @Test
+        @DisplayName("a checkpoint that fails after it let the resident keys go leaves the next one right trees and counts")
+        void failsAfterRelease() throws Exception {
+            var disk = CrashFileSystem.create();
+            var failing = new AtomicBoolean();
+            disk.intercept((path, kind) -> {
+                if (failing.get() && kind == ChangeInterceptor.ChangeKind.WRITE && path.getFileName() != null
+                        && path.getFileName().toString().equals(PageFile.FILE)) {
+                    throw new IOException("No space left on device");
+                }
+            });
+            var directory = disk.getPath("/store");
+            try (var ledger = (LiveLedger) open(directory)) {
+                write(ledger, "seed ", 0);
+                ledger.checkpoint();
+                write(ledger, "cut ", 2_000);
+                ledger.commit(ledger.newBatch().put(CHATS, "gone", "soon"));
+                ledger.checkpointer().hookResidentReleaseForTests(null, () -> {
+                    rewrite(ledger, "new ");
+                    ledger.commit(ledger.newBatch().put(CHATS, "fresh", "after cut").delete(CHATS, "gone")
+                            .delete(CHATS, chat(9)));
+                    failing.set(true);
+                });
+                try {
+                    assertThrows(LedgerIoException.class, ledger::checkpoint);
+                } finally {
+                    ledger.checkpointer().hookResidentReleaseForTests(null, null);
+                }
+                for (var i = 0; i < CHAT_COUNT; i++) {
+                    assertTrue(versions(ledger, chat(i)) <= 1, chat(i));
+                }
+                failing.set(false);
+                ledger.checkpoint();
+                assertEquals(CHAT_COUNT, ledger.size(CHATS));
+                ledger.awaitDurable();
+                crash(ledger);
+            }
+            try (var ledger = open(directory)) {
+                assertEquals(CHAT_COUNT, ledger.size(CHATS));
+                assertEquals(4_000, ledger.size(MESSAGES));
+                assertEquals(Optional.empty(), ledger.get(CHATS, "gone"));
+                assertEquals(Optional.empty(), ledger.get(CHATS, chat(9)));
+                assertEquals(Optional.of("after cut"), ledger.get(CHATS, "fresh"));
+                assertEquals(Optional.of("new 10"), ledger.get(CHATS, chat(10)));
+            }
+        }
+
+        @Test
+        @DisplayName("a crash while a checkpoint writes the paged trees, after it let the resident keys go, recovers every durable commit")
+        void crashAfterRelease() throws Exception {
+            var disk = CrashFileSystem.create();
+            var directory = disk.getPath("/store");
+            var ledger = (LiveLedger) open(directory);
+            try {
+                write(ledger, "seed ", 0);
+                ledger.checkpoint();
+                write(ledger, "cut ", 2_000);
+                ledger.checkpointer().hookResidentReleaseForTests(null, () -> {
+                    rewrite(ledger, "new ");
+                    ledger.commit(ledger.newBatch().put(CHATS, "fresh", "after cut").delete(CHATS, chat(9)));
+                    try {
+                        ledger.awaitDurable();
+                    } catch (InterruptedException exception) {
+                        throw new AssertionError(exception);
+                    }
+                    disk.stopAfter(0);
+                });
+                assertThrows(RuntimeException.class, ledger::checkpoint);
+            } finally {
+                ledger.checkpointer().hookResidentReleaseForTests(null, null);
+                try {
+                    crash(ledger);
+                } catch (RuntimeException _) {
+                    // The disk stopped under it
+                }
+            }
+            var survivor = disk.afterPowerLoss(new Random(13));
+            try (var reopened = open(survivor.getPath("/store"))) {
+                assertEquals(CHAT_COUNT, reopened.size(CHATS));
+                assertEquals(4_000, reopened.size(MESSAGES));
+                assertEquals(Optional.empty(), reopened.get(CHATS, chat(9)));
+                assertEquals(Optional.of("after cut"), reopened.get(CHATS, "fresh"));
+                for (var i = 0; i < CHAT_COUNT; i++) {
+                    if (i != 9) {
+                        assertEquals(Optional.of("new " + i), reopened.get(CHATS, chat(i)), chat(i));
+                    }
+                }
+                assertEquals(Optional.of("message 3999"), reopened.get(MESSAGES, "m03999"));
+                reopened.checkpoint();
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("reads a checkpoint exempts")
+    class ExemptReads {
+        @Test
+        @DisplayName("a scan exempts the checkpoint's read only while it is the one read at its sequence, below the latest, and never once the checkpoint lets it go")
+        void exemptsAlone() {
+            var latest = new AtomicLong(10);
+            var readers = new ReaderTable(8, latest::get);
+            var checkpoint = readers.register();
+            latest.set(12);
+            assertEquals(-1, readers.scan().exempt(), "not marked yet");
+            readers.exempt(checkpoint);
+            assertEquals(10, readers.scan().exempt());
+            assertEquals(10, readers.scanConcurrently().exempt());
+            // A read in a slot at the same sequence
+            latest.set(10);
+            var lease = readers.enter();
+            latest.set(12);
+            assertEquals(-1, readers.scan().exempt());
+            assertEquals(-1, readers.scanConcurrently().exempt());
+            readers.exit(lease);
+            assertEquals(10, readers.scan().exempt());
+            // A snapshot at the same sequence, which outlives the checkpoint
+            latest.set(10);
+            var snapshot = readers.register();
+            latest.set(12);
+            assertEquals(-1, readers.scan().exempt());
+            readers.unregisterCheckpoint(checkpoint);
+            assertEquals(-1, readers.scan().exempt());
+            assertEquals(-1, readers.scanConcurrently().exempt());
+            assertEquals(List.of(12L, 10L), java.util.Arrays.stream(readers.scan().active()).boxed().toList());
+            readers.unregister(snapshot);
+            // A retry that cuts at the same sequence is not exempt until it marks itself
+            latest.set(10);
+            var retry = readers.register();
+            latest.set(12);
+            assertEquals(-1, readers.scan().exempt());
+            readers.exempt(retry);
+            assertEquals(10, readers.scan().exempt());
+            // Never the latest sequence itself
+            latest.set(10);
+            assertEquals(-1, readers.scan().exempt());
+            latest.set(12);
+            readers.unregisterCheckpoint(retry);
+            assertEquals(-1, readers.scan().exempt());
+            assertTrue(readers.idle());
+        }
+    }
+
     /// Walks the data file from its newest superblock and checks that every page is used once or free.
     ///
     /// @return the delta records the trees refer to
