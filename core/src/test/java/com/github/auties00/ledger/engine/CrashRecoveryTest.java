@@ -32,8 +32,9 @@ import static org.junit.jupiter.api.Assertions.fail;
 ///
 /// A dry run of each workload counts its file system changes and forces, so the stop lands anywhere in it, half the
 /// time at a force: in a commit, a checkpoint, a rollover, a close or an open. Half the workloads write their values of
-/// more than 4 KiB to the file of large values, whose force runs beside the log's, and half write the groups one write
-/// holds through, each write of which is a force of its own.
+/// more than 4 KiB to the file of large values, whose force runs beside the log's; the others write some values of
+/// 128 KiB and more, on arrays of their own, which move to the log as soon as their commits are durable. Half the
+/// workloads write the groups one write holds through, each write of which is a force of its own.
 class CrashRecoveryTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.utf8());
@@ -166,11 +167,15 @@ class CrashRecoveryTest {
     }
 
     private static Ledger open(Path directory, Encryption encryption, long largeValues, WriteThrough.Mode writeThrough) {
-        return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(encryption).keyspace(MESSAGES).keyspace(CHATS)
+        var builder = ((LedgerBuilder) Ledger.builder().directory(directory).encryption(encryption).keyspace(MESSAGES).keyspace(CHATS)
                 .largeValues(largeValues))
                 .segmentSize(16_384)
-                .writeThrough(writeThrough)
-                .build();
+                .writeThrough(writeThrough);
+        if (largeValues == Long.MAX_VALUE) {
+            // Every value on an array of its own leaves the heap once its commit is durable
+            builder.spillBudget(0);
+        }
+        return builder.build();
     }
 
     /// {@return the size from which the workload of `seed` writes values to the file of large values}
@@ -319,6 +324,10 @@ class CrashRecoveryTest {
 
         private String value() {
             var length = random.nextInt(10) == 0 ? 2_500 + random.nextInt(6_000) : random.nextInt(80);
+            if (largeValues == Long.MAX_VALUE && random.nextInt(40) == 0) {
+                // On an array of its own in its batch
+                length = 130_000 + random.nextInt(140_000);
+            }
             var builder = new StringBuilder(length);
             for (var i = 0; i < length; i++) {
                 builder.append((char) ('a' + random.nextInt(26)));
