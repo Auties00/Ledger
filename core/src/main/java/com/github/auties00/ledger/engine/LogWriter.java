@@ -618,20 +618,24 @@ final class LogWriter {
     ///
     /// @throws LedgerIoException if the writer has stopped
     void append(byte type, long sequence, FrameBody body) {
-        append(type, sequence, body, 0, 0, false);
+        append(type, sequence, body, 0, 0, 0, false);
     }
 
     /// Queues a frame as [#append(byte, long, FrameBody)] does, for a commit of `writes` writes that wrote `unitBytes`
     /// of units of the file of large values.
     ///
     /// The group that holds the frame forces that file beside the segment. The units count toward the growth that
-    /// starts a checkpoint, as if their values were in the frame: memory holds them until a checkpoint takes them. The
-    /// writes count toward [#appendedHeap()].
+    /// starts a checkpoint, as if their values were in the frame: the file keeps each until a checkpoint takes it, or,
+    /// once a later commit replaced it, until the readers are past that checkpoint. The writes, and the units whose
+    /// values memory keeps too, count toward [#appendedHeap()].
     ///
+    /// @param unitHeap the bytes of the units whose values memory keeps until a checkpoint takes them, those of
+    ///                 resident key spaces
     /// @param sharesChunk whether the commit's values are on one chunk of the [ValueSlab], as [#heapOf] takes it
     /// @return the frames queued since the writer opened, the new one included
     /// @throws LedgerIoException if the writer has stopped
-    long append(byte type, long sequence, FrameBody body, long unitBytes, int writes, boolean sharesChunk) {
+    long append(byte type, long sequence, FrameBody body, long unitBytes, long unitHeap, int writes,
+                boolean sharesChunk) {
         checkHealthy();
         var length = body.size();
         long frames;
@@ -648,7 +652,7 @@ final class LogWriter {
             lastQueued = sequence;
             frames = ++appended;
             appendedBytes += 13 + length + unitBytes;
-            appendedHeap += heapOf(length, unitBytes, writes, sharesChunk);
+            appendedHeap += heapOf(length, unitHeap, writes, sharesChunk);
             queuedUnits |= unitBytes > 0;
         } finally {
             queueLock.unlock();
@@ -1552,14 +1556,15 @@ final class LogWriter {
             this.frames = new ArrayList<>();
         }
 
-        /// Adds a frame for a commit of `writes` writes that wrote `unitBytes` of units, whose values are on one chunk
-        /// of the [ValueSlab] if `sharesChunk`; its body is its writer's until [LogWriter#appendAll(Batch)] queues it,
-        /// and the log's from then on.
-        void add(byte type, long sequence, FrameBody body, long unitBytes, int writes, boolean sharesChunk) {
+        /// Adds a frame for a commit of `writes` writes that wrote `unitBytes` of units, `unitHeap` of them of values
+        /// memory keeps too, whose values are on one chunk of the [ValueSlab] if `sharesChunk`; its body is its
+        /// writer's until [LogWriter#appendAll(Batch)] queues it, and the log's from then on.
+        void add(byte type, long sequence, FrameBody body, long unitBytes, long unitHeap, int writes,
+                 boolean sharesChunk) {
             frames.add(new Queued(type, sequence, body));
             bodyBytes += body.size();
             appendedBytes += 13 + body.size() + unitBytes;
-            appendedHeap += heapOf(body.size(), unitBytes, writes, sharesChunk);
+            appendedHeap += heapOf(body.size(), unitHeap, writes, sharesChunk);
             units |= unitBytes > 0;
         }
 
@@ -1769,13 +1774,16 @@ final class LogWriter {
     }
 
     /// {@return the heap the commits queued since the writer opened hold until a checkpoint takes them, estimated: the
-    /// bytes of their frames and units, [#WRITE_HEAP] a write and [#COMMIT_HEAP] a commit}
+    /// bytes of their frames and of the units whose values memory keeps, [#WRITE_HEAP] a write and [#COMMIT_HEAP] a
+    /// commit}
     long appendedHeap() {
         return appendedHeap;
     }
 
-    /// {@return the heap a commit of `writes` writes, whose frame body is `bodyBytes` and whose units are `unitBytes`,
-    /// holds until a checkpoint takes it, as [#appendedHeap()] estimates it}
+    /// {@return the heap a commit of `writes` writes, whose frame body is `bodyBytes` and whose units of values memory
+    /// keeps are `unitBytes`, holds until a checkpoint takes it, as [#appendedHeap()] estimates it}
+    ///
+    /// A unit of a paged key space counts for nothing: its version keeps no copy of the value ([Version#ofUnit]).
     ///
     /// @param sharesChunk whether the commit's values are on one chunk of the [ValueSlab], whose view the slab shares
     ///                    among the commits on the chunk and whose whole the slab's own estimate counts: such a commit

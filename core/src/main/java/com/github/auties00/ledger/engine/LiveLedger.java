@@ -414,7 +414,11 @@ public final class LiveLedger implements Ledger {
         var queue = segment == null ? null : spills;
         // Whether the values go to the log at once rather than to chunks the queue lists
         var moves = queue != null && !queue.keepsReplayed(logFrom);
+        // The plaintext of each unit of a resident key space, whose version keeps the value; null for one of a paged
+        // key space, which the version names alone, or of a key space that no longer exists
         var units = new ArrayList<byte[]>();
+        // The bytes of the units, and of those memory keeps
+        var unitBytes = new long[2];
         var missing = new boolean[1];
         // The puts the queue lists, for the room of the commit's record
         var listed = new int[1];
@@ -443,12 +447,27 @@ public final class LiveLedger implements Ledger {
             @Override
             public void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
                 loadForReplay(keyspace);
-                var unit = blobs == null || missing[0] ? null : blobs.readUnit(ref);
-                if (unit == null || Bytes.i32(unit, PageFormat.LENGTH) != length) {
+                if (blobs == null || missing[0]) {
                     missing[0] = true;
-                } else {
-                    units.add(unit);
+                    return;
                 }
+                // Every unit of the commit authenticates, with its length, before any of its writes applies
+                var state = byId.get(keyspace);
+                if (state != null && state.resident) {
+                    var unit = blobs.readUnit(ref);
+                    if (unit == null || Bytes.i32(unit, PageFormat.LENGTH) != length) {
+                        missing[0] = true;
+                        return;
+                    }
+                    units.add(unit);
+                    unitBytes[1] += unit.length;
+                } else if (blobs.authenticates(ref, length)) {
+                    units.add(null);
+                } else {
+                    missing[0] = true;
+                    return;
+                }
+                unitBytes[0] += (long) ref.pages() * PageFormat.SIZE;
             }
         });
         if (missing[0]) {
@@ -467,12 +486,16 @@ public final class LiveLedger implements Ledger {
             public void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
                 var unit = units.get(next[0]++);
                 var state = byId.get(keyspace);
-                if (state != null) {
-                    var value = MemorySegment.ofArray(unit).asSlice(PageFormat.HEADER, length).asReadOnly();
-                    applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null,
-                            replayHint(state, key, values), ref);
-                    blobs.claim(ref);
+                if (state == null) {
+                    return;
                 }
+                if (unit == null) {
+                    applier.putUnit(state, key, Math.toIntExact(length), replayHint(state, key, values), ref);
+                } else {
+                    var value = MemorySegment.ofArray(unit).asSlice(PageFormat.HEADER, length).asReadOnly();
+                    applier.put(state, key, value, residentValue(state, null, value), replayHint(state, key, values), ref);
+                }
+                blobs.claim(ref);
             }
 
             @Override
@@ -571,13 +594,9 @@ public final class LiveLedger implements Ledger {
             // The log's last budget, which the queue holds without moving any
             queue.add(listing);
         }
-        var unitBytes = 0L;
-        for (var unit : units) {
-            unitBytes += unit.length;
-        }
-        replayedBytes += 13 + length + unitBytes;
+        replayedBytes += 13 + length + unitBytes[0];
         // As the writes would have held on chains, so the first checkpoint comes when it would have
-        replayedHeap += LogWriter.heapOf(length, unitBytes, applier.touched.size() + runWrites[0], false);
+        replayedHeap += LogWriter.heapOf(length, unitBytes[1], applier.touched.size() + runWrites[0], false);
         return true;
     }
 
@@ -1493,7 +1512,7 @@ public final class LiveLedger implements Ledger {
         do {
             commit = commit.next;
             if (commit.failure != null) {
-                batch.add(FrameBody.COMMIT, commit.sequence, new FrameBody(), 0, 0, false);
+                batch.add(FrameBody.COMMIT, commit.sequence, new FrameBody(), 0, 0, 0, false);
             } else {
                 commit.applier.queueFrame(batch);
             }
@@ -2059,8 +2078,8 @@ public final class LiveLedger implements Ledger {
     /// reads of the trees before it.
     ///
     /// The units of the file of large values its trees took leave the units in flight; those the commits it holds
-    /// replaced before a checkpoint took them are free at once, since only memory reads them; those its trees no longer
-    /// point to wait for the reads of the trees before it.
+    /// replaced before a checkpoint took them, which a reader below the commit that replaced one may still open, and
+    /// those its trees no longer point to wait for the reads that started before it.
     ///
     /// @param droppedRecords the delta records the trees before held and these do not, which leave the page cache with
     ///                       the units freed
@@ -2077,9 +2096,7 @@ public final class LiveLedger implements Ledger {
             space.pend(latest(), freed, droppedRecords);
             if (blobs != null) {
                 blobs.pend(latest(), freedExternal);
-                for (var unit : cut.superseded()) {
-                    blobs.release(unit);
-                }
+                blobs.pendSuperseded(latest(), cut.superseded());
                 for (var unit : adopted) {
                     blobs.adopt(unit);
                 }
@@ -2769,8 +2786,10 @@ public final class LiveLedger implements Ledger {
         private IdentityHashMap<KeyspaceState, RangeRemoval[]> removalsBefore;
         // The writes as the log records them, or null when nothing is journaled
         private final FrameBody frame;
-        // The bytes of the units of the file of large values this commit's values are in
+        // The bytes of the units of the file of large values this commit's values are in, and of those of resident key
+        // spaces, whose versions keep their values on the heap too
         private long unitBytes;
+        private long unitHeap;
         // Whether the commit's frame is queued in the log, which then names its units
         private boolean logged;
         // The versions this commit added whose value a unit of the file of large values holds
@@ -2927,6 +2946,12 @@ public final class LiveLedger implements Ledger {
             put(state, claim(state, key), key, value, null, false, null, null, 0, decoded, inTree, external);
         }
 
+        /// Applies a replayed put of `key` to `state`, a paged key space, whose value of `length` bytes only the unit
+        /// `external` of the file of large values holds: the version keeps no copy of it ([Version#ofUnit]).
+        void putUnit(KeyspaceState state, MemorySegment key, int length, byte inTree, PageRef external) {
+            put(state, claim(state, key), key, null, length, null, null, null, 0, null, inTree, external);
+        }
+
         /// Applies a put of `key` whose value is a read-only view of the whole of `array`, which no one writes from now
         /// on and the store's pool never hands out: the version keeps it as its own, with no copy, and the commit's
         /// frame may refer to it.
@@ -2968,8 +2993,9 @@ public final class LiveLedger implements Ledger {
         /// @param own the array that holds `value` alone, which no one writes and the version keeps in its place unless
         ///            `borrowed`; or `null`
         /// @param borrowed whether `own` is the caller's array, which its batch borrowed until the commit ends and the
-        ///                 caller may write after it: only a put with a unit of the file of large values has one, whose
-        ///                 frame records the unit, and nothing that outlives the commit refers to the array
+        ///                 caller may write after it: only a put of a paged key space with a unit of the file of large
+        ///                 values has one, whose frame records the unit and whose version names the unit alone
+        ///                 ([Version#ofUnit]), so nothing that outlives the commit refers to the array
         /// @param source the read-only segment `value` is part of, which the version keeps in its place, or `null` for a
         ///               value of its own
         /// @param array the array `value` lies on, at `offset`, which no one writes from now on and the store's pool never
@@ -2978,15 +3004,29 @@ public final class LiveLedger implements Ledger {
         /// @param offset where `value` starts in `source`, and in `array`
         void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, byte[] own, boolean borrowed,
                  MemorySegment source, byte[] array, int offset, Object decoded, byte inTree, PageRef external) {
-            if (borrowed && (external == null || source != null || array != null)) {
-                // A batch borrows only what goes to the file of large values: without its unit, the frame, which the
-                // log seals after the commit returns, would need the caller's array
+            if (borrowed && (external == null || state.resident || source != null || array != null)) {
+                // A batch borrows only what goes to the file of large values of a paged key space: anything else would
+                // keep the caller's array in a version, or in the frame the log seals after the commit returns
                 throw new IllegalStateException("A value the batch borrowed has no unit of the file of large values");
             }
+            // A borrowed array never reaches the version, which names the unit alone
+            put(state, chain, key, value, Math.toIntExact(value.byteSize()), borrowed ? null : own, source, array, offset,
+                    decoded, inTree, external);
+        }
+
+        /// Applies a put of `key` as [#put(KeyspaceState, Chain, MemorySegment, MemorySegment, byte\[\], boolean,
+        /// MemorySegment, byte\[\], int, Object, byte, PageRef)] does, given the value's `length`, for a value the
+        /// caller's batch did not borrow.
+        ///
+        /// A put of a paged key space with a unit keeps no copy of the value: the version names the unit alone
+        /// ([Version#ofUnit]), as the checkpoint takes the unit without reading it and a read opens it. `value` may
+        /// then be `null`, as for a replayed put whose unit recovery only authenticated.
+        private void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, int length,
+                         byte[] own, MemorySegment source, byte[] array, int offset, Object decoded,
+                         byte inTree, PageRef external) {
             var stamp = nextStamp();
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
-            var length = Math.toIntExact(value.byteSize());
             if (source != null && spillRoom >= 0 && !state.resident && (ValueSlab.Overwrites.sampled(stamp)
                     || spillRoom >= ValueSlab.Overwrites.BULK_WRITES && !state.overwrites.judged())) {
                 state.overwrites.sample(head, length);
@@ -2996,10 +3036,8 @@ public final class LiveLedger implements Ledger {
             // The array the frame may refer to for the value, and where the value starts in it
             var kept = array;
             var keptAt = offset;
-            if (borrowed) {
-                // The caller may write its array once the commit returns, and a version waits for a checkpoint: it
-                // keeps a copy
-                version = Version.ofOwn(stamp, Arrays.copyOf(own, length), null, head, external);
+            if (external != null && !state.resident) {
+                version = Version.ofUnit(stamp, blobs, length, head, external);
             } else if (own != null) {
                 version = Version.ofOwn(stamp, own, bytes ? own : decoded, head, external);
                 kept = own;
@@ -3044,6 +3082,9 @@ public final class LiveLedger implements Ledger {
                 if (external != null) {
                     frame.putExternal(state.id, key, length, external);
                     unitBytes += length;
+                    if (state.resident) {
+                        unitHeap += length;
+                    }
                 } else if (kept != null && length >= frame.referable()) {
                     frame.put(state.id, key, kept, keptAt, length);
                 } else {
@@ -3241,7 +3282,7 @@ public final class LiveLedger implements Ledger {
             // Queued before it is visible, so the log holds every commit a reader can see, in order
             if (frame != null) {
                 try {
-                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, touched.size(), sharesChunk);
+                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size(), sharesChunk);
                     logged = true;
                 } catch (RuntimeException exception) {
                     rollback();
@@ -3254,7 +3295,7 @@ public final class LiveLedger implements Ledger {
         /// Adds the commit's frame, if it is journaled, to `batch`.
         void queueFrame(LogWriter.Batch batch) {
             if (frame != null) {
-                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, touched.size(), sharesChunk);
+                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size(), sharesChunk);
             }
         }
 

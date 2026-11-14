@@ -131,7 +131,12 @@ class ByteValueReadsTest {
                         .put(FILES, "small", small).put(FILES, "empty", empty));
                 ledger.commit(ledger.newBatch().put(FILES, "alone", alone));
                 for (var key : List.of("huge", "large", "alone")) {
-                    assertTrue(ownsArray(head(ledger, FILES, key)), "a value of over half a chunk is on a segment");
+                    if (largeValues == Long.MAX_VALUE) {
+                        assertTrue(ownsArray(head(ledger, FILES, key)), "a value of over half a chunk is on a segment");
+                    } else {
+                        // Its unit holds it, and memory keeps no copy
+                        assertTrue(head(ledger, FILES, key).sourceForTests() instanceof BlobFile, "a large value kept a copy");
+                    }
                 }
                 assertFalse(ownsArray(head(ledger, FILES, "small")), "a small value took an array of its own");
                 expected.forEach((key, value) -> assertReads(ledger, FILES, key, value));
