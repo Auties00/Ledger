@@ -16,23 +16,27 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.List;
 import java.util.Random;
+import java.util.TreeSet;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/// The reads the page cache screens: a leaf or a value a point read of a paged key space misses goes to the cache at
-/// its second read, and one a scan misses at its third, whether the reads of the file are warm or cold, as the array
-/// the first read refused when the collector has not taken it, while branches, roots, the lookups of a commit and the
-/// reads of a resident key space cache at once. The tree tests run on a cache with a budget of its own, which only the
-/// test ticks.
+/// The reads the page cache screens: a leaf, a branch of level 1 or a value a point read of a paged key space misses
+/// goes to the cache at its second read, and one a scan misses at its third, whether the reads of the file are warm or
+/// cold, as the array the first read refused when the collector has not taken it, and a delta page goes with the leaf
+/// of its record, while the branches of level 2 or more, roots, the lookups of a commit and the reads of a resident key
+/// space cache at once. The tree tests run on a cache with a budget of its own, which only the test ticks.
 class ScreenedReadsTest {
     private static final long MIB = 1 << 20;
     private static final byte[] KEY = new byte[32];
@@ -127,23 +131,70 @@ class ScreenedReadsTest {
     @DisplayName("a read of a tree")
     class Trees {
         @Test
-        @DisplayName("of a point read caches a leaf it read once only at the second read, and the branches and the root at the first")
+        @DisplayName("of a point read caches a leaf and its branch of level 1 it read once only at the second read, and the higher branches and the root at the first")
         void leafAtSecondRead(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory).filled(KEYS, 150)) {
                 var path = tree.path(key(100));
                 assertTrue(path.size() > 2, "a tree of " + path.size() + " levels");
                 var leaf = path.getLast();
+                var parent = path.get(path.size() - 2);
                 tree.leaf(100);
-                for (var ref : path.subList(0, path.size() - 1)) {
+                for (var ref : path.subList(0, path.size() - 2)) {
                     assertNotNull(tree.cache.peek(ref), "the branch " + ref);
                 }
+                assertNull(tree.cache.peek(parent), "the branch of level 1 read once");
+                var refusedParent = tree.cache.recallWeak(PageCache.dataKey(parent.page(), parent.slot()), parent);
+                assertNotNull(refusedParent, "the branch of level 1 the first read refused");
+                assertEquals(1, TreeNodes.level(refusedParent));
                 assertNull(tree.cache.peek(leaf), "the leaf read once");
                 var bytes = tree.cache.size();
                 var read = tree.leaf(100);
                 assertSame(read, tree.cache.peek(leaf), "the leaf read twice");
                 assertTrue(tree.cache.referencedForTests(leaf));
-                assertEquals(bytes + read.length, tree.cache.size());
+                assertSame(refusedParent, tree.cache.peek(parent), "the branch of level 1 read twice");
+                assertTrue(tree.cache.referencedForTests(parent));
+                assertEquals(bytes + refusedParent.length + read.length, tree.cache.size());
                 assertSame(read, tree.leaf(100), "a hit");
+            }
+        }
+
+        @Test
+        @DisplayName("caches the branches of level 1 a scan reads among its first units at their third scan, and those past them at once")
+        void scannedBranches(@TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory).filled(KEYS, 150)) {
+                var firstPath = tree.path(key(0));
+                var lastPath = tree.path(key(KEYS - 1));
+                assertTrue(firstPath.size() > 2, "a tree of " + firstPath.size() + " levels");
+                var firstParent = firstPath.get(firstPath.size() - 2);
+                var lastParent = lastPath.get(lastPath.size() - 2);
+                assertNotEquals(firstParent, lastParent);
+                tree.cache.clearForTests();
+                var cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
+                var entries = 0;
+                while (cursor.next()) {
+                    entries++;
+                }
+                assertEquals(KEYS, entries);
+                for (var ref : firstPath.subList(0, firstPath.size() - 2)) {
+                    assertNotNull(tree.cache.peek(ref), "the branch " + ref);
+                }
+                assertNull(tree.cache.peek(firstParent), "a branch of level 1 among the first units the scan reads");
+                assertNotNull(tree.cache.peek(lastParent), "a branch of level 1 past them");
+                var refusedParent = tree.cache.recallWeak(PageCache.dataKey(firstParent.page(), firstParent.slot()), firstParent);
+                assertNotNull(refusedParent, "the branch of level 1 the first scan refused");
+                cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
+                assertTrue(cursor.next());
+                assertNull(tree.cache.peek(firstParent), "a branch of level 1 the scan read twice");
+                assertEquals(2, tree.cache.reads(firstParent), "the reads of the branch the doorkeeper saw");
+                cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
+                assertTrue(cursor.next());
+                assertSame(refusedParent, tree.cache.peek(firstParent), "a branch of level 1 the scan read three times");
+                assertTrue(tree.cache.referencedForTests(firstParent));
+                // A scan that does not screen caches the branches of level 1 it reads at once
+                tree.cache.clearForTests();
+                cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, false);
+                assertTrue(cursor.next());
+                assertNotNull(tree.cache.peek(firstParent), "a branch of level 1 an unscreened scan read");
             }
         }
 
@@ -254,35 +305,92 @@ class ScreenedReadsTest {
         }
 
         @Test
-        @DisplayName("of a point read of a delta record caches neither its leaf nor its base at the first read, keeps its delta page, and caches the leaf the first read made at the second")
+        @DisplayName("of a point read of a delta record caches neither its leaf, its base nor its delta page at the first read, refuses the delta page with the leaf, and caches the leaf the first read made at the second")
         void deltaRecords(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory).filled(KEYS, 150)) {
                 tree.apply(List.of(new TreeUpdate.Op(segment(key(100)), segment(new byte[151]))));
                 var record = tree.path(key(100)).getLast();
                 assertTrue(record.isRecord(), "the leaf of the key is no delta record");
                 var base = TreeNodes.base(tree.pages.read(record, PageFile.NODE, false), record);
+                var page = record.unit();
                 tree.cache.clearForTests();
                 var first = tree.leaf(100);
                 assertNull(tree.cache.peek(record), "the leaf of the record read once");
                 assertNull(tree.cache.peek(base), "the base of the record read once");
-                assertNotNull(tree.cache.peek(record.unit()), "the delta page, which the other records share");
-                assertFalse(tree.cache.referencedForTests(record.unit()), "the delta page counts as read");
+                assertNull(tree.cache.peek(page), "the delta page of a leaf the cache refused");
+                var refusedPage = tree.cache.recallWeak(PageCache.dataKey(page.page(), page.slot()), page);
+                assertNotNull(refusedPage, "the delta page refused with the leaf");
+                assertEquals(PageFormat.DELTA, refusedPage[PageFormat.KIND]);
+                assertEquals(PageFormat.cachedLength(1, Bytes.i32(refusedPage, PageFormat.LENGTH)), refusedPage.length,
+                        "the delta page is not opened as the cache keeps it");
                 var leaf = tree.leaf(100);
                 assertSame(first, leaf, "the leaf the first read made");
                 assertSame(leaf, tree.cache.peek(record), "the leaf of the record read twice");
                 assertTrue(tree.cache.referencedForTests(record));
                 assertNull(tree.cache.peek(base), "the base of a leaf read back from the first read");
+                assertNull(tree.cache.peek(page), "the delta page of a leaf read back from the first read");
 
-                // Once the collector took the first read's leaf, the second makes it again, its base as the first entry
-                // to evict
+                // Once the collector took the first read's leaf, the second makes it again, its base and its delta page
+                // as the first entries to evict
                 tree.cache.clearForTests();
                 assertTrue(tree.cache.doorkeeperForTests().holds(PageCache.dataKey(record.page(), record.slot()), record.nonceHigh()));
                 leaf = tree.leaf(100);
                 assertSame(leaf, tree.cache.peek(record), "the leaf of the record made again");
                 assertNotNull(tree.cache.peek(base), "the base of the record made again, as the first entry to evict");
                 assertFalse(tree.cache.referencedForTests(base), "the base counts as read");
+                assertNotNull(tree.cache.peek(page), "the delta page of the record made again, as the first entry to evict");
+                assertFalse(tree.cache.referencedForTests(page), "the delta page counts as read");
                 var entry = TreeSearch.entryOf(leaf, key(100));
                 assertArrayEquals(new byte[151], TreeSearch.valueBytes(tree.pages, leaf, entry, PageCache.POINT));
+            }
+        }
+
+        @Test
+        @DisplayName("gives the reads of the other records of a delta page the page a refused leaf left weakly held, and caches that array with the first leaf the cache takes")
+        void sharedDeltaPage(@TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory).filled(KEYS, 150)) {
+                // Keys in leaves far apart, whose records the checkpoint packs into its delta pages
+                var keys = new int[]{100, 3_000, 6_000, 9_000, 12_000, 15_000};
+                var ops = new ArrayList<TreeUpdate.Op>();
+                for (var key : keys) {
+                    ops.add(new TreeUpdate.Op(segment(key(key)), segment(new byte[151])));
+                }
+                tree.apply(ops);
+                var page = tree.path(key(keys[0])).getLast().unit();
+                // The keys whose records share the delta page of the first
+                var sharing = new ArrayList<Integer>();
+                for (var key : keys) {
+                    var record = tree.path(key(key)).getLast();
+                    assertTrue(record.isRecord(), "the leaf of key " + key + " is no delta record");
+                    if (record.unit().equals(page)) {
+                        sharing.add(key);
+                    }
+                }
+                assertTrue(sharing.size() >= 3, "only " + sharing.size() + " records share a delta page");
+                var pageKey = PageCache.dataKey(page.page(), page.slot());
+                tree.cache.clearForTests();
+
+                tree.leaf(sharing.get(0));
+                var refusedPage = tree.cache.recallWeak(pageKey, page);
+                assertNotNull(refusedPage, "the delta page refused with the first leaf");
+                var refusals = tree.cache.refusalsForTests();
+                // The first read of a neighbour takes the page from the refused units and refuses only its own leaf
+                var neighbour = tree.path(key(sharing.get(1))).getLast();
+                var second = tree.leaf(sharing.get(1));
+                assertNull(tree.cache.peek(neighbour), "the neighbour's leaf read once");
+                assertNull(tree.cache.peek(page), "the delta page of two refused leaves");
+                assertSame(refusedPage, tree.cache.recallWeak(pageKey, page), "the delta page read again");
+                assertEquals(refusals + 2, tree.cache.refusalsForTests(), "the refusals of the neighbour's first read: its branch of level 1 and its leaf");
+                var entry = TreeSearch.entryOf(second, key(sharing.get(1)));
+                assertArrayEquals(new byte[151], TreeSearch.valueBytes(tree.pages, second, entry, PageCache.POINT));
+
+                // A lookup of a commit caches the leaf it reads at once, and the delta page it takes from the refused
+                // units with it, as the first entry to evict
+                var third = tree.path(key(sharing.get(2))).getLast();
+                assertTrue(TreeSearch.contains(tree.pages, tree.root, MemorySegment.ofArray(key(sharing.get(2)))));
+                assertNotNull(tree.cache.peek(third), "the leaf a lookup read");
+                assertSame(refusedPage, tree.cache.peek(page), "the delta page of a leaf the cache took");
+                assertFalse(tree.cache.referencedForTests(page), "the delta page counts as read");
             }
         }
 
@@ -309,6 +417,100 @@ class ScreenedReadsTest {
                 assertTrue(cursor.next());
                 assertNotNull(tree.cache.peek(first), "a leaf of the first the scan read three times");
                 assertTrue(tree.cache.referencedForTests(first));
+            }
+        }
+
+        @Test
+        @DisplayName("readers on many threads read every value right through screened reads of delta records and branches while the collector takes refused units, and a checkpoint then replaces the records they read")
+        void concurrentDeltaReads(@TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory).filled(KEYS, 150)) {
+                var random = new Random(17);
+                var values = new int[KEYS];
+                // Rounds of scattered changes, so most leaves become delta records packed into shared delta pages
+                for (var round = 1; round <= 4; round++) {
+                    var changed = new TreeSet<Integer>();
+                    for (var i = 0; i < 300; i++) {
+                        changed.add(random.nextInt(KEYS));
+                    }
+                    var ops = new ArrayList<TreeUpdate.Op>();
+                    for (var key : changed) {
+                        values[key] = round;
+                        var value = new byte[150 + round];
+                        value[0] = (byte) round;
+                        ops.add(new TreeUpdate.Op(segment(key(key)), segment(value)));
+                    }
+                    tree.apply(ops);
+                }
+                var records = 0;
+                for (var key = 0; key < KEYS; key += 100) {
+                    if (tree.path(key(key)).getLast().isRecord()) {
+                        records++;
+                    }
+                }
+                assertTrue(records > 20, records + " delta records among 200 keys");
+                tree.cache.clearForTests();
+                var root = tree.root;
+                var failures = new ConcurrentLinkedQueue<String>();
+                var threads = new Thread[8];
+                for (var t = 0; t < threads.length; t++) {
+                    var seed = random.nextLong();
+                    var collector = t == 0;
+                    threads[t] = Thread.ofPlatform().start(() -> {
+                        var local = new Random(seed);
+                        for (var i = 0; i < 4_000 && failures.isEmpty(); i++) {
+                            try {
+                                if (collector && i % 500 == 0) {
+                                    System.gc();
+                                }
+                                var key = local.nextInt(KEYS);
+                                if (local.nextInt(50) == 0) {
+                                    var cursor = new TreeCursor(tree.pages, root, key(key), null, false, 0, true);
+                                    for (var n = key; n < Math.min(KEYS, key + 60) && cursor.next(); n++) {
+                                        if (!Arrays.equals(key(n), cursor.key().toArray(ValueLayout.JAVA_BYTE))
+                                                || cursor.value().byteSize() != 150 + values[n]) {
+                                            failures.add("the scan from " + key + " at " + n);
+                                        }
+                                    }
+                                    cursor.release();
+                                } else {
+                                    var screen = local.nextBoolean() ? PageCache.POINT : PageCache.SCAN;
+                                    var leaf = TreeSearch.leaf(tree.pages, root, key(key), screen);
+                                    var entry = TreeSearch.entryOf(leaf, key(key));
+                                    var value = entry == -1 ? null : TreeSearch.valueBytes(tree.pages, leaf, entry, screen);
+                                    if (value == null || value.length != 150 + values[key] || (values[key] != 0 && value[0] != values[key])) {
+                                        failures.add("the value of " + key);
+                                    }
+                                }
+                            } catch (RuntimeException exception) {
+                                failures.add(exception.toString());
+                            }
+                        }
+                    });
+                }
+                for (var thread : threads) {
+                    thread.join();
+                }
+                assertTrue(failures.isEmpty(), () -> failures.size() + " wrong reads, first: " + failures.peek());
+
+                // A checkpoint that rewrites records whose delta pages the readers left refused, then every value
+                var ops = new ArrayList<TreeUpdate.Op>();
+                for (var key = 50; key < KEYS; key += 97) {
+                    values[key] = 5;
+                    var value = new byte[155];
+                    value[0] = 5;
+                    ops.add(new TreeUpdate.Op(segment(key(key)), segment(value)));
+                }
+                tree.apply(ops);
+                for (var key = 0; key < KEYS; key++) {
+                    var leaf = tree.leaf(key);
+                    var entry = TreeSearch.entryOf(leaf, key(key));
+                    assertTrue(entry != -1, "no key " + key);
+                    var value = TreeSearch.valueBytes(tree.pages, leaf, entry, PageCache.POINT);
+                    assertEquals(150 + values[key], value.length, "key " + key);
+                    if (values[key] != 0) {
+                        assertEquals(values[key], value[0], "key " + key);
+                    }
+                }
             }
         }
 
@@ -377,42 +579,52 @@ class ScreenedReadsTest {
         }
 
         @Test
-        @DisplayName("of a scan of a delta record caches neither its leaf nor its base at the first two reads, keeps its delta page, and caches the leaf the first read made at the third")
+        @DisplayName("of a scan of a delta record caches neither its leaf, its base nor its delta page at the first two reads, refuses the delta page with the leaf, and caches the leaf the first read made at the third")
         void scanDeltaRecords(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory).filled(KEYS, 150)) {
                 tree.apply(List.of(new TreeUpdate.Op(segment(key(100)), segment(new byte[151]))));
                 var record = tree.path(key(100)).getLast();
                 assertTrue(record.isRecord(), "the leaf of the key is no delta record");
                 var base = TreeNodes.base(tree.pages.read(record, PageFile.NODE, false), record);
+                var page = record.unit();
+                var pageKey = PageCache.dataKey(page.page(), page.slot());
                 tree.cache.clearForTests();
                 var first = TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN);
+                var refusedPage = tree.cache.recallWeak(pageKey, page);
+                assertNotNull(refusedPage, "the delta page refused with the leaf");
                 for (var read = 1; read <= 2; read++) {
                     if (read == 2) {
                         assertSame(first, TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN));
                     }
                     assertNull(tree.cache.peek(record), "the leaf of the record read " + read + " times");
                     assertNull(tree.cache.peek(base), "the base of the record read " + read + " times");
-                    assertNotNull(tree.cache.peek(record.unit()), "the delta page, which the other records share");
-                    assertFalse(tree.cache.referencedForTests(record.unit()), "the delta page counts as read");
+                    assertNull(tree.cache.peek(page), "the delta page of a leaf read " + read + " times");
+                    assertSame(refusedPage, tree.cache.recallWeak(pageKey, page), "the delta page, which the other records share");
                 }
                 var leaf = TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN);
                 assertSame(first, leaf, "the leaf the first read made");
                 assertSame(leaf, tree.cache.peek(record), "the leaf of the record read three times");
                 assertTrue(tree.cache.referencedForTests(record));
                 assertNull(tree.cache.peek(base), "the base of a leaf read back from the first read");
+                assertNull(tree.cache.peek(page), "the delta page of a leaf read back from the first read");
 
-                // With the arrays the reads refused collected after each read, the third read makes the leaf again
+                // With the arrays the reads refused collected after each read, the third read makes the leaf again,
+                // its delta page as the first entry to evict
                 tree.apply(List.of(new TreeUpdate.Op(segment(key(100)), segment(new byte[152]))));
                 record = tree.path(key(100)).getLast();
                 assertTrue(record.isRecord(), "the leaf of the key is no delta record");
+                page = record.unit();
                 tree.cache.clearForTests();
                 for (var read = 1; read <= 2; read++) {
                     TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN);
+                    assertNull(tree.cache.peek(page), "the delta page of a leaf read " + read + " times");
                     tree.cache.clearForTests();
                     assertEquals(read, tree.cache.reads(record), "the reads of the record");
                 }
                 leaf = TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN);
                 assertSame(leaf, tree.cache.peek(record), "the leaf of the record made again");
+                assertNotNull(tree.cache.peek(page), "the delta page of the record made again, as the first entry to evict");
+                assertFalse(tree.cache.referencedForTests(page), "the delta page counts as read");
                 var entry = TreeSearch.entryOf(leaf, key(100));
                 assertArrayEquals(new byte[152], TreeSearch.valueBytes(tree.pages, leaf, entry, PageCache.SCAN));
             }
@@ -556,7 +768,8 @@ class ScreenedReadsTest {
                 }
                 // Reopened, so memory holds no version and every read goes to the tree
                 try (var ledger = (LiveLedger) open(store, largeValues)) {
-                    // The first read caches the branches; then the first reads of keys in other leaves cache nothing
+                    // The first read caches the root and the branches above the parents of the leaves; then the first
+                    // reads of keys in other leaves cache nothing
                     ledger.clearPageCacheForTests();
                     assertArrayEquals(value(1_999, 6_000), ledger.get(MESSAGES, key(1_999)).orElseThrow());
                     var branches = ledger.pageCacheBytesForTests();

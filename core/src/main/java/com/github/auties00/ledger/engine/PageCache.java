@@ -62,10 +62,13 @@ import java.util.concurrent.atomic.AtomicLong;
 /// its next read caches it at once, a scan's too once a scan read a unit twice; one a checkpoint cached as written that
 /// the clock evicts unread leaves no trace, as a saturated checkpoint caches leaves at every run, and recording each one
 /// the clock evicts would fill the doorkeeper's generations with keys no read touched, so that they rotate and forget
-/// the first reads they hold. A branch is never screened, as every read starts from the branches. Screening does not
-/// depend on how fast the device reads: the reads of the files go through the OS cache, so the first read of a unit,
-/// from the device or not, leaves its pages there, and its later reads cost a read of the OS cache and an open, a few
-/// microseconds, on a store copied past the OS cache as much as on any other.
+/// the first reads they hold. A branch of level 2 or more is never screened, as it lies on the way to every leaf of
+/// thousands: the reads of one chat or one key use it again. A branch of level 1, the parent of about 60 leaves, is
+/// screened as a leaf is, at the second read of a point read and the third of a scan, as a random read rarely comes
+/// back to its leaves and it would keep 3 to 4 KB for one read. Screening does not depend on how fast the device reads:
+/// the reads of the files go through the OS cache, so the first read of a unit, from the device or not, leaves its
+/// pages there, and its later reads cost a read of the OS cache and an open, a few microseconds, on a store copied
+/// past the OS cache as much as on any other.
 ///
 /// The array of a unit the cache refused stays reachable weakly, in one of two slots of a table of up to
 /// [#MAX_REFUSALS] by a hash of the key and nonce, so a read that misses the unit before the collector takes it uses
@@ -73,8 +76,11 @@ import java.util.concurrent.atomic.AtomicLong;
 /// point read and a lookup of a commit cache it, and a scan leaves it where it is at its second read and caches it at
 /// its third. What the cache holds stays what reads used often enough, and the first reads of a session allocate no
 /// more than they did when the cache took every unit at once, as long as the collector has not run between the reads.
-/// Writes, the lookups of a commit, the reads of a checkpoint and of a resident key space, the root of a tree, and the
-/// units of a scan past its first leaves and values cache as they would unscreened.
+/// A delta page read for a leaf the cache refused is refused with it, and the reads of the page's other records take
+/// it from there without putting it ([#recallWeak(long, PageRef)]): the page holds the records of several leaves,
+/// which random reads rarely reach, and kept 4 KB for one leaf the cache did not even take. Writes, the lookups of a
+/// commit, the reads of a checkpoint and of a resident key space, the root of a tree, and the units of a scan past its
+/// first leaves and values cache as they would unscreened.
 final class PageCache implements IdleTicker.Watched {
     /// The file of the trees, `ledger.data`.
     static final int DATA = 0;
@@ -285,7 +291,7 @@ final class PageCache implements IdleTicker.Watched {
     }
 
     /// Caches `unit`, the plaintext of the unit `ref` of the data file names, as a read that missed it, if the cache
-    /// [admits][#admits(long, PageRef, int)] it or it is a branch.
+    /// [admits][#admits(long, PageRef, int)] it or it is a branch of level 2 or more.
     ///
     /// @param unit an array as [#put(long, PageRef, byte\[\], boolean)] requires
     /// @param screen the read's screening: [#UNSCREENED], [#POINT] or [#SCAN]
@@ -294,14 +300,15 @@ final class PageCache implements IdleTicker.Watched {
     }
 
     /// Caches `unit`, the plaintext of the unit `ref` names, at `key`, as a read that missed it, as an entry a read
-    /// used, if the cache [admits][#admits(long, PageRef, int)] it or it is a branch; otherwise the read that missed
-    /// it keeps the array, which the cache holds only weakly, for a [recall][#recall(long, PageRef, int)].
+    /// used, if the cache [admits][#admits(long, PageRef, int)] it or it is a branch of level 2 or more; otherwise the
+    /// read that missed it keeps the array, which the cache holds only weakly, for a
+    /// [recall][#recall(long, PageRef, int)]. A branch of level 1, the parent of leaves, is screened as a leaf is.
     ///
     /// @param key a key of [#key(int, int)] or [#dataKey(int, int)]
     /// @param unit an array as [#put(long, PageRef, byte\[\], boolean)] requires
     /// @param screen the read's screening: [#UNSCREENED], [#POINT] or [#SCAN]
     void putScreened(long key, PageRef ref, byte[] unit, int screen) {
-        if (unit[PageFormat.KIND] == PageFormat.BRANCH || admits(key, ref, screen)) {
+        if ((unit[PageFormat.KIND] == PageFormat.BRANCH && unit[PageFormat.LEVEL] >= 2) || admits(key, ref, screen)) {
             put(key, ref, unit, true);
         } else {
             refuse(key, ref, unit);
@@ -396,16 +403,13 @@ final class PageCache implements IdleTicker.Watched {
         if (refused == null) {
             return null;
         }
-        var index = refusal(key, ref.nonceHigh(), refused.length);
-        var held = (Refused) REFUSED.getAcquire(refused, index);
-        if (held == null || !held.names(key, ref)) {
-            held = (Refused) REFUSED.getAcquire(refused, ++index);
-            if (held == null || !held.names(key, ref)) {
-                return null;
-            }
+        var index = refusedSlot(refused, key, ref);
+        if (index < 0) {
+            return null;
         }
-        var unit = held.get();
-        if (unit == null) {
+        var held = (Refused) REFUSED.getAcquire(refused, index);
+        var unit = held == null ? null : held.get();
+        if (unit == null || !held.names(key, ref)) {
             return null;
         }
         if (screen == SCAN && !admits(key, ref, SCAN)) {
@@ -414,6 +418,45 @@ final class PageCache implements IdleTicker.Watched {
         REFUSED.compareAndSet(refused, index, held, null);
         put(key, ref, unit, true);
         return unit;
+    }
+
+    /// {@return the array of the unit `ref` names, at `key`, if the cache refused it lately and the collector has not
+    /// taken it, or `null`; the cache stays as it was, and the unit stays refused}
+    ///
+    /// A read that uses a unit without making it an entry asks for it before it reads the file: the delta page of a
+    /// leaf the cache refused, which the reads of the page's other records share. It finds the unit as
+    /// [#recall(long, PageRef, int)] does, by its key and the nonce and pages it was sealed with, so a page a later
+    /// checkpoint reused never gives back what it held before. It takes no lock and allocates nothing.
+    ///
+    /// @param key a key of [#key(int, int)] or [#dataKey(int, int)]
+    byte[] recallWeak(long key, PageRef ref) {
+        var refused = this.refused;
+        if (refused == null) {
+            return null;
+        }
+        var index = refusedSlot(refused, key, ref);
+        if (index < 0) {
+            return null;
+        }
+        var held = (Refused) REFUSED.getAcquire(refused, index);
+        return held == null || !held.names(key, ref) ? null : held.get();
+    }
+
+    /// {@return what [#recallWeak(long, PageRef)] finds for the unit `ref` of the data file names, or the leaf its
+    /// delta record makes}
+    byte[] recallWeak(PageRef ref) {
+        return recallWeak(dataKey(ref.page(), ref.slot()), ref);
+    }
+
+    /// {@return the slot of `refused` that holds the unit `ref` names at `key`, of the two of its pair, or -1}
+    private static int refusedSlot(Refused[] refused, long key, PageRef ref) {
+        var index = refusal(key, ref.nonceHigh(), refused.length);
+        var held = (Refused) REFUSED.getAcquire(refused, index);
+        if (held != null && held.names(key, ref)) {
+            return index;
+        }
+        held = (Refused) REFUSED.getAcquire(refused, ++index);
+        return held != null && held.names(key, ref) ? index : -1;
     }
 
     /// {@return what [#recall(long, PageRef, int)] finds for the unit `ref` of the data file names, or the leaf its
@@ -842,6 +885,11 @@ final class PageCache implements IdleTicker.Watched {
     int refusalSlotsForTests() {
         var refused = this.refused;
         return refused == null ? 0 : refused.length;
+    }
+
+    /// {@return the refusals since the table of the refused units was built; for tests that count them}
+    int refusalsForTests() {
+        return refusals.get();
     }
 
     /// {@return the slots of the table of the refused units that hold one; for tests that bound it}
