@@ -14,6 +14,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -39,7 +40,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
-/// The runs an open replays the paged writes before the log's last budget into ([PackedRun]): the stores run with a
+/// The runs an open replays the paged writes before the log's last budget into ([PackedRun]): most stores run with a
 /// budget of 0, so every replayed paged write of a key memory holds no chain of goes to a run, and every read, scan,
 /// count, later write, range removal, checkpoint, snapshot and further crash sees the state the log holds, as the
 /// chains it replaced showed it.
@@ -50,11 +51,14 @@ class PackedRunTest {
     private static final Keyspace<String, String> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
     // Empty, short, at the log's threshold and above it
     private static final int[] LENGTHS = {0, 40, 200, SpillQueue.LOG_VALUE_MIN, 700, 1_500};
+    // The least value of MESSAGES that goes to the file of large values: longer than every value of LENGTHS
+    private static final int LARGE_VALUES = 4 << 10;
 
     private static LiveLedger open(Path directory, boolean encrypted, long budget) {
         var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(directory)
                 .encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
-                .keyspace(MESSAGES).keyspace(TEXTS).keyspace(CHATS).commitWindow(Duration.ZERO))
+                .keyspace(MESSAGES).keyspace(TEXTS).keyspace(CHATS).commitWindow(Duration.ZERO)
+                .largeValues(MESSAGES, LARGE_VALUES))
                 .segmentSize(64 << 10)
                 .spillBudget(budget)
                 .writeThrough(WriteThrough.Mode.OFF)
@@ -414,16 +418,60 @@ class PackedRunTest {
         }
     }
 
-    @ParameterizedTest(name = "encrypted: {0}")
-    @ValueSource(booleans = {true, false})
-    @DisplayName("writes of the log's last budget over keys of the run take chains that count against the run's entries")
-    void lastBudgetOverRun(boolean encrypted, @TempDir Path directory) throws Exception {
+    /// The tree a store holds of MESSAGES before the log the runs are replayed from.
+    enum Base {
+        /// A checkpointed tree of the key space.
+        CHECKPOINTED,
+        /// A checkpoint taken while the key space was empty, which leaves it no tree.
+        EMPTY,
+        /// No checkpoint at all.
+        NONE
+    }
+
+    static List<Arguments> lastBudgetCases() {
+        var cases = new ArrayList<Arguments>();
+        for (var base : Base.values()) {
+            cases.add(Arguments.of(base, true));
+            cases.add(Arguments.of(base, false));
+        }
+        return cases;
+    }
+
+    @ParameterizedTest(name = "{0}, encrypted: {1}")
+    @MethodSource("lastBudgetCases")
+    @DisplayName("writes the replay sends to chains over keys of the run, of the last budget and of the file of large values, take the run's entry as the key's state, with or without a tree under it")
+    void lastBudgetOverRun(Base base, boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
-            write(ledger, expected, 0, 0, 50, 0);
-            ledger.checkpoint();
+            switch (base) {
+                case CHECKPOINTED -> {
+                    write(ledger, expected, 0, 0, 50, 0);
+                    ledger.checkpoint();
+                }
+                case EMPTY -> {
+                    ledger.commit(ledger.newBatch().put(CHATS, "c", "x")).awaitDurable();
+                    ledger.checkpoint();
+                }
+                case NONE -> {
+                }
+            }
             for (var round = 0; round < 40; round++) {
                 write(ledger, expected, 1 + round % 3, round * 10, 10, 1);
+                if (round == 20) {
+                    // Before the last budget: values of the file of large values, two over keys the run holds, one
+                    // removed after; and a removal the run takes of a key it holds
+                    var batch = ledger.newBatch();
+                    for (var id = 1; id < 30; id += 4) {
+                        var large = new byte[LARGE_VALUES + id];
+                        large[id] = (byte) id;
+                        batch.put(MESSAGES, key(2, id), large);
+                        expected.put(key(2, id), large);
+                    }
+                    ledger.commit(batch).awaitDurable();
+                    ledger.commit(ledger.newBatch().delete(MESSAGES, key(2, 5)).delete(MESSAGES, key(3, 22))).awaitDurable();
+                    expected.delete(key(2, 5));
+                    expected.delete(key(3, 22));
+                }
             }
             // The last commits, within the last budget, write keys the run holds, a checkpointed one and new ones
             var batch = ledger.newBatch();
@@ -438,6 +486,14 @@ class PackedRunTest {
             expected.delete(key(0, 3));
             batch.put(MESSAGES, key(3, 5_000), new byte[]{9});
             expected.put(key(3, 5_000), new byte[]{9});
+            // A large value over a key of the run, and removals of keys the run removed and of a large value
+            var large = new byte[LARGE_VALUES];
+            large[0] = 1;
+            batch.put(MESSAGES, key(3, 25), large);
+            expected.put(key(3, 25), large);
+            batch.delete(MESSAGES, key(3, 22));
+            batch.delete(MESSAGES, key(2, 9));
+            expected.delete(key(2, 9));
             ledger.commit(batch).awaitDurable();
             ledger.closeWithoutCheckpoint();
         }
@@ -445,6 +501,13 @@ class PackedRunTest {
             assertNotNull(ledger.state(MESSAGES).run, "no run before the last budget");
             assertTrue(ledger.state(MESSAGES).chains() > 0, "the last budget took no chain");
             verify(ledger, expected);
+            for (var id = 0; id < 40; id += 2) {
+                assertFalse(ledger.get(MESSAGES, key(1, id)).isPresent(), "a removal of the last budget was lost");
+            }
+            ledger.checkpoint();
+            verify(ledger, expected);
+            // Every later checkpoint finds the count it expects
+            write(ledger, expected, 1, 0, 5, 9);
             ledger.checkpoint();
             verify(ledger, expected);
         }
@@ -579,8 +642,10 @@ class PackedRunTest {
         var workload = new Workload(seed, encrypted);
         workload.run(disk.getPath("/store"));
         var survivor = seed % 3 == 0 ? disk.afterProcessCrash() : disk.afterPowerLoss(new Random(random.nextLong()));
+        // Some seeds keep a last budget of the log on chains, over the runs of the writes before it
+        var budget = Workload.budget(seed);
         Expected after;
-        try (var ledger = open(survivor.getPath("/store"), encrypted, 0)) {
+        try (var ledger = open(survivor.getPath("/store"), encrypted, budget)) {
             Expected match = null;
             for (var commit = workload.durable; commit <= workload.visible; commit++) {
                 if (matches(ledger, workload.history.get(commit))) {
@@ -601,12 +666,12 @@ class PackedRunTest {
             // A second crash, before the first checkpoint after the recovery
             ledger.closeWithoutCheckpoint();
         }
-        try (var ledger = open(survivor.getPath("/store"), encrypted, 0)) {
+        try (var ledger = open(survivor.getPath("/store"), encrypted, budget)) {
             verify(ledger, after);
             ledger.checkpoint();
             verify(ledger, after);
         }
-        try (var ledger = open(survivor.getPath("/store"), encrypted, 0)) {
+        try (var ledger = open(survivor.getPath("/store"), encrypted, budget)) {
             verify(ledger, after);
         }
     }
@@ -639,6 +704,7 @@ class PackedRunTest {
     private static final class Workload {
         private final Random random;
         private final boolean encrypted;
+        private final long budget;
         final List<Expected> history;
         Expected state;
         int visible;
@@ -647,15 +713,21 @@ class PackedRunTest {
         Workload(int seed, boolean encrypted) {
             this.random = new Random(seed);
             this.encrypted = encrypted;
+            this.budget = budget(seed);
             this.history = new ArrayList<>();
             this.state = new Expected();
             history.add(state.copy());
         }
 
+        /// {@return the bytes of the log's last budget of the stores of `seed`: none, or a few commits}
+        static long budget(int seed) {
+            return seed % 4 == 1 ? 4 << 10 : 0;
+        }
+
         void run(Path directory) {
             LiveLedger ledger = null;
             try {
-                ledger = open(directory, encrypted, 0);
+                ledger = open(directory, encrypted, budget);
                 for (var step = 0; step < 50; step++) {
                     var choice = random.nextInt(24);
                     if (choice == 0) {
@@ -664,7 +736,7 @@ class PackedRunTest {
                     } else if (choice == 1) {
                         ledger.closeWithoutCheckpoint();
                         durable = visible;
-                        ledger = open(directory, encrypted, 0);
+                        ledger = open(directory, encrypted, budget);
                     } else if (choice == 2) {
                         var next = state.copy();
                         var chat = random.nextInt(4);
