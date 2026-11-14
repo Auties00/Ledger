@@ -43,11 +43,12 @@ import java.util.concurrent.atomic.AtomicLong;
 /// again, once.
 ///
 /// Above 1 MiB, the reads of the units of the file of large values ([BlobFile]) recycle at most [#LARGE_SPARES]
-/// arrays of their own ([#acquireLarge(int)]), sized to fill whole regions of the G1 collector and reached only weakly:
-/// G1 gives such an array regions of its own, which a dead one keeps committed until a marking frees them, so a read
-/// that missed the page cache and allocated the sealed unit, the opened one and the caller's copy kept three of them
-/// committed, where it now allocates the caller's alone. Only an array that never left its reader comes back: one the
-/// page cache, a version, a view or a caller received never does, as a reader may still read it.
+/// arrays of their own ([#acquireLarge(int)]), reached only weakly, and those of half a region of the G1 collector or
+/// more sized to fill whole regions: G1 gives such an array regions of its own, which a dead one keeps committed until
+/// a marking frees them, so a read that missed the page cache and allocated the sealed unit, the opened one and the
+/// caller's copy kept three of them committed, where it now allocates the caller's alone. Only an array that never
+/// left its reader comes back: one the page cache, a version, a view or a caller received never does, as a reader may
+/// still read it.
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
@@ -373,15 +374,17 @@ public final class HeapPool {
         set.free[size].offer(array);
     }
 
-    /// {@return the length of the array [#acquireLarge(int)] gives for `capacity` bytes: as many whole regions of G1 as
-    /// the bytes and the array's [headroom][ValueSlab#HEADROOM] take, less the headroom, or `capacity` if the JVM runs
-    /// another collector or cannot say}
+    /// {@return the length of the array [#acquireLarge(int)] gives for `capacity` bytes: if the bytes and the array's
+    /// [headroom][ValueSlab#HEADROOM] take half a region of G1 or more, as many whole regions as they take, less the
+    /// headroom; else, or if the JVM runs another collector or cannot say, `capacity`}
     ///
     /// G1 gives an array of half a region or more whole regions of its own, so the bytes past `capacity` cost no
-    /// memory, and an array of one length serves every unit whose length rounds up to the same regions.
+    /// memory, and an array of one length serves every unit whose length rounds up to the same regions. A shorter
+    /// array shares its region with others, so one of whole regions would take memory its unit does not need, which
+    /// the page cache, counting such an array by its unit's pages ([PageCache#charge(byte\[\])]), would not see.
     static int largeLength(int capacity) {
         var region = SplitValue.region();
-        if (region <= ValueSlab.HEADROOM) {
+        if (region <= ValueSlab.HEADROOM || (long) capacity + ValueSlab.HEADROOM < region / 2) {
             return capacity;
         }
         var length = (capacity + ValueSlab.HEADROOM + region - 1) / region * region - ValueSlab.HEADROOM;
@@ -392,7 +395,8 @@ public final class HeapPool {
     /// which goes back through [#releaseLarge(byte\[\])]}
     ///
     /// Only a free array of exactly that length is reused, so the page cache, which counts such an array by the pages
-    /// of its unit, never holds one of more regions than its unit needs.
+    /// of its unit, never holds one of more regions than its unit needs, nor one of a whole region for a unit G1 would
+    /// not give a region of its own.
     ///
     /// @param capacity the least length, above [#MAX_POOLED]
     byte[] acquireLarge(int capacity) {

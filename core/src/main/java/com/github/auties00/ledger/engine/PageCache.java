@@ -23,8 +23,9 @@ import java.util.concurrent.atomic.AtomicLong;
 /// is never written again, so a reader keeps using an array the cache has evicted: the array goes to the collector, not
 /// back to a pool, and no read pins anything. The limit counts the bytes of the arrays ([#charge(byte\[\])]), not of
 /// the units' pages, but for an array above [HeapPool#MAX_POOLED] longer than its unit, which counts as its unit's
-/// pages: a read of a large unit opens it into an array that fills whole regions of G1 ([HeapPool#acquireLarge(int)]),
-/// whose bytes past the unit take no memory a unit's own array would not. An entry is found only under the nonce and
+/// pages: a read of a unit of half a region of G1 or more opens it into an array that fills whole regions
+/// ([HeapPool#acquireLarge(int)]), whose bytes past the unit take no memory a unit's own array would not, as G1 gives
+/// either regions of its own; a shorter unit's array is the unit's length. An entry is found only under the nonce and
 /// the pages its unit was sealed with ([PageRef]), so a page a later checkpoint reused never returns the unit it held
 /// before. An entry the cache drops lets go of its array at once: the memory the cache keeps reachable stays within
 /// its limit.

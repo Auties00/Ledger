@@ -479,6 +479,27 @@ class HeapPoolTest {
     }
 
     @Test
+    @DisplayName("a large array below half a region is the length asked for, not a whole region, and one of half a region or more fills whole regions")
+    void largeSparesBelowHalfRegion() {
+        SplitValue.forceRegionForTests(8 << 20);
+        try {
+            var pool = new HeapPool(1 << 20, false);
+            var short_ = (1 << 20) + PageFormat.SIZE;
+            var array = pool.acquireLarge(short_);
+            assertEquals(short_, array.length, "G1 gives an array below half a region no region of its own");
+            pool.releaseLarge(array);
+            assertNotSame(array, pool.acquireLarge(short_ + PageFormat.SIZE));
+            assertSame(array, pool.acquireLarge(short_));
+            var lastShort = (4 << 20) - ValueSlab.HEADROOM - 1;
+            assertEquals(lastShort, HeapPool.largeLength(lastShort));
+            assertEquals((8 << 20) - ValueSlab.HEADROOM, HeapPool.largeLength(lastShort + 1));
+            assertEquals((16 << 20) - ValueSlab.HEADROOM, HeapPool.largeLength((8 << 20) + PageFormat.SIZE));
+        } finally {
+            SplitValue.forceRegionForTests(-1);
+        }
+    }
+
+    @Test
     @DisplayName("without a known region, a large array is the length asked for, reused only at that length")
     void largeSparesWithoutRegion() {
         SplitValue.forceRegionForTests(0);

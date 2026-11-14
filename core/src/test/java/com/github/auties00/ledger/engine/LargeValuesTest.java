@@ -522,6 +522,26 @@ class LargeValuesTest {
         }
 
         @Test
+        @DisplayName("with regions of 8 MiB, a large value below half a region is cached in an array of its unit's length, charged as its length")
+        void belowHalfRegion(@TempDir Path directory) throws Exception {
+            SplitValue.forceRegionForTests(8 << 20);
+            try (var ledger = (LiveLedger) options(directory, true).pageCache(256L << 20).build()) {
+                var value = value(144, SMALL_LARGE);
+                ledger.commit(ledger.newBatch().put(FILES, "a", value)).awaitDurable();
+                for (var round = 0; round < 3; round++) {
+                    assertArrayEquals(value, ledger.get(FILES, "a").orElseThrow(), "read " + round);
+                }
+                var ref = unit(ledger, "a");
+                var cached = ledger.blobsForTests().cachedForTests(ref);
+                assertNotNull(cached, "not cached after three reads");
+                assertEquals(ref.pages() * PageFormat.SIZE, cached.length, "an array longer than its unit");
+                assertEquals(cached.length, PageCache.charge(cached));
+            } finally {
+                SplitValue.forceRegionForTests(-1);
+            }
+        }
+
+        @Test
         @DisplayName("concurrent reads of large values the cache cannot hold copy each out of arrays of their own, whole")
         void uncached(@TempDir Path directory) throws Exception {
             SplitValue.forceRegionForTests(1 << 20);
