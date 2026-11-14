@@ -296,9 +296,10 @@ final class PageCache implements IdleTicker.Watched {
     /// {@return whether a read that missed the unit `ref` names, at `key`, caches what it reads}
     ///
     /// A cache the data file did not [turn screening on][#screen(boolean)] for always does. One that screens does if
-    /// the doorkeeper saw the unit, read or evicted, since its generations last forgot it, or takes it for one it saw,
-    /// at most 4% of the units it never saw; otherwise the doorkeeper records it and the cache drops the entry it held
-    /// at `key` for another unit, which no read finds any more. A cache that closed records nothing.
+    /// the doorkeeper saw the unit, read or evicted, or [expects][#expect(PageRef)] it, since its generations last
+    /// forgot it, or takes it for one it saw, at most 4% of the units it never saw; otherwise the doorkeeper records it
+    /// and the cache drops the entry it held at `key` for another unit, which no read finds any more. A cache that
+    /// closed records nothing.
     boolean admits(long key, PageRef ref) {
         if (!screening) {
             return true;
@@ -330,16 +331,18 @@ final class PageCache implements IdleTicker.Watched {
         return screening;
     }
 
-    /// Records the unit `ref` of the data file names, or the leaf its delta record makes, in the doorkeeper as seen, so
-    /// the first read that misses it caches it: a checkpoint wrote it, left it out of the cache, and a read used the
-    /// leaf it replaces.
+    /// Records the unit `ref` of the data file names, or the leaf its delta record makes, in the doorkeeper as
+    /// expected, so the first read that misses it caches it as an entry a read used: a checkpoint wrote it, left it
+    /// out of the cache, and a read used the leaf it replaces.
     ///
     /// The doorkeeper knows a unit by its nonce, which every checkpoint that rewrites a leaf changes, so a leaf a
-    /// reader reads once between two checkpoints would otherwise be refused at every read of every version. It records
-    /// nothing unless the cache screens and the doorkeeper recorded a unit before.
+    /// reader reads once between two checkpoints would otherwise be refused at every read of every version. An
+    /// expected unit is not [seen][#seen(PageRef)] ([Doorkeeper#expect(long, long, int)]), so a checkpoint that
+    /// rewrites it before any read expects nothing in its place: the record lasts one version, and only a read
+    /// carries it to the next. It records nothing unless the cache screens and the doorkeeper recorded a unit before.
     void expect(PageRef ref) {
         if (screening && !closed) {
-            doorkeeper.remember(dataKey(ref.page(), ref.slot()), ref.nonceHigh(), doorkeeperKeys());
+            doorkeeper.expect(dataKey(ref.page(), ref.slot()), ref.nonceHigh(), doorkeeperKeys());
         }
     }
 

@@ -25,6 +25,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Random;
@@ -345,6 +346,61 @@ class CheckpointSaturationTest {
                 }
                 assertArrayEquals(new byte[156], tree.read(key(100)));
                 assertArrayEquals(new byte[156], tree.read(key(5_000)));
+            }
+        }
+
+        @Test
+        @DisplayName("expects the leaf that replaces one a reader read once for one checkpoint only, so the checkpoints no read follows neither count its later versions as seen nor let them past the doorkeeper")
+        void expectsOneVersion(@TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
+                TreeSearch.leaf(tree.pages, tree.root, key(100), true);
+                assertNull(tree.cache.peek(tree.path(key(100)).getLast()), "the leaf the first read refused");
+                var keys = tree.cache.doorkeeperForTests().keysForTests();
+                for (var round = 0; round < 20; round++) {
+                    var ops = new ArrayList<TreeUpdate.Op>();
+                    ops.add(new TreeUpdate.Op(segment(key(100)), segment(new byte[151 + round])));
+                    ops.add(new TreeUpdate.Op(segment(key(5_000)), segment(new byte[151 + round])));
+                    tree.apply(ops, tree.unsaturated());
+                    var leaf = tree.path(key(100)).getLast();
+                    assertNull(tree.cache.peek(leaf), "the leaf of key 100 after checkpoint " + round);
+                    assertFalse(tree.cache.seen(leaf), "the leaf of key 100 seen after checkpoint " + round);
+                    assertFalse(tree.pages.seen(leaf), "the leaf of key 100 read after checkpoint " + round);
+                    assertFalse(tree.cache.seen(tree.path(key(5_000)).getLast()), "the leaf of key 5,000 seen after checkpoint " + round);
+                }
+                assertEquals(keys, tree.cache.doorkeeperForTests().keysForTests(), "the doorkeeper grew");
+                assertEquals(0, tree.cache.doorkeeperForTests().rotationsForTests(), "doorkeeper rotations");
+                var leaf = tree.path(key(100)).getLast();
+                TreeSearch.leaf(tree.pages, tree.root, key(100), true);
+                assertNull(tree.cache.peek(leaf), "the leaf of key 100 at its first read after checkpoints no read followed");
+                TreeSearch.leaf(tree.pages, tree.root, key(100), true);
+                assertTrue(tree.cache.referencedForTests(leaf), "the leaf of key 100 at its second read");
+                assertArrayEquals(new byte[170], tree.read(key(100)));
+                tree.verify(KEYS, 7, 150);
+            }
+        }
+
+        @Test
+        @DisplayName("keeps the first reads of the leaves no checkpoint rewrites through checkpoints that rewrite every leaf a reader read once, with no read between them")
+        void expectsKeepFirstReads(@TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory, 8 * MIB).filled(KEYS)) {
+                var leaves = new HashSet<PageRef>();
+                for (var i = 0; i < 19_000; i += 10) {
+                    if (leaves.add(tree.path(key(i)).getLast())) {
+                        TreeSearch.leaf(tree.pages, tree.root, key(i), true);
+                    }
+                }
+                // Its leaf holds no key the checkpoints write
+                var control = tree.path(key(19_990)).getLast();
+                assertFalse(leaves.contains(control));
+                TreeSearch.leaf(tree.pages, tree.root, key(19_990), true);
+                assertNull(tree.cache.peek(control), "the leaf of the control at its first read");
+                for (var round = 0; round < 12; round++) {
+                    tree.apply(ops(0, 19_000, 10, 151 + round), tree.unsaturated());
+                    assertTrue(tree.cache.seen(control), "the first read of the control after checkpoint " + round);
+                }
+                assertEquals(0, tree.cache.doorkeeperForTests().rotationsForTests(), "doorkeeper rotations");
+                TreeSearch.leaf(tree.pages, tree.root, key(19_990), true);
+                assertTrue(tree.cache.referencedForTests(control), "the leaf of the control at its second read");
             }
         }
 

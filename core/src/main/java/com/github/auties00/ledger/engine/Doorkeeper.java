@@ -33,6 +33,9 @@ final class Doorkeeper {
     static final int LEVEL_KEYS = 1_024;
     /// The share of the keys it never saw that a full generation takes for seen ones.
     static final double FALSE_POSITIVES = 0.02;
+    /// The salt of the nonce under which a unit is recorded as expected rather than seen ([#expect(long, long, int)]):
+    /// the fractional part of the golden ratio, which no nonce of the unit's page is but by chance.
+    private static final long EXPECTED = 0x9E3779B97F4A7C15L;
     private static final VarHandle WORDS = MethodHandles.arrayElementVarHandle(long[].class);
 
     // Guards the growths, the rotations, the first record and the close
@@ -47,8 +50,11 @@ final class Doorkeeper {
         this.lock = new Object();
     }
 
-    /// {@return whether it has seen the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh`, which
-    /// it records if not}
+    /// {@return whether it has seen the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh`, or
+    /// expects it, and records it as seen if neither}
+    ///
+    /// A unit admitted because it was expected is not recorded as seen: the cache takes it as an entry a read used,
+    /// which is what tells the next checkpoint that a read used it.
     ///
     /// @param most the most keys a generation may hold, at which it rotates rather than grow
     boolean admit(long key, long nonceHigh, int most) {
@@ -59,7 +65,7 @@ final class Doorkeeper {
             if (filter == null) {
                 return false;
             }
-        } else if (filter.holds(hash)) {
+        } else if (filter.holds(hash) || filter.holds(hash(key, nonceHigh ^ EXPECTED))) {
             return true;
         }
         add(filter, hash, most);
@@ -67,14 +73,31 @@ final class Doorkeeper {
     }
 
     /// Records the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh` as seen, if the doorkeeper
-    /// recorded any unit before: the cache evicted it, or a checkpoint wrote it in place of a unit a read used and left
-    /// it out of the cache, and the cache takes it at its next read.
+    /// recorded any unit before: the cache evicted it, and takes it back at its next read.
     ///
     /// @param most the most keys a generation may hold, at which it rotates rather than grow
     void remember(long key, long nonceHigh, int most) {
         var filter = this.filter;
         if (filter != null) {
             add(filter, hash(key, nonceHigh), most);
+        }
+    }
+
+    /// Records the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh` as expected, if the
+    /// doorkeeper recorded any unit before: a checkpoint wrote it in place of a unit a read used and left it out of
+    /// the cache, which takes it at its first read ([#admit(long, long, int)]).
+    ///
+    /// The record is kept apart from those of the units it saw, under a salted nonce, so [#holds(long, long)] does not
+    /// find it. A checkpoint that asks whether a read used the unit it replaces would otherwise take an expected unit
+    /// for a read one and expect its replacement in turn, at every checkpoint that rewrites it with no read between
+    /// them, and each such record would take a key of the generations that no read touched, rotating them so that
+    /// they forget the first reads they hold.
+    ///
+    /// @param most the most keys a generation may hold, at which it rotates rather than grow
+    void expect(long key, long nonceHigh, int most) {
+        var filter = this.filter;
+        if (filter != null) {
+            add(filter, hash(key, nonceHigh ^ EXPECTED), most);
         }
     }
 
@@ -87,7 +110,7 @@ final class Doorkeeper {
     }
 
     /// {@return whether it has seen the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh`,
-    /// recording nothing}
+    /// recording nothing; a unit it only expects is not one it has seen}
     boolean holds(long key, long nonceHigh) {
         var filter = this.filter;
         return filter != null && filter.holds(hash(key, nonceHigh));
