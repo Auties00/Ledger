@@ -33,9 +33,11 @@ import java.util.function.ToLongFunction;
 /// the store gives an array of its own in any case: cloned at the put, it is the one copy the store keeps, where on the
 /// batch's array it would be copied again by the store and leave the batch's bytes for the collector.
 ///
-/// A byte array of a G1 region or more put to a paged key space of byte arrays whose values of that length go to the
-/// file of large values, as the store's `splitFrom` says, takes two arrays instead, a [SplitValue]: the version keeps
-/// it until a checkpoint, and on one array its last region would be almost empty.
+/// A byte array of half a chunk or more put to a paged key space of byte arrays whose values of that length go to the
+/// file of large values, as the store's `borrowFrom` says, is not copied at all: the batch borrows the caller's array,
+/// which the commit seals into its unit, and lets go of it when the commit [ends][#finish()] or the batch is
+/// [cleared][#clear()]. A copy of a value of 16 MiB would take eight regions of the collector, which a collector
+/// waiting for a young collection before its mixed ones keeps committed long after the commit.
 ///
 /// A range removal stores its bounds, each encoded or absent; the store reads them back through the accessors of
 /// this class when it applies the batch, then starts it again with [#finish()].
@@ -95,6 +97,8 @@ public final class ArrayWriteBatch implements WriteBatch {
     private static final long ABSENT = -1;
     // The offset of a value on an array of its own, in owns
     private static final long OWN = -2;
+    // The offset of a value on the caller's array, in owns, which the batch borrows until the commit ends
+    private static final long BORROWED = -3;
     // The bytes a log frame takes for a write besides its key and value: its kind, its key space and the lengths, as
     // variable-length numbers
     private static final int WRITE_OVERHEAD = 16;
@@ -136,11 +140,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     // the write's value is in its home
     private long[] spans;
     // The array of each value of OWN_BYTES or more, and of each resident byte array of RESIDENT_OWN_BYTES or more, or
-    // null before the first
+    // null before the first: the batch's own, or the caller's for a value it borrows
     private byte[][] owns;
-    // The last bytes of each value in owns that the batch split, whose first bytes owns holds, or null before the first
-    private byte[][] ownTails;
-    // The bytes of the arrays in owns and ownTails
+    // The bytes of the arrays in owns
     private long ownBytes;
     // The chunks of the rope by the number a span's offset holds in its high bits, or null while the encodings are on
     // data, whose spans hold 0 there: the number 0 is no chunk's
@@ -166,7 +168,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     // The bytes of the largest value put
     private long largestValueBytes;
 
-    /// Creates an empty batch for a store that splits no value.
+    /// Creates an empty batch for a store that borrows no value.
     ///
     /// @param owner the store, which alone may apply the batch
     /// @param pool the store's pool, which the batch draws its memory from
@@ -180,13 +182,13 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// @param owner the store, which alone may apply the batch
     /// @param pool the store's pool, which the batch draws its memory from
     /// @param keyspaces the store's key spaces by name, which the batch may write
-    /// @param splitFrom the least bytes of a value put to a key space that the batch keeps as a [SplitValue], if a
-    ///                  region allows it, or [Long#MAX_VALUE] for a key space whose values it never splits: a key space
-    ///                  that splits is paged, of byte arrays, and writes values of that length to the file of large
-    ///                  values, so the store's version of one is always an [Version.External]; or `null` if the batch
-    ///                  splits none
-    ArrayWriteBatch(Object owner, HeapPool pool, Map<String, Keyspace<?, ?>> keyspaces, ToLongFunction<Keyspace<?, ?>> splitFrom) {
-        this(new Scope(owner, pool, keyspaces, splitFrom));
+    /// @param borrowFrom the least bytes of a byte array put to a key space that the batch borrows rather than copies,
+    ///                   if it is [#OWN_BYTES] or more, or [Long#MAX_VALUE] for a key space whose values it never
+    ///                   borrows: a key space that borrows is paged, of byte arrays, and writes values of that length to
+    ///                   the file of large values, so the commit seals each into its unit before it returns; or `null` if
+    ///                   the batch borrows none
+    ArrayWriteBatch(Object owner, HeapPool pool, Map<String, Keyspace<?, ?>> keyspaces, ToLongFunction<Keyspace<?, ?>> borrowFrom) {
+        this(new Scope(owner, pool, keyspaces, borrowFrom));
     }
 
     /// Creates an empty batch for the store `scope` describes, which makes `scope` once and passes it to every batch.
@@ -210,18 +212,14 @@ public final class ArrayWriteBatch implements WriteBatch {
         var valueLength = checkValueLength(keyspace.values().sizeOf(value));
         if (valueLength >= OWN_BYTES || valueLength >= RESIDENT_OWN_BYTES && residentBytes(keyspace)) {
             checkRoom(valueLength);
-            var head = splitHead(keyspace, valueLength);
-            if (head > 0) {
-                // Only a key space of byte arrays splits: the array is its own encoding
-                var array = (byte[]) value;
-                var first = Arrays.copyOf(array, head);
-                var tail = Arrays.copyOfRange(array, head, (int) valueLength);
-                addOwn(keyspace, null, encodeKey(keyspace, key, keyLength), keyLength, first, tail);
+            if (borrows(keyspace, valueLength)) {
+                // Only a key space of byte arrays borrows: the array is its own encoding
+                addOwn(keyspace, null, encodeKey(keyspace, key, keyLength), keyLength, (byte[]) value, true);
                 return this;
             }
             var own = encodeOwn(keyspace.values(), value, (int) valueLength);
             var ownKeyOffset = encodeKey(keyspace, key, keyLength);
-            addOwn(keyspace, keyspace.residency() == Keyspace.Residency.RESIDENT ? value : null, ownKeyOffset, keyLength, own, null);
+            addOwn(keyspace, keyspace.residency() == Keyspace.Residency.RESIDENT ? value : null, ownKeyOffset, keyLength, own, false);
             return this;
         }
         // One reservation for both, so a batch of one write grows its array once
@@ -244,16 +242,15 @@ public final class ArrayWriteBatch implements WriteBatch {
         var valueLength = checkValueLength(value.byteSize());
         if (valueLength >= OWN_BYTES || valueLength >= RESIDENT_OWN_BYTES && residentBytes(keyspace)) {
             checkRoom(valueLength);
-            var head = splitHead(keyspace, valueLength);
-            var own = head > 0 ? copyOwn(value.asSlice(0, head)) : copyOwn(value);
-            var tail = head > 0 ? copyOwn(value.asSlice(head)) : null;
+            // Copied whatever its length: the segment may be native memory, or the caller's to change once this returns
+            var own = copyOwn(value);
             var ownKeyOffset = reserve(keyLength);
             if (ownKeyOffset == ON_ROPE) {
                 checkRoom(keyLength);
                 ownKeyOffset = takeKey(keyLength);
             }
             MemorySegment.copy(key, 0, slot(ownKeyOffset, keyLength), 0, keyLength);
-            addOwn(keyspace, null, ownKeyOffset, keyLength, own, tail);
+            addOwn(keyspace, null, ownKeyOffset, keyLength, own, false);
             return this;
         }
         var keyOffset = reserve(keyLength + valueLength);
@@ -353,17 +350,11 @@ public final class ArrayWriteBatch implements WriteBatch {
         return length;
     }
 
-    /// {@return the bytes of the head of a value of `length` bytes put to `keyspace` if the batch splits it, as
-    /// [SplitValue#headLength(long, long)] gives them, or 0 if the value takes one array}
-    ///
-    /// Only a value of at least the smallest region G1 makes, put to a key space that splits values of its length,
-    /// asks for the region, which the first time loads the management classes.
-    private int splitHead(Keyspace<?, ?> keyspace, long length) {
-        var splitFrom = scope.splitFrom();
-        if (length < ValueSlab.SMALLEST_REGION || splitFrom == null || length < splitFrom.applyAsLong(keyspace)) {
-            return 0;
-        }
-        return SplitValue.headLength(length, SplitValue.region());
+    /// {@return whether the batch borrows a byte array of `length` bytes put to `keyspace`, of [#OWN_BYTES] or more,
+    /// rather than copying it: one the commit seals into the file of large values before it returns}
+    private boolean borrows(Keyspace<?, ?> keyspace, long length) {
+        var borrowFrom = scope.borrowFrom();
+        return borrowFrom != null && length >= borrowFrom.applyAsLong(keyspace);
     }
 
     /// {@return a new array holding the encoding of `value`, of `length` bytes}
@@ -389,23 +380,17 @@ public final class ArrayWriteBatch implements WriteBatch {
         return Segments.toBytes(value);
     }
 
-    /// Records a put of a value on an array of its own, private to the batch, or on two if `tail` is not `null`.
+    /// Records a put of a value on an array of its own, private to the batch, or on the caller's array.
     ///
-    /// @param own the value, or its first bytes if it is split
-    /// @param tail the rest of a split value, or `null`
-    private void addOwn(Keyspace<?, ?> keyspace, Object value, long keyOffset, int keyLength, byte[] own, byte[] tail) {
+    /// @param own the value, whole
+    /// @param borrowed whether `own` is the caller's array, which the batch lets go of when the commit ends
+    private void addOwn(Keyspace<?, ?> keyspace, Object value, long keyOffset, int keyLength, byte[] own, boolean borrowed) {
         if (owns == null) {
             owns = new byte[kinds.length][];
         }
-        if (tail != null && ownTails == null) {
-            ownTails = new byte[kinds.length][];
-        }
-        var length = tail == null ? own.length : own.length + tail.length;
-        add(PUT, keyspace, value, keyOffset, keyLength, OWN, length);
+        var length = own.length;
+        add(PUT, keyspace, value, keyOffset, keyLength, borrowed ? BORROWED : OWN, length);
         owns[size - 1] = own;
-        if (tail != null) {
-            ownTails[size - 1] = tail;
-        }
         ownBytes += length;
         // The value stays where it is, so add() is left without a branch no other write takes
         if (keyspace.residency() == Keyspace.Residency.PAGED) {
@@ -628,9 +613,6 @@ public final class ArrayWriteBatch implements WriteBatch {
             if (owns != null) {
                 owns = Arrays.copyOf(owns, capacity);
             }
-            if (ownTails != null) {
-                ownTails = Arrays.copyOf(ownTails, capacity);
-            }
         }
         kinds[size] = kind;
         targets[size] = keyspace;
@@ -678,8 +660,8 @@ public final class ArrayWriteBatch implements WriteBatch {
         residentValueBytes = 0;
         residentPuts = 0;
         largestValueBytes = 0;
+        // Every borrowed array with them: the batch keeps no caller's array past the end of a commit or a clear
         owns = null;
-        ownTails = null;
         ownBytes = 0;
         leaveRope();
         // What a commit that failed prepared
@@ -718,8 +700,6 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// range without an upper bound}
     ///
     /// @param index the write
-    /// @throws IllegalStateException if the batch split the value, which it never joins: [#ownValue(int)] and
-    ///                               [#ownTail(int)] hold it
     public MemorySegment value(int index) {
         return span(index, 2);
     }
@@ -748,11 +728,11 @@ public final class ArrayWriteBatch implements WriteBatch {
         return largestValueBytes;
     }
 
-    /// {@return the array of its own that holds the whole value of write `index`, which no one writes, or `null` if the
-    /// value has none}
+    /// {@return the array that holds the whole value of write `index` on its own, or `null` if the value has none}
     ///
-    /// The store's version keeps it in place of a copy. Reads of a resident byte array return the instance the version
-    /// holds, so this is never the array the caller passed to the put.
+    /// An array of the batch's own is private to it and no one writes it: the store's version keeps it in place of a
+    /// copy. Reads of a resident byte array return the instance the version holds, so for a resident key space this is
+    /// never the array the caller passed to the put. One the batch [borrowed][#borrowed(int)] is the caller's.
     ///
     /// @param index a write that puts a value
     byte[] ownValue(int index) {
@@ -760,25 +740,23 @@ public final class ArrayWriteBatch implements WriteBatch {
         return owns == null ? null : owns[index];
     }
 
-    /// {@return the last bytes of the value of write `index` if the batch split it, whose first bytes
-    /// [#ownValue(int)] holds, or `null` if it did not}
+    /// {@return whether [#ownValue(int)] of write `index` is the caller's array, which the batch borrows until the
+    /// commit ends}
     ///
-    /// Both arrays are private to the batch and no one writes them.
+    /// The commit seals the value into its unit of the file of large values straight from the array, and nothing that
+    /// outlives the commit may refer to the array: the caller may write it once the commit returns.
     ///
     /// @param index the write
-    byte[] ownTail(int index) {
-        Objects.checkIndex(index, size);
-        return ownTails == null ? null : ownTails[index];
+    boolean borrowed(int index) {
+        return spans[Objects.checkIndex(index, size) * 4 + 2] == BORROWED;
     }
 
     /// {@return the array that holds the value of write `index`, at [#valueArrayOffset(int)]}
     ///
     /// @param index a write that puts a value
-    /// @throws IllegalStateException if the batch split the value, which no one array holds
     byte[] valueArray(int index) {
         var offset = spans[Objects.checkIndex(index, size) * 4 + 2];
-        if (offset == OWN) {
-            checkWhole(index);
+        if (offset < 0) {
             return owns[index];
         }
         var chunk = (int) (offset >>> 32);
@@ -790,7 +768,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// @param index a write that puts a value
     int valueArrayOffset(int index) {
         var offset = spans[Objects.checkIndex(index, size) * 4 + 2];
-        return offset == OWN ? 0 : (int) offset;
+        return offset < 0 ? 0 : (int) offset;
     }
 
     /// {@return the arrays of the batch's rope, none of them above [#CHUNK_BYTES], or 0 if it has none; for tests}
@@ -812,21 +790,11 @@ public final class ArrayWriteBatch implements WriteBatch {
             if (offset == ABSENT) {
                 return null;
             }
-            checkWhole(index);
             return MemorySegment.ofArray(owns[index]).asReadOnly();
         }
         var length = (int) spans[index * 4 + field + 1];
         var chunk = (int) (offset >>> 32);
         return chunk == 0 ? view.asSlice(offset, length) : chunks[chunk].view.asSlice((int) offset, length);
-    }
-
-    /// Checks that the value of write `index`, on an array of its own, is not split.
-    ///
-    /// @throws IllegalStateException if it is: a value of a region or more is never joined without the caller knowing
-    private void checkWhole(int index) {
-        if (ownTails != null && ownTails[index] != null) {
-            throw new IllegalStateException("The value of write " + index + " is split");
-        }
     }
 
     /// {@return the read-only segment of the batch's array, the home of no value once the batch is on a rope; for tests}
@@ -1017,7 +985,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     // Whether write `index` puts a value the store keeps on a chunk, in HOMES_CHUNKS, HOMES_SLAB, HOMES_PER_WRITE and
     // HOMES_ROPE
     private boolean packed(int index) {
-        return kinds[index] == PUT && spans[index * 4 + 2] != OWN && targets[index].residency() == Keyspace.Residency.PAGED;
+        return kinds[index] == PUT && spans[index * 4 + 2] >= 0 && targets[index].residency() == Keyspace.Residency.PAGED;
     }
 
     /// The array [#prepare(boolean, ValueSlab, Map)] copies the values of paged key spaces into, in the order of the writes.
@@ -1057,7 +1025,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     MemorySegment home(int index) {
         Objects.checkIndex(index, size);
         return switch (homesMode) {
-            case HOMES_OWN -> spans[index * 4 + 2] == OWN ? null : view;
+            case HOMES_OWN -> spans[index * 4 + 2] < 0 ? null : view;
             case HOMES_CHUNKS, HOMES_SLAB -> packed(index) ? packedHome : null;
             case HOMES_ROPE -> packed(index) ? chunks[(int) (spans[index * 4 + 2] >>> 32)].home : null;
             case HOMES_PER_WRITE -> packed(index) ? perWriteHomes[index] : null;
@@ -1077,7 +1045,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     byte[] homeArray(int index) {
         Objects.checkIndex(index, size);
         return switch (homesMode) {
-            case HOMES_OWN -> spans[index * 4 + 2] == OWN ? null : data;
+            case HOMES_OWN -> spans[index * 4 + 2] < 0 ? null : data;
             case HOMES_CHUNKS, HOMES_SLAB -> packed(index) ? packedHomeArray : null;
             case HOMES_ROPE -> packed(index) ? chunks[(int) (spans[index * 4 + 2] >>> 32)].homeArray : null;
             case HOMES_PER_WRITE -> packed(index) ? perWriteHomeArrays[index] : null;
@@ -1091,7 +1059,7 @@ public final class ArrayWriteBatch implements WriteBatch {
     int homeOffset(int index) {
         Objects.checkIndex(index, size);
         return switch (homesMode) {
-            case HOMES_OWN -> spans[index * 4 + 2] == OWN ? 0 : Math.toIntExact(spans[index * 4 + 2]);
+            case HOMES_OWN -> spans[index * 4 + 2] < 0 ? 0 : Math.toIntExact(spans[index * 4 + 2]);
             case HOMES_CHUNKS, HOMES_SLAB, HOMES_PER_WRITE -> packed(index) ? (int) (spans[index * 4 + 1] >>> 32) : 0;
             case HOMES_ROPE -> packed(index) ? (int) spans[index * 4 + 2] : 0;
             default -> 0;
@@ -1155,10 +1123,10 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// @param owner the store, which alone may apply the batch
     /// @param pool the store's pool, which the batch draws its memory from
     /// @param keyspaces the store's key spaces by name, which the batch may write
-    /// @param splitFrom the least bytes of a value put to a key space that the batch keeps as a [SplitValue], if a
-    ///                  region allows it, or [Long#MAX_VALUE] for a key space whose values it never splits; or `null`
-    ///                  if the batch splits none
+    /// @param borrowFrom the least bytes of a byte array put to a key space that the batch borrows rather than copies,
+    ///                   if it is [#OWN_BYTES] or more, or [Long#MAX_VALUE] for a key space whose values it never
+    ///                   borrows; or `null` if the batch borrows none
     record Scope(Object owner, HeapPool pool, Map<String, Keyspace<?, ?>> keyspaces,
-                 ToLongFunction<Keyspace<?, ?>> splitFrom) {
+                 ToLongFunction<Keyspace<?, ?>> borrowFrom) {
     }
 }

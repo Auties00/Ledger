@@ -243,7 +243,7 @@ public final class LiveLedger implements Ledger {
         this.requests = new ReentrantLock();
         this.checkpointWaiting = new Padded.Role();
         this.publishHelper = this::publishApplied;
-        this.batchScope = new ArrayWriteBatch.Scope(this, pool, this.keyspaces, this::splitFrom);
+        this.batchScope = new ArrayWriteBatch.Scope(this, pool, this.keyspaces, this::borrowFrom);
 
         this.passFrames = new LogWriter.Batch();
         sequenced.next = 1;
@@ -478,7 +478,7 @@ public final class LiveLedger implements Ledger {
                     // On the body for as long as it takes to tag it there: a slice of the body's view, whose address
                     // is where it starts in the body
                     var at = Math.toIntExact(value.address());
-                    applier.put(state, applier.claim(state, key), key, value, null, null, view, null, at, null, TreeSearch.BLIND, null);
+                    applier.put(state, applier.claim(state, key), key, value, null, false, view, null, at, null, TreeSearch.BLIND, null);
                     if (!noted[0]) {
                         queue.noteReplayed(sequence, segment);
                         noted[0] = true;
@@ -554,13 +554,13 @@ public final class LiveLedger implements Ledger {
         var length = Math.toIntExact(value.byteSize());
         if (!ReplayValues.shared(length)) {
             var own = Segments.toBytes(value);
-            applier.put(state, chain, key, MemorySegment.ofArray(own).asReadOnly(), own, null, null, null, 0, null, TreeSearch.BLIND, null);
+            applier.put(state, chain, key, MemorySegment.ofArray(own).asReadOnly(), own, false, null, null, 0, null, TreeSearch.BLIND, null);
             return 0;
         }
         var at = values.copy(value, 0, length);
         var view = values.view();
         // No array for the frame: the replay has none, and the chunk takes more values after this one
-        applier.put(state, chain, key, view.asSlice(at, length), null, null, view, null, at, null, TreeSearch.BLIND, null);
+        applier.put(state, chain, key, view.asSlice(at, length), null, false, view, null, at, null, TreeSearch.BLIND, null);
         return at;
     }
 
@@ -792,13 +792,14 @@ public final class LiveLedger implements Ledger {
         return new ArrayWriteBatch(batchScope);
     }
 
-    /// {@return the least bytes of a value put to `keyspace` that a batch keeps as a [SplitValue], or [Long#MAX_VALUE]
-    /// if it keeps every value on one array}
+    /// {@return the least bytes of a byte array put to `keyspace` that a batch borrows rather than copies, or
+    /// [Long#MAX_VALUE] if it copies every value}
     ///
-    /// A value is split only where it always goes to the file of large values, so its version is always an
-    /// [Version.External], and where reads copy it out as a byte array: a paged key space of byte arrays of a store with
-    /// that file. The threshold of a key space is set before recovery and never changes.
-    private long splitFrom(Keyspace<?, ?> keyspace) {
+    /// A value is borrowed only where it always goes to the file of large values, which [#writeUnits(ArrayWriteBatch)]
+    /// seals it into before the commit is given a sequence, so the commit's frame records the unit alone: a paged key
+    /// space of byte arrays, whose array is its own encoding, of a store with that file. The threshold of a key space
+    /// is set before recovery and never changes.
+    private long borrowFrom(Keyspace<?, ?> keyspace) {
         var state = states.get(keyspace.name());
         if (blobs == null || state == null || state.resident || keyspace.values() != BuiltinCodecs.BYTES_VALUE) {
             return Long.MAX_VALUE;
@@ -900,12 +901,10 @@ public final class LiveLedger implements Ledger {
         var state = states.get(writes.keyspace(index).name());
         switch (writes.kind(index)) {
             case ArrayWriteBatch.PUT -> {
-                // A split value is passed as its two arrays: no view of it exists
-                var tail = writes.ownTail(index);
-                var value = tail == null ? writes.value(index) : null;
+                var value = writes.value(index);
                 var decoded = state.resident ? residentValue(state, writes.decodedValue(index), value) : null;
-                applier.put(state, applier.claim(state, writes.key(index)), writes.key(index), value, writes.ownValue(index), tail,
-                        writes.home(index), writes.homeArray(index), writes.homeOffset(index), decoded,
+                applier.put(state, applier.claim(state, writes.key(index)), writes.key(index), value, writes.ownValue(index),
+                        writes.borrowed(index), writes.home(index), writes.homeArray(index), writes.homeOffset(index), decoded,
                         hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree), units == null ? null : units[index]);
             }
             case ArrayWriteBatch.DELETE ->
@@ -1281,9 +1280,8 @@ public final class LiveLedger implements Ledger {
         var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(index, tree);
         var key = pending.keys[index];
         if (writes.kind(index) == ArrayWriteBatch.PUT) {
-            var tail = writes.ownTail(index);
-            applier.put(pending.states[index], pending.chains[index], key, tail == null ? writes.value(index) : null, writes.ownValue(index),
-                    tail, writes.home(index), writes.homeArray(index), writes.homeOffset(index),
+            applier.put(pending.states[index], pending.chains[index], key, writes.value(index), writes.ownValue(index),
+                    writes.borrowed(index), writes.home(index), writes.homeArray(index), writes.homeOffset(index),
                     pending.decoded == null ? null : pending.decoded[index], inTree, pending.units == null ? null : pending.units[index]);
         } else {
             applier.delete(pending.states[index], pending.chains[index], key, inTree);
@@ -1571,10 +1569,8 @@ public final class LiveLedger implements Ledger {
                 if (units == null) {
                     units = new PageRef[writes.size()];
                 }
-                var tail = writes.ownTail(i);
-                units[i] = tail == null
-                        ? blobs.write(writes.valueArray(i), writes.valueArrayOffset(i), (int) length)
-                        : blobs.write(writes.ownValue(i), tail);
+                // Straight from the caller's array for a value the batch borrowed, which nothing reads after the commit
+                units[i] = blobs.write(writes.valueArray(i), writes.valueArrayOffset(i), (int) length);
             }
             return units;
         } catch (RuntimeException | Error throwable) {
@@ -2814,7 +2810,7 @@ public final class LiveLedger implements Ledger {
         /// @param external the unit of the file of large values that holds `value` too, or `null`
         void put(KeyspaceState state, MemorySegment key, MemorySegment value, Object decoded, byte inTree, PageRef external) {
             // Usually opened already by the commit's prefetch
-            put(state, claim(state, key), key, value, null, null, null, null, 0, decoded, inTree, external);
+            put(state, claim(state, key), key, value, null, false, null, null, 0, decoded, inTree, external);
         }
 
         /// Applies a put of `key` whose value is a read-only view of the whole of `array`, which no one writes from now
@@ -2824,7 +2820,7 @@ public final class LiveLedger implements Ledger {
         /// @param decoded the decoded value of a put to a resident key space; ignored for one of byte arrays, whose
         ///                reads return `array`
         void put(KeyspaceState state, MemorySegment key, MemorySegment value, byte[] array, Object decoded) {
-            put(state, claim(state, key), key, value, array, null, null, array, 0, decoded, TreeSearch.UNKNOWN, null);
+            put(state, claim(state, key), key, value, array, false, null, array, 0, decoded, TreeSearch.UNKNOWN, null);
         }
 
         /// Checks that the commit's frame, if it has one, has room for a write of `payload` bytes of keys and values,
@@ -2855,32 +2851,28 @@ public final class LiveLedger implements Ledger {
         /// on an array no one writes and the store's pool never hands out: `own`, `array`, or the copy the version
         /// keeps.
         ///
-        /// @param value the value, or `null` if `ownTail` is not
-        /// @param own the array that holds `value` alone, which no one writes and the version keeps in its place, or
-        ///            its first bytes if `ownTail` is not `null`; or `null`
-        /// @param ownTail the last bytes of a value split in two arrays, whose first bytes are `own`, which no one writes
-        ///                and the version keeps as a [SplitValue]; or `null`. Only a put with a unit of the file of large
-        ///                values has one: its frame records the unit, never the value
+        /// @param own the array that holds `value` alone, which no one writes and the version keeps in its place unless
+        ///            `borrowed`; or `null`
+        /// @param borrowed whether `own` is the caller's array, which its batch borrowed until the commit ends and the
+        ///                 caller may write after it: only a put with a unit of the file of large values has one, whose
+        ///                 frame records the unit, and nothing that outlives the commit refers to the array
         /// @param source the read-only segment `value` is part of, which the version keeps in its place, or `null` for a
         ///               value of its own
         /// @param array the array `value` lies on, at `offset`, which no one writes from now on and the store's pool never
         ///              hands out, or `null` if `value` may lie on other memory: the array behind `source`, or the whole
         ///              value when `source` is `null`
         /// @param offset where `value` starts in `source`, and in `array`
-        void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, byte[] own, byte[] ownTail,
+        void put(KeyspaceState state, Chain chain, MemorySegment key, MemorySegment value, byte[] own, boolean borrowed,
                  MemorySegment source, byte[] array, int offset, Object decoded, byte inTree, PageRef external) {
-            if (ownTail != null && external == null) {
-                // A batch splits only what goes to the file of large values; were a value to come here without its
-                // unit, the frame would need it whole
-                assert false : "A split value without its unit";
-                own = SplitValue.join(own, ownTail);
-                ownTail = null;
-                value = MemorySegment.ofArray(own).asReadOnly();
+            if (borrowed && (external == null || source != null || array != null)) {
+                // A batch borrows only what goes to the file of large values: without its unit, the frame, which the
+                // log seals after the commit returns, would need the caller's array
+                throw new IllegalStateException("A value the batch borrowed has no unit of the file of large values");
             }
             var stamp = nextStamp();
             var head = chain.head;
             var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
-            var length = ownTail == null ? Math.toIntExact(value.byteSize()) : own.length + ownTail.length;
+            var length = Math.toIntExact(value.byteSize());
             if (source != null && spillRoom >= 0 && !state.resident && ValueSlab.Overwrites.sampled(sequence)) {
                 state.overwrites.sample(head, length);
             }
@@ -2889,8 +2881,10 @@ public final class LiveLedger implements Ledger {
             // The array the frame may refer to for the value, and where the value starts in it
             var kept = array;
             var keptAt = offset;
-            if (ownTail != null) {
-                version = Version.ofSplit(stamp, new SplitValue(own, ownTail), head, external);
+            if (borrowed) {
+                // The caller may write its array once the commit returns, and a version waits for a checkpoint: it
+                // keeps a copy
+                version = Version.ofOwn(stamp, Arrays.copyOf(own, length), null, head, external);
             } else if (own != null) {
                 version = Version.ofOwn(stamp, own, bytes ? own : decoded, head, external);
                 kept = own;
