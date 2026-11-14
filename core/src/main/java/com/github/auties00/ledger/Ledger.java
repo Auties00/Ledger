@@ -221,7 +221,9 @@ public non-sealed interface Ledger extends View, AutoCloseable {
 
         /// Runs the store's I/O on `pool`, which several stores may share.
         ///
-        /// By default each store has a pool of its own, closed with it.
+        /// By default the stores of the process opened without a pool share platform threads made as their flushes
+        /// need them, one per store flushing at the same moment, each ending after a minute without a flush; a store
+        /// that has been idle that long holds none.
         ///
         /// @param pool the pool; the store does not close it
         /// @return these options

@@ -16,7 +16,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.TreeMap;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicLong;
@@ -25,12 +24,13 @@ import java.util.function.BooleanSupplier;
 /// The data file of a store: its units, read through the page cache and verified against the reference that named
 /// them, and the superblocks.
 ///
-/// Reads run on the calling thread, each on a channel of its own from a small pool: Windows serializes positional
-/// reads on one channel, and an interrupt during a read closes the channel it ran on, which then is replaced. Writes run
+/// Reads run on the calling thread, each on a channel of its own from a small pool ([ChannelPool]), opened as reads at
+/// once need them: Windows serializes positional reads on one channel, and an interrupt during a read closes the
+/// channel it ran on, which then is replaced. Writes run
 /// on the one thread that writes a checkpoint, through a [Writer].
 final class PageFile implements AutoCloseable {
     static final String FILE = "ledger.data";
-    /// The channels reads take turns on, and the most threads [#readAll(List, byte, int)] and
+    /// The most channels reads take turns on, and the most threads [#readAll(List, byte, int)] and
     /// [#prefetch(PageRef\[\], int, int\[\])] read on at once.
     static final int READ_CHANNELS = 8;
     /// The most pages [#readAll(List, byte, int)] and [#prefetch(PageRef\[\], int, int\[\])] read with one call.
@@ -77,11 +77,10 @@ final class PageFile implements AutoCloseable {
     private final PageCipher cipher;
     private final PageCache cache;
     private final HeapPool pool;
-    private final ArrayBlockingQueue<FileChannel> readers;
+    private final ChannelPool readers;
     private final FileChannel writer;
     // The file of large values, which leaves point into
     private volatile BlobFile blobs;
-    private volatile boolean closed;
     // The moving average of the time a read of the file takes, in microseconds; racy, as a lost or stale sample only
     // moves the average less
     private int readMicros;
@@ -94,14 +93,12 @@ final class PageFile implements AutoCloseable {
         this.cache = cache;
         this.pool = pool;
         this.writer = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
-        this.readers = new ArrayBlockingQueue<>(READ_CHANNELS);
         this.forced = forceNewForTests;
         try {
-            for (var i = 0; i < READ_CHANNELS; i++) {
-                readers.add(FileChannel.open(path, StandardOpenOption.READ));
-            }
+            this.readers = new ChannelPool(path, READ_CHANNELS, StandardOpenOption.READ);
         } catch (IOException exception) {
-            close();
+            closeQuietly(writer);
+            cache.close();
             throw exception;
         }
         cache.screen(screenNewForTests);
@@ -926,7 +923,7 @@ final class PageFile implements AutoCloseable {
     // Reads `length` bytes of the file from `position` into `array` from `offset` on, counting the time it took in the
     // average of coldReads() if `sampled`
     private void readFully(byte[] array, int offset, int length, long position, boolean sampled) {
-        var channel = takeChannel();
+        var channel = readers.take();
         var interrupted = false;
         try {
             var buffer = ByteBuffer.wrap(array, offset, length);
@@ -939,7 +936,7 @@ final class PageFile implements AutoCloseable {
                 } catch (ClosedByInterruptException _) {
                     // The interrupt closed the channel; read on a new one and give the caller its interrupt back
                     interrupted |= Thread.interrupted();
-                    channel = FileChannel.open(path, StandardOpenOption.READ);
+                    channel = readers.reopen();
                 }
             }
             if (sampled) {
@@ -948,7 +945,7 @@ final class PageFile implements AutoCloseable {
         } catch (IOException exception) {
             throw new LedgerIoException(path + " could not be read", exception);
         } finally {
-            readers.offer(channel);
+            readers.give(channel);
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }
@@ -956,7 +953,7 @@ final class PageFile implements AutoCloseable {
     }
 
     private boolean readAvailable(byte[] array, long position) {
-        var channel = takeChannel();
+        var channel = readers.take();
         try {
             var buffer = ByteBuffer.wrap(array);
             while (buffer.hasRemaining()) {
@@ -968,37 +965,7 @@ final class PageFile implements AutoCloseable {
         } catch (IOException exception) {
             throw new LedgerIoException(path + " could not be read", exception);
         } finally {
-            readers.offer(channel);
-        }
-    }
-
-    private FileChannel takeChannel() {
-        if (closed) {
-            throw new IllegalStateException("The store is closed");
-        }
-        var interrupted = false;
-        try {
-            while (true) {
-                try {
-                    var channel = readers.take();
-                    if (channel.isOpen()) {
-                        return channel;
-                    }
-                    // A channel an interrupt closed and that could not be replaced at the time
-                    try {
-                        return FileChannel.open(path, StandardOpenOption.READ);
-                    } catch (IOException exception) {
-                        readers.offer(channel);
-                        throw new LedgerIoException(path + " could not be opened", exception);
-                    }
-                } catch (InterruptedException _) {
-                    interrupted = true;
-                }
-            }
-        } finally {
-            if (interrupted) {
-                Thread.currentThread().interrupt();
-            }
+            readers.give(channel);
         }
     }
 
@@ -1085,21 +1052,23 @@ final class PageFile implements AutoCloseable {
 
     @Override
     public void close() {
-        closed = true;
         cache.close();
         var external = blobs;
         if (external != null) {
             external.close();
         }
-        for (var channel : readers) {
-            try {
-                channel.close();
-            } catch (IOException _) {
-                // Nothing was written through a read channel
-            }
-        }
+        readers.close();
+        closeQuietly(writer);
+    }
+
+    /// {@return the read channels open, held or idle, for tests}
+    int readChannelsForTests() {
+        return readers.openedForTests();
+    }
+
+    private static void closeQuietly(FileChannel channel) {
         try {
-            writer.close();
+            channel.close();
         } catch (IOException _) {
             // Every write a checkpoint relies on was forced before its superblock
         }

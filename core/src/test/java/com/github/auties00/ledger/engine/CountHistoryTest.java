@@ -15,6 +15,29 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// The counts of a key space by commit, against a sorted map, alone and under a reader at a fixed sequence.
 class CountHistoryTest {
     @Test
+    @DisplayName("answers from a reset with its one count, then grows at the first commits and drops back to one")
+    void reset() {
+        var history = new CountHistory(5, 7);
+        assertEquals(7, history.last());
+        assertEquals(7, history.at(5));
+        assertEquals(0, history.at(4));
+        for (var sequence = 6L; sequence < 100; sequence++) {
+            history.append(sequence, sequence);
+            assertEquals(sequence, history.at(sequence));
+            assertEquals(7, history.at(5));
+        }
+        assertEquals(95, history.sizeForTests());
+        history.dropBelow(99);
+        assertEquals(1, history.sizeForTests());
+        assertEquals(99, history.last());
+        history.reset(200, 3);
+        assertEquals(1, history.sizeForTests());
+        history.append(201, 4);
+        assertEquals(3, history.at(200));
+        assertEquals(4, history.at(201));
+    }
+
+    @Test
     @DisplayName("answers as the floor of a sorted map of the counts, through growth and drops")
     void model() {
         var history = new CountHistory(0, 0);

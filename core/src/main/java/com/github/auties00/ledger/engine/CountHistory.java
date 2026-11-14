@@ -21,8 +21,11 @@ final class CountHistory {
     }
 
     /// Forgets every count but `count`, the number of entries as of `sequence`; while the store opens.
+    ///
+    /// The run holds that count alone, so a key space no commit changes keeps two one-element arrays; the first
+    /// [#append(long, long)] grows them.
     void reset(long sequence, long count) {
-        var fresh = new Run(new long[INITIAL_CAPACITY], new long[INITIAL_CAPACITY], 0, 0);
+        var fresh = new Run(new long[1], new long[1], 0, 0);
         fresh.sequences[0] = sequence;
         fresh.counts[0] = count;
         fresh.end = 1;

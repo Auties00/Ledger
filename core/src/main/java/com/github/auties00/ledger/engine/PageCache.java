@@ -101,8 +101,9 @@ final class PageCache implements IdleTicker.Watched {
     private static final int RECORDS = 2;
     /// The least bytes [#admission()] gives while the limit allows it: 4,096 leaves.
     private static final long MIN_ADMISSION = 16L << 20;
-    /// The slots of a new table, and the fewest a table shrinks to.
-    private static final int MIN_CAPACITY = 64;
+    /// The slots of a new table, and the fewest a table shrinks to: eight entries before it first grows, so a store that
+    /// reads few pages keeps a table of a few hundred bytes.
+    static final int MIN_CAPACITY = 16;
     /// The most slots of a table, as three longs per slot must fit an array. At half of them, 2^28 entries of at least a
     /// page each, a terabyte of heap, the cache evicts rather than grow.
     private static final int MAX_CAPACITY = 1 << 29;
