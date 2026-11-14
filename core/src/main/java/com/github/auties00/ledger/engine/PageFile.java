@@ -797,7 +797,8 @@ final class PageFile implements AutoCloseable {
     /// {@return whether the cache holds the leaf or branch `ref` names as an entry a read used since the clock last
     /// passed it, without counting as a read of it}
     ///
-    /// A unit a checkpoint wrote to the cache and no read used since does not count, nor does a hit of another kind.
+    /// A unit a checkpoint wrote to the cache and no read used since does not count, nor does a hit of another kind, nor
+    /// a leaf a screened read [refused][PageCache#putScreened(PageRef, byte\[\])] until a second read admits it.
     boolean referenced(PageRef ref) {
         var hit = cache.peekReferenced(ref);
         return hit != null && kindMatches(hit[PageFormat.KIND], NODE);
