@@ -529,7 +529,8 @@ final class ValueSlab {
     /// where a dead value costs more: its record keeps its batch's array alive until the record leaves the queue, and
     /// moving it takes a tag of its bytes for a value no reader can reach. So that verdict starts negative and turns
     /// positive only once enough samples show a share under an eighth, and under the limit of the chunks; a key space
-    /// that removes what it writes, like an inbox, never lists a value.
+    /// that removes what it writes, like an inbox, never lists a value on a batch's array. A value on an array of its
+    /// own lists whatever the verdict: no other value shares its array.
     static final class Overwrites {
         /// The top bits of a commit's hashed sequence that are clear when it is sampled.
         private static final int SAMPLE_BITS = 6;
