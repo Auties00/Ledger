@@ -139,7 +139,7 @@ class ReplayValuesTest {
     }
 
     @Test
-    @DisplayName("a replayed overwrite is not sampled: the key space's overwrite counters start empty after a recovery")
+    @DisplayName("a replayed overwrite is not sampled, nor a replayed commit of thousands of puts: the key space's overwrite counters start empty and unjudged after a recovery")
     void replayDoesNotSampleOverwrites(@TempDir Path directory) throws Exception {
         long first;
         long last;
@@ -151,12 +151,18 @@ class ReplayValuesTest {
             for (var commit = 0; commit < 400; commit++) {
                 ledger.commit(ledger.newBatch().put(MESSAGES, new byte[]{(byte) (commit % 20)}, filled(300, commit))).awaitDurable();
             }
+            // A commit whose puts are all sampled while the key space is not judged, when it is not replayed
+            var bulk = ledger.newBatch();
+            for (var i = 0; i < 2_000; i++) {
+                bulk.put(MESSAGES, new byte[]{2, (byte) (i >> 8), (byte) i}, filled(300, i));
+            }
+            ledger.commit(bulk).awaitDurable();
             last = ledger.latest();
             ledger.closeWithoutCheckpoint();
         }
         var sampled = 0;
         for (var sequence = first; sequence <= last; sequence++) {
-            if (ValueSlab.Overwrites.sampled(sequence)) {
+            if (ValueSlab.Overwrites.sampled(Reads.stamp(sequence, 0))) {
                 sampled++;
             }
         }
@@ -164,7 +170,11 @@ class ReplayValuesTest {
         try (var ledger = (LiveLedger) open(directory, Encryption.key(KEY))) {
             var overwrites = ledger.state(MESSAGES).overwrites;
             assertEquals(0, overwrites.sampledPutsForTests(), "the replay sampled its puts");
+            assertFalse(overwrites.judged(), "the replay judged the key space");
             assertTrue(overwrites.worthwhile());
+            for (var i = 0; i < 2_000; i += 97) {
+                assertArrayEquals(filled(300, i), ledger.get(MESSAGES, new byte[]{2, (byte) (i >> 8), (byte) i}).orElseThrow());
+            }
             for (var key = 0; key < 20; key++) {
                 var round = 380 + key;
                 assertArrayEquals(filled(300, round), ledger.get(MESSAGES, new byte[]{(byte) key}).orElseThrow());

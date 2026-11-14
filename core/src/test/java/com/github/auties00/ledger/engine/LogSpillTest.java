@@ -54,7 +54,8 @@ import static org.junit.jupiter.api.Assertions.fail;
 /// the values it replays off the heap the same way. The stores run with a budget of 0, so every value of a durable
 /// commit moves, a cold slab, so the values of small batches lie on arrays of their own commit, and, but for the tests
 /// of that verdict, key spaces whose values may leave the heap from their first commit rather than once samples of
-/// thousands of puts show that few are replaced; a key space that removes what it writes lists no value at all.
+/// thousands of puts, or the first 64 puts of a commit of 64 writes or more, show that few are replaced; a key space
+/// that removes what it writes in commits of under 64 writes lists no value at all.
 class LogSpillTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<byte[], byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.bytes(), ValueCodec.bytes());
@@ -683,24 +684,138 @@ class LogSpillTest {
     }
 
     @Test
-    @DisplayName("a key space that keeps what it writes lets its values leave the heap once its samples are judged")
+    @DisplayName("a key space that keeps what it writes in commits of under 64 writes lets its values leave the heap once its samples are judged")
     void keptValuesSpillOnceJudged(@TempDir Path directory) throws Exception {
         var expected = new Expected();
+        var count = 20;
         try (var ledger = openJudged(directory, true, 0, Duration.ZERO)) {
             var overwrites = ledger.state(MESSAGES).overwrites;
             assertFalse(overwrites.spills(), "the values may leave the heap before any sample");
             var batches = 0;
-            // A batch of 64 messages judges its key spaces whenever its commit is sampled, one in 64
+            // A batch of 20 messages is 60 writes, under the 64 that sample every put of a key space not yet judged,
+            // so one put in 64 is sampled, and the first judgement comes after about 4,096 messages
             while (!overwrites.spills()) {
                 assertTrue(batches < 1_000, "the samples of values written once never let them leave the heap");
-                write(ledger, expected, batches * 64, 64, 0, false);
+                write(ledger, expected, batches * count, count, 0, false);
                 batches++;
             }
-            assertEquals(0, ledger.spills().loggedValuesForTests() + ledger.spills().copiedValuesForTests());
-            write(ledger, expected, batches * 64, 64, 0, true);
+            assertTrue(batches > 20, "judged after " + batches + " batches, as if every put were sampled");
+            ledger.awaitDurable();
+            spillNow(ledger);
+            // The key space of texts may be judged first, so only the messages before the last batch are checked
+            for (var message = 0; message < (batches - 1) * count; message++) {
+                assertInstanceOf(MemorySegment.class, head(ledger, MESSAGES, key(message)).sourceForTests(),
+                        "message " + message + " moved before its key space was judged");
+            }
+            write(ledger, expected, batches * count, count, 0, true);
             spillNow(ledger);
             assertTrue(ledger.spills().loggedValuesForTests() > 0, "no value moved to the log once judged");
             verify(ledger, expected);
+        }
+    }
+
+    /// Commits `count` messages from `first` to [#MESSAGES] in one batch, each of one of `lengths`, after `residents`
+    /// writes of [#CHATS], and records them in `expected`.
+    private static void writeBulk(Ledger ledger, Expected expected, int first, int count, int[] lengths, int residents) throws Exception {
+        var batch = ledger.newBatch();
+        for (var i = 0; i < residents; i++) {
+            batch.put(CHATS, "bulk" + i, "resident " + first + "/" + i);
+            expected.chats.put("bulk" + i, "resident " + first + "/" + i);
+        }
+        for (var message = first; message < first + count; message++) {
+            var value = new byte[lengths[message % lengths.length]];
+            for (var i = 0; i < value.length; i++) {
+                value[i] = (byte) (message * 13 + i * 7);
+            }
+            batch.put(MESSAGES, key(message), value);
+            expected.messages.put(message, value);
+        }
+        ledger.commit(batch).awaitDurable();
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("one commit of 20,000 puts to a key space not yet judged judges it at its 64th put and lists the values from there, which leave the heap and read back from a frame of millions of bytes before and after a checkpoint and a reopen")
+    void bulkCommitListsOnceJudged(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var count = 20_000;
+        // About 4.6 MB of values, so the commit's frame is far above the largest body of a run and close to a segment
+        int[] lengths = {40, 200, SpillQueue.LOG_VALUE_MIN, 420};
+        var segmentSize = 6L << 20;
+        try (var ledger = openJudged(directory, encrypted, 0, Duration.ZERO, segmentSize)) {
+            var overwrites = ledger.state(MESSAGES).overwrites;
+            assertFalse(overwrites.judged());
+            // A commit of resident writes only, past the bound of a bulk commit, which no key space samples
+            var residents = ledger.newBatch();
+            for (var i = 0; i < 100; i++) {
+                // Long enough for the log, so the commit may list values
+                var chat = "chat " + i + "x".repeat(SpillQueue.LOG_VALUE_MIN);
+                residents.put(CHATS, "only" + i, chat);
+                expected.chats.put("only" + i, chat);
+            }
+            ledger.commit(residents).awaitDurable();
+            assertEquals(0, overwrites.sampledPutsForTests());
+            writeBulk(ledger, expected, 0, count, lengths, 100);
+            assertTrue(overwrites.judged(), "the bulk commit did not judge its key space");
+            assertTrue(overwrites.spills(), "values written once may not leave the heap");
+            var before = ledger.snapshot();
+            spillNow(ledger);
+            var spills = ledger.spills();
+            assertEquals(0, spills.heldForTests());
+            var logged = 0;
+            var copied = 0;
+            for (var message = 0; message < count; message++) {
+                var source = head(ledger, MESSAGES, key(message)).sourceForTests();
+                if (message < ValueSlab.Overwrites.BULK_WRITES - 1) {
+                    assertInstanceOf(MemorySegment.class, source, "message " + message + " was listed before the judgement");
+                } else if (expected.messages.get(message).length >= SpillQueue.LOG_VALUE_MIN) {
+                    assertInstanceOf(LogValue.class, source, "message " + message);
+                    logged++;
+                } else {
+                    assertInstanceOf(byte[].class, source, "message " + message);
+                    copied++;
+                }
+            }
+            assertEquals(logged, spills.loggedValuesForTests());
+            assertEquals(copied, spills.copiedValuesForTests());
+            for (var i = 0; i < 100; i++) {
+                assertFalse(head(ledger, CHATS, ("bulk" + i).getBytes(StandardCharsets.UTF_8)).sourceForTests() instanceof LogValue);
+            }
+            verify(ledger, expected);
+            try (before) {
+                verifyView(before, expected);
+            }
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = openJudged(directory, encrypted, 0, Duration.ZERO, segmentSize)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @Test
+    @DisplayName("a commit of thousands of removals from a key space not yet judged samples them one in 64, like any removal, and judges nothing")
+    void bulkRemovalsJudgeNothing(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        int[] lengths = {300};
+        try (var ledger = openJudged(directory, true, 64L << 20, Duration.ZERO)) {
+            var overwrites = ledger.state(MESSAGES).overwrites;
+            // Commits of 40 writes, sampled one put in 64, too few to judge
+            for (var batch = 0; batch < 50; batch++) {
+                writeBulk(ledger, expected, batch * 40, 40, lengths, 0);
+            }
+            assertFalse(overwrites.judged(), "2,000 puts sampled one in 64 judged the key space");
+            var puts = overwrites.sampledPutsForTests();
+            assertTrue(puts > 0 && puts < 64, puts + " sampled puts");
+            var removals = ledger.newBatch();
+            for (var message = 0; message < 2_000; message++) {
+                removals.delete(MESSAGES, key(message));
+            }
+            ledger.commit(removals).awaitDurable();
+            assertFalse(overwrites.judged(), "the removals judged the key space");
+            assertFalse(overwrites.spills());
+            assertEquals(puts, overwrites.sampledPutsForTests(), "the removals counted as puts");
+            assertEquals(0, ledger.size(MESSAGES));
         }
     }
 

@@ -1007,11 +1007,75 @@ class ValueSlabTest {
         void sampling(int stride, int start) {
             var samples = 0;
             for (var i = 0; i < 1 << 16; i++) {
-                if (ValueSlab.Overwrites.sampled(start + (long) stride * i)) {
+                if (ValueSlab.Overwrites.sampled(Reads.stamp(start + (long) stride * i, 0))) {
                     samples++;
                 }
             }
             assertTrue(samples > 512 && samples < 2_048, samples + " samples");
+        }
+
+        @Test
+        @DisplayName("the first write of a commit is sampled as the hash of its sequence alone")
+        void firstWriteSampledBySequence() {
+            for (var sequence = 0L; sequence < 1 << 20; sequence++) {
+                var bySequence = (sequence * 0x9E3779B97F4A7C15L) >>> Long.SIZE - 6 == 0;
+                assertEquals(bySequence, ValueSlab.Overwrites.sampled(Reads.stamp(sequence, 0)), "sequence " + sequence);
+            }
+            var last = (1L << Long.SIZE - Reads.OP_BITS) - 1;
+            assertEquals((last * 0x9E3779B97F4A7C15L) >>> Long.SIZE - 6 == 0, ValueSlab.Overwrites.sampled(Reads.stamp(last, 0)));
+        }
+
+        @ParameterizedTest(name = "{0} commits of {1} writes from {2}")
+        @CsvSource({"20,20000,1", "1,100000,1", "200,1000,1", "100,1000,5000"})
+        @DisplayName("the writes of large commits are sampled one in 64, in every commit and with no pattern of their positions")
+        void bulkSampling(int commits, int writes, long first) {
+            var samples = 0;
+            var even = 0;
+            var empty = 0;
+            for (var sequence = first; sequence < first + commits; sequence++) {
+                var inCommit = 0;
+                for (var op = 0; op < writes; op++) {
+                    if (ValueSlab.Overwrites.sampled(Reads.stamp(sequence, op))) {
+                        inCommit++;
+                        if (op % 2 == 0) {
+                            even++;
+                        }
+                    }
+                }
+                samples += inCommit;
+                if (inCommit == 0) {
+                    empty++;
+                }
+            }
+            var expected = (double) commits * writes / 64;
+            assertTrue(Math.abs(samples - expected) < expected * 0.1, samples + " samples, " + expected + " expected");
+            assertTrue(Math.abs(2 * even - samples) < samples * 0.1, even + " of " + samples + " samples at even positions");
+            assertTrue(writes < 1_000 || empty == 0, empty + " commits without a sample");
+        }
+
+        @Test
+        @DisplayName("a key space is judged at its 64th sample or at a cut of at least 64, and a forced verdict does not judge it")
+        void judged() {
+            var overwrites = new ValueSlab.Overwrites();
+            assertFalse(overwrites.judged());
+            overwrites.forceSpillsForTests();
+            assertTrue(overwrites.spills());
+            assertFalse(overwrites.judged(), "forcing the verdict judged the samples");
+            interval(overwrites, 63, 0, 128, 0);
+            assertFalse(overwrites.judged());
+            overwrites.sample(null, 128);
+            assertTrue(overwrites.judged());
+            overwrites.cut(1_000);
+            assertTrue(overwrites.judged(), "a cut cleared the judgement");
+            var dying = new ValueSlab.Overwrites();
+            interval(dying, 63, 63, 128, 0);
+            dying.cut(1_000);
+            assertFalse(dying.judged(), "a cut of 63 samples judged them");
+            interval(dying, 63, 63, 128, 1_000);
+            assertFalse(dying.judged(), "the counters restart at a cut, so 64 more are needed");
+            dying.sample(version(1_001), 128);
+            assertTrue(dying.judged());
+            assertFalse(dying.spills(), "a judgement that replaced every value lets them leave the heap");
         }
 
         @Test
