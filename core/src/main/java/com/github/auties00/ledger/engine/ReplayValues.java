@@ -4,7 +4,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 /// The arrays an open copies the values it replays to paged key spaces into, so their versions keep none of the
-/// decrypted frame bodies they came in once the open ends.
+/// decrypted frame bodies they came in.
 ///
 /// A body also holds the commit's keys, which the chains copy, its resident values, which the resident versions copy,
 /// and its own encoding: a version on a slice of it would keep about twice the bytes of its value, and the slice, until
@@ -14,9 +14,9 @@ import java.lang.foreign.ValueLayout;
 /// no pool hands out or takes back, and nothing writes again where a value was copied, so it stays as the copy left it
 /// until a checkpoint takes the last version on it.
 ///
-/// A store that moves values off the heap copies here only those its queue keeps once the replay ends: the others stay
-/// on their bodies until they move to the log ([SpillQueue#settleReplay(ReplayValues)]), so the bytes of most of a long
-/// log's values are never copied.
+/// A store that moves values off the heap copies here only the values of the log's last budget, and those too short for
+/// the log: it moves the others to the log at once, tagged where they lie in their bodies with the [SpillQueue.Crypto]
+/// this holds for the replay, so the bytes of most of a long log's values are never copied.
 ///
 /// One open makes one for its replay, which runs on the opening thread before the store starts its threads, and drops
 /// it after: the last chunk is then reachable through its versions alone.
@@ -34,6 +34,8 @@ final class ReplayValues {
     // replay ends
     private byte[] frame;
     private MemorySegment frameView;
+    // The ciphers that tag the values moved to the log, taken at the first, or null
+    private SpillQueue.Crypto crypto;
 
     /// {@return whether a value of `length` bytes shares a chunk, rather than taking an array of its own}
     static boolean shared(int length) {
@@ -70,9 +72,24 @@ final class ReplayValues {
         return frameView;
     }
 
-    /// Forgets the last frame body, as the replay ends.
-    void endFrames() {
+    /// {@return the [SpillQueue.Crypto] of the replay, taken from `queue` at the first call}
+    SpillQueue.Crypto crypto(SpillQueue queue) {
+        var taken = crypto;
+        if (taken == null) {
+            taken = crypto = queue.takeCrypto();
+        }
+        return taken;
+    }
+
+    /// Forgets the last frame body and gives the [SpillQueue.Crypto] it took back to `queue`, as the replay ends.
+    ///
+    /// @param queue the queue the crypto came from, or `null` if the store moves no value
+    void end(SpillQueue queue) {
         frame = null;
         frameView = null;
+        if (crypto != null && queue != null) {
+            queue.giveBack(crypto);
+        }
+        crypto = null;
     }
 }

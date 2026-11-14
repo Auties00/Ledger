@@ -334,7 +334,8 @@ class LogRunTest {
                 }
 
                 @Override
-                public boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset) {
+                public boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset,
+                                      long logFrom) {
                     if (sequence == missing) {
                         return false;
                     }

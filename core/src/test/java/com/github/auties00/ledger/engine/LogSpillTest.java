@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -74,10 +75,22 @@ class LogSpillTest {
 
     /// Opens a store whose key spaces let their values leave the heap only once their samples show few are replaced.
     private static LiveLedger openJudged(Path directory, boolean encrypted, long budget, Duration window) {
+        return openJudged(directory, encrypted, budget, window, 64 << 10);
+    }
+
+    /// Opens a store as [#open(Path, boolean, long, Duration)] does, with segments of `segmentSize` bytes.
+    private static LiveLedger openSized(Path directory, boolean encrypted, long budget, Duration window, long segmentSize) {
+        var ledger = openJudged(directory, encrypted, budget, window, segmentSize);
+        ledger.state(MESSAGES).overwrites.forceSpillsForTests();
+        ledger.state(TEXTS).overwrites.forceSpillsForTests();
+        return ledger;
+    }
+
+    private static LiveLedger openJudged(Path directory, boolean encrypted, long budget, Duration window, long segmentSize) {
         var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(directory)
                 .encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
                 .keyspace(MESSAGES).keyspace(TEXTS).keyspace(CHATS).commitWindow(window))
-                .segmentSize(64 << 10)
+                .segmentSize(segmentSize)
                 .spillBudget(budget)
                 // Values of a group written through stay on the heap, and whether a group goes through depends on
                 // whether a spare segment is ready; writtenThroughValuesStay covers them
@@ -495,7 +508,7 @@ class LogSpillTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
-    @DisplayName("a recovery moves the values it replays off the heap, reads them back, and checkpoints them")
+    @DisplayName("a recovery moves the values it replays off the heap, those too short for the log onto chunks, reads them back, and checkpoints them")
     void recoveryMovesReplayedValues(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
@@ -506,9 +519,14 @@ class LogSpillTest {
         }
         try (var ledger = open(directory, encrypted, 0)) {
             assertTrue(ledger.spills().loggedValuesForTests() > 0, "the recovery moved no value to the log");
-            for (var message : expected.messages.keySet()) {
-                var source = head(ledger, MESSAGES, key(message)).sourceForTests();
-                assertFalse(source instanceof MemorySegment, "message " + message + " stayed on its body");
+            for (var entry : expected.messages.entrySet()) {
+                var source = head(ledger, MESSAGES, key(entry.getKey())).sourceForTests();
+                if (entry.getValue().length >= SpillQueue.LOG_VALUE_MIN) {
+                    assertInstanceOf(LogValue.class, source, "message " + entry.getKey());
+                } else {
+                    var chunk = assertInstanceOf(MemorySegment.class, source, "message " + entry.getKey());
+                    assertEquals(ReplayValues.CHUNK_BYTES, chunk.byteSize(), "message " + entry.getKey() + " stayed on its body");
+                }
             }
             verify(ledger, expected);
             write(ledger, expected, 5_000, 10, 0, true);
@@ -719,46 +737,46 @@ class LogSpillTest {
         assertEquals(0, queue.heldForTests());
     }
 
-    @ParameterizedTest(name = "encrypted: {0}")
-    @ValueSource(booleans = {true, false})
-    @DisplayName("a recovery over its budget moves the oldest values it replays from runs and frames of their own to the log, tagged on their frame bodies, and copies the newest off those bodies into chunks")
-    void recoveryKeepsTheNewestOnChunks(boolean encrypted, @TempDir Path directory) throws Exception {
+    @ParameterizedTest(name = "encrypted: {0}, segment of {1} bytes")
+    @CsvSource({"true,65536", "false,65536", "true,1048576", "false,1048576"})
+    @DisplayName("a recovery over its budget moves the values it replays from runs and frames of their own before the log's last budget to the log at once, and keeps those of the last budget, as far as the last segment's frames reach, on chunks, never on a body")
+    void recoveryKeepsTheLastBudgetOnChunks(boolean encrypted, int segmentSize, @TempDir Path directory) throws Exception {
         var expected = new Expected();
-        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, Duration.ofMillis(20))) {
+        var newest = 0;
+        try (var ledger = openSized(directory, encrypted, Long.MAX_VALUE, Duration.ofMillis(20), segmentSize)) {
             long last = 0;
             for (var message = 0; message < 400; message++) {
                 // Commits of one message share runs, those of 30 take frames of their own
                 last = write(ledger, expected, message * 40, message % 10 == 0 ? 30 : 1, 0, false);
+                newest = message * 40;
             }
             ledger.awaitDurable();
             assertTrue(ledger.log().durableSequence() >= last);
             ledger.closeWithoutCheckpoint();
         }
         var budget = 64L << 10;
-        try (var ledger = open(directory, encrypted, budget)) {
+        try (var ledger = openSized(directory, encrypted, budget, Duration.ZERO, segmentSize)) {
             var logged = 0;
-            var chunked = 0;
             for (var message : expected.messages.keySet()) {
                 var source = head(ledger, MESSAGES, key(message)).sourceForTests();
                 switch (source) {
                     case LogValue _ -> logged++;
-                    case MemorySegment chunk -> {
-                        assertEquals(ReplayValues.CHUNK_BYTES, chunk.byteSize(), "message " + message + " is on its frame body");
-                        chunked++;
-                    }
+                    case MemorySegment chunk -> assertEquals(ReplayValues.CHUNK_BYTES, chunk.byteSize(),
+                            "message " + message + " is on its frame body");
                     case byte[] _ -> {
                     }
                     default -> fail("message " + message + " is on " + source);
                 }
             }
             assertTrue(logged > 0, "the recovery moved no value to the log");
-            assertTrue(chunked > 0, "the recovery kept no value on a chunk");
+            // The last segment is longer than the budget when it is 1 MiB, and only partly written
+            assertFalse(head(ledger, MESSAGES, key(newest)).sourceForTests() instanceof LogValue, "the newest message left the heap");
             assertTrue(ledger.spills().heldForTests() <= budget, "the queue holds " + ledger.spills().heldForTests() + " bytes");
             verify(ledger, expected);
             ledger.checkpoint();
             verify(ledger, expected);
         }
-        try (var ledger = open(directory, encrypted, budget)) {
+        try (var ledger = openSized(directory, encrypted, budget, Duration.ZERO, segmentSize)) {
             verify(ledger, expected);
         }
     }

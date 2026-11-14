@@ -79,8 +79,11 @@ final class LogRecovery {
         /// `body` is a new array no one else writes, which the commits of a run share.
         ///
         /// @param segment the use, or `null` if the recovery moves no value off the heap
+        /// @param logFrom the bytes of log from the start of the frame to the end of the log, at most: the frames a
+        ///                recovery that moves values off the heap still replays lie there, and 0 without one
         /// @return whether it replayed the commit; it changed nothing if not
-        boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset);
+        boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset,
+                       long logFrom);
 
         void epoch(int epoch);
     }
@@ -115,6 +118,11 @@ final class LogRecovery {
         LogFiles.Prepared empty = null;
         Path lastWritten = null;
         var buffer = new SegmentReader.Buffer();
+        // The bytes of the segments after each one, for how much log at most follows a frame
+        var after = new long[segments.size()];
+        for (var index = segments.size() - 2; spills != null && index >= 0; index--) {
+            after[index] = after[index + 1] + Files.size(files.segment(segments.get(index + 1)));
+        }
         for (var index = 0; index < segments.size(); index++) {
             var number = segments.get(index);
             var path = files.segment(number);
@@ -167,6 +175,12 @@ final class LogRecovery {
                 var segmentKey = keys.encrypted() ? keys.segmentKey(storeId, number, salt, useTag) : null;
                 ahead.begin(tag, useTag, segmentKey);
                 var view = spills == null ? null : spills.segment(number, path, segmentKey);
+                // Where the segment's frames end at most: the last segment of a recovery that moves values ends where
+                // its chain of frame headers does, unless all of it falls in the part of the log the heap keeps
+                var segmentEnd = reader.size();
+                if (spills != null && index == segments.size() - 1 && !spills.keepsReplayed(segmentEnd - position)) {
+                    segmentEnd = chainEnd(reader, position, tag, useTag, crc);
+                }
                 var afterPadding = false;
                 while (reader.read(position, frame, 0, LogWriter.FRAME_HEADER, peek)) {
                     if (position % LogWriter.ALIGNMENT != 0) {
@@ -222,7 +236,8 @@ final class LogRecovery {
                                 if (sequence != last + 1) {
                                     throw new LedgerCorruptedException(path + " holds commit " + sequence + " after commit " + last, null);
                                 }
-                                replayed = sink.commit(sequence, body, 0, body.length, view, position);
+                                replayed = sink.commit(sequence, body, 0, body.length, view, position,
+                                        spills == null ? 0 : segmentEnd - position + after[index]);
                                 if (replayed) {
                                     last = sequence;
                                 }
@@ -241,7 +256,8 @@ final class LogRecovery {
                                     throw new LedgerCorruptedException(path + " holds commit " + next + " after commit " + last, null);
                                 }
                                 var length = commits.next();
-                                replayed = sink.commit(next, body, commits.start(), length, view, position);
+                                replayed = sink.commit(next, body, commits.start(), length, view, position,
+                                        spills == null ? 0 : segmentEnd - position + after[index]);
                                 if (replayed) {
                                     last = next;
                                 }
@@ -349,6 +365,33 @@ final class LogRecovery {
             return null;
         }
         return Arrays.copyOfRange(sealed, at, at + bodyLength);
+    }
+
+    /// {@return where the frames of the use `useTag` of the segment whose salt has `tag` stop following each other from
+    /// the frame at `position`, as their headers tell: no frame replay replays from there lies past it}
+    ///
+    /// It reads the headers alone, and the padding after a group as far as the next page, as replay does.
+    private static long chainEnd(SegmentReader reader, long position, long tag, long useTag, CRC32C crc) throws IOException {
+        var frame = new byte[LogWriter.FRAME_HEADER];
+        while (true) {
+            if (!reader.read(position, frame, 0, LogWriter.FRAME_HEADER, true) || !validFrameHeader(frame, tag, useTag, crc)) {
+                // Inside the padding after a group, which ends at a page where the next group's first frame may start
+                var boundary = (position / LogWriter.ALIGNMENT + 1) * LogWriter.ALIGNMENT;
+                if (position % LogWriter.ALIGNMENT == 0
+                        || !reader.read(boundary, frame, 0, LogWriter.FRAME_HEADER, true)
+                        || !validFrameHeader(frame, tag, useTag, crc)
+                        || (frame[17] & LogWriter.GROUP_START) == 0) {
+                    return position;
+                }
+                position = boundary;
+            }
+            var sealedLength = ByteBuffer.wrap(frame).getInt(4);
+            var end = position + LogWriter.FRAME_HEADER + sealedLength;
+            if (sealedLength < 0 || sealedLength > MAX_SEALED || end > reader.size()) {
+                return position;
+            }
+            position = end;
+        }
     }
 
     /// Throws if a group written after a later force, by any use of the segment whose salt has `tag`, follows the
