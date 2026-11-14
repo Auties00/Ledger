@@ -294,6 +294,31 @@ class CheckpointSaturationTest {
         }
 
         @Test
+        @DisplayName("leaves out the leaf that replaces one a screened read refused, and caches the one that replaces a leaf read twice")
+        void screenedReads(@TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
+                TreeSearch.leaf(tree.pages, tree.root, key(100), true);
+                TreeSearch.leaf(tree.pages, tree.root, key(5_000), true);
+                TreeSearch.leaf(tree.pages, tree.root, key(5_000), true);
+                assertNull(tree.cache.peek(tree.path(key(100)).getLast()), "the leaf read once");
+                assertTrue(tree.cache.referencedForTests(tree.path(key(5_000)).getLast()), "the leaf read twice");
+                var ops = new ArrayList<TreeUpdate.Op>();
+                ops.add(new TreeUpdate.Op(segment(key(100)), segment(new byte[151])));
+                ops.add(new TreeUpdate.Op(segment(key(5_000)), segment(new byte[151])));
+                tree.apply(ops, tree.unsaturated());
+                var once = tree.path(key(100)).getLast();
+                var twice = tree.path(key(5_000)).getLast();
+                assertTrue(once.isRecord() && twice.isRecord());
+                assertNull(tree.cache.peek(once), "the record of the leaf read once");
+                assertNotNull(tree.cache.peek(twice), "the record of the leaf read twice");
+                assertFalse(tree.cache.referencedForTests(twice), "the new record counts as read");
+                assertArrayEquals(new byte[151], tree.read(key(100)));
+                assertArrayEquals(new byte[151], tree.read(key(5_000)));
+                tree.verify(KEYS, 7, 150);
+            }
+        }
+
+        @Test
         @DisplayName("caches the leaf that replaces one a reader read among those a checkpoint cached, for that checkpoint only")
         void readCheckpointLeaf(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, 64 * MIB).fill(KEYS)) {
