@@ -11,12 +11,24 @@ import java.lang.foreign.MemorySegment;
 /// the work is done before the batch waits for the writer. When the store applies the batch it takes that memory
 /// over to serve the writes until its next checkpoint, rather than copying them, and the batch continues in fresh
 /// memory: a batch can be reused after [Ledger#commit(WriteBatch)] or [#clear()]. A batch is not thread-safe.
+///
+/// A byte array [put][#put(Keyspace, Object, Object)] to a [Keyspace.Residency#PAGED] key space of a store in a
+/// directory, long enough to go to the store's file of large values, is the exception: the batch neither encodes nor
+/// copies it, and the commit seals it into that file straight from the caller's array.
 public sealed interface WriteBatch permits ArrayWriteBatch {
     /// Adds a write of `value` under `key`, replacing any value already there.
     ///
+    /// A byte array put to a [Keyspace.Residency#PAGED] key space, whose values of its length go to the store's file of
+    /// large values, is read by the store, not copied, until a [commit][Ledger#commit(WriteBatch)] of the batch returns
+    /// or the batch is [cleared][#clear()]; a commit that fails keeps it for a retry of the same batch. The store keeps
+    /// no reference to it once the commit returns, so the caller may reuse the array from then on. An array changed
+    /// before then is stored with the bytes it has when the commit seals it, without an error: one array filled again
+    /// is never put under several keys of one batch.
+    ///
     /// @param keyspace the key space to write
     /// @param key the key
-    /// @param value the value, which must not change after this call
+    /// @param value the value, which must not change after this call; a byte array the store reads at the commit, as
+    ///              said above, may change once the commit returns
     /// @param <K> the key type
     /// @param <V> the value type
     /// @return this batch

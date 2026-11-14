@@ -213,13 +213,19 @@ class BatchOwnValuesTest {
             try (var ledger = (LiveLedger) options(directory).build()) {
                 // A name beside it, so a value below half a chunk has to leave the batch's array
                 var batch = ledger.newBatch().put(NAMES, new byte[]{9}, "x".repeat(16_384)).put(MESSAGES, new byte[]{1}, caller);
-                // The batch copied the value at the put
-                caller[0]++;
+                // The batch copied a value below the file of large values at the put, and borrows one bound for it
+                // until the commit returns
+                var borrowed = ((ArrayWriteBatch) batch).borrowed(1);
+                assertEquals(length >= 1 << 20, borrowed);
+                if (!borrowed) {
+                    caller[0]++;
+                }
                 ledger.commit(batch).awaitDurable();
+                caller[1]++;
                 var version = head(ledger, MESSAGES, new byte[]{1});
                 assertEquals(length, version.sourceBytesForTests());
-                // A value of a G1 region or more may be split in two arrays of its own
-                assertEquals(length >= OWN, version.sourceForTests() instanceof byte[] || version.sourceForTests() instanceof SplitValue);
+                assertEquals(length >= OWN, version.sourceForTests() instanceof byte[]);
+                assertNotSame(caller, version.sourceForTests());
                 assertArrayEquals(expected, ledger.get(MESSAGES, new byte[]{1}).orElseThrow());
                 ledger.checkpoint();
                 assertArrayEquals(expected, ledger.get(MESSAGES, new byte[]{1}).orElseThrow());

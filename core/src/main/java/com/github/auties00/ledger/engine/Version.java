@@ -41,9 +41,9 @@ sealed class Version permits Version.External {
     final long stamp;
     // The read-only segment the encoded value is part of, the array of its batch; or the array that is the value, which
     // a resident version keeps, as does a paged one its batch gave an array of its own or whose value left the batch's
-    // array, and whose segment and session, 72 bytes, a read of its encoding makes; or the SplitValue of a large value
-    // its batch kept in two arrays, which only an External holds; or the place of the value in the log ([LogValue]); or
-    // `null` if this version removes the key. A slice of its own per version was 40 of the bytes a buffered write took.
+    // array, and whose segment and session, 72 bytes, a read of its encoding makes; or the place of the value in the
+    // log ([LogValue]); or `null` if this version removes the key. A slice of its own per version was 40 of the bytes a
+    // buffered write took.
     // Changed only by spill, from a segment or an array a recovery copied the value to, with a compare-and-set
     private Object source;
     // Where the value starts in source if source is a segment, and its length
@@ -84,14 +84,6 @@ sealed class Version permits Version.External {
                 : new External(stamp, value, 0, value.length, decoded, older, external);
     }
 
-    /// {@return a version whose value is `value`, kept in two arrays no one writes, which the unit `external` of
-    /// [BlobFile] also holds}
-    ///
-    /// Only a value of a paged key space is split, so the version keeps no decoded value.
-    static Version ofSplit(long stamp, SplitValue value, Version older, PageRef external) {
-        return new External(stamp, value, 0, value.length(), null, older, external);
-    }
-
     /// {@return a version of the `length` bytes `logged` holds in the log, stamped `stamp`, the stamp its tag binds; for
     /// a checkpoint that writes a value of a [PackedRun]}
     static Version ofLogged(long stamp, LogValue logged, int length) {
@@ -107,8 +99,7 @@ sealed class Version permits Version.External {
 
     /// {@return the encoded value, read-only, or `null` if this version removes the key}
     ///
-    /// The value of a [SplitValue] is joined into a new array on every call, which no version keeps: a scan or a read
-    /// of the encoding of a large value no checkpoint has taken yet copies it whole. A value in the log is read from it.
+    /// A value in the log is read from it.
     ///
     /// @throws LogSegmentView.Retired if the value is in a segment a checkpoint retired, which the tree of every reader
     ///                                that can still find this version holds
@@ -122,9 +113,6 @@ sealed class Version permits Version.External {
         if (held instanceof byte[] array) {
             return MemorySegment.ofArray(array).asReadOnly();
         }
-        if (held instanceof SplitValue split) {
-            return MemorySegment.ofArray(split.join()).asReadOnly();
-        }
         if (held instanceof LogValue logged) {
             return MemorySegment.ofArray(logged.read(stamp, length)).asReadOnly();
         }
@@ -135,9 +123,8 @@ sealed class Version permits Version.External {
     /// {@return the encoded value in a new array, or `null` if this version removes the key}
     ///
     /// A value on an array of its own is copied with an array copy, which spares the zeroing of the new array a copy
-    /// of [#value] pays ([Segments#toBytes(byte\[\], int, int)]), and a [SplitValue] with one per array, which spares
-    /// it for all but the tail's bytes; one on a read-only segment, which hides its array, cannot be. An array source is
-    /// the value whole, at no offset. A value in the log is read into an array of its own.
+    /// of [#value] pays ([Segments#toBytes(byte\[\], int, int)]); one on a read-only segment, which hides its array,
+    /// cannot be. An array source is the value whole, at no offset. A value in the log is read into an array of its own.
     ///
     /// @throws LogSegmentView.Retired as [#value()] does
     byte[] copyBytes() {
@@ -150,9 +137,6 @@ sealed class Version permits Version.External {
         }
         if (held == null) {
             return null;
-        }
-        if (held instanceof SplitValue split) {
-            return split.join();
         }
         // No slice of the segment: the copy reads the value where it is
         return Segments.toBytes((MemorySegment) held, offset, length);
@@ -265,14 +249,13 @@ sealed class Version permits Version.External {
         return switch (SOURCE.getAcquire(this)) {
             case null -> 0;
             case byte[] array -> array.length;
-            case SplitValue split -> split.length();
             case MemorySegment segment -> segment.byteSize();
             case LogValue _ -> 0;
             default -> throw new IllegalStateException();
         };
     }
 
-    /// {@return the segment, array, [SplitValue] or place in the log the value is on, `null` for a removal; for tests of
+    /// {@return the segment, array or place in the log the value is on, `null` for a removal; for tests of
     /// what memory keeps}
     Object sourceForTests() {
         return SOURCE.getAcquire(this);

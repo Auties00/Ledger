@@ -19,7 +19,6 @@ class PageCipher {
     /// The content a streamed unit passes to the cipher in one call: small enough to stay out of the way of the
     /// cipher's intrinsic, which a cold JVM reaches only through calls that are not too large.
     private static final int SLICE = 64 << 10;
-    private static final byte[] EMPTY = new byte[0];
 
     private final SecretKeySpec key;
     private final ConcurrentLinkedQueue<Cipher> ciphers;
@@ -132,23 +131,8 @@ class PageCipher {
     /// @param buffer the buffer the sealed bytes pass through, of at least 64 KiB
     /// @throws IOException if `out` fails
     void seal(byte[] header, byte[] content, int contentOffset, int contentLength, int pages, byte[] buffer, Output out) throws IOException {
-        seal(header, content, contentOffset, contentLength, EMPTY, pages, buffer, out);
-    }
-
-    /// Seals, as [#seal(byte\[\], byte\[\], int, int, int, byte\[\], Output)] does, the unit whose content is the
-    /// `headLength` bytes of `head` at `headOffset` followed by the whole of `tail`: the unit is the one the content on
-    /// one array makes.
-    ///
-    /// A slice of the content that starts in `head` and ends in `tail` passes to the cipher in two calls, which give out
-    /// together what one would, as the cipher holds back at most a partial block between calls.
-    ///
-    /// @param header the unit's header, filled in, of [PageFormat#HEADER] bytes
-    /// @param buffer the buffer the sealed bytes pass through, of at least 64 KiB
-    /// @throws IOException if `out` fails
-    void seal(byte[] header, byte[] head, int headOffset, int headLength, byte[] tail, int pages, byte[] buffer, Output out) throws IOException {
-        var contentLength = (long) headLength + tail.length;
         var tag = pages * PageFormat.SIZE - PageFormat.TAG;
-        var padding = tag - PageFormat.HEADER - contentLength;
+        var padding = tag - PageFormat.HEADER - (long) contentLength;
         if (padding < 0) {
             throw new IllegalArgumentException("A unit of " + pages + " pages holds at most " + PageFormat.capacity(pages) + " bytes");
         }
@@ -166,7 +150,7 @@ class PageCipher {
                 var count = (int) Math.min(buffer.length - used, total - offset);
                 var fromContent = (int) Math.max(0, Math.min(count, contentLength - offset));
                 if (fromContent > 0) {
-                    gather(head, headOffset, headLength, tail, offset, buffer, used, fromContent);
+                    System.arraycopy(content, contentOffset + (int) offset, buffer, used, fromContent);
                 }
                 Arrays.fill(buffer, used + fromContent, used + count, (byte) 0);
                 crc.update(buffer, used, count);
@@ -195,21 +179,15 @@ class PageCipher {
                     out.write(buffer, used);
                     used = 0;
                 }
-                if (offset + count <= headLength) {
-                    used += cipher.update(head, headOffset + (int) offset, count, buffer, used);
-                } else if (offset + count <= contentLength) {
-                    var inHead = (int) Math.max(0, headLength - offset);
-                    if (inHead > 0) {
-                        used += cipher.update(head, headOffset + (int) offset, inHead, buffer, used);
-                    }
-                    used += cipher.update(tail, (int) (offset + inHead - headLength), count - inHead, buffer, used);
+                if (offset + count <= contentLength) {
+                    used += cipher.update(content, contentOffset + (int) offset, count, buffer, used);
                 } else {
                     if (last == null) {
                         last = new byte[count];
                     }
                     var fromContent = (int) Math.max(0, contentLength - offset);
                     if (fromContent > 0) {
-                        gather(head, headOffset, headLength, tail, offset, last, 0, fromContent);
+                        System.arraycopy(content, contentOffset + (int) offset, last, 0, fromContent);
                     }
                     Arrays.fill(last, fromContent, count, (byte) 0);
                     used += cipher.update(last, 0, count, buffer, used);
@@ -226,18 +204,6 @@ class PageCipher {
             throw new IllegalStateException("A unit could not be sealed", exception);
         } finally {
             ciphers.offer(cipher);
-        }
-    }
-
-    /// Copies the `count` bytes at `from` of the content that is the `headLength` bytes of `head` at `headOffset`
-    /// followed by `tail` into `target` at `at`.
-    private static void gather(byte[] head, int headOffset, int headLength, byte[] tail, long from, byte[] target, int at, int count) {
-        var inHead = (int) Math.max(0, Math.min(count, headLength - from));
-        if (inHead > 0) {
-            System.arraycopy(head, headOffset + (int) from, target, at, inHead);
-        }
-        if (count > inHead) {
-            System.arraycopy(tail, (int) (from + inHead - headLength), target, at + inHead, count - inHead);
         }
     }
 
