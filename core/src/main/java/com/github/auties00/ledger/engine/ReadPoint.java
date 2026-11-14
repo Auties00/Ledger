@@ -17,8 +17,8 @@ record ReadPoint(long bound, TreeVersion tree, PageFile pages) {
         return tree == null ? null : tree.root(state.id);
     }
 
-    /// {@return the bound of the stamps the tree holds}
+    /// {@return the bound of the stamps the tree holds, or -1 if the read uses no tree}
     long treeBound() {
-        return Reads.boundOf(tree.sequence);
+        return tree == null ? -1 : Reads.boundOf(tree.sequence);
     }
 }

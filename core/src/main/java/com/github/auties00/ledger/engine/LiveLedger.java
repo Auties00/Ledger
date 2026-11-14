@@ -396,6 +396,12 @@ public final class LiveLedger implements Ledger {
     /// `body`, so the values of a long log neither stay in the heap until the first checkpoint nor are copied, and no
     /// body outlives its commit.
     ///
+    /// The puts and removals before the log's last budget of a paged key space go, for the keys memory holds no chain
+    /// of, to a [PackedRun] of the key space rather than to chains: a value in the log, or in a chunk if shorter, and the
+    /// key, in arrays with no object per write. [#endReplay(ReplayValues)] publishes the runs. A key space's first range
+    /// removal publishes its run before it counts what it removes, and the key space's later writes go to chains, so
+    /// every range removal stamped after the run's writes is newer than all of them.
+    ///
     /// @param values the chunks and the state of this open's replay
     /// @param segment the use of the segment that holds the frame, or `null` to move no value
     /// @return whether it replayed the commit
@@ -447,6 +453,8 @@ public final class LiveLedger implements Ledger {
         }
         var next = new int[1];
         var applier = new Applier(sequence, null, 4, false, false, false, true);
+        // The writes that went to runs rather than to chains
+        var runWrites = new int[1];
         // Made at the first put the queue lists, so a commit with none allocates no record
         var record = new SpillQueue.Record[1];
         // Whether the segment recorded the commit, before its first value moves there
@@ -474,6 +482,27 @@ public final class LiveLedger implements Ledger {
                     return;
                 }
                 var bytes = Math.toIntExact(value.byteSize());
+                var run = moves ? runFor(state, key, values, bytes >= SpillQueue.LOG_VALUE_MIN ? segment : null, bytes) : null;
+                if (run != null) {
+                    var stamp = applier.nextStamp();
+                    if (bytes >= SpillQueue.LOG_VALUE_MIN) {
+                        // Where the value starts in the body: the address of a slice of the body's view
+                        var at = Math.toIntExact(value.address());
+                        if (!noted[0]) {
+                            queue.noteReplayed(sequence, segment);
+                            noted[0] = true;
+                        }
+                        var logged = queue.tagReplayed(values.crypto(queue), segment, frameOffset, at, stamp, body, bytes);
+                        run.putLogged(key, stamp, logged, bytes);
+                    } else if (ReplayValues.shared(bytes)) {
+                        var at = values.copy(value, 0, bytes);
+                        run.put(key, stamp, values.view(), at, bytes);
+                    } else {
+                        run.put(key, stamp, null, 0, 0);
+                    }
+                    runWrites[0]++;
+                    return;
+                }
                 if (moves && bytes >= SpillQueue.LOG_VALUE_MIN) {
                     // On the body for as long as it takes to tag it there: a slice of the body's view, whose address
                     // is where it starts in the body
@@ -502,6 +531,12 @@ public final class LiveLedger implements Ledger {
                 if (state != null) {
                     var hint = replayHint(state);
                     if (hint == TreeSearch.BLIND) {
+                        var run = moves ? runFor(state, key, values, null, 0) : null;
+                        if (run != null) {
+                            run.delete(key, applier.nextStamp());
+                            runWrites[0]++;
+                            return;
+                        }
                         // On the key's chain, opened as a commit of the pipeline opens it: the other path checks first
                         // that the key exists, which a blind hint answers no for any key memory holds no version of
                         applier.delete(state, applier.claim(state, key), key, hint);
@@ -515,6 +550,8 @@ public final class LiveLedger implements Ledger {
             public void deleteRange(int keyspace, MemorySegment from, MemorySegment to) {
                 var state = byId.get(keyspace);
                 if (state != null) {
+                    // Counted over the run of the writes before it, and newer than every write the run takes
+                    publishRun(state, values.stopRun(state));
                     // The removal keeps its bounds until a checkpoint takes it
                     applier.deleteRange(state, from == null ? null : Segments.copy(from), to == null ? null : Segments.copy(to));
                 }
@@ -534,14 +571,44 @@ public final class LiveLedger implements Ledger {
             unitBytes += unit.length;
         }
         replayedBytes += 13 + length + unitBytes;
-        replayedHeap += LogWriter.heapOf(length, unitBytes, applier.touched.size(), false);
+        // As the writes would have held on chains, so the first checkpoint comes when it would have
+        replayedHeap += LogWriter.heapOf(length, unitBytes, applier.touched.size() + runWrites[0], false);
         return true;
     }
 
-    /// Ends the open's replay: `values` gives back what it took of the queue of values that may leave the heap and
-    /// forgets the last frame body.
+    /// Ends the open's replay: publishes the runs of the writes it kept in arrays, and `values` gives back what it took
+    /// of the queue of values that may leave the heap and forgets the last frame body.
     void endReplay(ReplayValues values) {
+        for (var entry : values.takeRuns().entrySet()) {
+            publishRun(entry.getKey(), entry.getValue());
+        }
         values.end(spills);
+    }
+
+    /// {@return the builder of the run of `state` that takes a replayed write of `key`, or `null` if the write goes to a
+    /// chain: the key space replays to chains from its first range removal, memory holds a chain of the key, or the
+    /// builder is full}
+    ///
+    /// A key the replay wrote to a chain never goes to the run: during the replay the chains of such a key space are
+    /// dropped only by its range removals, after which it replays to chains, so the run's entry of a key is always older
+    /// than the versions of its chain.
+    ///
+    /// @param segment the log segment of the value the write moves there, or `null` for a write of none
+    /// @param length the bytes of the value the write puts, 0 for a removal
+    private static PackedRun.Builder runFor(KeyspaceState state, MemorySegment key, ReplayValues values,
+                                            LogSegmentView segment, int length) {
+        var run = values.run(state);
+        return run != null && run.takes(segment, length) && state.chain(key) == null ? run : null;
+    }
+
+    /// Publishes the run `builder` of `state` holds, the open's writes of the key space kept in arrays, over the tree the
+    /// store opened from; nothing if `builder` is `null` or empty.
+    private void publishRun(KeyspaceState state, PackedRun.Builder builder) {
+        if (builder == null || builder.isEmpty()) {
+            return;
+        }
+        var trees = tree;
+        state.publishRun(builder.build(trees == null ? null : trees.root(state.id), pages));
     }
 
     /// Applies a replayed put of `value`, a slice of a frame body, to `state`, a paged key space of a store with pages,
@@ -2034,6 +2101,15 @@ public final class LiveLedger implements Ledger {
             }
             state.removeDropped();
             state.pruneListed(keyspace.number());
+            if (state.run != null) {
+                enterPublishing();
+                try {
+                    VarHandle.fullFence();
+                    state.releaseRun(Reads.boundOf(floor(readers.scan().oldest())));
+                } finally {
+                    exitPublishing();
+                }
+            }
         }
     }
 
@@ -2109,6 +2185,13 @@ public final class LiveLedger implements Ledger {
         var key = writes.key(index);
         var chain = kind == ArrayWriteBatch.PUT ? state.open(key) : state.chain(key);
         if (found == null || chain != null && chain.head != null) {
+            return false;
+        }
+        // The run the open replayed is part of the tree of `point` for its readers
+        var run = Reads.runOf(state, point);
+        var entry = run == null ? -1 : run.find(key);
+        if (entry >= 0) {
+            found[index] = run.removes(entry) ? TreeSearch.ABSENT : TreeSearch.FOUND;
             return false;
         }
         var root = point.root(state);
@@ -2386,6 +2469,7 @@ public final class LiveLedger implements Ledger {
             state.counts.dropBelow(oldest);
             state.blind.fold(oldest);
             state.ranges.fold(oldest);
+            state.releaseRun(cutBound);
         }
         sweep(bounds, cutBound, SWEEP_BUDGET);
     }
@@ -2794,7 +2878,8 @@ public final class LiveLedger implements Ledger {
         long count(KeyspaceState state) {
             var point = writerPoint(scanBound());
             var blind = state.blind.correction(sequence - 1, key -> Reads.inTreeOnly(state, key, point));
-            return state.counts.last() + blind + state.ranges.correction(sequence - 1) + delta(state);
+            return state.counts.last() + state.replayCorrection() + blind + state.ranges.correction(sequence - 1)
+                    + delta(state);
         }
 
         private long nextStamp() {

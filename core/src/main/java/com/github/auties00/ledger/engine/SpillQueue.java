@@ -196,6 +196,18 @@ final class SpillQueue {
         return true;
     }
 
+    /// {@return the place in the log of a value a recovery replays into a [PackedRun]: the `length` bytes at `bodyIndex`
+    /// of `frame`, the opened body of the frame at `frameOffset` of `segment`, which holds it durably, of the write
+    /// stamped `stamp`, tagged where they lie}
+    ///
+    /// @param crypto the caller's, until it gives it back ([#takeCrypto()])
+    LogValue tagReplayed(Crypto crypto, LogSegmentView segment, long frameOffset, int bodyIndex, long stamp, byte[] frame,
+                         int length) {
+        var logged = crypto.logValue(segment, frameOffset, bodyIndex, stamp, frame, bodyIndex, length);
+        loggedValues.incrementAndGet();
+        return logged;
+    }
+
     /// Queues `record`, of a published commit after every one queued, and starts moving values if the queue is over
     /// its budget.
     void add(Record record) {

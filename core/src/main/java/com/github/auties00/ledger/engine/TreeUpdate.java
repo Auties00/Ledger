@@ -110,7 +110,15 @@ final class TreeUpdate {
     /// @param version its version as of the checkpoint, or `null` if the key has none
     /// @param blind the chain of the key, if a blind write the checkpoint takes needs to know whether the tree held
     ///              the key ([BlindWrites]), which the update records on it; or `null`
-    record Op(Chain keyed, Version version, Chain blind) {
+    /// @param settles where the update records whether the tree held the key for the [PackedRun] that holds it
+    ///                ([PackedRun#settles()]), or `null`
+    /// @param entry the key's entry in that run, or -1
+    record Op(Chain keyed, Version version, Chain blind, byte[] settles, int entry) {
+        /// Makes the state of the key of `keyed` with `version`, as [Op] does, for a key no run holds.
+        Op(Chain keyed, Version version, Chain blind) {
+            this(keyed, version, blind, null, -1);
+        }
+
         /// Makes the state of `key` with `value`, or with none if `null`.
         Op(MemorySegment key, MemorySegment value) {
             this(new Chain(key, 0), value == null ? null : new Version(0, value, null, null), null);
@@ -145,10 +153,13 @@ final class TreeUpdate {
             return version == null ? null : version.external();
         }
 
-        /// Records on the chain of a blind write whether the tree held the key.
+        /// Records on the chain of a blind write, and for the run that holds the key, whether the tree held the key.
         void settle(boolean inTree) {
             if (blind != null) {
                 blind.settle(inTree);
+            }
+            if (settles != null && entry >= 0) {
+                PackedRun.settle(settles, entry, inTree);
             }
         }
     }
