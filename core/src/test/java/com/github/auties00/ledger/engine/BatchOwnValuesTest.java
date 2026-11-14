@@ -223,9 +223,16 @@ class BatchOwnValuesTest {
                 ledger.commit(batch).awaitDurable();
                 caller[1]++;
                 var version = head(ledger, MESSAGES, new byte[]{1});
-                assertEquals(length, version.sourceBytesForTests());
-                assertEquals(length >= OWN, version.sourceForTests() instanceof byte[]);
-                assertNotSame(caller, version.sourceForTests());
+                if (borrowed) {
+                    // A value of the file of large values: its unit holds it, and memory keeps neither the caller's
+                    // array nor a copy of it
+                    assertInstanceOf(BlobFile.class, version.sourceForTests());
+                    assertEquals(0, version.sourceBytesForTests());
+                } else {
+                    assertEquals(length, version.sourceBytesForTests());
+                    assertEquals(length >= OWN, version.sourceForTests() instanceof byte[]);
+                    assertNotSame(caller, version.sourceForTests());
+                }
                 assertArrayEquals(expected, ledger.get(MESSAGES, new byte[]{1}).orElseThrow());
                 ledger.checkpoint();
                 assertArrayEquals(expected, ledger.get(MESSAGES, new byte[]{1}).orElseThrow());

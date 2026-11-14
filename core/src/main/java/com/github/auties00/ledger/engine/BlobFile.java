@@ -4,6 +4,7 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.LedgerIoException;
 
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.FileChannel;
@@ -28,6 +29,13 @@ import java.util.concurrent.atomic.AtomicLong;
 /// data file's records its free pages, which list as free every unit no checkpoint has taken, since recovery claims
 /// again the units of the commits it replays.
 ///
+/// Memory keeps no copy of a value of a paged key space that a unit holds: until a checkpoint takes the unit, its
+/// version names the unit ([Version#ofUnit]), and a read opens it through the page cache, screened as a read of a
+/// tree's value is ([#copyValue(PageRef, int)]), so a value read once costs a read of the file and an open, as one
+/// after a checkpoint does, and only a value read twice stays in the cache. A unit a commit replaced before a
+/// checkpoint took it therefore waits, as one a checkpoint freed does, for every reader that may still read it
+/// ([#pendSuperseded(long, List)]).
+///
 /// Units follow [PageFormat], kind [PageFormat#EXTERNAL], sealed under a key of their own. A unit's nonce is the store's
 /// epoch, which grows with every open and is made durable before the open's first unit, then a counter: no nonce
 /// repeats under the key, and whatever refers to a unit records it, so a unit left in reused pages fails the check.
@@ -36,6 +44,9 @@ import java.util.concurrent.atomic.AtomicLong;
 final class BlobFile implements AutoCloseable {
     /// The name of the file in the store's directory.
     static final String FILE = "ledger.blobs";
+    /// The most bytes one call of a channel reads or writes: the JDK moves the bytes of a heap buffer through a
+    /// temporary direct buffer of the call's size, which it keeps for the thread until the thread ends, so a read of a
+    /// 16 MiB unit in one call left each reading thread 16 MiB of native memory.
     private static final int BUFFER = 1 << 20;
     /// The trailing free pages, 64 MiB of them, below which [#trim()] keeps the file's length.
     private static final int TRIM_SLACK = 16_384;
@@ -64,6 +75,10 @@ final class BlobFile implements AutoCloseable {
     private volatile Runnable epochGate;
     // Whether a unit was sealed under this open's epoch, which a later open must then not reuse
     private volatile boolean epochTaken;
+    // Set once the file closes: a caller then gets no channel, rather than one opened again that nothing closes
+    private volatile boolean closed;
+    // Runs before each read of a unit from the file, or null; for tests that race a read with what frees its unit
+    private volatile Runnable readHookForTests;
 
     private BlobFile(Path path, FileChannel channel, PageCipher cipher, PageCache cache, HeapPool pool, FreeSpace space) throws IOException {
         this.path = path;
@@ -177,13 +192,84 @@ final class BlobFile implements AutoCloseable {
             release(ref);
             throw new LedgerIoException(path + " could not be written", exception);
         } finally {
-            channels.offer(through[0]);
+            giveBack(through[0]);
             pool.release(buffer);
             if (interrupted[0]) {
                 Thread.currentThread().interrupt();
             }
         }
         return ref;
+    }
+
+    /// {@return the value of `length` bytes the unit `ref` holds, read-only, as a slice of the unit's plaintext}
+    ///
+    /// The unit comes from the page cache or the file, which screens it as a read of a tree's value: the cache takes
+    /// it at its second read. A view goes to a visitor, which may keep it, so its array is never recycled.
+    ///
+    /// @throws LedgerCorruptedException if the unit fails authentication, is not the one `ref` names, or does not
+    ///                                  hold `length` bytes
+    /// @throws LedgerIoException if the file cannot be read
+    MemorySegment value(PageRef ref, int length) {
+        var plain = read(ref, true, true, PageCache.POINT);
+        checkLength(ref, plain, length);
+        return MemorySegment.ofArray(plain).asSlice(PageFormat.HEADER, length).asReadOnly();
+    }
+
+    /// {@return the value of `length` bytes the unit `ref` holds, in a new array}
+    ///
+    /// The unit comes from the page cache or the file, which screens it as a read of a tree's value: the cache takes
+    /// it at its second read, if it [holds][PageCache#holds(long)] units of its size, so a value read once leaves
+    /// nothing reachable. A unit above [HeapPool#MAX_POOLED] that the cache does not take is read and opened into
+    /// arrays of the pool's large spares ([HeapPool#acquireLarge(int)]), which go back once the value is copied out,
+    /// so the read allocates no array but the caller's; it is never kept weakly for a
+    /// [recall][PageCache#recall(long, PageRef, int)], since a later read writes the spare.
+    ///
+    /// @throws LedgerCorruptedException if the unit fails authentication, is not the one `ref` names, or does not
+    ///                                  hold `length` bytes
+    /// @throws LedgerIoException if the file cannot be read
+    byte[] copyValue(PageRef ref, int length) {
+        if ((long) ref.pages() * PageFormat.SIZE <= HeapPool.MAX_POOLED) {
+            var plain = read(ref, true, true, PageCache.POINT);
+            checkLength(ref, plain, length);
+            return Segments.toBytes(plain, PageFormat.HEADER, length);
+        }
+        var key = PageCache.key(PageCache.BLOBS, ref.page());
+        var held = cache.get(key, ref);
+        if (held == null) {
+            held = cache.recall(key, ref, PageCache.POINT);
+        }
+        if (held != null) {
+            checkLength(ref, held, length);
+            return Segments.toBytes(held, PageFormat.HEADER, length);
+        }
+        var plain = readUnit(ref, true, true);
+        if (plain == null) {
+            throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+        }
+        try {
+            checkLength(ref, plain, length);
+        } catch (LedgerCorruptedException exception) {
+            pool.releaseLarge(plain);
+            throw exception;
+        }
+        if (cache.holds((long) ref.pages() * PageFormat.SIZE) && cache.admits(key, ref, PageCache.POINT)) {
+            // The cache holds it from now on, or drops it if it closed: never back to the spares, as readers may
+            // still read it
+            cache.put(key, ref, plain, true);
+            return Segments.toBytes(plain, PageFormat.HEADER, length);
+        }
+        var copy = Segments.toBytes(plain, PageFormat.HEADER, length);
+        pool.releaseLarge(plain);
+        return copy;
+    }
+
+    // Throws if `plain`, the plaintext of the unit `ref` names, does not hold a value of `length` bytes
+    private void checkLength(PageRef ref, byte[] plain, int length) {
+        var content = Bytes.i32(plain, PageFormat.LENGTH);
+        if (content != length) {
+            throw new LedgerCorruptedException(path + " holds " + content + " bytes at page " + ref.page()
+                    + " for a value of " + length, null);
+        }
     }
 
     /// {@return the plaintext of the unit `ref` names, header included}
@@ -209,6 +295,11 @@ final class BlobFile implements AutoCloseable {
 
     /// {@return the plaintext of the unit `ref` names, from the cache or the file}
     ///
+    /// A unit of half a region of G1 or more that a screened read does not cache is not kept weakly for a
+    /// [recall][PageCache#recall(long, PageRef, int)] either: G1 frees a humongous array no one reaches at its next young
+    /// collection, and one reached weakly only after the next marking, which a store reading large values once may
+    /// wait for with all of them committed.
+    ///
     /// @param cached whether to keep the unit in the cache
     /// @param referenced whether a unit the cache takes counts as read, rather than as the first it evicts
     /// @param screen the screening of a unit read as read, which goes to the cache only if it
@@ -228,44 +319,84 @@ final class BlobFile implements AutoCloseable {
                 return recalled;
             }
         }
-        var plain = readUnit(ref, cached);
+        var plain = readUnit(ref, cached, false);
         if (plain == null) {
             throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
         }
         if (screened != PageCache.UNSCREENED) {
-            cache.putScreened(key, ref, plain, screened);
+            if (cache.admits(key, ref, screened)) {
+                cache.put(key, ref, plain, true);
+            } else if (!humongous(plain.length)) {
+                cache.refuse(key, ref, plain);
+            }
         } else if (cached) {
             cache.put(key, ref, plain, referenced);
         }
         return plain;
     }
 
+    /// {@return whether G1 gives an array of `length` bytes regions of its own: half a region or more}
+    private static boolean humongous(int length) {
+        var region = HeapPool.region();
+        return region > 0 && length >= region / 2;
+    }
+
     /// {@return the plaintext of the unit `ref` names, its whole pages, or `null` if the file does not hold it whole}
     ///
     /// @throws LedgerIoException if the file cannot be read
     byte[] readUnit(PageRef ref) {
-        return readUnit(ref, false);
+        return readUnit(ref, false, false);
+    }
+
+    /// {@return whether the file holds the unit `ref` names whole and authenticated, with `length` bytes of content}
+    ///
+    /// It keeps nothing: a unit above [HeapPool#MAX_POOLED] is read and opened into the pool's large spares, which go
+    /// back at once.
+    ///
+    /// @throws LedgerIoException if the file cannot be read
+    boolean authenticates(PageRef ref, long length) {
+        var plain = readUnit(ref, false, true);
+        if (plain == null) {
+            return false;
+        }
+        var holds = Bytes.i32(plain, PageFormat.LENGTH) == length;
+        pool.releaseLarge(plain);
+        return holds;
     }
 
     /// {@return the plaintext of the unit `ref` names, or `null` if the file does not hold it whole}
     ///
+    /// A unit above [HeapPool#MAX_POOLED] is read into an array of the pool's large spares, which goes back at the
+    /// end. The channel reads at most [#BUFFER] bytes a call.
+    ///
     /// @param cached whether the unit is for the cache, and may end with its content
+    /// @param spare whether a unit above [HeapPool#MAX_POOLED] kept whole is opened into an array of the pool's large
+    ///              spares, which the caller gives back through [HeapPool#releaseLarge(byte\[\])] unless it hands it to
+    ///              the cache; such an array may be longer than the unit, and hold another unit's bytes past it
     /// @throws LedgerIoException if the file cannot be read
-    private byte[] readUnit(PageRef ref, boolean cached) {
-        var length = ref.pages() * PageFormat.SIZE;
-        var sealed = pool.acquire(length);
+    private byte[] readUnit(PageRef ref, boolean cached, boolean spare) {
+        var hook = readHookForTests;
+        if (hook != null) {
+            hook.run();
+        }
+        var pages = ref.pages();
+        var length = pages * PageFormat.SIZE;
+        var large = length > HeapPool.MAX_POOLED;
+        var sealed = large ? pool.acquireLarge(length) : pool.acquire(length);
         var through = takeChannel();
         var interrupted = false;
         try {
             var target = ByteBuffer.wrap(sealed, 0, length);
             var position = PageFormat.offset(ref.page());
-            while (target.hasRemaining()) {
+            while (target.position() < length) {
+                target.limit(Math.min(length, target.position() + BUFFER));
                 try {
                     if (through.read(target, position + target.position()) < 0) {
                         return null;
                     }
                 } catch (ClosedByInterruptException _) {
-                    // The interrupt closed the channel; read on a new one and give the caller its interrupt back
+                    // The interrupt closed the channel; read on a new one, from where the last read ended, and give
+                    // the caller its interrupt back
                     interrupted |= Thread.interrupted();
                     through = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
                 }
@@ -273,15 +404,30 @@ final class BlobFile implements AutoCloseable {
             // The header is the additional data of the tag and the open copies it as it is, so what it says holds once
             // the unit authenticates: it is checked first, and tells the bytes to keep
             var content = Bytes.i32(sealed, PageFormat.LENGTH);
-            if (!ref.describes(sealed) || sealed[PageFormat.KIND] != PageFormat.EXTERNAL || !PageFormat.fits(ref.pages(), content)) {
+            if (!ref.describes(sealed) || sealed[PageFormat.KIND] != PageFormat.EXTERNAL
+                    || !PageFormat.fits(pages, content)) {
                 return null;
             }
-            return cipher.open(sealed, 0, ref.pages(), cached ? PageFormat.cachedLength(ref.pages(), content) : length, pool);
+            var keep = cached ? PageFormat.cachedLength(pages, content) : length;
+            if (spare && large && keep == length) {
+                // Out of place, so the open runs the AES-GCM intrinsic that decrypts and authenticates in one pass
+                var plain = pool.acquireLarge(length);
+                if (cipher.open(sealed, 0, pages, plain)) {
+                    return plain;
+                }
+                pool.releaseLarge(plain);
+                return null;
+            }
+            return cipher.open(sealed, 0, pages, keep, pool);
         } catch (IOException exception) {
             throw new LedgerIoException(path + " could not be read", exception);
         } finally {
-            channels.offer(through);
-            pool.release(sealed);
+            giveBack(through);
+            if (large) {
+                pool.releaseLarge(sealed);
+            } else {
+                pool.release(sealed);
+            }
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }
@@ -289,7 +435,12 @@ final class BlobFile implements AutoCloseable {
     }
 
     /// {@return a channel for a caller's write or read, open, waiting for one if every one is in use}
+    ///
+    /// @throws IllegalStateException if the file closed
     private FileChannel takeChannel() {
+        if (closed) {
+            throw new IllegalStateException("The store is closed");
+        }
         var interrupted = false;
         try {
             while (true) {
@@ -297,6 +448,10 @@ final class BlobFile implements AutoCloseable {
                     var taken = channels.take();
                     if (taken.isOpen()) {
                         return taken;
+                    }
+                    if (closed) {
+                        channels.offer(taken);
+                        throw new IllegalStateException("The store is closed");
                     }
                     // An interrupt closed it after its last use, and it could not be replaced then
                     try {
@@ -316,12 +471,24 @@ final class BlobFile implements AutoCloseable {
         }
     }
 
+    /// Gives back `through`, a channel [#takeChannel()] gave, and closes it if the file closed meanwhile.
+    private void giveBack(FileChannel through) {
+        channels.offer(through);
+        if (closed) {
+            try {
+                through.close();
+            } catch (IOException _) {
+                // Nothing was left unforced through a caller's channel
+            }
+        }
+    }
+
     /// Forces every unit written so far, and the length of the file.
     void force() throws IOException {
         channel.force(true);
     }
 
-    /// Frees the pages of `ref` at once: a unit no commit made durable, or one a checkpoint superseded.
+    /// Frees the pages of `ref` at once: a unit of a commit no reader can see, which no log frame names.
     void release(PageRef ref) {
         synchronized (lock) {
             unadopted.remove(ref);
@@ -352,6 +519,25 @@ final class BlobFile implements AutoCloseable {
     /// Frees `units`, which a published checkpoint's tree no longer points to, once every reader is past `published`.
     void pend(long published, List<PageRef> units) {
         space.pend(published, units);
+    }
+
+    /// Frees `units`, which no published checkpoint's tree points to and whose versions commits replaced before a
+    /// checkpoint took them, once every reader is past `published`: a reader below the commit that replaced one may
+    /// still read it, as memory keeps no copy of a paged value ([#copyValue(PageRef, int)]).
+    ///
+    /// They leave the units in flight and join the pending ones at once, holding the lock [#durableRuns] takes, so a
+    /// checkpoint lists each of them as free exactly once. The list is kept as it is, so no one may change it from now
+    /// on.
+    void pendSuperseded(long published, List<PageRef> units) {
+        if (units.isEmpty()) {
+            return;
+        }
+        synchronized (lock) {
+            for (var unit : units) {
+                unadopted.remove(unit);
+            }
+            space.pend(published, units);
+        }
     }
 
     /// Frees what [#pend] holds for checkpoints published before `oldestReader`.
@@ -408,6 +594,17 @@ final class BlobFile implements AutoCloseable {
         }
     }
 
+    /// Makes `hook` run before each read of a unit from the file, or stops if `null`; for tests that race a read with
+    /// the commits and checkpoints that free its unit.
+    void readHookForTests(Runnable hook) {
+        this.readHookForTests = hook;
+    }
+
+    /// {@return the array the page cache holds for the unit `ref` names, or `null`; for tests}
+    byte[] cachedForTests(PageRef ref) {
+        return cache.get(PageCache.key(PageCache.BLOBS, ref.page()), ref);
+    }
+
     /// {@return the units no published checkpoint points to, for tests}
     int unadoptedForTests() {
         synchronized (lock) {
@@ -417,6 +614,8 @@ final class BlobFile implements AutoCloseable {
 
     @Override
     public void close() {
+        // Before the channels close: a caller that takes one after sees it, and one that gives one back closes it
+        closed = true;
         try {
             channel.close();
         } catch (IOException _) {

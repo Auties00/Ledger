@@ -434,4 +434,85 @@ class HeapPoolTest {
         assertTrue(pool.reservedBytesForTests() <= HeapPool.RESERVE);
         assertTrue(pool.pooledBytesForTests() <= 32L << 20);
     }
+
+    @Test
+    @DisplayName("hands a large array, region-exact, back only for a unit of the same regions, keeps at most two, weakly, and trims them when idle")
+    void largeSpares() throws InterruptedException {
+        HeapPool.forceRegionForTests(1 << 20);
+        try {
+            var pool = new HeapPool(1 << 20, false);
+            var unit = (2 << 20) + PageFormat.SIZE;
+            var array = pool.acquireLarge(unit);
+            // Three regions of 1 MiB, less the headroom of the array's header
+            assertEquals((3 << 20) - ValueSlab.HEADROOM, array.length);
+            pool.releaseLarge(array);
+            assertNotSame(array, pool.acquireLarge((1 << 20) + PageFormat.SIZE), "an array of more regions than the unit needs");
+            assertSame(array, pool.acquireLarge(unit + PageFormat.SIZE));
+            // Of the pooled sizes, or not region-exact: never kept
+            pool.releaseLarge(new byte[HeapPool.MAX_POOLED]);
+            pool.releaseLarge(new byte[3 << 20]);
+            assertEquals(0, pool.largeSparesForTests());
+            var arrays = new ArrayList<byte[]>();
+            for (var i = 0; i < 3; i++) {
+                arrays.add(pool.acquireLarge(unit));
+            }
+            arrays.forEach(pool::releaseLarge);
+            assertEquals(HeapPool.LARGE_SPARES, pool.largeSparesForTests());
+            pool.trimIfIdle();
+            assertEquals(HeapPool.LARGE_SPARES, pool.largeSparesForTests(), "taken since the last trim");
+            pool.trimIfIdle();
+            assertEquals(0, pool.largeSparesForTests(), "none taken between two trims");
+            var spare = pool.acquireLarge(unit);
+            var reference = new WeakReference<>(spare);
+            pool.releaseLarge(spare);
+            arrays.clear();
+            spare = null;
+            for (var attempt = 0; attempt < 20 && !reference.refersTo(null); attempt++) {
+                System.gc();
+                Thread.sleep(10);
+            }
+            assertNull(reference.get(), "the pool keeps a large array strongly");
+            assertEquals(0, pool.largeSparesForTests());
+        } finally {
+            HeapPool.forceRegionForTests(-1);
+        }
+    }
+
+    @Test
+    @DisplayName("a large array below half a region is the length asked for, not a whole region, and one of half a region or more fills whole regions")
+    void largeSparesBelowHalfRegion() {
+        HeapPool.forceRegionForTests(8 << 20);
+        try {
+            var pool = new HeapPool(1 << 20, false);
+            var short_ = (1 << 20) + PageFormat.SIZE;
+            var array = pool.acquireLarge(short_);
+            assertEquals(short_, array.length, "G1 gives an array below half a region no region of its own");
+            pool.releaseLarge(array);
+            assertNotSame(array, pool.acquireLarge(short_ + PageFormat.SIZE));
+            assertSame(array, pool.acquireLarge(short_));
+            var lastShort = (4 << 20) - ValueSlab.HEADROOM - 1;
+            assertEquals(lastShort, HeapPool.largeLength(lastShort));
+            assertEquals((8 << 20) - ValueSlab.HEADROOM, HeapPool.largeLength(lastShort + 1));
+            assertEquals((16 << 20) - ValueSlab.HEADROOM, HeapPool.largeLength((8 << 20) + PageFormat.SIZE));
+        } finally {
+            HeapPool.forceRegionForTests(-1);
+        }
+    }
+
+    @Test
+    @DisplayName("without a known region, a large array is the length asked for, reused only at that length")
+    void largeSparesWithoutRegion() {
+        HeapPool.forceRegionForTests(0);
+        try {
+            var pool = new HeapPool(1 << 20, false);
+            var length = (2 << 20) + PageFormat.SIZE;
+            var array = pool.acquireLarge(length);
+            assertEquals(length, array.length);
+            pool.releaseLarge(array);
+            assertNotSame(array, pool.acquireLarge(length + PageFormat.SIZE));
+            assertSame(array, pool.acquireLarge(length));
+        } finally {
+            HeapPool.forceRegionForTests(-1);
+        }
+    }
 }

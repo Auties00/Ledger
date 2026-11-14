@@ -21,10 +21,14 @@ import java.util.concurrent.atomic.AtomicLong;
 ///
 /// An entry holds the plaintext of the unit, which may end with its content ([PageFormat#cachedLength(int, int)]), and
 /// is never written again, so a reader keeps using an array the cache has evicted: the array goes to the collector, not
-/// back to a pool, and no read pins anything. The limit counts the bytes of the arrays, not of the units' pages. An
-/// entry is found only under the nonce and the pages its unit was sealed with ([PageRef]), so a page a later checkpoint
-/// reused never returns the unit it held before. An entry the cache drops lets go of its array at once: the memory the
-/// cache keeps reachable stays within its limit.
+/// back to a pool, and no read pins anything. The limit counts the bytes of the arrays ([#charge(byte\[\])]), not of
+/// the units' pages, but for an array above [HeapPool#MAX_POOLED] longer than its unit, which counts as its unit's
+/// pages: a read of a unit of half a region of G1 or more opens it into an array that fills whole regions
+/// ([HeapPool#acquireLarge(int)]), whose bytes past the unit take no memory a unit's own array would not, as G1 gives
+/// either regions of its own; a shorter unit's array is the unit's length. An entry is found only under the nonce and
+/// the pages its unit was sealed with ([PageRef]), so a page a later checkpoint reused never returns the unit it held
+/// before. An entry the cache drops lets go of its array at once: the memory the cache keeps reachable stays within
+/// its limit.
 ///
 /// An entry no read used for a whole period of the [IdleTicker] leaves at its next tick, however full the caches are:
 /// the clock evicts only past the limit, so a store that stopped reading kept a limit of pages, mostly the ones its last
@@ -276,7 +280,7 @@ final class PageCache implements IdleTicker.Watched {
     ///             array cached again under other metadata could pass as the leaf of a nonce it does not hold
     /// @param referenced whether the unit counts as read, rather than written and maybe never read
     void put(long key, PageRef ref, byte[] unit, boolean referenced) {
-        if (!holds(unit.length)) {
+        if (!holds(charge(unit))) {
             // A unit this large would evict most of the cache for one read; what the page held is out of date
             remove(key);
             return;
@@ -641,14 +645,14 @@ final class PageCache implements IdleTicker.Watched {
         UNITS.setRelease(table.units, slot, unit);
         table.append(slot);
         table.clock.live++;
-        account(unit.length);
+        account(charge(unit));
     }
 
     /// Takes the entry of `slot` out of the clock and the accounts, leaving its array and metadata to the caller.
     private void drain(Table table, int slot) {
         table.unlink(slot);
         table.clock.live--;
-        account(-table.units[slot].length);
+        account(-charge(table.units[slot]));
     }
 
     /// {@return the table to add an entry to: `table`, or one that replaces it, larger if the entries would pass half of
@@ -841,6 +845,20 @@ final class PageCache implements IdleTicker.Watched {
     /// {@return whether the cache would keep a unit of `bytes` bytes: one above a quarter of the limit it never does}
     boolean holds(long bytes) {
         return bytes <= budget.limit() / 4;
+    }
+
+    /// {@return the bytes the limit counts for `unit`, an array the cache holds or may: its length, or the bytes of
+    /// the pages its header gives if they are above [HeapPool#MAX_POOLED] and fewer}
+    ///
+    /// A function of the array's length and header alone, which never change once it is cached, so an entry gives
+    /// back what it took.
+    static long charge(byte[] unit) {
+        var length = unit.length;
+        if (length <= HeapPool.MAX_POOLED) {
+            return length;
+        }
+        var pages = (long) Bytes.i32(unit, PageFormat.PAGES) * PageFormat.SIZE;
+        return pages > HeapPool.MAX_POOLED && pages < length ? pages : length;
     }
 
     /// {@return the bytes of leaves and delta pages one checkpoint may cache at the cost of evicting others}

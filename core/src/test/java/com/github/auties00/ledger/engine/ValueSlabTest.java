@@ -145,7 +145,7 @@ class ValueSlabTest {
         }
 
         @Test
-        @DisplayName("beside a value the slab declines, the values it takes keep their chunk and the declined one has an array of the declined bytes alone")
+        @DisplayName("beside a value the slab declines, the values it takes keep their chunk and the declined one, which its unit holds, keeps no copy")
         void beside(@TempDir Path directory) throws Exception {
             try (var ledger = (LiveLedger) store(directory).largeValues(64 << 10).build()) {
                 ledger.valueSlab().forceHotForTests(REGION);
@@ -155,7 +155,7 @@ class ValueSlabTest {
                         .put(SESSIONS, new byte[]{3}, filled(500, 3))
                         .put(MESSAGES, new byte[]{4}, new byte[0])
                         .put(MESSAGES, new byte[]{5}, filled(400, 5))).awaitDurable();
-                assertEquals(70_000, head(ledger, MESSAGES, new byte[]{1}).sourceBytesForTests());
+                assertEquals(0, head(ledger, MESSAGES, new byte[]{1}).sourceBytesForTests());
                 assertEquals(CHUNK, head(ledger, MESSAGES, new byte[]{2}).sourceBytesForTests());
                 assertEquals(70_000, head(ledger, MESSAGES, new byte[]{4}).sourceBytesForTests());
                 assertEquals(CHUNK, head(ledger, MESSAGES, new byte[]{5}).sourceBytesForTests());
