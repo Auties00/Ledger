@@ -40,9 +40,10 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/// Values of a G1 region or more that a batch keeps in two arrays, a head of whole regions and a short tail, until a
-/// checkpoint: which values split, what reads, checkpoints, recovery and a commit that failed see of them, and how
-/// concurrent writers, readers and checkpoints share them. Every test forces a region of 1 MiB, whatever the JVM runs.
+/// Values of a G1 region or more that a batch keeps in two arrays, a head of whole regions and a short tail, until its
+/// commit seals them into their unit, whose version then keeps no copy: which values split, what reads, checkpoints,
+/// recovery and a commit that failed see of them, and how concurrent writers, readers and checkpoints share them.
+/// Every test forces a region of 1 MiB, whatever the JVM runs.
 class SplitValuesTest {
     private static final byte[] KEY = new byte[32];
     private static final long REGION = 1L << 20;
@@ -81,15 +82,12 @@ class SplitValuesTest {
         return ((LiveLedger) ledger).state(keyspace).chain(MemorySegment.ofArray(key.getBytes())).head;
     }
 
-    private static void assertSplit(Version version, int length) {
-        var split = assertInstanceOf(SplitValue.class, version.sourceForTests());
-        assertEquals(SplitValue.headLength(length, REGION), split.head.length);
-        assertEquals(length, split.length());
-        assertEquals(length, version.sourceBytesForTests());
+    // Asserts that the version of a split value names its unit alone, with no copy of the value in memory
+    private static void assertUnitOnly(Version version, int length) {
+        assertInstanceOf(BlobFile.class, version.sourceForTests());
+        assertInstanceOf(Version.External.class, version);
+        assertEquals(0, version.sourceBytesForTests());
         assertEquals(length, version.valueLength());
-        // The head and its header fill whole regions, and the tail is an ordinary object
-        assertEquals(0, (split.head.length + ValueSlab.HEADROOM) % REGION);
-        assertTrue(split.tail.length < REGION / 2);
     }
 
     private static void assertReads(Ledger ledger, String key, byte[] expected) {
@@ -219,8 +217,8 @@ class SplitValuesTest {
                 ledger.commit(ledger.newBatch().put(FILES, "exact", exact)).awaitDurable();
                 ledger.commit(ledger.newBatch().putEncoded(FILES, MemorySegment.ofArray("odd".getBytes()), MemorySegment.ofArray(odd)))
                         .awaitDurable();
-                assertSplit(head(ledger, FILES, "exact"), EXACT);
-                assertSplit(head(ledger, FILES, "odd"), ODD);
+                assertUnitOnly(head(ledger, FILES, "exact"), EXACT);
+                assertUnitOnly(head(ledger, FILES, "odd"), ODD);
                 assertReads(ledger, "exact", exact);
                 assertReads(ledger, "odd", odd);
                 try (var snapshot = ledger.snapshot()) {
@@ -247,7 +245,7 @@ class SplitValuesTest {
             var exact = value(12, EXACT);
             var ledger = options(directory, true).build();
             ledger.commit(ledger.newBatch().put(FILES, "exact", exact).put(FILES, "small", new byte[]{1})).awaitDurable();
-            assertSplit(head(ledger, FILES, "exact"), EXACT);
+            assertUnitOnly(head(ledger, FILES, "exact"), EXACT);
             ((LiveLedger) ledger).closeWithoutCheckpoint();
             try (var reopened = options(directory, true).build()) {
                 assertReads(reopened, "exact", exact);
@@ -263,7 +261,7 @@ class SplitValuesTest {
             try (var ledger = options(directory, true).build()) {
                 ledger.commit(ledger.newBatch().put(FILES, "a", new byte[]{1}).put(FILES, "b", new byte[]{2})).awaitDurable();
                 ledger.commit(ledger.newBatch().deleteRange(FILES, KeyRange.between("a", "c")).put(FILES, "c", exact)).awaitDurable();
-                assertSplit(head(ledger, FILES, "c"), EXACT);
+                assertUnitOnly(head(ledger, FILES, "c"), EXACT);
                 assertTrue(ledger.get(FILES, "a").isEmpty());
                 assertReads(ledger, "c", exact);
                 ledger.checkpoint();
@@ -320,7 +318,7 @@ class SplitValuesTest {
                 assertThrows(IllegalStateException.class, () -> ledger.commit(batch));
                 fails.set(false);
                 ledger.commit(batch).awaitDurable();
-                assertSplit(head(ledger, FILES, "odd"), ODD);
+                assertUnitOnly(head(ledger, FILES, "odd"), ODD);
                 assertReads(ledger, "odd", odd);
                 ledger.checkpoint();
                 assertReads(ledger, "odd", odd);

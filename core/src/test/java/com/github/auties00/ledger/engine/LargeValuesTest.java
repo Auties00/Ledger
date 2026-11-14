@@ -2,6 +2,7 @@ package com.github.auties00.ledger.engine;
 
 import com.github.auties00.ledger.Encryption;
 import com.github.auties00.ledger.KeyCodec;
+import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.LedgerCorruptedException;
@@ -10,20 +11,33 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Optional;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -304,6 +318,311 @@ class LargeValuesTest {
                 var zeros = ByteBuffer.allocate((int) Math.max(0, channel.size() - PageFormat.offset(PageFormat.FIRST_UNIT_PAGE)));
                 channel.write(zeros, PageFormat.offset(PageFormat.FIRST_UNIT_PAGE));
                 channel.force(true);
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("values no checkpoint took")
+    class Pending {
+        private static final Keyspace<String, byte[]> SESSIONS = Keyspace.resident("sessions", KeyCodec.utf8(), ValueCodec.bytes());
+        // Above the pooled sizes: their units take three, four and two regions of 1 MiB, which the tests force
+        private static final int LARGE = (2 << 20) + 100;
+        private static final int LARGER = (3 << 20) + 100;
+        private static final int SMALL_LARGE = (1 << 20) + 100;
+
+        private static Version head(Ledger ledger, String key) {
+            return ((LiveLedger) ledger).state(FILES).chain(MemorySegment.ofArray(key.getBytes())).head;
+        }
+
+        private static PageRef unit(Ledger ledger, String key) {
+            return assertInstanceOf(Version.External.class, head(ledger, key)).unit;
+        }
+
+        @ParameterizedTest(name = "{0} bytes")
+        @ValueSource(ints = {10_000, LARGE})
+        @DisplayName("keep no copy in memory, and read the same before a checkpoint, after it and after a reopen")
+        void noCopy(int length, @TempDir Path directory) throws Exception {
+            SplitValue.forceRegionForTests(1 << 20);
+            try {
+                var expected = value(90, length);
+                try (var ledger = open(directory, true)) {
+                    ledger.commit(ledger.newBatch().put(FILES, "v", expected)).awaitDurable();
+                    assertInstanceOf(BlobFile.class, head(ledger, "v").sourceForTests());
+                    assertEquals(0, head(ledger, "v").sourceBytesForTests());
+                    for (var read = 0; read < 3; read++) {
+                        assertArrayEquals(expected, ledger.get(FILES, "v").orElseThrow());
+                        assertArrayEquals(expected, ledger.readEncoded(FILES, "v", segment -> segment.toArray(ValueLayout.JAVA_BYTE)).orElseThrow());
+                        var visited = new ArrayList<byte[]>();
+                        ledger.forEachEncoded(FILES, KeyRange.all(), (_, value) -> visited.add(value.toArray(ValueLayout.JAVA_BYTE)));
+                        assertEquals(1, visited.size());
+                        assertArrayEquals(expected, visited.getFirst());
+                    }
+                    ledger.checkpoint();
+                    assertArrayEquals(expected, ledger.get(FILES, "v").orElseThrow());
+                }
+                try (var ledger = open(directory, true)) {
+                    assertArrayEquals(expected, ledger.get(FILES, "v").orElseThrow());
+                }
+                CheckpointTest.verifyPages(directory, true);
+            } finally {
+                SplitValue.forceRegionForTests(-1);
+            }
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("a snapshot reads a value a later commit replaced, after the checkpoint of that commit and new values that would reuse free pages")
+        void snapshotAcrossOverwrite(boolean encrypted, @TempDir Path directory) throws Exception {
+            var first = value(91, 40_000);
+            try (var ledger = open(directory, encrypted)) {
+                ledger.commit(ledger.newBatch().put(FILES, "a", first)).awaitDurable();
+                try (var snapshot = ledger.snapshot()) {
+                    ledger.commit(ledger.newBatch().put(FILES, "a", value(92, 40_000))).awaitDurable();
+                    ledger.checkpoint();
+                    for (var round = 0; round < 6; round++) {
+                        ledger.commit(ledger.newBatch().put(FILES, "x" + round, value(93 + round, 40_000))).awaitDurable();
+                        ledger.checkpoint();
+                    }
+                    assertArrayEquals(first, snapshot.get(FILES, "a").orElseThrow());
+                }
+                assertArrayEquals(value(92, 40_000), ledger.get(FILES, "a").orElseThrow());
+                // Once the snapshot closed, the replaced unit leaves the units in flight and its pages free
+                ledger.commit(ledger.newBatch().put(FILES, "y", value(99, 40_000))).awaitDurable();
+                ledger.checkpoint();
+                assertEquals(0, ((LiveLedger) ledger).blobsForTests().unadoptedForTests());
+            }
+            CheckpointTest.verifyPages(directory, encrypted);
+        }
+
+        @Test
+        @DisplayName("a snapshot reads a value a later range removal covered, after the checkpoint of the removal and new values")
+        void snapshotAcrossRangeRemoval(@TempDir Path directory) throws Exception {
+            var removed = value(100, 30_000);
+            try (var ledger = open(directory, true)) {
+                ledger.commit(ledger.newBatch().put(FILES, "r1", removed).put(FILES, "s", value(101, 30_000))).awaitDurable();
+                try (var snapshot = ledger.snapshot()) {
+                    ledger.commit(ledger.newBatch().deleteRange(FILES, KeyRange.between("r", "s"))).awaitDurable();
+                    ledger.checkpoint();
+                    for (var round = 0; round < 6; round++) {
+                        ledger.commit(ledger.newBatch().put(FILES, "x" + round, value(102 + round, 30_000))).awaitDurable();
+                        ledger.checkpoint();
+                    }
+                    assertArrayEquals(removed, snapshot.get(FILES, "r1").orElseThrow());
+                    assertEquals(Optional.empty(), ledger.get(FILES, "r1"));
+                }
+                ledger.commit(ledger.newBatch().put(FILES, "y", value(110, 30_000))).awaitDurable();
+                ledger.checkpoint();
+                assertEquals(0, ((LiveLedger) ledger).blobsForTests().unadoptedForTests());
+            }
+            CheckpointTest.verifyPages(directory, true);
+        }
+
+        @Test
+        @DisplayName("a read that found a version before a checkpoint replaced its unit opens the unit whole, though new values are written meanwhile")
+        void readAcrossPublish(@TempDir Path directory) throws Exception {
+            var first = value(120, 40_000);
+            var second = value(121, 40_000);
+            try (var ledger = (LiveLedger) open(directory, true)) {
+                ledger.commit(ledger.newBatch().put(FILES, "a", first)).awaitDurable();
+                ledger.clearPageCacheForTests();
+                var raced = new AtomicBoolean();
+                var failure = new AtomicReference<Throwable>();
+                ledger.blobsForTests().readHookForTests(() -> {
+                    if (!raced.compareAndSet(false, true)) {
+                        return;
+                    }
+                    // Between the reader's choice of the version and its read of the unit
+                    var racer = Thread.ofPlatform().start(() -> {
+                        try {
+                            ledger.commit(ledger.newBatch().put(FILES, "a", second)).awaitDurable();
+                            ledger.checkpoint();
+                            for (var round = 0; round < 6; round++) {
+                                ledger.commit(ledger.newBatch().put(FILES, "x" + round, value(122 + round, 40_000))).awaitDurable();
+                                ledger.checkpoint();
+                            }
+                        } catch (Throwable throwable) {
+                            failure.set(throwable);
+                        }
+                    });
+                    try {
+                        racer.join();
+                    } catch (InterruptedException exception) {
+                        throw new IllegalStateException(exception);
+                    }
+                });
+                try {
+                    assertArrayEquals(first, ledger.get(FILES, "a").orElseThrow());
+                } finally {
+                    ledger.blobsForTests().readHookForTests(null);
+                }
+                assertTrue(raced.get(), "the read never went to the file");
+                assertNull(failure.get(), () -> "the racing writer failed: " + failure.get());
+                assertArrayEquals(second, ledger.get(FILES, "a").orElseThrow());
+                ledger.commit(ledger.newBatch().put(FILES, "y", value(130, 40_000))).awaitDurable();
+                ledger.checkpoint();
+                assertEquals(0, ledger.blobsForTests().unadoptedForTests());
+            }
+            CheckpointTest.verifyPages(directory, true);
+        }
+
+        @Test
+        @DisplayName("reads of large values the cache refuses, then takes, never cache an array the pool may hand out again, nor one of more regions than the unit needs")
+        void spares(@TempDir Path directory) throws Exception {
+            SplitValue.forceRegionForTests(1 << 20);
+            var pool = HeapPool.process();
+            // The arrays above the pooled sizes the pool holds free, by identity
+            var free = Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<byte[], Boolean>()));
+            pool.watchForTests(new HeapPool.Watcher() {
+                @Override
+                public void acquired(byte[] array) {
+                    free.remove(array);
+                }
+
+                @Override
+                public void released(byte[] array) {
+                    if (array.length > HeapPool.MAX_POOLED) {
+                        free.add(array);
+                    }
+                }
+            });
+            try (var ledger = (LiveLedger) options(directory, true).pageCache(256L << 20).build()) {
+                var values = new LinkedHashMap<String, byte[]>();
+                values.put("larger", value(140, LARGER));
+                values.put("large", value(141, LARGE));
+                values.put("other", value(142, LARGE));
+                values.put("small", value(143, SMALL_LARGE));
+                var batch = ledger.newBatch();
+                values.forEach((key, value) -> batch.put(FILES, key, value));
+                ledger.commit(batch).awaitDurable();
+                var blobs = ledger.blobsForTests();
+                // The larger unit first, refused, so the spares hold arrays of more regions than the others need
+                for (var round = 0; round < 4; round++) {
+                    for (var entry : values.entrySet()) {
+                        var key = entry.getKey();
+                        assertArrayEquals(entry.getValue(), ledger.get(FILES, key).orElseThrow(), key + " at read " + round);
+                        var ref = unit(ledger, key);
+                        var cached = blobs.cachedForTests(ref);
+                        if (cached != null) {
+                            assertFalse(free.contains(cached), "the cache holds a spare of the pool for " + key);
+                            var unitBytes = ref.pages() * PageFormat.SIZE;
+                            assertEquals(HeapPool.largeLength(unitBytes), cached.length, key);
+                            assertEquals(unitBytes, PageCache.charge(cached), key);
+                        }
+                    }
+                }
+                for (var key : values.keySet()) {
+                    assertNotNull(blobs.cachedForTests(unit(ledger, key)), key + " is not cached after four reads");
+                }
+                assertTrue(pool.largeSparesForTests() <= HeapPool.LARGE_SPARES);
+            } finally {
+                pool.watchForTests(null);
+                SplitValue.forceRegionForTests(-1);
+            }
+        }
+
+        @Test
+        @DisplayName("concurrent reads of large values the cache cannot hold copy each out of arrays of their own, whole")
+        void uncached(@TempDir Path directory) throws Exception {
+            SplitValue.forceRegionForTests(1 << 20);
+            // A quarter of the limit is below each unit, so the cache holds none
+            try (var ledger = (LiveLedger) options(directory, true).pageCache(4L << 20).build()) {
+                var values = List.of(value(150, LARGE), value(151, LARGER), value(152, LARGE));
+                for (var i = 0; i < values.size(); i++) {
+                    ledger.commit(ledger.newBatch().put(FILES, "k" + i, values.get(i))).awaitDurable();
+                }
+                var readers = new ArrayList<Thread>();
+                var failure = new AtomicReference<Throwable>();
+                for (var reader = 0; reader < 4; reader++) {
+                    readers.add(Thread.ofPlatform().start(() -> {
+                        try {
+                            for (var round = 0; round < 6; round++) {
+                                for (var i = 0; i < values.size(); i++) {
+                                    assertArrayEquals(values.get(i), ledger.get(FILES, "k" + i).orElseThrow());
+                                }
+                            }
+                        } catch (Throwable throwable) {
+                            failure.set(throwable);
+                        }
+                    }));
+                }
+                for (var reader : readers) {
+                    reader.join();
+                }
+                assertNull(failure.get(), () -> "a reader failed: " + failure.get());
+                for (var i = 0; i < values.size(); i++) {
+                    assertNull(ledger.blobsForTests().cachedForTests(unit(ledger, "k" + i)), "k" + i + " is cached");
+                }
+            } finally {
+                SplitValue.forceRegionForTests(-1);
+            }
+        }
+
+        @Test
+        @DisplayName("a read of a value of a closed store fails rather than opening the file again")
+        void closed(@TempDir Path directory) throws Exception {
+            var ledger = (LiveLedger) open(directory, true);
+            ledger.commit(ledger.newBatch().put(FILES, "a", value(160, 20_000))).awaitDurable();
+            var blobs = ledger.blobsForTests();
+            var ref = unit(ledger, "a");
+            ledger.clearPageCacheForTests();
+            ledger.close();
+            assertThrows(IllegalStateException.class, () -> blobs.copyValue(ref, 20_000));
+            assertThrows(IllegalStateException.class, () -> ledger.get(FILES, "a"));
+        }
+
+        @Test
+        @DisplayName("recovery applies no write of a commit one of whose units does not authenticate, and replays the earlier ones without a copy")
+        void recoveryAuthenticatesEveryUnit(@TempDir Path directory) throws Exception {
+            SplitValue.forceRegionForTests(1 << 20);
+            try {
+                var ledger = (LiveLedger) options(directory, true).keyspace(SESSIONS).build();
+                var kept = value(170, LARGE);
+                ledger.commit(ledger.newBatch().put(FILES, "kept", kept).put(SESSIONS, "session", value(171, 20_000))).awaitDurable();
+                ledger.commit(ledger.newBatch().put(FILES, "first", value(172, LARGE)).put(FILES, "second", value(173, 30_000))
+                        .put(SESSIONS, "late", value(174, 20_000))).awaitDurable();
+                var damaged = unit(ledger, "second");
+                ledger.closeWithoutCheckpoint();
+                try (var channel = FileChannel.open(directory.resolve(BlobFile.FILE), StandardOpenOption.WRITE)) {
+                    channel.write(ByteBuffer.wrap(new byte[64]), PageFormat.offset(damaged.page()) + PageFormat.HEADER);
+                    channel.force(true);
+                }
+                try (var reopened = (LiveLedger) options(directory, true).keyspace(SESSIONS).build()) {
+                    assertArrayEquals(kept, reopened.get(FILES, "kept").orElseThrow());
+                    assertArrayEquals(value(171, 20_000), reopened.get(SESSIONS, "session").orElseThrow());
+                    assertInstanceOf(BlobFile.class, head(reopened, "kept").sourceForTests());
+                    assertEquals(Optional.empty(), reopened.get(FILES, "first"));
+                    assertEquals(Optional.empty(), reopened.get(FILES, "second"));
+                    assertEquals(Optional.empty(), reopened.get(SESSIONS, "late"));
+                    reopened.commit(reopened.newBatch().put(FILES, "after", value(175, LARGE))).awaitDurable();
+                    assertArrayEquals(kept, reopened.get(FILES, "kept").orElseThrow());
+                }
+                CheckpointTest.verifyPages(directory, true);
+            } finally {
+                SplitValue.forceRegionForTests(-1);
+            }
+        }
+
+        @Test
+        @DisplayName("a store that overwrites its large values keeps the file of large values at a steady size")
+        void steadySize(@TempDir Path directory) throws Exception {
+            var slots = 8;
+            var length = 64 << 10;
+            try (var ledger = (LiveLedger) open(directory, true)) {
+                for (var write = 0; write < 400; write++) {
+                    ledger.commit(ledger.newBatch().put(FILES, "slot" + write % slots, value(write, length)));
+                    if (write % 16 == 15) {
+                        ledger.checkpoint();
+                    }
+                }
+                ledger.checkpoint();
+                // The live units, those of the writes since the last checkpoint, and those waiting for readers
+                var unitPages = PageFormat.pagesFor(length);
+                assertTrue(ledger.blobsForTests().pageCount() <= PageFormat.FIRST_UNIT_PAGE + 4L * (slots + 16) * unitPages,
+                        "the file grew to " + ledger.blobsForTests().pageCount() + " pages");
+                for (var slot = 0; slot < slots; slot++) {
+                    assertArrayEquals(value(400 - slots + slot, length), ledger.get(FILES, "slot" + slot).orElseThrow());
+                }
             }
         }
     }

@@ -217,9 +217,14 @@ class BatchOwnValuesTest {
                 caller[0]++;
                 ledger.commit(batch).awaitDurable();
                 var version = head(ledger, MESSAGES, new byte[]{1});
-                assertEquals(length, version.sourceBytesForTests());
-                // A value of a G1 region or more may be split in two arrays of its own
-                assertEquals(length >= OWN, version.sourceForTests() instanceof byte[] || version.sourceForTests() instanceof SplitValue);
+                if (length >= 1 << 20) {
+                    // A value of the file of large values: its unit holds it, and memory keeps no copy
+                    assertInstanceOf(BlobFile.class, version.sourceForTests());
+                    assertEquals(0, version.sourceBytesForTests());
+                } else {
+                    assertEquals(length, version.sourceBytesForTests());
+                    assertEquals(length >= OWN, version.sourceForTests() instanceof byte[]);
+                }
                 assertArrayEquals(expected, ledger.get(MESSAGES, new byte[]{1}).orElseThrow());
                 ledger.checkpoint();
                 assertArrayEquals(expected, ledger.get(MESSAGES, new byte[]{1}).orElseThrow());

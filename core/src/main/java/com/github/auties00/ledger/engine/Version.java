@@ -14,7 +14,9 @@ import java.lang.invoke.VarHandle;
 /// store before it to reach the cache.
 ///
 /// A version whose value a unit of [BlobFile] also holds is an [External], which keeps what the file needs: 16 bytes
-/// every other buffered write would carry for nothing.
+/// every other buffered write would carry for nothing. One of a paged key space keeps no copy of the value at all: its
+/// source is the [BlobFile] itself ([#ofUnit]), and a read opens the unit, through the page cache. Its unit therefore
+/// stays until every reader that may find it is past the commit that replaced it ([External#replacedAt]).
 ///
 /// The value of a paged version waiting for a checkpoint may leave its batch's array for the log, which holds it too
 /// ([SpillQueue]): [#spill] replaces the source, once, with a [LogValue] or with an array of the value alone. Every
@@ -41,9 +43,10 @@ sealed class Version permits Version.External {
     final long stamp;
     // The read-only segment the encoded value is part of, the array of its batch; or the array that is the value, which
     // a resident version keeps, as does a paged one its batch gave an array of its own or whose value left the batch's
-    // array, and whose segment and session, 72 bytes, a read of its encoding makes; or the SplitValue of a large value
-    // its batch kept in two arrays, which only an External holds; or the place of the value in the log ([LogValue]); or
-    // `null` if this version removes the key. A slice of its own per version was 40 of the bytes a buffered write took.
+    // array, and whose segment and session, 72 bytes, a read of its encoding makes; or the BlobFile whose unit, which
+    // the External names, holds the value of a paged key space alone; or the place of the value in the log
+    // ([LogValue]); or `null` if this version removes the key. A slice of its own per version was 40 of the bytes a
+    // buffered write took.
     // Changed only by spill, from a segment or an array a recovery copied the value to, with a compare-and-set
     private Object source;
     // Where the value starts in source if source is a segment, and its length
@@ -84,12 +87,10 @@ sealed class Version permits Version.External {
                 : new External(stamp, value, 0, value.length, decoded, older, external);
     }
 
-    /// {@return a version whose value is `value`, kept in two arrays no one writes, which the unit `external` of
-    /// [BlobFile] also holds}
-    ///
-    /// Only a value of a paged key space is split, so the version keeps no decoded value.
-    static Version ofSplit(long stamp, SplitValue value, Version older, PageRef external) {
-        return new External(stamp, value, 0, value.length(), null, older, external);
+    /// {@return a version of a paged key space whose value of `length` bytes only the unit `external` of `blobs`
+    /// holds, which a read opens}
+    static Version ofUnit(long stamp, BlobFile blobs, int length, Version older, PageRef external) {
+        return new External(stamp, blobs, 0, length, null, older, external);
     }
 
     /// {@return a version of the `length` bytes at `offset` of `source`, a read-only segment, or of no value if
@@ -101,13 +102,14 @@ sealed class Version permits Version.External {
 
     /// {@return the encoded value, read-only, or `null` if this version removes the key}
     ///
-    /// The value of a [SplitValue] is joined into a new array on every call, which no version keeps: a scan or a read
-    /// of the encoding of a large value no checkpoint has taken yet copies it whole. A value in the log is read from it.
+    /// A value in the log is read from it, and one only a unit of [BlobFile] holds from the unit, through the page
+    /// cache ([BlobFile#value(PageRef, int)]).
     ///
     /// @throws LogSegmentView.Retired if the value is in a segment a checkpoint retired, which the tree of every reader
     ///                                that can still find this version holds
-    /// @throws com.github.auties00.ledger.LedgerIoException if the value is in the log and cannot be read
-    /// @throws com.github.auties00.ledger.LedgerCorruptedException if the value is in the log and the log changed
+    /// @throws com.github.auties00.ledger.LedgerIoException if the value is in the log or a unit and cannot be read
+    /// @throws com.github.auties00.ledger.LedgerCorruptedException if the value is in the log and the log changed, or
+    ///                                                            in a unit that fails authentication
     MemorySegment value() {
         var held = SOURCE.getAcquire(this);
         if (held == null) {
@@ -116,24 +118,25 @@ sealed class Version permits Version.External {
         if (held instanceof byte[] array) {
             return MemorySegment.ofArray(array).asReadOnly();
         }
-        if (held instanceof SplitValue split) {
-            return MemorySegment.ofArray(split.join()).asReadOnly();
-        }
         if (held instanceof LogValue logged) {
             return MemorySegment.ofArray(logged.read(stamp, length)).asReadOnly();
         }
-        var whole = (MemorySegment) held;
-        return offset == 0 && length == whole.byteSize() ? whole : whole.asSlice(offset, length);
+        if (held instanceof MemorySegment whole) {
+            return offset == 0 && length == whole.byteSize() ? whole : whole.asSlice(offset, length);
+        }
+        return ((BlobFile) held).value(((External) this).unit, length);
     }
 
     /// {@return the encoded value in a new array, or `null` if this version removes the key}
     ///
     /// A value on an array of its own is copied with an array copy, which spares the zeroing of the new array a copy
-    /// of [#value] pays ([Segments#toBytes(byte\[\], int, int)]), and a [SplitValue] with one per array, which spares
-    /// it for all but the tail's bytes; one on a read-only segment, which hides its array, cannot be. An array source is
-    /// the value whole, at no offset. A value in the log is read into an array of its own.
+    /// of [#value] pays ([Segments#toBytes(byte\[\], int, int)]); one on a read-only segment, which hides its array,
+    /// cannot be. An array source is the value whole, at no offset. A value in the log is read into an array of its
+    /// own, and one only a unit of [BlobFile] holds is copied out of the unit ([BlobFile#copyValue(PageRef, int)]).
     ///
     /// @throws LogSegmentView.Retired as [#value()] does
+    /// @throws com.github.auties00.ledger.LedgerIoException as [#value()] does
+    /// @throws com.github.auties00.ledger.LedgerCorruptedException as [#value()] does
     byte[] copyBytes() {
         var held = SOURCE.getAcquire(this);
         if (held instanceof byte[] array) {
@@ -145,11 +148,11 @@ sealed class Version permits Version.External {
         if (held == null) {
             return null;
         }
-        if (held instanceof SplitValue split) {
-            return split.join();
+        if (held instanceof MemorySegment segment) {
+            // No slice of the segment: the copy reads the value where it is
+            return Segments.toBytes(segment, offset, length);
         }
-        // No slice of the segment: the copy reads the value where it is
-        return Segments.toBytes((MemorySegment) held, offset, length);
+        return ((BlobFile) held).copyValue(((External) this).unit, length);
     }
 
     /// {@return the array that is the value whole, if the version keeps its value on an array of its own, or `null`}
@@ -230,7 +233,8 @@ sealed class Version permits Version.External {
         final PageRef unit;
         /// The sequence of the commit that replaced or removed this version, while no checkpoint has taken its unit,
         /// or [Long#MAX_VALUE]; written by that commit, which applies after the commits before it on the key, and read
-        /// holding the publishing role.
+        /// holding the publishing role. The checkpoint that holds that commit frees the unit once every reader is past
+        /// its publication, as a reader below the commit may still open the unit.
         long replacedAt;
 
         External(long stamp, Object source, int offset, int length, Object decoded, Version older, PageRef unit) {
@@ -253,20 +257,20 @@ sealed class Version permits Version.External {
         OLDER.setRelease(this, older);
     }
 
-    /// {@return the bytes of the segment the value is part of, 0 for a removal or a value in the log; for tests of what
-    /// memory keeps}
+    /// {@return the bytes of the segment the value is part of, 0 for a removal or a value in the log or a unit alone;
+    /// for tests of what memory keeps}
     long sourceBytesForTests() {
         return switch (SOURCE.getAcquire(this)) {
             case null -> 0;
             case byte[] array -> array.length;
-            case SplitValue split -> split.length();
             case MemorySegment segment -> segment.byteSize();
             case LogValue _ -> 0;
+            case BlobFile _ -> 0;
             default -> throw new IllegalStateException();
         };
     }
 
-    /// {@return the segment, array, [SplitValue] or place in the log the value is on, `null` for a removal; for tests of
+    /// {@return the segment, array, place in the log or [BlobFile] the value is on, `null` for a removal; for tests of
     /// what memory keeps}
     Object sourceForTests() {
         return SOURCE.getAcquire(this);

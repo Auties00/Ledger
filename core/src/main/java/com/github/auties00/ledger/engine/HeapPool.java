@@ -2,6 +2,7 @@ package com.github.auties00.ledger.engine;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
@@ -40,6 +41,13 @@ import java.util.concurrent.atomic.AtomicLong;
 /// ahead would stay in the pool for as long as scans read ahead, one of each size a round reads into, 520 KiB after
 /// 1,000 cold chat pages. A collection between two scans, of any kind, frees them, and the next scan allocates them
 /// again, once.
+///
+/// Above 1 MiB, the reads of the units of the file of large values ([BlobFile]) recycle at most [#LARGE_SPARES]
+/// arrays of their own ([#acquireLarge(int)]), sized to fill whole regions of the G1 collector and reached only weakly:
+/// G1 gives such an array regions of its own, which a dead one keeps committed until a marking frees them, so a read
+/// that missed the page cache and allocated the sealed unit, the opened one and the caller's copy kept three of them
+/// committed, where it now allocates the caller's alone. Only an array that never left its reader comes back: one the
+/// page cache, a version, a view or a caller received never does, as a reader may still read it.
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
@@ -51,6 +59,10 @@ public final class HeapPool {
     /// The most bytes of free arrays the pool holds strongly, 4 MiB: more than the growth arrays of eight writers'
     /// batches, about 2 MiB, take at once.
     static final long RESERVE = 4L << 20;
+    /// The most arrays above [#MAX_POOLED] the pool keeps for the reads of large units: the sealed and the opened
+    /// array of one read that missed the cache. Each more would keep the regions of a unit committed while a marking
+    /// is pending.
+    static final int LARGE_SPARES = 2;
     // The free arrays of the reserve, of each size
     private final ConcurrentLinkedQueue<byte[]>[] free;
     // The bytes of the reserve's free arrays
@@ -95,6 +107,15 @@ public final class HeapPool {
     private boolean holdCollectable;
     // The free collectable arrays while they are kept strongly, guarded by the lock
     private Collectable heldCollectable;
+    // Guards largeSpares, largeNext and the counts of large acquires
+    private final Object largeLock;
+    // The free arrays above MAX_POOLED, each of a length largeLength gives and reached only weakly; or null slots
+    private final WeakReference<byte[]>[] largeSpares;
+    // The slot the next array given back replaces when every slot holds one
+    private int largeNext;
+    // The large acquires so far, and the count the trimmer saw last, as for the other arrays
+    private int largeAcquires;
+    private int largeAcquiresSeen;
 
     // The pool the stores of the process share, made with the first; guarded by the class
     private static HeapPool process;
@@ -171,6 +192,8 @@ public final class HeapPool {
         this.collectable = new WeakReference<>(null);
         this.collectableLock = new Object();
         this.collectableOut = new AtomicInteger();
+        this.largeLock = new Object();
+        this.largeSpares = new WeakReference[LARGE_SPARES];
         this.trimmer = trimmed ? this::trimIfIdle : null;
         if (trimmed) {
             IdleTicker.watch(trimmer);
@@ -350,6 +373,92 @@ public final class HeapPool {
         set.free[size].offer(array);
     }
 
+    /// {@return the length of the array [#acquireLarge(int)] gives for `capacity` bytes: as many whole regions of G1 as
+    /// the bytes and the array's [headroom][ValueSlab#HEADROOM] take, less the headroom, or `capacity` if the JVM runs
+    /// another collector or cannot say}
+    ///
+    /// G1 gives an array of half a region or more whole regions of its own, so the bytes past `capacity` cost no
+    /// memory, and an array of one length serves every unit whose length rounds up to the same regions.
+    static int largeLength(int capacity) {
+        var region = SplitValue.region();
+        if (region <= ValueSlab.HEADROOM) {
+            return capacity;
+        }
+        var length = (capacity + ValueSlab.HEADROOM + region - 1) / region * region - ValueSlab.HEADROOM;
+        return length > Integer.MAX_VALUE - ValueSlab.HEADROOM ? capacity : (int) length;
+    }
+
+    /// {@return an array of [#largeLength(int)] bytes, at least `capacity`, for a read of a unit above [#MAX_POOLED],
+    /// which goes back through [#releaseLarge(byte\[\])]}
+    ///
+    /// Only a free array of exactly that length is reused, so the page cache, which counts such an array by the pages
+    /// of its unit, never holds one of more regions than its unit needs.
+    ///
+    /// @param capacity the least length, above [#MAX_POOLED]
+    byte[] acquireLarge(int capacity) {
+        var length = largeLength(capacity);
+        synchronized (largeLock) {
+            largeAcquires++;
+            for (var slot = 0; slot < largeSpares.length; slot++) {
+                var spare = largeSpares[slot];
+                var array = spare == null ? null : spare.get();
+                if (array != null && array.length == length) {
+                    largeSpares[slot] = null;
+                    var watching = watcher;
+                    if (watching != null) {
+                        watching.acquired(array);
+                    }
+                    return array;
+                }
+            }
+        }
+        return new byte[length];
+    }
+
+    /// Keeps `array`, which [#acquireLarge(int)] returned, for the next read of a large unit, reached only weakly: in a
+    /// free slot, or in place of the oldest spare. An array of another length is left to the collector.
+    ///
+    /// @param array an array no one else reaches or will: never one the page cache, a version, a view or a caller
+    ///              received, as a reader may still read it, and a later read would write it
+    void releaseLarge(byte[] array) {
+        var length = array.length;
+        if (length <= MAX_POOLED || largeLength(length) != length) {
+            return;
+        }
+        var watching = watcher;
+        if (watching != null) {
+            watching.released(array);
+        }
+        synchronized (largeLock) {
+            var slot = -1;
+            for (var i = 0; i < largeSpares.length; i++) {
+                var spare = largeSpares[i];
+                if (spare == null || spare.refersTo(null)) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot < 0) {
+                slot = largeNext;
+                largeNext = (largeNext + 1) % largeSpares.length;
+            }
+            largeSpares[slot] = new WeakReference<>(array);
+        }
+    }
+
+    /// {@return the arrays above [#MAX_POOLED] the pool keeps that the collector has not taken; for tests}
+    int largeSparesForTests() {
+        synchronized (largeLock) {
+            var held = 0;
+            for (var spare : largeSpares) {
+                if (spare != null && !spare.refersTo(null)) {
+                    held++;
+                }
+            }
+            return held;
+        }
+    }
+
     /// {@return what keeps the pool's overflow from the collector for as long as the caller holds it}
     ///
     /// Work that takes many arrays of the pool and gives them back as it goes or as it ends holds the overflow from
@@ -466,7 +575,8 @@ public final class HeapPool {
     /// and the free collectable arrays if no collectable one was.
     ///
     /// The overflow's free arrays of such a size go too, whether work holds the overflow or not: work that held it a
-    /// whole tick without taking an array of that size does not need them.
+    /// whole tick without taking an array of that size does not need them. The arrays above [#MAX_POOLED] go if no
+    /// read took one.
     void trimIfIdle() {
         var set = overflow.get();
         for (var i = 0; i < free.length; i++) {
@@ -486,6 +596,12 @@ public final class HeapPool {
             dropCollectable();
         }
         collectableAcquiresSeen = seen;
+        synchronized (largeLock) {
+            if (largeAcquires == largeAcquiresSeen) {
+                Arrays.fill(largeSpares, null);
+            }
+            largeAcquiresSeen = largeAcquires;
+        }
     }
 
     // Leaves the free collectable arrays to the collector

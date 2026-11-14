@@ -34,8 +34,8 @@ import java.util.function.ToLongFunction;
 /// batch's array it would be copied again by the store and leave the batch's bytes for the collector.
 ///
 /// A byte array of a G1 region or more put to a paged key space of byte arrays whose values of that length go to the
-/// file of large values, as the store's `splitFrom` says, takes two arrays instead, a [SplitValue]: the version keeps
-/// it until a checkpoint, and on one array its last region would be almost empty.
+/// file of large values, as the store's `splitFrom` says, takes two arrays instead, a [SplitValue]: the batch keeps
+/// it until its commit has sealed it into its unit, and on one array its last region would be almost empty.
 ///
 /// A range removal stores its bounds, each encoded or absent; the store reads them back through the accessors of
 /// this class when it applies the batch, then starts it again with [#finish()].

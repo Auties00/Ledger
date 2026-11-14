@@ -36,7 +36,9 @@ import java.util.function.Consumer;
 ///
 /// A value of a batch at least [Options#largeValues(long)] long, 1 MiB by default, is written once, to a file of
 /// its own, before the commit applies; its log frame records where it is, and the next checkpoint takes it from
-/// there. Other values reach the device twice, in the log and in a checkpoint.
+/// there. Other values reach the device twice, in the log and in a checkpoint. Memory keeps no copy of a large value
+/// of a paged key space: a read of one opens it from that file, before the next checkpoint as after it, and the page
+/// cache keeps the values read more than once.
 ///
 /// The writes since the last checkpoint stay in memory until the next one. When commits come faster than
 /// checkpoints can write them, and the log holds three checkpoint intervals ([Options#checkpointEvery(long)]) the

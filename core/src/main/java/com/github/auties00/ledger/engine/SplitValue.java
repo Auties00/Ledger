@@ -6,16 +6,16 @@ package com.github.auties00.ledger.engine;
 /// The G1 collector gives an array of half a region or more regions of its own, and counts every byte of its last one
 /// as used, so a value of 16 MiB on one array, 16 MiB and its header, takes nine regions of 2 MiB and leaves almost all
 /// of the last one empty until the array dies. Split, the head takes eight regions exactly and the 64 bytes after it
-/// are an ordinary young object. A version keeps such a value from its commit until a checkpoint has taken its unit of
-/// [BlobFile], which holds the value as well: only the value of a put to a paged key space of byte arrays that goes to
-/// that file is split, so a log frame never needs it whole.
+/// are an ordinary young object. A batch keeps such a value from its put until its commit has sealed it into a unit of
+/// [BlobFile], whose version then keeps no copy ([Version#ofUnit]): only the value of a put to a paged key space of
+/// byte arrays that goes to that file is split, so a log frame never needs it whole.
 ///
-/// A read copies the value out with one array copy per array into a new array, the head's copy first, which the
+/// A join copies the value out with one array copy per array into a new array, the head's copy first, which the
 /// compiler fuses with the allocation: it zeroes only the part of the new array the tail fills, which [#headLength]
-/// keeps to a thirty-second of the value, so the read costs about what one of a value on one array does
+/// keeps to a thirty-second of the value, so the join costs about what a copy of a value on one array does
 /// ([Segments#toBytes(byte\[\], int, int)]).
 ///
-/// It is immutable: both arrays are written once, before the version that holds them is published, and never again.
+/// It is immutable: both arrays are written once, before the commit that seals them, and never again.
 final class SplitValue {
     // The region before anyone asked, and what a test sets when it lets the JVM answer
     private static final long UNKNOWN = -1;
