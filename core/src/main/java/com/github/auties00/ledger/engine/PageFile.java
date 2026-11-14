@@ -1159,8 +1159,8 @@ final class PageFile implements AutoCloseable {
         /// @return the reference of the unit
         /// @throws IllegalArgumentException if the value does not fit in the unit
         PageRef writeLoggedValue(int page, int pages, Version version) throws IOException {
-            if (!PageFormat.fits(pages, version.length())) {
-                throw new IllegalArgumentException("A unit of " + pages + " pages cannot hold " + version.length() + " bytes of content");
+            if (!PageFormat.fits(pages, version.valueLength())) {
+                throw new IllegalArgumentException("A unit of " + pages + " pages cannot hold " + version.valueLength() + " bytes of content");
             }
             var ref = new PageRef(page, pages, nonceHigh, nextNonce());
             stage(new Staged(ref, null, null, version));
@@ -1422,7 +1422,7 @@ final class PageFile implements AutoCloseable {
     private record Staged(PageRef ref, byte[] unit, MemorySegment value, Version logged) {
         /// {@return the bytes of the content of a value unit}
         int contentLength() {
-            return value != null ? (int) value.byteSize() : logged.length();
+            return value != null ? (int) value.byteSize() : logged.valueLength();
         }
     }
 }

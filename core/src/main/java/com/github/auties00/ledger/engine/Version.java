@@ -44,7 +44,7 @@ sealed class Version permits Version.External {
     // array, and whose segment and session, 72 bytes, a read of its encoding makes; or the SplitValue of a large value
     // its batch kept in two arrays, which only an External holds; or the place of the value in the log ([LogValue]); or
     // `null` if this version removes the key. A slice of its own per version was 40 of the bytes a buffered write took.
-    // Changed only by spill, from a segment, with a compare-and-set
+    // Changed only by spill, from a segment or an array a recovery copied the value to, with a compare-and-set
     private Object source;
     // Where the value starts in source if source is a segment, and its length
     private final int offset;
@@ -165,20 +165,29 @@ sealed class Version permits Version.External {
     }
 
     /// Moves the value off the segment it is part of, once: to its place in the log if it is at least
-    /// [SpillQueue#LOG_VALUE_MIN] bytes, else to an array of its own.
+    /// [SpillQueue#LOG_VALUE_MIN] bytes, else to an array of its own. A value on an array of its own, which only a
+    /// recovery lists ([ReplayValues]), moves only to the log.
     ///
     /// The frame at `frameOffset` of `segment` holds the value durably, at `bodyIndex` of its body. The tag that
-    /// authenticates the value read back is made from the bytes of the segment, which are those the frame sealed.
+    /// authenticates the value read back is made from the bytes the version holds, which are those the frame sealed.
     ///
-    /// @return whether the value moved: not if it had moved already, or is not on a segment
+    /// @return whether the value moved: not if it had moved already, is not on a segment nor an array of its own long
+    ///         enough for the log, or has a unit of [BlobFile]
     boolean spill(SpillQueue.Crypto crypto, LogSegmentView segment, long frameOffset, int bodyIndex) {
         var held = SOURCE.getAcquire(this);
-        if (!(held instanceof MemorySegment home) || external() != null) {
+        if (external() != null) {
             return false;
         }
-        Object moved = length >= SpillQueue.LOG_VALUE_MIN
-                ? crypto.logValue(segment, frameOffset, bodyIndex, stamp, home, offset, length)
-                : Segments.toBytes(home, offset, length);
+        Object moved;
+        if (held instanceof MemorySegment home) {
+            moved = length >= SpillQueue.LOG_VALUE_MIN
+                    ? crypto.logValue(segment, frameOffset, bodyIndex, stamp, home, offset, length)
+                    : Segments.toBytes(home, offset, length);
+        } else if (held instanceof byte[] own && length >= SpillQueue.LOG_VALUE_MIN) {
+            moved = crypto.logValue(segment, frameOffset, bodyIndex, stamp, MemorySegment.ofArray(own), 0, length);
+        } else {
+            return false;
+        }
         return SOURCE.compareAndSet(this, held, moved);
     }
 
@@ -194,11 +203,6 @@ sealed class Version permits Version.External {
     /// @throws com.github.auties00.ledger.LedgerCorruptedException if the log changed
     void readLogged(byte[] target, int offset) {
         ((LogValue) SOURCE.getAcquire(this)).readInto(stamp, length, target, offset);
-    }
-
-    /// {@return the length of the encoded value, 0 for a removal}
-    int length() {
-        return length;
     }
 
     /// {@return the unit of [BlobFile] that also holds [#value], or `null` if the value is in memory and the log only}
