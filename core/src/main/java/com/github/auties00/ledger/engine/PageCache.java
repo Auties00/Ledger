@@ -53,8 +53,11 @@ import java.util.concurrent.atomic.AtomicLong;
 /// cache takes the unit only at its second read, the first one recorded by a [Doorkeeper] of the unit's key and nonce.
 /// Caching each unit at its first read, the leaves and values of every chat a client opened once, kept most of the
 /// cache's bytes for units no one read again. The doorkeeper takes at most 4% of the units it never saw for seen ones,
-/// which the cache takes at their first read. A unit the clock evicts is recorded as it leaves, so its next read caches
-/// it at once, and a branch is never screened, as every read starts from the branches. Screening does not depend on
+/// which the cache takes at their first read. A unit a read used that the clock evicts is recorded as it leaves, so its
+/// next read caches it at once; one a checkpoint cached as written that the clock evicts unread leaves no trace, as a
+/// saturated checkpoint caches leaves at every run, and recording each one the clock evicts would fill the
+/// doorkeeper's generations with keys no read touched, so that they rotate and forget the first reads they hold. A
+/// branch is never screened, as every read starts from the branches. Screening does not depend on
 /// how fast the device reads: the reads of the files go through the OS cache, so the first read of a unit, from the
 /// device or not, leaves its pages there, and its second read costs a read of the OS cache and an open, a few
 /// microseconds, on a store copied past the OS cache as much as on any other.
@@ -91,6 +94,11 @@ final class PageCache implements IdleTicker.Watched {
     private static final byte REFERENCED = 1;
     /// The flag a tick of the idle ticker sets and a read clears: a tick that finds it set evicts the entry.
     private static final byte IDLE = 2;
+    /// The flag of an entry a read used since it came, which the clock never clears: the clock records in the doorkeeper
+    /// only the entries it evicts with it set.
+    private static final byte READ = 4;
+    /// The flags a read leaves: [#REFERENCED] and [#READ], with [#IDLE] cleared.
+    private static final byte USED = REFERENCED | READ;
     /// 2^64 over the golden ratio: the product of a key by it gives the key's tag and the stride of its probe.
     private static final long HASH = 0x9E3779B97F4A7C15L;
     /// 2^32 over the golden ratio: how far apart, in slots, the pages of each file start, so that the same page of two
@@ -198,8 +206,8 @@ final class PageCache implements IdleTicker.Watched {
             // the line of its flag from each other. One that lands on a slot refilled meanwhile only gives its new
             // entry one more pass of the clock
             var flags = table.flags;
-            if (flags[slot] != REFERENCED) {
-                flags[slot] = REFERENCED;
+            if (flags[slot] != USED) {
+                flags[slot] = USED;
             }
         }
         return unit;
@@ -507,7 +515,7 @@ final class PageCache implements IdleTicker.Watched {
         META.setOpaque(table.meta, 3 * slot + 2, identity(ref.nonceLow(), ref.pages()));
         META.setOpaque(table.meta, 3 * slot, key);
         TAGS.setOpaque(table.tags, slot, Table.tag(key * HASH));
-        table.flags[slot] = referenced ? REFERENCED : 0;
+        table.flags[slot] = referenced ? USED : 0;
         UNITS.setRelease(table.units, slot, unit);
         table.append(slot);
         table.clock.live++;
@@ -839,9 +847,11 @@ final class PageCache implements IdleTicker.Watched {
             }
             var state = flags[slot];
             if ((state & REFERENCED) == 0) {
-                // A unit the clock pushed out goes back in at its next read. One the ticker found idle needs none: its
-                // bits stay set unless the doorkeeper forgot them since
-                doorkeeper.evicted(table.meta[3 * slot], table.meta[3 * slot + 1], doorkeeperKeys());
+                // A unit a read used that the clock pushed out goes back in at its next read. One the ticker found idle
+                // needs none: its bits stay set unless the doorkeeper forgot them since
+                if ((state & READ) != 0) {
+                    doorkeeper.evicted(table.meta[3 * slot], table.meta[3 * slot + 1], doorkeeperKeys());
+                }
                 drop(table, slot);
                 return true;
             }
@@ -874,7 +884,7 @@ final class PageCache implements IdleTicker.Watched {
         final long[] meta;
         // The plaintext of each slot, or null when the slot holds no entry or a writer is changing it
         final byte[][] units;
-        // REFERENCED and IDLE per slot, apart from the metadata so that a read that sets them dirties no line of it
+        // REFERENCED, IDLE and READ per slot, apart from the metadata so that a read that sets them dirties no line of it
         final byte[] flags;
         // Two ints per slot: the next newer and the next older entry of the clock, or -1
         final int[] links;

@@ -348,6 +348,61 @@ class ScreenedReadsTest {
     }
 
     @Nested
+    @DisplayName("the clock")
+    class Clock {
+        private static PageRef ref(int page) {
+            return new PageRef(page, 1, 1_000L + page, page);
+        }
+
+        private static byte[] unit(PageRef ref) {
+            var unit = new byte[PageFormat.SIZE];
+            PageFile.header(unit, PageFormat.LEAF, 0, ref.page(), 1, 0, ref.nonceHigh(), ref.nonceLow());
+            return unit;
+        }
+
+        @Test
+        @DisplayName("records in the doorkeeper the units a read used that it evicts, never those cached as written and evicted unread")
+        void recordsOnlyReadUnits() {
+            var cache = PageCache.isolated(64L * PageFormat.SIZE);
+            IdleTicker.unwatch(cache);
+            try {
+                cache.screen(true);
+                // A first read the cache refuses, so the doorkeeper records
+                var first = ref(1);
+                cache.putScreened(first, unit(first));
+                assertNull(cache.peek(first), "refused at its first read");
+                // Cached as read, cached as written then read, and cached as written only, in that order
+                var read = ref(10);
+                cache.put(read, unit(read), true);
+                var readLater = ref(11);
+                cache.put(readLater, unit(readLater), false);
+                assertNotNull(cache.get(PageCache.dataKey(readLater.page(), readLater.slot()), readLater));
+                for (var page = 100; page < 400; page++) {
+                    var written = ref(page);
+                    cache.put(written, unit(written), false);
+                }
+                assertNull(cache.peek(read), "evicted");
+                assertNull(cache.peek(readLater), "evicted");
+                assertTrue(cache.seen(read), "a unit cached as read and evicted");
+                assertTrue(cache.seen(readLater), "a unit cached as written, read, and evicted");
+                var unread = 0;
+                for (var page = 100; page < 200; page++) {
+                    var written = ref(page);
+                    assertNull(cache.peek(written), "evicted");
+                    if (cache.seen(written)) {
+                        unread++;
+                    }
+                }
+                assertEquals(0, unread, "units cached as written and evicted unread that the doorkeeper records");
+                assertEquals(0, cache.doorkeeperForTests().rotationsForTests(), "rotations of the doorkeeper");
+                assertTrue(cache.seen(first), "the first read the doorkeeper recorded");
+            } finally {
+                cache.close();
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("a store")
     class Stores {
         private static final Keyspace<String, byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.bytes());

@@ -741,18 +741,22 @@ class PageCacheTest {
         }
 
         @Test
-        @DisplayName("takes back at its first read a unit the clock evicted, and not one it never held")
+        @DisplayName("takes back at its first read a unit a read used that the clock evicted, and not one it held only as written or never held")
         void evictedReadmitted() {
             var cache = screening(16L * PageFormat.SIZE);
             // Starts the doorkeeper, which records evictions only once it holds bits
             cache.putScreened(page(100), unit(page(100)));
-            // As a checkpoint writes them, then more than the cache holds
-            for (var i = 0; i < 32; i++) {
+            // As a read caches it, then units as a checkpoint writes them, more than the cache holds
+            cache.put(page(0), unit(page(0)), true);
+            for (var i = 1; i < 33; i++) {
                 cache.put(page(i), unit(page(i)), false);
             }
-            assertNull(cache.peek(page(0)), "the cache kept the oldest written unit");
+            assertNull(cache.peek(page(0)), "the cache kept the unit a read used");
+            assertNull(cache.peek(page(1)), "the cache kept the oldest written unit");
             cache.putScreened(page(0), unit(page(0)));
-            assertNotNull(cache.peek(page(0)), "an evicted unit read again");
+            assertNotNull(cache.peek(page(0)), "an evicted unit a read used, read again");
+            cache.putScreened(page(1), unit(page(1)));
+            assertNull(cache.peek(page(1)), "an evicted unit cached only as written, read once");
             cache.putScreened(page(200), unit(page(200)));
             assertNull(cache.peek(page(200)), "a unit read once");
         }
