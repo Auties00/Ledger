@@ -41,8 +41,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /// entries the clock evicts: the branches, the leaves and delta pages the writer admits
 /// ([PageFile.Writer#admits(long, boolean)]), a leaf the more readily if one a read used in the cache is among those
 /// it replaces, and the units of values not at all. A leaf the writer leaves out in place of one a read used
-/// ([PageFile#seen(PageRef)]) is recorded as seen by the page cache's doorkeeper ([PageFile#expect(PageRef)]), so a
-/// reader that reads it once caches it, as it would have cached the leaf it replaces at that read.
+/// ([PageFile#seen(PageRef)]) is recorded as expected by the page cache's doorkeeper ([PageFile#expect(PageRef)]), so a
+/// reader that reads it once caches it, as it would have cached the leaf it replaces at that read; one rewritten
+/// before any read is not expected in turn.
 final class TreeUpdate {
     /// The writes below a branch from which its children's subtrees are updated on every processor.
     private static final int PARALLEL_OPS = 4_096;
@@ -991,7 +992,7 @@ final class TreeUpdate {
     ///
     /// The writer may admit a leaf to the page cache the more readily if a read used one of the leaves its entries came
     /// from there, which it asks only when it would not admit it otherwise. A leaf it leaves out whose entries came from
-    /// a leaf a read used is recorded as seen by the doorkeeper.
+    /// a leaf a read used is recorded as expected by the doorkeeper.
     private List<Child> writeLeaves(List<LeafEntry> entries, int[] sizes, List<int[]> runs, Replaced replaced) throws IOException {
         var out = new ArrayList<Child>(runs.size());
         for (var run : runs) {

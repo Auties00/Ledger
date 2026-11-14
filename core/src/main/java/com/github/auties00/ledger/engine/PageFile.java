@@ -833,7 +833,7 @@ final class PageFile implements AutoCloseable {
     }
 
     /// Records the leaf `ref` names, which a checkpoint wrote and left out of the cache in place of one a read used
-    /// ([#seen(PageRef)]), as seen by the doorkeeper, so the cache takes it at its first read
+    /// ([#seen(PageRef)]), as expected by the doorkeeper, so the cache takes it at its first read
     /// ([PageCache#expect(PageRef)]).
     void expect(PageRef ref) {
         cache.expect(ref);
