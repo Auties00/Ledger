@@ -204,7 +204,7 @@ class FrameReferencesTest {
         var units = new PageRef[]{new PageRef(1, 1, 0, 0, 0), null};
         assertEquals(Math.max(16, FrameBody.capacityFor(single, units)), FrameBody.forCommit(single, units, null, idle).chunk(0).length);
 
-        // Past a run, but with less than a chunk of values: never worth the pieces
+        // Past a run, but with fewer bytes of values than a large body refers to: never worth the pieces
         var large = new ArrayWriteBatch(this, pool, BY_NAME);
         for (var i = 0; i < 20; i++) {
             large.put(MESSAGES, "message" + i, pattern(random, 1_000));
@@ -218,14 +218,14 @@ class FrameReferencesTest {
 
     @ParameterizedTest(name = "log idle: {0}")
     @CsvSource({"false", "true"})
-    @DisplayName("of a commit of more than a chunk of values refers to those of 64 bytes or more while the log is idle, and to nothing while it is busy")
+    @DisplayName("of a commit of a few chunks of values refers to those of 64 bytes or more while the log is idle, and to nothing while it is busy")
     void forLargeCommit(boolean idle) {
         var random = new Random(5);
         var pool = new HeapPool(1L << 28, false);
         var batch = new ArrayWriteBatch(this, pool, BY_NAME);
         var referable = 0L;
         var count = 0;
-        for (var i = 0; i < 600; i++) {
+        for (var i = 0; i < 2_400; i++) {
             var length = i % 5 == 0 ? random.nextInt(FrameBody.LARGE_REFERABLE) : FrameBody.LARGE_REFERABLE + random.nextInt(1_500);
             batch.put(MESSAGES, "message" + i, pattern(random, length));
             if (length >= FrameBody.LARGE_REFERABLE) {
@@ -240,8 +240,17 @@ class FrameReferencesTest {
         referable += 3_000;
         count++;
         batch.prepare(false, null, Map.of());
-        assertTrue(referable >= FrameBody.CHUNK_BYTES);
+        assertTrue(referable >= FrameBody.LARGE_REFERRED_BYTES);
         var capacity = FrameBody.capacityFor(batch, null);
+        // With a pool, the body starts on a chunk whether it copies the values or holds only the rest, which takes less
+        var pooled = FrameBody.forCommit(batch, null, pool, idle);
+        assertTrue(capacity - referable < FrameBody.CHUNK_BYTES);
+        assertEquals(idle ? FrameBody.LARGE_REFERABLE : FrameBody.NOT_REFERABLE, pooled.referable());
+        assertEquals(1, pooled.chunkCount());
+        assertEquals(FrameBody.CHUNK_BYTES, pooled.chunk(0).length, "the room of the pooled body");
+        assertTrue(pooled.holdsPoolForTests());
+        pooled.release();
+        assertFalse(pooled.holdsPoolForTests());
         var body = FrameBody.forCommit(batch, null, null, idle);
         if (!idle) {
             assertEquals(FrameBody.NOT_REFERABLE, body.referable());
@@ -280,7 +289,7 @@ class FrameReferencesTest {
         // A value in its unit is no reference, nor counts toward the chunk of values
         var units = new PageRef[batch.size()];
         for (var i = 0; i < units.length; i++) {
-            if (batch.kind(i) == ArrayWriteBatch.PUT && i % 2 == 0) {
+            if (batch.kind(i) == ArrayWriteBatch.PUT && i % 4 == 0) {
                 units[i] = new PageRef(1, 1, 0, 0, 0);
             }
         }
@@ -291,10 +300,38 @@ class FrameReferencesTest {
                 left += batch.valueBytes(i);
             }
         }
-        if (left >= FrameBody.CHUNK_BYTES) {
+        if (left >= FrameBody.LARGE_REFERRED_BYTES) {
             assertEquals(FrameBody.capacityFor(batch, units) - left, inUnits.chunk(0).length);
         } else {
             assertEquals(FrameBody.NOT_REFERABLE, inUnits.referable());
+        }
+    }
+
+    @ParameterizedTest(name = "log idle: {0}")
+    @CsvSource({"false", "true"})
+    @DisplayName("of a batch of a hundred messages, sessions and chats, past a chunk of values, copies them on a pooled chunk whether the log is idle or not")
+    void forSteadyBatch(boolean idle) {
+        var random = new Random(7);
+        var pool = new HeapPool(1L << 28, false);
+        for (var round = 0; round < 20; round++) {
+            var batch = new ArrayWriteBatch(this, pool, BY_NAME);
+            var referable = 0L;
+            for (var i = 0; i < 100; i++) {
+                // Message bodies of up to a kilobyte and a half, one in seven a document of up to 12 KB, beside a session
+                // and a chat
+                var body = random.nextInt(7) == 0 ? 2_500 + random.nextInt(9_500) : 400 + random.nextInt(1_200);
+                batch.put(MESSAGES, "message" + round + ":" + i, pattern(random, body));
+                batch.put(SESSIONS, "session" + i, pattern(random, 1_536));
+                batch.put(NOTES, "chat" + i % 20, pattern(random, 320));
+                referable += body + 1_536 + 320;
+            }
+            batch.prepare(false, null, Map.of());
+            assertTrue(referable >= FrameBody.CHUNK_BYTES && referable < FrameBody.LARGE_REFERRED_BYTES, "values: " + referable);
+            var body = FrameBody.forCommit(batch, null, pool, idle);
+            assertEquals(FrameBody.NOT_REFERABLE, body.referable());
+            assertEquals(0, body.references());
+            assertEquals(FrameBody.CHUNK_BYTES, body.chunk(0).length, "the room of the body");
+            body.release();
         }
     }
 
@@ -627,22 +664,22 @@ class FrameReferencesTest {
     private static void largeBatch(WriteBatchFiller batch, int shape, String prefix, Random random, Map<String, byte[]> model) {
         switch (shape) {
             case 0 -> {
-                // Past a chunk of the batch: the chunks of its rope, the last one copied
-                for (var i = 0; i < 400; i++) {
+                // Past a few chunks of the batch: the chunks of its rope, the last one copied
+                for (var i = 0; i < 1_600; i++) {
                     batch.put(MESSAGES, prefix + "r" + i, pattern(random, FrameBody.LARGE_REFERABLE + random.nextInt(1_400)), model);
                 }
                 batch.put(SESSIONS, prefix + "s", pattern(random, 3_000), model);
             }
             case 1 -> {
-                // Little beside the values, just past a chunk
-                for (var i = 0; i < 200; i++) {
-                    batch.put(MESSAGES, prefix + "o" + i, pattern(random, 1_300 + random.nextInt(60)), model);
+                // Little beside the values, just past what a large body refers to
+                for (var i = 0; i < 800; i++) {
+                    batch.put(MESSAGES, prefix + "o" + i, pattern(random, 1_320 + random.nextInt(60)), model);
                 }
             }
             case 2 -> {
                 // Enough beside the values to copy them into arrays of their own, and resident values the store copies
-                for (var i = 0; i < 110; i++) {
-                    batch.put(MESSAGES, prefix + "c" + i, pattern(random, 2_000 + random.nextInt(1_000)), model);
+                for (var i = 0; i < 450; i++) {
+                    batch.put(MESSAGES, prefix + "c" + i, pattern(random, 2_400 + random.nextInt(1_000)), model);
                 }
                 for (var i = 0; i < 40; i++) {
                     batch.put(NOTES, prefix + "n" + i, pattern(random, 1_000), model);
@@ -654,17 +691,20 @@ class FrameReferencesTest {
                 batch.put(MESSAGES, prefix + "l1", pattern(random, 140_000), model);
                 batch.put(MESSAGES, prefix + "l2", pattern(random, 3_000), model);
                 batch.put(MESSAGES, prefix + "l3", pattern(random, 40), model);
+                batch.put(MESSAGES, prefix + "l4", pattern(random, 200_000), model);
+                batch.put(MESSAGES, prefix + "l5", pattern(random, 260_000), model);
+                batch.put(MESSAGES, prefix + "l6", pattern(random, 160_000), model);
                 batch.put(SESSIONS, prefix + "ls", pattern(random, 150_000), model);
             }
             case 4 -> {
                 // More writes than a chunk holds the keys and lengths of: a body on chunks of its own beside its values
-                for (var i = 0; i < 40_000; i++) {
-                    batch.put(MESSAGES, prefix + "t" + i, pattern(random, FrameBody.LARGE_REFERABLE + random.nextInt(140)), model);
+                for (var i = 0; i < 25_000; i++) {
+                    batch.put(MESSAGES, prefix + "t" + i, pattern(random, FrameBody.LARGE_REFERABLE + random.nextInt(80)), model);
                 }
             }
             default -> {
                 // Resident byte arrays on copies of their own, and resident values the store copies
-                for (var i = 0; i < 300; i++) {
+                for (var i = 0; i < 600; i++) {
                     batch.put(SESSIONS, prefix + "b" + i, pattern(random, 900), model);
                     batch.put(NOTES, prefix + "m" + i, pattern(random, 900), model);
                 }

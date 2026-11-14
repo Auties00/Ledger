@@ -268,7 +268,7 @@ class LogSpillTest {
         var expected = new Expected();
         try (var ledger = open(directory, encrypted, 0)) {
             // Right after the open, the log holds no frame but the catalog's, so the commit's frame refers to its values
-            write(ledger, expected, 0, 400, 0, true);
+            write(ledger, expected, 0, 1_000, 0, true);
             assertEquals(1, ledger.log().piecewiseFramesForTests(), "the frame sealed piece by piece");
             spillNow(ledger);
             assertTrue(ledger.spills().loggedValuesForTests() > 0, "no value moved to the log");

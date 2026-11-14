@@ -35,9 +35,10 @@ import java.util.Arrays;
 /// nothing: in a body of a batch of at most [LogWriter#RUN_MAX_BODY] bytes, which the writer copies into its output
 /// whole before it seals it there anyway, from [#RUN_REFERABLE] bytes; in a body of a transaction, whose length is
 /// unknown until its last write, from [#SEALED_REFERABLE] bytes, values long enough for the writer to hand to the
-/// cipher as they are; and in a larger body of a batch made while the log is [idle][LogWriter#idle()], from
-/// [#LARGE_REFERABLE] bytes, which the writer gathers into its output slice by slice as it seals them, so the frame
-/// holds no second copy of the batch's values from the commit until the seal. The body of a commit of one value of a
+/// cipher as they are; and in a larger body of a batch made while the log is [idle][LogWriter#idle()], whose values
+/// hold [#LARGE_REFERRED_BYTES] at least, from [#LARGE_REFERABLE] bytes, which the writer gathers into its output
+/// slice by slice as it seals them, so the frame holds no second copy of the batch's values from the commit until the
+/// seal. The body of a commit of one value of a
 /// kilobyte thus allocates an array for the value's key and lengths alone, where it copied the value too.
 ///
 /// A referred array is one no one writes and the store's [HeapPool] never hands out, so a frame may wait in the log's
@@ -87,6 +88,12 @@ final class FrameBody {
     /// [LogWriter#DIRECT_PIECE] bytes into its output, so a value copied there at the seal rather than into the body
     /// at the commit costs the same copy, and a shorter one would cost a reference of about its own bytes.
     static final int LARGE_REFERABLE = 64;
+    /// The fewest bytes of values of [#LARGE_REFERABLE] bytes or more that the body of a batch larger than
+    /// [LogWriter#RUN_MAX_BODY] made while the log is idle refers to rather than copies: a few chunks. A batch whose
+    /// values take fewer, as one of a hundred messages a client writes as they arrive, copies them onto a chunk or two
+    /// of the pool that the batches after it take again, too few bytes to raise the heap's peak, so it keeps sparing
+    /// the writer the pieces it would gather and the cipher a call for each long value.
+    static final int LARGE_REFERRED_BYTES = 4 * CHUNK_BYTES;
     /// What [#referable()] is for a body that refers to no value.
     static final int NOT_REFERABLE = Integer.MAX_VALUE;
     /// The longest body: the longest whose frame AES-GCM can seal and recovery can read into one array, which the JVM
@@ -176,8 +183,8 @@ final class FrameBody {
     /// room leaves out: every put of a batch offers its value on an array, but one whose value is in its unit. Such a
     /// commit has few writes, and only one with a value that long visits them. The body of any other commit keeps its
     /// bytes past [#CHUNK_BYTES] in chunks from `pool`, and the writer seals it slice by slice. Made while the log is
-    /// `idle`, it refers to its values of [#LARGE_REFERABLE] bytes or more, which its room leaves out, if they hold a
-    /// chunk's bytes at least: such a commit's frame is sealed next, by a writer with nothing else to do, so gathering
+    /// `idle`, it refers to its values of [#LARGE_REFERABLE] bytes or more, which its room leaves out, if they hold
+    /// [#LARGE_REFERRED_BYTES] at least: such a commit's frame is sealed next, by a writer with nothing else to do, so gathering
     /// the values there rather than copying them here moves the copy off the commit and spares the frame a second copy
     /// of the batch. Made while the log is busy, as the commits of a sync that outpaces the device are, it refers to
     /// nothing, so the writer, which those commits wait for, seals it from the body itself.
@@ -205,8 +212,9 @@ final class FrameBody {
     /// the log is idle, which takes `capacity` bytes if it refers to nothing}
     ///
     /// It refers to the values of [#LARGE_REFERABLE] bytes or more, with room for the rest and for as many references
-    /// as there are such values, unless they hold fewer bytes than a chunk, which then saves too little to pay for the
-    /// pieces the writer gathers.
+    /// as there are such values, unless they hold fewer than [#LARGE_REFERRED_BYTES]. With a pool it starts on a chunk,
+    /// as the body that copies them does, even when the rest takes less: the chunk goes back to the pool once the
+    /// frame is sealed, where an array of the rest's size would be allocated for each commit.
     private static FrameBody forLargeCommit(ArrayWriteBatch writes, PageRef[] units, HeapPool pool, int capacity) {
         var referable = 0L;
         var count = 0;
@@ -217,12 +225,12 @@ final class FrameBody {
                 count++;
             }
         }
-        if (referable < CHUNK_BYTES) {
+        if (referable < LARGE_REFERRED_BYTES) {
             return new FrameBody(capacity, NOT_REFERABLE, pool);
         }
         // What is left holds the kind, key space, lengths and key of every write, so it is never below 16
         var own = (int) Math.min(estimate(writes, units) - referable, MAX_CAPACITY);
-        var body = new FrameBody(own, LARGE_REFERABLE, pool);
+        var body = new FrameBody(pool == null ? own : Math.max(own, CHUNK_BYTES), LARGE_REFERABLE, pool);
         body.referred = References.expecting(LARGE_REFERABLE, count);
         return body;
     }
