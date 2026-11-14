@@ -40,17 +40,18 @@ import java.util.zip.CRC32C;
 ///   an array of its own, or of one with a unit of [BlobFile]. A value a recovery copied to an array of its own moves,
 ///   to the log only.
 ///
-/// A recovery lists the values it replays on the frame bodies they came in, which their records keep, and charges each
-/// record the bytes of its commit's body rather than of its values alone: those are the bytes a version on a body
-/// keeps. A value of such a record is tagged where it lies in its body; those the queue still lists as the recovery
-/// ends are copied off their bodies ([#settleReplay(ReplayValues)]).
+/// A recovery moves a value it replays that the log holds before its last budget of bytes at once, on its own thread,
+/// tagged where it lies in the frame body it came in
+/// ([#moveReplayed(Crypto, Version, LogSegmentView, long, int, byte\[\])]), so no version keeps a body past its commit
+/// and no value of the log's older part is copied; it queues only the values of the log's last budget, copied off their
+/// bodies ([#keepsReplayed(long)]).
 ///
 /// A segment holding such values stays in place past the checkpoint that makes it obsolete while a reader that may
 /// still need them reads a tree older than that checkpoint ([#retirableBefore(long, ReaderTable)]): log disk use then
 /// grows where the heap grew before. Once it retires, a reader that finds such a value reads it from its own tree.
 ///
 /// Nothing of this is durable: a recovery replays the commits as ever, and moves the values it replays the same way
-/// ([LiveLedger#replay(long, byte\[\], int, int, ReplayValues, LogSegmentView, long)]).
+/// ([LiveLedger#replay(long, byte\[\], int, int, ReplayValues, LogSegmentView, long, long)]).
 final class SpillQueue {
     /// The shortest value that moves to the log: a [LogValue] takes 40 bytes, an array of the value 16 more than the
     /// value; below it, the array costs less than a read back from the file.
@@ -159,13 +160,39 @@ final class SpillQueue {
 
     /// {@return an empty record of the commit at `sequence`, with room for `writes` values}
     Record record(long sequence, int writes) {
-        return new Record(sequence, Math.max(1, writes), null, 0);
+        return new Record(sequence, Math.max(1, writes));
     }
 
-    /// {@return an empty record of the commit at `sequence` a recovery replays, with room for `writes` values, whose
-    /// body is `length` bytes of `frame`, the frame body its values lie on}
-    Record replayed(long sequence, int writes, byte[] frame, int length) {
-        return new Record(sequence, Math.max(1, writes), frame, length);
+    /// {@return whether a recovery keeps on the heap, listed in the queue, the values of a frame that `logFrom` bytes
+    /// of log at most start from: those of the log's last budget}
+    boolean keepsReplayed(long logFrom) {
+        return logFrom <= budget;
+    }
+
+    /// Records that a recovery moves values of the commit at `sequence` it replays to `segment`, before the first
+    /// one moves there ([#moveReplayed(Crypto, Version, LogSegmentView, long, int, byte\[\])]), so a checkpoint that
+    /// retires segments sees the commit.
+    void noteReplayed(long sequence, LogSegmentView segment) {
+        synchronized (lock) {
+            if (segment.note(sequence)) {
+                segments.add(segment);
+            }
+        }
+    }
+
+    /// Moves the value of `version`, which a recovery replayed from `frame`, at once to its place in the log, on the
+    /// caller's thread: `frame` is the opened body of the frame at `frameOffset` of `segment`, which holds it durably,
+    /// and `version` is on it, at `bodyIndex`, and at least [#LOG_VALUE_MIN] bytes. The tag is made where the value
+    /// lies in `frame`, which the version no longer keeps.
+    ///
+    /// @param crypto the caller's, until it gives it back ([#takeCrypto()])
+    /// @return whether the value moved
+    boolean moveReplayed(Crypto crypto, Version version, LogSegmentView segment, long frameOffset, int bodyIndex, byte[] frame) {
+        if (!version.spill(crypto, segment, frameOffset, bodyIndex, frame)) {
+            return false;
+        }
+        loggedValues.incrementAndGet();
+        return true;
     }
 
     /// Queues `record`, of a published commit after every one queued, and starts moving values if the queue is over
@@ -179,8 +206,7 @@ final class SpillQueue {
                 return;
             }
             records.addLast(record);
-            record.charged = record.frame == null ? record.bytes : Math.max(record.bytes, record.bodyLength);
-            held = held + record.charged;
+            held = held + record.bytes;
         }
         if (over()) {
             start();
@@ -238,14 +264,6 @@ final class SpillQueue {
         drain(durableSequence, lowWater);
     }
 
-    /// Moves values on the caller's thread while the queue holds more than twice its budget, down to the budget: a
-    /// recovery replays commits faster than the queue's thread alone moves their values, which it then helps.
-    void keepUp() {
-        if (held - budget > budget) {
-            drain(current, budget);
-        }
-    }
-
     /// Moves the values of the oldest records whose commits `durableSequence` gives durable, while the queue holds more
     /// than `downTo` bytes, on the caller's thread.
     private void drain(LongSupplier durableSequence, long downTo) {
@@ -259,7 +277,7 @@ final class SpillQueue {
                         return;
                     }
                     records.pollFirst();
-                    held = held - record.charged;
+                    held = held - record.bytes;
                     if (record.logs()) {
                         // Before any value moves there, so a checkpoint that retires segments sees the commit
                         var segment = record.segment;
@@ -275,24 +293,6 @@ final class SpillQueue {
         }
     }
 
-    /// Ends a recovery's replay, on its thread: moves values down to three quarters of the budget if the queue holds
-    /// more than it, as its own thread would, then copies the values its records still list on frame bodies into the
-    /// chunks of `values` ([Version#settle(ReplayValues)]), so no version keeps a body once the store opens. Those
-    /// records then count their values alone, as those of live commits do.
-    ///
-    /// The thread that moves values may still move those of a record it took; a record in the queue it cannot take
-    /// while this holds the lock, so no other thread reads the versions this copies.
-    void settleReplay(ReplayValues values) {
-        if (over()) {
-            drain(current, lowWater);
-        }
-        synchronized (lock) {
-            for (var record : records) {
-                held = held - record.settle(values);
-            }
-        }
-    }
-
     /// Drops the records of the commits up to `cut`, which a checkpoint just published holds, and records that it holds
     /// every commit of the segments before `logStart`, `latest` being the latest sequence as it was published; holding
     /// the store's publishing role.
@@ -301,7 +301,7 @@ final class SpillQueue {
             Record record;
             while ((record = records.peekFirst()) != null && record.sequence <= cut) {
                 records.pollFirst();
-                held = held - record.charged;
+                held = held - record.bytes;
                 record.release();
             }
             for (var segment : segments) {
@@ -437,12 +437,6 @@ final class SpillQueue {
         // The bytes of the values, and whether one is at least LOG_VALUE_MIN
         private long bytes;
         private boolean large;
-        // Of a commit a recovery replayed: the frame body its values lie on, until they move or the replay ends, and
-        // the bytes of the commit's body in it
-        private byte[] frame;
-        private final int bodyLength;
-        // The bytes the queue counts in held for the record; written holding the lock
-        private long charged;
         // Set by the log writer as it seals the frame: the segment use, the frame's offset, where the commit's body
         // starts in the frame's body, and whether the group was written through
         private LogSegmentView segment;
@@ -450,12 +444,10 @@ final class SpillQueue {
         private int commitStart;
         private boolean through;
 
-        private Record(long sequence, int capacity, byte[] frame, int bodyLength) {
+        private Record(long sequence, int capacity) {
             this.sequence = sequence;
             this.versions = new Version[capacity];
             this.offsets = new int[capacity];
-            this.frame = frame;
-            this.bodyLength = bodyLength;
         }
 
         /// Lists `version`, whose value of `length` bytes starts at `offset` of the commit's body.
@@ -498,7 +490,7 @@ final class SpillQueue {
                 var copied = 0;
                 for (var i = 0; i < count; i++) {
                     var version = versions[i];
-                    if (version.spill(crypto, segment, frameOffset, commitStart + offsets[i], frame)) {
+                    if (version.spill(crypto, segment, frameOffset, commitStart + offsets[i], null)) {
                         if (version.valueLength() >= LOG_VALUE_MIN) {
                             logged++;
                         } else {
@@ -512,28 +504,10 @@ final class SpillQueue {
             release();
         }
 
-        /// Copies the values a recovery replayed onto the frame body, those still there, off it into the chunks of
-        /// `values`, and forgets the body; holding the queue's lock, on a record in the queue.
-        ///
-        /// @return how many fewer bytes the queue counts for the record
-        private long settle(ReplayValues values) {
-            if (frame == null) {
-                return 0;
-            }
-            for (var i = 0; i < count; i++) {
-                versions[i].settle(values);
-            }
-            frame = null;
-            var released = charged - bytes;
-            charged = bytes;
-            return released;
-        }
-
         /// Forgets the values.
         private void release() {
             versions = null;
             offsets = null;
-            frame = null;
             count = 0;
         }
     }
