@@ -600,15 +600,34 @@ class PageCacheTest {
         }
 
         @Test
-        @DisplayName("caches a branch at its first read, recording nothing")
+        @DisplayName("caches a branch of level 2 or more at its first read, recording nothing, and screens one of level 1 as a leaf")
         void branches() {
             var cache = screening(LIMIT);
+            for (var level = 2; level <= 4; level++) {
+                var ref = page(level);
+                var branch = new byte[PageFormat.SIZE];
+                PageFile.header(branch, PageFormat.BRANCH, level, ref.page(), 1, 0, ref.nonceHigh(), ref.nonceLow());
+                cache.putScreened(ref, branch, PageCache.SCAN);
+                assertSame(branch, cache.peek(ref), "a branch of level " + level);
+            }
+            assertEquals(0, cache.doorkeeperForTests().keysForTests());
             var ref = page(0);
             var branch = new byte[PageFormat.SIZE];
             PageFile.header(branch, PageFormat.BRANCH, 1, ref.page(), 1, 0, ref.nonceHigh(), ref.nonceLow());
             cache.putScreened(ref, branch, PageCache.POINT);
+            assertNull(cache.peek(ref), "a branch of level 1 read once");
+            assertTrue(cache.seen(ref), "a branch of level 1 the doorkeeper recorded");
+            assertSame(branch, cache.recall(ref, PageCache.POINT), "a branch of level 1 read twice");
             assertSame(branch, cache.peek(ref));
-            assertEquals(0, cache.doorkeeperForTests().keysForTests());
+            // A scan's read of one takes it at its third read, as a leaf's
+            var scanned = page(1);
+            var scannedBranch = new byte[PageFormat.SIZE];
+            PageFile.header(scannedBranch, PageFormat.BRANCH, 1, scanned.page(), 1, 0, scanned.nonceHigh(), scanned.nonceLow());
+            cache.putScreened(scanned, scannedBranch, PageCache.SCAN);
+            assertSame(scannedBranch, cache.recall(scanned, PageCache.SCAN), "a branch of level 1 a scan read twice");
+            assertNull(cache.peek(scanned), "a branch of level 1 a scan read twice");
+            assertSame(scannedBranch, cache.recall(scanned, PageCache.SCAN), "a branch of level 1 a scan read three times");
+            assertSame(scannedBranch, cache.peek(scanned));
         }
 
         @Test
