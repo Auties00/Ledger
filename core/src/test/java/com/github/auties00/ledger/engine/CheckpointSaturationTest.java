@@ -319,6 +319,62 @@ class CheckpointSaturationTest {
         }
 
         @Test
+        @DisplayName("caches at its first read the leaf that replaces one a screened read refused, for a reader that reads each version once")
+        void readOncePerVersion(@TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
+                for (var round = 0; round < 6; round++) {
+                    var leaf = tree.path(key(100)).getLast();
+                    if (round < 2) {
+                        assertNull(tree.cache.peek(leaf), "the leaf of key 100 before the read of round " + round);
+                    } else {
+                        assertNotNull(tree.cache.peek(leaf), "the leaf of key 100 before the read of round " + round);
+                    }
+                    TreeSearch.leaf(tree.pages, tree.root, key(100), true);
+                    if (round == 0) {
+                        assertNull(tree.cache.peek(leaf), "the leaf the first read refused");
+                    } else {
+                        assertTrue(tree.cache.referencedForTests(leaf), "the leaf of key 100 after the read of round " + round);
+                    }
+                    var ops = new ArrayList<TreeUpdate.Op>();
+                    ops.add(new TreeUpdate.Op(segment(key(100)), segment(new byte[151 + round])));
+                    ops.add(new TreeUpdate.Op(segment(key(5_000)), segment(new byte[151 + round])));
+                    tree.apply(ops, tree.unsaturated());
+                    var unread = tree.path(key(5_000)).getLast();
+                    assertNull(tree.cache.peek(unread), "the leaf of key 5,000 in round " + round);
+                    assertFalse(tree.cache.seen(unread), "the leaf of key 5,000 seen in round " + round);
+                }
+                assertArrayEquals(new byte[156], tree.read(key(100)));
+                assertArrayEquals(new byte[156], tree.read(key(5_000)));
+            }
+        }
+
+        @ParameterizedTest(name = "screening {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("keeps a leaf only the checkpoint read out of the leaves a read used, so the next checkpoint leaves its replacement out")
+        void keptLeafUnread(boolean screening, @TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
+                tree.cache.screen(screening);
+                var leaf = tree.path(key(100)).getLast();
+                // A removal of a key the tree lacks reads the leaf of key 100 and leaves it as it is
+                tree.apply(List.of(new TreeUpdate.Op(segment((new String(key(100)) + "a").getBytes()), null)), tree.unsaturated());
+                assertEquals(leaf, tree.path(key(100)).getLast(), "the leaf the removal left");
+                assertFalse(tree.cache.referencedForTests(leaf), "the leaf only the checkpoint read counts as read");
+                if (screening) {
+                    assertNull(tree.cache.peek(leaf), "the leaf only the checkpoint read, past the doorkeeper");
+                    TreeSearch.leaf(tree.pages, tree.root, key(100), true);
+                    assertNull(tree.cache.peek(leaf), "the leaf after a reader's first read");
+                } else {
+                    assertNotNull(tree.cache.peek(leaf), "the leaf only the checkpoint read, cached as written");
+                }
+                tree.apply(ops(100, 101, 1, 151), tree.unsaturated());
+                var replacement = tree.path(key(100)).getLast();
+                assertNull(tree.cache.peek(replacement), "the replacement of the leaf only the checkpoint read");
+                assertArrayEquals(new byte[151], tree.read(key(100)));
+                tree.verify(KEYS, 7, 150);
+            }
+        }
+
+        @Test
         @DisplayName("caches the leaf that replaces one a reader read among those a checkpoint cached, for that checkpoint only")
         void readCheckpointLeaf(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, 64 * MIB).fill(KEYS)) {

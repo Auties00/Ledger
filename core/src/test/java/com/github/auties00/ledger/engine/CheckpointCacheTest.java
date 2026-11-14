@@ -239,7 +239,7 @@ class CheckpointCacheTest {
 
         @ParameterizedTest(name = "{0}")
         @ValueSource(strings = {"removing an absent key", "writing the value a key has"})
-        @DisplayName("count as read when the writes change nothing under them")
+        @DisplayName("count as read when the writes change nothing under them, the branches only: a leaf only the checkpoint read stays out of a screening cache")
         void survivors(String writes, @TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, 64 * MIB).filled()) {
                 tree.makeRecords(100);
@@ -253,16 +253,17 @@ class CheckpointCacheTest {
                     tree.cache.clearForTests();
                     tree.apply(List.of(op));
                     assertEquals(root, tree.root);
-                    for (var ref : path) {
-                        assertNotNull(tree.cache.peek(ref), "the node " + ref);
-                        assertTrue(tree.cache.referencedForTests(ref), "the node " + ref);
+                    for (var ref : path.subList(0, path.size() - 1)) {
+                        assertNotNull(tree.cache.peek(ref), "the branch " + ref);
+                        assertTrue(tree.cache.referencedForTests(ref), "the branch " + ref);
                     }
+                    assertNull(tree.cache.peek(path.getLast()), "the leaf " + path.getLast());
                 }
             }
         }
 
         @Test
-        @DisplayName("count as read in a tree of one leaf the writes do not change")
+        @DisplayName("do not count as read in a tree of one leaf the writes do not change")
         void rootSurvivor(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, 64 * MIB)) {
                 tree.apply(List.of(new TreeUpdate.Op(segment(key(1)), segment(new byte[10]))));
@@ -270,7 +271,9 @@ class CheckpointCacheTest {
                 tree.cache.clearForTests();
                 tree.apply(List.of(new TreeUpdate.Op(segment(key(2)), null)));
                 assertEquals(root, tree.root);
-                assertTrue(tree.cache.referencedForTests(root.ref()));
+                assertFalse(tree.cache.referencedForTests(root.ref()));
+                assertArrayEquals(new byte[10], read(tree.pages, tree.root, key(1)));
+                assertTrue(tree.cache.referencedForTests(root.ref()), "the root a reader read");
             }
         }
 

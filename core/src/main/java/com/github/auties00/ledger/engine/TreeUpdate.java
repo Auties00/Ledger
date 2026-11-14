@@ -36,10 +36,13 @@ import java.util.concurrent.atomic.AtomicReference;
 /// parallel, in the common fork-join pool.
 ///
 /// A node read to be replaced is neither cached nor counted as read ([PageFile#readForReplace(PageRef, byte)]); one the
-/// writes turn out not to change then counts as read after all. What the update writes goes to the page cache as the
-/// first entries the clock evicts: the branches, the leaves and delta pages the writer admits
+/// writes turn out not to change is then kept ([PageFile#keep(PageRef, byte\[\])]): a branch counts as read after
+/// all, and a leaf keeps the state its readers gave it. What the update writes goes to the page cache as the first
+/// entries the clock evicts: the branches, the leaves and delta pages the writer admits
 /// ([PageFile.Writer#admits(long, boolean)]), a leaf the more readily if one a read used in the cache is among those
-/// it replaces, and the units of values not at all.
+/// it replaces, and the units of values not at all. A leaf the writer leaves out in place of one a read used
+/// ([PageFile#seen(PageRef)]) is recorded as seen by the page cache's doorkeeper ([PageFile#expect(PageRef)]), so a
+/// reader that reads it once caches it, as it would have cached the leaf it replaces at that read.
 final class TreeUpdate {
     /// The writes below a branch from which its children's subtrees are updated on every processor.
     private static final int PARALLEL_OPS = 4_096;
@@ -589,6 +592,9 @@ final class TreeUpdate {
             // A leaf a former use of the page left at the record's place, which no read finds under the new nonce,
             // still counts against the limit
             pages.cache().remove(PageCache.dataKey(record.page(), record.slot()));
+            if (pages.seen(ref)) {
+                pages.expect(record);
+            }
         }
         return List.of(new Child(merged.getFirst().key(), record, merged.size(), blobs, 0, fill));
     }
@@ -653,6 +659,12 @@ final class TreeUpdate {
         public boolean read(PageFile pages, int from, int to) {
             return pages.referenced(ref);
         }
+
+        /// {@inheritDoc} The leaf `ref` gave every entry.
+        @Override
+        public boolean seen(PageFile pages, int from, int to) {
+            return pages.seen(ref);
+        }
     }
 
     /// The entries of a leaf after the writes that change it.
@@ -671,6 +683,10 @@ final class TreeUpdate {
         /// {@return whether the page cache holds one of the leaves that gave the entries from `from` to `to` as one a
         /// read used ([PageFile#referenced(PageRef)])}
         boolean read(PageFile pages, int from, int to);
+
+        /// {@return whether the page cache screens what reads miss and a read used one of the leaves that gave the
+        /// entries from `from` to `to` ([PageFile#seen(PageRef)])}
+        boolean seen(PageFile pages, int from, int to);
     }
 
     /// One leaf, which gave every entry.
@@ -678,6 +694,11 @@ final class TreeUpdate {
         @Override
         public boolean read(PageFile pages, int from, int to) {
             return pages.referenced(ref);
+        }
+
+        @Override
+        public boolean seen(PageFile pages, int from, int to) {
+            return pages.seen(ref);
         }
     }
 
@@ -690,6 +711,21 @@ final class TreeUpdate {
             var start = 0;
             for (var i = 0; i < refs.length && start < to; i++) {
                 if (ends[i] > from && pages.referenced(refs[i])) {
+                    return true;
+                }
+                start = ends[i];
+            }
+            return false;
+        }
+
+        @Override
+        public boolean seen(PageFile pages, int from, int to) {
+            if (refs.length == 0 || !pages.cache().screens()) {
+                return false;
+            }
+            var start = 0;
+            for (var i = 0; i < refs.length && start < to; i++) {
+                if (ends[i] > from && pages.seen(refs[i])) {
                     return true;
                 }
                 start = ends[i];
@@ -781,8 +817,8 @@ final class TreeUpdate {
         return unit != null ? unit : pages.read(ref, PageFormat.DELTA, true);
     }
 
-    /// Counts the node `ref` names, read as `unit`, as read in the page cache, as the update leaves it in the tree; a
-    /// node this checkpoint wrote keeps what the writer admitted.
+    /// Keeps the node `ref` names, read as `unit`, in the page cache ([PageFile#keep(PageRef, byte\[\])]), as the update
+    /// leaves it in the tree; a node this checkpoint wrote keeps what the writer admitted.
     private void keep(PageRef ref, byte[] unit) {
         if (ref.nonceHigh() != writer.nonceHigh()) {
             pages.keep(ref, unit);
@@ -954,7 +990,8 @@ final class TreeUpdate {
     /// index, and replace the leaves of `replaced`}
     ///
     /// The writer may admit a leaf to the page cache the more readily if a read used one of the leaves its entries came
-    /// from there, which it asks only when it would not admit it otherwise.
+    /// from there, which it asks only when it would not admit it otherwise. A leaf it leaves out whose entries came from
+    /// a leaf a read used is recorded as seen by the doorkeeper.
     private List<Child> writeLeaves(List<LeafEntry> entries, int[] sizes, List<int[]> runs, Replaced replaced) throws IOException {
         var out = new ArrayList<Child>(runs.size());
         for (var run : runs) {
@@ -966,6 +1003,9 @@ final class TreeUpdate {
             }
             var admitted = writer.admits(unit.length, !writer.saturated() && replaced.read(pages, run[0], run[1]));
             var ref = writer.write(PageFormat.LEAF, 0, page, 1, unit, unit.length - PageFormat.HEADER, admitted);
+            if (!admitted && replaced.seen(pages, run[0], run[1])) {
+                pages.expect(ref);
+            }
             out.add(new Child(TreeNodes.leafKey(unit, TreeNodes.entry(unit, 0)), ref, run[1] - run[0], blobs, 0,
                     TreeNodes.fill(sizes, run[0], run[1])));
         }

@@ -804,16 +804,39 @@ final class PageFile implements AutoCloseable {
         return hit != null && kindMatches(hit[PageFormat.KIND], NODE);
     }
 
-    /// Counts `unit` as read, caching it if the cache does not hold it: the checkpoint that read it to replace it found
-    /// it outlives the checkpoint.
+    /// Keeps `unit` in the cache, which the checkpoint that read it to replace it found outlives the checkpoint.
+    ///
+    /// A branch or a delta page counts as read, and is cached if the cache does not hold it. A leaf keeps the state
+    /// the cache gave it, as the checkpoint's read is no reader's: one the cache holds stays as it is, and one it does
+    /// not hold is cached as written, the first the clock evicts, or not at all while the cache screens what reads
+    /// miss, whose doorkeeper then decides at the leaf's next read as it would without the checkpoint. Counting a leaf
+    /// only a checkpoint read as read made the next checkpoint that does not follow at once cache the leaf replacing
+    /// it ([PageFile.Writer#admits(long, boolean)]), and let a reader's first read hit it past the doorkeeper.
     ///
     /// @param unit the plaintext of what `ref` names, as [#readForReplace(PageRef, byte)] or [#peek(PageRef, byte)]
     ///             gave it, or the leaf of a delta record made of units they gave; an array no one writes again, as
     ///             [PageCache#put(long, PageRef, byte\[\], boolean)] requires
     void keep(PageRef ref, byte[] unit) {
-        if (cache.get(ref) == null) {
-            cache.put(ref, unit, true);
+        if (unit[PageFormat.KIND] != PageFormat.LEAF) {
+            if (cache.get(ref) == null) {
+                cache.put(ref, unit, true);
+            }
+        } else if (!cache.screens() && cache.peek(ref) == null) {
+            cache.put(ref, unit, false);
         }
+    }
+
+    /// {@return whether the cache screens what reads miss and a read used the leaf `ref` names: the doorkeeper saw it,
+    /// or the cache holds it as an entry a read used ([#referenced(PageRef)])}
+    boolean seen(PageRef ref) {
+        return cache.screens() && (cache.seen(ref) || referenced(ref));
+    }
+
+    /// Records the leaf `ref` names, which a checkpoint wrote and left out of the cache in place of one a read used
+    /// ([#seen(PageRef)]), as seen by the doorkeeper, so the cache takes it at its first read
+    /// ([PageCache#expect(PageRef)]).
+    void expect(PageRef ref) {
+        cache.expect(ref);
     }
 
     private static boolean kindMatches(byte actual, byte expected) {
