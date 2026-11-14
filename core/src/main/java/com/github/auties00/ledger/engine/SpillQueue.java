@@ -79,6 +79,11 @@ final class SpillQueue {
     // The latest sequence the log holds durably; before the store has a log, the commits queued are those a recovery
     // replays from it, every one durable
     private volatile LongSupplier durable = () -> Long.MAX_VALUE;
+    // Reads the supplier the queue holds at each call: a thread that started moving values during a recovery goes on
+    // after the store attaches its log, and a supplier it took at its start would let it move the values of live
+    // commits the log does not hold durably yet, and skip the volatile read of the log's durable sequence that orders
+    // the writer's locating of a record before the thread reads it
+    private final LongSupplier current = () -> durable.getAsLong();
     private final AtomicReferenceArray<Crypto> cryptos;
     // The values moved to the log and to arrays of their own, for tests
     private final AtomicLong loggedValues = new AtomicLong();
@@ -121,7 +126,13 @@ final class SpillQueue {
 
     /// Reads the latest durable sequence from `log` from now on, and moves values whenever the queue is over budget.
     void useLog(LogWriter log) {
-        this.durable = log::durableSequence;
+        useDurable(log::durableSequence);
+    }
+
+    /// Reads the latest durable sequence from `durableSequence` from now on, a thread moving values included, and moves
+    /// values whenever the queue is over budget.
+    void useDurable(LongSupplier durableSequence) {
+        this.durable = durableSequence;
         if (over()) {
             start();
         }
@@ -183,7 +194,7 @@ final class SpillQueue {
 
     private void run() {
         try {
-            drain(durable);
+            drain(current);
         } finally {
             running.set(false);
         }
@@ -215,7 +226,7 @@ final class SpillQueue {
     /// recovery replays commits faster than the queue's thread alone moves their values, which it then helps.
     void keepUp() {
         if (held - budget > budget) {
-            drain(durable, budget);
+            drain(current, budget);
         }
     }
 

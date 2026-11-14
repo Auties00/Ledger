@@ -668,6 +668,42 @@ class LogSpillTest {
     }
 
     @Test
+    @DisplayName("a thread that started moving values during a recovery stops at the log's durable sequence once the store attaches its log")
+    void recoveryThreadFollowsTheLog(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(0, true);
+        var view = queue.segment(1, directory.resolve("1.log"), null);
+        // A replayed commit whose value takes the thread a while to tag, queued before the store has a log
+        var replayed = queue.record(1, 1);
+        replayed.add(spillable(1L << 20, 64 << 20), 0, 64 << 20);
+        replayed.locate(view, 64, 0, false);
+        queue.add(replayed);
+        // The thread took the record, so it runs with the supplier it read at its start
+        while (queue.heldForTests() != 0) {
+            Thread.onSpinWait();
+        }
+        // The store attaches its log, which holds commits up to 1 durably, while the thread still tags
+        queue.useDurable(() -> 1);
+        // A live commit 2, published, its frame sealed but not durable
+        var live = spillable(2L << 20, 4_000);
+        var record = queue.record(2, 1);
+        record.add(live, 0, 4_000);
+        record.locate(view, 1 << 20, 0, false);
+        queue.add(record);
+        queue.awaitIdleForTests();
+        assertInstanceOf(MemorySegment.class, live.sourceForTests(), "the value of a commit the log does not hold durably");
+        assertEquals(1, queue.loggedValuesForTests(), "values moved to the log");
+    }
+
+    /// {@return a version of a value of `length` bytes on an array of its own, stamped `stamp`}
+    private static Version spillable(long stamp, int length) {
+        var bytes = new byte[length];
+        for (var i = 0; i < length; i++) {
+            bytes[i] = (byte) i;
+        }
+        return Version.of(stamp, MemorySegment.ofArray(bytes).asReadOnly(), 0, length, null, null, null);
+    }
+
+    @Test
     @DisplayName("the product modulo 2^61 - 1 of the tags is the exact one for operands up to 2^62")
     void multipliesModuloThePrime() {
         var prime = java.math.BigInteger.ONE.shiftLeft(61).subtract(java.math.BigInteger.ONE);
