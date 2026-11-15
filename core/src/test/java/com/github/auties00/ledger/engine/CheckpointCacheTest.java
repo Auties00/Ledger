@@ -239,7 +239,7 @@ class CheckpointCacheTest {
 
         @ParameterizedTest(name = "{0}")
         @ValueSource(strings = {"removing an absent key", "writing the value a key has"})
-        @DisplayName("count as read when the writes change nothing under them, the branches only: a leaf only the checkpoint read stays out of a screening cache")
+        @DisplayName("count as read when the writes change nothing under them, the root and the branches of level 2 or more only: a branch of level 1 and a leaf only the checkpoint read stay out of a screening cache")
         void survivors(String writes, @TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, 64 * MIB).filled()) {
                 tree.makeRecords(100);
@@ -253,10 +253,15 @@ class CheckpointCacheTest {
                     tree.cache.clearForTests();
                     tree.apply(List.of(op));
                     assertEquals(root, tree.root);
-                    for (var ref : path.subList(0, path.size() - 1)) {
+                    assertTrue(tree.cache.screens());
+                    assertTrue(path.size() >= 3, "no branch of level 1 below the root");
+                    for (var ref : path.subList(0, path.size() - 2)) {
                         assertNotNull(tree.cache.peek(ref), "the branch " + ref);
                         assertTrue(tree.cache.referencedForTests(ref), "the branch " + ref);
                     }
+                    var parent = path.get(path.size() - 2);
+                    assertEquals(1, tree.pages.read(parent, PageFile.NODE, false)[PageFormat.LEVEL]);
+                    assertNull(tree.cache.peek(parent), "the branch of level 1 " + parent);
                     assertNull(tree.cache.peek(path.getLast()), "the leaf " + path.getLast());
                 }
             }
@@ -294,7 +299,7 @@ class CheckpointCacheTest {
         }
 
         @Test
-        @DisplayName("read a delta page once for all the records of it that the checkpoint replaces, and keep it cached")
+        @DisplayName("read a delta page once for all the records of it that the checkpoint replaces, and leave it out of a screening cache")
         void deltaPageReadOnce(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, 64 * MIB, false).filled()) {
                 // In different leaves that sit next to one another, so the records fill one delta page
@@ -321,8 +326,9 @@ class CheckpointCacheTest {
                 }
                 var reads = tree.apply(ops, tree.pages.writer(tree.random.nextLong()));
                 assertEquals(branches.size() + bases.size() + deltaPages.size(), reads);
+                assertTrue(tree.cache.screens());
                 for (var page : deltaPages) {
-                    assertTrue(tree.cache.referencedForTests(page), "the delta page, whose other records live on");
+                    assertNull(tree.cache.peek(page), "the delta page only the checkpoint read, whose other records live on");
                 }
                 for (var base : bases) {
                     assertNull(tree.cache.peek(base), "the base of a replaced record");

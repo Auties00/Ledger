@@ -350,7 +350,7 @@ final class PageFile implements AutoCloseable {
     /// A node a checkpoint replaces is dead once the checkpoint ends. Caching or promoting it, while the units the
     /// checkpoint writes go in as the first the clock evicts, made a checkpoint larger than the cache keep the old
     /// nodes and evict the new ones. A unit read from the file ends with its content, as one read for the cache does,
-    /// so [#keep(PageRef, byte\[\])] can cache it.
+    /// so [#keep(PageRef, byte\[\], boolean)] can cache it.
     ///
     /// The read is left out of the average of [#coldReads()]: a checkpoint reads what the last ones wrote, which the
     /// OS cache mostly still holds, and quick reads of it would hide that the readers' own reads go to the device.
@@ -868,18 +868,22 @@ final class PageFile implements AutoCloseable {
 
     /// Keeps `unit` in the cache, which the checkpoint that read it to replace it found outlives the checkpoint.
     ///
-    /// A branch or a delta page counts as read, and is cached if the cache does not hold it. A leaf keeps the state
-    /// the cache gave it, as the checkpoint's read is no reader's: one the cache holds stays as it is, and one it does
-    /// not hold is cached as written, the first the clock evicts, or not at all while the cache screens what reads
-    /// miss, whose doorkeeper then decides at the leaf's next read as it would without the checkpoint. Counting a leaf
-    /// only a checkpoint read as read made the next checkpoint that does not follow at once cache the leaf replacing
-    /// it ([PageFile.Writer#admits(long, boolean)]), and let a reader's first read hit it past the doorkeeper.
+    /// A branch of level 2 or more, or a tree's root, counts as read, and is cached if the cache does not hold it: the
+    /// reads cache those at once anyway. A leaf, a branch of level 1 and a delta page keep the state the cache gave
+    /// them, as the checkpoint's read is no reader's: one the cache holds stays as it is, and one it does not hold is
+    /// cached as written, the first the clock evicts, or not at all while the cache screens what reads miss, whose
+    /// doorkeeper then decides at the unit's next read as it would without the checkpoint. Counting a leaf only a
+    /// checkpoint read as read made the next checkpoint that does not follow at once cache the leaf replacing it
+    /// ([PageFile.Writer#admits(long, boolean)]), and let a reader's first read hit it past the doorkeeper; counting a
+    /// branch of level 1 so let a scan's first read hit it, and one evicted unread recorded it, or a delta page no
+    /// read asks the doorkeeper about, as read twice.
     ///
     /// @param unit the plaintext of what `ref` names, as [#readForReplace(PageRef, byte)] or [#peek(PageRef, byte)]
     ///             gave it, or the leaf of a delta record made of units they gave; an array no one writes again, as
     ///             [PageCache#put(long, PageRef, byte\[\], boolean)] requires
-    void keep(PageRef ref, byte[] unit) {
-        if (unit[PageFormat.KIND] != PageFormat.LEAF) {
+    /// @param root whether `unit` is the root of its tree
+    void keep(PageRef ref, byte[] unit, boolean root) {
+        if (unit[PageFormat.KIND] == PageFormat.BRANCH && (root || unit[PageFormat.LEVEL] >= 2)) {
             if (cache.get(ref) == null) {
                 cache.put(ref, unit, true);
             }
