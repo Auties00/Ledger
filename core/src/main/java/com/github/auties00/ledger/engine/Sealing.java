@@ -8,17 +8,18 @@ import java.util.concurrent.atomic.AtomicLong;
 ///
 /// The JDK reaches its AES-GCM intrinsics only from code the second compiler of the JIT compiled, which it compiles
 /// once a method was called about 5,000 times: its GHASH, its counter mode and the methods that call them. Slices of
-/// 64 KiB call each about six times, so a process whose log seals large frames from its start sealed the first 50 to
-/// 100 MiB of them in the JDK's Java code, a few hundred megabytes a second, where the intrinsics take gigabytes. The
-/// first [#COLD_BYTES] of the log's frames the process seals therefore go to the cipher in slices of [#COLD_SLICE]
-/// ([#slice(int)]), one call each, so those methods reach the second compiler within them; the slices after are the
-/// log's own.
+/// 64 KiB call each about six times, so a process that seals large frames or units from its start sealed the first 50
+/// to 100 MiB of them in the JDK's Java code, a few hundred megabytes a second, where the intrinsics take gigabytes.
+/// The first [#COLD_BYTES] the process seals in the log's frames and at the start of the units of the file of large
+/// values therefore go to the cipher in slices of [#COLD_SLICE] ([#slice(int)]), one call each, so those methods reach
+/// the second compiler within them; the slices after are the callers' own.
 ///
-/// Only the log takes them: its frames are many messages, each initialized, given its header and finished, so the JIT
-/// compiles those methods from profiles that saw messages start and end. A unit of a file is one message of up to
-/// hundreds of megabytes, so the short slices of the first would have the JIT compile the cipher from calls that never
-/// finished a message, and the first message to end, and every later one, would deoptimize it, which left its methods
-/// in code of the first compiler for the rest of a process that wrote values of 16 MiB.
+/// The JIT compiles those methods from the calls it profiled, and a branch no profiled call took deoptimizes them when
+/// it is first taken, after which they stay in code of the first compiler for thousands of calls. So the short slices
+/// go only where messages end between them: the log's frames are many messages, each initialized, given its header
+/// and finished, and a unit takes them in its first 2 MiB alone, so the compilation comes over several units, after
+/// some ended. A unit of 16 MiB sealed in short slices whole had the JIT compile the cipher from calls that never
+/// finished a message, which every message after deoptimized.
 final class Sealing {
     /// The bytes one call to the cipher encrypts: a multiple of the AES block, so no slice leaves a partial block.
     private static final int SLICE = 64 << 10;
@@ -58,6 +59,14 @@ final class Sealing {
     /// {@return whether the process has sealed [#COLD_BYTES] bytes in slices of [#COLD_SLICE]; for tests}
     static boolean coldSpentForTests() {
         return COLD_LEFT.get() <= 0;
+    }
+
+    /// Sets the bytes of the budget no slice took yet to `left`, so a test seals as a process that sealed
+    /// [#COLD_BYTES] minus `left` bytes in short slices; for tests.
+    ///
+    /// @return the bytes the budget had left before
+    static long coldLeftForTests(long left) {
+        return COLD_LEFT.getAndSet(left);
     }
 
     /// Encrypts the `length` bytes of `input` at `inputOffset`, then `padding` zero bytes, into `output` at

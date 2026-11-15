@@ -33,6 +33,55 @@ class PageCipherTest {
     @MethodSource("units")
     @DisplayName("sealing a part at a time gives the bytes of the whole unit, which opens to its content and fails once changed")
     void sealsTheSameUnit(int length, boolean encrypted, int bufferLength) throws IOException {
+        assertSealsTheSameUnit(length, encrypted, bufferLength);
+    }
+
+    static Stream<Arguments> unitsAtTheColdEnd() {
+        // The content ends in the last short slice before 2 MiB, and the slice after it starts at 2 MiB, past the short
+        // slices, with the padding left of the unit
+        var lengths = new int[]{(2 << 20) - 47, (2 << 20) - 32, (2 << 20) - 10, (2 << 20) - 1, 2 << 20, (2 << 20) + 1};
+        return Arrays.stream(lengths).boxed().flatMap(length -> Stream.of(1 << 20, 64 << 10).map(buffer -> Arguments.of(length, buffer)));
+    }
+
+    @ParameterizedTest(name = "{0} bytes, buffer of {1}")
+    @MethodSource("unitsAtTheColdEnd")
+    @DisplayName("a cold process seals a unit whose content ends in its last short slice as the whole unit")
+    void sealsAtTheColdEnd(int length, int bufferLength) throws IOException {
+        var before = Sealing.coldLeftForTests(Sealing.COLD_BYTES);
+        try {
+            assertSealsTheSameUnit(length, true, bufferLength);
+        } finally {
+            Sealing.coldLeftForTests(before);
+        }
+    }
+
+    static Stream<Arguments> unitsAtTheBudgetEnd() {
+        // Each ends a little past a page, so the padding after the slice that crosses the content's end is longer
+        // than a short slice
+        var lengths = new int[]{1_500, 4_200, 41_060, (1 << 20) + 700};
+        return Arrays.stream(lengths).boxed().flatMap(length -> Stream.of(1 << 20, 64 << 10).map(buffer -> Arguments.of(length, buffer)));
+    }
+
+    @ParameterizedTest(name = "{0} bytes, buffer of {1}")
+    @MethodSource("unitsAtTheBudgetEnd")
+    @DisplayName("a unit whose last short slice, which spends the process's budget, crosses the end of its content seals as the whole unit")
+    void sealsAtTheBudgetEnd(int length, int bufferLength) throws IOException {
+        // The unit's first slice is 640 KiB when its content and the buffer hold as much, and takes a short slice of
+        // the budget all the same
+        var first = 640 << 10;
+        var slices = length >= first && bufferLength >= first + 2 * PageFormat.TAG
+                ? 1 + (length - first) / Sealing.COLD_SLICE + 1
+                : length / Sealing.COLD_SLICE + 1;
+        var before = Sealing.coldLeftForTests((long) slices * Sealing.COLD_SLICE);
+        try {
+            assertSealsTheSameUnit(length, true, bufferLength);
+            assertTrue(Sealing.coldSpentForTests(), "the unit did not spend the budget");
+        } finally {
+            Sealing.coldLeftForTests(before);
+        }
+    }
+
+    private static void assertSealsTheSameUnit(int length, boolean encrypted, int bufferLength) throws IOException {
         var cipher = new PageCipher(encrypted ? KEY : null);
         var pages = PageFormat.pagesFor(length);
         var content = new byte[length + 7];

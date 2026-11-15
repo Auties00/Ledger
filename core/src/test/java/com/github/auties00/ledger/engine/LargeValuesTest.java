@@ -104,6 +104,22 @@ class LargeValuesTest {
         }
 
         @Test
+        @DisplayName("an encrypted store in a cold process commits a value whose content ends in the last short slice before 2 MiB")
+        void coldUnitEnd(@TempDir Path directory) throws Exception {
+            var value = value(8, (2 << 20) - 32);
+            var before = Sealing.coldLeftForTests(Sealing.COLD_BYTES);
+            try (var ledger = open(directory, true)) {
+                ledger.commit(ledger.newBatch().put(FILES, "big", value)).awaitDurable();
+                assertArrayEquals(value, ledger.get(FILES, "big").orElseThrow());
+            } finally {
+                Sealing.coldLeftForTests(before);
+            }
+            try (var ledger = open(directory, true)) {
+                assertArrayEquals(value, ledger.get(FILES, "big").orElseThrow());
+            }
+        }
+
+        @Test
         @DisplayName("keep values below the threshold, and those of a key space with a threshold of its own, in the log")
         void thresholds(@TempDir Path directory) throws Exception {
             var below = value(2, 4_095);
