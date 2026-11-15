@@ -1093,6 +1093,11 @@ public final class ArrayWriteBatch implements WriteBatch {
         return pagedOwns > 0;
     }
 
+    /// {@return how many values the batch puts to paged key spaces on arrays of their own that it did not borrow}
+    int pagedOwns() {
+        return pagedOwns;
+    }
+
     /// Starts the batch again, empty, once the store has applied its writes: it hands over to the store the arrays the
     /// versions slice, and gives the others back to the pool.
     void finish() {
