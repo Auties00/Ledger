@@ -108,9 +108,9 @@ class PageCipher {
             // only trail its input, which it encrypts in place as well
             var consumed = PageFormat.HEADER;
             var written = PageFormat.HEADER;
-            while (tag - consumed > SLICE) {
-                written += cipher.update(unit, consumed, SLICE, unit, written);
-                consumed += SLICE;
+            for (var slice = Sealing.slice(SLICE); tag - consumed > slice; slice = Sealing.slice(SLICE)) {
+                written += cipher.update(unit, consumed, slice, unit, written);
+                consumed += slice;
             }
             cipher.doFinal(unit, consumed, tag - consumed, unit, written);
         } catch (GeneralSecurityException exception) {
@@ -133,7 +133,8 @@ class PageCipher {
     /// The unit is the one [#seal(byte\[\], int, byte\[\], int)] makes of the same header and content, but neither is
     /// whole in memory: a value of megabytes is sealed through a buffer of its own size. The cipher reads each whole
     /// slice of the content where it is; only the last part of the content and the padding after it are copied.
-    /// The first slice of a content of [#FIRST_SLICE] bytes or more is that long, the others [#SLICE] bytes.
+    /// The first slice of a content of [#FIRST_SLICE] bytes or more is that long, the others [#SLICE] bytes, or shorter
+    /// while the process seals its first megabytes ([Sealing#slice(int)]).
     ///
     /// @param header the unit's header, filled in, of [PageFormat#HEADER] bytes
     /// @param buffer the buffer the sealed bytes pass through, of at least 64 KiB
@@ -181,7 +182,7 @@ class PageCipher {
             var sliceLength = Math.min(SLICE, buffer.length / 2);
             byte[] last = null;
             for (var offset = 0L; offset < total; ) {
-                var count = (int) Math.min(sliceLength, total - offset);
+                var count = (int) Math.min(Sealing.slice(sliceLength), total - offset);
                 if (offset == 0 && contentLength >= FIRST_SLICE && buffer.length >= FIRST_SLICE + 2 * PageFormat.TAG) {
                     count = FIRST_SLICE;
                 }
