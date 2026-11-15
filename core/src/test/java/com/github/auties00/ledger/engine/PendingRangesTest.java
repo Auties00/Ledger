@@ -176,6 +176,12 @@ class PendingRangesTest {
             ledger.commit(ledger.newBatch().deleteRange(CHATS, KeyRange.below(message(100))));
             assertEquals(0, pending(ledger, CHATS));
             assertEquals(10, ledger.size(CHATS));
+            // The commit waits for the resident loader to pass its keys, and the loader lets its own read go only
+            // after that; a count that kept its read, which the held executor never runs, would hold it for good
+            var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (!ledger.readers().idle() && System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+            }
             assertTrue(ledger.readers().idle());
         }
     }
