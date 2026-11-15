@@ -566,6 +566,9 @@ final class SpillQueue {
     /// for one of 1 MiB, the longest that moves with the default large values, and below 2^-64 for the longest a frame
     /// holds, which a store without a file of large values may move.
     ///
+    /// The polynomials are evaluated four coefficients of the value at a time, as the sum of each times its power of the
+    /// point, so that the four products do not wait for one another; the result is the one Horner's rule gives.
+    ///
     /// @implNote This implementation tags with a universal hash of its own, not a MAC of the JDK: a store that recovers
     /// a long log after a crash tags every value it replays while the JVM has compiled little, when the C2 compilation
     /// of an HMAC inlined at its call site takes hundreds of milliseconds of a compiler thread, and a GMAC takes an
@@ -582,6 +585,9 @@ final class SpillQueue {
         private final byte[] skipped;
         // The points of the polynomials of the tags, or null without encryption
         private final long[] keys;
+        // The second, third and fourth powers of the points, in that order for the first and then for the second, or
+        // null without encryption
+        private final long[] powers;
         private final CRC32C crc;
         // The two polynomials of the last tag
         private long first;
@@ -592,11 +598,27 @@ final class SpillQueue {
 
         private Crypto(SpillQueue queue) {
             this.keys = queue.encrypted ? queue.tagKeys() : null;
+            this.powers = keys == null ? null : powersOf(keys);
             this.crc = new CRC32C();
             this.ctrs = new Cipher[KEPT_KEYS];
             this.ctrKeys = new SecretKeySpec[KEPT_KEYS];
             this.counter = new byte[BLOCK];
             this.skipped = new byte[BLOCK];
+        }
+
+        /// {@return the second, third and fourth powers of the two points of `keys`, those of the first and then those
+        /// of the second}
+        private static long[] powersOf(long[] keys) {
+            var powers = new long[6];
+            for (var i = 0; i < 2; i++) {
+                var point = keys[i];
+                var square = multiply(point, point);
+                var cube = multiply(square, point);
+                powers[3 * i] = square;
+                powers[3 * i + 1] = cube;
+                powers[3 * i + 2] = multiply(cube, point);
+            }
+            return powers;
         }
 
         /// {@return an array of at least `length` bytes, which only this holder uses until it is given back}
@@ -757,7 +779,8 @@ final class SpillQueue {
 
         /// Evaluates the two polynomials of the tag of the `length` bytes at `offset` of `value`, the value of the
         /// version stamped `stamp`, into [#first] and [#second]: by Horner's rule, the coefficients 1, the stamp in two
-        /// words, the value in words of 7 bytes, the last one shorter, and the length.
+        /// words, the value in words of 7 bytes, the last one shorter, and the length, four of the value's words at a
+        /// time while four whole ones are left.
         private void tag(byte[] value, int offset, int length, long stamp) {
             var x = keys[0];
             var y = keys[1];
@@ -772,6 +795,21 @@ final class SpillQueue {
             b = multiply(b + word, y);
             var end = offset + length;
             var at = offset;
+            var x2 = powers[0];
+            var x3 = powers[1];
+            var x4 = powers[2];
+            var y2 = powers[3];
+            var y3 = powers[4];
+            var y4 = powers[5];
+            // Four words at a time, the last read the 8 bytes after the first three
+            for (; at + 3 * WORD + Long.BYTES <= end; at += 4 * WORD) {
+                var w0 = Bytes.i64(value, at) >>> 8;
+                var w1 = Bytes.i64(value, at + WORD) >>> 8;
+                var w2 = Bytes.i64(value, at + 2 * WORD) >>> 8;
+                var w3 = Bytes.i64(value, at + 3 * WORD) >>> 8;
+                a = reduce(multiply(a + w0, x4) + multiply(w1, x3) + multiply(w2, x2) + multiply(w3, x));
+                b = reduce(multiply(b + w0, y4) + multiply(w1, y3) + multiply(w2, y2) + multiply(w3, y));
+            }
             // A long read takes 8 bytes: the top 7 of it are a word
             for (; at + Long.BYTES <= end; at += WORD) {
                 word = Bytes.i64(value, at) >>> 8;
@@ -789,6 +827,19 @@ final class SpillQueue {
             }
             first = multiply(a + length, x);
             second = multiply(b + length, y);
+        }
+
+        /// {@return `sum`, below 2^63, modulo [#PRIME]}
+        private static long reduce(long sum) {
+            var reduced = (sum & PRIME) + (sum >>> 61);
+            return reduced >= PRIME ? reduced - PRIME : reduced;
+        }
+
+        /// {@return the two polynomials of the tag of the `length` bytes at `offset` of `value`, of the version stamped
+        /// `stamp`, and the two points they are evaluated at, in this order}
+        long[] tagForTests(byte[] value, int offset, int length, long stamp) {
+            tag(value, offset, length, stamp);
+            return new long[]{first, second, keys[0], keys[1]};
         }
 
         /// {@return `a` times `b` modulo [#PRIME], both below 2^62}
