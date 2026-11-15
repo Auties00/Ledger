@@ -1197,6 +1197,37 @@ class LogSpillTest {
     }
 
     @Test
+    @DisplayName("a batch a hot slab takes beside values on arrays of their own lists them in a record with room for those values only, not for every write")
+    void ownValueRecordsHaveOwnRoom(@TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        // A budget no commit here passes, so the records stay queued
+        try (var ledger = open(directory, true, 64L << 20)) {
+            ledger.valueSlab().forceHotForTests(1L << 20);
+            com.github.auties00.ledger.Commit last = null;
+            for (var batch = 0; batch < 3; batch++) {
+                var writes = ledger.newBatch();
+                for (var i = 0; i < 14; i++) {
+                    var message = batch * 100 + i;
+                    var value = large(message, 1_000 + i);
+                    writes.put(MESSAGES, key(message), value);
+                    expected.put(message, value);
+                }
+                for (var own = 98; own < 100; own++) {
+                    var value = large(batch * 100 + own, 256 << 10);
+                    writes.put(MESSAGES, key(batch * 100 + own), value);
+                    expected.put(batch * 100 + own, value);
+                }
+                last = ledger.commit(writes);
+            }
+            assertArrayEquals(new int[]{2, 2, 2}, ledger.spills().recordRoomsForTests(), "the room of the queued records");
+            last.awaitDurable();
+            verifyLarge(ledger, expected);
+            ledger.checkpoint();
+            verifyLarge(ledger, expected);
+        }
+    }
+
+    @Test
     @DisplayName("the values of a group the log wrote through move to the log when each is long enough to read back from the device, and stay when one is not")
     void writtenThroughLongValuesMove(@TempDir Path directory) throws Exception {
         var queue = new SpillQueue(0, true);

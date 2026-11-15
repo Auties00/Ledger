@@ -414,6 +414,13 @@ final class SpillQueue {
         return copiedValues.get();
     }
 
+    /// {@return the room for values of each record the queue holds, oldest first; for tests}
+    int[] recordRoomsForTests() {
+        synchronized (lock) {
+            return records.stream().mapToInt(record -> record.versions.length).toArray();
+        }
+    }
+
     /// {@return the records whose values a drain took to move so far; for tests}
     long drainedRecordsForTests() {
         return drainedRecords.get();
