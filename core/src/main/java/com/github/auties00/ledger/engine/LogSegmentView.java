@@ -144,6 +144,9 @@ final class LogSegmentView {
             throw Retired.INSTANCE;
         }
         var crypto = spills.takeCrypto();
+        var diagStart = System.nanoTime();
+        ScratchCounters.addWho("read", 1);
+        ScratchCounters.add("readBytes", length);
         try {
             var start = logged.frameOffset() + LogWriter.FRAME_HEADER + logged.bodyIndex();
             if (key == null) {
@@ -158,6 +161,7 @@ final class LogSegmentView {
                 readFully(crypto.scratchBuffer(), 0, skip + length, start - skip);
                 var cipher = takeBlocks();
                 if (cipher == null) {
+                    ScratchCounters.addWho("cipherHolder", 1);
                     crypto.decrypt(key, logged.frameOffset(), logged.bodyIndex(), sealed, skip, length, target, offset);
                 } else {
                     try {
@@ -181,6 +185,7 @@ final class LogSegmentView {
                         + " does not match the value the store wrote", null);
             }
         } finally {
+            ScratchCounters.addWho("readNanos", System.nanoTime() - diagStart);
             spills.giveBack(crypto);
         }
     }
@@ -219,6 +224,7 @@ final class LogSegmentView {
             return cipher;
         }
         blocksMade = true;
+        ScratchCounters.addWho("cipherNew", 1);
         cipher = SpillQueue.Crypto.newBlocks();
         try {
             cipher.init(Cipher.ENCRYPT_MODE, key);

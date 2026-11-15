@@ -449,6 +449,8 @@ final class Checkpointer implements IdleTicker.Watched {
                 return;
             }
             cutBytes = cut.logBytes();
+            ScratchCounters.print("before-ckpt closing=" + closing);
+            var diagStart = System.nanoTime();
             poolHold = pages.pool().hold();
             // Lagging once a second interval of log waits behind the cut: the commits will wait for this checkpoint
             BooleanSupplier lagging = () -> log.appendedBytes() - cutBytes > every;
@@ -468,6 +470,7 @@ final class Checkpointer implements IdleTicker.Watched {
             var superblockWritten = false;
             try {
                 roots = build(cut, update, adopted);
+                ScratchCounters.add("ckptBuildNanos", System.nanoTime() - diagStart);
                 nextDeltas = update.finishDeltas(deltas);
                 freed.addAll(update.freed());
                 if (deltaTable != null) {
@@ -492,8 +495,10 @@ final class Checkpointer implements IdleTicker.Watched {
                     blobFreeList = writeBlobFreeList(writer, update, blobRuns);
                 }
                 freeList = writeFreeList(writer, update, freed);
+                var diagFlush = System.nanoTime();
                 writer.flush();
                 writer.awaitForce();
+                ScratchCounters.add("ckptFlushNanos", System.nanoTime() - diagFlush);
                 if (blobs != null) {
                     // The units the trees take were written by commits the log may not have forced yet
                     blobs.force();
@@ -527,6 +532,7 @@ final class Checkpointer implements IdleTicker.Watched {
             } finally {
                 ledger.readers().unregister(cut.sequence());
             }
+            ScratchCounters.add("ckptToPublishNanos", System.nanoTime() - diagStart);
             ledger.publish(cut, number, roots, catalog, freeList, blobFreeList, freed, update.droppedRecords(),
                     update.freedExternal(), adopted);
             publishedBytes = cut.logBytes();
@@ -549,6 +555,8 @@ final class Checkpointer implements IdleTicker.Watched {
             } catch (IOException exception) {
                 // The checkpoint is durable; trailing free pages wait for the next one
             }
+            ScratchCounters.add("ckptTotalNanos", System.nanoTime() - diagStart);
+            ScratchCounters.print("ckpt closing=" + closing);
         } finally {
             // Every flush of the checkpoint gave its sealed arrays back before it returned
             Reference.reachabilityFence(poolHold);

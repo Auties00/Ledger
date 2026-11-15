@@ -248,7 +248,9 @@ final class SpillQueue {
         if (record.count == 0) {
             return;
         }
+        var diagAdd = System.nanoTime();
         synchronized (lock) {
+            ScratchCounters.add("addLockWaitNanos", System.nanoTime() - diagAdd);
             if (closed) {
                 return;
             }
@@ -275,6 +277,7 @@ final class SpillQueue {
             return;
         }
         alive.incrementAndGet();
+        ScratchCounters.add("spillStarts", 1);
         try {
             Thread.ofVirtual().name("ledger-spill").start(this::run);
         } catch (Throwable _) {
@@ -335,6 +338,7 @@ final class SpillQueue {
                     held = held - record.bytes;
                     drainedRecords.incrementAndGet();
                     if (record.sequence <= taken) {
+                        ScratchCounters.add("drainTaken", 1);
                         takenRecords.incrementAndGet();
                         record.release();
                         continue;
@@ -351,14 +355,23 @@ final class SpillQueue {
                         }
                     }
                 }
-                if (extent >= 0 && !warm(record, extent, durableSequence, downTo)) {
+                var diagWarm = System.nanoTime();
+                var diagWarmed = extent >= 0 && !warm(record, extent, durableSequence, downTo);
+                if (extent >= 0) {
+                    ScratchCounters.add("drainWarmNanos", System.nanoTime() - diagWarm);
+                    ScratchCounters.add("drainWarmRecords", 1);
+                }
+                if (diagWarmed) {
                     // The values stay on their arrays rather than leave for a place that a read would fetch from the
                     // device; a retired segment's commit is in a published checkpoint, which drops the record anyway
                     unwarmedRecords.incrementAndGet();
                     record.release();
                     continue;
                 }
+                var diagStart = System.nanoTime();
                 record.spill(this, crypto);
+                ScratchCounters.add("drainNanos", System.nanoTime() - diagStart);
+                ScratchCounters.add("drained", 1);
             }
         } finally {
             giveBack(crypto);
@@ -445,7 +458,11 @@ final class SpillQueue {
     private Warm span(LogSegmentView view, long from, long end, boolean ahead, LongSupplier durableSequence, long downTo) {
         var durable = durableSequence.getAsLong();
         var started = !ahead;
+        var diagSpan = System.nanoTime();
+        var diagWalked = 0L;
+        try {
         synchronized (lock) {
+            ScratchCounters.add("spanLockWaitNanos", System.nanoTime() - diagSpan);
             var left = held - downTo;
             var skipped = taken;
             for (var next : records) {
@@ -453,7 +470,7 @@ final class SpillQueue {
                     break;
                 }
                 left -= next.bytes;
-                // The drain drops a record of a commit the checkpoint in flight writes without reading it
+                diagWalked++;
                 if (next.sequence <= skipped || !warms(next)) {
                     continue;
                 }
@@ -473,6 +490,11 @@ final class SpillQueue {
                 }
                 end = nextEnd;
             }
+        }
+        } finally {
+            ScratchCounters.add("spanNanos", System.nanoTime() - diagSpan);
+            ScratchCounters.add("spanCalls" + (ahead ? "Ahead" : "Inline"), 1);
+            ScratchCounters.add("spanWalked", diagWalked);
         }
         if (end <= from) {
             return null;
@@ -661,6 +683,7 @@ final class SpillQueue {
                 return crypto;
             }
         }
+        ScratchCounters.addWho("cryptoNew", 1);
         return new Crypto(this);
     }
 
@@ -763,8 +786,13 @@ final class SpillQueue {
                         }
                     }
                 }
+                ScratchCounters.add("spillLogged", logged);
+                ScratchCounters.add("spillCopied", copied);
                 queue.loggedValues.addAndGet(logged);
                 queue.copiedValues.addAndGet(copied);
+            }
+            if (large && !logs()) {
+                ScratchCounters.add(uncached ? "spillKeptThrough" : "spillKeptOther", count);
             }
             release();
         }
@@ -800,8 +828,12 @@ final class SpillQueue {
 
         /// Reads the frames, unless `queue` closes first.
         private void run(SpillQueue queue) {
+            var diagRun = System.nanoTime();
             try {
                 read = view.warm(from, to - from, buffer, () -> queue.closed);
+                ScratchCounters.addWho("warmRunNanos", System.nanoTime() - diagRun);
+                ScratchCounters.addWho("warmRunBytes", to - from);
+                ScratchCounters.add(read ? "warmRunOk" : "warmRunFailed", 1);
                 if (read) {
                     queue.warmedBytes.addAndGet(to - from);
                 }
