@@ -730,6 +730,72 @@ class LargeValuesTest {
         }
 
         @Test
+        @DisplayName("a store without encryption reads a large value the cache cannot hold into the caller's array alone, before a checkpoint takes its unit and after")
+        void plainReadsIntoTheCopy(@TempDir Path directory) throws Exception {
+            HeapPool.forceRegionForTests(1 << 20);
+            var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+            var length = 16 << 20;
+            // A quarter of the limit is below the unit, so the cache never holds it
+            try (var ledger = (LiveLedger) options(directory, false).pageCache(4L << 20).build()) {
+                var expected = value(165, length);
+                ledger.commit(ledger.newBatch().put(FILES, "v", expected)).awaitDurable();
+                for (var checkpointed : new boolean[]{false, true}) {
+                    if (checkpointed) {
+                        ledger.checkpoint();
+                        assertNull(ledger.state(FILES).head(MemorySegment.ofArray("v".getBytes())), "a version in memory");
+                    }
+                    for (var read = 0; read < 3; read++) {
+                        var before = threads.getCurrentThreadAllocatedBytes();
+                        var value = ledger.get(FILES, "v").orElseThrow();
+                        var allocated = threads.getCurrentThreadAllocatedBytes() - before;
+                        assertArrayEquals(expected, value);
+                        // The first read may make the pool's array of the header and the checksum
+                        if (read > 0) {
+                            assertTrue(allocated - length < 64 << 10, allocated + " bytes allocated by read " + read
+                                    + (checkpointed ? " after the checkpoint" : " before the checkpoint"));
+                        }
+                    }
+                }
+            } finally {
+                HeapPool.forceRegionForTests(-1);
+            }
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @ValueSource(strings = {"header", "content", "padding", "checksum"})
+        @DisplayName("a store without encryption reports a unit changed in its header, its content, its padding or its checksum, which the read takes in pieces")
+        void plainPiecesChecked(String where, @TempDir Path directory) throws Exception {
+            var length = LARGE;
+            var expected = value(166, length);
+            PageRef ref;
+            try (var ledger = (LiveLedger) options(directory, false).pageCache(4L << 20).build()) {
+                ledger.commit(ledger.newBatch().put(FILES, "v", expected)).awaitDurable();
+                ref = unit(ledger, "v");
+                // The tree's leaf points to the unit, so the reopen replays nothing that would check it
+                ledger.checkpoint();
+            }
+            var unitBytes = ref.pages() * PageFormat.SIZE;
+            var padding = unitBytes - PageFormat.TAG - PageFormat.HEADER - length;
+            assertTrue(padding > 0, "the unit has no padding");
+            var at = PageFormat.offset(ref.page()) + switch (where) {
+                case "header" -> PageFormat.INDEX;
+                case "content" -> PageFormat.HEADER + length / 2;
+                case "padding" -> PageFormat.HEADER + length + padding / 2;
+                default -> unitBytes - PageFormat.TAG;
+            };
+            try (var channel = FileChannel.open(directory.resolve(BlobFile.FILE), StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                var bytes = ByteBuffer.allocate(1);
+                channel.read(bytes, at);
+                bytes.put(0, (byte) (bytes.get(0) ^ 1)).position(0);
+                channel.write(bytes, at);
+                channel.force(true);
+            }
+            try (var ledger = options(directory, false).pageCache(4L << 20).build()) {
+                assertThrows(LedgerCorruptedException.class, () -> ledger.get(FILES, "v"));
+            }
+        }
+
+        @Test
         @DisplayName("a read of a value of a closed store fails rather than opening the file again")
         void closed(@TempDir Path directory) throws Exception {
             var ledger = (LiveLedger) open(directory, true);
