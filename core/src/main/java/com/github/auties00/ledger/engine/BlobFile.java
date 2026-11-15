@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Collection;
 import java.util.HashSet;
@@ -140,6 +141,9 @@ final class BlobFile implements AutoCloseable {
     ///
     /// The unit is in flight until a checkpoint takes it or [#release(PageRef)] frees it.
     ///
+    /// A write that fails in any way, the file's, the cipher's or a closed store's, frees the unit's pages and gives
+    /// back what it took to write it.
+    ///
     /// @return where the unit is
     /// @throws LedgerIoException if the file cannot be written; the pages are free again
     PageRef write(byte[] value, int offset, int length) {
@@ -150,17 +154,25 @@ final class BlobFile implements AutoCloseable {
         }
         epochTaken = true;
         var pages = PageFormat.pagesFor(length);
-        PageRef ref;
-        synchronized (lock) {
-            ref = new PageRef(space.allocate(pages), pages, counter.getAndIncrement(), epoch);
-            unadopted.add(ref);
-        }
-        var header = new byte[PageFormat.HEADER];
-        PageFile.header(header, PageFormat.EXTERNAL, 0, ref.page(), pages, length, ref.nonceHigh(), ref.nonceLow());
         var buffer = pool.acquire(BUFFER);
-        var through = new FileChannel[]{channels.take()};
-        var interrupted = new boolean[1];
+        FileChannel taken;
         try {
+            taken = channels.take();
+        } catch (RuntimeException | Error failure) {
+            pool.release(buffer);
+            throw failure;
+        }
+        var through = new FileChannel[]{taken};
+        var interrupted = new boolean[1];
+        PageRef ref = null;
+        try {
+            synchronized (lock) {
+                var unit = new PageRef(space.allocate(pages), pages, counter.getAndIncrement(), epoch);
+                unadopted.add(unit);
+                ref = unit;
+            }
+            var header = new byte[PageFormat.HEADER];
+            PageFile.header(header, PageFormat.EXTERNAL, 0, ref.page(), pages, length, ref.nonceHigh(), ref.nonceLow());
             var position = new long[]{PageFormat.offset(ref.page())};
             cipher.seal(header, value, offset, length, pages, buffer, (bytes, count) -> {
                 var start = position[0];
@@ -184,6 +196,11 @@ final class BlobFile implements AutoCloseable {
         } catch (IOException exception) {
             release(ref);
             throw new LedgerIoException(path + " could not be written", exception);
+        } catch (RuntimeException | Error failure) {
+            if (ref != null) {
+                release(ref);
+            }
+            throw failure;
         } finally {
             channels.give(through[0]);
             pool.release(buffer);
@@ -239,8 +256,10 @@ final class BlobFile implements AutoCloseable {
     /// nothing reachable. A unit above [HeapPool#MAX_POOLED] that the cache does not take is read and opened into
     /// arrays of the pool's large spares ([HeapPool#acquireLarge(int)]), which go back once the value is copied out,
     /// so the read allocates no array but the caller's; it is never kept weakly for a
-    /// [recall][PageCache#recall(long, PageRef, int)], since a later read writes the spare. A value that a version
-    /// names and one that a leaf of a tree points to copy out the same way.
+    /// [recall][PageCache#recall(long, PageRef, int)], since a later read writes the spare. A spare the cache takes is
+    /// zeroed past the unit's tag first, so the cache holds no byte of the unit an earlier read, of this store or of
+    /// another that shares the pool, opened into it. A value that a version names and one that a leaf of a tree points
+    /// to copy out the same way.
     ///
     /// @param screen the read's screening: [PageCache#UNSCREENED], [PageCache#POINT] or [PageCache#SCAN]
     /// @throws LedgerCorruptedException if the unit fails authentication, is not the one `ref` names, or does not
@@ -272,6 +291,9 @@ final class BlobFile implements AutoCloseable {
             throw exception;
         }
         if (cache.holds((long) ref.pages() * PageFormat.SIZE) && cache.admits(key, ref, screen)) {
+            // A spare may be longer than the unit, and hold past the unit's tag the plaintext of an earlier read, of
+            // this store or of another that shares the pool: the cache keeps only bytes of this unit
+            Arrays.fill(plain, ref.pages() * PageFormat.SIZE - PageFormat.TAG, plain.length, (byte) 0);
             // The cache holds it from now on, or drops it if it closed: never back to the spares, as readers may
             // still read it
             cache.put(key, ref, plain, true);
@@ -391,7 +413,8 @@ final class BlobFile implements AutoCloseable {
     /// @param cached whether the unit is for the cache, and may end with its content
     /// @param spare whether a unit above [HeapPool#MAX_POOLED] kept whole is opened into an array of the pool's large
     ///              spares, which the caller gives back through [HeapPool#releaseLarge(byte\[\])] unless it hands it to
-    ///              the cache; such an array may be longer than the unit, and hold another unit's bytes past it
+    ///              the cache; such an array may be longer than the unit, and hold another unit's bytes past its tag,
+    ///              which the caller zeroes before the cache takes it
     /// @throws LedgerIoException if the file cannot be read
     private byte[] readUnit(PageRef ref, boolean cached, boolean spare) {
         var hook = readHookForTests;

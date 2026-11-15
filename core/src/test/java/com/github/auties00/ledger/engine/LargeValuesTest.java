@@ -14,6 +14,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -23,6 +24,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -30,6 +32,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -149,6 +152,46 @@ class LargeValuesTest {
                     assertEquals(Optional.empty(), ledger.get(FILES, "c"));
                     assertEquals(1, ledger.size(FILES));
                 }
+            }
+        }
+
+        @Test
+        @DisplayName("a unit whose write fails in the cipher or on a closed file frees its pages and gives back its buffer")
+        void failedWrites(@TempDir Path directory) throws Exception {
+            var pool = new HeapPool(4 << 20);
+            var buffers = new AtomicInteger();
+            pool.watchForTests(new HeapPool.Watcher() {
+                @Override
+                public void acquired(byte[] array) {
+                }
+
+                @Override
+                public void released(byte[] array) {
+                    if (array.length == 1 << 20) {
+                        buffers.incrementAndGet();
+                    }
+                }
+            });
+            var cache = PageCache.isolated(64L << 20);
+            var cipher = new PageCipher(new SecretKeySpec(KEY, "AES"));
+            var written = value(16, 50_000);
+            try (var blobs = BlobFile.open(directory, cipher, cache, pool, 0, new BitSet())) {
+                blobs.begin(1);
+                // A value shorter than the length the write is given fails in the cipher, past the unit's allocation
+                assertThrows(RuntimeException.class, () -> blobs.write(new byte[100], 0, written.length));
+                assertEquals(0, blobs.unadoptedForTests(), "the unit of the failed write is still in flight");
+                assertEquals(1, buffers.get(), "the failed write kept its buffer");
+                var ref = blobs.write(written, 0, written.length);
+                assertEquals(PageFormat.FIRST_UNIT_PAGE, ref.page(), "the pages of the failed write are still taken");
+                assertEquals(2, buffers.get());
+                blobs.release(ref);
+                blobs.close();
+                assertThrows(IllegalStateException.class, () -> blobs.write(written, 0, written.length));
+                assertEquals(0, blobs.unadoptedForTests(), "the write on the closed file left a unit in flight");
+                assertEquals(3, buffers.get(), "the write on the closed file kept its buffer");
+            } finally {
+                pool.watchForTests(null);
+                cache.close();
             }
         }
 
@@ -537,6 +580,65 @@ class LargeValuesTest {
                 assertEquals(ref.pages() * PageFormat.SIZE, cached.length, "an array longer than its unit");
                 assertEquals(cached.length, PageCache.charge(cached));
             } finally {
+                HeapPool.forceRegionForTests(-1);
+            }
+        }
+
+        @Test
+        @DisplayName("a store caches a value read into a spare another store used for a longer unit with no byte of that unit past its own")
+        void sparesCarryNoOtherUnit(@TempDir Path directory) throws Exception {
+            HeapPool.forceRegionForTests(1 << 20);
+            var pool = HeapPool.process();
+            // Held strongly, so the spares the first store gives back are still there for the second
+            var released = Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<byte[], Boolean>()));
+            pool.watchForTests(new HeapPool.Watcher() {
+                @Override
+                public void acquired(byte[] array) {
+                }
+
+                @Override
+                public void released(byte[] array) {
+                    if (array.length > HeapPool.MAX_POOLED) {
+                        released.add(array);
+                    }
+                }
+            });
+            try {
+                // Both units round up to arrays of three regions of 1 MiB; the first fills nearly all of its array
+                var longer = value(150, (3 << 20) - 100_000);
+                try (var first = (LiveLedger) options(directory.resolve("first"), true).pageCache(256L << 20).build()) {
+                    first.commit(first.newBatch().put(FILES, "a", longer)).awaitDurable();
+                    assertArrayEquals(longer, first.get(FILES, "a").orElseThrow());
+                    assertNull(first.blobsForTests().cachedForTests(unit(first, "a")), "cached at its first read");
+                }
+                assertTrue(released.size() >= 2, "the first store's read gave back no spares");
+                var fromFirst = Collections.newSetFromMap(new IdentityHashMap<byte[], Boolean>());
+                fromFirst.addAll(released);
+                var shorter = value(151, SMALL_LARGE + (1 << 20));
+                try (var second = (LiveLedger) options(directory.resolve("second"), true).pageCache(256L << 20).build()) {
+                    second.commit(second.newBatch().put(FILES, "b", shorter)).awaitDurable();
+                    for (var round = 0; round < 2; round++) {
+                        assertArrayEquals(shorter, second.get(FILES, "b").orElseThrow(), "read " + round);
+                    }
+                    var ref = unit(second, "b");
+                    var cached = second.blobsForTests().cachedForTests(ref);
+                    assertNotNull(cached, "not cached after two reads");
+                    assertTrue(fromFirst.contains(cached), "the cache took no spare the first store used");
+                    var unitBytes = ref.pages() * PageFormat.SIZE;
+                    assertEquals(HeapPool.largeLength(unitBytes), cached.length);
+                    assertTrue(cached.length > unitBytes + (512 << 10), "the spare is not longer than the unit");
+                    for (var at = unitBytes - PageFormat.TAG; at < cached.length; at++) {
+                        assertEquals(0, cached[at], "a byte past the unit's tag at " + at);
+                    }
+                    assertArrayEquals(shorter, java.util.Arrays.copyOfRange(cached, PageFormat.HEADER, PageFormat.HEADER + shorter.length));
+                }
+            } finally {
+                pool.watchForTests(null);
+                // Takes the spares of this test's length out of the pool the process shares, so they do not take the
+                // slots of the next test's spares
+                for (var spare = 0; spare < HeapPool.LARGE_SPARES; spare++) {
+                    pool.acquireLarge((3 << 20) - 1_024);
+                }
                 HeapPool.forceRegionForTests(-1);
             }
         }
