@@ -598,7 +598,7 @@ public final class LiveLedger implements Ledger {
         var listing = record[0];
         if (listing != null) {
             // The values lie at their addresses in the frame's body, so the commit's body starts at 0 of it
-            listing.locate(segment, frameOffset, 0, false);
+            listing.locate(segment, frameOffset, 0, 0, false);
             // The log's last budget, which the queue holds without moving any
             queue.add(listing);
         }
