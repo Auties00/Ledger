@@ -48,10 +48,11 @@ import java.util.zip.CRC32C;
 /// - of a batch on a [ValueSlab]'s chunks, which the slab bounds already, even beside a value on an array of its
 ///   own, of a transaction, or of one with a unit of [BlobFile]. A value a recovery copied to an array of its own
 ///   moves, to the log only;
-/// - of a commit whose values would take, once moved, more than half the bytes they take now ([Record#pays()]): a
-///   short value goes to an array of its own, which frees the array it shared only once every other value on it
-///   left too, so moving a commit of mostly short values, like an app-state snapshot of 100 to 300 byte values,
-///   allocates about as much as it frees and makes the next checkpoint read the long ones back from the log.
+/// - of a commit whose values on shared arrays would take, once moved, more than half the bytes they take now
+///   ([Record#settle()]): a short value goes to an array of its own, which frees the array it shared only once every
+///   other value on it left too, so moving a commit of mostly short values, like an app-state snapshot of 100 to 300
+///   byte values, allocates about as much as it frees and makes the next checkpoint read the long ones back from the
+///   log. The commit's values on arrays of their own move all the same, each freeing its array for a [LogValue].
 ///
 /// A recovery moves a value it replays that the log holds before its last budget of bytes at once, on its own thread,
 /// tagged where it lies in the frame body it came in
@@ -125,7 +126,7 @@ final class SpillQueue {
     private final AtomicLong loggedValues = new AtomicLong();
     private final AtomicLong copiedValues = new AtomicLong();
     private final AtomicLong drainedRecords = new AtomicLong();
-    // The records left off the queue as their move would not pay, for tests
+    // The records whose values on shared arrays stay, as their move would not pay, for tests
     private final AtomicLong unpaidRecords = new AtomicLong();
 
     /// Creates the queue of a store.
@@ -264,10 +265,13 @@ final class SpillQueue {
         if (record.count == 0) {
             return;
         }
-        if (!record.pays()) {
+        var settled = record.settle();
+        if (settled != Record.ALL) {
             unpaidRecords.incrementAndGet();
-            record.release();
-            return;
+            if (settled == Record.NONE) {
+                record.release();
+                return;
+            }
         }
         synchronized (lock) {
             if (closed) {
@@ -469,7 +473,8 @@ final class SpillQueue {
         return drainedRecords.get();
     }
 
-    /// {@return the records left off the queue as moving their values would not pay ([Record#pays()]); for tests}
+    /// {@return the records whose values on shared arrays stay where they are, as moving them would not pay
+    /// ([Record#settle()]), whether or not the record's values on arrays of their own move; for tests}
     long unpaidRecordsForTests() {
         return unpaidRecords.get();
     }
@@ -520,12 +525,26 @@ final class SpillQueue {
         // Where each value starts in the body of its commit
         private int[] offsets;
         private int count;
-        // The bytes of the values, the heap they would take once moved, whether one is at least LOG_VALUE_MIN, and the
-        // bytes of the shortest
+        /// The verdict of [#settle()] that every value of the record may move.
+        static final int ALL = 0;
+        /// The verdict of [#settle()] that only the record's values on arrays of their own may move.
+        static final int OWN = 1;
+        /// The verdict of [#settle()] that no value of the record moves.
+        static final int NONE = 2;
+
+        // The bytes of the values the record moves, whether one is at least LOG_VALUE_MIN, and the bytes of the
+        // shortest
         private long bytes;
-        private long moved;
         private boolean large;
         private int shortest = Integer.MAX_VALUE;
+        // The bytes of the values on arrays other values may share (a batch's, a frame's body) and the heap they would
+        // take once moved; the bytes of the values on arrays of their own, and of the shortest of them
+        private long sharedBytes;
+        private long sharedMoved;
+        private long ownBytes;
+        private int ownShortest = Integer.MAX_VALUE;
+        // Whether only the values on arrays of their own move ([#settle()])
+        private boolean ownOnly;
         // Set by the log writer as it seals the frame: the segment use, the frame's offset, where the commit's body
         // starts in the frame's body, the bytes of the frame's body, 0 if unknown, and whether the group was written
         // through
@@ -550,9 +569,15 @@ final class SpillQueue {
             versions[count] = version;
             offsets[count++] = offset;
             bytes += length;
-            moved += length >= LOG_VALUE_MIN ? LOG_VALUE_BYTES : (ARRAY_HEADER + length + 7) & -8;
             large |= length >= LOG_VALUE_MIN;
             shortest = Math.min(shortest, length);
+            if (length >= LOG_VALUE_MIN && version.ownArray() != null) {
+                ownBytes += length;
+                ownShortest = Math.min(ownShortest, length);
+            } else {
+                sharedBytes += length;
+                sharedMoved += length >= LOG_VALUE_MIN ? LOG_VALUE_BYTES : (ARRAY_HEADER + length + 7) & -8;
+            }
         }
 
         /// Records where the log wrote the frame of the commit: at `frameOffset` of the use `segment`, the commit's body
@@ -569,13 +594,28 @@ final class SpillQueue {
             this.through = through;
         }
 
-        /// {@return whether moving the values frees at least as much heap as it allocates: what they would take once
-        /// moved, a [LogValue] for a long one and an array of its own for a short one, is at most half of their bytes}
+        /// Decides which values move, before the record is queued: all of them if moving those on shared arrays frees
+        /// at least as much heap as it allocates, what they would take once moved (a [LogValue] for a long one and an
+        /// array of its own for a short one) being at most half of their bytes, else only those on arrays of their own,
+        /// whose bytes alone the record then counts.
         ///
-        /// A batch's values lie packed on arrays of about their bytes, so moving them frees about their bytes; a commit
-        /// of short values frees little more than it copies, and leaves the heap it holds where it was.
-        boolean pays() {
-            return moved <= bytes / 2;
+        /// A batch's values lie packed on arrays of about their bytes, so moving them all frees about their bytes, and
+        /// moving some frees nothing while the others keep the arrays alive; a commit of short values frees little more
+        /// than it copies, and leaves the heap it holds where it was. A value of at least [#LOG_VALUE_MIN] bytes on an
+        /// array of its own frees that array whatever its record's other values do.
+        ///
+        /// @return [#ALL], [#OWN] or [#NONE]
+        int settle() {
+            if (sharedMoved <= sharedBytes / 2) {
+                return ALL;
+            }
+            if (ownBytes == 0) {
+                return NONE;
+            }
+            ownOnly = true;
+            bytes = ownBytes;
+            shortest = ownShortest;
+            return OWN;
         }
 
         /// {@return the sequence of the commit}
@@ -596,6 +636,10 @@ final class SpillQueue {
                 var copied = 0;
                 for (var i = 0; i < count; i++) {
                     var version = versions[i];
+                    // A value on a shared array stays on a segment until a spill moves it, so one on an array is on its own
+                    if (ownOnly && version.ownArray() == null) {
+                        continue;
+                    }
                     var framed = segment != null && framesAlone(segment, frameBody, version.valueLength()) ? frameBody : 0;
                     if (version.spill(crypto, segment, frameOffset, commitStart + offsets[i], framed, null)) {
                         if (version.valueLength() >= LOG_VALUE_MIN) {
