@@ -253,15 +253,16 @@ final class BlobFile implements AutoCloseable {
     ///
     /// The unit comes from the page cache or the file, which screens it as `screen` asks: a point read's is taken at
     /// its second read, if the cache [holds][PageCache#holds(long)] units of its size, so a value read once leaves
-    /// nothing reachable. A unit above [HeapPool#MAX_POOLED] that the cache does not take is read and opened into
-    /// arrays of the pool's large spares ([HeapPool#acquireLarge(int)]), which go back once the value is copied out,
-    /// so the read allocates no array but the caller's; it is never kept weakly for a
-    /// [recall][PageCache#recall(long, PageRef, int)], since a later read writes the spare. A spare the cache takes is
+    /// nothing reachable. In a store that encrypts, a unit above [HeapPool#MAX_POOLED] that the cache does not take is
+    /// read and opened into arrays of the pool's large spares ([HeapPool#acquireLarge(int)]), which go back once the
+    /// value is copied out, so the read allocates no array but the caller's; it is never kept weakly for a
+    /// [recall][PageCache#recall(long, PageRef, int)], since a later read writes the spare. In a store without
+    /// encryption such a unit is read straight into the caller's array, its header and the bytes past its content into
+    /// an array of the pool, and its checksum checked over the three ([#readContent(PageRef, int)]); one the cache
+    /// takes is read into a large spare, which is its plaintext once its checksum matches. A spare the cache takes is
     /// zeroed past the unit's tag first, so the cache holds no byte of the unit an earlier read, of this store or of
-    /// another that shares the pool, opened into it. In a store without encryption a unit the cache does not take is
-    /// read straight into the caller's array, its header and the bytes past its content into an array of the pool,
-    /// and its checksum checked over the three ([#readContent(PageRef, int)]). A value that a version names and one
-    /// that a leaf of a tree points to copy out the same way.
+    /// another that shares the pool, opened into it. A value that a version names and one that a leaf of a tree points
+    /// to copy out the same way.
     ///
     /// @param screen the read's screening: [PageCache#UNSCREENED], [PageCache#POINT] or [PageCache#SCAN]
     /// @throws LedgerCorruptedException if the unit fails authentication, is not the one `ref` names, or does not
@@ -417,13 +418,16 @@ final class BlobFile implements AutoCloseable {
     /// {@return the plaintext of the unit `ref` names, or `null` if the file does not hold it whole}
     ///
     /// A unit above [HeapPool#MAX_POOLED] is read into an array of the pool's large spares, which goes back at the
-    /// end. The channel reads at most [#BUFFER] bytes a call.
+    /// end unless it is the array returned (`spare`). Every array taken goes back if no channel can be taken. The
+    /// channel reads at most [#BUFFER] bytes a call.
     ///
     /// @param cached whether the unit is for the cache, and may end with its content
-    /// @param spare whether a unit above [HeapPool#MAX_POOLED] kept whole is opened into an array of the pool's large
+    /// @param spare whether a unit above [HeapPool#MAX_POOLED] kept whole comes back in an array of the pool's large
     ///              spares, which the caller gives back through [HeapPool#releaseLarge(byte\[\])] unless it hands it to
-    ///              the cache; such an array may be longer than the unit, and hold another unit's bytes past its tag,
-    ///              which the caller zeroes before the cache takes it
+    ///              the cache: in a store that encrypts the unit is opened into a second spare, in one without
+    ///              encryption the spare it was read into is returned once its checksum matches; such an array may be
+    ///              longer than the unit, and hold another unit's bytes past its tag, which the caller zeroes before
+    ///              the cache takes it
     /// @throws LedgerIoException if the file cannot be read
     private byte[] readUnit(PageRef ref, boolean cached, boolean spare) {
         var hook = readHookForTests;
@@ -434,7 +438,18 @@ final class BlobFile implements AutoCloseable {
         var length = pages * PageFormat.SIZE;
         var large = length > HeapPool.MAX_POOLED;
         var sealed = large ? pool.acquireLarge(length) : pool.acquire(length);
-        var through = new FileChannel[]{channels.take()};
+        FileChannel taken;
+        try {
+            taken = channels.take();
+        } catch (RuntimeException | Error failure) {
+            if (large) {
+                pool.releaseLarge(sealed);
+            } else {
+                pool.release(sealed);
+            }
+            throw failure;
+        }
+        var through = new FileChannel[]{taken};
         var interrupted = new boolean[1];
         // Whether sealed goes to the caller as the plaintext, so it does not go back to the pool
         var handed = false;
@@ -505,7 +520,14 @@ final class BlobFile implements AutoCloseable {
         var position = PageFormat.offset(ref.page());
         // The header at 0, then the bytes after the content: its padding and the checksum
         var rest = pool.acquire(PageFormat.HEADER + PageFormat.SIZE + PageFormat.TAG);
-        var through = new FileChannel[]{channels.take()};
+        FileChannel taken;
+        try {
+            taken = channels.take();
+        } catch (RuntimeException | Error failure) {
+            pool.release(rest);
+            throw failure;
+        }
+        var through = new FileChannel[]{taken};
         var interrupted = new boolean[1];
         try {
             if (!readFully(through, rest, 0, PageFormat.HEADER, position, interrupted)) {

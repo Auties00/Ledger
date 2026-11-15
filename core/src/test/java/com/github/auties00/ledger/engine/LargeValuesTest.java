@@ -211,6 +211,43 @@ class LargeValuesTest {
             }
         }
 
+        @ParameterizedTest(name = "encrypted = {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("a read of a large unit on a closed file gives back the array it took to read it")
+        void failedReads(boolean encrypted, @TempDir Path directory) throws Exception {
+            HeapPool.forceRegionForTests(1 << 20);
+            var pool = new HeapPool(4 << 20);
+            var released = new AtomicInteger();
+            pool.watchForTests(new HeapPool.Watcher() {
+                @Override
+                public void acquired(byte[] array) {
+                }
+
+                @Override
+                public void released(byte[] array) {
+                    released.incrementAndGet();
+                }
+            });
+            // Below a quarter of the unit, so the cache never takes it and a read without encryption reads in pieces
+            var cache = PageCache.isolated(1L << 20);
+            var cipher = new PageCipher(encrypted ? new SecretKeySpec(KEY, "AES") : null);
+            var length = (1 << 20) + 100;
+            var written = value(17, length);
+            try (var blobs = BlobFile.open(directory, cipher, cache, pool, 0, new BitSet())) {
+                blobs.begin(1);
+                var ref = blobs.write(written, 0, length);
+                assertArrayEquals(written, blobs.copyValue(ref, length, PageCache.POINT));
+                blobs.close();
+                var before = released.get();
+                assertThrows(IllegalStateException.class, () -> blobs.copyValue(ref, length, PageCache.POINT));
+                assertEquals(before + 1, released.get(), "the read on the closed file kept its array");
+            } finally {
+                pool.watchForTests(null);
+                cache.close();
+                HeapPool.forceRegionForTests(-1);
+            }
+        }
+
         @Test
         @DisplayName("keep the unit a snapshot's tree points to until the snapshot closes")
         void snapshots(@TempDir Path directory) throws Exception {
