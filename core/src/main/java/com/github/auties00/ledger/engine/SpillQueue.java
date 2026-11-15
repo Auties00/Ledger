@@ -1,6 +1,7 @@
 package com.github.auties00.ledger.engine;
 
 import javax.crypto.Cipher;
+import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
@@ -532,8 +533,14 @@ final class SpillQueue {
 
     /// The ciphers of one thread at a time: those that authenticate a value moved to the log and decrypt it back.
     ///
-    /// Neither allocates per value: the keystream of a value is AES-ECB of its counter blocks under a cipher keyed once
-    /// per segment use, where a cipher in CTR mode takes a new IV and with it a new initialization per value.
+    /// Neither allocates per value up to [#KEPT_SCRATCH] bytes: the keystream of such a value is AES-ECB of its counter
+    /// blocks under a cipher keyed once per segment use, where a cipher in CTR mode takes a new IV and with it a new
+    /// initialization per value. A longer value is decrypted in place by a cipher in CTR mode initialized for it, whose
+    /// few dozen bytes are little beside the value: the JDK's intrinsic of the counter mode runs the keystream and its
+    /// XOR where AES-ECB and a loop of this class took several times as long.
+    ///
+    /// The polynomials are evaluated four coefficients at a time, as the sum of each times its power of the point, so
+    /// that the four products do not wait for one another; the result is the one Horner's rule gives.
     ///
     /// The tag of a value in an encrypted store is a pair of polynomials over the field of [#PRIME] elements, evaluated
     /// at the two secret points of the queue: one coefficient per 7 bytes of the value, after a leading 1 and the
@@ -559,6 +566,9 @@ final class SpillQueue {
         private SecretKeySpec blocksKey;
         // The points of the polynomials of the tags, or null without encryption
         private final long[] keys;
+        // The second, third and fourth powers of the points, in that order for the first and then for the second, or
+        // null without encryption
+        private final long[] powers;
         private final CRC32C crc;
         // The two polynomials of the last tag
         private long first;
@@ -570,10 +580,30 @@ final class SpillQueue {
         // before the first decryption
         private byte[] counters;
         private byte[] keystream;
+        // The first counter block of a value decrypted in counter mode, whose bytes then run the keystream to the
+        // value's first
+        private final byte[] counter;
 
         private Crypto(SpillQueue queue) {
             this.keys = queue.encrypted ? queue.tagKeys() : null;
+            this.powers = keys == null ? null : powersOf(keys);
             this.crc = new CRC32C();
+            this.counter = new byte[BLOCK];
+        }
+
+        /// {@return the second, third and fourth powers of the two points of `keys`, those of the first and then those
+        /// of the second}
+        private static long[] powersOf(long[] keys) {
+            var powers = new long[6];
+            for (var i = 0; i < 2; i++) {
+                var point = keys[i];
+                var square = multiply(point, point);
+                var cube = multiply(square, point);
+                powers[3 * i] = square;
+                powers[3 * i + 1] = cube;
+                powers[3 * i + 2] = multiply(cube, point);
+            }
+            return powers;
         }
 
         /// {@return an array of at least `length` bytes, which only this holder uses until it is given back}
@@ -668,25 +698,6 @@ final class SpillQueue {
         /// @throws IllegalStateException if the cipher fails, which leaves its state unknown
         void decrypt(Cipher cipher, long frameOffset, int bodyIndex, byte[] sealed, int skip, int length, byte[] target,
                      int offset) {
-            decrypt(cipher, frameOffset, bodyIndex, sealed, 0, skip, length, target, offset);
-        }
-
-        /// Decrypts in place, as [#decrypt(Cipher, long, int, byte\[\], int, int, byte\[\], int)] does, the `length`
-        /// sealed bytes at `offset` of `value`, the value at `bodyIndex` of the body of the frame at `frameOffset`: the
-        /// keystream comes from the counter blocks alone, so the bytes before the value in its first block are not
-        /// needed.
-        ///
-        /// @throws IllegalStateException if the cipher fails, which leaves its state unknown
-        void decryptInPlace(Cipher cipher, long frameOffset, int bodyIndex, byte[] value, int offset, int length) {
-            var skip = bodyIndex & (BLOCK - 1);
-            // The byte at i of the blocks is at offset - skip + i of the value, read only from i = skip on
-            decrypt(cipher, frameOffset, bodyIndex, value, offset - skip, skip, length, value, offset);
-        }
-
-        /// Decrypts as [#decrypt(Cipher, long, int, byte\[\], int, int, byte\[\], int)] does, the byte at `i` of the
-        /// blocks being at `sealedBase + i` of `sealed`, which may be `target` itself.
-        private void decrypt(Cipher cipher, long frameOffset, int bodyIndex, byte[] sealed, int sealedBase, int skip,
-                             int length, byte[] target, int offset) {
             if (counters == null) {
                 counters = new byte[KEYSTREAM];
                 keystream = new byte[KEYSTREAM];
@@ -708,8 +719,44 @@ final class SpillQueue {
                 // The value's bytes in this piece: from skip in the first, up to skip + length in the last
                 var to = Math.min(start + piece, skip + length);
                 for (var i = Math.max(start, skip); i < to; i++) {
-                    target[offset + i - skip] = (byte) (sealed[sealedBase + i] ^ keystream[i - start]);
+                    target[offset + i - skip] = (byte) (sealed[i] ^ keystream[i - start]);
                 }
+            }
+        }
+
+        /// Decrypts in place the `length` sealed bytes at `offset` of `value`, the value at `bodyIndex` of the body of the
+        /// frame at `frameOffset`, sealed under `key`, with `counterMode`, an AES-CTR cipher ([#newCounterMode()]) in any
+        /// state, which this initializes: the keystream comes from the counter blocks alone, so the bytes before the
+        /// value in its first block are not needed.
+        ///
+        /// The cipher decrypts a piece of at most [#KEPT_SCRATCH] bytes at a time into the scratch, which is copied
+        /// back: a piece far shorter than the chunks the JDK's counter mode cuts a call into keeps its loop over them
+        /// out of the code the JIT compiled from the seals, and the cipher would copy the input of a call that writes
+        /// over it.
+        ///
+        /// @throws IllegalStateException if the cipher fails, which leaves its state unknown
+        void decryptInPlace(Cipher counterMode, SecretKeySpec key, long frameOffset, int bodyIndex, byte[] value,
+                            int offset, int length) {
+            var block = counter;
+            Bytes.i32(block, 0, 0);
+            Bytes.i64(block, Integer.BYTES, frameOffset);
+            Bytes.i32(block, Integer.BYTES + Long.BYTES, 2 + (bodyIndex >>> 4));
+            var skip = bodyIndex & (BLOCK - 1);
+            var staging = scratch(KEPT_SCRATCH);
+            try {
+                counterMode.init(Cipher.ENCRYPT_MODE, key, new IvParameterSpec(block));
+                if (skip > 0) {
+                    // The keystream of the bytes before the value in its block, from any bytes
+                    counterMode.update(block, 0, skip, staging, 0);
+                }
+                for (var at = 0; at < length; ) {
+                    var piece = Math.min(KEPT_SCRATCH, length - at);
+                    counterMode.update(value, offset + at, piece, staging, 0);
+                    System.arraycopy(staging, 0, value, offset + at, piece);
+                    at += piece;
+                }
+            } catch (GeneralSecurityException exception) {
+                throw new IllegalStateException("AES failed", exception);
             }
         }
 
@@ -717,6 +764,16 @@ final class SpillQueue {
         static Cipher newBlocks() {
             try {
                 return Cipher.getInstance("AES/ECB/NoPadding");
+            } catch (GeneralSecurityException exception) {
+                throw new IllegalStateException("AES is not available", exception);
+            }
+        }
+
+        /// {@return a new AES-CTR cipher, which decrypts a value in place once
+        /// [#decryptInPlace(Cipher, SecretKeySpec, long, int, byte\[\], int, int)] initialized it}
+        static Cipher newCounterMode() {
+            try {
+                return Cipher.getInstance("AES/CTR/NoPadding");
             } catch (GeneralSecurityException exception) {
                 throw new IllegalStateException("AES is not available", exception);
             }
@@ -752,6 +809,21 @@ final class SpillQueue {
             b = multiply(b + word, y);
             var end = offset + length;
             var at = offset;
+            var x2 = powers[0];
+            var x3 = powers[1];
+            var x4 = powers[2];
+            var y2 = powers[3];
+            var y3 = powers[4];
+            var y4 = powers[5];
+            // Four words at a time, the last read the 8 bytes after the first three
+            for (; at + 3 * WORD + Long.BYTES <= end; at += 4 * WORD) {
+                var w0 = Bytes.i64(value, at) >>> 8;
+                var w1 = Bytes.i64(value, at + WORD) >>> 8;
+                var w2 = Bytes.i64(value, at + 2 * WORD) >>> 8;
+                var w3 = Bytes.i64(value, at + 3 * WORD) >>> 8;
+                a = reduce(multiply(a + w0, x4) + multiply(w1, x3) + multiply(w2, x2) + multiply(w3, x));
+                b = reduce(multiply(b + w0, y4) + multiply(w1, y3) + multiply(w2, y2) + multiply(w3, y));
+            }
             // A long read takes 8 bytes: the top 7 of it are a word
             for (; at + Long.BYTES <= end; at += WORD) {
                 word = Bytes.i64(value, at) >>> 8;
@@ -769,6 +841,19 @@ final class SpillQueue {
             }
             first = multiply(a + length, x);
             second = multiply(b + length, y);
+        }
+
+        /// {@return `sum`, below 2^63, modulo [#PRIME]}
+        private static long reduce(long sum) {
+            var reduced = (sum & PRIME) + (sum >>> 61);
+            return reduced >= PRIME ? reduced - PRIME : reduced;
+        }
+
+        /// {@return the two polynomials of the tag of the `length` bytes at `offset` of `value`, of the version stamped
+        /// `stamp`, and the two points they are evaluated at, in this order}
+        long[] tagForTests(byte[] value, int offset, int length, long stamp) {
+            tag(value, offset, length, stamp);
+            return new long[]{first, second, keys[0], keys[1]};
         }
 
         /// {@return `a` times `b` modulo [#PRIME], both below 2^62}

@@ -19,6 +19,13 @@ class PageCipher {
     /// The content a streamed unit passes to the cipher in one call: small enough to stay out of the way of the
     /// cipher's intrinsic, which a cold JVM reaches only through calls that are not too large.
     private static final int SLICE = 64 << 10;
+    /// The content the first call to the cipher takes when a streamed unit holds as much: long enough that the cipher's
+    /// counter mode runs it as more than one chunk, as it runs every piece of a mebibyte an open of a unit of a
+    /// mebibyte or more cuts the unit into. The JIT compiles the counter mode's code from the calls it profiled, and a
+    /// JVM that saw only slices of [#SLICE] compiles it without that loop: the first open of a long unit then
+    /// deoptimizes it, and the opens after decrypt in the counter mode's Java code, several times slower than its
+    /// intrinsic, until the JIT compiled it again.
+    private static final int FIRST_SLICE = 640 << 10;
 
     private final SecretKeySpec key;
     private final ConcurrentLinkedQueue<Cipher> ciphers;
@@ -126,6 +133,7 @@ class PageCipher {
     /// The unit is the one [#seal(byte\[\], int, byte\[\], int)] makes of the same header and content, but neither is
     /// whole in memory: a value of megabytes is sealed through a buffer of its own size. The cipher reads each whole
     /// slice of the content where it is; only the last part of the content and the padding after it are copied.
+    ///    /// The first slice of a content of [#FIRST_SLICE] bytes or more is that long, the others [#SLICE] bytes.
     ///
     /// @param header the unit's header, filled in, of [PageFormat#HEADER] bytes
     /// @param buffer the buffer the sealed bytes pass through, of at least 64 KiB
@@ -174,6 +182,9 @@ class PageCipher {
             byte[] last = null;
             for (var offset = 0L; offset < total; ) {
                 var count = (int) Math.min(sliceLength, total - offset);
+                if (offset == 0 && contentLength >= FIRST_SLICE && buffer.length >= FIRST_SLICE + 2 * PageFormat.TAG) {
+                    count = FIRST_SLICE;
+                }
                 // The cipher may hold back a partial block, and gives it out with the next call
                 if (buffer.length - used < count + PageFormat.TAG) {
                     out.write(buffer, used);

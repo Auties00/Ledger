@@ -35,7 +35,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /// A value longer than the scratch a [SpillQueue.Crypto] keeps is read straight into the caller's array and decrypted
 /// there, [#SLICE] bytes per read of the channel at most: the JDK reads into a heap buffer through a temporary direct
 /// buffer of the read's size, which it keeps for the thread, so a read of a whole value of a mebibyte or more would
-/// keep that much native memory per reading thread, a checkpoint's included.
+/// keep that much native memory per reading thread, a checkpoint's included. It is decrypted by an AES-CTR cipher of
+/// the use, kept as the AES-ECB one is and initialized again for each such value, under the same key, whose schedule the
+/// JDK then keeps.
 final class LogSegmentView {
     /// The most bytes one read of the channel takes, the size of the temporary direct buffer the JDK keeps per thread.
     static final int SLICE = 1 << 20;
@@ -49,6 +51,8 @@ final class LogSegmentView {
     // The cipher that makes the keystream under key, or null before the first read, while a read holds it, and without
     // encryption; a read that finds it taken makes one of its own, which it leaves here if the place is empty
     private final AtomicReference<Cipher> blocks;
+    // The cipher that decrypts a value read straight into the caller's array, kept as blocks is
+    private final AtomicReference<Cipher> counterMode;
     private volatile boolean retired;
     // The lowest and highest sequence of the commits whose values were moved here, written holding the lock of the
     // queue; Long.MAX_VALUE and -1 before any
@@ -65,6 +69,7 @@ final class LogSegmentView {
         this.spills = spills;
         this.lock = new Object();
         this.blocks = new AtomicReference<>();
+        this.counterMode = new AtomicReference<>();
         this.lowest = Long.MAX_VALUE;
         this.highest = -1;
         this.coveredAt = -1;
@@ -123,6 +128,7 @@ final class LogSegmentView {
         synchronized (lock) {
             retired = true;
             blocks.set(null);
+            counterMode.set(null);
             var open = channel;
             channel = null;
             if (open != null) {
@@ -152,10 +158,14 @@ final class LogSegmentView {
                 // A scratch of the value's size would be dropped at the give-back: one buffer over the target instead
                 readFully(ByteBuffer.wrap(target), offset, length, start);
                 if (key != null) {
-                    var cipher = takeBlocks();
-                    crypto.decryptInPlace(cipher, logged.frameOffset(), logged.bodyIndex(), target, offset, length);
+                    var cipher = counterMode.getAndSet(null);
+                    if (cipher == null) {
+                        cipher = SpillQueue.Crypto.newCounterMode();
+                    }
+                    // Not given back if it failed, which leaves its state unknown
+                    crypto.decryptInPlace(cipher, key, logged.frameOffset(), logged.bodyIndex(), target, offset, length);
                     if (!retired) {
-                        blocks.compareAndSet(null, cipher);
+                        counterMode.compareAndSet(null, cipher);
                     }
                 }
             } else if (key == null) {
