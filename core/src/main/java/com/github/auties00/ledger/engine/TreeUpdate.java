@@ -938,8 +938,10 @@ final class TreeUpdate {
             // array the unit is sealed into
             var length = version.valueLength();
             if (LeafEntry.fitsInline(key.byteSize(), length)) {
+                ScratchCounters.add("ckptLoggedInline", 1);
                 return new LeafEntry(key, version, null, length);
             }
+            ScratchCounters.add("ckptLoggedUnit", 1);
             var unitPages = PageFormat.pagesFor(length);
             var ref = writer.writeLoggedValue(allocate(unitPages), unitPages, version);
             return new LeafEntry(key, null, ref, length);
@@ -948,6 +950,7 @@ final class TreeUpdate {
             // The unit holds the value: a split one is never joined for it
             return new LeafEntry(key, null, external, version.valueLength(), true);
         }
+        ScratchCounters.add("ckptHeapValue", 1);
         var array = version.ownArray();
         if (array != null && LeafEntry.fitsInline(key.byteSize(), array.length)) {
             // Copied into the leaf with an array copy, without a view of it

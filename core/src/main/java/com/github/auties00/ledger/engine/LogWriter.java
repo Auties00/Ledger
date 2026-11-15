@@ -1094,6 +1094,7 @@ final class LogWriter {
         }
         // Before a frame is sealed, while the output holds no byte of the group
         var through = writesThrough(group);
+        ScratchCounters.add(through ? "groupThrough" : "groupForced", 1);
         // A write through that bypasses the system's cache leaves no page of the group there: the values of its
         // commits leave the heap once the queue reads its frames back once, which brings those pages back
         sealingUncached = through && !throughFile.cached();
