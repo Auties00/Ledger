@@ -32,8 +32,6 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private Encryption encryption;
     private final Map<String, Keyspace<?, ?>> keyspaces;
     private IoPool ioPool;
-    // Null for the process's flusher
-    private PlatformIoPool flusher;
     private long pageCache;
     private long checkpointEvery;
     private Duration commitWindow;
@@ -63,13 +61,6 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         this.largeValues = MIB;
         this.largeValuesByKeyspace = new LinkedHashMap<>();
         this.spillBudget = SpillQueue.defaultBudget(Runtime.getRuntime().maxMemory());
-    }
-
-    /// Runs the flushes of a store opened without a pool on `flusher`, a pool shaped as the process's flusher, in place
-    /// of the process's; for tests that make its threads fail to start.
-    LedgerBuilder flusher(PlatformIoPool flusher) {
-        this.flusher = flusher;
-        return this;
     }
 
     /// Sets the size past which the log starts a new segment, so tests can roll segments over without writing
@@ -248,6 +239,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private Ledger openDirectory() {
         var encryption = (EncryptionSpec) this.encryption;
         DirectoryLock lock = null;
+        PlatformIoPool ownedPool = null;
         PageFile pages = null;
         try {
             Files.createDirectories(directory);
@@ -321,8 +313,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             ledger.endReplay(values);
             blobs.begin(epochs[0] + 1);
             var catalog = ledger.assignIds();
-            // Without a pool of the user's, the flusher the stores of the process share, which no store closes
-            var pool = ioPool != null ? (PlatformIoPool) ioPool : flusher != null ? flusher : PlatformIoPool.process();
+            var pool = ioPool != null ? (PlatformIoPool) ioPool : (ownedPool = new PlatformIoPool(1));
             // Numbers only grow, past every segment and the first one the checkpoint may need
             var first = Math.max(recovered.lastSegment() + 1, Math.max(firstSegment, 1));
             var empty = recovered.empty();
@@ -351,22 +342,26 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var through = writeThroughWay != null ? writeThroughWay
                     : WriteThrough.of(writeThrough != null ? writeThrough : WriteThrough.Mode.fromProperty(), logDirectory);
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
-                    segmentSize, pool.executor(), ioPool != null ? pool::queued : null, commitWindow, empty, through);
+                    segmentSize, pool.executor(), ownedPool == null ? pool::queued : null, commitWindow, empty, through);
             var deltaTable = superblock == null ? null : superblock.deltaTable();
             var deltas = deltaTable == null ? DeltaTable.EMPTY
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));
             var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
                     superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures,
                     superblock == null ? 0 : superblock.epoch(), epochs[0], checkpointHeap);
-            ledger.attach(log, catalog, checkpointer, pages, lock);
+            if (ownedPool != null) {
+                ledger.attach(log, catalog, checkpointer, pages, lock, ownedPool);
+            } else {
+                ledger.attach(log, catalog, checkpointer, pages, lock);
+            }
             // Once nothing can fail: a store that failed to open would count toward the process's budget
             checkpointer.open(ledger.replayedBytes(), ledger.replayedHeap());
             return ledger;
         } catch (IOException exception) {
-            release(pages, lock);
+            release(pages, lock, ownedPool);
             throw new LedgerIoException("The store in " + directory + " could not be opened", exception);
         } catch (RuntimeException | Error throwable) {
-            release(pages, lock);
+            release(pages, lock, ownedPool);
             throw throwable;
         }
     }
@@ -380,9 +375,12 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         }
     }
 
-    private static void release(PageFile pages, DirectoryLock lock) {
+    private static void release(PageFile pages, DirectoryLock lock, PlatformIoPool pool) {
         if (pages != null) {
             pages.close();
+        }
+        if (pool != null) {
+            pool.close();
         }
         if (lock != null) {
             try {

@@ -9,10 +9,8 @@ import com.github.auties00.ledger.engine.PlatformIoPool;
 /// thread instead, sparing two thread wakeups: on a virtual thread, the force lends the carrier's place to another, as
 /// the JDK does for a force, and the write into the file's cache holds the carrier while it copies. An interrupt then
 /// lets the write and force finish, and the thread that sends it waits until the force returns.
-/// A store opened without a pool ([Ledger.Options#ioPool(IoPool)]) runs its flushes on threads the stores of the
-/// process share, made as flushes need them and ending after a minute without one. A pool of this interface has a
-/// fixed number of threads instead, which several stores of one application can share: their flushes then take turns
-/// on those threads, a group each while another store's flush waits.
+/// Several stores of one application can share a pool: a process holding many small stores needs a few threads,
+/// not a few per store.
 public sealed interface IoPool extends AutoCloseable permits PlatformIoPool {
     /// {@return a pool of `threads` platform threads}
     ///
