@@ -22,7 +22,7 @@ import java.util.Random;
 import java.util.TreeMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -34,16 +34,16 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The flusher the stores opened without a pool share: threads made as flushes need them and ended once idle, which no
-/// store closes; and a flush no thread can be made for, which fails the commits waiting for it rather than leaving them
-/// waiting.
+/// store closes; its lanes, which run again after each task given and never two at once; and a flush no thread can be
+/// made for, which fails the commits waiting for it rather than leaving them waiting.
 ///
-/// The tests run their stores on a flusher of their own ([LedgerBuilder#flusher(PlatformIoPool)]), shaped as the
-/// process's, so the threads other tests left waiting do not take their flushes.
+/// The tests run their stores on a flusher of their own ([LedgerBuilder#flusher(ProcessFlusher)]), so the threads
+/// other tests left waiting do not take their flushes.
 class ProcessFlusherTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> NAMES = Keyspace.paged("names", KeyCodec.utf8(), ValueCodec.utf8());
 
-    private static Ledger open(Path directory, PlatformIoPool flusher) {
+    private static Ledger open(Path directory, ProcessFlusher flusher) {
         var builder = Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(NAMES);
         return ((LedgerBuilder) builder).flusher(flusher).build();
     }
@@ -72,11 +72,20 @@ class ProcessFlusherTest {
         };
     }
 
-    private static void awaitThreads(PlatformIoPool pool, int count) throws InterruptedException {
+    private static void awaitThreads(ProcessFlusher flusher, int count) throws InterruptedException {
         var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-        while (pool.threadsForTests() != count) {
-            assertTrue(System.nanoTime() < deadline, "the flusher holds " + pool.threadsForTests() + " threads");
+        while (flusher.threadsForTests() != count) {
+            assertTrue(System.nanoTime() < deadline, "the flusher holds " + flusher.threadsForTests() + " threads");
             Thread.sleep(5);
+        }
+    }
+
+    /// Waits until every thread of `flusher` waits for a lane.
+    private static void awaitIdle(ProcessFlusher flusher) throws InterruptedException {
+        var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (flusher.idleForTests() != flusher.threadsForTests()) {
+            assertTrue(System.nanoTime() < deadline, "the flusher runs a lane");
+            Thread.sleep(1);
         }
     }
 
@@ -93,10 +102,10 @@ class ProcessFlusherTest {
     }
 
     @Test
-    @DisplayName("runs the flushes of stores used one after another on a few threads, which outlive the stores and end once idle")
+    @DisplayName("runs the flushes of stores used one after another on one thread, which outlives the stores and ends once idle")
     void shared() throws Exception {
         var made = new AtomicInteger();
-        var flusher = PlatformIoPool.sharedForTests(counting(made));
+        var flusher = new ProcessFlusher(counting(made));
         var disk = CrashFileSystem.create();
         spinForces(disk, 300_000);
         var models = new ArrayList<Map<String, String>>();
@@ -110,15 +119,18 @@ class ProcessFlusherTest {
                 for (var i = 0; i < 20; i++) {
                     commit(ledger, model, "k" + i);
                 }
+                // The flush a commit gave its lane may still run, writing nothing, after the commit wrote its own group
+                awaitIdle(flusher);
             }
-            // One for the flushes, and a second for a commit that lands as the first ends a flush
-            assertTrue(made.get() <= 3, "8 stores made " + made.get() + " threads");
+            // A flush given while its lane holds the thread runs on it, and one given once the lane gave the thread up
+            // takes it back, as does the next store's
+            assertEquals(1, made.get(), "8 stores used one after another made " + made.get() + " threads");
         } finally {
             for (var ledger : stores) {
                 ledger.close();
             }
         }
-        assertFalse(((ThreadPoolExecutor) flusher.executor()).isShutdown(), "a store closed the flusher");
+        assertEquals(1, flusher.threadsForTests(), "a store's close ended the thread");
         flusher.keepAliveForTests(20, TimeUnit.MILLISECONDS);
         awaitThreads(flusher, 0);
         disk.intercept((path, kind) -> {
@@ -139,7 +151,7 @@ class ProcessFlusherTest {
     @DisplayName("makes a thread at once for a store's flush while every thread runs another store's, without waiting for one to come back")
     void busyThreads() throws Exception {
         var made = new AtomicInteger();
-        var flusher = PlatformIoPool.sharedForTests(counting(made));
+        var flusher = new ProcessFlusher(counting(made));
         var disk = CrashFileSystem.create();
         var entered = new CountDownLatch(1);
         var release = new CountDownLatch(1);
@@ -147,7 +159,7 @@ class ProcessFlusherTest {
             try {
                 flusher.keepAliveForTests(1, TimeUnit.MILLISECONDS);
                 awaitThreads(flusher, 0);
-                flusher.keepAliveForTests(PlatformIoPool.KEEP_ALIVE_SECONDS, TimeUnit.SECONDS);
+                flusher.keepAliveForTests(ProcessFlusher.KEEP_ALIVE_SECONDS, TimeUnit.SECONDS);
                 // The threads the opens made
                 var opens = made.get();
                 // The force of the first store's log holds the only thread until the second store's flush has a thread
@@ -166,7 +178,6 @@ class ProcessFlusherTest {
                 var held = first.commit(first.newBatch().put(NAMES, "held", "v".repeat(500)));
                 assertTrue(entered.await(30, TimeUnit.SECONDS), "the first store's flush never forced");
                 assertEquals(1, flusher.threadsForTests());
-                var waits = flusher.handoffWaitsForTests();
                 var value = "v".repeat(500) + "k";
                 var other = second.commit(second.newBatch().put(NAMES, "k", value));
                 var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
@@ -175,7 +186,6 @@ class ProcessFlusherTest {
                     Thread.sleep(1);
                 }
                 assertTrue(other.awaitDurable(Duration.ofSeconds(30)), "the second store's commit never became durable");
-                assertEquals(waits, flusher.handoffWaitsForTests(), "the second store's flush waited for the busy thread");
                 assertEquals(opens + 2, made.get());
                 release.countDown();
                 held.awaitDurable();
@@ -189,16 +199,14 @@ class ProcessFlusherTest {
     @Test
     @DisplayName("is the default of a store opened without a pool, one flusher for the process that no close stops")
     void processDefault() throws Exception {
-        var flusher = PlatformIoPool.process();
-        assertSame(flusher, PlatformIoPool.process());
+        var flusher = ProcessFlusher.process();
+        assertSame(flusher, ProcessFlusher.process());
         var disk = CrashFileSystem.create();
         var model = new TreeMap<String, String>();
         try (var ledger = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(NAMES).build()) {
             commit(ledger, model, "k");
         }
-        assertFalse(((ThreadPoolExecutor) flusher.executor()).isShutdown());
-        flusher.close();
-        assertFalse(((ThreadPoolExecutor) flusher.executor()).isShutdown(), "the process's flusher was closed");
+        assertTrue(flusher.threadsForTests() > 0, "the store's close ended the process's flush threads");
         try (var ledger = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(NAMES).build()) {
             commit(ledger, model, "again");
             assertEquals(model, contents(ledger));
@@ -209,7 +217,7 @@ class ProcessFlusherTest {
     @ValueSource(strings = {"null", "error"})
     @DisplayName("fails the commits and the close of a store whose flush no thread can be made for, rather than leaving them waiting")
     void noThread(String failure) {
-        var flusher = PlatformIoPool.sharedForTests(runnable -> {
+        var flusher = new ProcessFlusher(runnable -> {
             if (failure.equals("null")) {
                 return null;
             }
@@ -242,7 +250,7 @@ class ProcessFlusherTest {
     void threadsRunOut() throws Exception {
         var made = new AtomicInteger();
         var factory = Thread.ofPlatform().daemon().name("ledger-io-test-", 0).factory();
-        var flusher = PlatformIoPool.sharedForTests(runnable -> made.getAndIncrement() == 0 ? factory.newThread(runnable) : null);
+        var flusher = new ProcessFlusher(runnable -> made.getAndIncrement() == 0 ? factory.newThread(runnable) : null);
         flusher.keepAliveForTests(1, TimeUnit.MILLISECONDS);
         var disk = CrashFileSystem.create();
         var durable = new TreeMap<String, String>();
@@ -276,11 +284,83 @@ class ProcessFlusherTest {
             assertTrue(failed, "every commit found a thread");
         });
         // What was acknowledged is durable
-        try (var ledger = open(disk.afterPowerLoss(new Random(1)).getPath("/store"), PlatformIoPool.process())) {
+        try (var ledger = open(disk.afterPowerLoss(new Random(1)).getPath("/store"), ProcessFlusher.process())) {
             var recovered = contents(ledger);
             for (var entry : durable.entrySet()) {
                 assertEquals(entry.getValue(), recovered.get(entry.getKey()), entry.getKey());
             }
         }
+    }
+
+    @Test
+    @DisplayName("runs a lane's task once more after the tasks given while it runs, never two at once, on the lane's thread")
+    void laneCoalesces() throws Exception {
+        var made = new AtomicInteger();
+        var flusher = new ProcessFlusher(counting(made));
+        var lane = flusher.lane();
+        var runs = new AtomicInteger();
+        var running = new AtomicInteger();
+        var overlapped = new AtomicInteger();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        Runnable task = () -> {
+            if (running.incrementAndGet() > 1) {
+                overlapped.incrementAndGet();
+            }
+            try {
+                if (runs.incrementAndGet() == 1) {
+                    entered.countDown();
+                    release.await();
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+            } finally {
+                running.decrementAndGet();
+            }
+        };
+        lane.execute(task);
+        assertTrue(entered.await(30, TimeUnit.SECONDS), "the first task never ran");
+        for (var i = 0; i < 5; i++) {
+            lane.execute(task);
+        }
+        release.countDown();
+        awaitIdle(flusher);
+        assertEquals(2, runs.get(), "the tasks given while the first ran did not run once after it");
+        assertEquals(0, overlapped.get());
+        assertEquals(1, made.get());
+        // Given once the lane gave its thread up: the thread, waiting, takes it
+        lane.execute(task);
+        awaitIdle(flusher);
+        assertEquals(3, runs.get());
+        assertEquals(1, made.get());
+    }
+
+    @Test
+    @DisplayName("keeps a lane running after its task throws, and takes a thread again after one could not be made")
+    void laneSurvivesFailures() throws Exception {
+        var calls = new AtomicInteger();
+        var factory = Thread.ofPlatform().daemon().name("ledger-io-test-", 0).factory();
+        var flusher = new ProcessFlusher(runnable -> {
+            if (calls.getAndIncrement() == 0) {
+                return null;
+            }
+            var thread = factory.newThread(runnable);
+            thread.setUncaughtExceptionHandler((_, _) -> {
+            });
+            return thread;
+        });
+        var lane = flusher.lane();
+        var runs = new AtomicInteger();
+        assertThrows(RejectedExecutionException.class, () -> lane.execute(runs::incrementAndGet));
+        assertEquals(0, flusher.threadsForTests());
+        lane.execute(() -> {
+            runs.incrementAndGet();
+            throw new IllegalStateException("thrown by a task");
+        });
+        awaitIdle(flusher);
+        lane.execute(runs::incrementAndGet);
+        awaitIdle(flusher);
+        assertEquals(2, runs.get());
+        assertEquals(1, flusher.threadsForTests());
     }
 }

@@ -49,8 +49,9 @@ import java.util.zip.CRC32C;
 ///
 /// A flush of the pool whose store shares the pool writes one group at a time while a task of another store waits for
 /// a thread: it submits itself again behind that task, so the stores on a pool take turns a group each. A store whose
-/// queue never drains would otherwise hold a thread for as long as its commits keep coming. On the process's flusher,
-/// which makes a thread for every task that finds none waiting, no task waits, and a flush keeps its thread.
+/// queue never drains would otherwise hold a thread for as long as its commits keep coming. On a lane of the process's
+/// flusher ([ProcessFlusher]), which holds a thread of its own while it has a flush to run, no task of another store
+/// waits behind it, and a flush keeps its thread.
 ///
 /// Segments come from [LogFiles] prepared: once a segment takes its first group, the next one is prepared on a thread
 /// of its own, so a rollover only forces the full segment and switches to the next, and no file is created or renamed
@@ -226,8 +227,8 @@ final class LogWriter {
     private final byte[] storeId;
     private final long segmentSize;
     private final Executor executor;
-    // Whether a task waits for a thread of the pool, which a flush of the pool gives up its thread to, or null on the
-    // process's flusher, where no task waits
+    // Whether a task waits for a thread of the pool, which a flush of the pool gives up its thread to, or null on a lane
+    // of the process's flusher, where no task of another store waits
     private final BooleanSupplier poolQueued;
     private final long commitWindowNanos;
     // How the flush task opens segments to write groups through; owned by it
@@ -393,7 +394,7 @@ final class LogWriter {
     /// @param segmentSize the size past which a new segment starts
     /// @param executor runs the flush task on platform threads
     /// @param poolQueued whether a task waits for a thread of the pool, or `null` if no task of another store waits behind
-    ///                   this store's flush, as on the process's flusher, which makes a thread for each: a flush
+    ///                   this store's flush, as on a lane of the process's flusher, which has a thread of its own: a flush
     ///                   waiting for the commits a force woke stops waiting once one does, and a flush of the pool
     ///                   gives up its thread after the group it wrote
     /// @param commitWindow how long a flush waits for more commits before it starts
