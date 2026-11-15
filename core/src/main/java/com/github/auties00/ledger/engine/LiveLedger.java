@@ -604,7 +604,7 @@ public final class LiveLedger implements Ledger {
     private static PackedRun.Builder runFor(KeyspaceState state, MemorySegment key, ReplayValues values,
                                             LogSegmentView segment, int length) {
         var run = values.run(state);
-        return run != null && run.takes(segment, length) && state.chain(key) == null ? run : null;
+        return run != null && run.takes(key, segment, length) && state.chain(key) == null ? run : null;
     }
 
     /// Publishes the run `builder` of `state` holds, the open's writes of the key space kept in arrays, over the tree the

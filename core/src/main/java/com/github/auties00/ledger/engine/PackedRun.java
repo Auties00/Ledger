@@ -22,9 +22,9 @@ import java.util.Arrays;
 ///
 /// The writes of the run are listed in no [BlindWrites]: the run's effect on the count of the key space, against the
 /// open's tree, is [#correction()], which the first checkpoint finds as a by-product of merging the run into the tree
-/// ([#settle(int, boolean)]), and a count before then by looking each key up. A write the replay sent to a chain whose key
-/// the run holds takes the run's entry as the key's state before it, as the builder's entry while the replay runs and the
-/// run's after, so it is exact, never blind.
+/// ([#settle(byte\[\], int, boolean)]), and a count before then by looking each key up. A write the replay sent to a
+/// chain whose key the run holds takes the run's entry as the key's state before it, as the builder's entry while the
+/// replay runs and the run's after, so it is exact, never blind.
 ///
 /// Per entry it keeps the key's bytes and their end, a word of the value's place and kind, a slot of the hash table and an
 /// index of the key order; a value shorter than [SpillQueue#LOG_VALUE_MIN] lies in the replay's chunks
@@ -42,6 +42,8 @@ final class PackedRun {
     static final int MAX_SEGMENTS = 1 << 16;
     /// The longest value a run takes: the bits of the word of an entry that hold a logged value's length.
     static final int MAX_VALUE_LENGTH = (1 << 30) - 1;
+    /// The bytes the keys of a run take at most, all in one array whose length doubles as the builder grows.
+    static final int MAX_KEY_BYTES = 1 << 30;
     // The kind and place of a value, in the word of an entry: the sign bit for a removal; then a bit for a value in the
     // log, whose length and index among the logged values follow; otherwise the length, the chunk and the offset of a
     // value in a chunk of the replay
@@ -290,7 +292,7 @@ final class PackedRun {
     }
 
     /// {@return the array a checkpoint records in whether the tree the store opened from holds each entry's key, as it
-    /// merges the entries into that tree ([#settle(int, boolean)])}
+    /// merges the entries into that tree ([#settle(byte\[\], int, boolean)])}
     byte[] settles() {
         var known = inBase;
         if (known == null) {
@@ -483,11 +485,11 @@ final class PackedRun {
             return values[entry] < 0;
         }
 
-        /// {@return whether the builder takes a write of a value of `length` bytes in `segment`, or of no segment if
-        /// `null`: past [#MAX_ENTRIES] entries, [#MAX_SEGMENTS] segments or [#MAX_VALUE_LENGTH] bytes, the replay writes
-        /// to chains}
-        boolean takes(LogSegmentView segment, int length) {
-            if (size >= MAX_ENTRIES || length > MAX_VALUE_LENGTH) {
+        /// {@return whether the builder takes a write of `key` with a value of `length` bytes in `segment`, or of no
+        /// segment if `null`: past [#MAX_ENTRIES] entries, [#MAX_KEY_BYTES] bytes of keys, [#MAX_SEGMENTS] segments or
+        /// [#MAX_VALUE_LENGTH] bytes, the replay writes to chains}
+        boolean takes(MemorySegment key, LogSegmentView segment, int length) {
+            if (size >= MAX_ENTRIES || length > MAX_VALUE_LENGTH || keyBytes + key.byteSize() > MAX_KEY_BYTES) {
                 return false;
             }
             return segment == null || segments.size() < MAX_SEGMENTS
@@ -587,7 +589,8 @@ final class PackedRun {
             }
             var length = Math.toIntExact(key.byteSize());
             if (keyBytes + length > keys.length) {
-                keys = Arrays.copyOf(keys, Math.max(keyBytes + length, 2 * keys.length));
+                var capacity = Math.min(MAX_KEY_BYTES, Math.max(keyBytes + length, 2L * keys.length));
+                keys = Arrays.copyOf(keys, (int) capacity);
             }
             MemorySegment.copy(key, ValueLayout.JAVA_BYTE, 0, keys, keyBytes, length);
             keyBytes += length;
