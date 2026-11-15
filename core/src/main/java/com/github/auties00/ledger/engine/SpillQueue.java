@@ -567,7 +567,8 @@ final class SpillQueue {
     /// holds, which a store without a file of large values may move.
     ///
     /// The polynomials are evaluated four coefficients of the value at a time, as the sum of each times its power of the
-    /// point, so that the four products do not wait for one another; the result is the one Horner's rule gives.
+    /// point, so that the four products do not wait for one another, reduced modulo the prime once for the four; the
+    /// result is the one Horner's rule gives.
     ///
     /// @implNote This implementation tags with a universal hash of its own, not a MAC of the JDK: a store that recovers
     /// a long log after a crash tags every value it replays while the JVM has compiled little, when the C2 compilation
@@ -801,14 +802,15 @@ final class SpillQueue {
             var y2 = powers[3];
             var y3 = powers[4];
             var y4 = powers[5];
-            // Four words at a time, the last read the 8 bytes after the first three
+            // Four words at a time, the last read the 8 bytes after the first three; the four products, folded below 2^63
+            // but not reduced, sum below 2^64, which one reduction takes below the prime
             for (; at + 3 * WORD + Long.BYTES <= end; at += 4 * WORD) {
                 var w0 = Bytes.i64(value, at) >>> 8;
                 var w1 = Bytes.i64(value, at + WORD) >>> 8;
                 var w2 = Bytes.i64(value, at + 2 * WORD) >>> 8;
                 var w3 = Bytes.i64(value, at + 3 * WORD) >>> 8;
-                a = reduce(multiply(a + w0, x4) + multiply(w1, x3) + multiply(w2, x2) + multiply(w3, x));
-                b = reduce(multiply(b + w0, y4) + multiply(w1, y3) + multiply(w2, y2) + multiply(w3, y));
+                a = reduce(fold(a + w0, x4) + fold(w1, x3) + fold(w2, x2) + fold(w3, x));
+                b = reduce(fold(b + w0, y4) + fold(w1, y3) + fold(w2, y2) + fold(w3, y));
             }
             // A long read takes 8 bytes: the top 7 of it are a word
             for (; at + Long.BYTES <= end; at += WORD) {
@@ -829,7 +831,7 @@ final class SpillQueue {
             second = multiply(b + length, y);
         }
 
-        /// {@return `sum`, below 2^63, modulo [#PRIME]}
+        /// {@return `sum`, read as unsigned, modulo [#PRIME]}
         private static long reduce(long sum) {
             var reduced = (sum & PRIME) + (sum >>> 61);
             return reduced >= PRIME ? reduced - PRIME : reduced;
@@ -840,6 +842,15 @@ final class SpillQueue {
         long[] tagForTests(byte[] value, int offset, int length, long stamp) {
             tag(value, offset, length, stamp);
             return new long[]{first, second, keys[0], keys[1]};
+        }
+
+        /// {@return a number below 2^63 that is `a` times `b` modulo [#PRIME], for `a` below 2^62 and `b` below 2^61}
+        ///
+        /// The 123 bits of the product fold into 64 as [#multiply(long, long)] folds them, without the reduction after.
+        private static long fold(long a, long b) {
+            var high = Math.unsignedMultiplyHigh(a, b);
+            var low = a * b;
+            return (high << 3) + (low >>> 61) + (low & PRIME);
         }
 
         /// {@return `a` times `b` modulo [#PRIME], both below 2^62}
