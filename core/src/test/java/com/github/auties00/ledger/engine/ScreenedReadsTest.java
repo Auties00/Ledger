@@ -22,10 +22,12 @@ import java.util.List;
 import java.util.Random;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -820,6 +822,104 @@ class ScreenedReadsTest {
                     assertTrue(ledger.pageCacheBytesForTests() >= branches + 20 * 6_000L,
                             ledger.pageCacheBytesForTests() + " bytes cached after the branches' " + branches);
                 }
+            }
+        }
+
+        // The unit of the large value of `key` a version in memory names alone, no checkpoint having taken it
+        private static PageRef pendingUnit(LiveLedger ledger, String key) {
+            var head = ledger.state(MESSAGES).chain(MemorySegment.ofArray(key.getBytes())).head;
+            assertInstanceOf(BlobFile.class, head.sourceForTests(), key);
+            return ((Version.External) head).unit;
+        }
+
+        @Test
+        @DisplayName("caches the units of large values no checkpoint took that a scan reads first only at the third scan, and those past them while the cache has room, as it does after a checkpoint")
+        void pendingLargeScans(@TempDir Path directory) throws Exception {
+            var count = 200;
+            try (var ledger = (LiveLedger) open(directory, 4_096)) {
+                var batch = ledger.newBatch();
+                for (var i = 0; i < count; i++) {
+                    batch.put(MESSAGES, key(i), value(i, 6_000));
+                }
+                ledger.commit(batch).awaitDurable();
+                ledger.clearPageCacheForTests();
+                var blobs = ledger.blobsForTests();
+                for (var scan = 0; scan < 3; scan++) {
+                    var seen = new int[1];
+                    ledger.forEach(MESSAGES, KeyRange.all(), (key, value) -> {
+                        assertArrayEquals(value(seen[0], 6_000), value);
+                        seen[0]++;
+                        return true;
+                    });
+                    assertEquals(count, seen[0]);
+                    for (var i = 0; i < count; i++) {
+                        var cached = blobs.cachedForTests(pendingUnit(ledger, key(i))) != null;
+                        if (i < TreeCursor.ADMITTED) {
+                            assertEquals(scan == 2, cached, "the unit of " + key(i) + " after scan " + scan);
+                        } else {
+                            assertTrue(cached, "the unit of " + key(i) + " past the admitted ones after scan " + scan);
+                        }
+                    }
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("evicts none of the large values point reads use for scans of large values no checkpoint took, as for scans of the same values after a checkpoint")
+        void pendingLargeScansKeepPointReads(@TempDir Path directory) throws Exception {
+            for (var checkpointFirst : new boolean[]{false, true}) {
+                var store = directory.resolve("checkpointed-" + checkpointFirst);
+                try (var ledger = small(store)) {
+                    var batch = ledger.newBatch();
+                    for (var i = 0; i < 300; i++) {
+                        batch.put(MESSAGES, "b" + key(i), value(i, 6_000));
+                    }
+                    ledger.commit(batch).awaitDurable();
+                }
+                try (var ledger = (LiveLedger) small(store)) {
+                    ledger.clearPageCacheForTests();
+                    // Read twice, so the cache holds them
+                    for (var round = 0; round < 2; round++) {
+                        for (var i = 0; i < 300; i++) {
+                            assertArrayEquals(value(i, 6_000), ledger.get(MESSAGES, "b" + key(i)).orElseThrow());
+                        }
+                    }
+                    var batch = ledger.newBatch();
+                    for (var i = 0; i < 1_000; i++) {
+                        batch.put(MESSAGES, "a" + key(i), value(i, 6_000));
+                    }
+                    ledger.commit(batch).awaitDurable();
+                    if (checkpointFirst) {
+                        ledger.checkpoint();
+                    }
+                    for (var scan = 0; scan < 2; scan++) {
+                        var seen = new int[1];
+                        ledger.forEach(MESSAGES, KeyRange.between("a", "b"), (key, value) -> {
+                            assertArrayEquals(value(seen[0], 6_000), value);
+                            seen[0]++;
+                            return true;
+                        });
+                        assertEquals(1_000, seen[0]);
+                    }
+                    var reads = new AtomicInteger();
+                    ledger.blobsForTests().readHookForTests(reads::incrementAndGet);
+                    for (var i = 0; i < 300; i++) {
+                        assertArrayEquals(value(i, 6_000), ledger.get(MESSAGES, "b" + key(i)).orElseThrow());
+                    }
+                    ledger.blobsForTests().readHookForTests(null);
+                    assertEquals(0, reads.get(), "the reads of the file of large values with checkpointFirst " + checkpointFirst);
+                }
+            }
+        }
+
+        // Opened as open(directory, 4_096) is, with a cache of 4 MiB, which 300 values of 6,000 bytes fill to about half
+        private static Ledger small(Path directory) {
+            PageFile.forceWarmNewForTests(true);
+            try {
+                return Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(MESSAGES)
+                        .keyspace(SESSIONS).pageCache(4 * MIB).largeValues(4_096).build();
+            } finally {
+                PageFile.forceWarmNewForTests(false);
             }
         }
 

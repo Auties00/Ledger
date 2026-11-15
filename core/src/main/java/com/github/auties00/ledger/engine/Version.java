@@ -110,7 +110,8 @@ sealed class Version permits Version.External {
     /// {@return the encoded value, read-only, or `null` if this version removes the key}
     ///
     /// A value in the log is read from it, and one only a unit of [BlobFile] holds from the unit, through the page
-    /// cache ([BlobFile#value(PageRef, int)]).
+    /// cache, screened as a point read ([BlobFile#value(PageRef, int)]); a scan reads such a value through
+    /// [#scanValue(boolean, int)].
     ///
     /// @throws LogSegmentView.Retired if the value is in a segment a checkpoint retired, which the tree of every reader
     ///                                that can still find this version holds
@@ -134,12 +135,31 @@ sealed class Version permits Version.External {
         return ((BlobFile) held).value(((External) this).unit, length);
     }
 
+    /// {@return whether only a unit of [BlobFile] holds the value, which a read opens}
+    ///
+    /// The answer never changes: such a version is never [spilled][#spill].
+    boolean inUnit() {
+        return SOURCE.getAcquire(this) instanceof BlobFile;
+    }
+
+    /// {@return the encoded value, read-only, which only a unit of [BlobFile] holds ([#inUnit()]), read as a scan's
+    /// cursor reads the unit of a value of its tree ([BlobFile#scanValue(PageRef, int, boolean, int)])}
+    ///
+    /// @param admitted whether the scan still admits the units it reads
+    /// @param screen the screening of an admitted unit: [PageCache#UNSCREENED] or [PageCache#SCAN]
+    /// @throws com.github.auties00.ledger.LedgerIoException if the unit cannot be read
+    /// @throws com.github.auties00.ledger.LedgerCorruptedException if the unit fails authentication
+    MemorySegment scanValue(boolean admitted, int screen) {
+        return ((BlobFile) SOURCE.getAcquire(this)).scanValue(((External) this).unit, length, admitted, screen);
+    }
+
     /// {@return the encoded value in a new array, or `null` if this version removes the key}
     ///
     /// A value on an array of its own is copied with an array copy, which spares the zeroing of the new array a copy
     /// of [#value] pays ([Segments#toBytes(byte\[\], int, int)]); one on a read-only segment, which hides its array,
     /// cannot be. An array source is the value whole, at no offset. A value in the log is read into an array of its
-    /// own, and one only a unit of [BlobFile] holds is copied out of the unit ([BlobFile#copyValue(PageRef, int)]).
+    /// own, and one only a unit of [BlobFile] holds is copied out of the unit, screened as a point read
+    /// ([BlobFile#copyValue(PageRef, int, int)]).
     ///
     /// @throws LogSegmentView.Retired as [#value()] does
     /// @throws com.github.auties00.ledger.LedgerIoException as [#value()] does
@@ -159,7 +179,7 @@ sealed class Version permits Version.External {
             // No slice of the segment: the copy reads the value where it is
             return Segments.toBytes(segment, offset, length);
         }
-        return ((BlobFile) held).copyValue(((External) this).unit, length);
+        return ((BlobFile) held).copyValue(((External) this).unit, length, PageCache.POINT);
     }
 
     /// {@return the array that is the value whole, if the version keeps its value on an array of its own, or `null`}
