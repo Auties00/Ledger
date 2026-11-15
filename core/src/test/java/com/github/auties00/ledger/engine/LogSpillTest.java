@@ -1344,6 +1344,88 @@ class LogSpillTest {
     }
 
     @Test
+    @DisplayName("a value decrypted in place is the value AES-CTR from the body's first counter block decrypts, wherever it starts and however long it is, and the decryption allocates a few hundred bytes whatever the value's length")
+    void decryptsInPlaceAsCounterMode() throws Exception {
+        var queue = new SpillQueue(0, true);
+        var crypto = queue.takeCrypto();
+        var random = new Random(3);
+        var bytes = new byte[32];
+        random.nextBytes(bytes);
+        var key = new SecretKeySpec(bytes, "AES");
+        var body = new byte[700_000];
+        random.nextBytes(body);
+        for (var frameOffset : new long[]{0, 4_096, 0x1_0000_1000L}) {
+            var counter = new byte[SpillQueue.BLOCK];
+            System.arraycopy(LogWriter.nonce(frameOffset), 0, counter, 0, 12);
+            Bytes.i32(counter, 12, 2);
+            var ctr = javax.crypto.Cipher.getInstance("AES/CTR/NoPadding");
+            ctr.init(javax.crypto.Cipher.ENCRYPT_MODE, key, new javax.crypto.spec.IvParameterSpec(counter));
+            var sealedBody = ctr.doFinal(body);
+            // Lengths around the pieces of the scratch, and up to several of them
+            var lengths = new int[]{1, 15, 16, 17, SpillQueue.KEPT_SCRATCH - 1, SpillQueue.KEPT_SCRATCH,
+                    SpillQueue.KEPT_SCRATCH + 1, 3 * SpillQueue.KEPT_SCRATCH + 5, 256 << 10, 600_000};
+            for (var length : lengths) {
+                for (var trial = 0; trial < 4; trial++) {
+                    var bodyIndex = random.nextInt(body.length - length);
+                    var at = random.nextInt(40);
+                    var value = new byte[at + length + random.nextInt(40)];
+                    System.arraycopy(sealedBody, bodyIndex, value, at, length);
+                    crypto.decryptInPlace(key, frameOffset, bodyIndex, value, at, length);
+                    assertArrayEquals(Arrays.copyOfRange(body, bodyIndex, bodyIndex + length),
+                            Arrays.copyOfRange(value, at, at + length),
+                            "at " + bodyIndex + " for " + length + " bytes of the frame at " + frameOffset);
+                }
+            }
+        }
+        var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+        var value = new byte[256 << 10];
+        var allocated = 0L;
+        for (var round = 0; round < 3; round++) {
+            var before = threads.getCurrentThreadAllocatedBytes();
+            for (var i = 0; i < 200; i++) {
+                crypto.decryptInPlace(key, 4_096, 3 + 16 * i, value, 0, value.length);
+            }
+            allocated = (threads.getCurrentThreadAllocatedBytes() - before) / 200;
+        }
+        assertTrue(allocated < 512, "decrypting in place allocated " + allocated + " bytes per value");
+        queue.giveBack(crypto);
+    }
+
+    @Test
+    @DisplayName("the polynomials of a tag, four words at a time, are those Horner's rule gives a word at a time, whatever the value's length and offset")
+    void tagsAsHornersRule() {
+        var queue = new SpillQueue(0, true);
+        var crypto = queue.takeCrypto();
+        var random = new Random(4);
+        var value = new byte[2_000];
+        random.nextBytes(value);
+        // Every byte set, so a word is as large as one gets
+        Arrays.fill(value, 900, 1_000, (byte) 0xFF);
+        for (var length = 0; length < 300; length++) {
+            for (var offset : new int[]{0, 1, 7, 900 - length / 2}) {
+                var stamp = random.nextLong();
+                var tag = crypto.tagForTests(value, offset, length, stamp);
+                for (var i = 0; i < 2; i++) {
+                    var point = tag[2 + i];
+                    var expected = point;
+                    expected = SpillQueue.Crypto.multiply(expected + (stamp >>> 8), point);
+                    expected = SpillQueue.Crypto.multiply(expected + (stamp & 0xFF), point);
+                    for (var at = offset; at < offset + length; at += 7) {
+                        var word = 0L;
+                        for (var j = at; j < Math.min(at + 7, offset + length); j++) {
+                            word = (word << 8) | (value[j] & 0xFF);
+                        }
+                        expected = SpillQueue.Crypto.multiply(expected + word, point);
+                    }
+                    expected = SpillQueue.Crypto.multiply(expected + length, point);
+                    assertEquals(expected, tag[i], "polynomial " + i + " of " + length + " bytes at " + offset);
+                }
+            }
+        }
+        queue.giveBack(crypto);
+    }
+
+    @Test
     @DisplayName("a segment a snapshot held past the checkpoint that made it obsolete is ignored and removed by the next open")
     void ignoresSegmentsLeftBehind(@TempDir Path directory) throws Exception {
         var expected = new Expected();
