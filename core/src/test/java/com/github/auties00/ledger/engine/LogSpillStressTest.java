@@ -138,6 +138,12 @@ class LogSpillStressTest {
         }
     }
 
+    /// {@return whether values moved to the log, if spills are `forced`, or the key space's samples were judged
+    /// otherwise}
+    private static boolean exercised(LiveLedger ledger, boolean forced) {
+        return forced ? ledger.spills().loggedValuesForTests() > 0 : ledger.state(MSG).overwrites.judged();
+    }
+
     @ParameterizedTest(name = "encrypted={0} cold={1} forced={2}")
     @CsvSource({"true,false,true", "true,true,true", "false,true,true", "true,false,false"})
     @Timeout(300)
@@ -287,8 +293,18 @@ class LogSpillStressTest {
                         failure.compareAndSet(null, t);
                     }
                 }));
-                var deadline = System.nanoTime() + Duration.ofSeconds(4).toNanos();
-                while (System.nanoTime() < deadline && failure.get() == null) {
+                // Four seconds, then on until the phase did what it is checked for, at most a minute: a record leaves the
+                // queue with its values in place when a checkpoint holds its commit before the log's group of it is
+                // durable, and the writers wait for no commit, so the log forces a few large groups a phase while a
+                // checkpoint publishes every 15 ms: a run measured 4 to 8 durable groups a phase, and in some phases
+                // every record left with a checkpoint
+                var started = System.nanoTime();
+                while (failure.get() == null) {
+                    var elapsed = System.nanoTime() - started;
+                    if (elapsed >= Duration.ofMinutes(1).toNanos()
+                            || (elapsed >= Duration.ofSeconds(4).toNanos() && exercised(ledger, forced))) {
+                        break;
+                    }
                     Thread.sleep(50);
                 }
                 stop.set(true);
@@ -302,11 +318,7 @@ class LogSpillStressTest {
                 ledger.awaitDurable();
                 carried = scan(ledger, false);
                 checkAtomic(carried, "end of phase " + phase);
-                if (forced) {
-                    assertTrue(ledger.spills().loggedValuesForTests() > 0, "values moved to the log in phase " + phase);
-                } else {
-                    assertTrue(ledger.state(MSG).overwrites.judged(), "no judgement in phase " + phase);
-                }
+                assertTrue(exercised(ledger, forced), (forced ? "no value moved to the log" : "no judgement") + " in phase " + phase);
                 if (phase % 2 == 0) {
                     ledger.closeWithoutCheckpoint();
                 } else {
