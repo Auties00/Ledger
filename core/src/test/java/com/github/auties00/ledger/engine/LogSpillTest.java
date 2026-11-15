@@ -332,7 +332,7 @@ class LogSpillTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
-    @DisplayName("values read back in turn from several segments into a caller's array allocate nothing per value, as a checkpoint reads them")
+    @DisplayName("values read back in turn from several segments into a caller's array allocate no buffer and no key schedule per value, as a checkpoint reads them")
     void readsBackInPlace(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         try (var ledger = open(directory, encrypted, 0)) {
@@ -375,13 +375,14 @@ class LogSpillTest {
                 logged.get(index).readLogged(target, 16);
                 assertArrayEquals(value, Arrays.copyOfRange(target, 16, 16 + value.length));
             }
-            // Before, each read wrapped its array in a buffer and, switching segments, initialized a key schedule
-            assertTrue(perValue < 32, "a value read back allocated " + perValue + " bytes");
+            // The cipher's initialization at each value copies the counter block and the key, about 130 bytes; a buffer
+            // of the array per read, or a key schedule per change of segment, would take hundreds more
+            assertTrue(perValue < (encrypted ? 192 : 32), "a value read back allocated " + perValue + " bytes");
         }
     }
 
     @Test
-    @DisplayName("values read while another read holds the cipher of their segment use read back as written with the reader's own cipher, which makes no cipher per value")
+    @DisplayName("values read while another read holds the cipher of their segment use read back as written with the reader's own cipher, which makes no cipher and no key schedule per value")
     void readsBesideAHeldCipher(@TempDir Path directory) throws Exception {
         var expected = new Expected();
         try (var ledger = open(directory, true, 0)) {
@@ -430,7 +431,9 @@ class LogSpillTest {
                 }
                 assertArrayEquals(values.get(i), Arrays.copyOfRange(target, 16, 16 + values.get(i).length));
             }
-            assertTrue(perValue < 64, "a value read back beside a held cipher allocated " + perValue + " bytes");
+            // A cipher made per value would take kilobytes, and a key schedule hundreds of bytes more than the copies of
+            // the counter block and the key an initialization makes
+            assertTrue(perValue < 192, "a value read back beside a held cipher allocated " + perValue + " bytes");
         }
     }
 

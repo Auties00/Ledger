@@ -13,7 +13,6 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.security.InvalidKeyException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
@@ -29,11 +28,11 @@ import java.util.function.BooleanSupplier;
 /// The file is read through one channel, opened at the first read. An interrupt of a reading thread closes the
 /// channel for every thread; the read then opens it again, reads again, and gives the thread its interrupt back.
 ///
-/// The keystream of a value comes from an AES-ECB cipher initialized under the key of the use once, at the first read,
-/// and kept for the next: a checkpoint reads values back in key order, which interleaves the uses they moved to, and an
-/// initialization per value allocated the key schedule of each. A read that finds that cipher taken by another, as the
-/// threads of a checkpoint read values of one use at once, takes the cipher of its [SpillQueue.Crypto] instead, keyed
-/// again only if the holder last decrypted a value of another use, rather than a cipher of its own.
+/// A value is decrypted with an AES-CTR cipher made at the first read and kept for the next, initialized at each value
+/// under the key of the use, which the JDK expands again only when the key changes: a checkpoint reads values back in
+/// key order, which interleaves the uses they moved to, and one cipher for every use expanded a key per value. A read
+/// that finds that cipher taken by another, as the threads of a checkpoint read values of one use at once, takes the
+/// cipher of its [SpillQueue.Crypto] instead, rather than making one of its own.
 final class LogSegmentView {
     private final long number;
     private final Path path;
@@ -42,7 +41,7 @@ final class LogSegmentView {
     private final SpillQueue spills;
     private final Object lock;
     private volatile FileChannel channel;
-    // The cipher that makes the keystream under key, or null before the first read, while a read holds it, and without
+    // The cipher that decrypts the values of the use, or null before the first read, while a read holds it, and without
     // encryption
     private final AtomicReference<Cipher> blocks;
     // Whether a read made the cipher blocks holds, so a read that finds it empty knows another holds it
@@ -161,7 +160,8 @@ final class LogSegmentView {
                     crypto.decrypt(key, logged.frameOffset(), logged.bodyIndex(), sealed, skip, length, target, offset);
                 } else {
                     try {
-                        crypto.decrypt(cipher, logged.frameOffset(), logged.bodyIndex(), sealed, skip, length, target, offset);
+                        crypto.decrypt(cipher, key, logged.frameOffset(), logged.bodyIndex(), sealed, skip, length, target,
+                                offset);
                     } catch (RuntimeException | Error failure) {
                         // Not given back, which leaves its state unknown: the next read makes another
                         blocksMade = false;
@@ -211,21 +211,15 @@ final class LogSegmentView {
         }
     }
 
-    /// {@return the cipher that makes the keystream under the use's key, which the caller alone holds until it gives
-    /// it back: the one kept here, or one made now if no read made it yet; `null` if another read holds it}
+    /// {@return the cipher that decrypts the values of the use, which the caller alone holds until it gives it back:
+    /// the one kept here, or one made now if no read made it yet; `null` if another read holds it}
     private Cipher takeBlocks() {
         var cipher = blocks.getAndSet(null);
         if (cipher != null || blocksMade) {
             return cipher;
         }
         blocksMade = true;
-        cipher = SpillQueue.Crypto.newBlocks();
-        try {
-            cipher.init(Cipher.ENCRYPT_MODE, key);
-        } catch (InvalidKeyException exception) {
-            throw new IllegalStateException("AES failed", exception);
-        }
-        return cipher;
+        return SpillQueue.Crypto.newBlocks();
     }
 
     /// Reads `length` bytes at `position` of the file into `buffer` from `offset`, whatever the buffer's position and
