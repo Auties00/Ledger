@@ -258,8 +258,10 @@ final class BlobFile implements AutoCloseable {
     /// so the read allocates no array but the caller's; it is never kept weakly for a
     /// [recall][PageCache#recall(long, PageRef, int)], since a later read writes the spare. A spare the cache takes is
     /// zeroed past the unit's tag first, so the cache holds no byte of the unit an earlier read, of this store or of
-    /// another that shares the pool, opened into it. A value that a version names and one that a leaf of a tree points
-    /// to copy out the same way.
+    /// another that shares the pool, opened into it. In a store without encryption a unit the cache does not take is
+    /// read straight into the caller's array, its header and the bytes past its content into an array of the pool,
+    /// and its checksum checked over the three ([#readContent(PageRef, int)]). A value that a version names and one
+    /// that a leaf of a tree points to copy out the same way.
     ///
     /// @param screen the read's screening: [PageCache#UNSCREENED], [PageCache#POINT] or [PageCache#SCAN]
     /// @throws LedgerCorruptedException if the unit fails authentication, is not the one `ref` names, or does not
@@ -280,6 +282,13 @@ final class BlobFile implements AutoCloseable {
             checkLength(ref, held, length);
             return Segments.toBytes(held, PageFormat.HEADER, length);
         }
+        var unitBytes = (long) ref.pages() * PageFormat.SIZE;
+        var encrypts = cipher.encrypts();
+        // Without encryption the cache's verdict comes first: a unit it does not take needs no array but the caller's
+        var admitted = !encrypts && cache.holds(unitBytes) && cache.admits(key, ref, screen);
+        if (!encrypts && !admitted) {
+            return readContent(ref, length);
+        }
         var plain = readUnit(ref, true, true);
         if (plain == null) {
             throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
@@ -290,7 +299,7 @@ final class BlobFile implements AutoCloseable {
             pool.releaseLarge(plain);
             throw exception;
         }
-        if (cache.holds((long) ref.pages() * PageFormat.SIZE) && cache.admits(key, ref, screen)) {
+        if (encrypts ? cache.holds(unitBytes) && cache.admits(key, ref, screen) : admitted) {
             // A spare may be longer than the unit, and hold past the unit's tag the plaintext of an earlier read, of
             // this store or of another that shares the pool: the cache keeps only bytes of this unit
             Arrays.fill(plain, ref.pages() * PageFormat.SIZE - PageFormat.TAG, plain.length, (byte) 0);
@@ -425,23 +434,13 @@ final class BlobFile implements AutoCloseable {
         var length = pages * PageFormat.SIZE;
         var large = length > HeapPool.MAX_POOLED;
         var sealed = large ? pool.acquireLarge(length) : pool.acquire(length);
-        var through = channels.take();
-        var interrupted = false;
+        var through = new FileChannel[]{channels.take()};
+        var interrupted = new boolean[1];
+        // Whether sealed goes to the caller as the plaintext, so it does not go back to the pool
+        var handed = false;
         try {
-            var target = ByteBuffer.wrap(sealed, 0, length);
-            var position = PageFormat.offset(ref.page());
-            while (target.position() < length) {
-                target.limit(Math.min(length, target.position() + BUFFER));
-                try {
-                    if (through.read(target, position + target.position()) < 0) {
-                        return null;
-                    }
-                } catch (ClosedByInterruptException _) {
-                    // The interrupt closed the channel; read on a new one, from where the last read ended, and give
-                    // the caller its interrupt back
-                    interrupted |= Thread.interrupted();
-                    through = channels.reopen();
-                }
+            if (!readFully(through, sealed, 0, length, PageFormat.offset(ref.page()), interrupted)) {
+                return null;
             }
             // The header is the additional data of the tag and the open copies it as it is, so what it says holds once
             // the unit authenticates: it is checked first, and tells the bytes to keep
@@ -452,6 +451,14 @@ final class BlobFile implements AutoCloseable {
             }
             var keep = cached ? PageFormat.cachedLength(pages, content) : length;
             if (spare && large && keep == length) {
+                if (!cipher.encrypts()) {
+                    // Without encryption the bytes read are the plaintext, once their checksum matches
+                    if (!PageCipher.checksumMatches(sealed, 0, length - PageFormat.TAG)) {
+                        return null;
+                    }
+                    handed = true;
+                    return sealed;
+                }
                 // Out of place, so the open runs the AES-GCM intrinsic that decrypts and authenticates in one pass
                 var plain = pool.acquireLarge(length);
                 if (cipher.open(sealed, 0, pages, plain)) {
@@ -464,16 +471,102 @@ final class BlobFile implements AutoCloseable {
         } catch (IOException exception) {
             throw new LedgerIoException(path + " could not be read", exception);
         } finally {
-            channels.give(through);
-            if (large) {
-                pool.releaseLarge(sealed);
-            } else {
-                pool.release(sealed);
+            channels.give(through[0]);
+            if (!handed) {
+                if (large) {
+                    pool.releaseLarge(sealed);
+                } else {
+                    pool.release(sealed);
+                }
             }
-            if (interrupted) {
+            if (interrupted[0]) {
                 Thread.currentThread().interrupt();
             }
         }
+    }
+
+    /// {@return the value of `length` bytes the unit `ref` names, in a new array, read from the file of a store
+    /// without encryption}
+    ///
+    /// The content goes from the file straight into the array returned, and the unit's header and the bytes past its
+    /// content into an array of the pool, which goes back at the end: the read allocates the caller's array alone and
+    /// copies each byte once, where reading the whole unit into one array, as an open does, copies the content out of
+    /// it again. The header is checked before the content is read, the checksum over the three pieces after.
+    ///
+    /// @throws LedgerCorruptedException if the unit fails its checksum, is not the one `ref` names, or does not hold
+    ///                                  `length` bytes
+    /// @throws LedgerIoException if the file cannot be read
+    private byte[] readContent(PageRef ref, int length) {
+        var hook = readHookForTests;
+        if (hook != null) {
+            hook.run();
+        }
+        var pages = ref.pages();
+        var position = PageFormat.offset(ref.page());
+        // The header at 0, then the bytes after the content: its padding and the checksum
+        var rest = pool.acquire(PageFormat.HEADER + PageFormat.SIZE + PageFormat.TAG);
+        var through = new FileChannel[]{channels.take()};
+        var interrupted = new boolean[1];
+        try {
+            if (!readFully(through, rest, 0, PageFormat.HEADER, position, interrupted)) {
+                throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+            }
+            var content = Bytes.i32(rest, PageFormat.LENGTH);
+            if (!ref.describes(rest) || rest[PageFormat.KIND] != PageFormat.EXTERNAL || !PageFormat.fits(pages, content)) {
+                throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+            }
+            if (content != length) {
+                throw new LedgerCorruptedException(path + " holds " + content + " bytes at page " + ref.page()
+                        + " for a value of " + length, null);
+            }
+            var after = pages * PageFormat.SIZE - PageFormat.HEADER - length;
+            if (PageFormat.HEADER + after > rest.length) {
+                // A unit of more pages than its content needs
+                var longer = pool.acquire(PageFormat.HEADER + after);
+                System.arraycopy(rest, 0, longer, 0, PageFormat.HEADER);
+                pool.release(rest);
+                rest = longer;
+            }
+            var value = new byte[length];
+            if (!readFully(through, value, 0, length, position + PageFormat.HEADER, interrupted)
+                    || !readFully(through, rest, PageFormat.HEADER, after, position + PageFormat.HEADER + length, interrupted)
+                    || !PageCipher.checksumMatches(value, length, rest, after - PageFormat.TAG)) {
+                throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+            }
+            return value;
+        } catch (IOException exception) {
+            throw new LedgerIoException(path + " could not be read", exception);
+        } finally {
+            channels.give(through[0]);
+            pool.release(rest);
+            if (interrupted[0]) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /// Reads the `length` bytes of the file at `position` into `array` at `offset`, at most [#BUFFER] bytes a call,
+    /// through the channel of `through`, which a new one replaces if an interrupt closes it, setting `interrupted`.
+    ///
+    /// @return whether the file holds them all
+    private boolean readFully(FileChannel[] through, byte[] array, int offset, int length, long position, boolean[] interrupted)
+            throws IOException {
+        var target = ByteBuffer.wrap(array, offset, length);
+        var end = offset + length;
+        while (target.position() < end) {
+            target.limit(Math.min(end, target.position() + BUFFER));
+            try {
+                if (through[0].read(target, position + target.position() - offset) < 0) {
+                    return false;
+                }
+            } catch (ClosedByInterruptException _) {
+                // The interrupt closed the channel; read on a new one, from where the last read ended, and give the
+                // caller its interrupt back
+                interrupted[0] |= Thread.interrupted();
+                through[0] = channels.reopen();
+            }
+        }
+        return true;
     }
 
     /// Forces every unit written so far, and the length of the file.

@@ -40,6 +40,12 @@ class PageCipher {
         this.ciphers = new ConcurrentLinkedQueue<>();
     }
 
+    /// {@return whether the store encrypts its units: without encryption, a unit is its plaintext followed by a
+    /// CRC-32C of it}
+    boolean encrypts() {
+        return key != null;
+    }
+
     /// Seals the unit of `pages` pages in `plain`, whose header and content are filled in, into `out` at `offset`.
     ///
     /// `plain` may end anywhere from the end of its content to the end of the unit: the bytes it lacks before the tag
@@ -289,10 +295,21 @@ class PageCipher {
 
     /// {@return whether the CRC-32C after the first `tag` bytes of the unit sealed in `sealed` at `offset`, which does
     /// not encrypt, matches them}
-    private static boolean checksumMatches(byte[] sealed, int offset, int tag) {
+    static boolean checksumMatches(byte[] sealed, int offset, int tag) {
         var crc = new CRC32C();
         crc.update(sealed, offset, tag);
         return Bytes.i32(sealed, offset + tag) == (int) crc.getValue();
+    }
+
+    /// {@return whether the CRC-32C of a unit that does not encrypt, read in pieces, matches it: the unit's header at 0
+    /// of `rest`, then its `contentLength` bytes of content in `content`, then the `padding` bytes after the content
+    /// and the checksum, at [PageFormat#HEADER] of `rest`}
+    static boolean checksumMatches(byte[] content, int contentLength, byte[] rest, int padding) {
+        var crc = new CRC32C();
+        crc.update(rest, 0, PageFormat.HEADER);
+        crc.update(content, 0, contentLength);
+        crc.update(rest, PageFormat.HEADER, padding);
+        return Bytes.i32(rest, PageFormat.HEADER + padding) == (int) crc.getValue();
     }
 
     private Cipher take() {
