@@ -430,6 +430,61 @@ class CheckpointSaturationTest {
             }
         }
 
+        @ParameterizedTest(name = "screening {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("keeps a branch of level 1 only the checkpoint read as a leaf, never as read, and the root as read")
+        void keptBranchUnread(boolean screening, @TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
+                tree.cache.screen(screening);
+                var path = tree.path(key(100));
+                assertEquals(3, path.size(), "a root, a branch of level 1 and a leaf");
+                var root = path.getFirst();
+                var branch = path.get(1);
+                // A removal of a key the tree lacks reads the path of key 100 and leaves it as it is
+                tree.apply(List.of(new TreeUpdate.Op(segment((new String(key(100)) + "a").getBytes()), null)), tree.unsaturated());
+                assertEquals(path, tree.path(key(100)), "the path the removal left");
+                assertTrue(tree.cache.referencedForTests(root), "the root counts as read");
+                assertFalse(tree.cache.referencedForTests(branch), "the branch only the checkpoint read counts as read");
+                if (screening) {
+                    assertNull(tree.cache.peek(branch), "the branch only the checkpoint read, past the doorkeeper");
+                } else {
+                    assertNotNull(tree.cache.peek(branch), "the branch only the checkpoint read, cached as written");
+                }
+                tree.verify(KEYS, 7, 150);
+            }
+        }
+
+        @ParameterizedTest(name = "screening {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("keeps a delta page only the checkpoint read to rewrite one of its records as a leaf, never as read")
+        void keptDeltaPageUnread(boolean screening, @TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
+                tree.apply(ops(0, KEYS, 40, 151), tree.unsaturated());
+                var record = tree.path(key(80)).getLast();
+                assertTrue(record.isRecord(), "the leaf of key 80 is no delta record");
+                assertEquals(record, tree.path(key(81)).getLast(), "keys 80 and 81 in leaves of their own");
+                // The record's leaf in the cache, its delta page not: the checkpoint reads the page alone
+                assertArrayEquals(new byte[151], tree.read(key(80)));
+                tree.cache.remove(PageCache.dataKey(record.unit().page(), -1));
+                assertNotNull(tree.cache.peek(record), "the record's leaf");
+                assertNull(tree.cache.peek(record.unit()), "the delta page");
+                tree.cache.screen(screening);
+                tree.apply(ops(81, 82, 1, 152), tree.unsaturated());
+                var rewritten = tree.path(key(81)).getLast();
+                assertTrue(rewritten.isRecord() && !rewritten.equals(record), "the leaf of key 81 is no new delta record");
+                assertFalse(tree.cache.referencedForTests(record.unit()), "the delta page only the checkpoint read counts as read");
+                if (screening) {
+                    assertNull(tree.cache.peek(record.unit()), "the delta page only the checkpoint read, past the doorkeeper");
+                } else {
+                    assertNotNull(tree.cache.peek(record.unit()), "the delta page only the checkpoint read, cached as written");
+                }
+                assertArrayEquals(new byte[152], tree.read(key(81)));
+                for (var i = 0; i < KEYS; i += 40) {
+                    assertArrayEquals(new byte[151], tree.read(key(i)), "key " + i);
+                }
+            }
+        }
+
         @Test
         @DisplayName("keeps a leaf only the checkpoint read out of the leaves a scan used, so neither its first two scans nor the next checkpoint cache it, and a scan caches its replacement at the first read")
         void keptLeafUnreadByScan(@TempDir Path directory) throws Exception {

@@ -36,8 +36,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /// parallel, in the common fork-join pool.
 ///
 /// A node read to be replaced is neither cached nor counted as read ([PageFile#readForReplace(PageRef, byte)]); one the
-/// writes turn out not to change is then kept ([PageFile#keep(PageRef, byte\[\])]): a branch counts as read after
-/// all, and a leaf keeps the state its readers gave it. What the update writes goes to the page cache as the first
+/// writes turn out not to change is then kept ([PageFile#keep(PageRef, byte\[\], boolean)]): the root and a branch of
+/// level 2 or more count as read after all, and a leaf, a branch of level 1 and a delta page keep the state their
+/// readers gave them. What the update writes goes to the page cache as the first
 /// entries the clock evicts: the branches, the leaves and delta pages the writer admits
 /// ([PageFile.Writer#admits(long, boolean)]), a leaf the more readily if one a read used in the cache is among those
 /// it replaces, and the units of values not at all. A leaf the writer leaves out in place of one reads used
@@ -255,7 +256,7 @@ final class TreeUpdate {
             var node = new Child(null, root.ref(), root.count(), root.blobs(), TreeNodes.level(unit), -1);
             switch (update(node, unit, null, null, ops, 0, ops.size(), removals, 0, removals.size(), true)) {
                 case null -> {
-                    keep(root.ref(), unit);
+                    keep(root.ref(), unit, true);
                     return root;
                 }
                 case Written written -> result = new ArrayList<>(written.nodes());
@@ -278,7 +279,7 @@ final class TreeUpdate {
             while (top.level() > 0) {
                 var unit = read(top.ref(), PageFormat.BRANCH);
                 if (TreeNodes.count(unit) != 1) {
-                    keep(top.ref(), unit);
+                    keep(top.ref(), unit, true);
                     break;
                 }
                 freed.add(top.ref());
@@ -547,7 +548,7 @@ final class TreeUpdate {
         var unit = read(child.ref(), PageFile.NODE);
         var replacement = update(child, unit, plan.low(), plan.high(), ops, plan.opFrom(), plan.opTo(), removals, plan.remFrom(), plan.remTo(), false);
         if (replacement == null) {
-            keep(child.ref(), unit);
+            keep(child.ref(), unit, false);
         }
         return replacement;
     }
@@ -818,25 +819,34 @@ final class TreeUpdate {
         });
     }
 
-    /// {@return the plaintext of the delta page `ref` of a record about to be written anew, kept in the page cache as
-    /// any read keeps a unit: the page's other records stay live, and the next records this update replaces need it}
+    /// {@return the plaintext of the delta page `ref` of a record about to be written anew, which outlives the
+    /// checkpoint, as the page's other records stay live}
     ///
-    /// The memo of the last delta page read is safe whatever the page held before: it is compared by the whole
-    /// reference, nonce included.
+    /// The page is read as a node to replace is ([PageFile#readForReplace(PageRef, byte)]), the update's memo of the
+    /// last delta page first, which then holds it for the next records this update replaces, and kept as a leaf is
+    /// ([PageFile#keep(PageRef, byte\[\], boolean)]): no reader read it. The memo is safe whatever the page held
+    /// before: it is compared by the whole reference, nonce included.
     private byte[] readLiveDeltaPage(PageRef ref) {
-        if (ref.equals(deltaPageRef)) {
-            pages.keep(ref, deltaPage);
-            return deltaPage;
+        if (!ref.equals(deltaPageRef)) {
+            var staged = writer.staged(ref);
+            if (staged != null) {
+                return staged;
+            }
+            deltaPage = pages.readForReplace(ref, PageFormat.DELTA);
+            deltaPageRef = ref;
         }
-        var unit = writer.staged(ref);
-        return unit != null ? unit : pages.read(ref, PageFormat.DELTA, true);
+        keep(ref, deltaPage, false);
+        return deltaPage;
     }
 
-    /// Keeps the node `ref` names, read as `unit`, in the page cache ([PageFile#keep(PageRef, byte\[\])]), as the update
-    /// leaves it in the tree; a node this checkpoint wrote keeps what the writer admitted.
-    private void keep(PageRef ref, byte[] unit) {
+    /// Keeps the node or delta page `ref` names, read as `unit`, in the page cache
+    /// ([PageFile#keep(PageRef, byte\[\], boolean)]), as the update leaves it in the tree; a unit this checkpoint wrote
+    /// keeps what the writer admitted.
+    ///
+    /// @param root whether `unit` is the root of its tree
+    private void keep(PageRef ref, byte[] unit, boolean root) {
         if (ref.nonceHigh() != writer.nonceHigh()) {
-            pages.keep(ref, unit);
+            pages.keep(ref, unit, root);
         }
     }
 
@@ -1076,8 +1086,8 @@ final class TreeUpdate {
                 var unitA = read(a.ref(), PageFile.NODE);
                 var unitB = read(b.ref(), PageFile.NODE);
                 if (TreeNodes.fill(unitA) + TreeNodes.fill(unitB) > TreeNodes.CAPACITY) {
-                    keep(a.ref(), unitA);
-                    keep(b.ref(), unitB);
+                    keep(a.ref(), unitA, false);
+                    keep(b.ref(), unitB, false);
                     continue;
                 }
                 List<Child> replacement;
