@@ -198,8 +198,10 @@ class PageCipher {
                 if (offset + count <= contentLength) {
                     used += cipher.update(content, contentOffset + (int) offset, count, buffer, used);
                 } else {
+                    // Long enough for every slice left: a short slice of a cold process may cross the end of the
+                    // content and a longer one follow it
                     if (last == null) {
-                        last = new byte[count];
+                        last = new byte[(int) Math.min(sliceLength, total - offset)];
                     }
                     var fromContent = (int) Math.max(0, contentLength - offset);
                     if (fromContent > 0) {

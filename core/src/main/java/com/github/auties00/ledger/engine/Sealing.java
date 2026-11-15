@@ -61,6 +61,14 @@ final class Sealing {
         return COLD_LEFT.get() <= 0;
     }
 
+    /// Sets the bytes of the budget no slice took yet to `left`, so a test seals as a process that sealed
+    /// [#COLD_BYTES] minus `left` bytes in short slices; for tests.
+    ///
+    /// @return the bytes the budget had left before
+    static long coldLeftForTests(long left) {
+        return COLD_LEFT.getAndSet(left);
+    }
+
     /// Encrypts the `length` bytes of `input` at `inputOffset`, then `padding` zero bytes, into `output` at
     /// `outputOffset`, then appends the tag, through `cipher`, which is initialized for encryption and has its
     /// additional data.
