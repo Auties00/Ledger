@@ -26,6 +26,10 @@ class PageCipher {
     /// deoptimizes it, and the opens after decrypt in the counter mode's Java code, several times slower than its
     /// intrinsic, until the JIT compiled it again.
     private static final int FIRST_SLICE = 640 << 10;
+    /// The content at the start of a streamed unit that may go in the short slices of a cold process
+    /// ([Sealing#slice(int)]): 1,400 calls past the first slice, so the cipher's methods reach the second compiler over
+    /// four units, whose ends its profile then holds.
+    private static final int UNIT_COLD_BYTES = 2 << 20;
 
     private final SecretKeySpec key;
     private final ConcurrentLinkedQueue<Cipher> ciphers;
@@ -133,7 +137,8 @@ class PageCipher {
     /// The unit is the one [#seal(byte\[\], int, byte\[\], int)] makes of the same header and content, but neither is
     /// whole in memory: a value of megabytes is sealed through a buffer of its own size. The cipher reads each whole
     /// slice of the content where it is; only the last part of the content and the padding after it are copied.
-    /// The first slice of a content of [#FIRST_SLICE] bytes or more is that long, the others [#SLICE] bytes.
+    /// The first slice of a content of [#FIRST_SLICE] bytes or more is that long, the others [#SLICE] bytes, or shorter
+    /// in the first [#UNIT_COLD_BYTES] while the process seals its first megabytes ([Sealing#slice(int)]).
     ///
     /// @param header the unit's header, filled in, of [PageFormat#HEADER] bytes
     /// @param buffer the buffer the sealed bytes pass through, of at least 64 KiB
@@ -181,7 +186,7 @@ class PageCipher {
             var sliceLength = Math.min(SLICE, buffer.length / 2);
             byte[] last = null;
             for (var offset = 0L; offset < total; ) {
-                var count = (int) Math.min(sliceLength, total - offset);
+                var count = (int) Math.min(offset < UNIT_COLD_BYTES ? Sealing.slice(sliceLength) : sliceLength, total - offset);
                 if (offset == 0 && contentLength >= FIRST_SLICE && buffer.length >= FIRST_SLICE + 2 * PageFormat.TAG) {
                     count = FIRST_SLICE;
                 }
