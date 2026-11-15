@@ -133,9 +133,8 @@ final class SpillQueue {
 
     /// {@return the budget for a heap of `maxMemory` bytes: a 1,024th, from 4 MiB to 64 MiB}
     ///
-    /// A value within the budget keeps the whole array of its batch, which lives until its last value moves, so a full
-    /// queue holds more heap than its budget; a read of a value past it costs one positioned read of the log, which
-    /// the system's cache serves while the log is recent.
+    /// The budget counts the bytes of the values, not of the arrays of their batches, which they keep alive with them,
+    /// so a full queue holds more heap than its budget.
     static long defaultBudget(long maxMemory) {
         return Math.clamp(maxMemory / 1024, 4L << 20, 64L << 20);
     }
