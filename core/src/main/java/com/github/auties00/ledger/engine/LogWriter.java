@@ -1308,7 +1308,9 @@ final class LogWriter {
     ///
     /// The body goes to the cipher a slice at a time, chunk by chunk: the frame is the one GCM message a single call
     /// would make, and the output stays at most [#OUTPUT] bytes whatever the frame's size. Every chunk but the last
-    /// holds [FrameBody#CHUNK_BYTES], a multiple of [#SLICE], so the slices are those of a body of one array. A body
+    /// holds [FrameBody#CHUNK_BYTES], a multiple of [#SLICE], so the slices are those of a body of one array; the first
+    /// megabytes the process seals go in shorter slices ([Sealing#slice(int)]), so the JIT compiles the cipher's
+    /// intrinsics within them. A body
     /// that refers to values is read piece by piece, each byte once, from the output where it is gathered or as the
     /// cipher reads it, so the tag or checksum of the frame covers the bytes the frame holds, whatever an array it
     /// refers to holds later.
@@ -1334,7 +1336,7 @@ final class LogWriter {
                     var bytes = body.chunk(chunk);
                     var length = body.chunkLength(chunk);
                     for (var offset = 0; offset < length; ) {
-                        var slice = Math.min(SLICE, length - offset);
+                        var slice = Math.min(Sealing.slice(SLICE), length - offset);
                         room(slice + TAG_BYTES);
                         used += cipher.update(bytes, offset, slice, output, used);
                         offset += slice;
@@ -1423,7 +1425,7 @@ final class LogWriter {
                 while (left > 0) {
                     int taken;
                     if (gathered == 0 && left >= DIRECT_PIECE) {
-                        taken = Math.min(SLICE, left);
+                        taken = Math.min(Sealing.slice(SLICE), left);
                         if (taken != remaining) {
                             taken &= -BLOCK;
                         }
