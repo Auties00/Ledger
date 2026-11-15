@@ -381,6 +381,60 @@ class LogSpillTest {
     }
 
     @Test
+    @DisplayName("values read while another read holds the cipher of their segment use read back as written with the reader's own cipher, which makes no cipher per value")
+    void readsBesideAHeldCipher(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, true, 0)) {
+            for (var batch = 0; batch < 20; batch++) {
+                write(ledger, expected, batch * 30, 30, 0, true);
+            }
+            spillNow(ledger);
+            var logged = new ArrayList<Version>();
+            var values = new ArrayList<byte[]>();
+            LogSegmentView view = null;
+            for (var entry : expected.messages.entrySet()) {
+                var version = head(ledger, MESSAGES, key(entry.getKey()));
+                if (version.sourceForTests() instanceof LogValue value && (view == null || value.segment() == view)) {
+                    view = value.segment();
+                    logged.add(version);
+                    values.add(entry.getValue());
+                }
+            }
+            assertTrue(logged.size() >= 10, "values moved to one segment: " + logged.size());
+            var target = new byte[8_192];
+            // The first read makes the use's cipher
+            logged.getFirst().readLogged(target, 0);
+            var field = LogSegmentView.class.getDeclaredField("blocks");
+            field.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            var blocks = (java.util.concurrent.atomic.AtomicReference<javax.crypto.Cipher>) field.get(view);
+            var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+            var perValue = 0L;
+            for (var round = 0; round < 4; round++) {
+                var before = threads.getCurrentThreadAllocatedBytes();
+                for (var i = 0; i < logged.size(); i++) {
+                    // Another read holds it at every read
+                    var held = blocks.getAndSet(null);
+                    logged.get(i).readLogged(target, 16);
+                    if (held != null) {
+                        blocks.set(held);
+                    }
+                }
+                perValue = (threads.getCurrentThreadAllocatedBytes() - before) / logged.size();
+            }
+            for (var i = 0; i < logged.size(); i++) {
+                var held = blocks.getAndSet(null);
+                logged.get(i).readLogged(target, 16);
+                if (held != null) {
+                    blocks.set(held);
+                }
+                assertArrayEquals(values.get(i), Arrays.copyOfRange(target, 16, 16 + values.get(i).length));
+            }
+            assertTrue(perValue < 64, "a value read back beside a held cipher allocated " + perValue + " bytes");
+        }
+    }
+
+    @Test
     @DisplayName("the segments of moved values stay while a snapshot of the tree before the checkpoint reads them, and retire once it closes")
     void keepsSegmentsForOlderTrees(@TempDir Path directory) throws Exception {
         var expected = new Expected();
@@ -970,6 +1024,71 @@ class LogSpillTest {
         assertTrue(warmed >= records * 4_000L && warmed <= extent(4_096 + (records - 1) * 8_192L, 4_000) - 4_096,
                 "bytes read back: " + warmed);
         queue.close();
+    }
+
+    @Test
+    @DisplayName("the records of the commits a checkpoint in flight writes leave the queue unmoved, with no read of their frames, while those after its cut move, and every commit moves again once it is published or given back")
+    void leavesWhatACheckpointTakes(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(0, true);
+        var durable = new java.util.concurrent.atomic.AtomicLong();
+        queue.useDurable(durable::get);
+        var path = directory.resolve("1.log");
+        var view = queue.segment(1, path, null);
+        long[] frames = {4_096, 12_288, 20_480, 28_672, 36_864};
+        var versions = new Version[frames.length];
+        for (var i = 0; i < frames.length; i++) {
+            versions[i] = spillable((i + 1L) << 20, 4_000);
+            writeFrame(path, frames[i], versions[i], 4_000);
+        }
+        // A forced commit and one written past the cache, which a checkpoint cuts, and one after its cut
+        queue.add(located(queue, 1, versions[0], 4_000, view, frames[0], false));
+        queue.add(located(queue, 2, versions[1], 4_000, view, frames[1], true));
+        queue.checkpointTakes(2);
+        queue.add(located(queue, 3, versions[2], 4_000, view, frames[2], true));
+        queue.awaitIdleForTests();
+        durable.set(3);
+        queue.drain(durable::get);
+        assertInstanceOf(MemorySegment.class, versions[0].sourceForTests(), "a value of a forced commit the checkpoint writes");
+        assertInstanceOf(MemorySegment.class, versions[1].sourceForTests(), "a value of a commit the checkpoint writes");
+        assertMovedAndReads(versions[2], 4_000);
+        assertEquals(2, queue.takenRecordsForTests(), "records dropped unmoved");
+        assertEquals(1, queue.loggedValuesForTests(), "values moved to the log");
+        assertEquals(extent(frames[2], 4_000) - frames[2], queue.warmedBytesForTests(), "bytes of frames read back");
+        assertEquals(0, queue.heldForTests());
+        // Published: a later commit moves as before the checkpoint
+        queue.published(2, 0, 3);
+        assertEquals(-1, queue.takenForTests());
+        queue.add(located(queue, 4, versions[3], 4_000, view, frames[3], false));
+        // A checkpoint that cuts commit 5 and fails gives it back before the thread reaches it
+        queue.checkpointTakes(5);
+        queue.add(located(queue, 5, versions[4], 4_000, view, frames[4], true));
+        queue.checkpointDropped();
+        queue.awaitIdleForTests();
+        durable.set(5);
+        queue.drain(durable::get);
+        assertMovedAndReads(versions[3], 4_000);
+        assertMovedAndReads(versions[4], 4_000);
+        assertEquals(2, queue.takenRecordsForTests(), "records dropped unmoved");
+        queue.close();
+    }
+
+    @Test
+    @DisplayName("a store's queue learns the commits of a checkpoint as it cuts them, and forgets them once the checkpoint is published or given back")
+    void storeTellsItsQueueWhatACheckpointTakes(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, true, 0)) {
+            write(ledger, expected, 0, 4, 0, true);
+            var sequence = write(ledger, expected, 4, 4, 0, true);
+            var cut = ledger.cutCheckpoint(() -> ledger.log().currentSegment());
+            assertEquals(sequence, cut.sequence());
+            assertEquals(sequence, ledger.spills().takenForTests(), "commits of the cut");
+            ledger.restoreCut(cut);
+            ledger.readers().unregister(cut.sequence());
+            assertEquals(-1, ledger.spills().takenForTests(), "after the checkpoint was given back");
+            ledger.checkpoint();
+            assertEquals(-1, ledger.spills().takenForTests(), "after a checkpoint was published");
+            verify(ledger, expected);
+        }
     }
 
     @ParameterizedTest(name = "encrypted: {0}")

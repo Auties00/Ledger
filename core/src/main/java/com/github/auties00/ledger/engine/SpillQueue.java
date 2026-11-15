@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.LongSupplier;
@@ -45,7 +46,11 @@ import java.util.zip.CRC32C;
 ///   the samples keep under an eighth;
 /// - of a batch on a [ValueSlab]'s chunks, which the slab bounds already, of a transaction, of a value a batch put on
 ///   an array of its own, or of one with a unit of [BlobFile]. A value a recovery copied to an array of its own moves,
-///   to the log only.
+///   to the log only;
+/// - of a commit that a checkpoint in flight writes ([#checkpointTakes(long)]): its values leave the heap once that
+///   checkpoint is published, and a value moved before the checkpoint reaches it is read back from the log, with a
+///   read of its frame first if its group bypassed the system's cache, where the checkpoint copies it from its array
+///   otherwise. The thread drops such a record unmoved, so the held bytes count only the commits the checkpoint leaves.
 ///
 /// A recovery moves a value it replays that the log holds before its last budget of bytes at once, on its own thread,
 /// tagged where it lies in the frame body it came in
@@ -101,7 +106,12 @@ final class SpillQueue {
     private volatile long held;
     // Whether the thread that moves values runs
     private final AtomicBoolean running;
+    // The threads that move values started and not yet returned, the one a thread starts as it stops included
+    private final AtomicInteger alive;
     private volatile boolean closed;
+    // The sequence of the last commit a checkpoint in flight writes, or -1 while none runs; written holding the store's
+    // publishing role
+    private volatile long taken = -1;
     // The latest sequence the log holds durably; before the store has a log, the commits queued are those a recovery
     // replays from it, every one durable
     private volatile LongSupplier durable = () -> Long.MAX_VALUE;
@@ -132,6 +142,7 @@ final class SpillQueue {
     private final AtomicLong drainedRecords = new AtomicLong();
     private final AtomicLong warmedBytes = new AtomicLong();
     private final AtomicLong unwarmedRecords = new AtomicLong();
+    private final AtomicLong takenRecords = new AtomicLong();
 
     /// Creates the queue of a store.
     ///
@@ -146,6 +157,7 @@ final class SpillQueue {
         this.records = new ArrayDeque<>();
         this.segments = new ArrayList<>();
         this.running = new AtomicBoolean();
+        this.alive = new AtomicInteger();
         this.cryptos = new AtomicReferenceArray<>(Math.max(4, 2 * Runtime.getRuntime().availableProcessors()));
     }
 
@@ -262,22 +274,28 @@ final class SpillQueue {
         if (closed || !running.compareAndSet(false, true)) {
             return;
         }
+        alive.incrementAndGet();
         try {
             Thread.ofVirtual().name("ledger-spill").start(this::run);
         } catch (Throwable _) {
             running.set(false);
+            alive.decrementAndGet();
         }
     }
 
     private void run() {
         try {
-            drain(current);
+            try {
+                drain(current);
+            } finally {
+                running.set(false);
+            }
+            // A group that became durable as the thread stopped found it running
+            if (movable()) {
+                start();
+            }
         } finally {
-            running.set(false);
-        }
-        // A group that became durable as the thread stopped found it running
-        if (movable()) {
-            start();
+            alive.decrementAndGet();
         }
     }
 
@@ -316,6 +334,11 @@ final class SpillQueue {
                     records.pollFirst();
                     held = held - record.bytes;
                     drainedRecords.incrementAndGet();
+                    if (record.sequence <= taken) {
+                        takenRecords.incrementAndGet();
+                        record.release();
+                        continue;
+                    }
                     if (record.logs()) {
                         // Before any value moves there, and before a read of its frames opens its channel, so a
                         // checkpoint that retires segments sees the commit and closes the channel
@@ -424,12 +447,14 @@ final class SpillQueue {
         var started = !ahead;
         synchronized (lock) {
             var left = held - downTo;
+            var skipped = taken;
             for (var next : records) {
                 if (left <= 0 || closed || next.sequence > durable) {
                     break;
                 }
                 left -= next.bytes;
-                if (!warms(next)) {
+                // The drain drops a record of a commit the checkpoint in flight writes without reading it
+                if (next.sequence <= skipped || !warms(next)) {
                     continue;
                 }
                 // Compared by use, not by number: a file is reused under a new use and key
@@ -468,6 +493,22 @@ final class SpillQueue {
         }
     }
 
+    /// Records that a checkpoint writes every commit up to `cut` into its trees, as it cuts them, so the thread moves no
+    /// value of those commits until it is published ([#published(long, long, long)]) or given up ([#checkpointDropped()]);
+    /// holding the store's publishing role.
+    void checkpointTakes(long cut) {
+        taken = cut;
+    }
+
+    /// Records that the checkpoint that cut the commits [#checkpointTakes(long)] named failed, so their records still
+    /// queued move as any other; holding the store's publishing role.
+    ///
+    /// A record the thread dropped while that checkpoint ran keeps its values on its batch's arrays until the next
+    /// checkpoint is published.
+    void checkpointDropped() {
+        taken = -1;
+    }
+
     /// Drops the records of the commits up to `cut`, which a checkpoint just published holds, and records that it holds
     /// every commit of the segments before `logStart`, `latest` being the latest sequence as it was published; holding
     /// the store's publishing role.
@@ -486,6 +527,8 @@ final class SpillQueue {
                 segment.cover(latest);
             }
         }
+        // Once no record of the commits it wrote is left
+        taken = -1;
     }
 
     /// Retires, from the oldest, the segments before `first` that values moved to and that no reader may need any
@@ -579,6 +622,16 @@ final class SpillQueue {
         return unwarmedRecords.get();
     }
 
+    /// {@return the records dropped unmoved because a checkpoint in flight writes their commits; for tests}
+    long takenRecordsForTests() {
+        return takenRecords.get();
+    }
+
+    /// {@return the sequence of the last commit a checkpoint in flight writes, or -1 while none runs; for tests}
+    long takenForTests() {
+        return taken;
+    }
+
     /// Reads back the frames of every record whose values go to the log before they move, as if every group bypassed
     /// the system's cache; for tests.
     void warmEveryRecordForTests() {
@@ -592,9 +645,10 @@ final class SpillQueue {
         }
     }
 
-    /// Waits until the thread that moves values is not running; for tests.
+    /// Waits until no thread that moves values runs, nor one that stopping started, so a drain a test runs next is the
+    /// only one; for tests.
     void awaitIdleForTests() throws InterruptedException {
-        while (running.get()) {
+        while (alive.get() != 0) {
             Thread.sleep(1);
         }
     }

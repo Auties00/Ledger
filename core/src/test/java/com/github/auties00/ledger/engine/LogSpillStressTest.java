@@ -28,15 +28,16 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/// A stress of the values that leave the heap for the log ([SpillQueue]) beside everything that reads or replaces
-/// them at once: writers that overwrite, delete and remove ranges of groups of keys, transactions, commits of 1,280
-/// writes that forget their values once published, snapshots scanned both ways, gets, ranges and encoded reads,
-/// checkpoints every 15 ms, collections every 20 ms that empty the weak pools, and reopens that alternate a crash-like
-/// close without a checkpoint and a clean one. The store runs with a budget of 0, key spaces that move values from their
-/// first commit and a cold slab, so every value of 256 bytes or more of a durable commit moves to the log. Each value
-/// names its key, generation and length and fills its bytes from them, and the 8 keys of a group always change
-/// together at one generation, so a value read from a wrong place, a released array or a torn snapshot shows as a
-/// corrupt value, a group of mixed generations or a group partly present.
+/// A stress of the values that leave the heap for the log ([SpillQueue]) beside everything that reads or replaces them
+/// at once: writers that overwrite, delete and remove ranges of groups of keys, transactions, commits of 1,280 writes
+/// that forget their values once published, snapshots scanned both ways, gets, ranges and encoded reads, checkpoints
+/// every 15 ms, collections every 20 ms that empty the weak pools, and reopens that alternate a crash-like close
+/// without a checkpoint and a clean one. Checkpoints start in each phase once a value moved, since a checkpoint drops
+/// the records of the commits it writes with their values unmoved. The store runs with a budget of 0, key spaces that
+/// move values from their first commit and a cold slab, so every value of 256 bytes or more of a durable commit moves
+/// to the log. Each value names its key, generation and length and fills its bytes from them, and the 8 keys of a group
+/// always change together at one generation, so a value read from a wrong place, a released array or a torn snapshot
+/// shows as a corrupt value, a group of mixed generations or a group partly present.
 class LogSpillStressTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<byte[], byte[]> MSG = Keyspace.paged("msg", KeyCodec.bytes(), ValueCodec.bytes());
@@ -265,6 +266,11 @@ class LogSpillStressTest {
                 }
                 threads.add(Thread.ofPlatform().start(() -> {
                     try {
+                        // A checkpoint drops the records of the commits it writes, values unmoved, so checkpoints that
+                        // always came before the queue's thread would leave a phase with nothing moved to the log
+                        while (!stop.get() && failure.get() == null && ledger.spills().loggedValuesForTests() == 0) {
+                            Thread.sleep(1);
+                        }
                         while (!stop.get() && failure.get() == null) {
                             Thread.sleep(15);
                             ledger.checkpoint();
@@ -283,6 +289,10 @@ class LogSpillStressTest {
                         failure.compareAndSet(null, t);
                     }
                 }));
+                var moving = System.nanoTime() + Duration.ofSeconds(60).toNanos();
+                while (ledger.spills().loggedValuesForTests() == 0 && System.nanoTime() < moving && failure.get() == null) {
+                    Thread.sleep(1);
+                }
                 var deadline = System.nanoTime() + Duration.ofSeconds(4).toNanos();
                 while (System.nanoTime() < deadline && failure.get() == null) {
                     Thread.sleep(50);

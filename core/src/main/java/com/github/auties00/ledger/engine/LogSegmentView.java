@@ -31,7 +31,9 @@ import java.util.function.BooleanSupplier;
 ///
 /// The keystream of a value comes from an AES-ECB cipher initialized under the key of the use once, at the first read,
 /// and kept for the next: a checkpoint reads values back in key order, which interleaves the uses they moved to, and an
-/// initialization per value allocated the key schedule of each.
+/// initialization per value allocated the key schedule of each. A read that finds that cipher taken by another, as the
+/// threads of a checkpoint read values of one use at once, takes the cipher of its [SpillQueue.Crypto] instead, keyed
+/// again only if the holder last decrypted a value of another use, rather than a cipher of its own.
 final class LogSegmentView {
     private final long number;
     private final Path path;
@@ -41,8 +43,10 @@ final class LogSegmentView {
     private final Object lock;
     private volatile FileChannel channel;
     // The cipher that makes the keystream under key, or null before the first read, while a read holds it, and without
-    // encryption; a read that finds it taken makes one of its own, which it leaves here if the place is empty
+    // encryption
     private final AtomicReference<Cipher> blocks;
+    // Whether a read made the cipher blocks holds, so a read that finds it empty knows another holds it
+    private volatile boolean blocksMade;
     private volatile boolean retired;
     // The lowest and highest sequence of the commits whose values were moved here, written holding the lock of the
     // queue; Long.MAX_VALUE and -1 before any
@@ -153,10 +157,19 @@ final class LogSegmentView {
                 var sealed = crypto.scratch(skip + length);
                 readFully(crypto.scratchBuffer(), 0, skip + length, start - skip);
                 var cipher = takeBlocks();
-                // Not given back if it failed, which leaves its state unknown
-                crypto.decrypt(cipher, logged.frameOffset(), logged.bodyIndex(), sealed, skip, length, target, offset);
-                if (!retired) {
-                    blocks.compareAndSet(null, cipher);
+                if (cipher == null) {
+                    crypto.decrypt(key, logged.frameOffset(), logged.bodyIndex(), sealed, skip, length, target, offset);
+                } else {
+                    try {
+                        crypto.decrypt(cipher, logged.frameOffset(), logged.bodyIndex(), sealed, skip, length, target, offset);
+                    } catch (RuntimeException | Error failure) {
+                        // Not given back, which leaves its state unknown: the next read makes another
+                        blocksMade = false;
+                        throw failure;
+                    }
+                    if (!retired) {
+                        blocks.compareAndSet(null, cipher);
+                    }
                 }
             }
             if (!crypto.verifies(target, offset, length, stamp, logged)) {
@@ -199,12 +212,13 @@ final class LogSegmentView {
     }
 
     /// {@return the cipher that makes the keystream under the use's key, which the caller alone holds until it gives
-    /// it back: the one kept here, or a new one if another read holds it}
+    /// it back: the one kept here, or one made now if no read made it yet; `null` if another read holds it}
     private Cipher takeBlocks() {
         var cipher = blocks.getAndSet(null);
-        if (cipher != null) {
+        if (cipher != null || blocksMade) {
             return cipher;
         }
+        blocksMade = true;
         cipher = SpillQueue.Crypto.newBlocks();
         try {
             cipher.init(Cipher.ENCRYPT_MODE, key);
