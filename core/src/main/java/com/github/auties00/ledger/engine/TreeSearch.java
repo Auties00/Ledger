@@ -174,6 +174,10 @@ final class TreeSearch {
     /// {@return the value of leaf entry `entry` of `unit` in a new array, as [#valueBytes(PageFile, byte\[\], int)]
     /// copies it}
     ///
+    /// A value in a unit of the file of large values is copied out as [BlobFile#copyValue(PageRef, int, int)] copies
+    /// it: a unit the cache does not take is read and opened into the pool's large spares, so the read allocates no
+    /// array but the new one.
+    ///
     /// @param screen the screening of a blob read from the file, which goes to the cache only if it
     ///               [admits][PageCache#admits(long, PageRef, int)] it: [PageCache#UNSCREENED], [PageCache#POINT] or
     ///               [PageCache#SCAN]
@@ -181,6 +185,9 @@ final class TreeSearch {
     static byte[] valueBytes(PageFile pages, byte[] unit, int entry, int screen) {
         if (TreeNodes.isInline(unit, entry)) {
             return TreeNodes.inlineValueBytes(unit, entry);
+        }
+        if (TreeNodes.isExternal(unit, entry)) {
+            return pages.blobs().copyValue(TreeNodes.blobRef(unit, entry), TreeNodes.blobLength(unit, entry), screen);
         }
         return Segments.toBytes(blob(pages, unit, entry, true, true, screen), PageFormat.HEADER,
                 TreeNodes.blobLength(unit, entry));

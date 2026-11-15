@@ -10,7 +10,8 @@ import java.util.HashMap;
 /// Copy-on-write nodes cannot link to their siblings, so the cursor keeps the path from the root to its leaf and
 /// climbs it to reach the next leaf.
 ///
-/// The first [#ADMITTED] leaves and blobs a cursor reads go to the page cache; past them it reads through the cache,
+/// The first [#ADMITTED] leaves and blobs a cursor reads, with the units of the values in memory its scan merges
+/// ([#admit()]), go to the page cache; past them it reads through the cache,
 /// using the units the cache holds and adding the others only while the cache has room for them, as entries the cache
 /// evicts before any other. A long scan reads each unit once, so caching what it reads would only evict the units
 /// other reads use: the PostgreSQL buffer manager holds a large sequential scan to a small ring for the same reason. A
@@ -384,7 +385,11 @@ final class TreeCursor implements StoredCursor {
     }
 
     /// {@return whether the leaf or blob the cursor reads next goes to the cache}
-    private boolean admit() {
+    ///
+    /// A scan that merges memory with the tree also asks it for each value in memory that only a unit of [BlobFile]
+    /// holds ([Version#inUnit()]), so the units of values no checkpoint took count against [#ADMITTED] with those of
+    /// the tree.
+    boolean admit() {
         if (admitted == ADMITTED) {
             return false;
         }

@@ -46,7 +46,9 @@ import java.util.concurrent.atomic.AtomicLong;
 /// arrays of their own ([#acquireLarge(int)]), reached only weakly, and those of half a region of the G1 collector or
 /// more sized to fill whole regions: G1 gives such an array regions of its own, which a dead one keeps committed until
 /// a marking frees them, so a read that missed the page cache and allocated the sealed unit, the opened one and the
-/// caller's copy kept three of them committed, where it now allocates the caller's alone. Only an array that never
+/// caller's copy kept three of them committed, where a read that copies the value out, before a checkpoint takes the
+/// unit or after, allocates the caller's alone ([BlobFile#copyValue(PageRef, int, int)]); a read that gives a view of
+/// the value, which the caller may keep, still opens the unit into an array of its own. Only an array that never
 /// left its reader comes back: one the page cache, a version, a view or a caller received never does, as a reader may
 /// still read it.
 public final class HeapPool {

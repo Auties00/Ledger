@@ -392,6 +392,11 @@ final class Reads {
     /// links ([KeyspaceState#walk]). A resident key space whose loader has not put every entry in memory reads through a
     /// [ResidentScan].
     ///
+    /// A version in memory whose value only a unit of [BlobFile] holds, a large value no checkpoint took, is read as the
+    /// tree's cursor reads the unit of a value of the tree, and counts against the units the cursor
+    /// [admits][TreeCursor#admit()] ([Version#scanValue(boolean, int)]): a scan caches the same units before a checkpoint
+    /// takes them as after.
+    ///
     /// @return the number of entries passed
     static <K> long scan(KeyspaceState state, Keyspace<K, ?> keyspace, KeyRange<K> range, ReadPoint point, Visitor consumer) {
         return scan(state, keyspace, range, point, Long.MAX_VALUE, consumer);
@@ -426,6 +431,9 @@ final class Reads {
         var cursor = root == null ? null
                 : new TreeCursor(point.pages(), root, fromBytes, toBytes, descending, wanted, !state.resident);
         StoredCursor tree = run == null ? cursor : new PackedRun.Cursor(run, cursor, from, to, descending);
+        var screen = state.resident ? PageCache.UNSCREENED : PageCache.SCAN;
+        // The units of values in memory read so far, up to TreeCursor.ADMITTED, while no cursor counts them
+        var unitsAdmitted = 0;
         try {
             var inTree = tree != null && tree.next();
             var held = memory.next();
@@ -450,7 +458,21 @@ final class Reads {
                     Object decoded = null;
                     if (version != null && version != Version.HIDDEN) {
                         try {
-                            value = version.value();
+                            if (version.inUnit()) {
+                                // Admitted with the tree's leaves and blobs, as the same value after a checkpoint is
+                                boolean admitted;
+                                if (cursor != null) {
+                                    admitted = cursor.admit();
+                                } else {
+                                    admitted = unitsAdmitted < TreeCursor.ADMITTED;
+                                    if (admitted) {
+                                        unitsAdmitted++;
+                                    }
+                                }
+                                value = version.scanValue(admitted, screen);
+                            } else {
+                                value = version.value();
+                            }
                         } catch (LogSegmentView.Retired _) {
                             checkTreeHolds(version, point);
                             if (order != 0) {

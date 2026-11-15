@@ -30,8 +30,9 @@ import java.util.concurrent.atomic.AtomicLong;
 ///
 /// Memory keeps no copy of a value of a paged key space that a unit holds: until a checkpoint takes the unit, its
 /// version names the unit ([Version#ofUnit]), and a read opens it through the page cache, screened as a read of a
-/// tree's value is ([#copyValue(PageRef, int)]), so a value read once costs a read of the file and an open, as one
-/// after a checkpoint does, and only a value read twice stays in the cache. A unit a commit replaced before a
+/// tree's value is ([#copyValue(PageRef, int, int)], [#scanValue(PageRef, int, boolean, int)]), so a value read once
+/// costs a read of the file and an open, as one after a checkpoint does, and only a value a point read read twice, or a
+/// scan three times among its first units, stays in the cache. A unit a commit replaced before a
 /// checkpoint took it therefore waits, as one a checkpoint freed does, for every reader that may still read it
 /// ([#pendSuperseded(long, List)]).
 ///
@@ -195,40 +196,66 @@ final class BlobFile implements AutoCloseable {
 
     /// {@return the value of `length` bytes the unit `ref` holds, read-only, as a slice of the unit's plaintext}
     ///
-    /// The unit comes from the page cache or the file, which screens it as a read of a tree's value: the cache takes
-    /// it at its second read. A view goes to a visitor, which may keep it, so its array is never recycled.
+    /// The unit comes from the page cache or the file, which screens it as a point read of a tree's value: the cache
+    /// takes it at its second read. A view goes to a visitor, which may keep it, so its array is never recycled.
     ///
     /// @throws LedgerCorruptedException if the unit fails authentication, is not the one `ref` names, or does not
     ///                                  hold `length` bytes
     /// @throws LedgerIoException if the file cannot be read
     MemorySegment value(PageRef ref, int length) {
-        var plain = read(ref, true, true, PageCache.POINT);
+        return value(ref, length, true, true, PageCache.POINT);
+    }
+
+    /// {@return the value of `length` bytes the unit `ref` holds, read-only, as a slice of the unit's plaintext, read
+    /// as a scan's cursor reads the unit of a value of its tree}
+    ///
+    /// A unit the scan still [admits][TreeCursor#ADMITTED] is screened as `screen` asks; past them, the read uses the
+    /// unit the cache holds and adds one it reads only while the cache [has room][PageCache#hasRoom(long)] for it, as
+    /// an entry the cache evicts before any other. A long scan of values no checkpoint took so evicts nothing, as one
+    /// of the same values after a checkpoint does not.
+    ///
+    /// @param admitted whether the scan still admits the units it reads
+    /// @param screen the screening of an admitted unit: [PageCache#UNSCREENED] or [PageCache#SCAN]
+    /// @throws LedgerCorruptedException if the unit fails authentication, is not the one `ref` names, or does not
+    ///                                  hold `length` bytes
+    /// @throws LedgerIoException if the file cannot be read
+    MemorySegment scanValue(PageRef ref, int length, boolean admitted, int screen) {
+        var cached = admitted || cache.hasRoom(PageFormat.cachedLength(ref.pages(), length));
+        return value(ref, length, cached, admitted, screen);
+    }
+
+    // The value of `length` bytes the unit `ref` holds, read-only, as a slice of the plaintext read(ref, cached,
+    // referenced, screen) gives
+    private MemorySegment value(PageRef ref, int length, boolean cached, boolean referenced, int screen) {
+        var plain = read(ref, cached, referenced, screen);
         checkLength(ref, plain, length);
         return MemorySegment.ofArray(plain).asSlice(PageFormat.HEADER, length).asReadOnly();
     }
 
     /// {@return the value of `length` bytes the unit `ref` holds, in a new array}
     ///
-    /// The unit comes from the page cache or the file, which screens it as a read of a tree's value: the cache takes
-    /// it at its second read, if it [holds][PageCache#holds(long)] units of its size, so a value read once leaves
+    /// The unit comes from the page cache or the file, which screens it as `screen` asks: a point read's is taken at
+    /// its second read, if the cache [holds][PageCache#holds(long)] units of its size, so a value read once leaves
     /// nothing reachable. A unit above [HeapPool#MAX_POOLED] that the cache does not take is read and opened into
     /// arrays of the pool's large spares ([HeapPool#acquireLarge(int)]), which go back once the value is copied out,
     /// so the read allocates no array but the caller's; it is never kept weakly for a
-    /// [recall][PageCache#recall(long, PageRef, int)], since a later read writes the spare.
+    /// [recall][PageCache#recall(long, PageRef, int)], since a later read writes the spare. A value that a version
+    /// names and one that a leaf of a tree points to copy out the same way.
     ///
+    /// @param screen the read's screening: [PageCache#UNSCREENED], [PageCache#POINT] or [PageCache#SCAN]
     /// @throws LedgerCorruptedException if the unit fails authentication, is not the one `ref` names, or does not
     ///                                  hold `length` bytes
     /// @throws LedgerIoException if the file cannot be read
-    byte[] copyValue(PageRef ref, int length) {
+    byte[] copyValue(PageRef ref, int length, int screen) {
         if ((long) ref.pages() * PageFormat.SIZE <= HeapPool.MAX_POOLED) {
-            var plain = read(ref, true, true, PageCache.POINT);
+            var plain = read(ref, true, true, screen);
             checkLength(ref, plain, length);
             return Segments.toBytes(plain, PageFormat.HEADER, length);
         }
         var key = PageCache.key(PageCache.BLOBS, ref.page());
         var held = cache.get(key, ref);
         if (held == null) {
-            held = cache.recall(key, ref, PageCache.POINT);
+            held = cache.recall(key, ref, screen);
         }
         if (held != null) {
             checkLength(ref, held, length);
@@ -244,7 +271,7 @@ final class BlobFile implements AutoCloseable {
             pool.releaseLarge(plain);
             throw exception;
         }
-        if (cache.holds((long) ref.pages() * PageFormat.SIZE) && cache.admits(key, ref, PageCache.POINT)) {
+        if (cache.holds((long) ref.pages() * PageFormat.SIZE) && cache.admits(key, ref, screen)) {
             // The cache holds it from now on, or drops it if it closed: never back to the spares, as readers may
             // still read it
             cache.put(key, ref, plain, true);
@@ -466,7 +493,7 @@ final class BlobFile implements AutoCloseable {
 
     /// Frees `units`, which no published checkpoint's tree points to and whose versions commits replaced before a
     /// checkpoint took them, once every reader is past `published`: a reader below the commit that replaced one may
-    /// still read it, as memory keeps no copy of a paged value ([#copyValue(PageRef, int)]).
+    /// still read it, as memory keeps no copy of a paged value ([#copyValue(PageRef, int, int)]).
     ///
     /// They leave the units in flight and join the pending ones at once, holding the lock [#durableRuns] takes, so a
     /// checkpoint lists each of them as free exactly once. The list is kept as it is, so no one may change it from now

@@ -579,6 +579,39 @@ class LargeValuesTest {
         }
 
         @Test
+        @DisplayName("a get of a large value the cache cannot hold allocates little but the caller's copy, before a checkpoint takes its unit and after")
+        void copiesOutOfSpares(@TempDir Path directory) throws Exception {
+            HeapPool.forceRegionForTests(1 << 20);
+            var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+            var length = 16 << 20;
+            // A quarter of the limit is below the unit, so the cache never holds it
+            try (var ledger = (LiveLedger) options(directory, true).pageCache(4L << 20).build()) {
+                var expected = value(160, length);
+                ledger.commit(ledger.newBatch().put(FILES, "v", expected)).awaitDurable();
+                for (var checkpointed : new boolean[]{false, true}) {
+                    if (checkpointed) {
+                        ledger.checkpoint();
+                        // The reads go to the tree's leaf, which points to the unit
+                        assertNull(ledger.state(FILES).head(MemorySegment.ofArray("v".getBytes())), "a version in memory");
+                    }
+                    // The first read may make the pool's spares
+                    for (var read = 0; read < 4; read++) {
+                        var before = threads.getCurrentThreadAllocatedBytes();
+                        var value = ledger.get(FILES, "v").orElseThrow();
+                        var allocated = threads.getCurrentThreadAllocatedBytes() - before;
+                        assertArrayEquals(expected, value);
+                        if (read > 0) {
+                            assertTrue(allocated - length < length / 4, allocated + " bytes allocated by read " + read
+                                    + (checkpointed ? " after the checkpoint" : " before the checkpoint"));
+                        }
+                    }
+                }
+            } finally {
+                HeapPool.forceRegionForTests(-1);
+            }
+        }
+
+        @Test
         @DisplayName("a read of a value of a closed store fails rather than opening the file again")
         void closed(@TempDir Path directory) throws Exception {
             var ledger = (LiveLedger) open(directory, true);
@@ -587,7 +620,7 @@ class LargeValuesTest {
             var ref = unit(ledger, "a");
             ledger.clearPageCacheForTests();
             ledger.close();
-            assertThrows(IllegalStateException.class, () -> blobs.copyValue(ref, 20_000));
+            assertThrows(IllegalStateException.class, () -> blobs.copyValue(ref, 20_000, PageCache.POINT));
             assertThrows(IllegalStateException.class, () -> ledger.get(FILES, "a"));
         }
 
