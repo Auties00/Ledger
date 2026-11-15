@@ -539,9 +539,6 @@ final class SpillQueue {
     /// few dozen bytes are little beside the value: the JDK's intrinsic of the counter mode runs the keystream and its
     /// XOR where AES-ECB and a loop of this class took several times as long.
     ///
-    /// The polynomials are evaluated four coefficients at a time, as the sum of each times its power of the point, so
-    /// that the four products do not wait for one another; the result is the one Horner's rule gives.
-    ///
     /// The tag of a value in an encrypted store is a pair of polynomials over the field of [#PRIME] elements, evaluated
     /// at the two secret points of the queue: one coefficient per 7 bytes of the value, after a leading 1 and the
     /// version's stamp and before the value's length, so distinct values, or the same value of another version, are
@@ -553,6 +550,9 @@ final class SpillQueue {
     /// polynomial: below 2^-80 for a value of 12 KiB, about the bound of a 96-bit GMAC of the same value, below 2^-75
     /// for one of 1 MiB, the longest that moves with the default large values, and below 2^-64 for the longest a frame
     /// holds, which a store without a file of large values may move.
+    ///
+    /// The polynomials are evaluated four coefficients of the value at a time, as the sum of each times its power of the
+    /// point, so that the four products do not wait for one another; the result is the one Horner's rule gives.
     ///
     /// @implNote This implementation tags with a universal hash of its own, not a MAC of the JDK: a store that recovers
     /// a long log after a crash tags every value it replays while the JVM has compiled little, when the C2 compilation
@@ -794,7 +794,8 @@ final class SpillQueue {
 
         /// Evaluates the two polynomials of the tag of the `length` bytes at `offset` of `value`, the value of the
         /// version stamped `stamp`, into [#first] and [#second]: by Horner's rule, the coefficients 1, the stamp in two
-        /// words, the value in words of 7 bytes, the last one shorter, and the length.
+        /// words, the value in words of 7 bytes, the last one shorter, and the length, four of the value's words at a
+        /// time while four whole ones are left.
         private void tag(byte[] value, int offset, int length, long stamp) {
             var x = keys[0];
             var y = keys[1];
