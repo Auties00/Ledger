@@ -1,6 +1,8 @@
 package com.github.auties00.ledger.engine;
 
+import javax.crypto.AEADBadTagException;
 import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.lang.foreign.MemorySegment;
@@ -25,7 +27,9 @@ import java.util.zip.CRC32C;
 /// the log writer locates in the frame it seals. Once the queue holds more than its budget of values whose frames are
 /// durable, a virtual thread moves the values of the oldest records off their arrays, until three quarters of the
 /// budget is left: a value of at least [#LOG_VALUE_MIN] bytes to its place in the log ([LogValue]), with a tag that
-/// authenticates it, a shorter one to an array of its own. An array no version needs any more is then garbage. The
+/// authenticates it, a shorter one to an array of its own. A value that takes nearly all of its frame gets no tag: its
+/// frame's own AES-GCM tag authenticates it, as a read takes the whole frame ([#framesAlone]), so the thread moves it
+/// without reading a byte of it. An array no version needs any more is then garbage. The
 /// newest values, those of the budget, stay where they are, so reads of recent writes do not change; a read of a value
 /// in the log reads it back with one positioned read.
 ///
@@ -75,6 +79,9 @@ final class SpillQueue {
     static final int THROUGH_VALUE_MIN = 128 << 10;
     /// The bytes of an AES block.
     static final int BLOCK = 16;
+    /// The shortest value a read authenticates by the tag of its frame rather than by a tag of its own: below it, the
+    /// set-up of an AES-GCM message per read costs more than the polynomials of the value.
+    static final int FRAMED_VALUE_MIN = 16 << 10;
     /// The prime 2^61 - 1, the modulus of the polynomials of the tags.
     private static final long PRIME = (1L << 61) - 1;
     /// The bytes of a word of a tagged value: 7, so a word is below [#PRIME].
@@ -112,6 +119,8 @@ final class SpillQueue {
     // the writer's locating of a record before the thread reads it
     private final LongSupplier current = () -> durable.getAsLong();
     private final AtomicReferenceArray<Crypto> cryptos;
+    // The arrays the reads of framed values take their frames into
+    private final HeapPool pool;
     // The values moved to the log and to arrays of their own, and the records drained, for tests
     private final AtomicLong loggedValues = new AtomicLong();
     private final AtomicLong copiedValues = new AtomicLong();
@@ -132,6 +141,13 @@ final class SpillQueue {
         this.segments = new ArrayList<>();
         this.running = new AtomicBoolean();
         this.cryptos = new AtomicReferenceArray<>(Math.max(4, 2 * Runtime.getRuntime().availableProcessors()));
+        this.pool = HeapPool.process();
+    }
+
+    /// {@return the pool the reads of [framed][LogValue#framed()] values take their arrays from: the process's, which
+    /// every store with a directory shares}
+    HeapPool pool() {
+        return pool;
     }
 
     /// {@return the keys of the tags, drawn at the first call}
@@ -181,6 +197,18 @@ final class SpillQueue {
         return held > budget;
     }
 
+    /// {@return whether a value of `length` bytes in a frame of an encrypted segment use whose body holds `frameBody`
+    /// bytes is read back as its whole frame, which the frame's own AES-GCM tag authenticates}
+    ///
+    /// The value takes nearly all of the frame: at least [#FRAMED_VALUE_MIN] bytes, and at least eight ninths of the
+    /// body, so a read takes at most an eighth more bytes than the value's own; and the frame fits an array the pool
+    /// recycles. The tag of such a value is never made: the value moves without being read.
+    static boolean framesAlone(LogSegmentView segment, int frameBody, int length) {
+        return segment.key() != null && length >= FRAMED_VALUE_MIN && frameBody >= length
+                && frameBody - length <= length >>> 3
+                && LogWriter.FRAME_HEADER + (long) frameBody + LogWriter.TAG_BYTES <= HeapPool.MAX_POOLED;
+    }
+
     /// {@return an empty record of the commit at `sequence`, with room for `writes` values}
     Record record(long sequence, int writes) {
         return new Record(sequence, Math.max(1, writes));
@@ -211,7 +239,7 @@ final class SpillQueue {
     /// @param crypto the caller's, until it gives it back ([#takeCrypto()])
     /// @return whether the value moved
     boolean moveReplayed(Crypto crypto, Version version, LogSegmentView segment, long frameOffset, int bodyIndex, byte[] frame) {
-        if (!version.spill(crypto, segment, frameOffset, bodyIndex, frame)) {
+        if (!version.spill(crypto, segment, frameOffset, bodyIndex, 0, frame)) {
             return false;
         }
         loggedValues.incrementAndGet();
@@ -499,10 +527,12 @@ final class SpillQueue {
         private boolean large;
         private int shortest = Integer.MAX_VALUE;
         // Set by the log writer as it seals the frame: the segment use, the frame's offset, where the commit's body
-        // starts in the frame's body, and whether the group was written through
+        // starts in the frame's body, the bytes of the frame's body, 0 if unknown, and whether the group was written
+        // through
         private LogSegmentView segment;
         private long frameOffset;
         private int commitStart;
+        private int frameBody;
         private boolean through;
 
         private Record(long sequence, int capacity) {
@@ -526,13 +556,16 @@ final class SpillQueue {
         }
 
         /// Records where the log wrote the frame of the commit: at `frameOffset` of the use `segment`, the commit's body
-        /// at `commitStart` of the frame's body, written through to stable storage if `through`.
+        /// at `commitStart` of the frame's body of `frameBody` bytes, written through to stable storage if `through`.
         ///
         /// @param segment the use, or `null` if the store moves no value
-        void locate(LogSegmentView segment, long frameOffset, int commitStart, boolean through) {
+        /// @param frameBody the bytes of the frame's body before it was sealed, or 0 if they are not known, so no value
+        ///                  is authenticated by the frame's tag ([LogValue#framed()])
+        void locate(LogSegmentView segment, long frameOffset, int commitStart, int frameBody, boolean through) {
             this.segment = segment;
             this.frameOffset = frameOffset;
             this.commitStart = commitStart;
+            this.frameBody = frameBody;
             this.through = through;
         }
 
@@ -563,7 +596,8 @@ final class SpillQueue {
                 var copied = 0;
                 for (var i = 0; i < count; i++) {
                     var version = versions[i];
-                    if (version.spill(crypto, segment, frameOffset, commitStart + offsets[i], null)) {
+                    var framed = segment != null && framesAlone(segment, frameBody, version.valueLength()) ? frameBody : 0;
+                    if (version.spill(crypto, segment, frameOffset, commitStart + offsets[i], framed, null)) {
                         if (version.valueLength() >= LOG_VALUE_MIN) {
                             logged++;
                         } else {
@@ -618,6 +652,9 @@ final class SpillQueue {
         // key and after one that failed
         private final Cipher[] ctrs;
         private final SecretKeySpec[] ctrKeys;
+        // The AES-GCM cipher that opens the frames of framed values, or null before the first and after one that
+        // failed other than by authentication
+        private Cipher gcm;
         // The index the next key without a cipher takes
         private int nextKey;
         // The counter block a value's keystream starts from, and the keystream of the bytes of that block before it
@@ -780,6 +817,36 @@ final class SpillQueue {
                 ctrs[slot] = null;
                 ctrKeys[slot] = null;
                 throw new IllegalStateException("AES failed", exception);
+            }
+        }
+
+        /// Opens the frame at `frameOffset` of a segment use sealed under `key`, read whole into `sealed`: its header,
+        /// then its body of `body` bytes sealed, then its tag; the body goes to `plain` from its start.
+        ///
+        /// The frame is the AES-GCM message the log sealed, the frame's offset its nonce and its header the additional
+        /// data, so the tag authenticates the header, the body and the place of the frame under the key of the use.
+        /// `plain` is a separate array: the JDK's GCM runs its combined intrinsic only when it does not decrypt in
+        /// place.
+        ///
+        /// @return whether the frame authenticates; if not, `plain` holds no byte of it
+        /// @throws IllegalStateException if the cipher fails otherwise, which leaves its state unknown, so it is not
+        ///                               kept
+        boolean openFrame(SecretKeySpec key, long frameOffset, byte[] sealed, int body, byte[] plain) {
+            try {
+                var cipher = gcm;
+                if (cipher == null) {
+                    cipher = Cipher.getInstance("AES/GCM/NoPadding");
+                    gcm = cipher;
+                }
+                cipher.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(LogWriter.TAG_BYTES * 8, LogWriter.nonce(frameOffset)));
+                cipher.updateAAD(sealed, 0, LogWriter.FRAME_HEADER);
+                cipher.doFinal(sealed, LogWriter.FRAME_HEADER, body + LogWriter.TAG_BYTES, plain, 0);
+                return true;
+            } catch (AEADBadTagException _) {
+                return false;
+            } catch (GeneralSecurityException | RuntimeException exception) {
+                gcm = null;
+                throw new IllegalStateException("AES-GCM failed", exception);
             }
         }
 

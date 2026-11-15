@@ -945,7 +945,7 @@ class LogSpillTest {
         // A replayed commit whose value takes the thread a while to tag, queued before the store has a log
         var replayed = queue.record(1, 1);
         replayed.add(spillable(1L << 20, 64 << 20), 0, 64 << 20);
-        replayed.locate(view, 64, 0, false);
+        replayed.locate(view, 64, 0, 0, false);
         queue.add(replayed);
         // The thread took the record, so it runs with the supplier it read at its start
         while (queue.heldForTests() != 0) {
@@ -957,7 +957,7 @@ class LogSpillTest {
         var live = spillable(2L << 20, 4_000);
         var record = queue.record(2, 1);
         record.add(live, 0, 4_000);
-        record.locate(view, 1 << 20, 0, false);
+        record.locate(view, 1 << 20, 0, 0, false);
         queue.add(record);
         queue.awaitIdleForTests();
         assertInstanceOf(MemorySegment.class, live.sourceForTests(), "the value of a commit the log does not hold durably");
@@ -972,7 +972,7 @@ class LogSpillTest {
         var through = spillable(1L << 20, 4_000);
         var record = queue.record(1, 1);
         record.add(through, 0, 4_000);
-        record.locate(view, 64, 0, true);
+        record.locate(view, 64, 0, 0, true);
         queue.add(record);
         queue.drain(() -> 1);
         queue.awaitIdleForTests();
@@ -1134,6 +1134,118 @@ class LogSpillTest {
     }
 
     @Test
+    @DisplayName("a value that takes nearly all of its frame leaves the heap without a tag of its own, and reads back as written through its frame, from a get, a range, a checkpoint and a recovery, while values that share their frame or exceed the pool keep their tags")
+    void framedValuesMove(@TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        // Framed: from the shortest framed value to one near the longest frame the pool recycles
+        var framed = new int[]{SpillQueue.FRAMED_VALUE_MIN, ArrayWriteBatch.CHUNK_BYTES / 2, 256 << 10, 900 << 10};
+        try (var ledger = openUnsplit(directory, true)) {
+            ledger.state(MESSAGES).overwrites.forceSpillsForTests();
+            for (var message = 0; message < framed.length; message++) {
+                var value = large(message, framed[message]);
+                ledger.commit(ledger.newBatch().put(MESSAGES, key(message), value)).awaitDurable();
+                expected.put(message, value);
+            }
+            // Two values of half a frame each, and one whose frame is past the pool's arrays
+            var shared = ledger.newBatch();
+            for (var message = 10; message < 12; message++) {
+                var value = large(message, 200 << 10);
+                shared.put(MESSAGES, key(message), value);
+                expected.put(message, value);
+            }
+            ledger.commit(shared).awaitDurable();
+            var long_ = large(20, HeapPool.MAX_POOLED);
+            ledger.commit(ledger.newBatch().put(MESSAGES, key(20), long_)).awaitDurable();
+            expected.put(20, long_);
+            spillNow(ledger);
+            for (var message : expected.keySet()) {
+                var logged = assertInstanceOf(LogValue.class, head(ledger, MESSAGES, key(message)).sourceForTests(), "message " + message);
+                assertEquals(message < framed.length, logged.framed(), "message " + message + " framed");
+            }
+            verifyLarge(ledger, expected);
+            // The checkpoint reads the framed values back into its units
+            ledger.checkpoint();
+            verifyLarge(ledger, expected);
+            for (var message = 30; message < 32; message++) {
+                var value = large(message, 300 << 10);
+                ledger.commit(ledger.newBatch().put(MESSAGES, key(message), value)).awaitDurable();
+                expected.put(message, value);
+            }
+            spillNow(ledger);
+            assertTrue(((LogValue) head(ledger, MESSAGES, key(30)).sourceForTests()).framed());
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = openUnsplit(directory, true)) {
+            ledger.state(MESSAGES).overwrites.forceSpillsForTests();
+            verifyLarge(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "byte {0} of the frame")
+    @ValueSource(strings = {"header", "value", "tag"})
+    @DisplayName("a framed value whose frame changed in its header, its value or its tag is reported, never returned, and the other values read on")
+    void reportsDamagedFrames(String where, @TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = openUnsplit(directory, true)) {
+            ledger.state(MESSAGES).overwrites.forceSpillsForTests();
+            for (var message = 0; message < 4; message++) {
+                var value = large(message, 100 << 10);
+                ledger.commit(ledger.newBatch().put(MESSAGES, key(message), value)).awaitDurable();
+                expected.put(message, value);
+            }
+            spillNow(ledger);
+            var logged = (LogValue) head(ledger, MESSAGES, key(2)).sourceForTests();
+            assertTrue(logged.framed());
+            var frame = logged.frameOffset();
+            var position = switch (where) {
+                case "header" -> frame + 9;
+                case "value" -> frame + LogWriter.FRAME_HEADER + logged.bodyIndex() + 50_000;
+                default -> frame + LogWriter.FRAME_HEADER + logged.frameBody() + 5;
+            };
+            try (var channel = FileChannel.open(logged.segment().path(), StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                var one = ByteBuffer.allocate(1);
+                channel.read(one, position);
+                one.put(0, (byte) (one.get(0) ^ 0x21)).rewind();
+                channel.write(one, position);
+            }
+            assertThrows(LedgerCorruptedException.class, () -> ledger.get(MESSAGES, key(2)));
+            var target = new byte[(100 << 10) + 8];
+            assertThrows(LedgerCorruptedException.class, () -> head(ledger, MESSAGES, key(2)).readLogged(target, 8));
+            for (var message : expected.keySet()) {
+                if (message != 2) {
+                    assertArrayEquals(expected.get(message), ledger.get(MESSAGES, key(message)).orElseThrow());
+                }
+            }
+            ledger.closeWithoutCheckpoint();
+        }
+    }
+
+    @Test
+    @DisplayName("a get of a framed value allocates the value it returns and little else, the frame's arrays coming back to the pool")
+    void framedReadsAllocateTheValue(@TempDir Path directory) throws Exception {
+        var length = 256 << 10;
+        try (var ledger = openUnsplit(directory, true)) {
+            ledger.state(MESSAGES).overwrites.forceSpillsForTests();
+            for (var message = 0; message < 8; message++) {
+                ledger.commit(ledger.newBatch().put(MESSAGES, key(message), large(message, length))).awaitDurable();
+            }
+            spillNow(ledger);
+            assertTrue(((LogValue) head(ledger, MESSAGES, key(3)).sourceForTests()).framed());
+            var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+            var least = Long.MAX_VALUE;
+            for (var round = 0; round < 6; round++) {
+                var before = threads.getCurrentThreadAllocatedBytes();
+                for (var message = 0; message < 8; message++) {
+                    ledger.get(MESSAGES, key(message)).orElseThrow();
+                }
+                least = Math.min(least, (threads.getCurrentThreadAllocatedBytes() - before) / 8);
+            }
+            assertTrue(least < length + (4 << 10), "a get allocated " + least + " bytes");
+            ledger.closeWithoutCheckpoint();
+        }
+    }
+
+    @Test
     @DisplayName("moved values on arrays of their own keep their segments for a snapshot of an older tree, and once the segments retire a reader whose versions point there reads them from its tree")
     void ownValuesOfRetiredSegments(@TempDir Path directory) throws Exception {
         var expected = new TreeMap<Integer, byte[]>();
@@ -1268,19 +1380,19 @@ class LogSpillTest {
         var alone = Version.ofOwn(1L << 20, large(1, length), null, null, null);
         var record = queue.record(1, 1);
         record.add(alone, 0, length);
-        record.locate(view, 64, 0, true);
+        record.locate(view, 64, 0, 0, true);
         queue.add(record);
         var beside = Version.ofOwn(2L << 20, large(2, length), null, null, null);
         var small = spillable(2L << 20 | 1, 4_000);
         var mixed = queue.record(2, 2);
         mixed.add(beside, 0, length);
         mixed.add(small, length, 4_000);
-        mixed.locate(view, 1 << 20, 0, true);
+        mixed.locate(view, 1 << 20, 0, 0, true);
         queue.add(mixed);
         var shorter = Version.ofOwn(3L << 20, large(3, length - 1), null, null, null);
         var under = queue.record(3, 1);
         under.add(shorter, 0, length - 1);
-        under.locate(view, 2 << 20, 0, true);
+        under.locate(view, 2 << 20, 0, 0, true);
         queue.add(under);
         queue.drain(() -> 3);
         queue.awaitIdleForTests();

@@ -803,13 +803,14 @@ final class LogWriter {
     }
 
     /// Records, for the commit of `body`, if it lists values that may leave the heap, where the frame at
-    /// `frameOffset` of the current segment holds it: its body at `commitStart` of the frame's body.
+    /// `frameOffset` of the current segment holds it: its body at `commitStart` of the frame's body of `frameBody`
+    /// bytes.
     ///
     /// Before the group's write, so before the durable sequence that publishes the location covers it.
-    private void locate(FrameBody body, long frameOffset, int commitStart) {
+    private void locate(FrameBody body, long frameOffset, int commitStart, int frameBody) {
         var record = body.spill();
         if (record != null) {
-            record.locate(view, frameOffset, commitStart, sealingThrough);
+            record.locate(view, frameOffset, commitStart, frameBody, sealingThrough);
         }
     }
 
@@ -1262,7 +1263,7 @@ final class LogWriter {
         writeHeader(at, sealedLength, frame.sequence(), single ? frame.type() : FrameBody.COMMITS, groupStart);
         var bodyAt = at + FRAME_HEADER;
         if (single) {
-            locate(frame.body(), frameOffset, 0);
+            locate(frame.body(), frameOffset, 0, plainLength);
             frame.body().copyTo(output, bodyAt);
         } else {
             var offset = bodyAt;
@@ -1270,7 +1271,7 @@ final class LogWriter {
                 var body = group.get(index).body();
                 offset = body.writeRunEntry(output, offset);
                 // The entry is the body's length, then the body
-                locate(body, frameOffset, offset - bodyAt - body.size());
+                locate(body, frameOffset, offset - bodyAt - body.size(), plainLength);
             }
         }
         if (cipher != null) {
@@ -1321,7 +1322,7 @@ final class LogWriter {
         writeHeader(at, sealedLength, frame.sequence(), frame.type(), groupStart);
         used += FRAME_HEADER;
         var body = frame.body();
-        locate(body, frameOffset, 0);
+        locate(body, frameOffset, 0, body.size());
         if (body.references() != 0) {
             sealPieces(body, at, frameOffset);
             return;

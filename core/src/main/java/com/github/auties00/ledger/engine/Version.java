@@ -207,19 +207,24 @@ sealed class Version permits Version.External {
     /// gave it or a recovery copied it to ([ReplayValues]), moves only to the log.
     ///
     /// The frame at `frameOffset` of `segment` holds the value durably, at `bodyIndex` of its body. The tag that
-    /// authenticates the value read back is made from the bytes the version holds, which are those the frame sealed.
+    /// authenticates the value read back is made from the bytes the version holds, which are those the frame sealed;
+    /// or, for a value that takes nearly all of its frame ([SpillQueue#framesAlone]), no tag is made: a read takes the
+    /// whole frame, which its own tag authenticates ([LogValue#framed()]).
     ///
+    /// @param frameBody the bytes of the frame's body if a read authenticates the value by the frame's tag, else 0
     /// @param frame the array the segment the value is on views, the frame body a recovery replays the value from, so
     ///              the tag reads the value where it lies; or `null` if the segment is another
     /// @return whether the value moved: not if it had moved already, is not on a segment nor an array of its own long
     ///         enough for the log, or has a unit of [BlobFile]
-    boolean spill(SpillQueue.Crypto crypto, LogSegmentView segment, long frameOffset, int bodyIndex, byte[] frame) {
+    boolean spill(SpillQueue.Crypto crypto, LogSegmentView segment, long frameOffset, int bodyIndex, int frameBody, byte[] frame) {
         var held = SOURCE.getAcquire(this);
         if (external() != null) {
             return false;
         }
         Object moved;
-        if (held instanceof MemorySegment home) {
+        if (frameBody > 0 && length >= SpillQueue.LOG_VALUE_MIN && (held instanceof MemorySegment || held instanceof byte[])) {
+            moved = LogValue.framed(segment, frameOffset, bodyIndex, frameBody);
+        } else if (held instanceof MemorySegment home) {
             if (length < SpillQueue.LOG_VALUE_MIN) {
                 moved = Segments.toBytes(home, offset, length);
             } else if (frame != null) {
