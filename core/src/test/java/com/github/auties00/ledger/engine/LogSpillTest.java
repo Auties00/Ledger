@@ -826,6 +826,38 @@ class LogSpillTest {
     }
 
     @Test
+    @DisplayName("a commit of values of 100 to 300 bytes, whose move would allocate more than half of what it frees, stays off the queue on its batch's arrays, and reads back as written before and after a checkpoint and a reopen")
+    void shortValuesStayOffTheQueue(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var count = 20_000;
+        // Two in three values move to arrays of their own, which take 16 bytes more than the value
+        int[] lengths = {100, 200, 300};
+        try (var ledger = openJudged(directory, true, 0, Duration.ZERO, 6L << 20)) {
+            writeBulk(ledger, expected, 0, count, lengths, 0);
+            assertTrue(ledger.state(MESSAGES).overwrites.spills(), "values written once may not leave the heap");
+            var spills = ledger.spills();
+            assertEquals(1, spills.unpaidRecordsForTests(), "the commit's record was queued");
+            assertEquals(0, spills.heldForTests());
+            spillNow(ledger);
+            assertEquals(0, spills.loggedValuesForTests() + spills.copiedValuesForTests());
+            for (var message = 0; message < count; message += 97) {
+                assertInstanceOf(MemorySegment.class, head(ledger, MESSAGES, key(message)).sourceForTests(), "message " + message);
+            }
+            // Values of 300 bytes alone pay: a quarter of a commit of them is more than enough
+            writeBulk(ledger, expected, count, 1_000, new int[]{300}, 0);
+            spillNow(ledger);
+            assertEquals(1, spills.unpaidRecordsForTests(), "the commit of long values was left off the queue");
+            assertEquals(1_000, spills.loggedValuesForTests());
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = openJudged(directory, true, 0, Duration.ZERO, 6L << 20)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @Test
     @DisplayName("a commit of thousands of removals from a key space not yet judged samples them one in 64, like any removal, and judges nothing")
     void bulkRemovalsJudgeNothing(@TempDir Path directory) throws Exception {
         var expected = new Expected();
