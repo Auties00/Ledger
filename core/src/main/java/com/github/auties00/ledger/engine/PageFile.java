@@ -350,7 +350,7 @@ final class PageFile implements AutoCloseable {
     /// A node a checkpoint replaces is dead once the checkpoint ends. Caching or promoting it, while the units the
     /// checkpoint writes go in as the first the clock evicts, made a checkpoint larger than the cache keep the old
     /// nodes and evict the new ones. A unit read from the file ends with its content, as one read for the cache does,
-    /// so [#keep(PageRef, byte\[\])] can cache it.
+    /// so [#keep(PageRef, byte\[\], boolean)] can cache it.
     ///
     /// The read is left out of the average of [#coldReads()]: a checkpoint reads what the last ones wrote, which the
     /// OS cache mostly still holds, and quick reads of it would hide that the readers' own reads go to the device.
