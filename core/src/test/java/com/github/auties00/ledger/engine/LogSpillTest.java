@@ -857,6 +857,44 @@ class LogSpillTest {
         }
     }
 
+    @ParameterizedTest(name = "{0} bytes")
+    @ValueSource(ints = {160 << 10, 256 << 10})
+    @DisplayName("a value on an array of its own leaves the heap for the log beside thousands of short values, which stay on their batch's arrays")
+    void ownValueBesideShortValues(int ownLength, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var shorts = 3_000;
+        var own = 1_000_000;
+        try (var ledger = openSized(directory, true, 0, Duration.ZERO, 16L << 20)) {
+            var batch = ledger.newBatch();
+            for (var message = 0; message < shorts; message++) {
+                var value = new byte[message % 2 == 0 ? 100 : 200];
+                Arrays.fill(value, (byte) message);
+                batch.put(MESSAGES, key(message), value);
+                expected.messages.put(message, value);
+            }
+            var large = new byte[ownLength];
+            new Random(ownLength).nextBytes(large);
+            batch.put(MESSAGES, key(own), large);
+            expected.messages.put(own, large);
+            ledger.commit(batch).awaitDurable();
+            spillNow(ledger);
+            var spills = ledger.spills();
+            assertEquals(1, spills.unpaidRecordsForTests(), "the short values' move was judged to pay");
+            assertEquals(1, spills.loggedValuesForTests());
+            assertEquals(0, spills.copiedValuesForTests());
+            assertInstanceOf(LogValue.class, head(ledger, MESSAGES, key(own)).sourceForTests());
+            for (var message = 0; message < shorts; message += 97) {
+                assertInstanceOf(MemorySegment.class, head(ledger, MESSAGES, key(message)).sourceForTests(), "message " + message);
+            }
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = openSized(directory, true, 0, Duration.ZERO, 16L << 20)) {
+            verify(ledger, expected);
+        }
+    }
+
     @Test
     @DisplayName("a commit of thousands of removals from a key space not yet judged samples them one in 64, like any removal, and judges nothing")
     void bulkRemovalsJudgeNothing(@TempDir Path directory) throws Exception {
