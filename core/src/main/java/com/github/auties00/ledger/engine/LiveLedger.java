@@ -1904,8 +1904,7 @@ public final class LiveLedger implements Ledger {
     }
 
     /// Cuts the writes of a checkpoint and registers a read at its sequence, which keeps the versions it needs until
-    /// [ReaderTable#unregister(long)]; the spill queue moves no value of the commits cut until the checkpoint is
-    /// published or given back ([SpillQueue#checkpointTakes(long)]).
+    /// [ReaderTable#unregister(long)].
     ///
     /// @param logStart the first log segment a commit after the cut may be in
     /// @return the cut, or `null` if no commit was made since the last checkpoint
@@ -1936,23 +1935,16 @@ public final class LiveLedger implements Ledger {
                     superseded.add(unit.version().unit);
                 }
             }
-            if (spills != null) {
-                spills.checkpointTakes(sequence);
-            }
             return new Cut(sequence, logStart.getAsLong(), log.appendedBytes(), log.appendedHeap(), base, maxId, cuts, superseded);
         } finally {
             exitPublishing();
         }
     }
 
-    /// Gives a checkpoint that failed its keys back, so the next one writes them, and the values of its commits still
-    /// queued back to the spill queue, which may move them again.
+    /// Gives a checkpoint that failed its keys back, so the next one writes them.
     void restoreCut(Cut cut) {
         enterPublishing();
         try {
-            if (spills != null) {
-                spills.checkpointDropped();
-            }
             for (var keyspace : cut.keyspaces()) {
                 for (var chain : keyspace.dirty()) {
                     keyspace.state().markDirty(chain);
