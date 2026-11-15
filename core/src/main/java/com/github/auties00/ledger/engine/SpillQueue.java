@@ -64,6 +64,9 @@ final class SpillQueue {
     /// The shortest value that moves to the log: a [LogValue] takes 40 bytes, an array of the value 16 more than the
     /// value; below it, the array costs less than a read back from the file.
     static final int LOG_VALUE_MIN = 256;
+    // Diagnostic modes, not for merging: off keeps uncached values in place, nowarm moves them unread, warmonly reads
+    // their frames and keeps them in place
+    static final String DIAG = System.getProperty("ledger.diag.spillWt", "");
     /// The most bytes of log one read of frames written through covers, from the first it reads: the frames of the
     /// records after the one the thread is about to move are read with it while they are durable, in the same segment
     /// use, and among those the drain will take, so a drain reads them in a few sequential reads; the thread starts the
@@ -345,6 +348,10 @@ final class SpillQueue {
                     record.release();
                     continue;
                 }
+                if (extent >= 0 && DIAG.equals("warmonly")) {
+                    record.release();
+                    continue;
+                }
                 record.spill(this, crypto);
             }
         } finally {
@@ -355,6 +362,9 @@ final class SpillQueue {
     /// {@return whether the values of `record` move only once its frames are read back: some go to the log, and its
     /// group bypassed the system's cache}
     private boolean warms(Record record) {
+        if (DIAG.equals("nowarm")) {
+            return false;
+        }
         return record.logs() && (record.uncached || warmsEveryRecord);
     }
 
@@ -690,6 +700,9 @@ final class SpillQueue {
         /// {@return whether values move to the log: some are long enough, and a segment holds its frame; one written
         /// past the system's cache moves once a read of the frame brings its pages back there}
         private boolean logs() {
+            if (uncached && DIAG.equals("off")) {
+                return false;
+            }
             return large && segment != null;
         }
 
