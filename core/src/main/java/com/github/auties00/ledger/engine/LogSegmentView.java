@@ -29,6 +29,11 @@ import java.nio.file.StandardOpenOption;
 /// there, [#SLICE] bytes per read of the channel at most: the JDK reads into a heap buffer through a temporary direct
 /// buffer of the read's size, which it keeps for the thread, so a read of a whole value of a mebibyte or more would
 /// keep that much native memory per reading thread, a checkpoint's included.
+///
+/// A [framed][LogValue#framed()] value is read with its whole frame into an array of the process's [HeapPool], taken
+/// for the burst of reads ([HeapPool#acquireCollectable(int)]), and opened into a second one by the JDK's AES-GCM,
+/// which runs its intrinsics over the whole message and authenticates it before the value is copied out. Neither
+/// array outlives the read; at rest the pool reaches them only weakly.
 final class LogSegmentView {
     /// The most bytes one read of the channel takes, the size of the temporary direct buffer the JDK keeps per thread.
     static final int SLICE = 1 << 20;
@@ -133,6 +138,15 @@ final class LogSegmentView {
         if (retired) {
             throw Retired.INSTANCE;
         }
+        if (logged.framed()) {
+            var plain = openFrame(logged, length);
+            try {
+                System.arraycopy(plain, logged.bodyIndex(), target, offset, length);
+            } finally {
+                spills.pool().releaseCollectable(plain);
+            }
+            return;
+        }
         var crypto = spills.takeCrypto();
         try {
             var start = logged.frameOffset() + LogWriter.FRAME_HEADER + logged.bodyIndex();
@@ -164,6 +178,64 @@ final class LogSegmentView {
             }
         } finally {
             spills.giveBack(crypto);
+        }
+    }
+
+    /// {@return the value `logged` places here, `length` bytes, which is [framed][LogValue#framed()], in an array of
+    /// its own}
+    ///
+    /// The array is filled by a copy alone, so the JVM does not zero it first ([Segments#toBytes(byte\[\], int, int)]).
+    ///
+    /// @throws Retired if a checkpoint retired the segment
+    /// @throws LedgerIoException if the segment cannot be read
+    /// @throws LedgerCorruptedException if the frame fails authentication
+    byte[] readFramed(LogValue logged, int length) {
+        if (retired) {
+            throw Retired.INSTANCE;
+        }
+        var plain = openFrame(logged, length);
+        try {
+            return Segments.toBytes(plain, logged.bodyIndex(), length);
+        } finally {
+            spills.pool().releaseCollectable(plain);
+        }
+    }
+
+    /// {@return the opened body of the frame of `logged`, a value of `length` bytes, in an array of the pool the caller
+    /// gives back ([HeapPool#releaseCollectable(byte\[\])])}
+    ///
+    /// @throws Retired if a checkpoint retired the segment, or retires it as the frame is read
+    /// @throws LedgerCorruptedException if the frame fails authentication, or does not hold the value
+    private byte[] openFrame(LogValue logged, int length) {
+        var body = logged.frameBody();
+        if (logged.bodyIndex() < 0 || (long) logged.bodyIndex() + length > body) {
+            throw new LedgerCorruptedException("A value of the log segment " + path + " lies past its frame", null);
+        }
+        var pool = spills.pool();
+        var sealedLength = LogWriter.FRAME_HEADER + body + LogWriter.TAG_BYTES;
+        var sealed = pool.acquireCollectable(sealedLength);
+        byte[] plain = null;
+        var crypto = spills.takeCrypto();
+        try {
+            readFully(ByteBuffer.wrap(sealed), 0, sealedLength, logged.frameOffset());
+            plain = pool.acquireCollectable(body);
+            if (!crypto.openFrame(key, logged.frameOffset(), sealed, body, plain)) {
+                if (retired) {
+                    // Read as a preparation reused the file
+                    throw Retired.INSTANCE;
+                }
+                throw new LedgerCorruptedException("A frame of the log segment " + path
+                        + " that holds a value does not authenticate", null);
+            }
+            var opened = plain;
+            plain = null;
+            return opened;
+        } finally {
+            spills.giveBack(crypto);
+            pool.releaseCollectable(sealed);
+            if (plain != null) {
+                pool.releaseCollectable(plain);
+            }
         }
     }
 
