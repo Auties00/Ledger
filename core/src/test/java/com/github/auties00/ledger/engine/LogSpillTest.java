@@ -333,7 +333,7 @@ class LogSpillTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
-    @DisplayName("values read back in turn from several segments into a caller's array allocate nothing per value, as a checkpoint reads them")
+    @DisplayName("values read back in turn from several segments into a caller's array allocate no copy and no key schedule per value, as a checkpoint reads them")
     void readsBackInPlace(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         try (var ledger = open(directory, encrypted, 0)) {
@@ -376,8 +376,10 @@ class LogSpillTest {
                 logged.get(index).readLogged(target, 16);
                 assertArrayEquals(value, Arrays.copyOfRange(target, 16, 16 + value.length));
             }
-            // Before, each read wrapped its array in a buffer and, switching segments, initialized a key schedule
-            assertTrue(perValue < 32, "a value read back allocated " + perValue + " bytes");
+            // Without encryption nothing; with it the counter block and the key bytes the cipher copies to start at the
+            // value, never a buffer over the target or the key schedule of a segment switched to (about 300 bytes)
+            var allowed = encrypted ? 256 : 32;
+            assertTrue(perValue < allowed, "a value read back allocated " + perValue + " bytes");
         }
     }
 

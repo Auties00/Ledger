@@ -1,6 +1,7 @@
 package com.github.auties00.ledger.engine;
 
 import javax.crypto.Cipher;
+import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
@@ -64,9 +65,9 @@ final class SpillQueue {
     private static final int WORD = 7;
     /// The scratch past which a [Crypto] given back lets go of it: the values of messages take a few kilobytes.
     private static final int KEPT_SCRATCH = 16 << 10;
-    /// The keystream a [Crypto] makes in one call, a multiple of [#BLOCK]: its arrays of counter blocks and keystream
-    /// keep this size, and a longer value is decrypted a piece at a time.
-    private static final int KEYSTREAM = 4 << 10;
+    /// The keys of segment uses a [Crypto] keeps a cipher for: a checkpoint reads values back in key order, which
+    /// interleaves the few segments the log holds values in.
+    private static final int KEPT_KEYS = 4;
     private static final SecureRandom KEYS = new SecureRandom();
 
     private final long budget;
@@ -525,8 +526,11 @@ final class SpillQueue {
 
     /// The ciphers of one thread at a time: those that authenticate a value moved to the log and decrypt it back.
     ///
-    /// Neither allocates per value: the keystream of a value is AES-ECB of its counter blocks under a cipher keyed once
-    /// per segment use, where a cipher in CTR mode takes a new IV and with it a new initialization per value.
+    /// A value is decrypted by an AES-CTR cipher started at the counter block that holds its first byte, one cipher per
+    /// key of the last few segment uses read: a value of a use read before only sets a new counter and keeps the key
+    /// schedule. The keystream is made and applied by the JDK's counter mode, which the log's AES-GCM runs on too, so
+    /// it is compiled by the time the first checkpoint after an open reads thousands of values back at once, where a
+    /// loop of this class would still run in the interpreter.
     ///
     /// The tag of a value in an encrypted store is a pair of polynomials over the field of [#PRIME] elements, evaluated
     /// at the two secret points of the queue: one coefficient per 7 bytes of the value, after a leading 1 and the
@@ -543,11 +547,15 @@ final class SpillQueue {
     /// of an HMAC inlined at its call site takes hundreds of milliseconds of a compiler thread, and a GMAC takes an
     /// initialization and two copies of the value per tag; the loop of the polynomials compiles in a few.
     static final class Crypto {
-        // AES-ECB under the key it last decrypted from by key rather than with a segment use's cipher; made at the first
-        // such decryption
-        private Cipher blocks;
-        // The key blocks is under, or null before the first such decryption
-        private SecretKeySpec blocksKey;
+        // AES-CTR ciphers, each for the key at the same index of ctrKeys; null before the first decryption under that
+        // key and after one that failed
+        private final Cipher[] ctrs;
+        private final SecretKeySpec[] ctrKeys;
+        // The index the next key without a cipher takes
+        private int nextKey;
+        // The counter block a value's keystream starts from, and the keystream of the bytes of that block before it
+        private final byte[] counter;
+        private final byte[] skipped;
         // The points of the polynomials of the tags, or null without encryption
         private final long[] keys;
         private final CRC32C crc;
@@ -557,14 +565,14 @@ final class SpillQueue {
         private byte[] scratch;
         // A buffer over scratch, which a read of the log fills, or null before the first
         private ByteBuffer scratchBuffer;
-        // The counter blocks of a piece of a value and the keystream they encrypt to, of KEYSTREAM bytes each, or null
-        // before the first decryption
-        private byte[] counters;
-        private byte[] keystream;
 
         private Crypto(SpillQueue queue) {
             this.keys = queue.encrypted ? queue.tagKeys() : null;
             this.crc = new CRC32C();
+            this.ctrs = new Cipher[KEPT_KEYS];
+            this.ctrKeys = new SecretKeySpec[KEPT_KEYS];
+            this.counter = new byte[BLOCK];
+            this.skipped = new byte[BLOCK];
         }
 
         /// {@return an array of at least `length` bytes, which only this holder uses until it is given back}
@@ -623,75 +631,53 @@ final class SpillQueue {
 
         /// Decrypts the `length` bytes after the first `skip` of `sealed` into `target` from `offset`: the bytes from the
         /// block holding the value's first byte at `bodyIndex` of the body of the frame at `frameOffset`, sealed under
-        /// `key`.
+        /// `key`. The bytes of `sealed` stay as they are.
         ///
         /// A body is sealed from the counter block after the first, `nonce || 2`, so the block of a byte at `i` of it
         /// is `nonce || 2 + i / 16`; a body holds far fewer than 2^36 bytes, so the counter never carries into the
         /// nonce.
+        ///
+        /// @throws IllegalStateException if the cipher fails, which leaves its state unknown, so it is not kept
         void decrypt(SecretKeySpec key, long frameOffset, int bodyIndex, byte[] sealed, int skip, int length,
                      byte[] target, int offset) {
+            var slot = ctr(key);
+            var cipher = ctrs[slot];
+            Bytes.i32(counter, 0, 0);
+            Bytes.i64(counter, Integer.BYTES, frameOffset);
+            Bytes.i32(counter, Integer.BYTES + Long.BYTES, 2 + (bodyIndex >>> 4));
             try {
-                if (blocks == null) {
-                    blocks = newBlocks();
+                // The key the cipher last had, whose schedule it keeps
+                cipher.init(Cipher.DECRYPT_MODE, key, new IvParameterSpec(counter));
+                if (skip > 0) {
+                    cipher.update(sealed, 0, skip, skipped, 0);
                 }
-                if (key != blocksKey) {
-                    blocksKey = null;
-                    blocks.init(Cipher.ENCRYPT_MODE, key);
-                    blocksKey = key;
-                }
-            } catch (GeneralSecurityException exception) {
+                cipher.update(sealed, skip, length, target, offset);
+            } catch (GeneralSecurityException | RuntimeException exception) {
+                ctrs[slot] = null;
+                ctrKeys[slot] = null;
                 throw new IllegalStateException("AES failed", exception);
             }
-            try {
-                decrypt(blocks, frameOffset, bodyIndex, sealed, skip, length, target, offset);
-            } catch (IllegalStateException exception) {
-                blocksKey = null;
-                throw exception;
-            }
         }
 
-        /// Decrypts as [#decrypt(SecretKeySpec, long, int, byte\[\], int, int, byte\[\], int)] does, with `cipher`, an
-        /// AES-ECB cipher ([#newBlocks()]) initialized to encrypt under the key of the value's segment use.
-        ///
-        /// The keystream is made a piece of [#KEYSTREAM] bytes at a time, so the holder's arrays keep their size
-        /// whatever the value's.
-        ///
-        /// @throws IllegalStateException if the cipher fails, which leaves its state unknown
-        void decrypt(Cipher cipher, long frameOffset, int bodyIndex, byte[] sealed, int skip, int length, byte[] target,
-                     int offset) {
-            if (counters == null) {
-                counters = new byte[KEYSTREAM];
-                keystream = new byte[KEYSTREAM];
-            }
-            var bytes = (skip + length + BLOCK - 1) & -BLOCK;
-            var first = 2 + (bodyIndex >>> 4);
-            for (var start = 0; start < bytes; start += KEYSTREAM) {
-                var piece = Math.min(KEYSTREAM, bytes - start);
-                for (var block = 0; block < piece; block += BLOCK) {
-                    Bytes.i32(counters, block, 0);
-                    Bytes.i64(counters, block + Integer.BYTES, frameOffset);
-                    Bytes.i32(counters, block + Integer.BYTES + Long.BYTES, first + ((start + block) >>> 4));
+        /// {@return the index of the AES-CTR cipher for `key`, made now in place of the one whose key came the longest
+        /// ago if none is}
+        private int ctr(SecretKeySpec key) {
+            for (var slot = 0; slot < KEPT_KEYS; slot++) {
+                if (ctrKeys[slot] == key && ctrs[slot] != null) {
+                    return slot;
                 }
+            }
+            var slot = nextKey;
+            nextKey = (slot + 1) % KEPT_KEYS;
+            if (ctrs[slot] == null) {
                 try {
-                    cipher.update(counters, 0, piece, keystream, 0);
+                    ctrs[slot] = Cipher.getInstance("AES/CTR/NoPadding");
                 } catch (GeneralSecurityException exception) {
-                    throw new IllegalStateException("AES failed", exception);
-                }
-                // The value's bytes in this piece: from skip in the first, up to skip + length in the last
-                var to = Math.min(start + piece, skip + length);
-                for (var i = Math.max(start, skip); i < to; i++) {
-                    target[offset + i - skip] = (byte) (sealed[i] ^ keystream[i - start]);
+                    throw new IllegalStateException("AES is not available", exception);
                 }
             }
-        }
-
-        /// {@return a new AES-ECB cipher, which makes the keystream blocks of a value once initialized under a key}
-        static Cipher newBlocks() {
-            try {
-                return Cipher.getInstance("AES/ECB/NoPadding");
-            } catch (GeneralSecurityException exception) {
-                throw new IllegalStateException("AES is not available", exception);
-            }
+            ctrKeys[slot] = key;
+            return slot;
         }
 
         /// {@return whether the `length` bytes at `offset` of `value` are the value `logged` holds the tag of, of the
