@@ -605,6 +605,27 @@ final class SpillQueue {
         warmsEveryRecord = true;
     }
 
+    /// Reads every noted segment back whole, for a diagnostic.
+    void rewarmForDiag() {
+        java.util.List<LogSegmentView> views;
+        synchronized (lock) {
+            views = new java.util.ArrayList<>(segments);
+        }
+        var buffer = ByteBuffer.allocateDirect(1 << 20);
+        var start = System.nanoTime();
+        var bytes = 0L;
+        for (var view : views) {
+            try {
+                var size = java.nio.file.Files.size(view.path());
+                if (view.warm(0, size, buffer, () -> closed)) {
+                    bytes += size;
+                }
+            } catch (java.io.IOException _) {
+            }
+        }
+        System.err.println("DIAG rewarm segments=" + views.size() + " bytes=" + bytes + " nanos=" + (System.nanoTime() - start));
+    }
+
     /// {@return the segments values moved to that no checkpoint retired, by number; for tests}
     long[] segmentsForTests() {
         synchronized (lock) {

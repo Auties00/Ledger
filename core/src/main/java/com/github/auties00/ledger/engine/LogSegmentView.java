@@ -139,7 +139,20 @@ final class LogSegmentView {
     /// @throws Retired if a checkpoint retired the segment
     /// @throws LedgerIoException if the segment cannot be read
     /// @throws LedgerCorruptedException if the bytes read are not the value
+    static final java.util.concurrent.atomic.AtomicLong DIAG_FAST = new java.util.concurrent.atomic.AtomicLong(), DIAG_MID = new java.util.concurrent.atomic.AtomicLong(), DIAG_SLOW = new java.util.concurrent.atomic.AtomicLong(), DIAG_NANOS = new java.util.concurrent.atomic.AtomicLong(), DIAG_PREAD = new java.util.concurrent.atomic.AtomicLong();
+
     void read(LogValue logged, long stamp, int length, byte[] target, int offset) {
+        var diagStart = System.nanoTime();
+        try {
+            readDiag(logged, stamp, length, target, offset);
+        } finally {
+            var took = System.nanoTime() - diagStart;
+            DIAG_NANOS.addAndGet(took);
+            (took < 20_000 ? DIAG_FAST : took < 200_000 ? DIAG_MID : DIAG_SLOW).incrementAndGet();
+        }
+    }
+
+    private void readDiag(LogValue logged, long stamp, int length, byte[] target, int offset) {
         if (retired) {
             throw Retired.INSTANCE;
         }
@@ -155,7 +168,9 @@ final class LogSegmentView {
                 // From the first byte of the block holding the value's first, which the keystream starts from
                 var skip = logged.bodyIndex() & (SpillQueue.BLOCK - 1);
                 var sealed = crypto.scratch(skip + length);
+                var diagPread = System.nanoTime();
                 readFully(crypto.scratchBuffer(), 0, skip + length, start - skip);
+                DIAG_PREAD.addAndGet(System.nanoTime() - diagPread);
                 var cipher = takeBlocks();
                 if (cipher == null) {
                     crypto.decrypt(key, logged.frameOffset(), logged.bodyIndex(), sealed, skip, length, target, offset);

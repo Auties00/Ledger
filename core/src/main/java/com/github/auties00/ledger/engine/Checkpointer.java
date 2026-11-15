@@ -440,6 +440,12 @@ final class Checkpointer implements IdleTicker.Watched {
             var slackAtCut = slab.slackBytes();
             var chunksAtCut = slab.retiredChunkBytes();
             var cut = ledger.cutCheckpoint(() -> closing ? log.nextOpenSegment() : log.currentSegment());
+            if (cut != null && !closing && Boolean.getBoolean("ledger.diag.rewarm") && ledger.spills() != null) {
+                ledger.spills().rewarmForDiag();
+            }
+            if (cut != null && !closing) {
+                LogSegmentView.DIAG_FAST.set(0); LogSegmentView.DIAG_MID.set(0); LogSegmentView.DIAG_SLOW.set(0); LogSegmentView.DIAG_NANOS.set(0);
+            }
             if (cut == null) {
                 if (closing && !epochOnlyInLog()) {
                     // The trees hold every commit, so the segments hold nothing a reopen needs but the one kept for it
@@ -536,6 +542,9 @@ final class Checkpointer implements IdleTicker.Watched {
             endedSaturated = !closing && saturated();
             signalProgress();
             ledger.pruneCut(cut);
+            if (!closing) {
+                System.err.println("DIAG ckptreads fast=" + LogSegmentView.DIAG_FAST.get() + " mid=" + LogSegmentView.DIAG_MID.get() + " slow=" + LogSegmentView.DIAG_SLOW.get() + " nanos=" + LogSegmentView.DIAG_NANOS.get() + " preadNanos=" + LogSegmentView.DIAG_PREAD.getAndSet(0));
+            }
             // While the store runs, as many as a checkpoint interval fills, so the log seldom writes into a new file
             retire(retireLogged(cut.logStart(), closing), closing ? SPARES : spares());
             try {
