@@ -174,15 +174,17 @@ class CheckpointSaturationTest {
     @DisplayName("a checkpoint the next one does not follow at once")
     class Unsaturated {
         @Test
-        @DisplayName("leaves the leaves it writes whole out of the cache and caches every branch")
+        @DisplayName("leaves the leaves it writes whole and its branches of level 1 out of the cache, and caches the root and every higher branch")
         void leavesOut(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
                 tree.apply(ops(0, KEYS, 1, 160), tree.unsaturated());
                 for (var i = 0; i < KEYS; i += 97) {
                     var path = tree.path(key(i));
-                    for (var ref : path.subList(0, path.size() - 1)) {
+                    assertTrue(path.size() > 2, "a tree of " + path.size() + " levels");
+                    for (var ref : path.subList(0, path.size() - 2)) {
                         assertNotNull(tree.cache.peek(ref), "the branch " + ref);
                     }
+                    assertNull(tree.cache.peek(path.get(path.size() - 2)), "the branch of level 1 " + path.get(path.size() - 2));
                     assertFalse(path.getLast().isRecord());
                     assertNull(tree.cache.peek(path.getLast()), "the leaf " + path.getLast());
                 }
@@ -782,7 +784,7 @@ class CheckpointSaturationTest {
         }
 
         @Test
-        @DisplayName("an explicit checkpoint that no commit follows caches only its branches, and reads back")
+        @DisplayName("an explicit checkpoint that no commit follows caches only its root and higher branches, and reads back")
         void explicit(@TempDir Path directory) throws Exception {
             var keys = 900;
             try (var ledger = options(directory).build()) {

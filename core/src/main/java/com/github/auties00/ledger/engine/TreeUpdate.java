@@ -39,13 +39,16 @@ import java.util.concurrent.atomic.AtomicReference;
 /// writes turn out not to change is then kept ([PageFile#keep(PageRef, byte\[\], boolean)]): the root and a branch of
 /// level 2 or more count as read after all, and a leaf, a branch of level 1 and a delta page keep the state their
 /// readers gave them. What the update writes goes to the page cache as the first
-/// entries the clock evicts: the branches, the leaves and delta pages the writer admits
-/// ([PageFile.Writer#admits(long, boolean)]), a leaf the more readily if one a read used in the cache is among those
-/// it replaces, and the units of values not at all. A leaf the writer leaves out in place of one reads used
-/// ([PageFile#reads(PageRef)]) is recorded as expected by the page cache's doorkeeper, with the most reads of any leaf
-/// it replaces ([PageFile#expect(PageRef, int)]): a point reader that reads it once caches it, as it would have cached
-/// the leaf it replaces at that read, and a scan that reads each version once caches it at its first read once it read
-/// the two versions before it; one rewritten before any read is not expected in turn.
+/// entries the clock evicts: the root and the branches of level 2 or more always, the leaves, the branches of level 1
+/// and the delta pages if the writer admits them ([PageFile.Writer#admits(long, boolean)]), a leaf or a branch of
+/// level 1 the more readily if one a read used in the cache is among those it replaces, and the units of values not at
+/// all. A leaf or a branch
+/// of level 1 the writer leaves out in place of one reads used ([PageFile#reads(PageRef)]) is recorded as expected by
+/// the page cache's doorkeeper, with the most reads of any it replaces ([PageFile#expect(PageRef, int)]): a point
+/// reader that reads it once caches it, as it would have cached the node it replaces at that read, and a scan that
+/// reads each version once caches it at its first read once it read the two versions before it; one rewritten before
+/// any read is not expected in turn. A branch of level 1 the writer cached as written would count as read at a reader's
+/// first read, past the doorkeeper that screens it as it screens the leaves under it.
 final class TreeUpdate {
     /// The writes below a branch from which its children's subtrees are updated on every processor.
     private static final int PARALLEL_OPS = 4_096;
@@ -269,7 +272,7 @@ final class TreeUpdate {
         mergeUnderfull(result);
         while (true) {
             while (result.size() > 1) {
-                result = writeBranches(result);
+                result = writeBranches(result, Replaced.NONE, true);
             }
             if (result.isEmpty()) {
                 return null;
@@ -399,7 +402,7 @@ final class TreeUpdate {
         }
         mergeUnderfull(out);
         freed.add(node.ref());
-        return new Written(out.isEmpty() ? List.of() : writeBranches(out));
+        return new Written(out.isEmpty() ? List.of() : writeBranches(out, new One(node.ref()), root));
     }
 
     /// Writes the leaves of `run`, next to each other under one branch, to `out`, gives up the units they replace and
@@ -690,21 +693,23 @@ final class TreeUpdate {
     private record Merged(List<LeafEntry> entries, int inserted, int gaps) {
     }
 
-    /// The leaves that the leaves written of a list of entries replace, and which of the entries each gave.
+    /// The nodes that the nodes written of a list of entries, or of children, replace, and which of the entries or
+    /// children each gave: leaves for leaves, branches for branches.
     private sealed interface Replaced {
-        /// Leaves that replace none, as those of a new tree.
+        /// Nodes that replace none, as those of a new tree.
         Replaced NONE = new Run(new PageRef[0], new int[0]);
 
-        /// {@return whether the page cache holds one of the leaves that gave the entries from `from` to `to` as one a
-        /// read used ([PageFile#referenced(PageRef)])}
+        /// {@return whether the page cache holds one of the nodes that gave the entries or children from `from` to `to`
+        /// as one a read used ([PageFile#referenced(PageRef)])}
         boolean read(PageFile pages, int from, int to);
 
-        /// {@return the most reads that used one of the leaves that gave the entries from `from` to `to` while the page
-        /// cache screens what reads miss ([PageFile#reads(PageRef)]): 2, 1, or 0 if none or if the cache does not}
+        /// {@return the most reads that used one of the nodes that gave the entries or children from `from` to `to`
+        /// while the page cache screens what reads miss ([PageFile#reads(PageRef)]): 2, 1, or 0 if none or if the cache
+        /// does not}
         int reads(PageFile pages, int from, int to);
     }
 
-    /// One leaf, which gave every entry.
+    /// One node, which gave every entry or child.
     private record One(PageRef ref) implements Replaced {
         @Override
         public boolean read(PageFile pages, int from, int to) {
@@ -717,9 +722,9 @@ final class TreeUpdate {
         }
     }
 
-    /// Sibling leaves, in key order.
+    /// Sibling nodes, in key order.
     ///
-    /// @param ends for each leaf of `refs`, the index past the last of the entries it gave
+    /// @param ends for each node of `refs`, the index past the last of the entries or children it gave
     private record Run(PageRef[] refs, int[] ends) implements Replaced {
         @Override
         public boolean read(PageFile pages, int from, int to) {
@@ -1040,14 +1045,27 @@ final class TreeUpdate {
         return out;
     }
 
-    private List<Child> writeBranches(List<Child> children) throws IOException {
+    /// {@return the branches written of `children`, which replace the branches of `replaced`}
+    ///
+    /// The root and the branches of level 2 or more go to the page cache, as the reads cache those at their first read
+    /// anyway. A branch of level 1 goes there as a leaf does: if the writer admits it, the more readily if a read used
+    /// one of the branches its children came from, and one it leaves out in place of one reads used is recorded as
+    /// expected by the doorkeeper. The reads screen a branch of level 1 under the root as they screen a leaf, and one
+    /// cached as written would count as read at its first read, past the doorkeeper.
+    ///
+    /// @param replaced the branches that gave the children, by the index past the last child each gave; read only for
+    ///                 a branch of level 1
+    /// @param top whether `children` are the whole level below the top of the tree, so that one branch written of them
+    ///            is its root
+    private List<Child> writeBranches(List<Child> children, Replaced replaced, boolean top) throws IOException {
         var sizes = new int[children.size()];
         for (var i = 0; i < sizes.length; i++) {
             sizes[i] = children.get(i).size();
         }
         var level = children.getFirst().level() + 1;
-        var out = new ArrayList<Child>();
-        for (var run : TreeNodes.split(sizes, sizes.length)) {
+        var runs = TreeNodes.split(sizes, sizes.length);
+        var out = new ArrayList<Child>(runs.size());
+        for (var run : runs) {
             var page = allocate(1);
             var unit = TreeNodes.writeBranch(children, run[0], run[1]);
             var count = 0L;
@@ -1056,7 +1074,15 @@ final class TreeUpdate {
                 count += children.get(i).count();
                 blobs |= children.get(i).blobs();
             }
-            var ref = writer.write(PageFormat.BRANCH, level, page, 1, unit, unit.length - PageFormat.HEADER, true);
+            var screened = level == 1 && !(top && runs.size() == 1);
+            var cached = !screened || writer.admits(unit.length, !writer.saturated() && replaced.read(pages, run[0], run[1]));
+            var ref = writer.write(PageFormat.BRANCH, level, page, 1, unit, unit.length - PageFormat.HEADER, cached);
+            if (!cached) {
+                var reads = replaced.reads(pages, run[0], run[1]);
+                if (reads > 0) {
+                    pages.expect(ref, reads);
+                }
+            }
             out.add(new Child(TreeNodes.childKey(unit, 0), ref, count, blobs, level, TreeNodes.fill(sizes, run[0], run[1])));
         }
         return out;
@@ -1098,8 +1124,9 @@ final class TreeUpdate {
                     replacement = writeLeaves(entries, new Run(new PageRef[]{a.ref(), b.ref()}, new int[]{endA, entries.size()}));
                 } else {
                     var children = new ArrayList<>(TreeNodes.children(unitA));
+                    var endA = children.size();
                     children.addAll(TreeNodes.children(unitB));
-                    replacement = writeBranches(children);
+                    replacement = writeBranches(children, new Run(new PageRef[]{a.ref(), b.ref()}, new int[]{endA, children.size()}), false);
                 }
                 retire(a.ref(), TreeNodes.base(unitA, a.ref()));
                 retire(b.ref(), TreeNodes.base(unitB, b.ref()));

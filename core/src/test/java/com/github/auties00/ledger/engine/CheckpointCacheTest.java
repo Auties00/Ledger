@@ -433,7 +433,7 @@ class CheckpointCacheTest {
 
         @ParameterizedTest(name = "a cache of {0} bytes")
         @ValueSource(longs = {MIB, 2 * MIB})
-        @DisplayName("leaves the first units within the allowance and every branch when it is more than the cache holds")
+        @DisplayName("leaves the first leaves and branches of level 1 within the allowance, and the root and every higher branch, when it is more than the cache holds")
         void largerThanTheCache(long cacheBytes, @TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, cacheBytes).filled()) {
                 var old = tree.path(key(0));
@@ -447,14 +447,22 @@ class CheckpointCacheTest {
                 for (var ref : old) {
                     assertNull(tree.cache.peek(ref), "the replaced node " + ref);
                 }
-                // The leaves count by the bytes the cache keeps of those a checkpoint writes, which end with their content
+                // The leaves count by the bytes the cache keeps of those a checkpoint writes, which end with their
+                // content, and the branches of level 1 count against the allowance as the leaves do
                 var cachedBytes = 0L;
                 var leafBytes = 0L;
                 var seen = new TreeSet<Integer>();
+                var seenBranches = new TreeSet<Integer>();
                 for (var i = 0; i < KEYS; i += 3) {
                     var path = tree.path(key(i));
-                    for (var ref : path.subList(0, path.size() - 1)) {
+                    assertTrue(path.size() > 2, "a tree of " + path.size() + " levels");
+                    for (var ref : path.subList(0, path.size() - 2)) {
                         assertNotNull(tree.cache.peek(ref), "the branch " + ref);
+                    }
+                    var parent = path.get(path.size() - 2);
+                    var cachedParent = tree.cache.peek(parent);
+                    if (seenBranches.add(parent.page()) && cachedParent != null) {
+                        cachedBytes += cachedParent.length;
                     }
                     var leaf = path.getLast();
                     if (seen.add(leaf.page())) {

@@ -892,9 +892,9 @@ final class PageFile implements AutoCloseable {
         }
     }
 
-    /// {@return the reads that used the leaf `ref` names while the cache screens what reads miss, or 0 if it does not:
-    /// 2 if the cache holds it as an entry a read used ([#referenced(PageRef)]), else the reads its doorkeeper saw, 2
-    /// for two or more, 1 or 0 ([PageCache#reads(PageRef)])}
+    /// {@return the reads that used the leaf or branch `ref` names while the cache screens what reads miss, or 0 if it
+    /// does not: 2 if the cache holds it as an entry a read used ([#referenced(PageRef)]), else the reads its
+    /// doorkeeper saw, 2 for two or more, 1 or 0 ([PageCache#reads(PageRef)])}
     int reads(PageRef ref) {
         if (!cache.screens()) {
             return 0;
@@ -902,12 +902,12 @@ final class PageFile implements AutoCloseable {
         return referenced(ref) ? 2 : cache.reads(ref);
     }
 
-    /// Records the leaf `ref` names, which a checkpoint wrote and left out of the cache in place of one reads used
-    /// `reads` times ([#reads(PageRef)]), as expected by the doorkeeper, so the cache takes it a read sooner than the
-    /// read's screening asks for, or two sooner for a scan after two reads of the leaf it replaces
+    /// Records the leaf or branch of level 1 `ref` names, which a checkpoint wrote and left out of the cache in place
+    /// of one reads used `reads` times ([#reads(PageRef)]), as expected by the doorkeeper, so the cache takes it a read
+    /// sooner than the read's screening asks for, or two sooner for a scan after two reads of the node it replaces
     /// ([PageCache#expect(PageRef, int)]).
     ///
-    /// @param reads the reads of the leaf it replaces, 1 or 2
+    /// @param reads the reads of the node it replaces, 1 or 2
     void expect(PageRef ref, int reads) {
         cache.expect(ref, reads);
     }
@@ -1141,7 +1141,8 @@ final class PageFile implements AutoCloseable {
             return admits(bytes, false);
         }
 
-        /// {@return whether the page cache should take a leaf or a delta page of `bytes` bytes this checkpoint writes}
+        /// {@return whether the page cache should take a leaf, a branch of level 1 or a delta page of `bytes` bytes this
+        /// checkpoint writes}
         ///
         /// Only while the checkpoints run back to back ([#saturated()]), or for a leaf that replaces one a read used in
         /// the cache ([PageFile#referenced(PageRef)]), as the leaf of a chat a reader has open: the leaves a checkpoint
@@ -1153,10 +1154,12 @@ final class PageFile implements AutoCloseable {
         /// Each call that may cache the unit counts `bytes` against what the checkpoint may cache. Past
         /// [PageCache#admission()] only what fits in free room goes in, as a scan's leaves do: a checkpoint that writes
         /// more than the cache holds would otherwise evict its own first units for its last ones, none read in between.
-        /// A unit the cache never keeps, or that the checkpoint leaves out, counts nothing. Branches never ask, as a
-        /// reader and the next checkpoint's lookups need them all to reach a leaf.
+        /// A unit the cache never keeps, or that the checkpoint leaves out, counts nothing. A branch of level 1 under the
+        /// root asks as a leaf does, as the reads screen it as they screen a leaf; the root and the branches of level 2
+        /// or more never ask, as a reader and the next checkpoint's lookups need them all to reach a leaf.
         ///
-        /// @param replacesRead whether the unit replaces a leaf the page cache holds as one a read used
+        /// @param replacesRead whether the unit replaces a leaf, or a branch of level 1, the page cache holds as one a
+        ///                     read used
         boolean admits(long bytes, boolean replacesRead) {
             return cache.holds(bytes) && (replacesRead || saturated())
                     && (admitted.addAndGet(bytes) <= admission || cache.hasRoom(bytes));

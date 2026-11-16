@@ -65,7 +65,16 @@ class ScreenedReadsTest {
         }
 
         void apply(List<TreeUpdate.Op> ops) throws Exception {
-            var writer = pages.writer(random.nextLong());
+            apply(ops, pages.writer(random.nextLong()));
+        }
+
+        /// Applies `ops` as a checkpoint the next one does not follow at once, which caches only the leaves and branches
+        /// of level 1 that replace ones a read used.
+        void applyUnsaturated(List<TreeUpdate.Op> ops) throws Exception {
+            apply(ops, pages.writer(random.nextLong(), () -> false, () -> false));
+        }
+
+        private void apply(List<TreeUpdate.Op> ops, PageFile.Writer writer) throws Exception {
             var update = new TreeUpdate(pages, writer, space);
             root = update.apply(root, ops, List.of());
             deltas = update.finishDeltas(deltas);
@@ -197,6 +206,85 @@ class ScreenedReadsTest {
                 cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, false);
                 assertTrue(cursor.next());
                 assertNotNull(tree.cache.peek(firstParent), "a branch of level 1 an unscreened scan read");
+            }
+        }
+
+        @Test
+        @DisplayName("of a point read caches a branch of level 1 a checkpoint rewrote in place of one no read used only at the second read")
+        void rewrittenBranch(@TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory).filled(KEYS, 150)) {
+                tree.applyUnsaturated(List.of(new TreeUpdate.Op(segment(key(100)), segment(new byte[151]))));
+                var path = tree.path(key(100));
+                assertTrue(path.size() > 2, "a tree of " + path.size() + " levels");
+                var parent = path.get(path.size() - 2);
+                assertNull(tree.cache.peek(parent), "the branch of level 1 the checkpoint wrote");
+                for (var ref : path.subList(0, path.size() - 2)) {
+                    assertNotNull(tree.cache.peek(ref), "the branch " + ref);
+                }
+                tree.leaf(100);
+                assertNull(tree.cache.peek(parent), "the branch of level 1 a point read read once");
+                assertEquals(1, tree.cache.reads(parent), "the reads of the branch the doorkeeper saw");
+                tree.leaf(100);
+                assertNotNull(tree.cache.peek(parent), "the branch of level 1 a point read read twice");
+                assertTrue(tree.cache.referencedForTests(parent));
+            }
+        }
+
+        @Test
+        @DisplayName("of a scan caches a branch of level 1 a checkpoint rewrote in place of one no read used among the first units it reads only at the third scan")
+        void rewrittenScannedBranch(@TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory).filled(KEYS, 150)) {
+                tree.applyUnsaturated(List.of(new TreeUpdate.Op(segment(key(0)), segment(new byte[151]))));
+                var path = tree.path(key(0));
+                assertTrue(path.size() > 2, "a tree of " + path.size() + " levels");
+                var parent = path.get(path.size() - 2);
+                assertNull(tree.cache.peek(parent), "the branch of level 1 the checkpoint wrote");
+                for (var scan = 1; scan <= 2; scan++) {
+                    var cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
+                    assertTrue(cursor.next());
+                    assertNull(tree.cache.peek(parent), "a branch of level 1 the scan read " + scan + " times");
+                    assertEquals(scan, tree.cache.reads(parent), "the reads of the branch the doorkeeper saw");
+                }
+                var cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
+                assertTrue(cursor.next());
+                assertNotNull(tree.cache.peek(parent), "a branch of level 1 the scan read three times");
+                assertTrue(tree.cache.referencedForTests(parent));
+            }
+        }
+
+        @Test
+        @DisplayName("caches a branch of level 1 a checkpoint rewrote in place of one a read used as written, expects one in place of one read once, and caches the root and the higher branches")
+        void rewrittenReadBranch(@TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory).filled(KEYS, 150)) {
+                tree.leaf(100);
+                tree.leaf(100);
+                var before = tree.path(key(100));
+                assertTrue(tree.cache.referencedForTests(before.get(before.size() - 2)));
+                tree.applyUnsaturated(List.of(new TreeUpdate.Op(segment(key(100)), segment(new byte[151]))));
+                var path = tree.path(key(100));
+                var parent = path.get(path.size() - 2);
+                assertNotEquals(before.get(before.size() - 2), parent);
+                assertNotNull(tree.cache.peek(parent), "the branch of level 1 that replaces one a read used");
+                assertFalse(tree.cache.referencedForTests(parent), "a branch of level 1 the checkpoint wrote");
+                for (var ref : path.subList(0, path.size() - 2)) {
+                    assertNotNull(tree.cache.peek(ref), "the branch " + ref);
+                }
+
+                // A branch of level 1 a point read read once, which the doorkeeper counted
+                var far = KEYS - 100;
+                tree.leaf(far);
+                var farBefore = tree.path(key(far));
+                var farParentBefore = farBefore.get(farBefore.size() - 2);
+                assertNull(tree.cache.peek(farParentBefore));
+                assertEquals(1, tree.cache.reads(farParentBefore));
+                tree.applyUnsaturated(List.of(new TreeUpdate.Op(segment(key(far)), segment(new byte[151]))));
+                var farPath = tree.path(key(far));
+                var farParent = farPath.get(farPath.size() - 2);
+                assertNotEquals(farParentBefore, farParent);
+                assertNull(tree.cache.peek(farParent), "the branch of level 1 that replaces one read once");
+                tree.leaf(far);
+                assertNotNull(tree.cache.peek(farParent), "the expected branch of level 1 at its first read");
+                assertTrue(tree.cache.referencedForTests(farParent));
             }
         }
 
