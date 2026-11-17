@@ -704,8 +704,8 @@ final class TreeUpdate {
         boolean read(PageFile pages, int from, int to);
 
         /// {@return the most reads that used one of the nodes that gave the entries or children from `from` to `to`
-        /// while the page cache screens what reads miss ([PageFile#reads(PageRef)]): 2, 1, or 0 if none or if the cache
-        /// does not}
+        /// while the page cache screens what reads miss ([PageFile#reads(PageRef)]): 3, 2, 1, or 0 if none or if the
+        /// cache does not}
         int reads(PageFile pages, int from, int to);
     }
 
@@ -745,7 +745,7 @@ final class TreeUpdate {
             }
             var most = 0;
             var start = 0;
-            for (var i = 0; i < refs.length && start < to && most < 2; i++) {
+            for (var i = 0; i < refs.length && start < to && most < Doorkeeper.MOST_READS; i++) {
                 if (ends[i] > from) {
                     most = Math.max(most, pages.reads(refs[i]));
                 }

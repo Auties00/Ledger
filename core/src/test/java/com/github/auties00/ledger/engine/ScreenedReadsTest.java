@@ -34,11 +34,12 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/// The reads the page cache screens: a leaf, a branch of level 1 or a value a point read of a paged key space misses
-/// goes to the cache at its second read, and one a scan misses at its third, whether the reads of the file are warm or
-/// cold, as the array the first read refused when the collector has not taken it, and a delta page goes with the leaf
-/// of its record, while the branches of level 2 or more, roots, the lookups of a commit and the reads of a resident key
-/// space cache at once. The tree tests run on a cache with a budget of its own, which only the test ticks.
+/// The reads the page cache screens: a leaf or a value a point read of a paged key space misses goes to the cache at its
+/// second read, a branch of level 1 at its third, and a unit a scan misses at its fourth, whether the reads of the file
+/// are warm or cold, as the array the first read refused when the collector has not taken it, and a delta page goes
+/// with the leaf of its record, while the branches of level 2 or more, roots, the lookups of a commit and the reads of
+/// a resident key space cache at once. The tree tests run on a cache with a budget of its own, which only the test
+/// ticks.
 class ScreenedReadsTest {
     private static final long MIB = 1 << 20;
     private static final byte[] KEY = new byte[32];
@@ -142,7 +143,7 @@ class ScreenedReadsTest {
     @DisplayName("a read of a tree")
     class Trees {
         @Test
-        @DisplayName("of a point read caches a leaf and its branch of level 1 it read once only at the second read, and the higher branches and the root at the first")
+        @DisplayName("of a point read caches a leaf it read once only at the second read, its branch of level 1 only at the third, and the higher branches and the root at the first")
         void leafAtSecondRead(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory).filled(KEYS, 150)) {
                 var path = tree.path(key(100));
@@ -162,15 +163,20 @@ class ScreenedReadsTest {
                 var read = tree.leaf(100);
                 assertSame(read, tree.cache.peek(leaf), "the leaf read twice");
                 assertTrue(tree.cache.referencedForTests(leaf));
-                assertSame(refusedParent, tree.cache.peek(parent), "the branch of level 1 read twice");
+                assertNull(tree.cache.peek(parent), "the branch of level 1 read twice");
+                assertSame(refusedParent, tree.cache.recallWeak(PageCache.dataKey(parent.page(), parent.slot()), parent),
+                        "the branch of level 1 the second read left refused");
+                assertEquals(2, tree.cache.reads(parent), "the reads of the branch the doorkeeper saw");
+                assertEquals(bytes + read.length, tree.cache.size());
+                assertSame(read, tree.leaf(100), "a hit");
+                assertSame(refusedParent, tree.cache.peek(parent), "the branch of level 1 read three times");
                 assertTrue(tree.cache.referencedForTests(parent));
                 assertEquals(bytes + refusedParent.length + read.length, tree.cache.size());
-                assertSame(read, tree.leaf(100), "a hit");
             }
         }
 
         @Test
-        @DisplayName("caches the branches of level 1 a scan reads among its first units at their third scan, and those past them at once")
+        @DisplayName("caches the branches of level 1 a scan reads among its first units at their fourth scan, and those past them at once")
         void scannedBranches(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory).filled(KEYS, 150)) {
                 var firstPath = tree.path(key(0));
@@ -193,13 +199,15 @@ class ScreenedReadsTest {
                 assertNotNull(tree.cache.peek(lastParent), "a branch of level 1 past them");
                 var refusedParent = tree.cache.recallWeak(PageCache.dataKey(firstParent.page(), firstParent.slot()), firstParent);
                 assertNotNull(refusedParent, "the branch of level 1 the first scan refused");
+                for (var scan = 2; scan <= 3; scan++) {
+                    cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
+                    assertTrue(cursor.next());
+                    assertNull(tree.cache.peek(firstParent), "a branch of level 1 the scan read " + scan + " times");
+                    assertEquals(scan, tree.cache.reads(firstParent), "the reads of the branch the doorkeeper saw");
+                }
                 cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
                 assertTrue(cursor.next());
-                assertNull(tree.cache.peek(firstParent), "a branch of level 1 the scan read twice");
-                assertEquals(2, tree.cache.reads(firstParent), "the reads of the branch the doorkeeper saw");
-                cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
-                assertTrue(cursor.next());
-                assertSame(refusedParent, tree.cache.peek(firstParent), "a branch of level 1 the scan read three times");
+                assertSame(refusedParent, tree.cache.peek(firstParent), "a branch of level 1 the scan read four times");
                 assertTrue(tree.cache.referencedForTests(firstParent));
                 // A scan that does not screen caches the branches of level 1 it reads at once
                 tree.cache.clearForTests();
@@ -210,7 +218,7 @@ class ScreenedReadsTest {
         }
 
         @Test
-        @DisplayName("of a point read caches a branch of level 1 a checkpoint rewrote in place of one no read used only at the second read")
+        @DisplayName("of a point read caches a branch of level 1 a checkpoint rewrote in place of one no read used only at the third read")
         void rewrittenBranch(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory).filled(KEYS, 150)) {
                 tree.applyUnsaturated(List.of(new TreeUpdate.Op(segment(key(100)), segment(new byte[151]))));
@@ -221,17 +229,19 @@ class ScreenedReadsTest {
                 for (var ref : path.subList(0, path.size() - 2)) {
                     assertNotNull(tree.cache.peek(ref), "the branch " + ref);
                 }
+                for (var read = 1; read <= 2; read++) {
+                    tree.leaf(100);
+                    assertNull(tree.cache.peek(parent), "the branch of level 1 a point read read " + read + " times");
+                    assertEquals(read, tree.cache.reads(parent), "the reads of the branch the doorkeeper saw");
+                }
                 tree.leaf(100);
-                assertNull(tree.cache.peek(parent), "the branch of level 1 a point read read once");
-                assertEquals(1, tree.cache.reads(parent), "the reads of the branch the doorkeeper saw");
-                tree.leaf(100);
-                assertNotNull(tree.cache.peek(parent), "the branch of level 1 a point read read twice");
+                assertNotNull(tree.cache.peek(parent), "the branch of level 1 a point read read three times");
                 assertTrue(tree.cache.referencedForTests(parent));
             }
         }
 
         @Test
-        @DisplayName("of a scan caches a branch of level 1 a checkpoint rewrote in place of one no read used among the first units it reads only at the third scan")
+        @DisplayName("of a scan caches a branch of level 1 a checkpoint rewrote in place of one no read used among the first units it reads only at the fourth scan")
         void rewrittenScannedBranch(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory).filled(KEYS, 150)) {
                 tree.applyUnsaturated(List.of(new TreeUpdate.Op(segment(key(0)), segment(new byte[151]))));
@@ -239,7 +249,7 @@ class ScreenedReadsTest {
                 assertTrue(path.size() > 2, "a tree of " + path.size() + " levels");
                 var parent = path.get(path.size() - 2);
                 assertNull(tree.cache.peek(parent), "the branch of level 1 the checkpoint wrote");
-                for (var scan = 1; scan <= 2; scan++) {
+                for (var scan = 1; scan <= 3; scan++) {
                     var cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
                     assertTrue(cursor.next());
                     assertNull(tree.cache.peek(parent), "a branch of level 1 the scan read " + scan + " times");
@@ -247,15 +257,16 @@ class ScreenedReadsTest {
                 }
                 var cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
                 assertTrue(cursor.next());
-                assertNotNull(tree.cache.peek(parent), "a branch of level 1 the scan read three times");
+                assertNotNull(tree.cache.peek(parent), "a branch of level 1 the scan read four times");
                 assertTrue(tree.cache.referencedForTests(parent));
             }
         }
 
         @Test
-        @DisplayName("caches a branch of level 1 a checkpoint rewrote in place of one a read used as written, expects one in place of one read once, and caches the root and the higher branches")
+        @DisplayName("caches a branch of level 1 a checkpoint rewrote in place of one a read used as written, expects one in place of one read once or twice, and caches the root and the higher branches")
         void rewrittenReadBranch(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory).filled(KEYS, 150)) {
+                tree.leaf(100);
                 tree.leaf(100);
                 tree.leaf(100);
                 var before = tree.path(key(100));
@@ -283,8 +294,32 @@ class ScreenedReadsTest {
                 assertNotEquals(farParentBefore, farParent);
                 assertNull(tree.cache.peek(farParent), "the branch of level 1 that replaces one read once");
                 tree.leaf(far);
-                assertNotNull(tree.cache.peek(farParent), "the expected branch of level 1 at its first read");
+                assertNull(tree.cache.peek(farParent), "the branch of level 1 expected after one read, at its first read");
+                assertEquals(2, tree.cache.reads(farParent));
+                tree.leaf(far);
+                assertNotNull(tree.cache.peek(farParent), "the branch of level 1 expected after one read, at its second read");
                 assertTrue(tree.cache.referencedForTests(farParent));
+
+                // A branch of level 1 a point read read twice, which the doorkeeper counted and the cache refused
+                var mid = KEYS / 2;
+                tree.leaf(mid);
+                tree.leaf(mid);
+                var midBefore = tree.path(key(mid));
+                var midParentBefore = midBefore.get(midBefore.size() - 2);
+                assertNotEquals(farParent, midParentBefore);
+                assertNotEquals(parent, midParentBefore);
+                assertNull(tree.cache.peek(midParentBefore));
+                assertEquals(2, tree.cache.reads(midParentBefore));
+                tree.applyUnsaturated(List.of(new TreeUpdate.Op(segment(key(mid)), segment(new byte[151]))));
+                var midPath = tree.path(key(mid));
+                var midParent = midPath.get(midPath.size() - 2);
+                assertNotEquals(midParentBefore, midParent);
+                assertNull(tree.cache.peek(midParent), "the branch of level 1 that replaces one read twice");
+                assertEquals(0, tree.cache.reads(midParent), "an expected branch counts no read");
+                tree.leaf(mid);
+                assertNotNull(tree.cache.peek(midParent), "the branch of level 1 expected after two reads, at its first read");
+                assertTrue(tree.cache.referencedForTests(midParent));
+                assertEquals(0, tree.cache.doorkeeperForTests().thriceKeysForTests(), "point reads started the third filter");
             }
         }
 
@@ -356,7 +391,7 @@ class ScreenedReadsTest {
                         leaves.add(ref);
                     }
                 }
-                for (var pass = 0; pass < 3; pass++) {
+                for (var pass = 0; pass < 4; pass++) {
                     var cursor = new TreeCursor(tree.pages, tree.root, from, to, false, 40, true);
                     var entries = 0;
                     try {
@@ -371,14 +406,14 @@ class ScreenedReadsTest {
                         cursor.release();
                     }
                     assertEquals(40, entries);
-                    if (pass < 2) {
+                    if (pass < 3) {
                         for (var ref : leaves) {
                             assertNull(tree.cache.peek(ref), "a leaf cold scans read " + (pass + 1) + " times");
                         }
                     }
                 }
                 for (var ref : leaves) {
-                    assertNotNull(tree.cache.peek(ref), "a leaf cold scans read three times");
+                    assertNotNull(tree.cache.peek(ref), "a leaf cold scans read four times");
                 }
             }
         }
@@ -485,7 +520,7 @@ class ScreenedReadsTest {
         }
 
         @Test
-        @DisplayName("caches the units a scan reads first at their third scan, and past them those it caches anyway")
+        @DisplayName("caches the units a scan reads first at their fourth scan, and past them those it caches anyway")
         void scans(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory).filled(KEYS, 150)) {
                 var cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
@@ -499,13 +534,15 @@ class ScreenedReadsTest {
                 assertNull(tree.cache.peek(first), "a leaf of the first the scan reads");
                 assertNotNull(tree.cache.peek(last), "a leaf past them, with room in the cache");
                 assertFalse(tree.cache.referencedForTests(last));
+                for (var scan = 2; scan <= 3; scan++) {
+                    cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
+                    assertTrue(cursor.next());
+                    assertNull(tree.cache.peek(first), "a leaf of the first the scan read " + scan + " times");
+                    assertEquals(scan, tree.cache.reads(first), "the reads of the leaf the doorkeeper saw");
+                }
                 cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
                 assertTrue(cursor.next());
-                assertNull(tree.cache.peek(first), "a leaf of the first the scan read twice");
-                assertEquals(2, tree.cache.reads(first), "the reads of the leaf the doorkeeper saw");
-                cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
-                assertTrue(cursor.next());
-                assertNotNull(tree.cache.peek(first), "a leaf of the first the scan read three times");
+                assertNotNull(tree.cache.peek(first), "a leaf of the first the scan read four times");
                 assertTrue(tree.cache.referencedForTests(first));
             }
         }
@@ -613,7 +650,7 @@ class ScreenedReadsTest {
                     var unit = tree.pages.read(leaf, PageFile.NODE, false);
                     var blob = TreeNodes.blobRef(unit, TreeSearch.entryOf(unit, key(7)));
                     tree.cache.clearForTests();
-                    for (var scan = 0; scan < 3; scan++) {
+                    for (var scan = 0; scan < 4; scan++) {
                         var cursor = new TreeCursor(tree.pages, tree.root, key(7), key(8), false, 1, true);
                         try {
                             assertTrue(cursor.next());
@@ -622,7 +659,7 @@ class ScreenedReadsTest {
                         } finally {
                             cursor.release();
                         }
-                        if (scan < 2) {
+                        if (scan < 3) {
                             assertNull(tree.cache.peek(leaf), "the leaf after scan " + scan + ", collected " + collected);
                             assertNull(tree.cache.peek(blob), "the value after scan " + scan + ", collected " + collected);
                             assertEquals(scan + 1, tree.cache.reads(leaf), "the reads of the leaf after scan " + scan);
@@ -633,8 +670,8 @@ class ScreenedReadsTest {
                             }
                         }
                     }
-                    assertNotNull(tree.cache.peek(leaf), "the leaf a scan read three times, collected " + collected);
-                    assertNotNull(tree.cache.peek(blob), "the value a scan read three times, collected " + collected);
+                    assertNotNull(tree.cache.peek(leaf), "the leaf a scan read four times, collected " + collected);
+                    assertNotNull(tree.cache.peek(blob), "the value a scan read four times, collected " + collected);
                     assertTrue(tree.cache.referencedForTests(leaf));
                     assertTrue(tree.cache.referencedForTests(blob));
                 }
@@ -642,7 +679,7 @@ class ScreenedReadsTest {
         }
 
         @Test
-        @DisplayName("of a scan leaves the leaf and the value it refused where they were at the second read, reading nothing, and caches those very arrays at the third")
+        @DisplayName("of a scan leaves the leaf and the value it refused where they were at the second and third reads, reading nothing, and caches those very arrays at the fourth")
         void scanRecalled(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory).filled(200, 3_000)) {
                 var leaf = tree.path(key(7)).getLast();
@@ -653,13 +690,15 @@ class ScreenedReadsTest {
                 assertNull(tree.cache.peek(leaf), "the leaf read once");
                 assertNull(tree.cache.peek(blob), "the value read once");
                 var bytes = tree.cache.size();
-                assertSame(first, TreeSearch.leaf(tree.pages, tree.root, key(7), PageCache.SCAN), "the leaf read twice");
-                assertSame(value, tree.pages.read(blob, PageFormat.VALUE, true, true, PageCache.SCAN), "the value read twice");
-                assertNull(tree.cache.peek(leaf), "the leaf read twice");
-                assertNull(tree.cache.peek(blob), "the value read twice");
-                assertEquals(bytes, tree.cache.size());
-                assertSame(first, TreeSearch.leaf(tree.pages, tree.root, key(7), PageCache.SCAN), "the leaf read three times");
-                assertSame(value, tree.pages.read(blob, PageFormat.VALUE, true, true, PageCache.SCAN), "the value read three times");
+                for (var read = 2; read <= 3; read++) {
+                    assertSame(first, TreeSearch.leaf(tree.pages, tree.root, key(7), PageCache.SCAN), "the leaf read " + read + " times");
+                    assertSame(value, tree.pages.read(blob, PageFormat.VALUE, true, true, PageCache.SCAN), "the value read " + read + " times");
+                    assertNull(tree.cache.peek(leaf), "the leaf read " + read + " times");
+                    assertNull(tree.cache.peek(blob), "the value read " + read + " times");
+                    assertEquals(bytes, tree.cache.size());
+                }
+                assertSame(first, TreeSearch.leaf(tree.pages, tree.root, key(7), PageCache.SCAN), "the leaf read four times");
+                assertSame(value, tree.pages.read(blob, PageFormat.VALUE, true, true, PageCache.SCAN), "the value read four times");
                 assertSame(first, tree.cache.peek(leaf));
                 assertSame(value, tree.cache.peek(blob));
                 assertTrue(tree.cache.referencedForTests(leaf));
@@ -669,7 +708,7 @@ class ScreenedReadsTest {
         }
 
         @Test
-        @DisplayName("of a scan of a delta record caches neither its leaf, its base nor its delta page at the first two reads, refuses the delta page with the leaf, and caches the leaf the first read made at the third")
+        @DisplayName("of a scan of a delta record caches neither its leaf, its base nor its delta page at the first three reads, refuses the delta page with the leaf, and caches the leaf the first read made at the fourth")
         void scanDeltaRecords(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory).filled(KEYS, 150)) {
                 tree.apply(List.of(new TreeUpdate.Op(segment(key(100)), segment(new byte[151]))));
@@ -682,8 +721,8 @@ class ScreenedReadsTest {
                 var first = TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN);
                 var refusedPage = tree.cache.recallWeak(pageKey, page);
                 assertNotNull(refusedPage, "the delta page refused with the leaf");
-                for (var read = 1; read <= 2; read++) {
-                    if (read == 2) {
+                for (var read = 1; read <= 3; read++) {
+                    if (read >= 2) {
                         assertSame(first, TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN));
                     }
                     assertNull(tree.cache.peek(record), "the leaf of the record read " + read + " times");
@@ -693,19 +732,19 @@ class ScreenedReadsTest {
                 }
                 var leaf = TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN);
                 assertSame(first, leaf, "the leaf the first read made");
-                assertSame(leaf, tree.cache.peek(record), "the leaf of the record read three times");
+                assertSame(leaf, tree.cache.peek(record), "the leaf of the record read four times");
                 assertTrue(tree.cache.referencedForTests(record));
                 assertNull(tree.cache.peek(base), "the base of a leaf read back from the first read");
                 assertNull(tree.cache.peek(page), "the delta page of a leaf read back from the first read");
 
-                // With the arrays the reads refused collected after each read, the third read makes the leaf again,
+                // With the arrays the reads refused collected after each read, the fourth read makes the leaf again,
                 // its delta page as the first entry to evict
                 tree.apply(List.of(new TreeUpdate.Op(segment(key(100)), segment(new byte[152]))));
                 record = tree.path(key(100)).getLast();
                 assertTrue(record.isRecord(), "the leaf of the key is no delta record");
                 page = record.unit();
                 tree.cache.clearForTests();
-                for (var read = 1; read <= 2; read++) {
+                for (var read = 1; read <= 3; read++) {
                     TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN);
                     assertNull(tree.cache.peek(page), "the delta page of a leaf read " + read + " times");
                     tree.cache.clearForTests();
@@ -878,7 +917,7 @@ class ScreenedReadsTest {
         }
 
         @Test
-        @DisplayName("caches the leaves and the values of a paged range a scan reads only at the third scan, values of the file of large values included")
+        @DisplayName("caches the leaves and the values of a paged range a scan reads only at the fourth scan, values of the file of large values included")
         void pagedScans(@TempDir Path directory) throws Exception {
             for (var largeValues : new long[]{Long.MAX_VALUE, 4_096}) {
                 var store = directory.resolve("large-" + (largeValues != Long.MAX_VALUE));
@@ -895,7 +934,7 @@ class ScreenedReadsTest {
                     assertArrayEquals(value(1_999, 6_000), ledger.get(MESSAGES, key(1_999)).orElseThrow());
                     var branches = ledger.pageCacheBytesForTests();
                     var range = KeyRange.between(key(0), key(20));
-                    for (var scan = 0; scan < 3; scan++) {
+                    for (var scan = 0; scan < 4; scan++) {
                         var seen = new int[1];
                         ledger.forEach(MESSAGES, range, (key, value) -> {
                             assertArrayEquals(value(seen[0], 6_000), value);
@@ -903,7 +942,7 @@ class ScreenedReadsTest {
                             return true;
                         });
                         assertEquals(20, seen[0]);
-                        if (scan < 2) {
+                        if (scan < 3) {
                             assertEquals(branches, ledger.pageCacheBytesForTests(), "the bytes cached by scan " + scan);
                         }
                     }
@@ -921,7 +960,7 @@ class ScreenedReadsTest {
         }
 
         @Test
-        @DisplayName("caches the units of large values no checkpoint took that a scan reads first only at the third scan, and those past them while the cache has room, as it does after a checkpoint")
+        @DisplayName("caches the units of large values no checkpoint took that a scan reads first only at the fourth scan, and those past them while the cache has room, as it does after a checkpoint")
         void pendingLargeScans(@TempDir Path directory) throws Exception {
             var count = 200;
             try (var ledger = (LiveLedger) open(directory, 4_096)) {
@@ -932,7 +971,7 @@ class ScreenedReadsTest {
                 ledger.commit(batch).awaitDurable();
                 ledger.clearPageCacheForTests();
                 var blobs = ledger.blobsForTests();
-                for (var scan = 0; scan < 3; scan++) {
+                for (var scan = 0; scan < 4; scan++) {
                     var seen = new int[1];
                     ledger.forEach(MESSAGES, KeyRange.all(), (key, value) -> {
                         assertArrayEquals(value(seen[0], 6_000), value);
@@ -943,7 +982,7 @@ class ScreenedReadsTest {
                     for (var i = 0; i < count; i++) {
                         var cached = blobs.cachedForTests(pendingUnit(ledger, key(i))) != null;
                         if (i < TreeCursor.ADMITTED) {
-                            assertEquals(scan == 2, cached, "the unit of " + key(i) + " after scan " + scan);
+                            assertEquals(scan == 3, cached, "the unit of " + key(i) + " after scan " + scan);
                         } else {
                             assertTrue(cached, "the unit of " + key(i) + " past the admitted ones after scan " + scan);
                         }
