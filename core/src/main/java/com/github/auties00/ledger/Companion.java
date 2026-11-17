@@ -4,8 +4,9 @@ import java.util.Objects;
 import java.util.function.Predicate;
 
 /// A key space that holds one zero-length entry under the key of each entry of another key space whose value is a
-/// member, which [WriteBatch#compute(Keyspace, Object, java.util.function.Function, java.util.List)] keeps in step with
-/// the values it computes.
+/// member, which [WriteBatch#compute(Keyspace, Object, java.util.function.Function, java.util.List)] and
+/// [Ledger#compute(Keyspace, Object, java.util.function.Function, java.util.List)] keep in step with the values they
+/// compute.
 ///
 /// A companion is an index of a property of the values: the entries of a key space of messages that are starred, for
 /// example, which a range read or [View#count] of the companion lists or counts without reading a message. The

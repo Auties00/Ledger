@@ -147,6 +147,41 @@ class CompanionTest {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(Store.class)
+    @DisplayName("Ledger.compute with companions keeps them in step, also while threads take turns on a hot key")
+    void ledgerCompute(Store store, @TempDir Path directory) throws Exception {
+        try (var ledger = open(store, directory)) {
+            var computed = ledger.compute(MESSAGES, "a", _ -> "x*", INDEXES);
+            assertEquals(true, computed.changed());
+            assertEquals(List.of("a"), keys(ledger, STARRED));
+            ledger.compute(MESSAGES, "a", _ -> "x^", INDEXES);
+            assertEquals(List.of(), keys(ledger, STARRED));
+            assertEquals(List.of("a"), keys(ledger, PINNED));
+            // Each compute adds one v: membership changes with their number
+            var threads = new ArrayList<Thread>();
+            for (var t = 0; t < 8; t++) {
+                threads.add(Thread.ofVirtual().start(() -> {
+                    for (var i = 0; i < 200; i++) {
+                        ledger.compute(MESSAGES, "hot", (String value) -> {
+                            var length = value == null ? 1 : (int) value.chars().filter(c -> c == 'v').count() + 1;
+                            return "v".repeat(length) + (length % 2 == 0 ? "*" : "") + (length % 3 == 0 ? "^" : "");
+                        }, INDEXES);
+                    }
+                }));
+            }
+            for (var thread : threads) {
+                thread.join();
+            }
+            var value = ledger.get(MESSAGES, "hot").orElseThrow();
+            assertEquals(1_600, value.chars().filter(c -> c == 'v').count());
+            assertEquals(value.contains("*"), keys(ledger, STARRED).contains("hot"));
+            assertEquals(value.contains("^"), keys(ledger, PINNED).contains("hot"));
+            assertEquals(keys(ledger, STARRED).size(), ledger.size(STARRED));
+            assertEquals(keys(ledger, PINNED).size(), ledger.size(PINNED));
+        }
+    }
+
     @Test
     @DisplayName("a companion must be another key space, opened, and given once")
     void validation() {

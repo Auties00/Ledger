@@ -4,6 +4,7 @@ import com.github.auties00.ledger.engine.LedgerBuilder;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -191,6 +192,29 @@ public non-sealed interface Ledger extends View, AutoCloseable {
     /// @throws IllegalStateException if the store is closed, or if called from a compute function of this store or
     ///                               from a transaction
     <K, V> Computed<V> compute(Keyspace<K, V> keyspace, K key, Function<? super V, ? extends V> function);
+
+    /// Replaces the value under `key` with what `function` makes of it, as [#compute(Keyspace, Object, Function)] does,
+    /// and keeps each of `companions` in step with it, as
+    /// [WriteBatch#compute(Keyspace, Object, Function, List)] does.
+    ///
+    /// The companions are written in the same commit as the value, only when its membership changes. They stay in step
+    /// with the values only under the rules [Companion] states.
+    ///
+    /// @param keyspace the key space to write
+    /// @param key the key
+    /// @param function makes the new value from the latest one
+    /// @param companions the key spaces that index the values, each once, none of them `keyspace`
+    /// @param <K> the key type
+    /// @param <V> the value type
+    /// @return the outcome, which is also the commit to wait on for durability
+    /// @throws IllegalArgumentException as [#compute(Keyspace, Object, Function)] does, or if a companion's key space
+    ///                                  is `keyspace`, appears twice, or this store was not opened with it
+    /// @throws LedgerIoException if the store has stopped after a failed write
+    /// @throws LedgerCorruptedException if the page holding the value fails authentication
+    /// @throws IllegalStateException if the store is closed, or if called from a compute function of this store or
+    ///                               from a transaction
+    <K, V> Computed<V> compute(Keyspace<K, V> keyspace, K key, Function<? super V, ? extends V> function,
+                               List<Companion<K, ? super V>> companions);
 
     /// {@return the names of every key space the store holds, including those it was not opened with}
     ///

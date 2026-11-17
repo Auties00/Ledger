@@ -1,6 +1,8 @@
 package com.github.auties00.ledger.engine;
 
 import com.github.auties00.ledger.Commit;
+import com.github.auties00.ledger.Companion;
+import com.github.auties00.ledger.Computation;
 import com.github.auties00.ledger.Computed;
 import com.github.auties00.ledger.Entry;
 import com.github.auties00.ledger.KeyCodec;
@@ -990,8 +992,18 @@ public final class LiveLedger implements Ledger {
     }
 
     @Override
-    @SuppressWarnings("unchecked")
     public <K, V> Computed<V> compute(Keyspace<K, V> keyspace, K key, Function<? super V, ? extends V> function) {
+        return compute(keyspace, key, function, null);
+    }
+
+    /// {@inheritDoc}
+    ///
+    /// @implNote This implementation takes the same lock of a hot key as a compute without companions: the lock is the
+    /// computed key's, and the companions' writes follow it in the commit.
+    @Override
+    @SuppressWarnings("unchecked")
+    public <K, V> Computed<V> compute(Keyspace<K, V> keyspace, K key, Function<? super V, ? extends V> function,
+                                      List<Companion<K, ? super V>> companions) {
         ensureOpen();
         checkNotComputing();
         checkNotInTransaction();
@@ -1000,7 +1012,7 @@ public final class LiveLedger implements Ledger {
         var index = locks == null ? -1 : hotIndex(keyspace, key);
         // A compute whose key's lock is warm, or taken by a compute of a hot key, queues behind it rather than race it
         if (locks == null || locks[index].heat == 0 && !locks[index].isLocked()) {
-            var computation = (BatchComputation<V>) batch.compute(keyspace, key, function);
+            var computation = (BatchComputation<V>) add(batch, keyspace, key, function, companions);
             if (batch.slots()[0].ran) {
                 return new LiveComputed<>(commit(batch), computation);
             }
@@ -1013,7 +1025,7 @@ public final class LiveLedger implements Ledger {
         var lock = hotLock(index);
         lock.lock();
         try {
-            var computation = (BatchComputation<V>) batch.compute(keyspace, key, function);
+            var computation = (BatchComputation<V>) add(batch, keyspace, key, function, companions);
             var hot = !batch.slots()[0].ran;
             var computed = new LiveComputed<>(commit(batch), computation);
             // The lock cools down once its computes come one at a time and find no write under way
@@ -1026,6 +1038,15 @@ public final class LiveLedger implements Ledger {
         } finally {
             lock.unlock();
         }
+    }
+
+    /// Adds to `batch` the computed write of [#compute(Keyspace, Object, Function, List)], with `companions` unless
+    /// they are `null`.
+    private static <K, V> Computation<V> add(ArrayWriteBatch batch, Keyspace<K, V> keyspace, K key,
+                                             Function<? super V, ? extends V> function,
+                                             List<Companion<K, ? super V>> companions) {
+        return companions == null ? batch.compute(keyspace, key, function)
+                : batch.compute(keyspace, key, function, companions);
     }
 
     /// A lock of hot keys, and how warm it is: while it is warm, every compute of its keys takes it, so a compute
