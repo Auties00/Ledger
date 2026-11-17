@@ -39,6 +39,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /// A compute whose key a write ahead of it holds runs its function in the order of the commits, which the commits
 /// behind it wait to become visible for; a transaction stops every commit while it runs. None of the writes waits for
 /// stable storage.
+///
+/// `disjoint` is the fair baseline of `compute`: the same threads compute as fast, each a counter of its own, so the
+/// store and the processors carry the same load with no key shared. The ratio of `compute` to `disjoint` is what the
+/// hot key costs the measured commits; the ratio of `disjoint` to `none` is what the extra writers cost them.
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.SampleTime)
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
@@ -54,9 +58,9 @@ public class HeadOfLineBenchmark {
     @Param({"ledger", "ledger-exclusive"})
     public String engine;
 
-    /// How the hot key is updated: `none`, `compute`, or `put`, a blind write of the key, which orders behind the
-    /// writes of the key ahead of it as a compute does.
-    @Param({"none", "compute", "put"})
+    /// How the hot key is updated: `none`, `compute`, `put`, a blind write of the key, which orders behind the
+    /// writes of the key ahead of it as a compute does, or `disjoint`, computes of a key of each thread's own.
+    @Param({"none", "compute", "put", "disjoint"})
     public String hot;
 
     /// The threads updating the hot key.
@@ -79,14 +83,15 @@ public class HeadOfLineBenchmark {
             return;
         }
         for (var i = 0; i < hotThreads; i++) {
+            var key = hot.equals("disjoint") ? Corpus.hashedKey(-2 - i, 16) : HOT;
             hammers.add(Thread.ofVirtual().name("hot-key").start(() -> {
                 while (!stopped.get()) {
                     try {
                         if (hot.equals("put")) {
-                            store.engine().write(new WriteBatch().put(Keyspace.CHATS, HOT, corpus.slice(0, 128)), Durability.DEFERRED);
+                            store.engine().write(new WriteBatch().put(Keyspace.CHATS, key, corpus.slice(0, 128)), Durability.DEFERRED);
                             continue;
                         }
-                        store.engine().compute(Keyspace.CHATS, HOT, value -> {
+                        store.engine().compute(Keyspace.CHATS, key, value -> {
                             var next = value == null ? corpus.slice(0, 128) : value.clone();
                             var buffer = ByteBuffer.wrap(next);
                             buffer.putLong(0, value == null ? 1 : buffer.getLong(0) + 1);

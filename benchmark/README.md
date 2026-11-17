@@ -68,7 +68,7 @@ Workloads Ledger is not built for, in `workload.limits`:
 | `CallerThreadsBenchmark` | Durable and deferred writes from platform threads and from virtual threads, Ledger only: what the kind of the calling thread costs |
 | `CallerThreadsReadBenchmark` | Lookups by id from eight platform threads and from eight virtual threads, Ledger only |
 | `ReadModifyWriteBenchmark` | Counter increments from 1 to 256 virtual threads on one hot key, 64 keys or a million (Zipf or uniform), resident or paged, through the engine's read-modify-write, against a read and a write held by nothing and a blind write; the `functionRuns` counter gives the function's runs per operation |
-| `HeadOfLineBenchmark` | The latency of blind commits of eight threads while one or four threads update one hot key, through the engine's read-modify-write or a blind put, against the same commits with the hot key idle |
+| `HeadOfLineBenchmark` | The latency of blind commits of eight threads while one or four threads update one hot key, through the engine's read-modify-write or a blind put, against the same commits with the hot key idle and with the same threads computing keys of their own (`disjoint`, the fair baseline) |
 
 Memory, in `workload.memory`:
 
