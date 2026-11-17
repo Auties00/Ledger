@@ -666,6 +666,9 @@ final class PackedRun {
             var previousSize = previous == null ? 0 : previous.size;
             var keyBytes = 0L;
             var logged = 0;
+            // The chunks the short values of the chains take, and the bytes of the last, which is allocated as long
+            var valueChunks = 0;
+            var lastFill = 0;
             var total = 0;
             var p = 0;
             var c = 0;
@@ -681,8 +684,19 @@ final class PackedRun {
                     if (order == 0) {
                         p++;
                     }
-                    if (heads[c].logValue() != null) {
+                    var head = heads[c];
+                    if (head.logValue() != null) {
                         logged++;
+                    } else if (!head.removes()) {
+                        var own = head.ownArray();
+                        var ownLength = own == null ? 0 : own.length;
+                        if (ownLength > 0) {
+                            if (valueChunks == 0 || lastFill > ReplayValues.CHUNK_BYTES - ownLength) {
+                                valueChunks++;
+                                lastFill = 0;
+                            }
+                            lastFill += ownLength;
+                        }
                     }
                     c++;
                 }
@@ -781,8 +795,9 @@ final class PackedRun {
                             if (own.length == 0) {
                                 values[out] = 0;
                             } else {
-                                if (chunk == null || fill > ReplayValues.CHUNK_BYTES - own.length) {
-                                    chunk = new byte[ReplayValues.CHUNK_BYTES];
+                                if (chunk == null || fill > chunk.length - own.length) {
+                                    var chunkLength = copies.size() + 1 == valueChunks ? lastFill : ReplayValues.CHUNK_BYTES;
+                                    chunk = new byte[Math.max(chunkLength, own.length)];
                                     copies.add(chunk);
                                     fill = 0;
                                 }
@@ -815,7 +830,8 @@ final class PackedRun {
             }
             for (var i = 0; i < copies.size(); i++) {
                 var copy = copies.get(i);
-                // The last chunk only as long as its values: a freeze of a few short values takes no whole chunk
+                // The last chunk only as long as its values, as it was sized: a freeze of a few short values takes no whole
+                // chunk
                 if (i == copies.size() - 1 && fill < copy.length) {
                     copy = Arrays.copyOf(copy, fill);
                 }
