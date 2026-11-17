@@ -1713,8 +1713,9 @@ public final class LiveLedger implements Ledger {
 
     /// {@return which values `writes` keeps may leave the heap for the log, as the room of the record that lists them:
     /// the batch's writes if those on arrays a commit allocates, not a slab's chunks, may, with a value long enough to
-    /// move to the log or the queue over its budget, besides those of paged key spaces on arrays of their own; `-1 - n`
-    /// if only the `n` values of paged key spaces on arrays of their own may; 0 for none}
+    /// make their move pay ([SpillQueue#PAYING_VALUE_MIN]) or the queue over its budget, besides those of paged key
+    /// spaces on arrays of their own; `-1 - n` if only the `n` values of paged key spaces on arrays of their own may; 0
+    /// for none}
     ///
     /// The room of a record of values on arrays of their own counts only those values, as no other write of the batch
     /// lists: a batch of thousands of writes on a slab's chunk beside one such value allocates a record of one slot,
@@ -1731,7 +1732,7 @@ public final class LiveLedger implements Ledger {
         if (queue == null) {
             return 0;
         }
-        if (writes.homesAllocated() && (writes.largestValueBytes() >= SpillQueue.LOG_VALUE_MIN || queue.over())) {
+        if (writes.homesAllocated() && (writes.largestValueBytes() >= SpillQueue.PAYING_VALUE_MIN || queue.over())) {
             return Math.max(1, writes.size());
         }
         return writes.ownsPagedValues() ? -1 - writes.pagedOwns() : 0;
