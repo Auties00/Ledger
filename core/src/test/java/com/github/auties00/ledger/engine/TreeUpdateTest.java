@@ -239,6 +239,151 @@ class TreeUpdateTest {
         }
     }
 
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a checkpoint into an empty tree writes the puts as the model holds them, with removals left out, keys and values of every size and form")
+    void newTree(boolean encrypted, @TempDir Path directory) throws Exception {
+        var random = new Random(encrypted ? 31 : 37);
+        var cipher = new PageCipher(encrypted ? new SecretKeySpec(new byte[32], "AES") : null);
+        try (var pages = PageFile.open(directory, cipher, 1 << 20, new HeapPool(1 << 20))) {
+            var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+            var slab = new KeySlab();
+            var states = new TreeMap<byte[], byte[]>(UNSIGNED);
+            while (states.size() < 6_000) {
+                // Keys past the longest a slab chunk takes, too
+                var key = new byte[random.nextInt(10) == 0 ? 257 + random.nextInt(200) : 1 + random.nextInt(40)];
+                random.nextBytes(key);
+                states.put(key, random.nextInt(6) == 0 ? null : value(random));
+            }
+            var model = new TreeMap<byte[], byte[]>(UNSIGNED);
+            var ops = new ArrayList<TreeUpdate.Op>();
+            for (var state : states.entrySet()) {
+                ops.add(op(slab, state.getKey(), state.getValue(), null, random));
+                if (state.getValue() != null) {
+                    model.put(state.getKey(), state.getValue());
+                }
+            }
+            var writer = pages.writer(random.nextLong());
+            var root = new TreeUpdate(pages, writer, space).apply(null, ops, List.of());
+            writer.flush();
+            pages.cache().clearForTests();
+            verify(pages, root, model, random, new ArrayList<>(states.keySet()));
+            verifyNodes(pages, root);
+            verifyPages(pages, space, root, DeltaTable.EMPTY);
+            // Removals alone leave the tree empty
+            var removals = new ArrayList<TreeUpdate.Op>();
+            for (var key : states.keySet()) {
+                removals.add(new TreeUpdate.Op(segment(key), null));
+            }
+            assertNull(new TreeUpdate(pages, pages.writer(random.nextLong()), space).apply(null, removals, List.of()));
+        }
+    }
+
+    @Test
+    @DisplayName("the leaves of an empty tree split their entries as the split of every entry's size does, sit on consecutive pages before the units of their values, and keep first keys that outlive their plaintext")
+    void newTreeLeaves(@TempDir Path directory) throws Exception {
+        var random = new Random(41);
+        try (var pages = PageFile.open(directory, new PageCipher(new SecretKeySpec(new byte[32], "AES")), 1 << 20, new HeapPool(1 << 20))) {
+            var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+            var slab = new KeySlab();
+            var states = new TreeMap<byte[], byte[]>(UNSIGNED);
+            while (states.size() < 3_000) {
+                var key = new byte[random.nextInt(10) == 0 ? 257 + random.nextInt(100) : 1 + random.nextInt(40)];
+                random.nextBytes(key);
+                states.put(key, random.nextInt(6) == 0 ? null : value(random));
+            }
+            var ops = new ArrayList<TreeUpdate.Op>();
+            var expected = new ArrayList<byte[]>();
+            // The form each put's value takes: 0 inline, 1 a blob of the data file, 2 a unit of the blob file
+            var forms = new ArrayList<Integer>();
+            var externalPage = 1_000_000;
+            for (var state : states.entrySet()) {
+                var value = state.getValue();
+                var external = value != null && random.nextInt(8) == 0 ? new PageRef(externalPage++, 1, 2, 3) : null;
+                ops.add(op(slab, state.getKey(), value, external, random));
+                if (value != null) {
+                    expected.add(state.getKey());
+                    forms.add(external != null ? 2 : TreeNodes.LeafEntry.fitsInline(state.getKey().length, value.length) ? 0 : 1);
+                }
+            }
+            var writer = pages.writer(random.nextLong());
+            var leaves = new TreeUpdate(pages, writer, space).writeNewLeaves(ops);
+            var units = new ArrayList<byte[]>();
+            var sizes = new ArrayList<Integer>();
+            var index = 0;
+            var lastLeafPage = -1;
+            var valuePages = new ArrayList<Integer>();
+            for (var leaf : leaves) {
+                assertEquals(0, leaf.level());
+                if (lastLeafPage >= 0) {
+                    assertEquals(lastLeafPage + 1, leaf.ref().page(), "the leaves are not on consecutive pages");
+                }
+                lastLeafPage = leaf.ref().page();
+                var unit = writer.staged(leaf.ref());
+                units.add(unit);
+                assertEquals(TreeNodes.count(unit), leaf.count());
+                assertEquals(TreeNodes.fill(unit), leaf.fill());
+                assertArrayEquals(bytes(TreeNodes.leafKey(unit, TreeNodes.entry(unit, 0))), bytes(leaf.firstKey()));
+                var blobs = false;
+                for (var i = 0; i < TreeNodes.count(unit); i++) {
+                    var entry = TreeNodes.entry(unit, i);
+                    assertArrayEquals(expected.get(index), bytes(TreeNodes.leafKey(unit, entry)));
+                    var form = TreeNodes.isExternal(unit, entry) ? 2 : TreeNodes.isBlob(unit, entry) ? 1 : 0;
+                    assertEquals(forms.get(index), form, "entry " + index + " holds its value in another form");
+                    if (form == 1) {
+                        valuePages.add(TreeNodes.blobRef(unit, entry).page());
+                    }
+                    blobs |= form != 0;
+                    sizes.add(TreeNodes.entryAt(unit, entry).size());
+                    index++;
+                }
+                assertEquals(blobs, leaf.blobs());
+            }
+            assertEquals(expected.size(), index);
+            // The runs the split of every entry gives, which a tree written of all its entries at once takes
+            var all = sizes.stream().mapToInt(Integer::intValue).toArray();
+            var runs = TreeNodes.split(all, all.length);
+            assertEquals(runs.size(), leaves.size());
+            for (var i = 0; i < runs.size(); i++) {
+                assertEquals(runs.get(i)[1] - runs.get(i)[0], leaves.get(i).count(), "leaf " + i + " splits elsewhere");
+            }
+            assertFalse(valuePages.isEmpty());
+            for (var i = 0; i < valuePages.size(); i++) {
+                assertTrue(valuePages.get(i) > (i == 0 ? lastLeafPage : valuePages.get(i - 1)),
+                        "the value units are not past the leaves, in key order");
+            }
+            // A pool that hands the plaintext on, or a cache that drops it, leaves the first keys as they were
+            var firstKeys = new ArrayList<byte[]>();
+            for (var leaf : leaves) {
+                firstKeys.add(bytes(leaf.firstKey()));
+            }
+            writer.flush();
+            pages.cache().clearForTests();
+            for (var unit : units) {
+                Arrays.fill(unit, (byte) 0x5A);
+            }
+            for (var i = 0; i < leaves.size(); i++) {
+                assertArrayEquals(firstKeys.get(i), bytes(leaves.get(i).firstKey()), "a first key is a view of its leaf");
+                assertTrue(leaves.get(i).firstKey().isReadOnly());
+            }
+        }
+    }
+
+    /// {@return the state of `key` with `value`, or with none if `null`, as a checkpoint takes it: the chain of the key
+    /// in its words, in a slab or in a segment; the value on an array of its own or a segment, or in the unit
+    /// `external` of the blob file if it is not `null`}
+    private static TreeUpdate.Op op(KeySlab slab, byte[] key, byte[] value, PageRef external, Random random) {
+        var segment = segment(key);
+        var chain = random.nextBoolean() ? slab.chain(segment, Segments.hash(segment)) : new Chain(segment, 0);
+        if (value == null) {
+            return new TreeUpdate.Op(chain, null, null);
+        }
+        var version = external != null ? Version.ofOwn(0, value.clone(), null, null, external)
+                : random.nextBoolean() ? Version.ofOwn(0, value.clone(), null, null, null)
+                : new Version(0, segment(value), null, null);
+        return new TreeUpdate.Op(chain, version, null);
+    }
+
     /// Checks what each branch records of its children against the nodes themselves, and each node against its limits.
     static void verifyNodes(PageFile pages, TreeRoot root) {
         if (root != null) {

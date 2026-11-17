@@ -669,7 +669,19 @@ final class TreeNodes {
             if (isRemoved()) {
                 return 2 + (int) key.byteSize() + 1;
             }
-            return 2 + (int) key.byteSize() + 1 + (blob == null ? 2 + length : 4 + PageRef.BYTES);
+            return bytes(key.byteSize(), length, blob != null);
+        }
+
+        /// {@return the bytes an entry takes in a leaf, its offset and the head of its key included, for a value of
+        /// `length` bytes under a key of `keyLength` bytes, in a blob or a unit if `blob`, else inline; as [#size()]
+        /// gives them for such an entry}
+        static int size(long keyLength, int length, boolean blob) {
+            return SLOT + bytes(keyLength, length, blob);
+        }
+
+        // The bytes of such an entry without its offset and head, as bytes() gives them
+        private static int bytes(long keyLength, int length, boolean blob) {
+            return 2 + (int) keyLength + 1 + (blob ? 4 + PageRef.BYTES : 2 + length);
         }
 
         /// {@return whether a value of `length` bytes under a key of `keyLength` bytes is stored inline}

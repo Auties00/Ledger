@@ -13,7 +13,10 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 /// copies live takes a copy of it here ([#key(Chain)]): the ordered map of a key space, whose keys are segments, as the
 /// chain enters it, and the update of a tree, with a slab of its own, for the entries it writes. A copy only a short
 /// lookup needs is made elsewhere ([Chain#key()]), since a copy here stays reachable while another copy in its chunk
-/// does: the copies of a key space's scans and removals would stay with its map's keys.
+/// does: the copies of a key space's scans and removals would stay with its map's keys. The update of a tree also
+/// copies here the first key of each node it writes ([#copy(MemorySegment)]), which the branch above records, into a
+/// slab apart from that of its entries: a view of the node's own plaintext would keep the whole unit until the
+/// checkpoint ends, and a copy among the entries' keys would keep their chunks.
 ///
 /// A key copied into an array of its own costs the array's header and, for the read-only view of it, a segment and a
 /// memory session of the segment's own: about a hundred bytes for a 16-byte key, on every key a commit writes. A copy
@@ -94,6 +97,26 @@ final class KeySlab {
             var start = (int) USED.getVolatile(chunk);
             if (start + length <= chunk.array.length && USED.compareAndSet(chunk, start, start + length)) {
                 chain.copyKey(chunk.array, start);
+                return chunk.view.asSlice(start, length);
+            }
+            stripe = retry(stripe, chunk, start, length);
+        }
+    }
+
+    /// {@return a read-only copy of `key`, here if a chunk takes it, else in an array of its own}
+    ///
+    /// The copy shares nothing with `key`, so it keeps no array `key` views reachable.
+    MemorySegment copy(MemorySegment key) {
+        var length = (int) key.byteSize();
+        if (length > LARGEST) {
+            return Segments.copy(key);
+        }
+        var stripe = contended ? stripe() : 0;
+        while (true) {
+            var chunk = room(stripe);
+            var start = (int) USED.getVolatile(chunk);
+            if (start + length <= chunk.array.length && USED.compareAndSet(chunk, start, start + length)) {
+                MemorySegment.copy(key, ValueLayout.JAVA_BYTE, 0, chunk.array, start, length);
                 return chunk.view.asSlice(start, length);
             }
             stripe = retry(stripe, chunk, start, length);

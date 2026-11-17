@@ -20,6 +20,11 @@ import java.util.concurrent.atomic.AtomicReference;
 /// removed range covers is dropped without being rewritten. A rewritten node left less than a quarter full merges with
 /// a neighbour when both fit in one node.
 ///
+/// A tree that held no key is written a leaf at a time ([#writeNewLeaves(List)]): the update holds the entries of one
+/// leaf, not those of the whole tree. The first key of each node written, which the branch above it records, is a
+/// copy ([KeySlab#copy(MemorySegment)]), never a view of the node's plaintext, which would keep the whole unit until
+/// the checkpoint ends.
+///
 /// A leaf below the root that the writes change by a little is written as a delta record of what changed since its
 /// base leaf ([DeltaLeaves]); one that changes more, splits, or falls under a quarter full is written whole.
 ///
@@ -69,18 +74,24 @@ final class TreeUpdate {
     // Where the update copies the keys of the entries it writes whose chains hold them in words of their own: a view
     // of a shared chunk costs a written key less than an array, a view and a memory session of its own
     private final KeySlab keys;
+    // Where the update and the updates of its subtrees, which share it, copy the first key of each node they write,
+    // which the branch above records until it is written: a view of the node's plaintext would keep the whole unit
+    // after the writer sealed it, until the checkpoint ends
+    private final KeySlab firstKeys;
     // The delta page the leaf of a record was last made from, which that read did not cache, and its reference: writing
     // the record anew reads the page again, and so do the records of the neighbouring leaves, which share it
     private byte[] deltaPage;
     private PageRef deltaPageRef;
 
     TreeUpdate(PageFile pages, PageFile.Writer writer, FreeSpace space) {
-        this(pages, writer, space, new AtomicReference<>());
+        this(pages, writer, space, new AtomicReference<>(), new KeySlab());
     }
 
-    private TreeUpdate(PageFile pages, PageFile.Writer writer, FreeSpace space, AtomicReference<Throwable> failure) {
+    private TreeUpdate(PageFile pages, PageFile.Writer writer, FreeSpace space, AtomicReference<Throwable> failure,
+                       KeySlab firstKeys) {
         this.failure = failure;
         this.keys = new KeySlab();
+        this.firstKeys = firstKeys;
         this.pages = pages;
         this.writer = writer;
         this.space = space;
@@ -249,11 +260,10 @@ final class TreeUpdate {
         }
         List<Child> result;
         if (root == null) {
-            var merged = merge(List.of(), ops, 0, ops.size(), removals, 0, 0);
-            if (merged == null) {
+            result = writeNewLeaves(ops);
+            if (result == null) {
                 return null;
             }
-            result = writeLeaves(merged.entries(), Replaced.NONE);
         } else {
             var unit = read(root.ref(), PageFile.NODE);
             var node = new Child(null, root.ref(), root.count(), root.blobs(), TreeNodes.level(unit), -1);
@@ -505,7 +515,8 @@ final class TreeUpdate {
         for (var i = 0; i < children.size(); i++) {
             var plan = plans[i];
             if (plan != null && plan != Plan.DROP) {
-                tasks.add(new Subtree(i, new TreeUpdate(pages, writer, space, failure), children.get(i), ops, removals, plan));
+                var update = new TreeUpdate(pages, writer, space, failure, firstKeys);
+                tasks.add(new Subtree(i, update, children.get(i), ops, removals, plan));
             }
         }
         // The tasks before this index stay on this thread: the first, and any the pool refused
@@ -614,7 +625,7 @@ final class TreeUpdate {
                 pages.expect(record, reads);
             }
         }
-        return List.of(new Child(merged.getFirst().key(), record, merged.size(), blobs, 0, fill));
+        return List.of(new Child(firstKeys.copy(merged.getFirst().key()), record, merged.size(), blobs, 0, fill));
     }
 
     /// {@return whether every one of `changes` puts a key past the last of `entries`}
@@ -958,41 +969,105 @@ final class TreeUpdate {
         }
     }
 
+    /// {@return the entry of `op`, a put, which takes the bytes [#entrySize(Op)] gives; a value the entry does not
+    /// hold inline is written to a unit of its own, on pages taken now}
     private LeafEntry entry(Op op) throws IOException {
         var key = keys.key(op.keyed());
         var version = op.version();
         var external = op.external();
-        if (external == null && version.logged()) {
-            // Read from the log only where it is used: into the leaf or delta record that holds it inline, or into the
-            // array the unit is sealed into
-            var length = version.valueLength();
-            if (LeafEntry.fitsInline(key.byteSize(), length)) {
-                return new LeafEntry(key, version, null, length);
-            }
-            var unitPages = PageFormat.pagesFor(length);
-            var ref = writer.writeLoggedValue(allocate(unitPages), unitPages, version);
-            return new LeafEntry(key, null, ref, length);
-        }
+        // Fixed for the version: a spill moves only the source of the value
+        var length = version.valueLength();
         if (external != null) {
             // The unit holds the value: a split one is never joined for it
-            return new LeafEntry(key, null, external, version.valueLength(), true);
+            return new LeafEntry(key, null, external, length, true);
         }
-        var array = version.ownArray();
-        if (array != null && LeafEntry.fitsInline(key.byteSize(), array.length)) {
-            // Copied into the leaf with an array copy, without a view of it
-            return new LeafEntry(key, array, null, array.length);
-        }
-        var value = op.value();
-        var length = value.byteSize();
-        if (LeafEntry.fitsInline(key.byteSize(), length)) {
-            return new LeafEntry(key, value, null, (int) length);
+        if (inline(op)) {
+            if (version.logged()) {
+                // Read from the log only where it is used: into the leaf or delta record that holds it
+                return new LeafEntry(key, version, null, length);
+            }
+            var array = version.ownArray();
+            if (array != null) {
+                // Copied into the leaf with an array copy, without a view of it
+                return new LeafEntry(key, array, null, length);
+            }
+            return new LeafEntry(key, op.value(), null, length);
         }
         var unitPages = PageFormat.pagesFor(length);
         var page = allocate(unitPages);
+        if (version.logged()) {
+            // Read from the log straight into the array the unit is sealed into
+            return new LeafEntry(key, null, writer.writeLoggedValue(page, unitPages, version), length);
+        }
         // The writer builds the unit from the version's value in the array it seals it into: nothing reads it before
         // the checkpoint is published, and a read after goes through the file
-        var ref = writer.writeValue(page, unitPages, value);
-        return new LeafEntry(key, null, ref, (int) length);
+        return new LeafEntry(key, null, writer.writeValue(page, unitPages, op.value()), length);
+    }
+
+    /// {@return whether the entry of `op`, a put, holds its value inline}
+    private static boolean inline(Op op) {
+        return op.external() == null && LeafEntry.fitsInline(op.keyed().keyLength(), op.version().valueLength());
+    }
+
+    /// {@return the bytes the entry of `op`, a put, takes in a leaf, known before [#entry(Op)] makes it}
+    private static int entrySize(Op op) {
+        return LeafEntry.size(op.keyed().keyLength(), op.version().valueLength(), !inline(op));
+    }
+
+    /// {@return the leaves of a tree that held no key, written of the puts of `ops`, or `null` if every one of them
+    /// removes its key}
+    ///
+    /// The leaves split the entries as [#writeLeaves(List, Replaced)] would, by the bytes each entry will take
+    /// ([#entrySize(Op)]), and each leaf's entries are made, written and dropped before the next leaf's: the update
+    /// holds the entries and the plaintext of one leaf at a time, not those of the whole tree. The pages of the leaves
+    /// are taken before those of any value, so the leaves sit next to each other, for the scans that read them in runs,
+    /// and the units of the values follow them, in key order. The writer admits a leaf to the page cache as one that
+    /// replaces no other.
+    List<Child> writeNewLeaves(List<Op> ops) throws IOException {
+        // The index in ops of each put, and the bytes its entry will take
+        var puts = new int[ops.size()];
+        var sizes = new int[ops.size()];
+        var count = 0;
+        for (var i = 0; i < ops.size(); i++) {
+            var op = ops.get(i);
+            op.settle(false);
+            if (!op.removes()) {
+                puts[count] = i;
+                sizes[count++] = entrySize(op);
+            }
+        }
+        if (count == 0) {
+            return null;
+        }
+        var runs = TreeNodes.split(sizes, count);
+        var leafPages = new int[runs.size()];
+        var longest = 0;
+        for (var leaf = 0; leaf < leafPages.length; leaf++) {
+            leafPages[leaf] = allocate(1);
+            longest = Math.max(longest, runs.get(leaf)[1] - runs.get(leaf)[0]);
+        }
+        var entries = new ArrayList<LeafEntry>(longest);
+        var out = new ArrayList<Child>(runs.size());
+        for (var leaf = 0; leaf < leafPages.length; leaf++) {
+            var run = runs.get(leaf);
+            var blobs = false;
+            for (var i = run[0]; i < run[1]; i++) {
+                var entry = entry(ops.get(puts[i]));
+                if (entry.size() != sizes[i]) {
+                    // The split counted other bytes, so the leaf could pass its page
+                    throw new IllegalStateException("An entry of " + entry.size() + " bytes was counted as " + sizes[i]);
+                }
+                blobs |= entry.blob() != null;
+                entries.add(entry);
+            }
+            var unit = TreeNodes.writeLeaf(entries, 0, entries.size());
+            var ref = writer.write(PageFormat.LEAF, 0, leafPages[leaf], 1, unit, unit.length - PageFormat.HEADER,
+                    writer.admits(unit.length, false));
+            out.add(new Child(firstKeys.copy(entries.getFirst().key()), ref, entries.size(), blobs, 0,
+                    TreeNodes.fill(sizes, run[0], run[1])));
+            entries.clear();
+        }
+        return out;
     }
 
     /// {@return the first of `unitPages` free pages, which the update took}
@@ -1039,7 +1114,7 @@ final class TreeUpdate {
                     pages.expect(ref, reads);
                 }
             }
-            out.add(new Child(TreeNodes.leafKey(unit, TreeNodes.entry(unit, 0)), ref, run[1] - run[0], blobs, 0,
+            out.add(new Child(firstKeys.copy(entries.get(run[0]).key()), ref, run[1] - run[0], blobs, 0,
                     TreeNodes.fill(sizes, run[0], run[1])));
         }
         return out;
@@ -1083,7 +1158,8 @@ final class TreeUpdate {
                     pages.expect(ref, reads);
                 }
             }
-            out.add(new Child(TreeNodes.childKey(unit, 0), ref, count, blobs, level, TreeNodes.fill(sizes, run[0], run[1])));
+            out.add(new Child(firstKeys.copy(children.get(run[0]).firstKey()), ref, count, blobs, level,
+                    TreeNodes.fill(sizes, run[0], run[1])));
         }
         return out;
     }

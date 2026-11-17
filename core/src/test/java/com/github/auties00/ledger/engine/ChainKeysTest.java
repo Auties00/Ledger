@@ -313,6 +313,38 @@ class ChainKeysTest {
     }
 
     @Test
+    @DisplayName("copies a key into a chunk, rolling to the next chunk when one fills, and a key longer than a chunk takes into an array of its own, sharing nothing with the key")
+    void copies() {
+        var random = new SplittableRandom(29);
+        var slab = new KeySlab();
+        var sources = new ArrayList<byte[]>();
+        var copies = new ArrayList<MemorySegment>();
+        var claimed = 0;
+        // Past the first chunks, which double up to 4 KiB, and into several of 4 KiB
+        for (var i = 0; i < 400; i++) {
+            var key = bytes(random, i % 50 == 0 ? 257 : random.nextInt(0, 257));
+            var copy = slab.copy(MemorySegment.ofArray(key));
+            assertTrue(copy.isReadOnly());
+            assertArrayEquals(key, copy.toArray(ValueLayout.JAVA_BYTE));
+            sources.add(key);
+            copies.add(copy);
+            if (key.length <= 256) {
+                claimed += key.length;
+            }
+        }
+        // Keys in full chunks are no longer counted, and keys of 257 bytes never were
+        assertTrue(slab.usedForTests() < claimed);
+        for (var key : sources) {
+            Arrays.fill(key, (byte) 0x5A);
+        }
+        var check = new SplittableRandom(29);
+        for (var i = 0; i < copies.size(); i++) {
+            var key = bytes(check, i % 50 == 0 ? 257 : check.nextInt(0, 257));
+            assertArrayEquals(key, copies.get(i).toArray(ValueLayout.JAVA_BYTE), "copy " + i);
+        }
+    }
+
+    @Test
     @DisplayName("finds a chain in the hash index by a segment or an array, whichever way the chain holds its key")
     void indexLookups() {
         var random = new SplittableRandom(17);
