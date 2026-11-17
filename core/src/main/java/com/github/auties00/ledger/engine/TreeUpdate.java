@@ -20,10 +20,10 @@ import java.util.concurrent.atomic.AtomicReference;
 /// removed range covers is dropped without being rewritten. A rewritten node left less than a quarter full merges with
 /// a neighbour when both fit in one node.
 ///
-/// A tree that held no key is written a leaf at a time ([#writeNewLeaves(List)]): the update holds the entries of one
-/// leaf, not those of the whole tree. The first key of each node written, which the branch above it records, is a
-/// copy ([KeySlab#copy(MemorySegment)]), never a view of the node's plaintext, which would keep the whole unit until
-/// the checkpoint ends.
+/// A tree that held no key is written a window of leaves at a time ([#writeNewLeaves(List)]): the update holds the
+/// entries of one window, not those of the whole tree. The first key of each node written, which the branch above it
+/// records, is a copy ([KeySlab#copy(MemorySegment)]), never a view of the node's plaintext, which would keep the whole
+/// unit until the checkpoint ends.
 ///
 /// A leaf below the root that the writes change by a little is written as a delta record of what changed since its
 /// base leaf ([DeltaLeaves]); one that changes more, splits, or falls under a quarter full is written whole.
@@ -57,6 +57,10 @@ import java.util.concurrent.atomic.AtomicReference;
 final class TreeUpdate {
     /// The writes below a branch from which its children's subtrees are updated on every processor.
     private static final int PARALLEL_OPS = 4_096;
+    /// The leaves a tree that held no key is written in at a time ([#writeNewLeaves(List)]), each window's on pages
+    /// next to each other after the units of their values: the most pages a scan reads with one call
+    /// ([PageFile#RUN_PAGES]), as more leaves next to each other save it no call.
+    static final int NEW_LEAVES_WINDOW = PageFile.RUN_PAGES;
 
     private final PageFile pages;
     private final PageFile.Writer writer;
@@ -1018,11 +1022,12 @@ final class TreeUpdate {
     /// removes its key}
     ///
     /// The leaves split the entries as [#writeLeaves(List, Replaced)] would, by the bytes each entry will take
-    /// ([#entrySize(Op)]), and each leaf's entries are made, written and dropped before the next leaf's: the update
-    /// holds the entries and the plaintext of one leaf at a time, not those of the whole tree. The pages of the leaves
-    /// are taken before those of any value, so the leaves sit next to each other, for the scans that read them in runs,
-    /// and the units of the values follow them, in key order. The writer admits a leaf to the page cache as one that
-    /// replaces no other.
+    /// ([#entrySize(Op)]), and are written [#NEW_LEAVES_WINDOW] at a time: the entries of a window's leaves are made,
+    /// which writes the units of the values they do not hold inline, in key order, then its leaves are written on the
+    /// pages that follow, next to each other, and the entries are dropped before the next window's. The update holds
+    /// the entries of one window, not those of the whole tree, and the file grows in the order the writer stages its
+    /// units, as it does for the runs of leaves an update of a tree that holds keys rewrites. The writer admits a leaf to
+    /// the page cache as one that replaces no other.
     List<Child> writeNewLeaves(List<Op> ops) throws IOException {
         // The index in ops of each put, and the bytes its entry will take
         var puts = new int[ops.size()];
@@ -1040,31 +1045,30 @@ final class TreeUpdate {
             return null;
         }
         var runs = TreeNodes.split(sizes, count);
-        var leafPages = new int[runs.size()];
         var longest = 0;
-        for (var leaf = 0; leaf < leafPages.length; leaf++) {
-            leafPages[leaf] = allocate(1);
-            longest = Math.max(longest, runs.get(leaf)[1] - runs.get(leaf)[0]);
+        for (var first = 0; first < runs.size(); first += NEW_LEAVES_WINDOW) {
+            var last = Math.min(first + NEW_LEAVES_WINDOW, runs.size()) - 1;
+            longest = Math.max(longest, runs.get(last)[1] - runs.get(first)[0]);
         }
         var entries = new ArrayList<LeafEntry>(longest);
         var out = new ArrayList<Child>(runs.size());
-        for (var leaf = 0; leaf < leafPages.length; leaf++) {
-            var run = runs.get(leaf);
-            var blobs = false;
-            for (var i = run[0]; i < run[1]; i++) {
+        for (var first = 0; first < runs.size(); first += NEW_LEAVES_WINDOW) {
+            var window = runs.subList(first, Math.min(first + NEW_LEAVES_WINDOW, runs.size()));
+            var from = window.getFirst()[0];
+            var to = window.getLast()[1];
+            for (var i = from; i < to; i++) {
                 var entry = entry(ops.get(puts[i]));
                 if (entry.size() != sizes[i]) {
                     // The split counted other bytes, so the leaf could pass its page
                     throw new IllegalStateException("An entry of " + entry.size() + " bytes was counted as " + sizes[i]);
                 }
-                blobs |= entry.blob() != null;
                 entries.add(entry);
             }
-            var unit = TreeNodes.writeLeaf(entries, 0, entries.size());
-            var ref = writer.write(PageFormat.LEAF, 0, leafPages[leaf], 1, unit, unit.length - PageFormat.HEADER,
-                    writer.admits(unit.length, false));
-            out.add(new Child(firstKeys.copy(entries.getFirst().key()), ref, entries.size(), blobs, 0,
-                    TreeNodes.fill(sizes, run[0], run[1])));
+            var windowRuns = new ArrayList<int[]>(window.size());
+            for (var run : window) {
+                windowRuns.add(new int[]{run[0] - from, run[1] - from});
+            }
+            out.addAll(writeLeaves(entries, Arrays.copyOfRange(sizes, from, to), windowRuns, Replaced.NONE));
             entries.clear();
         }
         return out;

@@ -9,6 +9,7 @@ import org.junit.jupiter.api.io.TempDir;
 import javax.crypto.spec.SecretKeySpec;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -280,7 +281,7 @@ class TreeUpdateTest {
     }
 
     @Test
-    @DisplayName("the leaves of an empty tree split their entries as the split of every entry's size does, sit on consecutive pages before the units of their values, and keep first keys that outlive their plaintext")
+    @DisplayName("the leaves of an empty tree split their entries as the split of every entry's size does, sit on consecutive pages a window at a time after the units of the window's values, and keep first keys that outlive their plaintext")
     void newTreeLeaves(@TempDir Path directory) throws Exception {
         var random = new Random(41);
         try (var pages = PageFile.open(directory, new PageCipher(new SecretKeySpec(new byte[32], "AES")), 1 << 20, new HeapPool(1 << 20))) {
@@ -311,14 +312,17 @@ class TreeUpdateTest {
             var units = new ArrayList<byte[]>();
             var sizes = new ArrayList<Integer>();
             var index = 0;
-            var lastLeafPage = -1;
-            var valuePages = new ArrayList<Integer>();
-            for (var leaf : leaves) {
+            // The units of each window in the order the file should hold them: its values in key order, then its leaves
+            var layout = new ArrayList<List<PageRef>>();
+            for (var l = 0; l < leaves.size(); l++) {
+                var leaf = leaves.get(l);
                 assertEquals(0, leaf.level());
-                if (lastLeafPage >= 0) {
-                    assertEquals(lastLeafPage + 1, leaf.ref().page(), "the leaves are not on consecutive pages");
+                if (l % TreeUpdate.NEW_LEAVES_WINDOW == 0) {
+                    layout.add(new ArrayList<>());
+                    layout.add(new ArrayList<>());
                 }
-                lastLeafPage = leaf.ref().page();
+                var valueRefs = layout.get(layout.size() - 2);
+                layout.getLast().add(leaf.ref());
                 var unit = writer.staged(leaf.ref());
                 units.add(unit);
                 assertEquals(TreeNodes.count(unit), leaf.count());
@@ -331,7 +335,7 @@ class TreeUpdateTest {
                     var form = TreeNodes.isExternal(unit, entry) ? 2 : TreeNodes.isBlob(unit, entry) ? 1 : 0;
                     assertEquals(forms.get(index), form, "entry " + index + " holds its value in another form");
                     if (form == 1) {
-                        valuePages.add(TreeNodes.blobRef(unit, entry).page());
+                        valueRefs.add(TreeNodes.blobRef(unit, entry));
                     }
                     blobs |= form != 0;
                     sizes.add(TreeNodes.entryAt(unit, entry).size());
@@ -347,10 +351,13 @@ class TreeUpdateTest {
             for (var i = 0; i < runs.size(); i++) {
                 assertEquals(runs.get(i)[1] - runs.get(i)[0], leaves.get(i).count(), "leaf " + i + " splits elsewhere");
             }
-            assertFalse(valuePages.isEmpty());
-            for (var i = 0; i < valuePages.size(); i++) {
-                assertTrue(valuePages.get(i) > (i == 0 ? lastLeafPage : valuePages.get(i - 1)),
-                        "the value units are not past the leaves, in key order");
+            assertTrue(layout.size() >= 4, "the leaves fill a single window");
+            var next = PageFormat.FIRST_UNIT_PAGE;
+            for (var refs : layout) {
+                for (var ref : refs) {
+                    assertEquals(next, ref.page(), "a unit is not where the one before it ends");
+                    next = ref.page() + ref.pages();
+                }
             }
             // A pool that hands the plaintext on, or a cache that drops it, leaves the first keys as they were
             var firstKeys = new ArrayList<byte[]>();
@@ -366,6 +373,44 @@ class TreeUpdateTest {
                 assertArrayEquals(firstKeys.get(i), bytes(leaves.get(i).firstKey()), "a first key is a view of its leaf");
                 assertTrue(leaves.get(i).firstKey().isReadOnly());
             }
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("an empty tree whose values pass the writer's staged limit is written to the file without a page left unwritten below one written")
+    void newTreeFileGrowth(boolean encrypted, @TempDir Path directory) throws Exception {
+        var random = new Random(encrypted ? 43 : 47);
+        var cipher = new PageCipher(encrypted ? new SecretKeySpec(new byte[32], "AES") : null);
+        try (var pages = PageFile.open(directory, cipher, 1 << 20, new HeapPool(1 << 20))) {
+            var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+            var slab = new KeySlab();
+            var states = new TreeMap<byte[], byte[]>(UNSIGNED);
+            while (states.size() < 20_000) {
+                var key = new byte[8 + random.nextInt(24)];
+                random.nextBytes(key);
+                // About 20 MiB of units of values, past the 8 MiB the writer stages before it writes
+                var value = new byte[random.nextInt(8) == 0 ? 2_500 + random.nextInt(6_000) : random.nextInt(200)];
+                random.nextBytes(value);
+                states.put(key, value);
+            }
+            var ops = new ArrayList<TreeUpdate.Op>();
+            for (var state : states.entrySet()) {
+                ops.add(op(slab, state.getKey(), state.getValue(), null, random));
+            }
+            var writer = pages.writer(random.nextLong());
+            var leaves = new TreeUpdate(pages, writer, space).writeNewLeaves(ops);
+            assertTrue(leaves.size() > 2 * TreeUpdate.NEW_LEAVES_WINDOW, "the leaves fill fewer than three windows");
+            var length = Files.size(directory.resolve(PageFile.FILE));
+            assertTrue(length > 0, "the writer wrote nothing before the end");
+            // A leaf still staged below the end of the file is a page the file grew past
+            for (var leaf : leaves) {
+                if (PageFormat.offset(leaf.ref().page()) < length) {
+                    assertNull(writer.staged(leaf.ref()), "the file grew past leaf " + leaf.ref().page() + " before it was written");
+                }
+            }
+            assertEquals(states.size(), leaves.stream().mapToLong(TreeNodes.Child::count).sum());
+            writer.flush();
         }
     }
 
