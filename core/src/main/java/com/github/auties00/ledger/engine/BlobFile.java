@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /// version names the unit ([Version#ofUnit]), and a read opens it through the page cache, screened as a read of a
 /// tree's value is ([#copyValue(PageRef, int, int)], [#scanValue(PageRef, int, boolean, int)]), so a value read once
 /// costs a read of the file and an open, as one after a checkpoint does, and only a value a point read read twice, or a
-/// scan three times among its first units, stays in the cache. A unit a commit replaced before a
+/// scan four times among its first units, stays in the cache. A unit a commit replaced before a
 /// checkpoint took it therefore waits, as one a checkpoint freed does, for every reader that may still read it
 /// ([#pendSuperseded(long, List)]).
 ///

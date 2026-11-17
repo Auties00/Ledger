@@ -893,21 +893,20 @@ final class PageFile implements AutoCloseable {
     }
 
     /// {@return the reads that used the leaf or branch `ref` names while the cache screens what reads miss, or 0 if it
-    /// does not: 2 if the cache holds it as an entry a read used ([#referenced(PageRef)]), else the reads its
-    /// doorkeeper saw, 2 for two or more, 1 or 0 ([PageCache#reads(PageRef)])}
+    /// does not: 3 if the cache holds it as an entry a read used ([#referenced(PageRef)]), else the reads its
+    /// doorkeeper saw, 3 for three or more, 2, 1 or 0 ([PageCache#reads(PageRef)])}
     int reads(PageRef ref) {
         if (!cache.screens()) {
             return 0;
         }
-        return referenced(ref) ? 2 : cache.reads(ref);
+        return referenced(ref) ? Doorkeeper.MOST_READS : cache.reads(ref);
     }
 
     /// Records the leaf or branch of level 1 `ref` names, which a checkpoint wrote and left out of the cache in place
-    /// of one reads used `reads` times ([#reads(PageRef)]), as expected by the doorkeeper, so the cache takes it a read
-    /// sooner than the read's screening asks for, or two sooner for a scan after two reads of the node it replaces
-    /// ([PageCache#expect(PageRef, int)]).
+    /// of one reads used `reads` times ([#reads(PageRef)]), as expected by the doorkeeper, so the cache counts as many
+    /// reads of it before the first ([PageCache#expect(PageRef, int)]).
     ///
-    /// @param reads the reads of the node it replaces, 1 or 2
+    /// @param reads the reads of the node it replaces, 1, 2 or 3
     void expect(PageRef ref, int reads) {
         cache.expect(ref, reads);
     }
