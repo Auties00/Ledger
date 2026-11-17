@@ -2272,43 +2272,6 @@ class LogSpillTest {
         assertEquals(0, queue.chunkRecordsForTests());
     }
 
-    @ParameterizedTest(name = "sealed first: {0}")
-    @ValueSource(booleans = {true, false})
-    @DisplayName("the runs of a record are prepared ahead once it is queued to move an array at a time and its frame is sealed, whichever comes last, and its move takes them")
-    void chunksPreparedOnceQueuedAndSealed(boolean sealedFirst, @TempDir Path directory) throws Exception {
-        var queue = new SpillQueue(0, true);
-        queue.chunksMinForTests(1);
-        var durable = new java.util.concurrent.atomic.AtomicLong();
-        queue.useDurable(durable::get);
-        var started = new CountDownLatch(1);
-        queue.prepareHookForTests(started::countDown);
-        var view = queue.segment(1, directory.resolve("1.log"), null);
-        var home = MemorySegment.ofArray(new byte[1_000]).asReadOnly();
-        var first = Version.of(1L << 20, home, 0, 100, null, null, null);
-        var second = Version.of(1L << 20 | 1, home, 100, 100, null, null, null);
-        var record = queue.record(1, 2);
-        record.add(first, 40, 100);
-        record.add(second, 140, 100);
-        record.locate(view, 64, 0, 0, false);
-        if (sealedFirst) {
-            record.sealed(queue);
-        } else {
-            queue.add(record);
-        }
-        assertFalse(started.await(100, TimeUnit.MILLISECONDS), "the runs were prepared before both steps");
-        if (sealedFirst) {
-            queue.add(record);
-        } else {
-            record.sealed(queue);
-        }
-        assertTrue(started.await(30, TimeUnit.SECONDS), "the runs were not prepared once both steps were done");
-        durable.set(1);
-        queue.moveOwn(1);
-        var chunk = assertInstanceOf(LogChunk.class, first.sourceForTests());
-        assertSame(chunk, second.sourceForTests());
-        assertEquals(1, queue.preparedAheadForTests());
-    }
-
     @Test
     @DisplayName("the values of a commit that would move an array at a time stay on the heap if the log wrote its group through, and its record leaves the queue")
     void writtenThroughChunksStay(@TempDir Path directory) throws Exception {

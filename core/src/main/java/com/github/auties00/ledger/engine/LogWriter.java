@@ -386,9 +386,6 @@ final class LogWriter {
     private LogSegmentView view;
     // Whether the group being sealed is written through to stable storage; owned by the flush task
     private boolean sealingThrough;
-    // The records of values of the group being sealed that the writer located, which it tells the group is sealed
-    // before it forces it; owned by the flush task
-    private final ArrayList<SpillQueue.Record> sealedRecords = new ArrayList<>();
     private final AtomicBoolean scheduled;
     // Held by the one flush that writes groups, on the pool or on the thread of a commit waiting for its group
     private final AtomicBoolean running;
@@ -832,9 +829,6 @@ final class LogWriter {
         var record = body.spill();
         if (record != null) {
             record.locate(view, frameOffset, commitStart, frameBody, sealingThrough);
-            if (!sealingThrough) {
-                sealedRecords.add(record);
-            }
         }
     }
 
@@ -1151,7 +1145,6 @@ final class LogWriter {
             waitedGroups++;
         }
         // Before a frame is sealed, while the output holds no byte of the group
-        sealedRecords.clear();
         var through = writesThrough(group);
         // A write through takes the pages it writes out of the system's cache, so their values stay in the heap
         sealingThrough = through;
@@ -1194,12 +1187,6 @@ final class LogWriter {
             }
             groupStart = false;
         }
-        // Sealed: the values of a record that leave the heap a chunk at a time are prepared while the device writes
-        // the group, not while the processors seal it
-        for (var record : sealedRecords) {
-            record.sealed(spills);
-        }
-        sealedRecords.clear();
         // Zeros to the next block, where the next group starts: a reused file holds older bytes there
         var end = position + used;
         var padding = (int) ((end + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT - end);

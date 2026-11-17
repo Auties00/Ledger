@@ -58,8 +58,8 @@ import java.util.zip.CRC32C;
 ///   the log. The commit's values on arrays of their own move all the same, each freeing its array for a [LogValue].
 ///   Unless the commit holds more such values than twice the budget, and at least [#CHUNKS_MIN] bytes, that lie back
 ///   to back on their arrays: each array then leaves the heap whole for one [LogChunk], which the next checkpoint reads
-///   back in one read rather than one per value. A thread of its own checks those arrays and tags their blocks while
-///   the log forces the commit's frame ([Record#prepareAhead(SpillQueue)]), and a wait for such a commit to be durable
+///   back in one read rather than one per value. A thread of its own tags the blocks of those arrays while the log
+///   writes the commit's frame ([Record#prepareAhead(SpillQueue)]), and a wait for such a commit to be durable
 ///   moves its values on the waiting thread before it returns ([#moveOwn(long)]), rather than leaving them to the
 ///   thread that moves values, which would take them only after the commit returned.
 ///
@@ -375,7 +375,7 @@ final class SpillQueue {
             }
         }
         if (settled == Record.CHUNKS && prepareAhead) {
-            record.ready(this, Record.READY_QUEUED);
+            record.prepareAhead(this);
         }
         if (over()) {
             start();
@@ -486,9 +486,8 @@ final class SpillQueue {
     /// an array at a time ([LogChunk]) and are still queued; or waits for the thread that moves values if it took
     /// them. A commit that waits for its frame to be durable calls it once it is: such a commit's values on shared
     /// arrays take more than twice the budget, which a collection right after it would otherwise find on the heap. Those
-    /// arrays are checked and their blocks tagged by then, by the thread that prepares them while the log forces the
-    /// frame ([Record#prepareAhead(SpillQueue)]), which the move waits for if it still prepares them, or else by the
-    /// move.
+    /// arrays' blocks are tagged by then, by the thread that tags them while the log writes the frame
+    /// ([Record#prepareAhead(SpillQueue)]), which the move waits for if it still tags them, or else by the move.
     ///
     /// Any other commit returns at once, after one volatile read. An interrupt while waiting for the thread ends the
     /// wait, the interrupt kept, and the thread moves the values as it would. A failure to move them leaves them on the
@@ -773,19 +772,6 @@ final class SpillQueue {
         /// The verdict of [#settle(long)] that the record's values on shared arrays that lie back to back on them move
         /// an array at a time ([LogChunk]), and its values on arrays of their own one by one.
         static final int CHUNKS = 3;
-        // The steps before the runs are prepared ahead ([#ready])
-        private static final int READY_QUEUED = 1;
-        private static final int READY_SEALED = 2;
-        private static final VarHandle READY;
-
-        static {
-            try {
-                READY = MethodHandles.lookup().findVarHandle(Record.class, "ready", int.class);
-            } catch (ReflectiveOperationException exception) {
-                throw new ExceptionInInitializerError(exception);
-            }
-        }
-
         // The bytes of the values the record moves, whether one is at least LOG_VALUE_MIN, and the bytes of the
         // shortest
         private long bytes;
@@ -804,9 +790,6 @@ final class SpillQueue {
         // In a record whose values move an array at a time, the runs of its values and their preparation; null in any
         // other, and once released
         private Runs runs;
-        // READY_QUEUED once the record is queued to move an array at a time, READY_SEALED once the log sealed its frame;
-        // the second set starts the thread that prepares the runs ahead
-        private volatile int ready;
         // Set by the log writer as it seals the frame: the segment use, the frame's offset, where the commit's body
         // starts in the frame's body, the bytes of the frame's body, 0 if unknown, and whether the group was written
         // through
@@ -1076,7 +1059,7 @@ final class SpillQueue {
             queue.chunkedValues.addAndGet(values);
         }
 
-        /// {@return `runs`, the runs of this record, checked and tagged on this thread}
+        /// {@return the tags of the blocks of `runs`, the runs of this record, made on this thread}
         private Prepared prepareRuns(Runs runs, Crypto crypto, boolean encrypted) {
             var count = runs.count;
             var prepared = new Prepared(new long[count][], new int[count][]);
@@ -1088,36 +1071,18 @@ final class SpillQueue {
             return prepared;
         }
 
-        /// Checks that the values of run `run` of `runs` still lie back to back on their array where [#findRuns()]
-        /// found them, and in the commit's body as on the array, and tags its blocks from the bytes of the array, into
-        /// `prepared`, or leaves the run out if they do not lie so.
+        /// Tags the blocks of run `run` of `runs` from the bytes of its array, into `prepared`.
         ///
         /// The tags are bound to the commit's sequence and to where the run's first value starts in the commit's body
-        /// ([LogChunk#place(int, int)]): the array is never written once its batch is prepared, and only the move of
-        /// this record moves its versions, so runs checked and tagged while the log forces the frame hold the bytes the
-        /// frame holds once it is durable.
+        /// ([LogChunk#place(int, int)]). The values lie as [#findRuns()] found them, back to back on the array and in
+        /// the commit's body, until the move: the array is never written once its batch is prepared, and only the move
+        /// of this record moves its versions, each from that array alone, so tags made while the log writes the frame
+        /// hold the bytes the frame holds once it is durable.
         private void prepareRun(Runs runs, int run, Crypto crypto, boolean encrypted, Prepared prepared) {
             var home = runs.homes[run];
-            var values = runs.values[run];
             var start = runs.starts[run];
             var first = offsets[runs.firsts[run]];
-            var at = 0;
-            var next = start;
-            for (var i = runs.firsts[run]; i <= runs.lasts[run]; i++) {
-                var version = versions[i];
-                if (version.sharedSource() != home) {
-                    continue;
-                }
-                if (at == values || version.sourceOffset() != next || offsets[i] - first != next - start) {
-                    return;
-                }
-                at++;
-                next += version.valueLength();
-            }
-            if (at != values || next != runs.ends[run]) {
-                return;
-            }
-            var length = next - start;
+            var length = runs.ends[run] - start;
             var bytes = crypto.scratch(length);
             MemorySegment.copy(home, start, MemorySegment.ofArray(bytes), 0, length);
             var blocks = LogChunk.blocks(length);
@@ -1132,28 +1097,17 @@ final class SpillQueue {
             prepared.lows[run] = lows;
         }
 
-        /// Records that the log sealed the commit's frame, before it forces it, which starts the thread that prepares the
-        /// runs if the record is queued to move an array at a time.
-        void sealed(SpillQueue queue) {
-            ready(queue, READY_SEALED);
-        }
-
-        /// Records step `step` before the runs are prepared ahead, [#READY_QUEUED] or [#READY_SEALED], and starts the
-        /// thread that prepares them once both are done, whichever comes last.
-        private void ready(SpillQueue queue, int step) {
-            var before = (int) READY.getAndBitwiseOr(this, step);
-            if (before != 0 && (before & step) == 0) {
-                prepareAhead(queue);
-            }
-        }
-
-        /// Starts a thread that checks and tags the runs while the log forces the commit's frame, so the move of the
-        /// values, once the frame is durable, takes them rather than preparing them on the thread of the commit that
-        /// waits for it ([SpillQueue#moveOwn(long)]). The frame is sealed by then, so the thread takes no processor
-        /// from the seal, only from a force that waits for the device. A thread the system refuses leaves them to the
-        /// move. The ciphers are taken here, so the thread takes no lock and never parks before it publishes the runs.
+        /// Starts a thread that tags the runs' blocks while the log seals, writes and forces the commit's frame, as the
+        /// record is queued, so the move of the values, once the frame is durable, takes the tags rather than making
+        /// them on the thread of the commit that waits for it ([SpillQueue#moveOwn(long)]). A thread the system refuses
+        /// leaves them to the move. The ciphers are taken here, so the thread takes no lock and never parks before it
+        /// publishes the tags.
+        ///
+        /// @implNote This implementation starts the thread as the record is queued rather than once the frame is sealed,
+        /// although it then takes a processor from the seal: started after the seal, the thread has only the force to
+        /// work in, which a fast device ends first, so the commit waits for the thread after the force, as the
+        /// 100,000-entry app-state snapshot's did on CI's ubuntu runners.
         private void prepareAhead(SpillQueue queue) {
-            // Set before the step that queued the record, which happens-before this
             var runs = this.runs;
             if (runs == null) {
                 return;
@@ -1280,8 +1234,8 @@ final class SpillQueue {
         private int count;
         // While the record scans for runs: where the last run's last value ends in the commit's body
         private int scanBodyEnd;
-        // The runs the thread that prepares them ahead checked and tagged while the log forced the frame; null until it
-        // published them, and if it failed
+        // The tags the thread that prepares the runs ahead made while the log wrote the frame; null until it published
+        // them, and if it failed
         private volatile Prepared prepared;
         // PREPARE_NONE until the thread that prepares the runs ahead starts, or the move claims them first;
         // PREPARE_RUNNING while that thread prepares them; PREPARE_DONE once it published them, or the move claimed them
@@ -1320,8 +1274,8 @@ final class SpillQueue {
         }
     }
 
-    /// The runs of a record checked and tagged ahead of their move, per run: the first polynomials of the tags of its
-    /// blocks, `null` without encryption, and the low 32 bits of the second or the CRC-32C, `null` for a run that stays.
+    /// The tags of the blocks of a record's runs, made ahead of their move, per run: the first polynomials, `null`
+    /// without encryption, and the low 32 bits of the second or the CRC-32C, `null` for a run that stays.
     private record Prepared(long[][] highs, int[][] lows) {
     }
 
