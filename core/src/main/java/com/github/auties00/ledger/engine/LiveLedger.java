@@ -105,9 +105,13 @@ public final class LiveLedger implements Ledger {
     private static final int REPLAYED = -1;
     private static final VarHandle LAST_PUBLISHED;
     private static final VarHandle LATEST;
+    private static final VarHandle HOT_LOCKS_FIELD;
+    /// The locks the computes of hot keys take turns on, a power of two.
+    private static final int HOT_LOCKS = 256;
 
     static {
         try {
+            HOT_LOCKS_FIELD = MethodHandles.lookup().findVarHandle(LiveLedger.class, "hotLocks", ReentrantLock[].class);
             LAST_PUBLISHED = MethodHandles.lookup().findVarHandle(Padded.PublishedFields.class, "last", PendingCommit.class);
             LATEST = MethodHandles.lookup().findVarHandle(Padded.PublishedFields.class, "latest", long.class);
         } catch (ReflectiveOperationException exception) {
@@ -219,6 +223,8 @@ public final class LiveLedger implements Ledger {
     private final ReentrantReadWriteLock rangeCountGate;
     // Starts the counts of range removals that run on threads of their own
     private volatile Executor rangeCounts;
+    // The locks of hot keys, made at the first compute of one, or null
+    private volatile ReentrantLock[] hotLocks;
     // The chunks the values of the fastest commits of a store with pages share
     private final ValueSlab valueSlab;
     // The paged values waiting for a checkpoint that may leave the heap for the log, or null for a store that moves none
@@ -984,8 +990,49 @@ public final class LiveLedger implements Ledger {
         checkNotComputing();
         checkNotInTransaction();
         var batch = new ArrayWriteBatch(batchScope);
-        var computation = (BatchComputation<V>) batch.compute(keyspace, key, function);
-        return new LiveComputed<>(commit(batch), computation);
+        var locks = hotLocks;
+        // A compute that finds its key's lock taken, by a compute of a hot key, queues behind it rather than race it
+        if (locks == null || !locks[hotIndex(keyspace, key)].isLocked()) {
+            var computation = (BatchComputation<V>) batch.compute(keyspace, key, function);
+            if (batch.slots()[0].ran) {
+                return new LiveComputed<>(commit(batch), computation);
+            }
+            batch.clear();
+        }
+        // A write of the key was under way: the computes of a hot key take turns, so at most one of them waits in the
+        // pipeline at a time, rather than a queue of them that every later commit would wait behind
+        var lock = hotLock(hotIndex(keyspace, key));
+        lock.lock();
+        try {
+            var computation = (BatchComputation<V>) batch.compute(keyspace, key, function);
+            return new LiveComputed<>(commit(batch), computation);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// {@return the index of the hot lock of `key` of `keyspace`}
+    private static <K> int hotIndex(Keyspace<K, ?> keyspace, K key) {
+        return Segments.hash(Segments.lookupKey(keyspace.keys(), key)) & (HOT_LOCKS - 1);
+    }
+
+    /// {@return the lock `index` of the hot keys, of [#HOT_LOCKS], made at the first hot compute}
+    ///
+    /// The locks are no part of the ordering of writes, which the pipeline alone gives: a compute holds one only to
+    /// wait for the compute of its key ahead of it to become visible before it reads, so its function runs once, on
+    /// the calling thread, and no commit waits behind a run of the function in the order of the commits.
+    private ReentrantLock hotLock(int index) {
+        var locks = hotLocks;
+        if (locks == null) {
+            locks = new ReentrantLock[HOT_LOCKS];
+            for (var i = 0; i < locks.length; i++) {
+                locks[i] = new ReentrantLock();
+            }
+            if (!HOT_LOCKS_FIELD.compareAndSet(this, null, locks)) {
+                locks = hotLocks;
+            }
+        }
+        return locks[index];
     }
 
     @Override

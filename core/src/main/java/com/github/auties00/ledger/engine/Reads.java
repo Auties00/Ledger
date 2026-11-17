@@ -209,13 +209,32 @@ final class Reads {
         var root = point.root(state);
         var run = runOf(state, point);
         var total = 0L;
+        var lookups = 0;
+        // Once enough keys of the range were looked up, the lowest and highest keys the tree holds in the range: a key
+        // outside them, as the messages written to a chat since the last checkpoint are, is in no tree, and needs no
+        // lookup. Null bounds once found mean the tree holds no key of the range
+        var bounded = false;
+        MemorySegment lowest = null;
+        MemorySegment highest = null;
         for (var entry : state.slice(from, to).entrySet()) {
-            var version = KeyspaceState.resolve(entry.getValue().head, entry.getKey(), point.bound(), removals);
+            var key = entry.getKey();
+            var version = KeyspaceState.resolve(entry.getValue().head, key, point.bound(), removals);
             if (version == null) {
                 // Counted with the tree
                 continue;
             }
-            var counted = inTree(state, entry.getKey(), point, removals);
+            boolean counted;
+            if (bounded && (lowest == null || Segments.compare(key, lowest) < 0 || Segments.compare(key, highest) > 0)) {
+                counted = false;
+            } else {
+                counted = inTree(state, key, point, removals);
+                if (!bounded && ++lookups == BOUNDED_LOOKUPS && root != null && run == null) {
+                    var bounds = treeBounds(point, root, from, to);
+                    lowest = bounds == null ? null : bounds[0];
+                    highest = bounds == null ? null : bounds[1];
+                    bounded = true;
+                }
+            }
             total += (version == Version.HIDDEN ? 0 : 1) - (counted ? 1 : 0);
         }
         if (root == null && run == null) {
@@ -237,6 +256,30 @@ final class Reads {
             }
         }
         return total;
+    }
+
+    /// The keys of a range a count looks up in the tree before it finds the lowest and highest keys the tree holds there,
+    /// two walks down the tree, past which it looks up only the keys between them.
+    private static final int BOUNDED_LOOKUPS = 16;
+
+    /// {@return the lowest and highest keys the tree under `root` holds from `from`, included, to `to`, excluded,
+    /// either `null` for no bound, in arrays of their own, or `null` if it holds none}
+    private static MemorySegment[] treeBounds(ReadPoint point, TreeRoot root, MemorySegment from, MemorySegment to) {
+        var fromBytes = from == null ? null : Segments.toBytes(from);
+        var toBytes = to == null ? null : Segments.toBytes(to);
+        var bounds = new MemorySegment[2];
+        for (var side = 0; side < 2; side++) {
+            var cursor = new TreeCursor(point.pages(), root, fromBytes, toBytes, side == 1);
+            try {
+                if (!cursor.next()) {
+                    return null;
+                }
+                bounds[side] = Segments.copy(cursor.key());
+            } finally {
+                cursor.release();
+            }
+        }
+        return bounds;
     }
 
     /// {@return the entries from `from`, included, to `to`, excluded, either `null` for no bound, of the tree under
