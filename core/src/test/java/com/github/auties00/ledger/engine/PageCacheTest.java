@@ -752,6 +752,33 @@ class PageCacheTest {
         }
 
         @Test
+        @DisplayName("of a scan counts the reads of a unit it refused on the refusal, so a recall caches it at the fourth read though the doorkeeper forgot a read, and records each read for a read from the file")
+        void scanRecallCounts() {
+            var cache = screening(LIMIT);
+            var first = unit(page(0));
+            cache.putScreened(page(0), first, PageCache.SCAN);
+            assertSame(first, cache.recall(page(0), PageCache.SCAN), "the second read");
+            assertEquals(2, cache.reads(page(0)));
+            cache.doorkeeperForTests().forgetTwiceForTests(Doorkeeper.FIRST_KEYS);
+            assertEquals(1, cache.reads(page(0)), "the reads once the doorkeeper forgot the second");
+            assertSame(first, cache.recall(page(0), PageCache.SCAN), "the third read");
+            assertNull(cache.peek(page(0)), "the third read");
+            assertEquals(3, cache.reads(page(0)), "the reads the third recall recorded");
+            assertSame(first, cache.recall(page(0), PageCache.SCAN), "the fourth read");
+            assertSame(first, cache.peek(page(0)), "cached at the fourth read");
+
+            var other = unit(page(1));
+            cache.putScreened(page(1), other, PageCache.SCAN);
+            assertSame(other, cache.recall(page(1), PageCache.SCAN), "the second read");
+            assertSame(other, cache.recall(page(1), PageCache.SCAN), "the third read");
+            // As a collection that took the array would leave the table of refused units
+            cache.clearForTests();
+            var fourth = unit(page(1));
+            cache.putScreened(page(1), fourth, PageCache.SCAN);
+            assertSame(fourth, cache.peek(page(1)), "a fourth read from the file, after three the doorkeeper recorded");
+        }
+
+        @Test
         @DisplayName("counts a unit a scan refused again after the collector took its first array once in its table of refused units")
         void refusedAgainOnce() {
             var cache = screening(LIMIT);
