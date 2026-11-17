@@ -3144,7 +3144,7 @@ public final class LiveLedger implements Ledger {
                 frame.spill(record);
             }
             // A put ends with its value, whether the frame copies it or refers to it, or ends the section so far
-            record.add(version, sectioned ? frame.sectionOffset(length) : frame.valueOffset(length), length);
+            record.add(version, sectioned ? frame.sectionOffset(length) : frame.valueOffset(length), length, sectioned);
         }
 
         /// Ends the commit's frame once its last write is in, if it is split ([FrameBody#finishSplit()]); not for a

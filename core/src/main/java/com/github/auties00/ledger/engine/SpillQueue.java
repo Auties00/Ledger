@@ -6,8 +6,6 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.lang.foreign.MemorySegment;
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
@@ -16,6 +14,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.locks.LockSupport;
@@ -397,9 +396,18 @@ final class SpillQueue {
             return;
         }
         try {
-            Thread.ofVirtual().name("ledger-spill").start(this::run);
+            Thread.ofVirtual().name("ledger-spill").start(new Mover());
         } catch (Throwable _) {
             running.set(false);
+        }
+    }
+
+    /// The thread that moves values: a class of its own rather than a lambda, whose first use in a fresh JVM links a
+    /// call site on the thread that starts it, the commit's thread when a commit's values move an array at a time.
+    private final class Mover implements Runnable {
+        @Override
+        public void run() {
+            SpillQueue.this.run();
         }
     }
 
@@ -772,6 +780,9 @@ final class SpillQueue {
         /// The verdict of [#settle(long)] that the record's values on shared arrays that lie back to back on them move
         /// an array at a time ([LogChunk]), and its values on arrays of their own one by one.
         static final int CHUNKS = 3;
+        // Where the places of a section start among the places of a commit's body that the runs compare, past every
+        // place of its own part
+        private static final long SECTION_PLACES = 1L << 32;
         // The bytes of the values the record moves, whether one is at least LOG_VALUE_MIN, and the bytes of the
         // shortest
         private long bytes;
@@ -805,11 +816,23 @@ final class SpillQueue {
             this.offsets = new int[capacity];
         }
 
-        /// Lists `version`, whose value of `length` bytes starts at `offset` of the commit's body.
+        /// Lists `version`, whose value of `length` bytes starts at `offset` of the commit's body, and finds whether it
+        /// goes on the run of values before it ([#findRuns()]).
         ///
         /// @param offset where the value starts in the commit's body; or, for a value a split body left to its section,
         ///               `-1` minus where it starts in the section, until [#resolveSection(int)]
         void add(Version version, int offset, int length) {
+            add(version, offset, length, true);
+        }
+
+        /// Lists `version` as [#add(Version, int, int)] does, finding whether it goes on the run of values before it
+        /// only if `runs`: a commit whose frame holds each value after its put's key lays no two of them back to back,
+        /// so its values make no run that moves.
+        ///
+        /// The runs are found here, as each value is listed, where its version was just made, rather than in a pass
+        /// over every value once the commit is published: a commit of 100,000 values made that pass once, in a JVM
+        /// that may not have compiled its loop yet, on the commit's thread.
+        void add(Version version, int offset, int length, boolean runs) {
             if (count == versions.length) {
                 versions = Arrays.copyOf(versions, count * 2);
                 offsets = Arrays.copyOf(offsets, count * 2);
@@ -825,6 +848,17 @@ final class SpillQueue {
             } else {
                 sharedBytes += length;
                 sharedMoved += length >= LOG_VALUE_MIN ? LOG_VALUE_BYTES : (ARRAY_HEADER + length + 7) & -8;
+            }
+            if (runs) {
+                var home = version.sharedSource();
+                if (home != null) {
+                    var found = this.runs;
+                    if (found == null) {
+                        found = new Runs();
+                        this.runs = found;
+                    }
+                    scan(found, home, version.sourceOffset(), count - 1, offset, length);
+                }
             }
         }
 
@@ -869,21 +903,22 @@ final class SpillQueue {
         /// @return [#ALL], [#OWN], [#NONE] or [#CHUNKS]
         int settle(long chunksMin) {
             if (sharedMoved <= sharedBytes / 2) {
+                runs = null;
                 return ALL;
             }
             if (ownBytes != 0) {
                 ownOnly = true;
                 shortest = ownShortest;
             }
-            if (sharedBytes >= chunksMin) {
+            if (sharedBytes >= chunksMin && runs != null) {
                 var runBytes = findRuns();
                 if (runBytes >= chunksMin) {
                     chunked = true;
                     bytes = runBytes + ownBytes;
                     return CHUNKS;
                 }
-                runs = null;
             }
+            runs = null;
             if (!ownOnly) {
                 return NONE;
             }
@@ -891,8 +926,9 @@ final class SpillQueue {
             return OWN;
         }
 
-        /// Finds the runs of the record's values that lie back to back on one shared array, in the order of the
-        /// writes, and returns their bytes, those of runs that stay left out.
+        /// Ends the runs of the record's values that lie back to back on one shared array, in the order of the writes,
+        /// which [#add(Version, int, int, boolean)] found as it listed them, and returns their bytes, those of runs that
+        /// stay left out.
         ///
         /// A batch's values of paged key spaces lie on its arrays in the order of its writes, each array filled before
         /// the next, so the values the record lists of one array are one run, unless a value the record does not list,
@@ -905,13 +941,7 @@ final class SpillQueue {
         /// being freed only once every value on it moves, and only if they average [LogChunk#PIECE_MIN] bytes; a run
         /// without a byte stays, as it frees nothing.
         private long findRuns() {
-            var runs = new Runs();
-            this.runs = runs;
-            // One call per value: a commit of 100,000 values runs this once, in a JVM that may not have compiled the
-            // loop yet, where a step of its own is compiled after a few hundred calls
-            for (var i = 0; i < count; i++) {
-                scan(runs, i);
-            }
+            var runs = this.runs;
             var runBytes = 0L;
             var first = 0;
             while (first < runs.count) {
@@ -939,35 +969,34 @@ final class SpillQueue {
             return runBytes;
         }
 
-        /// Adds value `i` to the last of `runs`, or starts a run with it, or marks the last run as one that stays.
-        private void scan(Runs runs, int i) {
-            var version = versions[i];
-            var home = version.sharedSource();
-            if (home == null) {
-                return;
-            }
-            var offset = version.sourceOffset();
-            var length = version.valueLength();
-            var body = offsets[i];
+        /// Adds value `i`, at `offset` of `home`, to the last of `runs`, or starts a run with it, or marks the last run as
+        /// one that stays.
+        ///
+        /// @param body where the value starts in the commit's body, or `-1` minus where it starts in the section, which
+        ///             follows the body's own part
+        private static void scan(Runs runs, MemorySegment home, int offset, int i, int body, int length) {
+            // Places in the section come after every place of the own part, where no listed value lies back to back
+            // with one of the section
+            var at = body >= 0 ? body : SECTION_PLACES + (-1L - body);
             var last = runs.count - 1;
             if (last >= 0 && runs.homes[last] == home) {
-                if (runs.ends[last] != offset || body < runs.scanBodyEnd) {
+                if (runs.ends[last] != offset || at < runs.scanBodyEnd) {
                     // A gap, a value before the run's end, or one the frame holds before the run's last value: the run
                     // stays, and so does this value
                     runs.ends[last] = -1;
                     return;
                 }
-                if (body == runs.scanBodyEnd) {
+                if (at == runs.scanBodyEnd) {
                     runs.ends[last] = offset + length;
                     runs.lasts[last] = i;
                     runs.values[last]++;
-                    runs.scanBodyEnd = body + length;
+                    runs.scanBodyEnd = at + length;
                     return;
                 }
                 // Other bytes of the frame lie between the two values: a run of its own from this one
             }
             runs.add(home, i, offset, length);
-            runs.scanBodyEnd = body + length;
+            runs.scanBodyEnd = at + length;
         }
 
         /// {@return the sequence of the commit}
@@ -1100,8 +1129,11 @@ final class SpillQueue {
         /// Starts a thread that tags the runs' blocks while the log seals, writes and forces the commit's frame, as the
         /// record is queued, so the move of the values, once the frame is durable, takes the tags rather than making
         /// them on the thread of the commit that waits for it ([SpillQueue#moveOwn(long)]). A thread the system refuses
-        /// leaves them to the move. The ciphers are taken here, so the thread takes no lock and never parks before it
-        /// publishes the tags.
+        /// leaves them to the move.
+        ///
+        /// The commit's thread does nothing more here: the thread takes the ciphers, the first of which draws the keys
+        /// of the tags, and the class it runs is not a lambda, whose first use links a call site, each a cost a fresh
+        /// JVM paid on the commit's thread before its frame was even sealed.
         ///
         /// @implNote This implementation starts the thread as the record is queued rather than once the frame is sealed,
         /// although it then takes a processor from the seal: started after the seal, the thread has only the force to
@@ -1112,24 +1144,41 @@ final class SpillQueue {
             if (runs == null) {
                 return;
             }
-            var crypto = queue.takeCrypto();
             try {
-                Thread.ofVirtual().name("ledger-chunks").start(() -> {
-                    try {
-                        runAhead(queue, runs, crypto);
-                    } finally {
-                        queue.giveBack(crypto);
-                    }
-                });
+                Thread.ofVirtual().name("ledger-chunks").start(new Ahead(this, queue, runs));
             } catch (Throwable _) {
-                queue.giveBack(crypto);
+                // The move prepares them itself
+            }
+        }
+
+        /// The thread that prepares a record's runs ahead of its move.
+        ///
+        /// @param record the record
+        /// @param queue its queue
+        /// @param runs its runs
+        private record Ahead(Record record, SpillQueue queue, Runs runs) implements Runnable {
+            @Override
+            public void run() {
+                // Before the runs are claimed: drawing the keys of the tags takes the queue's lock, and the move waits
+                // only for a thread that claimed them
+                Crypto crypto;
+                try {
+                    crypto = queue.takeCrypto();
+                } catch (RuntimeException | OutOfMemoryError _) {
+                    return;
+                }
+                try {
+                    record.runAhead(queue, runs, crypto);
+                } finally {
+                    queue.giveBack(crypto);
+                }
             }
         }
 
         /// Prepares `runs` ahead of the move, unless the move claimed them first, and publishes them, none if they could
         /// not be prepared, waking the move if it waits for them.
         private void runAhead(SpillQueue queue, Runs runs, Crypto crypto) {
-            if (!Runs.PREPARING.compareAndSet(runs, Runs.PREPARE_NONE, Runs.PREPARE_RUNNING)) {
+            if (!runs.preparing.compareAndSet(Runs.PREPARE_NONE, Runs.PREPARE_RUNNING)) {
                 return;
             }
             try {
@@ -1141,7 +1190,7 @@ final class SpillQueue {
             } catch (RuntimeException | OutOfMemoryError _) {
                 // The move prepares them itself; a record released meanwhile, its versions gone, is not moved at all
             } finally {
-                runs.preparing = Runs.PREPARE_DONE;
+                runs.preparing.set(Runs.PREPARE_DONE);
                 var waiter = runs.waiter;
                 if (waiter != null) {
                     LockSupport.unpark(waiter);
@@ -1157,15 +1206,15 @@ final class SpillQueue {
         /// preparing the runs itself, so no move waits on a thread that lost its carrier. An interrupt does not end the
         /// wait, and is kept.
         private Prepared takePrepared(SpillQueue queue, Runs runs) {
-            if (Runs.PREPARING.compareAndSet(runs, Runs.PREPARE_NONE, Runs.PREPARE_DONE)) {
+            if (runs.preparing.compareAndSet(Runs.PREPARE_NONE, Runs.PREPARE_DONE)) {
                 return null;
             }
-            if (runs.preparing == Runs.PREPARE_RUNNING) {
+            if (runs.preparing.get() == Runs.PREPARE_RUNNING) {
                 runs.waiter = Thread.currentThread();
                 var interrupted = false;
                 var deadline = System.nanoTime() + queue.prepareWait;
                 long left;
-                while (runs.preparing == Runs.PREPARE_RUNNING && (left = deadline - System.nanoTime()) > 0) {
+                while (runs.preparing.get() == Runs.PREPARE_RUNNING && (left = deadline - System.nanoTime()) > 0) {
                     LockSupport.parkNanos(this, left);
                     interrupted |= Thread.interrupted();
                 }
@@ -1173,7 +1222,7 @@ final class SpillQueue {
                 if (interrupted) {
                     Thread.currentThread().interrupt();
                 }
-                if (runs.preparing == Runs.PREPARE_RUNNING) {
+                if (runs.preparing.get() == Runs.PREPARE_RUNNING) {
                     return null;
                 }
             }
@@ -1212,15 +1261,6 @@ final class SpillQueue {
         private static final int PREPARE_NONE = 0;
         private static final int PREPARE_RUNNING = 1;
         private static final int PREPARE_DONE = 2;
-        private static final VarHandle PREPARING;
-
-        static {
-            try {
-                PREPARING = MethodHandles.lookup().findVarHandle(Runs.class, "preparing", int.class);
-            } catch (ReflectiveOperationException exception) {
-                throw new ExceptionInInitializerError(exception);
-            }
-        }
 
         // Per run: the read-only segment of the array, the first and last index of its values among the record's
         // versions, the values in it, where the first starts on the array and where the last ends; an end of -1 marks
@@ -1232,14 +1272,17 @@ final class SpillQueue {
         private int[] starts;
         private int[] ends;
         private int count;
-        // While the record scans for runs: where the last run's last value ends in the commit's body
-        private int scanBodyEnd;
+        // Where the last run's last value ends: in the commit's body, or SECTION_PLACES past where it ends in the
+        // section
+        private long scanBodyEnd;
         // The tags the thread that prepares the runs ahead made while the log wrote the frame; null until it published
         // them, and if it failed
         private volatile Prepared prepared;
         // PREPARE_NONE until the thread that prepares the runs ahead starts, or the move claims them first;
-        // PREPARE_RUNNING while that thread prepares them; PREPARE_DONE once it published them, or the move claimed them
-        private volatile int preparing;
+        // PREPARE_RUNNING while that thread prepares them; PREPARE_DONE once it published them, or the move claimed
+        // them. An atomic integer, not a field handle, whose first use in a fresh JVM links its call sites on the commit's
+        // thread
+        private final AtomicInteger preparing = new AtomicInteger();
         // The thread of the move waiting for the thread that prepares the runs ahead, which that thread unparks once done
         private volatile Thread waiter;
 
