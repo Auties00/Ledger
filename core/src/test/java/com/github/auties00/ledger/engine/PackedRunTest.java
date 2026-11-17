@@ -25,11 +25,16 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.List;
+import java.util.Objects;
 import java.util.Random;
+import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -623,6 +628,261 @@ class PackedRunTest {
             assertEquals(-1, run.find(MemorySegment.ofArray(key(9, 9))));
             assertEquals(-1, run.find(key(9, 9)));
         }
+    }
+
+    /// {@return a key of chat `chat` of `length` bytes, from 5 to [KeyCodec#MAX_LENGTH], unique by its first five}
+    private static byte[] longKey(int chat, int id, int length) {
+        var key = new byte[length];
+        ByteBuffer.wrap(key).put((byte) chat).putInt(id);
+        for (var i = 5; i < length; i++) {
+            key[i] = (byte) (id * 13 + i);
+        }
+        return key;
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a replay of more than a megabyte of long keys into one key space keeps them in several chunks of the run, read, scanned and counted as the log holds them, before and after the checkpoint that takes them")
+    void replayedKeysSpanChunks(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var random = new Random(11);
+        var lengths = new int[2_400];
+        for (var id = 0; id < lengths.length; id++) {
+            lengths[id] = 5 + random.nextInt(KeyCodec.MAX_LENGTH - 4);
+        }
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            for (var first = 0; first < lengths.length; first += 200) {
+                var batch = ledger.newBatch();
+                for (var id = first; id < first + 200; id++) {
+                    var key = longKey(id % 4, id, lengths[id]);
+                    var value = value(id, 0);
+                    batch.put(MESSAGES, key, value);
+                    expected.put(key, value);
+                }
+                ledger.commit(batch).awaitDurable();
+            }
+            // Overwrites and removals of keys the run takes, and removals of keys never written
+            var batch = ledger.newBatch();
+            for (var id = 0; id < lengths.length; id += 7) {
+                var key = longKey(id % 4, id, lengths[id]);
+                if (id % 2 == 0) {
+                    var value = value(id, 5);
+                    batch.put(MESSAGES, key, value);
+                    expected.put(key, value);
+                } else {
+                    batch.delete(MESSAGES, key);
+                    expected.delete(key);
+                }
+                batch.delete(MESSAGES, longKey(id % 4, -id - 1, KeyCodec.MAX_LENGTH));
+            }
+            ledger.commit(batch).awaitDurable();
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            var run = ledger.state(MESSAGES).run;
+            assertNotNull(run, "the replay built no run");
+            assertTrue(run.keyChunkLengthsForTests().length >= 5, "the run's keys lie in fewer than five chunks");
+            verify(ledger, expected);
+            ledger.checkpoint();
+            assertNull(ledger.state(MESSAGES).run);
+            verify(ledger, expected);
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            verify(ledger, expected);
+        }
+        CheckpointTest.verifyPages(directory, encrypted);
+    }
+
+    static Stream<Arguments> keyLayouts() {
+        return Stream.of(Arguments.of(1, false), Arguments.of(2, true), Arguments.of(3, false), Arguments.of(4, true));
+    }
+
+    @ParameterizedTest(name = "seed {0}, last chunk full: {1}")
+    @MethodSource("keyLayouts")
+    @DisplayName("a run of keys of 1 to 1,024 bytes over many chunks places each key whole in one chunk, trims only the last, and finds, compares, orders and scans every key as a sorted map of them does")
+    void keysAcrossChunks(int seed, boolean fillLast) {
+        var random = new Random(seed);
+        var valueBytes = new byte[64 << 10];
+        random.nextBytes(valueBytes);
+        var valueChunk = MemorySegment.ofArray(valueBytes).asReadOnly();
+        // The newest write of each key: its value, or null for a removal
+        var model = new TreeMap<ByteBuffer, byte[]>(Expected::compare);
+        var builder = new PackedRun.Builder();
+        var stamp = new long[1];
+        // Where the keys end and how many started a chunk early, as the builder places them
+        var placed = new int[2];
+        Consumer<byte[]> write = key -> {
+            var wrapped = ByteBuffer.wrap(key);
+            if (!model.containsKey(wrapped)) {
+                var start = placed[0];
+                if (start % PackedRun.KEY_CHUNK + key.length > PackedRun.KEY_CHUNK) {
+                    start = (start / PackedRun.KEY_CHUNK + 1) * PackedRun.KEY_CHUNK;
+                    placed[1]++;
+                }
+                placed[0] = start + key.length;
+            }
+            var segment = MemorySegment.ofArray(key);
+            assertTrue(builder.takes(segment, null, 100));
+            var kind = random.nextInt(8);
+            if (kind == 0) {
+                builder.delete(segment, stamp[0]++);
+                model.put(wrapped, null);
+            } else if (kind == 1) {
+                builder.put(segment, stamp[0]++, null, 0, 0);
+                model.put(wrapped, new byte[0]);
+            } else {
+                var length = 1 + random.nextInt(100);
+                var offset = random.nextInt(valueBytes.length - length);
+                builder.put(segment, stamp[0]++, valueChunk, offset, length);
+                model.put(wrapped, Arrays.copyOfRange(valueBytes, offset, offset + length));
+            }
+        };
+        // A whole first chunk of keys of the longest length, the last of which ends at the chunk's end
+        for (var id = 0; id < PackedRun.KEY_CHUNK / KeyCodec.MAX_LENGTH; id++) {
+            write.accept(longKey(0, id, KeyCodec.MAX_LENGTH));
+        }
+        assertEquals(PackedRun.KEY_CHUNK, placed[0]);
+        checkBuilder(builder, model, random);
+        // Keys of every length, new ones and writes of earlier ones
+        var keys = new ArrayList<>(model.keySet());
+        while (placed[0] < 6 * PackedRun.KEY_CHUNK) {
+            if (random.nextInt(5) == 0) {
+                write.accept(keys.get(random.nextInt(keys.size())).array());
+                continue;
+            }
+            var length = random.nextInt(4) == 0 ? KeyCodec.MAX_LENGTH - random.nextInt(8) : 1 + random.nextInt(KeyCodec.MAX_LENGTH);
+            var key = new byte[length];
+            random.nextBytes(key);
+            write.accept(key);
+            keys.add(ByteBuffer.wrap(key));
+        }
+        if (fillLast) {
+            // New keys that end exactly at the end of the last chunk
+            var counter = 0;
+            while (placed[0] % PackedRun.KEY_CHUNK != 0) {
+                var rest = PackedRun.KEY_CHUNK - placed[0] % PackedRun.KEY_CHUNK;
+                var length = Math.min(rest, KeyCodec.MAX_LENGTH);
+                byte[] key;
+                if (length >= 5) {
+                    key = longKey(9, counter++, length);
+                } else {
+                    key = new byte[length];
+                    do {
+                        random.nextBytes(key);
+                    } while (model.containsKey(ByteBuffer.wrap(key)));
+                }
+                write.accept(key);
+            }
+        }
+        assertTrue(placed[1] > 0, "no key started a chunk early");
+        checkBuilder(builder, model, random);
+        var run = builder.build(null, null);
+
+        var chunks = run.keyChunkLengthsForTests();
+        var last = chunks.length - 1;
+        assertEquals((placed[0] - 1) / PackedRun.KEY_CHUNK, last, "chunks of the keys");
+        for (var i = 0; i < last; i++) {
+            assertEquals(PackedRun.KEY_CHUNK, chunks[i], "chunk " + i + " is not whole");
+        }
+        assertEquals(placed[0] - last * PackedRun.KEY_CHUNK, chunks[last], "the last chunk is not trimmed to its keys");
+
+        var sorted = new ArrayList<>(model.keySet());
+        assertEquals(sorted.size(), run.size());
+        for (var position = 0; position < run.size(); position++) {
+            var entry = run.entryAt(position);
+            var key = sorted.get(position).array();
+            assertArrayEquals(key, run.key(entry).toArray(ValueLayout.JAVA_BYTE), "key at " + position);
+            assertEquals(entry, run.find(MemorySegment.ofArray(key)));
+            assertEquals(entry, run.find(key));
+            var value = model.get(sorted.get(position));
+            assertEquals(value == null, run.removes(entry));
+            if (value != null) {
+                assertArrayEquals(value, run.valueBytes(entry));
+                assertArrayEquals(value, run.value(entry).toArray(ValueLayout.JAVA_BYTE));
+            }
+        }
+        assertEquals(model.values().stream().filter(Objects::nonNull).count(), run.correction(),
+                "every put of a run over no tree adds a key");
+        // Probes: keys of the run, keys next to them, and keys of no write
+        var probes = new ArrayList<byte[]>();
+        for (var i = 0; i < 400; i++) {
+            var key = sorted.get(random.nextInt(sorted.size())).array();
+            probes.add(key);
+            var near = Arrays.copyOf(key, Math.max(1, Math.min(KeyCodec.MAX_LENGTH, key.length + random.nextInt(3) - 1)));
+            near[near.length - 1] += (byte) (random.nextInt(3) - 1);
+            probes.add(near);
+            var absent = new byte[1 + random.nextInt(KeyCodec.MAX_LENGTH)];
+            random.nextBytes(absent);
+            probes.add(absent);
+        }
+        for (var probe : probes) {
+            var wrapped = ByteBuffer.wrap(probe);
+            var below = model.headMap(wrapped).size();
+            var expectedEntry = model.containsKey(wrapped) ? run.entryAt(below) : -1;
+            assertEquals(expectedEntry, run.find(MemorySegment.ofArray(probe)));
+            assertEquals(expectedEntry, run.find(probe));
+            assertEquals(below, run.lowerPosition(MemorySegment.ofArray(probe)));
+            var entry = run.entryAt(random.nextInt(run.size()));
+            var key = run.key(entry).toArray(ValueLayout.JAVA_BYTE);
+            assertEquals(Integer.signum(Arrays.compareUnsigned(key, probe)),
+                    Integer.signum(run.compareKey(entry, MemorySegment.ofArray(probe))));
+        }
+        // Scans over no tree, whole and between two probes, both ways
+        assertEquals(live(model), scanRun(run, null, null, false));
+        assertEquals(live(model).reversed(), scanRun(run, null, null, true));
+        for (var i = 0; i < 20; i++) {
+            var from = probes.get(random.nextInt(probes.size()));
+            var to = probes.get(random.nextInt(probes.size()));
+            if (Arrays.compareUnsigned(from, to) > 0) {
+                var swap = from;
+                from = to;
+                to = swap;
+            }
+            var range = live(model.subMap(ByteBuffer.wrap(from), true, ByteBuffer.wrap(to), false));
+            assertEquals(range, scanRun(run, from, to, false));
+            assertEquals(range.reversed(), scanRun(run, from, to, true));
+        }
+    }
+
+    /// Checks that `builder` finds every key of `model`, as a removal if its value is `null`, and no other key.
+    private static void checkBuilder(PackedRun.Builder builder, TreeMap<ByteBuffer, byte[]> model, Random random) {
+        for (var entry : model.entrySet()) {
+            var found = builder.find(MemorySegment.ofArray(entry.getKey().array()));
+            assertTrue(found >= 0, "the builder lost a key");
+            assertEquals(entry.getValue() == null, builder.removes(found));
+        }
+        for (var i = 0; i < 100; i++) {
+            var absent = new byte[1 + random.nextInt(KeyCodec.MAX_LENGTH)];
+            random.nextBytes(absent);
+            if (!model.containsKey(ByteBuffer.wrap(absent))) {
+                assertEquals(-1, builder.find(MemorySegment.ofArray(absent)));
+            }
+        }
+    }
+
+    /// {@return the keys `model` puts, in order, each with its value, in hex}
+    private static List<String> live(SortedMap<ByteBuffer, byte[]> model) {
+        var live = new ArrayList<String>();
+        model.forEach((key, value) -> {
+            if (value != null) {
+                live.add(HexFormat.of().formatHex(key.array()) + "=" + HexFormat.of().formatHex(value));
+            }
+        });
+        return live;
+    }
+
+    /// {@return the entries a cursor over `run` alone returns from `from` to `to`, either `null` for no bound, in hex}
+    private static List<String> scanRun(PackedRun run, byte[] from, byte[] to, boolean descending) {
+        var cursor = new PackedRun.Cursor(run, null, from == null ? null : MemorySegment.ofArray(from),
+                to == null ? null : MemorySegment.ofArray(to), descending);
+        var entries = new ArrayList<String>();
+        while (cursor.next()) {
+            var key = cursor.key().toArray(ValueLayout.JAVA_BYTE);
+            assertEquals(0, cursor.compareKey(MemorySegment.ofArray(key)));
+            entries.add(HexFormat.of().formatHex(key) + "=" + HexFormat.of().formatHex(cursor.value().toArray(ValueLayout.JAVA_BYTE)));
+        }
+        cursor.release();
+        return entries;
     }
 
     static IntStream seeds() {
