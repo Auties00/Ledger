@@ -1767,8 +1767,11 @@ public final class LiveLedger implements Ledger {
     /// Applies the write of the companion `slot` of the computed write `primary`, which applied first: puts the entry
     /// when the value it left is a member and the one it replaced was not, removes it in the opposite case.
     ///
-    /// Whether the companion holds the entry is what membership says of the value replaced, as the store writes it only
-    /// in step; a resident companion knows from memory alone.
+    /// Whether the companion holds the entry is not inferred from the membership of the value replaced: a write of the
+    /// primary that named no companion, or a range removal of it alone, leaves the companion out of step, and an
+    /// existence inferred from membership would then miscount the companion. A paged companion's write is blind, its
+    /// existence learned as any blind write's is, so the commit reads nothing here; a resident companion knows from
+    /// memory alone.
     private void applyCompanion(Applier applier, ComputeSlot primary, ComputeSlot slot, KeyspaceState state, Chain chain,
                                 MemorySegment key) {
         var previous = primary.appliedPrevious;
@@ -1779,7 +1782,7 @@ public final class LiveLedger implements Ledger {
             applier.claimedOnly(state, chain);
             return;
         }
-        var existed = state.resident ? TreeSearch.ABSENT : was ? TreeSearch.FOUND : TreeSearch.ABSENT;
+        var existed = state.resident ? TreeSearch.ABSENT : TreeSearch.BLIND;
         if (is) {
             var decoded = state.resident && state.keyspace.values() != BuiltinCodecs.BYTES_VALUE
                     ? state.keyspace.values().decode(EMPTY_SEGMENT) : EMPTY_VALUE;

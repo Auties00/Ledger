@@ -104,6 +104,49 @@ class CompanionTest {
         }
     }
 
+    @ParameterizedTest
+    @EnumSource(Store.class)
+    @DisplayName("a compute after a blind put of a member counts the companions it finds, not the ones membership implies")
+    void afterBlindPut(Store store, @TempDir Path directory) {
+        try (var ledger = open(store, directory)) {
+            // The blind put names no companion, so neither holds an entry for the member it writes
+            ledger.commit(ledger.newBatch().put(MESSAGES, "a", "x*^"));
+            compute(ledger, "a", "plain");
+            assertEquals(List.of(), keys(ledger, STARRED));
+            assertEquals(List.of(), keys(ledger, PINNED));
+            assertEquals(0, ledger.size(STARRED));
+            assertEquals(0, ledger.size(PINNED));
+            assertEquals(0, ledger.count(PINNED, KeyRange.all()));
+            if (store == Store.DIRECTORY) {
+                ledger.checkpoint();
+                assertEquals(0, ledger.size(PINNED));
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(Store.class)
+    @DisplayName("a compute after a range removal of the primary alone counts the companions it finds")
+    void afterPrimaryRangeRemoval(Store store, @TempDir Path directory) {
+        try (var ledger = open(store, directory)) {
+            compute(ledger, "a", "x*^");
+            if (store == Store.DIRECTORY) {
+                ledger.checkpoint();
+            }
+            // The companions keep their entries: the removal names only the primary
+            ledger.commit(ledger.newBatch().deleteRange(MESSAGES, KeyRange.all()));
+            compute(ledger, "a", "y*^");
+            assertEquals(List.of("a"), keys(ledger, STARRED));
+            assertEquals(List.of("a"), keys(ledger, PINNED));
+            assertEquals(1, ledger.size(STARRED));
+            assertEquals(1, ledger.size(PINNED));
+            if (store == Store.DIRECTORY) {
+                ledger.checkpoint();
+                assertEquals(1, ledger.size(PINNED));
+            }
+        }
+    }
+
     @Test
     @DisplayName("a companion must be another key space, opened, and given once")
     void validation() {
