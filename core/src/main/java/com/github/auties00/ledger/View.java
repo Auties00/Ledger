@@ -124,7 +124,9 @@ public sealed interface View permits Ledger, Snapshot, Transaction {
     /// The count is exact, as [#size] is. It reads the tree's nodes on the paths to the two bounds, and looks up in the
     /// tree each key of the range written since the last checkpoint, so its cost grows with those keys, not with the
     /// entries of the range. A [Keyspace.Residency#RESIDENT] key space whose entries are all in memory is counted there,
-    /// without reading the files. In a [Transaction] the count takes in the transaction's own writes.
+    /// without reading the files, but entry by entry: its cost grows with the entries of the range, so a large range of
+    /// a resident key space, such as a whole index, is cheaper to count through [#size] or as a paged key space. In a
+    /// [Transaction] the count takes in the transaction's own writes.
     ///
     /// @param keyspace the key space to count
     /// @param range the keys to count; its order does not matter
