@@ -119,7 +119,9 @@ public sealed interface WriteBatch permits ArrayWriteBatch {
     /// Each companion holds a zero-length entry under the same key bytes while the value is a member: the commit puts
     /// it when the value the write leaves is a member and the one it replaced was not, and removes it in the opposite
     /// case, from the value of the function's last run. The companions' writes apply with the computed one, ordered
-    /// with every other write of their keys.
+    /// with every other write of their keys. They stay in step with the values only if every write of `keyspace` is
+    /// such a compute naming all of them, and every range removal of `keyspace` removes the same range of each of them
+    /// in the same batch, as [Companion] describes.
     ///
     /// @param keyspace the key space to write
     /// @param key the key
