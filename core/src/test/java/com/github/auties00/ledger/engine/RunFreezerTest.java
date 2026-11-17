@@ -635,9 +635,10 @@ class RunFreezerTest {
 
     @Test
     @Timeout(60)
-    @DisplayName("a scan that holds the run before a freeze keeps the freeze from dropping its chains, and returns every key")
+    @DisplayName("a scan that holds the run before a freeze keeps the freeze from dropping its chains, and returns every key; the next freeze drops them, and does not take them for keys written again")
     void scanDuringFreeze(@TempDir Path directory) throws Exception {
-        try (var ledger = open(directory, false)) {
+        // A least number of chains no test reaches, so the key space's next threshold shows what the freezes judged
+        try (var ledger = open(directory, false, 1_000_000)) {
             var expected = history(ledger);
             write(ledger, expected, 150, 450, 1, 1);
             var outcome = new AtomicReference<RunFreezer.Outcome>();
@@ -663,6 +664,8 @@ class RunFreezerTest {
             // Once no scan holds it, the next freeze drops them
             var next = ledger.freezeForTests(MESSAGES);
             assertEquals(next.candidates(), next.dropped(), next.toString());
+            assertTrue(ledger.state(MESSAGES).freezeAt != KeyspaceState.NO_FREEZE,
+                    "the chains the first freeze left beside their entries counted as keys written again");
             verify(ledger, expected);
             ledger.checkpoint();
             verify(ledger, expected);

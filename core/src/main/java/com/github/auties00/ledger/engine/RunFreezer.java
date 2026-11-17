@@ -40,8 +40,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /// as its frozen run holds, so the rebuilds copy at most twice the run they end with; and once more as the log nears
 /// the next checkpoint, so that checkpoint starts with most of the chains frozen. Only a key space whose samples show
 /// it replaces few of its values before a checkpoint freezes ([ValueSlab.Overwrites#spills()]), and one whose freeze
-/// finds a quarter of its chains' keys frozen already, written again since, freezes no more until the next cut:
-/// overwritten keys would only go from chains to the run and back. A freeze that finds fewer chains ready than half of
+/// finds a quarter of its chains' keys frozen and dropped already, written again since, freezes no more until the next
+/// cut: overwritten keys would only go from chains to the run and back. A chain an earlier freeze left beside its entry,
+/// as its wait for the walkers ran out or a checkpoint came, is not one. A freeze that finds fewer chains ready than half of
 /// those it waited for doubles the wait, so chains whose values never leave their arrays do not start one freeze after
 /// another.
 final class RunFreezer {
@@ -53,8 +54,8 @@ final class RunFreezer {
     /// The chains a freeze drops per hold of the publishing role, as many as the sweep prunes: a commit that finds the
     /// role held waits for at most this many drops, a few tens of microseconds.
     private static final int DROP_CHUNK = 256;
-    /// The share of the frozen chains, a quarter, whose keys the run held already past which a key space freezes no
-    /// more until the next cut.
+    /// The share of the frozen chains, a quarter, whose keys the run held already from a dropped chain past which a key
+    /// space freezes no more until the next cut.
     private static final int CHURN_SHARE = 4;
     /// How long no freeze starts after one could not run: a checkpoint ran or was about to, or a reader held an older
     /// tree, or a run a checkpoint took waited for one, none of which the commits that ask meanwhile change.

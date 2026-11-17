@@ -652,7 +652,8 @@ final class PackedRun {
             return entries[index];
         }
 
-        /// {@return how many of the chains replaced an entry of the run before}
+        /// {@return how many of the chains replaced an entry of the run before whose chain the freeze that made it
+        /// dropped, so a commit wrote the key again since}
         int replaced() {
             return replaced;
         }
@@ -758,10 +759,15 @@ final class PackedRun {
                     if (order == 0) {
                         inBase[out] = previousKnown == null ? TreeSearch.UNKNOWN : previousKnown[p];
                         // A chain the previous freeze dropped had its blind write counted by its entry, which the
-                        // chain written since, counted against that entry, leaves to this one
+                        // chain written since, counted against that entry, leaves to this one; a chain it left beside
+                        // its entry still counts its own
                         var before = previousEffects == null ? COUNTED : previousEffects[p];
-                        effects[out] = before == SHADOWED ? SHADOWED : before;
-                        replaced++;
+                        effects[out] = before;
+                        if (before != SHADOWED) {
+                            // Written again since the previous freeze dropped its chain: one it did not drop comes
+                            // back unwritten
+                            replaced++;
+                        }
                         p++;
                     } else {
                         // Not the chain's blind state, which a write taken by an earlier tree settled against that tree
