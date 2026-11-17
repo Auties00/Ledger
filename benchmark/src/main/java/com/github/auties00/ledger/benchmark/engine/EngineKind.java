@@ -39,6 +39,24 @@ public enum EngineKind {
             return LedgerEngine.open(directory, settings, true, true);
         }
     },
+    /// Ledger as [#LEDGER], computing each read-modify-write in a transaction, which runs alone, rather than with
+    /// `compute`, which runs beside the other commits. Not in the workloads' default engines but those of
+    /// read-modify-writes: it shows what `compute` saves.
+    LEDGER_EXCLUSIVE("ledger-exclusive", false, true) {
+        @Override
+        public Engine open(Path directory, EngineSettings settings) {
+            return LedgerEngine.open(directory, settings, true, false, LedgerEngine.ComputeMode.EXCLUSIVE);
+        }
+    },
+    /// Ledger as [#LEDGER], computing each read-modify-write under a lock of 256 per key over a read and a commit, the
+    /// lock an application adds over an engine without a read-modify-write of its own. Not in the workloads' default
+    /// engines but those of read-modify-writes: it is the design `compute` replaces.
+    LEDGER_STRIPED("ledger-striped", false, true) {
+        @Override
+        public Engine open(Path directory, EngineSettings settings) {
+            return LedgerEngine.open(directory, settings, true, false, LedgerEngine.ComputeMode.STRIPED);
+        }
+    },
     /// H2 MVStore, the engine under Cobalt's current store: a copy-on-write B-tree written as append-only chunks.
     MVSTORE("mvstore", false) {
         @Override

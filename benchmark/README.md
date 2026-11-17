@@ -9,6 +9,8 @@ JMH workloads that compare Ledger with other embedded storage engines. Some work
 | `ledger` | Ledger, encrypting its files with AES-256-GCM: a group-committed log checkpointed into copy-on-write B+trees; sessions and chats resident, the rest paged | yes |
 | `ledger-plain` | The same without encryption | yes |
 | `ledger-resident-at-open` | `ledger`, reading its resident key spaces while it opens; only when `-p engine` names it, to compare the two ways of loading them | yes |
+| `ledger-exclusive` | `ledger`, running each read-modify-write as a transaction, which runs alone; in the read-modify-write workloads | yes |
+| `ledger-striped` | `ledger`, running each read-modify-write under one of 256 locks per key over a read and a commit, as an application adds over an engine without one; in the read-modify-write workloads | yes |
 | `mvstore` | H2 MVStore 2.5.252, configured as Cobalt's current store configures it | yes |
 | `mvstore-encrypted` | The same, with MVStore's XTS-AES file encryption (not authenticated) | yes |
 | `rocksdb` | RocksDB 11.8.1 through JNI: an LSM tree with a write-ahead log and group commit | no |
@@ -49,6 +51,8 @@ Cobalt's workloads, in `workload.cobalt`:
 | `WebhookInboxBenchmark` | Cloud webhook deliveries: stored durably, removed once handled, four at a time |
 | `ReopenBenchmark` | Startup over an existing store, and the memory the warm store holds |
 | `ChatDeleteBenchmark` | Clearing the most active chat |
+| `ChatUpdateBenchmark` | `OfflineDrainBenchmark` with the chat read and rebuilt in the batch (unread count, last timestamp) through the engine's read-modify-write, against the same batch with the chat put blind |
+| `ChatCountBenchmark` | Counting a chat of about 5,000 messages, warm and after a reopen, with and without 10,000 messages written since the last checkpoint; the engines without a count scan the chat |
 
 Workloads Ledger is not built for, in `workload.limits`:
 
@@ -63,6 +67,8 @@ Workloads Ledger is not built for, in `workload.limits`:
 | `PinnedReaderBenchmark` | File growth while a long reader pins an old version |
 | `CallerThreadsBenchmark` | Durable and deferred writes from platform threads and from virtual threads, Ledger only: what the kind of the calling thread costs |
 | `CallerThreadsReadBenchmark` | Lookups by id from eight platform threads and from eight virtual threads, Ledger only |
+| `ReadModifyWriteBenchmark` | Counter increments from 1 to 256 virtual threads on one hot key, 64 keys or a million (Zipf or uniform), resident or paged, through the engine's read-modify-write, against a read and a write held by nothing and a blind write; the `functionRuns` counter gives the function's runs per operation |
+| `HeadOfLineBenchmark` | The latency of blind commits of eight threads while one or four threads update one hot key, through the engine's read-modify-write or a blind put, against the same commits with the hot key idle |
 
 Memory, in `workload.memory`:
 

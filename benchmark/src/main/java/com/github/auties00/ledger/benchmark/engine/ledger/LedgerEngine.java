@@ -19,6 +19,7 @@ import java.lang.foreign.MemorySegment;
 import java.nio.file.Path;
 import java.util.EnumMap;
 import java.util.Locale;
+import java.util.function.UnaryOperator;
 
 /// Ledger, as Cobalt will open it: one store, a resident key space for the small records read on every message
 /// (sessions, chats) and paged key spaces for the rest.
@@ -32,11 +33,25 @@ public final class LedgerEngine implements Engine {
     private final Ledger ledger;
     private final EnumMap<Keyspace, com.github.auties00.ledger.Keyspace<byte[], byte[]>> keyspaces;
     private final Path directory;
+    // How a read-modify-write runs
+    private final ComputeMode computeMode;
 
-    private LedgerEngine(Ledger ledger, EnumMap<Keyspace, com.github.auties00.ledger.Keyspace<byte[], byte[]>> keyspaces, Path directory) {
+    /// How [LedgerEngine] runs a read-modify-write.
+    public enum ComputeMode {
+        /// Through `Ledger.compute` and `WriteBatch.compute`, beside the other commits.
+        COMPUTE,
+        /// In a transaction, which runs alone.
+        EXCLUSIVE,
+        /// Under a lock of the engine's stripes, over a read and a commit: the per-key lock an application adds.
+        STRIPED
+    }
+
+    private LedgerEngine(Ledger ledger, EnumMap<Keyspace, com.github.auties00.ledger.Keyspace<byte[], byte[]>> keyspaces, Path directory,
+                         ComputeMode computeMode) {
         this.ledger = ledger;
         this.keyspaces = keyspaces;
         this.directory = directory;
+        this.computeMode = computeMode;
     }
 
     /// Opens or creates the store in `directory`.
@@ -55,6 +70,18 @@ public final class LedgerEngine implements Engine {
     /// @param residentAtOpen whether the open reads the resident key spaces whatever the store's default is
     /// @return the open engine
     public static LedgerEngine open(Path directory, EngineSettings settings, boolean encrypted, boolean residentAtOpen) {
+        return open(directory, settings, encrypted, residentAtOpen, ComputeMode.COMPUTE);
+    }
+
+    /// Opens or creates the store in `directory`.
+    ///
+    /// @param settings the shared settings; their cache becomes the page cache
+    /// @param encrypted whether the store encrypts its files, with AES-256-GCM
+    /// @param residentAtOpen whether the open reads the resident key spaces whatever the store's default is
+    /// @param computeMode how a read-modify-write runs
+    /// @return the open engine
+    public static LedgerEngine open(Path directory, EngineSettings settings, boolean encrypted, boolean residentAtOpen,
+                                    ComputeMode computeMode) {
         var keyspaces = new EnumMap<Keyspace, com.github.auties00.ledger.Keyspace<byte[], byte[]>>(Keyspace.class);
         var options = Ledger.builder()
                 .directory(directory)
@@ -73,7 +100,7 @@ public final class LedgerEngine implements Engine {
             keyspaces.put(keyspace, mapped);
             options.keyspace(mapped);
         }
-        return new LedgerEngine(options.build(), keyspaces, directory);
+        return new LedgerEngine(options.build(), keyspaces, directory, computeMode);
     }
 
     @Override
@@ -101,6 +128,70 @@ public final class LedgerEngine implements Engine {
             Thread.currentThread().interrupt();
             throw new InterruptedIOException("Interrupted while waiting for durability");
         }
+    }
+
+    @Override
+    public void compute(Keyspace keyspace, byte[] key, UnaryOperator<byte[]> function, Durability durability) throws IOException {
+        if (computeMode != ComputeMode.COMPUTE) {
+            computeIn(new WriteBatch(), keyspace, key, function, durability);
+            return;
+        }
+        var computed = ledger.compute(keyspaces.get(keyspace), key, function);
+        if (durability == Durability.DURABLE) {
+            await(computed);
+        }
+    }
+
+    @Override
+    public void computeIn(WriteBatch batch, Keyspace keyspace, byte[] key, UnaryOperator<byte[]> function,
+                          Durability durability) throws IOException {
+        if (computeMode == ComputeMode.STRIPED) {
+            Engine.super.computeIn(batch, keyspace, key, function, durability);
+            return;
+        }
+        com.github.auties00.ledger.Commit commit;
+        if (computeMode == ComputeMode.EXCLUSIVE) {
+            commit = ledger.update(transaction -> {
+                for (var i = 0; i < batch.size(); i++) {
+                    var value = batch.value(i);
+                    if (value == null) {
+                        transaction.delete(keyspaces.get(batch.keyspace(i)), batch.key(i));
+                    } else {
+                        transaction.put(keyspaces.get(batch.keyspace(i)), batch.key(i), value);
+                    }
+                }
+                var mapped = keyspaces.get(keyspace);
+                var current = transaction.get(mapped, key).orElse(null);
+                var result = function.apply(current);
+                if (result != current) {
+                    if (result == null) {
+                        transaction.delete(mapped, key);
+                    } else {
+                        transaction.put(mapped, key, result);
+                    }
+                }
+            });
+        } else {
+            var writes = ledger.newBatch();
+            for (var i = 0; i < batch.size(); i++) {
+                var value = batch.value(i);
+                if (value == null) {
+                    writes.delete(keyspaces.get(batch.keyspace(i)), batch.key(i));
+                } else {
+                    writes.put(keyspaces.get(batch.keyspace(i)), batch.key(i), value);
+                }
+            }
+            writes.compute(keyspaces.get(keyspace), key, function);
+            commit = ledger.commit(writes);
+        }
+        if (durability == Durability.DURABLE) {
+            await(commit);
+        }
+    }
+
+    @Override
+    public long count(Keyspace keyspace, byte[] from, byte[] to) {
+        return ledger.count(keyspaces.get(keyspace), KeyRange.between(from, to));
     }
 
     @Override

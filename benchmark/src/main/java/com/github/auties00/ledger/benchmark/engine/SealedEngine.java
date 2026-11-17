@@ -10,6 +10,7 @@ import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.UnaryOperator;
 
 /// Seals every value with AES-256-GCM before it reaches the wrapped engine, as an application must to store data
 /// authenticated and encrypted in an engine that cannot.
@@ -83,6 +84,41 @@ public final class SealedEngine implements Engine {
     @Override
     public void deleteRange(Keyspace keyspace, byte[] from, byte[] to, Durability durability) throws IOException {
         delegate.deleteRange(keyspace, from, to, durability);
+    }
+
+    @Override
+    public void computeIn(WriteBatch batch, Keyspace keyspace, byte[] key, UnaryOperator<byte[]> function,
+                          Durability durability) throws IOException {
+        var sealed = new WriteBatch();
+        for (var i = 0; i < batch.size(); i++) {
+            var value = batch.value(i);
+            if (value == null) {
+                sealed.delete(batch.keyspace(i), batch.key(i));
+            } else {
+                sealed.put(batch.keyspace(i), batch.key(i), seal(batch.key(i), value));
+            }
+        }
+        try {
+            delegate.computeIn(sealed, keyspace, key, stored -> {
+                try {
+                    var plain = stored == null ? null : open(key, stored);
+                    var result = function.apply(plain);
+                    if (result == plain) {
+                        return stored;
+                    }
+                    return result == null ? null : seal(key, result);
+                } catch (IOException exception) {
+                    throw new SealException(exception);
+                }
+            }, durability);
+        } catch (SealException exception) {
+            throw exception.cause;
+        }
+    }
+
+    @Override
+    public long count(Keyspace keyspace, byte[] from, byte[] to) throws IOException {
+        return delegate.count(keyspace, from, to);
     }
 
     @Override

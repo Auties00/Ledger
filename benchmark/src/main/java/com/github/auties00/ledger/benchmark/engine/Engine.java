@@ -1,6 +1,9 @@
 package com.github.auties00.ledger.benchmark.engine;
 
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.UnaryOperator;
 
 /// One storage engine, adapted to the operations the workloads need.
 ///
@@ -57,6 +60,70 @@ public interface Engine extends AutoCloseable {
         });
         write(batch, durability);
     }
+
+    /// Replaces the value under `key` with what `function` makes of it, so that no other compute of the key comes
+    /// between the value read and the value written.
+    ///
+    /// `function` receives the value, `null` if there is none, and returns the new value, `null` to delete the key, or
+    /// the array it received to leave it unchanged; it may run more than once, and must not change the array it
+    /// receives.
+    ///
+    /// @implSpec The default implementation calls [#computeIn] with an empty batch.
+    /// @param keyspace the key space to write
+    /// @param key the key
+    /// @param function makes the new value from the current one
+    /// @param durability when the write must reach stable storage
+    /// @throws IOException if the engine fails to read or write
+    default void compute(Keyspace keyspace, byte[] key, UnaryOperator<byte[]> function, Durability durability) throws IOException {
+        computeIn(new WriteBatch(), keyspace, key, function, durability);
+    }
+
+    /// Applies `batch` and what `function` makes of the value under `key`, atomically, as [#compute] does for the key.
+    ///
+    /// @implSpec The default implementation holds a lock of [#STRIPES] for the key, which every compute of the key takes,
+    /// while it reads the value, applies the function and writes the batch with the result: the per-key lock an
+    /// application adds over an engine that has no read-modify-write of its own, which every writer of the key must take.
+    /// @param batch the other writes, which this call may extend
+    /// @param keyspace the key space of the computed key
+    /// @param key the computed key
+    /// @param function makes the new value from the current one
+    /// @param durability when the writes must reach stable storage
+    /// @throws IOException if the engine fails to read or write
+    default void computeIn(WriteBatch batch, Keyspace keyspace, byte[] key, UnaryOperator<byte[]> function,
+                           Durability durability) throws IOException {
+        var lock = STRIPES[(System.identityHashCode(this) * 31 + keyspace.ordinal() * 17 + Arrays.hashCode(key)) & (STRIPES.length - 1)];
+        lock.lock();
+        try {
+            var current = get(keyspace, key);
+            var result = function.apply(current);
+            if (result != current) {
+                if (result == null) {
+                    batch.delete(keyspace, key);
+                } else {
+                    batch.put(keyspace, key, result);
+                }
+            }
+            if (batch.size() > 0) {
+                write(batch, durability);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// {@return the number of entries of `keyspace` whose keys are in `[from, to)`}
+    ///
+    /// @implSpec The default implementation scans the range.
+    /// @param keyspace the key space to count
+    /// @param from the lowest key counted
+    /// @param to the first key not counted
+    /// @throws IOException if the engine fails to read
+    default long count(Keyspace keyspace, byte[] from, byte[] to) throws IOException {
+        return scan(keyspace, from, to, false, Integer.MAX_VALUE, (_, _) -> true);
+    }
+
+    /// The 256 locks the default [#computeIn] stripes the computed keys of every engine over.
+    ReentrantLock[] STRIPES = java.util.stream.Stream.generate(ReentrantLock::new).limit(256).toArray(ReentrantLock[]::new);
 
     /// Opens a read view that keeps seeing the current state while later writes go on.
     ///
