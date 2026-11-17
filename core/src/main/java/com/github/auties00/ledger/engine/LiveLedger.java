@@ -108,10 +108,12 @@ public final class LiveLedger implements Ledger {
     private static final VarHandle HOT_LOCKS_FIELD;
     /// The locks the computes of hot keys take turns on, a power of two.
     private static final int HOT_LOCKS = 256;
+    /// The uncontended computes a hot lock takes before it cools, and computes of its keys race again.
+    private static final int HOT_HEAT = 64;
 
     static {
         try {
-            HOT_LOCKS_FIELD = MethodHandles.lookup().findVarHandle(LiveLedger.class, "hotLocks", ReentrantLock[].class);
+            HOT_LOCKS_FIELD = MethodHandles.lookup().findVarHandle(LiveLedger.class, "hotLocks", HotLock[].class);
             LAST_PUBLISHED = MethodHandles.lookup().findVarHandle(Padded.PublishedFields.class, "last", PendingCommit.class);
             LATEST = MethodHandles.lookup().findVarHandle(Padded.PublishedFields.class, "latest", long.class);
         } catch (ReflectiveOperationException exception) {
@@ -224,7 +226,7 @@ public final class LiveLedger implements Ledger {
     // Starts the counts of range removals that run on threads of their own
     private volatile Executor rangeCounts;
     // The locks of hot keys, made at the first compute of one, or null
-    private volatile ReentrantLock[] hotLocks;
+    private volatile HotLock[] hotLocks;
     // The chunks the values of the fastest commits of a store with pages share
     private final ValueSlab valueSlab;
     // The paged values waiting for a checkpoint that may leave the heap for the log, or null for a store that moves none
@@ -991,24 +993,42 @@ public final class LiveLedger implements Ledger {
         checkNotInTransaction();
         var batch = new ArrayWriteBatch(batchScope);
         var locks = hotLocks;
-        // A compute that finds its key's lock taken, by a compute of a hot key, queues behind it rather than race it
-        if (locks == null || !locks[hotIndex(keyspace, key)].isLocked()) {
+        var index = locks == null ? -1 : hotIndex(keyspace, key);
+        // A compute whose key's lock is warm, or taken by a compute of a hot key, queues behind it rather than race it
+        if (locks == null || locks[index].heat == 0 && !locks[index].isLocked()) {
             var computation = (BatchComputation<V>) batch.compute(keyspace, key, function);
             if (batch.slots()[0].ran) {
                 return new LiveComputed<>(commit(batch), computation);
             }
             batch.clear();
+            index = hotIndex(keyspace, key);
+            hotLock(index).heat = HOT_HEAT;
         }
         // A write of the key was under way: the computes of a hot key take turns, so at most one of them waits in the
         // pipeline at a time, rather than a queue of them that every later commit would wait behind
-        var lock = hotLock(hotIndex(keyspace, key));
+        var lock = hotLock(index);
         lock.lock();
         try {
             var computation = (BatchComputation<V>) batch.compute(keyspace, key, function);
-            return new LiveComputed<>(commit(batch), computation);
+            var hot = !batch.slots()[0].ran;
+            var computed = new LiveComputed<>(commit(batch), computation);
+            // The lock cools down once its computes come one at a time and find no write under way
+            if (hot || lock.hasQueuedThreads()) {
+                lock.heat = HOT_HEAT;
+            } else if (lock.heat > 0) {
+                lock.heat--;
+            }
+            return computed;
         } finally {
             lock.unlock();
         }
+    }
+
+    /// A lock of hot keys, and how warm it is: while it is warm, every compute of its keys takes it, so a compute
+    /// arriving as the lock passes from one holder to the next queues rather than overtake the queue.
+    private static final class HotLock extends ReentrantLock {
+        /// The computes left before the lock cools, [#HOT_HEAT] when it last saw contention; racy, as a hint.
+        volatile int heat;
     }
 
     /// {@return the index of the hot lock of `key` of `keyspace`}
@@ -1021,12 +1041,12 @@ public final class LiveLedger implements Ledger {
     /// The locks are no part of the ordering of writes, which the pipeline alone gives: a compute holds one only to
     /// wait for the compute of its key ahead of it to become visible before it reads, so its function runs once, on
     /// the calling thread, and no commit waits behind a run of the function in the order of the commits.
-    private ReentrantLock hotLock(int index) {
+    private HotLock hotLock(int index) {
         var locks = hotLocks;
         if (locks == null) {
-            locks = new ReentrantLock[HOT_LOCKS];
+            locks = new HotLock[HOT_LOCKS];
             for (var i = 0; i < locks.length; i++) {
-                locks[i] = new ReentrantLock();
+                locks[i] = new HotLock();
             }
             if (!HOT_LOCKS_FIELD.compareAndSet(this, null, locks)) {
                 locks = hotLocks;
