@@ -3,3 +3,4 @@ bench-data/
 .idea/
 *.iml
 jmh-result*.json
+.flattened-pom.xml
