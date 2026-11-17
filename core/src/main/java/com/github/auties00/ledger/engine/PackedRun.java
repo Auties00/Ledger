@@ -1,5 +1,7 @@
 package com.github.auties00.ledger.engine;
 
+import com.github.auties00.ledger.KeyCodec;
+
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
@@ -27,11 +29,11 @@ import java.util.Arrays;
 /// replay runs and the run's after, so it is exact, never blind.
 ///
 /// Per entry it keeps the key's bytes and their end, a word of the value's place and kind, a slot of the hash table and an
-/// index of the key order; a value shorter than [SpillQueue#LOG_VALUE_MIN] lies in the replay's chunks
-/// ([ReplayValues]), and a longer one stays in the log, where the run keeps its place, its tag and its stamp, which the
-/// tag binds, as a [LogValue] would. A message that took a chain, a version, a [LogValue], an entry of the hash index, of
-/// the dirty and blind lists, and a node of the ordered map once scanned, about 300 bytes over its key and value, takes
-/// about 50 here.
+/// index of the key order; the keys lie in chunks of [#KEY_CHUNK] bytes, a value shorter than
+/// [SpillQueue#LOG_VALUE_MIN] in the replay's chunks ([ReplayValues]), and a longer one stays in the log, where the run
+/// keeps its place, its tag and its stamp, which the tag binds, as a [LogValue] would. A message that took a chain, a
+/// version, a [LogValue], an entry of the hash index, of the dirty and blind lists, and a node of the ordered map once
+/// scanned, about 300 bytes over its key and value, takes about 50 here.
 ///
 /// Immutable once built, so readers use it without synchronization; [#correction()] and the tree lookups it caches
 /// take a lock of their own.
@@ -42,8 +44,15 @@ final class PackedRun {
     static final int MAX_SEGMENTS = 1 << 16;
     /// The longest value a run takes: the bits of the word of an entry that hold a logged value's length.
     static final int MAX_VALUE_LENGTH = (1 << 30) - 1;
-    /// The bytes the keys of a run take at most, all in one array whose length doubles as the builder grows.
+    /// The bytes the keys of a run take at most, with the ends of the chunks no key fit: the builder takes no key that
+    /// could pass it once moved to the start of the next chunk.
     static final int MAX_KEY_BYTES = 1 << 30;
+    /// The bytes of a chunk of the keys: below half the smallest region of the G1 collector, as the replay's chunks
+    /// of values are, so no array of a run's keys is humongous whatever the heap. A key never crosses a chunk: one that
+    /// does not fit the rest of a chunk starts the next.
+    static final int KEY_CHUNK = 1 << 18;
+    private static final int KEY_CHUNK_BITS = Integer.numberOfTrailingZeros(KEY_CHUNK);
+    private static final int KEY_OFFSET_MASK = KEY_CHUNK - 1;
     // The kind and place of a value, in the word of an entry: the sign bit for a removal; then a bit for a value in the
     // log, whose length and index among the logged values follow; otherwise the length, the chunk and the offset of a
     // value in a chunk of the replay
@@ -66,13 +75,17 @@ final class PackedRun {
         if (ReplayValues.CHUNK_BYTES > 1 << OFFSET_BITS || SpillQueue.LOG_VALUE_MIN > LENGTH_MASK) {
             throw new ExceptionInInitializerError("A value in a chunk does not fit the word of its entry");
         }
+        if (KeyCodec.MAX_LENGTH > KEY_CHUNK) {
+            throw new ExceptionInInitializerError("A key does not fit a chunk of the keys");
+        }
     }
 
-    // The bytes of the keys, one after another, and where each ends: entry i's key starts where entry i - 1's ends
-    private final byte[] keys;
+    // The chunks of the keys, and where each key ends, as its chunk times KEY_CHUNK plus its end in the chunk: entry
+    // i's key starts where entry i - 1's ends, or at the start of the next chunk if it did not fit the rest of that one
+    private final byte[][] keys;
     private final int[] keyEnds;
-    // A read-only view of `keys`, which the slices of a key are made of
-    private final MemorySegment keyView;
+    // Read-only views of the chunks of `keys`, which the slices of a key are made of
+    private final MemorySegment[] keyViews;
     // The kind and place of each entry's value
     private final long[] values;
     // The read-only views of the replay's chunks the short values lie in
@@ -106,11 +119,22 @@ final class PackedRun {
     private PackedRun(Builder builder, TreeRoot base, PageFile pages) {
         var size = builder.size;
         this.size = size;
-        this.keys = Arrays.copyOf(builder.keys, builder.keyBytes);
+        // Every chunk but the last is whole; the last is trimmed to the bytes its keys take
+        var keys = builder.keyChunks.toArray(byte[][]::new);
+        var last = keys.length - 1;
+        var lastUsed = builder.keyBytes - last * KEY_CHUNK;
+        if (lastUsed < keys[last].length) {
+            keys[last] = Arrays.copyOf(keys[last], lastUsed);
+        }
+        this.keys = keys;
+        builder.keyChunks = null;
         builder.keys = null;
         this.keyEnds = Arrays.copyOf(builder.keyEnds, size);
         builder.keyEnds = null;
-        this.keyView = MemorySegment.ofArray(keys).asReadOnly();
+        this.keyViews = new MemorySegment[keys.length];
+        for (var i = 0; i < keys.length; i++) {
+            keyViews[i] = MemorySegment.ofArray(keys[i]).asReadOnly();
+        }
         this.values = Arrays.copyOf(builder.values, size);
         builder.values = null;
         this.chunks = builder.chunks.toArray(MemorySegment[]::new);
@@ -163,7 +187,7 @@ final class PackedRun {
                 var entry = (slot & ENTRY_MASK) - 1;
                 var start = keyStart(entry);
                 var length = keyEnds[entry] - start;
-                if (length == key.byteSize() && Segments.compare(keys, start, length, key) == 0) {
+                if (length == key.byteSize() && Segments.compare(keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK, length, key) == 0) {
                     return entry;
                 }
             }
@@ -184,7 +208,8 @@ final class PackedRun {
                 var entry = (slot & ENTRY_MASK) - 1;
                 var start = keyStart(entry);
                 var length = keyEnds[entry] - start;
-                if (length == key.length && Segments.compare(keys, start, length, key, 0, key.length) == 0) {
+                if (length == key.length
+                        && Segments.compare(keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK, length, key, 0, key.length) == 0) {
                     return entry;
                 }
             }
@@ -199,13 +224,13 @@ final class PackedRun {
     /// {@return the key of `entry`, a read-only slice of the run's keys}
     MemorySegment key(int entry) {
         var start = keyStart(entry);
-        return keyView.asSlice(start, keyEnds[entry] - start);
+        return keyViews[start >>> KEY_CHUNK_BITS].asSlice(start & KEY_OFFSET_MASK, keyEnds[entry] - start);
     }
 
     /// {@return the order of the key of `entry` and `key`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
     int compareKey(int entry, MemorySegment key) {
         var start = keyStart(entry);
-        return Segments.compare(keys, start, keyEnds[entry] - start, key);
+        return Segments.compare(keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK, keyEnds[entry] - start, key);
     }
 
     /// {@return the value of `entry`, which puts its key, read-only: a slice of a chunk of the replay, or read from the
@@ -365,8 +390,24 @@ final class PackedRun {
         return ((value >>> LENGTH_SHIFT) & LENGTH_MASK) == 0 ? null : chunks[chunkOf(value)];
     }
 
+    /// {@return the length of each chunk of the run's keys, for tests}
+    int[] keyChunkLengthsForTests() {
+        var lengths = new int[keys.length];
+        for (var i = 0; i < keys.length; i++) {
+            lengths[i] = keys[i].length;
+        }
+        return lengths;
+    }
+
     private int keyStart(int entry) {
-        return entry == 0 ? 0 : keyEnds[entry - 1];
+        return keyStart(keyEnds, entry);
+    }
+
+    // Where the key of `entry` starts, given where each key ends: where the key before it ends, unless the key did not
+    // fit the rest of that chunk and starts the chunk of its last byte; a key has at least one byte
+    private static int keyStart(int[] keyEnds, int entry) {
+        var previous = entry == 0 ? 0 : keyEnds[entry - 1];
+        return Math.max(previous, (keyEnds[entry] - 1) & ~KEY_OFFSET_MASK);
     }
 
     private static int chunkOf(long value) {
@@ -429,7 +470,8 @@ final class PackedRun {
     private int compareEntries(int left, int right) {
         var leftStart = keyStart(left);
         var rightStart = keyStart(right);
-        return Segments.compare(keys, leftStart, keyEnds[left] - leftStart, keys, rightStart, keyEnds[right] - rightStart);
+        return Segments.compare(keys[leftStart >>> KEY_CHUNK_BITS], leftStart & KEY_OFFSET_MASK, keyEnds[left] - leftStart,
+                keys[rightStart >>> KEY_CHUNK_BITS], rightStart & KEY_OFFSET_MASK, keyEnds[right] - rightStart);
     }
 
     /// Collects the writes of one paged key space as the open replays them, the newest of each key, into a [PackedRun].
@@ -438,7 +480,11 @@ final class PackedRun {
     /// takes its arrays or copies of them, and the builder lets go of them.
     static final class Builder {
         private static final int FIRST_ENTRIES = 64;
+        // The chunks of the keys, the last of which is `keys`: the first doubles from a small array up to a whole
+        // chunk, and every later one is allocated whole
+        private ArrayList<byte[]> keyChunks;
         private byte[] keys;
+        // Where the last key ends, as its chunk times KEY_CHUNK plus its end in the chunk
         private int keyBytes;
         private int[] keyEnds;
         private long[] values;
@@ -456,6 +502,8 @@ final class PackedRun {
 
         Builder() {
             this.keys = new byte[FIRST_ENTRIES * 32];
+            this.keyChunks = new ArrayList<>();
+            keyChunks.add(keys);
             this.keyEnds = new int[FIRST_ENTRIES];
             this.values = new long[FIRST_ENTRIES];
             this.chunks = new ArrayList<>();
@@ -486,10 +534,16 @@ final class PackedRun {
         }
 
         /// {@return whether the builder takes a write of `key` with a value of `length` bytes in `segment`, or of no
-        /// segment if `null`: past [#MAX_ENTRIES] entries, [#MAX_KEY_BYTES] bytes of keys, [#MAX_SEGMENTS] segments or
-        /// [#MAX_VALUE_LENGTH] bytes, the replay writes to chains}
+        /// segment if `null`: past [#MAX_ENTRIES] entries, [#MAX_SEGMENTS] segments or [#MAX_VALUE_LENGTH] bytes, when
+        /// the key could end past [#MAX_KEY_BYTES] bytes of keys, and for a key of no bytes or more than
+        /// [KeyCodec#MAX_LENGTH], which only a malformed log holds, the replay writes to chains}
+        ///
+        /// It stops [KeyCodec#MAX_LENGTH] bytes short of [#MAX_KEY_BYTES]: a key that does not fit the rest of a chunk
+        /// starts the next one, leaving unused fewer bytes than it has.
         boolean takes(MemorySegment key, LogSegmentView segment, int length) {
-            if (size >= MAX_ENTRIES || length > MAX_VALUE_LENGTH || keyBytes + key.byteSize() > MAX_KEY_BYTES) {
+            var keyLength = key.byteSize();
+            if (size >= MAX_ENTRIES || length > MAX_VALUE_LENGTH || keyLength < 1 || keyLength > KeyCodec.MAX_LENGTH
+                    || keyBytes + keyLength + KeyCodec.MAX_LENGTH > MAX_KEY_BYTES) {
                 return false;
             }
             return segment == null || segments.size() < MAX_SEGMENTS
@@ -562,9 +616,10 @@ final class PackedRun {
                 }
                 if ((slot & TAG_MASK) == tag) {
                     var entry = (slot & ENTRY_MASK) - 1;
-                    var start = entry == 0 ? 0 : keyEnds[entry - 1];
+                    var start = keyStart(keyEnds, entry);
                     var length = keyEnds[entry] - start;
-                    if (length == key.byteSize() && Segments.compare(keys, start, length, key) == 0) {
+                    if (length == key.byteSize()
+                            && Segments.compare(keyChunks.get(start >>> KEY_CHUNK_BITS), start & KEY_OFFSET_MASK, length, key) == 0) {
                         return i;
                     }
                 }
@@ -588,12 +643,22 @@ final class PackedRun {
                 values = Arrays.copyOf(values, capacity);
             }
             var length = Math.toIntExact(key.byteSize());
-            if (keyBytes + length > keys.length) {
-                var capacity = Math.min(MAX_KEY_BYTES, Math.max(keyBytes + length, 2L * keys.length));
-                keys = Arrays.copyOf(keys, (int) capacity);
+            var start = keyBytes;
+            if ((start & KEY_OFFSET_MASK) + length > KEY_CHUNK) {
+                // The rest of the chunk is too short: the key starts the next one
+                start = (start + KEY_OFFSET_MASK) & ~KEY_OFFSET_MASK;
             }
-            MemorySegment.copy(key, ValueLayout.JAVA_BYTE, 0, keys, keyBytes, length);
-            keyBytes += length;
+            var offset = start & KEY_OFFSET_MASK;
+            if (start >>> KEY_CHUNK_BITS == keyChunks.size()) {
+                keys = new byte[KEY_CHUNK];
+                keyChunks.add(keys);
+            } else if (offset + length > keys.length) {
+                // Only the first chunk is shorter than a chunk, and it is the last until it is whole
+                keys = Arrays.copyOf(keys, Math.min(KEY_CHUNK, Math.max(offset + length, 2 * keys.length)));
+                keyChunks.set(keyChunks.size() - 1, keys);
+            }
+            MemorySegment.copy(key, ValueLayout.JAVA_BYTE, 0, keys, offset, length);
+            keyBytes = start + length;
             keyEnds[entry] = keyBytes;
             size = entry + 1;
             slots[i] = tag | (entry + 1);
@@ -608,8 +673,8 @@ final class PackedRun {
             var grown = new int[2 * slots.length];
             var mask = grown.length - 1;
             for (var entry = 0; entry < size; entry++) {
-                var start = entry == 0 ? 0 : keyEnds[entry - 1];
-                var hash = Segments.hash(keys, start, keyEnds[entry] - start);
+                var start = keyStart(keyEnds, entry);
+                var hash = Segments.hash(keyChunks.get(start >>> KEY_CHUNK_BITS), start & KEY_OFFSET_MASK, keyEnds[entry] - start);
                 var i = hash & mask;
                 while (grown[i] != 0) {
                     i = (i + 1) & mask;
