@@ -38,6 +38,10 @@ import java.util.zip.CRC32C;
 /// At most one frame per processor but the replaying one is open ahead, and at most [#AHEAD_BYTES] of sealed bytes
 /// unless a single frame is longer; a frame longer than that is left to recovery. Used by the thread that replays the
 /// segment only.
+///
+/// The frames are read into, and opened into, arrays of the [Spares] the read-aheads of one recovery share with it: a
+/// frame's body is opened out of place into an array of its own, which recovery gives back once nothing it replayed
+/// refers to it, so the frames of a whole log take a few arrays rather than two new ones each.
 final class FrameReadAhead implements AutoCloseable {
     /// The sealed bytes the frames read ahead hold at most, unless one frame alone is longer.
     static final long AHEAD_BYTES = 8L << 20;
@@ -51,9 +55,8 @@ final class FrameReadAhead implements AutoCloseable {
     private final int frames;
     private final ArrayDeque<Ahead> pending;
     private final CRC32C crc;
-    // The arrays of the frames whose bodies were read and opened, for the next frames to read into
-    private final ConcurrentLinkedQueue<byte[]> spareArrays;
-    private final ConcurrentLinkedQueue<Cipher> ciphers;
+    // The arrays and ciphers of the recovery, which the frames are read and opened into
+    private final Spares spares;
     private long tag;
     private long useTag;
     private SecretKeySpec segmentKey;
@@ -62,16 +65,16 @@ final class FrameReadAhead implements AutoCloseable {
     private long cursor;
     private long pendingBytes;
 
-    /// Creates the read-ahead of the segment at `path`, holding `size` bytes, which reads nothing before [#begin].
-    FrameReadAhead(Path path, long size) {
+    /// Creates the read-ahead of the segment at `path`, holding `size` bytes, which reads nothing before [#begin] and
+    /// reads and opens its frames into arrays of `spares`.
+    FrameReadAhead(Path path, long size, Spares spares) {
         this.path = path;
         this.size = size;
+        this.spares = spares;
         var forTests = framesForTests;
         this.frames = forTests >= 0 ? forTests : Runtime.getRuntime().availableProcessors() - 1;
         this.pending = new ArrayDeque<>();
         this.crc = new CRC32C();
-        this.spareArrays = new ConcurrentLinkedQueue<>();
-        this.ciphers = new ConcurrentLinkedQueue<>();
         this.cursor = -1;
     }
 
@@ -99,8 +102,8 @@ final class FrameReadAhead implements AutoCloseable {
     }
 
     /// {@return the frame at `position`, whose header recovery read as `header` and whose sealed body is
-    /// `sealedLength` bytes, if it was read ahead: its body, or `null` for a frame that failed authentication; `null` if
-    /// recovery must open it itself}
+    /// `sealedLength` bytes, if it was read ahead: its body, on an array of the [Spares] that recovery owns from now on,
+    /// or `null` for a frame that failed authentication; `null` if recovery must open it itself}
     ///
     /// It also reads ahead the frames after it, before it waits for the one asked for, so they open while recovery
     /// replays this one, or while recovery opens it itself.
@@ -216,8 +219,105 @@ final class FrameReadAhead implements AutoCloseable {
         }
     }
 
-    /// A frame read ahead: its body, or `null` if it failed authentication.
-    record Opened(byte[] body) {
+    /// A frame opened: its body in the first `length` bytes of `body`, an array of the [Spares] whose bytes after them
+    /// may hold those of an earlier frame; or `body` `null` if it failed authentication.
+    record Opened(byte[] body, int length) {
+    }
+
+    /// The arrays and ciphers the read-aheads of one recovery share with it, so the frames of every segment are read
+    /// and opened into the arrays the earlier ones were.
+    ///
+    /// An array is handed out for a frame of at least its length: a spare long enough, or a new one with an eighth more
+    /// room, so frames that differ a little in length share their arrays and the arrays settle at the longest frame. The
+    /// room never takes an array past a multiple of [#STEP], so it never gives an array more regions of G1 than its
+    /// frame's length needs, nor makes one humongous that its length alone would not. A spare shorter than the frame is
+    /// dropped, as is one more than four times as long and longer than [#STEP], so a few long frames leave no long
+    /// arrays to the short ones after them; an array for a frame longer than [#AHEAD_BYTES], which the read-ahead leaves
+    /// to recovery, is never kept. Each array passes between the frame it holds and the queue, so the spares hold at
+    /// most the arrays of the frames open at once.
+    ///
+    /// Shared by the replaying thread and the read-aheads' virtual threads. One recovery makes one and drops it after.
+    static final class Spares {
+        /// Half the smallest region of G1, the granularity of the room an array is given.
+        static final int STEP = 1 << 19;
+        // The bytes G1 adds to the elements of an array, its header, rounded up
+        private static final int HEADER = 64;
+        // The arrays handed out again, by any recovery; for tests
+        private static final LongAdder REUSED = new LongAdder();
+
+        private final ConcurrentLinkedQueue<byte[]> sealed = new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<byte[]> bodies = new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<Cipher> ciphers = new ConcurrentLinkedQueue<>();
+
+        /// {@return an array of at least `length` bytes for the sealed bytes of a frame, which goes back through
+        /// [#giveSealed(byte\[\])]}
+        byte[] takeSealed(int length) {
+            return take(sealed, length);
+        }
+
+        /// Gives back `array`, which [#takeSealed(int)] handed out and nothing reads or writes any more.
+        void giveSealed(byte[] array) {
+            give(sealed, array);
+        }
+
+        /// {@return an array of at least `length` bytes for the body of a frame, which goes back through
+        /// [#giveBody(byte\[\])]}
+        byte[] takeBody(int length) {
+            return take(bodies, length);
+        }
+
+        /// Gives back `body`, which [#takeBody(int)] handed out and nothing reads or writes any more, for a later frame
+        /// to be opened into.
+        void giveBody(byte[] body) {
+            give(bodies, body);
+        }
+
+        /// {@return an AES-GCM cipher, which goes back through [#giveCipher(Cipher)]}
+        ///
+        /// @throws GeneralSecurityException if the JDK has no AES-GCM
+        Cipher takeCipher() throws GeneralSecurityException {
+            var cipher = ciphers.poll();
+            return cipher != null ? cipher : Cipher.getInstance("AES/GCM/NoPadding");
+        }
+
+        /// Gives back `cipher`, which [#takeCipher()] handed out.
+        void giveCipher(Cipher cipher) {
+            ciphers.offer(cipher);
+        }
+
+        /// {@return the arrays handed out again since the process started, by any recovery; for tests}
+        static long reusedForTests() {
+            return REUSED.sum();
+        }
+
+        private static byte[] take(ConcurrentLinkedQueue<byte[]> spares, int length) {
+            if (length > AHEAD_BYTES) {
+                return new byte[length];
+            }
+            byte[] spare;
+            while ((spare = spares.poll()) != null) {
+                if (spare.length >= length && (spare.length <= STEP || spare.length / 4 <= length)) {
+                    REUSED.increment();
+                    return spare;
+                }
+            }
+            return new byte[room(length)];
+        }
+
+        private static void give(ConcurrentLinkedQueue<byte[]> spares, byte[] array) {
+            if (array.length <= AHEAD_BYTES) {
+                spares.offer(array);
+            }
+        }
+
+        /// {@return the length of a new array for a frame of `length` bytes, at most [#AHEAD_BYTES]: an eighth more,
+        /// rounded up to 4 KiB, but never past the multiple of [#STEP] that holds an array of `length` bytes, nor past
+        /// [#AHEAD_BYTES]}
+        static int room(int length) {
+            var roomy = ((long) length + (length >>> 3) + 4095) & ~4095L;
+            var limit = ((long) length + HEADER + STEP - 1) / STEP * STEP - HEADER;
+            return (int) Math.min(Math.min(roomy, limit), AHEAD_BYTES);
+        }
     }
 
     /// A frame being read and opened ahead, by its own virtual thread or by recovery's when that takes it first.
@@ -261,29 +361,30 @@ final class FrameReadAhead implements AutoCloseable {
         /// {@return the frame's body, opened, or a frame with a `null` body if it failed authentication; `null` if
         /// it could not be read}
         private Opened open() throws IOException, GeneralSecurityException {
-            var sealed = spareArrays.poll();
-            if (sealed == null || sealed.length < sealedLength) {
-                sealed = new byte[sealedLength];
-            }
+            var sealed = spares.takeSealed(sealedLength);
             try {
                 if (!read(ByteBuffer.wrap(sealed, 0, sealedLength), position + LogWriter.FRAME_HEADER)) {
                     return null;
                 }
-                var cipher = ciphers.poll();
-                if (cipher == null) {
-                    cipher = Cipher.getInstance("AES/GCM/NoPadding");
-                }
+                var cipher = spares.takeCipher();
+                var body = spares.takeBody(sealedLength - LogWriter.TAG_BYTES);
                 try {
                     cipher.init(Cipher.DECRYPT_MODE, segmentKey, new GCMParameterSpec(LogWriter.TAG_BYTES * 8, LogWriter.nonce(position)));
                     cipher.updateAAD(header, 0, LogWriter.FRAME_HEADER);
-                    return new Opened(cipher.doFinal(sealed, 0, sealedLength));
+                    // Out of place, into an array other than the sealed one, which keeps the combined intrinsic
+                    var opened = new Opened(body, cipher.doFinal(sealed, 0, sealedLength, body, 0));
+                    body = null;
+                    return opened;
                 } catch (AEADBadTagException _) {
-                    return new Opened(null);
+                    return new Opened(null, 0);
                 } finally {
-                    ciphers.offer(cipher);
+                    if (body != null) {
+                        spares.giveBody(body);
+                    }
+                    spares.giveCipher(cipher);
                 }
             } finally {
-                spareArrays.offer(sealed);
+                spares.giveSealed(sealed);
             }
         }
 
@@ -296,10 +397,15 @@ final class FrameReadAhead implements AutoCloseable {
             return opened;
         }
 
-        /// Makes sure the frame is never opened, or waits for the thread opening it.
+        /// Makes sure the frame is never opened, or waits for the thread opening it and gives back the body it opened,
+        /// which recovery never takes.
         private void abandon() {
             if (!state.compareAndSet(NEW, DONE)) {
                 awaitDone();
+                var abandoned = opened;
+                if (abandoned != null && abandoned.body() != null) {
+                    spares.giveBody(abandoned.body());
+                }
             }
         }
 

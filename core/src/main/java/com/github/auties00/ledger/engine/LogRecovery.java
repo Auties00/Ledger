@@ -48,13 +48,15 @@ import java.util.zip.CRC32C;
 /// not. A run whose frame authenticates but whose entries are malformed is damage, not a tear, and is refused.
 ///
 /// Segments are read through one buffer, a part at a time, which passes from each segment to the next. A frame is
-/// authenticated where the buffer holds it, and only its opened body is a new array: replay copies no sealed bytes, and
-/// a frame longer than the buffer is read into an array of its own, which no later frame keeps. The frames of an
-/// encrypted log are opened ahead on the other processors ([FrameReadAhead]) while the earlier ones replay, each read
-/// into an array of the read-ahead's own that the frames after it reuse: recovery then reads only the headers and the
-/// padding of such a segment itself, through a window of a page and a header, and fills the buffer only for a frame the
-/// read-ahead does not hold, so the replay reads each byte of the log once. The commits of a run are passed where they
-/// lie in their frame's body, never copied out of it.
+/// authenticated where the buffer holds it, and opened out of it into an array of the recovery's [FrameReadAhead.Spares]:
+/// replay copies no sealed bytes, and a frame longer than the buffer is read into an array of its own, which no later
+/// frame keeps. The frames of an encrypted log are opened ahead on the other processors ([FrameReadAhead]) while the
+/// earlier ones replay, each read into and opened into arrays of the same spares: recovery then reads only the headers
+/// and the padding of such a segment itself, through a window of a page and a header, and fills the buffer only for a
+/// frame the read-ahead does not hold, so the replay reads each byte of the log once. The commits of a run are passed
+/// where they lie in their frame's body, never copied out of it. Once a frame replays, its body goes back to the spares
+/// for a later frame to be opened into, unless the sink keeps something on it ([Sink#releasesFrame()]): a log of
+/// frames of similar lengths opens into a few arrays, as many as the frames open at once.
 ///
 /// A recovery that moves values off the heap bounds the log that follows each frame before it replays
 /// ([Sink#commit(long, byte\[\], int, int, LogSegmentView, long, long)]): it reads the header and the first frame
@@ -84,7 +86,10 @@ final class LogRecovery {
         /// the frame at `frameOffset` of the segment use `segment`, unless the file of large values lacks one of its
         /// units.
         ///
-        /// `body` is a new array no one else writes, which the commits of a run share.
+        /// `body` is an array of the recovery's that no one else writes while its frame replays, which the commits of a
+        /// run share; its bytes past the frame's body may hold those of an earlier frame. Unless
+        /// [#releasesFrame()] then says otherwise, recovery opens a later frame into it once the frame replayed, so
+        /// nothing that outlives the frame may refer to it.
         ///
         /// @param segment the use, or `null` if the recovery moves no value off the heap
         /// @param logFrom the bytes of log from the start of the frame to the end of the log, at most: the frames a
@@ -94,6 +99,16 @@ final class LogRecovery {
                        long logFrom);
 
         void epoch(int epoch);
+
+        /// {@return whether nothing the sink keeps refers to the body of the frame whose commits it replayed since the
+        /// last call, so recovery may open a later frame into its array}
+        ///
+        /// Recovery asks once after each frame it replays whole.
+        ///
+        /// @implSpec The default answers `false`: recovery opens every frame into an array no other frame takes.
+        default boolean releasesFrame() {
+            return false;
+        }
     }
 
     /// What recovery found.
@@ -126,6 +141,8 @@ final class LogRecovery {
         LogFiles.Prepared empty = null;
         Path lastWritten = null;
         var buffer = new SegmentReader.Buffer();
+        // The arrays the frames of every segment are read and opened into, by the read-aheads and by recovery
+        var spares = new FrameReadAhead.Spares();
         // Each segment's header, read and checked before the next segment's
         var header = new byte[LogWriter.SEGMENT_HEADER];
         // Where the frames of each segment end at most, and the bytes of those of the segments after each one, for how
@@ -145,7 +162,7 @@ final class LogRecovery {
         for (var index = 0; index < segments.size(); index++) {
             var number = segments.get(index);
             var path = files.segment(number);
-            try (var reader = new SegmentReader(path, buffer); var ahead = new FrameReadAhead(path, reader.size())) {
+            try (var reader = new SegmentReader(path, buffer); var ahead = new FrameReadAhead(path, reader.size(), spares)) {
                 // The read-ahead reads the frames' bodies, so recovery peeks only at what lies around them
                 var peek = keys.encrypted() && ahead.opensFrames();
                 if (!reader.read(0, header, 0, header.length, peek) || !intactSegmentHeader(header, crc)) {
@@ -217,12 +234,9 @@ final class LogRecovery {
                     var sequence = header32.getLong(8);
                     var type = frame[16];
                     var end = position + LogWriter.FRAME_HEADER + sealedLength;
-                    byte[] body = null;
                     var whole = sealedLength >= 0 && sealedLength <= MAX_SEALED && end <= reader.size();
                     var opened = whole ? ahead.take(frame, position, sealedLength) : null;
-                    if (opened != null) {
-                        body = opened.body();
-                    } else if (whole) {
+                    if (opened == null && whole) {
                         byte[] sealed;
                         int at;
                         if (sealedLength <= reader.capacity()) {
@@ -234,13 +248,15 @@ final class LogRecovery {
                             at = reader.read(position + LogWriter.FRAME_HEADER, sealed, 0, sealedLength) ? 0 : -1;
                         }
                         if (at >= 0) {
-                            body = open(frame, sealed, at, position, sealedLength, keys, segmentKey, cipher, crc);
+                            opened = open(frame, sealed, at, position, sealedLength, keys, segmentKey, cipher, crc, spares);
                         }
                     }
-                    if (body == null) {
+                    if (opened == null || opened.body() == null) {
                         checkNoLaterGroup(reader, position, last, tag, crc, path);
                         break;
                     }
+                    var body = opened.body();
+                    var bodyLength = opened.length();
                     lastWritten = path;
                     var replayed = true;
                     switch (type) {
@@ -249,7 +265,7 @@ final class LogRecovery {
                                 if (sequence != last + 1) {
                                     throw new LedgerCorruptedException(path + " holds commit " + sequence + " after commit " + last, null);
                                 }
-                                replayed = sink.commit(sequence, body, 0, body.length, view, position,
+                                replayed = sink.commit(sequence, body, 0, bodyLength, view, position,
                                         spills == null ? 0 : segmentEnd - position + after[index]);
                                 if (replayed) {
                                     last = sequence;
@@ -258,7 +274,7 @@ final class LogRecovery {
                             // Otherwise held by the checkpoint's trees
                         }
                         case FrameBody.COMMITS -> {
-                            var commits = new FrameBody.RunReader(body);
+                            var commits = new FrameBody.RunReader(body, bodyLength);
                             for (var next = sequence; replayed && commits.hasNext(); next++) {
                                 if (next <= checkpoint) {
                                     // Held by the checkpoint's trees
@@ -280,19 +296,24 @@ final class LogRecovery {
                             if (sequence > last) {
                                 throw new LedgerCorruptedException(path + " holds a catalog at " + sequence + " after commit " + last, null);
                             }
-                            FrameBody.readCatalog(body, sink::catalog);
+                            FrameBody.readCatalog(body, bodyLength, sink::catalog);
                         }
                         case FrameBody.EPOCH -> {
                             if (sequence > last) {
                                 throw new LedgerCorruptedException(path + " holds an epoch at " + sequence + " after commit " + last, null);
                             }
-                            sink.epoch(FrameBody.readEpoch(body));
+                            sink.epoch(FrameBody.readEpoch(body, bodyLength));
                         }
                         default -> throw new LedgerCorruptedException(path + " holds a frame of unknown type " + type, null);
                     }
+                    // Asked after every frame, so what the sink keeps of one frame never holds back the next
+                    var released = sink.releasesFrame();
                     if (!replayed) {
                         checkNoLaterGroup(reader, position, last, tag, crc, path);
                         break;
+                    }
+                    if (released) {
+                        spares.giveBody(body);
                     }
                     position = end;
                 }
@@ -345,23 +366,25 @@ final class LogRecovery {
         return wholeFrameHeader(frame, tag, crc) && ByteBuffer.wrap(frame).getLong(LogWriter.USE_TAG_OFFSET) == useTag;
     }
 
-    /// {@return a new array holding the body of the frame at `position` of its segment, whose header is `header` and
-    /// whose `sealedLength` sealed bytes start at `at` of `sealed`, or `null` if it fails authentication}
+    /// {@return the body of the frame at `position` of its segment, whose header is `header` and whose `sealedLength`
+    /// sealed bytes start at `at` of `sealed`, on an array of `spares`; or `null` if it fails authentication}
     ///
-    /// The header authenticated is the one replay parsed. The result never shares `sealed`, which may be the buffer the
-    /// next frame is read into.
-    private static byte[] open(byte[] header, byte[] sealed, int at, long position, int sealedLength, StoreKeys keys,
-                               SecretKeySpec segmentKey, Cipher cipher, CRC32C crc) {
+    /// The header authenticated is the one replay parsed. The body never shares `sealed`, which may be the buffer the
+    /// next frame is read into: it is opened, or copied, out of place.
+    private static FrameReadAhead.Opened open(byte[] header, byte[] sealed, int at, long position, int sealedLength,
+                                              StoreKeys keys, SecretKeySpec segmentKey, Cipher cipher, CRC32C crc,
+                                              FrameReadAhead.Spares spares) {
         if (keys.encrypted()) {
             if (sealedLength < LogWriter.TAG_BYTES) {
                 return null;
             }
+            var body = spares.takeBody(sealedLength - LogWriter.TAG_BYTES);
             try {
                 cipher.init(Cipher.DECRYPT_MODE, segmentKey, new GCMParameterSpec(LogWriter.TAG_BYTES * 8, LogWriter.nonce(position)));
                 cipher.updateAAD(header, 0, LogWriter.FRAME_HEADER);
-                // Into an array the cipher allocates: decrypting in place would leave the body in the buffer
-                return cipher.doFinal(sealed, at, sealedLength);
+                return new FrameReadAhead.Opened(body, cipher.doFinal(sealed, at, sealedLength, body, 0));
             } catch (AEADBadTagException _) {
+                spares.giveBody(body);
                 return null;
             } catch (GeneralSecurityException exception) {
                 throw new IllegalStateException("AES-GCM failed", exception);
@@ -377,7 +400,9 @@ final class LogRecovery {
         if (ByteBuffer.wrap(sealed).getInt(at + bodyLength) != (int) crc.getValue()) {
             return null;
         }
-        return Arrays.copyOfRange(sealed, at, at + bodyLength);
+        var body = spares.takeBody(bodyLength);
+        System.arraycopy(sealed, at, body, 0, bodyLength);
+        return new FrameReadAhead.Opened(body, bodyLength);
     }
 
     /// {@return where the frames of the segment at `path` end at most, [LogWriter#SEGMENT_HEADER] if it holds none}

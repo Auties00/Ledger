@@ -673,13 +673,13 @@ final class FrameBody {
         return body;
     }
 
-    /// {@return the epoch an epoch body holds}
+    /// {@return the epoch the epoch body in the first `length` bytes of `body` holds}
     ///
     /// @throws LedgerCorruptedException if the body is malformed
-    static int readEpoch(byte[] body) {
-        var reader = new Reader(body);
+    static int readEpoch(byte[] body, int length) {
+        var reader = new Reader(body, null, 0, length);
         var epoch = reader.readVarInt();
-        if (reader.position != body.length || epoch > 0xFFFF_FFFFL) {
+        if (reader.position != length || epoch > 0xFFFF_FFFFL) {
             throw new LedgerCorruptedException("A log frame holds a malformed epoch", null);
         }
         return (int) epoch;
@@ -987,17 +987,51 @@ final class FrameBody {
         }
     }
 
-    /// Reads a catalog body, passing each entry to `visitor`.
+    /// Reads the commit body that is the `length` bytes at `start` of `body` as [#readCommit] does, passing `visitor` the
+    /// key space of each write, and the length and unit of a put of a value in the file of large values, with no slice
+    /// of a key or a value.
     ///
     /// @throws LedgerCorruptedException if the body is malformed
-    static void readCatalog(byte[] body, CatalogVisitor visitor) {
-        var reader = new Reader(body);
-        while (reader.position < body.length) {
+    static void readCommitKinds(byte[] body, int start, int length, KindVisitor visitor) {
+        var reader = new Reader(body, null, start, start + length);
+        while (reader.position < reader.end) {
+            var kind = reader.readByte();
             var keyspace = Math.toIntExact(reader.readVarInt());
-            var length = Math.toIntExact(reader.readVarInt());
-            reader.check(length);
-            visitor.entry(keyspace, new String(body, reader.position, length, StandardCharsets.UTF_8));
-            reader.position += length;
+            switch (kind) {
+                case PUT -> {
+                    reader.skipSegment();
+                    reader.skipSegment();
+                    visitor.put(keyspace);
+                }
+                case DELETE -> {
+                    reader.skipSegment();
+                    visitor.remove(keyspace);
+                }
+                case RANGE -> {
+                    reader.skipSegment();
+                    reader.skipSegment();
+                    visitor.remove(keyspace);
+                }
+                case EXTERNAL -> {
+                    reader.skipSegment();
+                    visitor.putExternal(keyspace, reader.readVarInt(), reader.readRef());
+                }
+                default -> throw new LedgerCorruptedException("A log frame holds an unknown write kind " + kind, null);
+            }
+        }
+    }
+
+    /// Reads the catalog body in the first `length` bytes of `body`, passing each entry to `visitor`.
+    ///
+    /// @throws LedgerCorruptedException if the body is malformed
+    static void readCatalog(byte[] body, int length, CatalogVisitor visitor) {
+        var reader = new Reader(body, null, 0, length);
+        while (reader.position < length) {
+            var keyspace = Math.toIntExact(reader.readVarInt());
+            var name = Math.toIntExact(reader.readVarInt());
+            reader.check(name);
+            visitor.entry(keyspace, new String(body, reader.position, name, StandardCharsets.UTF_8));
+            reader.position += name;
         }
     }
 
@@ -1008,15 +1042,15 @@ final class FrameBody {
         // Where the body of the commit the last next() passed over starts in the run body
         private int start;
 
-        /// Reads the run body `run`.
+        /// Reads the run body in the first `length` bytes of `run`.
         ///
         /// @throws LedgerCorruptedException if it holds no commit
-        RunReader(byte[] run) {
-            if (run.length == 0) {
+        RunReader(byte[] run, int length) {
+            if (length == 0) {
                 throw new LedgerCorruptedException("A log frame holds a run of no commits", null);
             }
-            this.reader = new Reader(run);
-            this.length = run.length;
+            this.reader = new Reader(run, null, 0, length);
+            this.length = length;
         }
 
         /// {@return whether a commit follows the ones read}
@@ -1060,6 +1094,18 @@ final class FrameBody {
         void putExternal(int keyspace, MemorySegment key, long length, PageRef ref);
     }
 
+    /// Receives the key space of each write of a commit body ([#readCommitKinds]).
+    interface KindVisitor {
+        /// Receives a put of a value the body holds to `keyspace`.
+        void put(int keyspace);
+
+        /// Receives a removal, or a range removal, of `keyspace`.
+        void remove(int keyspace);
+
+        /// Receives a put to `keyspace` of a value of `length` bytes the unit `ref` of the file of large values holds.
+        void putExternal(int keyspace, long length, PageRef ref);
+    }
+
     /// Receives the entries of a catalog body.
     @FunctionalInterface
     interface CatalogVisitor {
@@ -1074,11 +1120,8 @@ final class FrameBody {
         private final int end;
         private int position;
 
-        Reader(byte[] body) {
-            this(body, MemorySegment.ofArray(body).asReadOnly(), 0, body.length);
-        }
-
-        /// Reads the bytes of `body` from `start` to `end`, `memory` being a read-only segment of the whole of it.
+        /// Reads the bytes of `body` from `start` to `end`, `memory` being a read-only segment of the whole of it, or
+        /// `null` for a reader that slices nothing.
         Reader(byte[] body, MemorySegment memory, int start, int end) {
             this.body = body;
             this.memory = memory;
@@ -1121,6 +1164,13 @@ final class FrameBody {
             var segment = memory.asSlice(position, length);
             position += (int) length;
             return segment;
+        }
+
+        /// Passes over a field [#readSegment()] reads, its length checked against what is left.
+        void skipSegment() {
+            // Read before the addition, which would otherwise add to the position before the length
+            var length = (int) readLength();
+            position += length;
         }
 
         PageRef readRef() {
