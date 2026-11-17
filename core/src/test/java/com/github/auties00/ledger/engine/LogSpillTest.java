@@ -446,6 +446,92 @@ class LogSpillTest {
         }
     }
 
+    @ParameterizedTest(name = "encrypted: {0}, crash: {1}")
+    @CsvSource({"true, false", "true, true", "false, false", "false, true"})
+    @DisplayName("values moved to segments after a checkpoint's cut stay in place while a tick retires the segments a snapshot held back and rollovers prepare the next segments from those spares, and a close checkpoints them, or a crash replays them")
+    void pendingValuesOutliveRecycledSpares(boolean encrypted, boolean crash, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, encrypted, 0)) {
+            for (var batch = 0; batch < 6; batch++) {
+                write(ledger, expected, batch * 30, 30, 0, true);
+            }
+            spillNow(ledger);
+            var held = ledger.spills().segmentsForTests();
+            var snapshot = ledger.snapshot();
+            var seen = expected.copy();
+            ledger.checkpoint();
+            var logStart = ledger.log().currentSegment();
+            assertTrue(held[0] < logStart && Files.exists(segmentPath(directory, held[0])),
+                    "the checkpoint retired a segment a snapshot needs");
+            // Values no checkpoint holds, moved to the segments after the cut, over several rollovers
+            for (var batch = 0; batch < 6; batch++) {
+                write(ledger, expected, 1_000 + batch * 30, 30, 0, true);
+            }
+            spillNow(ledger);
+            var pending = pendingSegments(ledger, 1_000, 1_180);
+            assertTrue(pending.length > 1, "the pending values moved to " + pending.length + " segments");
+            assertTrue(pending[0] >= logStart, "a pending value moved to segment " + pending[0] + " before the cut's " + logStart);
+            verifyView(snapshot, seen);
+            snapshot.close();
+            // The tick retires the held segments into spares, keeping those of the pending values
+            ledger.checkpointer().tick();
+            assertTrue(Arrays.stream(ledger.spills().segmentsForTests()).noneMatch(number -> number == held[0]));
+            assertFalse(Files.exists(segmentPath(directory, held[0])));
+            var spares = spares(directory);
+            assertFalse(spares.isEmpty(), "the tick kept no spare");
+            assertPendingInPlace(directory, ledger, 1_000, 1_180);
+            // Rollovers prepare their segments from those spares, while the pending values stay where they moved
+            for (var batch = 0; batch < 6; batch++) {
+                write(ledger, expected, 2_000 + batch * 30, 30, 0, true);
+            }
+            spillNow(ledger);
+            assertTrue(spares.stream().anyMatch(spare -> !Files.exists(spare)), "no rollover took a spare");
+            assertTrue(pendingSegments(ledger, 2_000, 2_180).length > 1, "the later values moved to one segment");
+            ledger.checkpointer().tick();
+            assertPendingInPlace(directory, ledger, 1_000, 1_180);
+            assertPendingInPlace(directory, ledger, 2_000, 2_180);
+            verify(ledger, expected);
+            if (crash) {
+                ledger.closeWithoutCheckpoint();
+            }
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+    }
+
+    /// {@return the segments, ascending and distinct, that the newest values of the messages from `from` to `to`,
+    /// exclusive, moved to and that no checkpoint retired}
+    private static long[] pendingSegments(LiveLedger ledger, int from, int to) {
+        return IntStream.range(from, to)
+                .mapToObj(message -> head(ledger, MESSAGES, key(message)))
+                .filter(version -> version != null && version.sourceForTests() instanceof LogValue logged && !logged.segment().retired())
+                .mapToLong(version -> ((LogValue) version.sourceForTests()).segment().number())
+                .distinct().sorted().toArray();
+    }
+
+    /// Checks that the file of every segment the newest values of the messages from `from` to `to`, exclusive, moved to
+    /// is in place, unless a checkpoint retired it, and that each such value reads back.
+    private static void assertPendingInPlace(Path directory, LiveLedger ledger, int from, int to) {
+        for (var message = from; message < to; message++) {
+            var version = head(ledger, MESSAGES, key(message));
+            if (version != null && version.sourceForTests() instanceof LogValue logged && !logged.segment().retired()) {
+                assertTrue(Files.exists(segmentPath(directory, logged.segment().number())),
+                        "the segment " + logged.segment().number() + " of message " + message + " is gone");
+                assertNotNull(version.copyBytes(), "message " + message);
+            }
+        }
+    }
+
+    /// {@return the spare segments of the log of the store in `directory`}
+    private static List<Path> spares(Path directory) throws java.io.IOException {
+        try (var files = Files.list(directory.resolve("log"))) {
+            return files.filter(file -> file.getFileName().toString().endsWith(".spare")).toList();
+        }
+    }
+
     private static Path segmentPath(Path directory, long number) {
         return directory.resolve("log").resolve(LogFiles.segmentName(number));
     }
