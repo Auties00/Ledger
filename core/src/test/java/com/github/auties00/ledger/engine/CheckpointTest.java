@@ -387,6 +387,19 @@ class CheckpointTest {
                 var key = key(random);
                 batch.delete(keyspace, key);
                 model.remove(key);
+            } else if (kind < 12) {
+                // A computed write, which sees the batch's earlier writes of its key as the model does
+                var key = key(random);
+                if (i == 0 && kind == 8) {
+                    assertEquals(Optional.ofNullable(model.get(key)), batch.guard(keyspace, key));
+                }
+                var computed = grow(model.get(key));
+                batch.compute(keyspace, key, CheckpointTest::grow);
+                if (computed == null) {
+                    model.remove(key);
+                } else {
+                    model.put(key, computed);
+                }
             } else {
                 var key = key(random);
                 var value = value(random);
@@ -395,6 +408,11 @@ class CheckpointTest {
             }
         }
         ledger.commit(batch);
+    }
+
+    /// {@return the value a computed write of the random histories makes of `value`: one more letter, or none past 100}
+    static String grow(String value) {
+        return value == null ? "c" : value.length() > 100 ? null : value + "c";
     }
 
     private static void transfer(Ledger ledger, Map<Keyspace<String, String>, TreeMap<String, String>> models, Random random) {
@@ -433,7 +451,10 @@ class CheckpointTest {
             assertEquals(entries(expected.descendingMap()).stream().limit(limit).toList(),
                     view.range(keyspace, KeyRange.between(from, to).reversed(), limit));
             assertEquals(entries(subMap(model, from, null)).stream().limit(limit).toList(), view.range(keyspace, KeyRange.atLeast(from), limit));
+            assertEquals(expected.size(), view.count(keyspace, KeyRange.between(from, to)), keyspace.name() + " count");
+            assertEquals(subMap(model, null, to).size(), view.count(keyspace, KeyRange.below(to).reversed()), keyspace.name() + " count");
         }
+        assertEquals(model.size(), view.count(keyspace, KeyRange.all()), keyspace.name() + " count of all");
         for (var i = 0; i < 30; i++) {
             var key = key(random);
             assertEquals(Optional.ofNullable(model.get(key)), view.get(keyspace, key), keyspace.name() + " " + key);

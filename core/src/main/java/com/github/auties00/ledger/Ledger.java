@@ -4,7 +4,9 @@ import com.github.auties00.ledger.engine.LedgerBuilder;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 /// An open store.
 ///
@@ -45,6 +47,15 @@ import java.util.function.Consumer;
 /// files do not, a commit waits for the running checkpoint before it applies: memory stays bounded, at the cost of
 /// throughput.
 ///
+/// # Read-modify-write
+/// [#compute] replaces the value of a key with what a function makes of it, and [WriteBatch#compute] adds such a
+/// write to a batch: no write of the key by another commit comes between the value the function read and the one it
+/// returned, and writes of other keys are not held back. The function runs on the calling thread before the commit
+/// takes its turn and, only if another write of the key came first, once more in the order of the commits, on the
+/// value that write left. A [guard][WriteBatch#guard] holds a whole batch to a value it read instead, failing the
+/// commit with [LedgerConflictException] if the value changed, and a [Companion] keeps an index of the computed
+/// values under the same keys.
+///
 /// # Reads
 /// Reads never wait for writes and never see part of a batch. The read methods of this interface read the latest
 /// state, each on its own; a [Snapshot] reads one state for as long as it stays open.
@@ -55,7 +66,10 @@ import java.util.function.Consumer;
 /// the rest; it never recovers part of a batch.
 ///
 /// A failed force leaves the store unable to tell which commits reached stable storage, so it stops: every later
-/// commit, and every wait for durability, throws [LedgerIoException]. Reopen the store to recover.
+/// commit, and every wait for durability, throws [LedgerIoException], while reads keep working and no checkpoint
+/// starts. [Options#onStop(Consumer)] hears of the stop as it happens. A force is never retried: after a failed one the
+/// system may have dropped the data it was asked to write and still report the next force a success. Close the store,
+/// which releases its directory, and open it again to recover every durable commit.
 ///
 /// On macOS a force empties the drive's cache too, so a durable commit survives a loss of power: the JDK forces a file
 /// with `fcntl(F_FULLFSYNC)` there.
@@ -124,15 +138,69 @@ public non-sealed interface Ledger extends View, AutoCloseable {
     /// The batch is visible when this method returns; the returned commit says when it becomes durable. The batch
     /// may be reused once this method returns.
     ///
+    /// A batch whose writes are all computed writes that leave their keys unchanged commits nothing: the returned
+    /// commit has the sequence of the latest state its functions read, and waiting for its durability waits for that
+    /// state.
+    ///
     /// @param batch the writes to apply
     /// @return the commit, to wait on for durability
-    /// @throws IllegalArgumentException if another store created `batch`
+    /// @throws IllegalArgumentException if another store created `batch`, it holds more than 16,777,215 writes, or a
+    ///                                  value a compute function returned when it ran again in the order of commits
+    ///                                  encodes to more than [ValueCodec#MAX_LENGTH]: none of its writes apply
+    /// @throws LedgerConflictException if a value a [guard][WriteBatch#guard] of the batch read has changed: none of
+    ///                                 its writes apply
     /// @throws LedgerIoException if the store has stopped after a failed write
     /// @throws LedgerCorruptedException if `batch` writes an entry of a [resident][Keyspace.Residency#RESIDENT] key
     ///                                  space that could not be read into memory: none of its writes apply, and the
     ///                                  next write tries again
-    /// @throws IllegalStateException if the store is closed
+    /// @throws IllegalStateException if the store is closed, or if called from a compute function of this store or
+    ///                               from a transaction
     Commit commit(WriteBatch batch);
+
+    /// Replaces the value under `key` with what `function` makes of it, atomically with respect to every other write
+    /// of the key.
+    ///
+    /// `function` receives the latest value, or `null` if there is none, and returns the new value, `null` to remove
+    /// the key, or the instance it received to leave the key unchanged. No write of the key by another commit, batch,
+    /// transaction or range removal comes between the value the function received and the one it returned. Writes of
+    /// other keys are not held back.
+    ///
+    /// The function may run twice: once on the calling thread before the commit takes its turn, and, only if another
+    /// write of the key came first, again in the order of commits, on the value that write left. Only the result of its
+    /// last run is written. It must depend only on the value it receives, and must not commit, start a transaction, wait
+    /// for durability or close the store; it may read the store. If it throws, nothing is written and the exception
+    /// propagates. A value of a [resident][Keyspace.Residency#RESIDENT] key space is the instance the store holds, which
+    /// must not be modified: the function returns a new one.
+    ///
+    /// When the function leaves the key unchanged, nothing is committed: the result's sequence is that of the state the
+    /// function read, and waiting for its durability waits for that state.
+    ///
+    /// @apiNote While the function runs in the order of commits, later commits wait to become visible: keep it to
+    /// rebuilding the value. Several keys that must change together go in one batch, through [WriteBatch#compute].
+    /// @param keyspace the key space to write
+    /// @param key the key
+    /// @param function makes the new value from the latest one
+    /// @param <K> the key type
+    /// @param <V> the value type
+    /// @return the outcome, which is also the commit to wait on for durability
+    /// @throws IllegalArgumentException if this store was not opened with `keyspace`, the key encodes to no bytes or
+    ///                                  more than [KeyCodec#MAX_LENGTH], or the new value to more than
+    ///                                  [ValueCodec#MAX_LENGTH]
+    /// @throws LedgerIoException if the store has stopped after a failed write
+    /// @throws LedgerCorruptedException if the page holding the value fails authentication
+    /// @throws IllegalStateException if the store is closed, or if called from a compute function of this store or
+    ///                               from a transaction
+    <K, V> Computed<V> compute(Keyspace<K, V> keyspace, K key, Function<? super V, ? extends V> function);
+
+    /// {@return the names of every key space the store holds, including those it was not opened with}
+    ///
+    /// A name is in the set once its key space was created, so a store opened again lists what earlier opens created;
+    /// a store in memory holds only the key spaces it was opened with. The set is unmodifiable and does not change
+    /// after the call. A key space the store was not opened with can be opened by its name with byte codecs
+    /// (`Keyspace.paged(name, KeyCodec.bytes(), ValueCodec.bytes())`), as codecs are not stored.
+    ///
+    /// @throws IllegalStateException if the store is closed
+    Set<String> keyspaces();
 
     /// Runs `transaction` alone against the latest state and applies its writes atomically.
     ///
@@ -156,7 +224,7 @@ public non-sealed interface Ledger extends View, AutoCloseable {
     ///
     /// @throws InterruptedException if interrupted while waiting; the commits still become durable
     /// @throws LedgerIoException if a force failed
-    /// @throws IllegalStateException if the store is closed
+    /// @throws IllegalStateException if the store is closed, or if called from a compute function of this store
     void awaitDurable() throws InterruptedException;
 
     /// Opens a snapshot of the latest state.
@@ -172,16 +240,20 @@ public non-sealed interface Ledger extends View, AutoCloseable {
     /// The store also checkpoints on its own, as [Options#checkpointEvery(long)] says; calling this method is never
     /// needed for durability.
     ///
-    /// @throws LedgerIoException if the checkpoint cannot be written
-    /// @throws IllegalStateException if the store is closed
+    /// @throws LedgerIoException if the checkpoint cannot be written, or the store has stopped after a failed write
+    /// @throws IllegalStateException if the store is closed, or if called from a compute function of this store
     void checkpoint();
 
     /// Makes every commit durable, writes a checkpoint and releases the directory.
     ///
     /// Commits and reads that are running finish first; later calls throw [IllegalStateException]. Closing a
-    /// closed store does nothing.
+    /// closed store does nothing. If the store has stopped after a failed write, the close writes no checkpoint,
+    /// releases the directory and its files, and throws the failure that stopped it: the store can be opened again at
+    /// once, and recovers every durable commit.
     ///
-    /// @throws LedgerIoException if the commits cannot be made durable or the checkpoint cannot be written
+    /// @throws LedgerIoException if the commits cannot be made durable or the checkpoint cannot be written, or the
+    ///                           store had stopped; the directory is released either way
+    /// @throws IllegalStateException if called from a compute function of this store
     @Override
     void close();
 
@@ -227,7 +299,8 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         ///
         /// By default the stores of the process opened without a pool share platform threads made as their flushes
         /// need them, one per store flushing at the same moment, each ending after a minute without a flush; a store
-        /// that has been idle that long holds none.
+        /// that has been idle that long holds none. Every thread a store starts on its own is a daemon thread, so none
+        /// keeps the process alive; a store the process does not close before it exits loses what was not durable.
         ///
         /// @param pool the pool; the store does not close it
         /// @return these options
@@ -271,12 +344,25 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// retries; until one succeeds the log grows and opening replays more of it. Reads of a resident key space
         /// whose entries could not be read into memory read them from the store's files, and the next write of an
         /// entry not read yet tries again, throwing [LedgerCorruptedException] if it fails again. A failure of the log
-        /// itself stops the store instead, and every later commit throws it. Without a listener, these failures are not
-        /// reported.
+        /// itself stops the store instead, which [#onStop(Consumer)] reports, and every later commit throws it. Without
+        /// a listener, these failures are not reported.
         ///
         /// @param listener receives each failure on the thread that met it, and must not block for long
         /// @return these options
         Options onBackgroundFailure(Consumer<? super LedgerException> listener);
+
+        /// Sends the failure that stops the store to `listener`, once, as the store stops: a write or force of its log
+        /// that failed.
+        ///
+        /// After it, every commit and every wait for durability throws the same [LedgerIoException], reads keep
+        /// working and no checkpoint starts; [Ledger#close()] releases the directory, and the store recovers every
+        /// durable commit when it is opened again. Without the listener the store learns of the stop at its next
+        /// commit or wait. A store in memory never stops.
+        ///
+        /// @param listener receives the failure on the thread that met it, a thread of the store's own, and must not
+        ///                 block for long or call the store
+        /// @return these options
+        Options onStop(Consumer<? super LedgerIoException> listener);
 
         /// Writes each value of at least `bytes` bytes that a batch puts to a file of its own, once, instead of into the
         /// log and again at the next checkpoint.

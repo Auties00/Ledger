@@ -77,6 +77,11 @@ final class LiveSnapshot implements Snapshot {
     }
 
     @Override
+    public <K> long count(Keyspace<K, ?> keyspace, KeyRange<K> range) {
+        return Reads.count(state(keyspace), keyspace, range, point);
+    }
+
+    @Override
     public void close() {
         if (closed.compareAndSet(false, true)) {
             ledger.readers().unregister(sequence);

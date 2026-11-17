@@ -1,5 +1,7 @@
 package com.github.auties00.ledger.engine;
 
+import com.github.auties00.ledger.Companion;
+import com.github.auties00.ledger.Computation;
 import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
@@ -7,9 +9,14 @@ import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.WriteBatch;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.ToLongFunction;
 
 /// A [WriteBatch] that encodes into arrays and records each write as offsets into them.
@@ -48,6 +55,10 @@ import java.util.function.ToLongFunction;
 /// only after tens of thousands of iterations, so a process making a few large commits would run it interpreted; kept
 /// as the writes come, the totals cost a few instructions of a method the JIT compiles within the first thousands of
 /// writes.
+///
+/// A computed write, a guard and the write of a companion are recorded as the plain write each resolves to when it is
+/// added, with a [ComputeSlot] beside it that the commit checks at the batch's turn ([#slots()]); the slots take an
+/// array only once the batch holds one, so a batch without them pays one test of a field per write.
 public final class ArrayWriteBatch implements WriteBatch {
     private static final int INITIAL_CAPACITY = 4_096;
     private static final byte[] EMPTY = new byte[0];
@@ -168,6 +179,8 @@ public final class ArrayWriteBatch implements WriteBatch {
     // puts, all of them
     private long residentValueBytes;
     private int residentPuts;
+    // The slot of each write a commit checks at its turn, null for the others; null until the batch holds one
+    private ComputeSlot[] slots;
     // The bytes of the largest value put
     private long largestValueBytes;
 
@@ -311,6 +324,142 @@ public final class ArrayWriteBatch implements WriteBatch {
         }
         add(DELETE_RANGE, keyspace, null, fromOffset, fromLength, toOffset, toLength);
         return this;
+    }
+
+    @Override
+    public <K, V> Computation<V> compute(Keyspace<K, V> keyspace, K key, Function<? super V, ? extends V> function) {
+        return compute(keyspace, key, function, List.of());
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <K, V> Computation<V> compute(Keyspace<K, V> keyspace, K key, Function<? super V, ? extends V> function,
+                                         List<Companion<K, ? super V>> companions) {
+        checkOpened(keyspace);
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(function, "function");
+        var indexes = List.copyOf(companions);
+        for (var i = 0; i < indexes.size(); i++) {
+            var companion = indexes.get(i).keyspace();
+            checkOpened(companion);
+            if (companion.equals(keyspace)) {
+                throw new IllegalArgumentException("A key space cannot be its own companion: " + keyspace.name());
+            }
+            for (var j = 0; j < i; j++) {
+                if (indexes.get(j).keyspace().equals(companion)) {
+                    throw new IllegalArgumentException("A companion appears twice: " + companion.name());
+                }
+            }
+        }
+        var store = store();
+        var encoded = Segments.lookupKey(keyspace.keys(), key);
+        var observation = store.observe(keyspace, encoded);
+        var previous = observation.value();
+        Object result = null;
+        var effect = ComputeSlot.NONE;
+        if (!observation.hot()) {
+            result = store.runCompute((Function<Object, Object>) function, previous);
+            if (result != previous) {
+                effect = result != null ? ComputeSlot.PUT : ComputeSlot.DELETE;
+            }
+        }
+        var outcome = new BatchComputation<V>();
+        var index = size;
+        if (effect == ComputeSlot.PUT) {
+            put(keyspace, key, (V) result);
+        } else {
+            addKey(keyspace, encoded);
+        }
+        assignSlot(index, ComputeSlot.compute((Function<Object, Object>) function, observation.sequence(), previous,
+                !observation.hot(), result, effect, (BatchComputation<Object>) outcome));
+        for (var companion : indexes) {
+            addKey(companion.keyspace(), encoded);
+            assignSlot(size - 1, ComputeSlot.companion(size - 1 - index, (Predicate<Object>) companion.member()));
+        }
+        return outcome;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <K, V> Optional<V> guard(Keyspace<K, V> keyspace, K key) {
+        checkOpened(keyspace);
+        Objects.requireNonNull(key, "key");
+        var encoded = Segments.lookupKey(keyspace.keys(), key);
+        var observation = store().observe(keyspace, encoded);
+        addKey(keyspace, encoded);
+        assignSlot(size - 1, ComputeSlot.guard(observation.sequence(), observation.value()));
+        return Optional.ofNullable((V) observation.value());
+    }
+
+    /// {@return the store that reads the values of the batch's computed writes and guards}
+    ///
+    /// @throws IllegalStateException if called from a compute function of the store
+    private LiveLedger store() {
+        if (!(scope.owner() instanceof LiveLedger store)) {
+            throw new UnsupportedOperationException("A batch of no store cannot compute or guard");
+        }
+        store.checkNotComputing();
+        return store;
+    }
+
+    /// Records a write of `key`, encoded, whose [ComputeSlot] says what the commit makes of it: recorded as a removal,
+    /// which the commit applies only as the slot decides.
+    private void addKey(Keyspace<?, ?> keyspace, byte[] key) {
+        var length = key.length;
+        var offset = reserve(length);
+        if (offset == ON_ROPE) {
+            checkRoom(length);
+            offset = takeKey(length);
+        }
+        MemorySegment.copy(key, 0, slot(offset, length), ValueLayout.JAVA_BYTE, 0, length);
+        add(DELETE, keyspace, null, offset, length, ABSENT, 0);
+    }
+
+    /// Gives write `index` its slot.
+    private void assignSlot(int index, ComputeSlot slot) {
+        if (slots == null) {
+            slots = new ComputeSlot[kinds.length];
+        }
+        slots[index] = slot;
+    }
+
+    /// {@return the slot of each write a commit checks at its turn, `null` for the others, in an array at least as long
+    /// as the batch; or `null` if the batch holds none}
+    ///
+    /// The array stays as it is once [#clear()] lets go of it, so a commit that took it before the finish of the batch
+    /// reads its slots after.
+    ComputeSlot[] slots() {
+        return slots;
+    }
+
+    /// {@return whether the batch holds only computed writes whose function ran when they were added and left their
+    /// keys unchanged, with their companions: a commit of it has nothing to write or check}
+    boolean leavesUnchanged() {
+        if (slots == null) {
+            return false;
+        }
+        for (var i = 0; i < size; i++) {
+            var slot = slots[i];
+            if (slot == null || slot.kind == ComputeSlot.GUARD
+                    || slot.kind == ComputeSlot.COMPUTE && (!slot.ran || slot.effect != ComputeSlot.NONE)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// {@return the latest sequence at which a computed write or guard of the batch read its value, 0 if none did}
+    long latestRead() {
+        var latest = 0L;
+        if (slots != null) {
+            for (var i = 0; i < size; i++) {
+                var slot = slots[i];
+                if (slot != null) {
+                    latest = Math.max(latest, slot.readSequence);
+                }
+            }
+        }
+        return latest;
     }
 
     /// {@return where the batch holds `key`, which it encoded there}
@@ -619,6 +768,9 @@ public final class ArrayWriteBatch implements WriteBatch {
             if (owns != null) {
                 owns = Arrays.copyOf(owns, capacity);
             }
+            if (slots != null) {
+                slots = Arrays.copyOf(slots, capacity);
+            }
         }
         kinds[size] = kind;
         targets[size] = keyspace;
@@ -668,6 +820,8 @@ public final class ArrayWriteBatch implements WriteBatch {
         largestValueBytes = 0;
         // Every borrowed array with them: the batch keeps no caller's array past the end of a commit or a clear
         owns = null;
+        // Let go of, not cleared: a commit that took the array reads it after the finish
+        slots = null;
         ownBytes = 0;
         pagedOwns = 0;
         leaveRope();

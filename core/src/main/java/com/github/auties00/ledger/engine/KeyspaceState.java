@@ -149,11 +149,20 @@ final class KeyspaceState {
     /// Whether the store is closing, after which a commit no longer waits for the creator of a chain to list it; set
     /// by the store before its close waits for the commits under way.
     volatile boolean closing;
+    /// The highest sequence of the last write claimed on a chain the store dropped, raised before the drop takes
+    /// effect: a key whose chain has no claim had its earlier writes on chains no higher than this ([ComputeSlot]).
+    @SuppressWarnings("unused")
+    private volatile long droppedClaims;
+    /// The sequence of the last commit that removed a range of the key space, 0 before any; written by commits that run
+    /// alone, and never lowered, a rolled-back removal included.
+    volatile long lastRangeRemoval;
 
     private static final VarHandle UNORDERED;
+    private static final VarHandle DROPPED_CLAIMS;
 
     static {
         try {
+            DROPPED_CLAIMS = MethodHandles.lookup().findVarHandle(KeyspaceState.class, "droppedClaims", long.class);
             UNORDERED = MethodHandles.lookup().findVarHandle(KeyspaceState.class, "unordered", Chain.class);
         } catch (ReflectiveOperationException exception) {
             throw new ExceptionInInitializerError(exception);
@@ -782,7 +791,11 @@ final class KeyspaceState {
         if (claimed == Chain.DROPPED) {
             return true;
         }
-        if (claimed > latest.getAsLong() || chain.head != head || !chain.release(claimed)) {
+        if (claimed > latest.getAsLong() || chain.head != head) {
+            return false;
+        }
+        noteDropped(claimed);
+        if (!chain.release(claimed)) {
             return false;
         }
         empty(chain);
@@ -791,11 +804,31 @@ final class KeyspaceState {
 
     /// Drops `chain`, which a rolled-back write at `sequence` left empty, unless a later write was claimed since.
     boolean dropRolledBack(Chain chain, long sequence) {
-        if (chain.head != null || !chain.release(sequence)) {
+        if (chain.head != null) {
+            return false;
+        }
+        noteDropped(sequence);
+        if (!chain.release(sequence)) {
             return false;
         }
         empty(chain);
         return true;
+    }
+
+    /// Raises [#droppedClaims()] to `claimed`, the last claim of a chain about to be dropped: before the drop, so a
+    /// commit that opens the key's next chain once it sees the drop sees the claim too. A drop that then fails leaves
+    /// it raised, which only sends a later computed write of a key with a new chain to run again.
+    private void noteDropped(long claimed) {
+        long current;
+        while ((current = (long) DROPPED_CLAIMS.getVolatile(this)) < claimed
+                && !DROPPED_CLAIMS.compareAndSet(this, current, claimed)) {
+            Thread.onSpinWait();
+        }
+    }
+
+    /// {@return the highest last claim of a chain the store dropped, or is dropping, in this key space}
+    long droppedClaims() {
+        return (long) DROPPED_CLAIMS.getVolatile(this);
     }
 
     private void empty(Chain chain) {

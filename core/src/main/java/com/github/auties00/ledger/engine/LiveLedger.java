@@ -1,11 +1,13 @@
 package com.github.auties00.ledger.engine;
 
 import com.github.auties00.ledger.Commit;
+import com.github.auties00.ledger.Computed;
 import com.github.auties00.ledger.Entry;
 import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
+import com.github.auties00.ledger.LedgerConflictException;
 import com.github.auties00.ledger.LedgerException;
 import com.github.auties00.ledger.Snapshot;
 import com.github.auties00.ledger.Transaction;
@@ -58,6 +60,13 @@ import java.util.function.LongSupplier;
 /// range removal stays as a record while a reader's tree may hold keys it removed. A resident key space gets the
 /// entries of the checkpoint the store opened from through its [ResidentLoader], from its first use on a thread of the
 /// loader's own, or while the store opens; a write of a key the loader has not reached waits for it.
+///
+/// A computed write or a guard ([ComputeSlot]) reads its key's value before the commit, at the latest sequence, and
+/// the sequencer records, as it claims the key's chain for the commit, the last write claimed there before: at the
+/// commit's turn, once every earlier write of the key has applied, a claim after the read, a range removal of the key
+/// space after it, or a chain dropped since, sends the write to read the key again and run its function there, in the
+/// order of the commits, or fails the guard's commit. The function is never run while the store waits for it
+/// otherwise, so a batch without such writes pays nothing for them.
 public final class LiveLedger implements Ledger {
     /// The bytes by which the array a resident value came in may exceed it before the value takes an array of its own.
     private static final int RESIDENT_SLACK = 64;
@@ -108,6 +117,12 @@ public final class LiveLedger implements Ledger {
     /// The most threads a commit reads tree pages with before it is given a sequence, its own included, about the queue
     /// depth that keeps a solid-state drive busy.
     private static final int PREFETCH_THREADS = 32;
+    /// The store whose compute function the current thread runs, bound while it runs: the store's commits, waits and
+    /// close refuse to run inside one, where a commit could wait for its own.
+    private static final ScopedValue<LiveLedger> COMPUTING = ScopedValue.newInstance();
+    /// The value of an entry of a companion key space.
+    private static final byte[] EMPTY_VALUE = new byte[0];
+    private static final MemorySegment EMPTY_SEGMENT = MemorySegment.ofArray(EMPTY_VALUE).asReadOnly();
 
     private final Map<String, KeyspaceState> states;
     private List<KeyspaceState> sweepOrder;
@@ -907,6 +922,73 @@ public final class LiveLedger implements Ledger {
     }
 
     @Override
+    public <K> long count(Keyspace<K, ?> keyspace, KeyRange<K> range) {
+        ensureOpen();
+        var state = state(keyspace);
+        var lease = readers.enter();
+        try {
+            return Reads.count(state, keyspace, range, point(lease.sequence()));
+        } finally {
+            readers.exit(lease);
+        }
+    }
+
+    @Override
+    public Set<String> keyspaces() {
+        ensureOpen();
+        return Set.copyOf(states.keySet());
+    }
+
+    /// What a computed write or a guard read: the value, decoded, or `null` for none, the latest sequence it was read
+    /// at, and whether a write of the key was claimed after that sequence, which is under way.
+    record Observation(Object value, long sequence, boolean hot) {
+    }
+
+    /// {@return the latest value of the key whose bytes are `key` in `keyspace`, the sequence it was read at, and whether
+    /// a write of the key is under way}
+    ///
+    /// @throws IllegalArgumentException if the store was not opened with `keyspace`
+    Observation observe(Keyspace<?, ?> keyspace, byte[] key) {
+        ensureOpen();
+        var state = state(keyspace);
+        var lease = readers.enter();
+        try {
+            var sequence = lease.sequence();
+            var value = Reads.getEncoded(state, keyspace, key, point(sequence)).orElse(null);
+            var chain = state.chain(MemorySegment.ofArray(key));
+            var claimed = chain == null ? 0 : chain.claimed();
+            return new Observation(value, sequence, claimed > sequence && claimed != Chain.DROPPED);
+        } finally {
+            readers.exit(lease);
+        }
+    }
+
+    /// {@return what `function` makes of `value`, run as a compute function of this store}
+    Object runCompute(Function<Object, Object> function, Object value) {
+        return ScopedValue.where(COMPUTING, this).call(() -> function.apply(value));
+    }
+
+    /// Throws unless the current thread is outside the compute functions of this store.
+    ///
+    /// @throws IllegalStateException if it runs one
+    void checkNotComputing() {
+        if (COMPUTING.isBound() && COMPUTING.get() == this) {
+            throw new IllegalStateException("A compute function cannot commit, compute, wait for durability or close its store");
+        }
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <K, V> Computed<V> compute(Keyspace<K, V> keyspace, K key, Function<? super V, ? extends V> function) {
+        ensureOpen();
+        checkNotComputing();
+        checkNotInTransaction();
+        var batch = new ArrayWriteBatch(batchScope);
+        var computation = (BatchComputation<V>) batch.compute(keyspace, key, function);
+        return new LiveComputed<>(commit(batch), computation);
+    }
+
+    @Override
     public WriteBatch newBatch() {
         ensureOpen();
         return new ArrayWriteBatch(batchScope);
@@ -934,6 +1016,7 @@ public final class LiveLedger implements Ledger {
             throw new IllegalArgumentException("Another store created the batch");
         }
         ensureOpen();
+        checkNotComputing();
         if (writes.size() > Reads.MAX_OPS) {
             throw new IllegalArgumentException("A batch holds at most " + Reads.MAX_OPS + " writes: " + writes.size());
         }
@@ -941,6 +1024,30 @@ public final class LiveLedger implements Ledger {
             return ticket(latest());
         }
         checkNotInTransaction();
+        // Taken before the batch finishes, which lets go of them
+        var slots = writes.slots();
+        var size = writes.size();
+        if (slots != null) {
+            for (var i = 0; i < size; i++) {
+                var slot = slots[i];
+                if (slot != null && slot.outcome != null) {
+                    slot.outcome.reset();
+                }
+            }
+            if (writes.leavesUnchanged()) {
+                // Nothing to write, and nothing to check: each function's read is its own linearization point
+                var read = writes.latestRead();
+                for (var i = 0; i < size; i++) {
+                    var slot = slots[i];
+                    if (slot.outcome != null) {
+                        slot.outcome.applied(slot.observed, slot.observed);
+                        slot.outcome.complete();
+                    }
+                }
+                writes.finish();
+                return ticket(read);
+            }
+        }
         if (checkpointer != null) {
             checkpointer.throttle();
         }
@@ -954,6 +1061,14 @@ public final class LiveLedger implements Ledger {
                 awaitLoaded(writes);
             }
             commit = writes.removesRanges() ? commitAlone(writes, units, outcome) : commitPipelined(writes, units, outcome);
+            if (slots != null) {
+                for (var i = 0; i < size; i++) {
+                    var slot = slots[i];
+                    if (slot != null && slot.outcome != null) {
+                        slot.outcome.complete();
+                    }
+                }
+            }
         } finally {
             if (outcome != null && (outcome[0] == null || !outcome[0].logged())) {
                 // No log frame names them
@@ -1019,6 +1134,16 @@ public final class LiveLedger implements Ledger {
     /// @param units the unit of the file of large values of each put, or `null`
     private void applyAlone(ArrayWriteBatch writes, int index, Applier applier, Hints hints, PageRef[] units) {
         var state = states.get(writes.keyspace(index).name());
+        var slots = writes.slots();
+        if (slots != null && slots[index] != null) {
+            var slot = slots[index];
+            var key = writes.key(index);
+            var chain = slot.kind == ComputeSlot.COMPANION ? applier.claim(state, key) : applier.claimRead(state, key, slot);
+            var decoded = state.resident && writes.kind(index) == ArrayWriteBatch.PUT
+                    ? residentValue(state, writes.decodedValue(index), writes.value(index)) : null;
+            applySlot(applier, writes, slots, index, state, chain, key, decoded, units);
+            return;
+        }
         switch (writes.kind(index)) {
             case ArrayWriteBatch.PUT -> {
                 var value = writes.value(index);
@@ -1335,8 +1460,17 @@ public final class LiveLedger implements Ledger {
         }
         var sequence = sequenced.next;
         var predecessors = new PendingCommit[pending.chains.length];
-        for (var i = 0; i < predecessors.length; i++) {
-            predecessors[i] = claimWrite(pending, i, sequence);
+        var slots = pending.writes.slots();
+        if (slots == null) {
+            for (var i = 0; i < predecessors.length; i++) {
+                predecessors[i] = claimWrite(pending, i, sequence);
+            }
+        } else {
+            for (var i = 0; i < predecessors.length; i++) {
+                var slot = slots[i];
+                predecessors[i] = slot == null || slot.kind == ComputeSlot.COMPANION
+                        ? claimWrite(pending, i, sequence) : claimRead(pending, i, sequence, slot);
+            }
         }
         pending.predecessors = predecessors;
         pending.sequence = sequence;
@@ -1367,6 +1501,26 @@ public final class LiveLedger implements Ledger {
         }
     }
 
+    /// Claims the chain of the key of write `index` of `pending`, a computed write or a guard, as
+    /// [#claimWrite(PendingCommit, int, long)] does, recording in `slot` the sequence of the last write claimed on it
+    /// before: only a drop can come between the two loads, as claims are made holding the sequencing role or alone, and
+    /// a drop makes the claim fail and the key take a chain of its own.
+    private static PendingCommit claimRead(PendingCommit pending, int index, long sequence, ComputeSlot slot) {
+        var chain = pending.chains[index];
+        while (true) {
+            var prior = chain.claimed();
+            if (prior != Chain.DROPPED) {
+                var previous = chain.claim(pending, sequence);
+                if (previous != Chain.DROPPED_WRITER) {
+                    slot.prior = prior;
+                    return previous instanceof PendingCommit commit && commit != pending ? commit : null;
+                }
+            }
+            chain = pending.states[index].open(pending.keys[index]);
+            pending.chains[index] = chain;
+        }
+    }
+
     /// Applies the writes of `pending` to their chains, each once the commit before it on the same key has.
     ///
     /// A write whose tree cannot be read takes back the commit's writes: it publishes empty, so the commits after it
@@ -1377,8 +1531,9 @@ public final class LiveLedger implements Ledger {
                 writes.sharesChunk(), spillRoom(writes));
         try {
             var size = writes.size();
+            var slots = writes.slots();
             for (var i = 0; i < size; i++) {
-                applyWrite(pending, applier, i);
+                applyWrite(pending, applier, i, slots);
             }
         } catch (Throwable failure) {
             applier.rollback();
@@ -1391,12 +1546,19 @@ public final class LiveLedger implements Ledger {
     }
 
     /// Applies write `index` of `pending` to its chain once the commit before it on the same key has.
-    private void applyWrite(PendingCommit pending, Applier applier, int index) {
+    ///
+    /// @param slots the slots of the batch's writes, or `null` if it has none
+    private void applyWrite(PendingCommit pending, Applier applier, int index, ComputeSlot[] slots) {
         var predecessor = pending.predecessors[index];
         if (predecessor != null) {
             predecessor.awaitApplied();
         }
         var writes = pending.writes;
+        if (slots != null && slots[index] != null) {
+            applySlot(applier, writes, slots, index, pending.states[index], pending.chains[index], pending.keys[index],
+                    pending.decoded == null ? null : pending.decoded[index], pending.units);
+            return;
+        }
         var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(index, tree);
         var key = pending.keys[index];
         if (writes.kind(index) == ArrayWriteBatch.PUT) {
@@ -1405,6 +1567,158 @@ public final class LiveLedger implements Ledger {
                     pending.decoded == null ? null : pending.decoded[index], inTree, pending.units == null ? null : pending.units[index]);
         } else {
             applier.delete(pending.states[index], pending.chains[index], key, inTree);
+        }
+    }
+
+    /// Applies write `index` of `writes`, which has a slot, to `chain`, claimed for it, once every earlier write of its
+    /// key has applied.
+    ///
+    /// A guard checks that the key holds what it read, a companion follows its computed write, and a computed write
+    /// applies what its function decided when it was added, or runs it again on the latest value; a value read here may
+    /// come from the tree, reading the file.
+    ///
+    /// @param decoded the decoded value of a put to a resident key space the write resolved to, or `null`
+    /// @param units the unit of the file of large values of each put, or `null`; the one of a computed write that runs
+    ///              again is released and cleared, as its value goes to the log
+    /// @throws LedgerConflictException if a guard finds its value changed
+    private void applySlot(Applier applier, ArrayWriteBatch writes, ComputeSlot[] slots, int index, KeyspaceState state,
+                           Chain chain, MemorySegment key, Object decoded, PageRef[] units) {
+        var slot = slots[index];
+        switch (slot.kind) {
+            case ComputeSlot.GUARD -> {
+                if (!slot.unchangedSinceRead(state.droppedClaims(), state.lastRangeRemoval)
+                        && !holdsAgain(state, Reads.current(state, chain.head, key, writerPoint(applier.scanBound())), slot.observed)) {
+                    throw new LedgerConflictException("A value a guard read in " + state.keyspace.name() + " has changed");
+                }
+                applier.claimedOnly(state, chain);
+            }
+            case ComputeSlot.COMPANION -> applyCompanion(applier, slots[index - slot.primary], slot, state, chain, key);
+            default -> applyCompute(applier, writes, slot, index, state, chain, key, decoded, units);
+        }
+    }
+
+    /// {@return whether `current`, the latest value of a key, is what a guard read as `observed`: no value either time,
+    /// the same instance, or values that encode to the same bytes}
+    @SuppressWarnings("unchecked")
+    private static boolean holdsAgain(KeyspaceState state, Object current, Object observed) {
+        if (current == observed) {
+            return true;
+        }
+        if (current == null || observed == null) {
+            return false;
+        }
+        if (state.keyspace.values() == BuiltinCodecs.BYTES_VALUE) {
+            return Arrays.equals((byte[]) current, (byte[]) observed);
+        }
+        var codec = (ValueCodec<Object>) state.keyspace.values();
+        var length = codec.sizeOf(current);
+        if (length != codec.sizeOf(observed)) {
+            return false;
+        }
+        var left = new byte[Math.toIntExact(length)];
+        var right = new byte[left.length];
+        codec.encode(current, MemorySegment.ofArray(left));
+        codec.encode(observed, MemorySegment.ofArray(right));
+        return Arrays.equals(left, right);
+    }
+
+    /// Applies the computed write `index` of `writes`, as [#applySlot] does.
+    private void applyCompute(Applier applier, ArrayWriteBatch writes, ComputeSlot slot, int index, KeyspaceState state,
+                              Chain chain, MemorySegment key, Object decoded, PageRef[] units) {
+        if (!slot.unchangedSinceRead(state.droppedClaims(), state.lastRangeRemoval)) {
+            var current = Reads.current(state, chain.head, key, writerPoint(applier.scanBound()));
+            // The same instance, or no value either time: the function would make the same of it
+            if (!slot.ran || current != slot.observed) {
+                rerun(applier, slot, index, state, chain, key, current, units);
+                return;
+            }
+        }
+        // Whether the key existed is what the read found: no write came between
+        var existed = slot.observed != null ? TreeSearch.FOUND : TreeSearch.ABSENT;
+        switch (slot.effect) {
+            case ComputeSlot.PUT -> applier.put(state, chain, key, writes.value(index), writes.ownValue(index),
+                    writes.borrowed(index), writes.home(index), writes.homeArray(index), writes.homeOffset(index), decoded,
+                    existed, units == null ? null : units[index]);
+            case ComputeSlot.DELETE -> applier.delete(state, chain, key, existed);
+            default -> applier.claimedOnly(state, chain);
+        }
+        var left = slot.effect == ComputeSlot.NONE ? slot.observed : slot.result;
+        slot.appliedPrevious = slot.observed;
+        slot.appliedValue = left;
+        slot.outcome.applied(slot.observed, left);
+    }
+
+    /// Runs the function of the computed write `index` again on `current`, the latest value of its key, and applies
+    /// what it returns.
+    private void rerun(Applier applier, ComputeSlot slot, int index, KeyspaceState state, Chain chain, MemorySegment key,
+                       Object current, PageRef[] units) {
+        if (units != null && units[index] != null) {
+            // Sealed for the result of the first run, which no frame names
+            blobs.release(units[index]);
+            units[index] = null;
+        }
+        // Registered before the function runs, so a rollback drops the chain if the function throws
+        applier.claimedOnly(state, chain);
+        var result = runCompute(slot.function, current);
+        var existed = current != null ? TreeSearch.FOUND : TreeSearch.ABSENT;
+        if (result != current) {
+            if (result == null) {
+                applier.delete(state, chain, key, existed);
+            } else {
+                putComputed(applier, state, chain, key, result, existed);
+            }
+        }
+        slot.appliedPrevious = current;
+        slot.appliedValue = result;
+        slot.outcome.applied(current, result);
+    }
+
+    /// Encodes `result`, what a compute function returned in the order of the commits, into an array of its own and
+    /// puts it under `key`.
+    ///
+    /// @throws IllegalArgumentException if it encodes to more than [ValueCodec#MAX_LENGTH]
+    @SuppressWarnings("unchecked")
+    private static void putComputed(Applier applier, KeyspaceState state, Chain chain, MemorySegment key, Object result,
+                                    byte existed) {
+        var codec = (ValueCodec<Object>) state.keyspace.values();
+        var length = codec.sizeOf(result);
+        if (length < 0 || length > ValueCodec.MAX_LENGTH) {
+            throw new IllegalArgumentException("Values are at most " + ValueCodec.MAX_LENGTH + " bytes: " + length);
+        }
+        applier.checkFrame(key.byteSize() + length);
+        byte[] own;
+        if (state.keyspace.values() == BuiltinCodecs.BYTES_VALUE) {
+            own = ((byte[]) result).clone();
+        } else {
+            own = new byte[(int) length];
+            codec.encode(result, MemorySegment.ofArray(own));
+        }
+        applier.put(state, chain, key, MemorySegment.ofArray(own).asReadOnly(), own, false, null, own, 0,
+                state.resident ? result : null, existed, null);
+    }
+
+    /// Applies the write of the companion `slot` of the computed write `primary`, which applied first: puts the entry
+    /// when the value it left is a member and the one it replaced was not, removes it in the opposite case.
+    ///
+    /// Whether the companion holds the entry is what membership says of the value replaced, as the store writes it only
+    /// in step; a resident companion knows from memory alone.
+    private void applyCompanion(Applier applier, ComputeSlot primary, ComputeSlot slot, KeyspaceState state, Chain chain,
+                                MemorySegment key) {
+        var previous = primary.appliedPrevious;
+        var value = primary.appliedValue;
+        var was = previous != null && slot.member.test(previous);
+        var is = value != null && slot.member.test(value);
+        if (previous == value || was == is) {
+            applier.claimedOnly(state, chain);
+            return;
+        }
+        var existed = state.resident ? TreeSearch.ABSENT : was ? TreeSearch.FOUND : TreeSearch.ABSENT;
+        if (is) {
+            var decoded = state.resident && state.keyspace.values() != BuiltinCodecs.BYTES_VALUE
+                    ? state.keyspace.values().decode(EMPTY_SEGMENT) : EMPTY_VALUE;
+            applier.put(state, chain, key, EMPTY_SEGMENT, EMPTY_VALUE, false, null, EMPTY_VALUE, 0, decoded, existed, null);
+        } else {
+            applier.delete(state, chain, key, existed);
         }
     }
 
@@ -1758,6 +2072,7 @@ public final class LiveLedger implements Ledger {
     public Commit update(Consumer<Transaction> transaction) {
         Objects.requireNonNull(transaction, "transaction");
         ensureOpen();
+        checkNotComputing();
         checkNotInTransaction();
         if (checkpointer != null) {
             checkpointer.throttle();
@@ -1820,6 +2135,7 @@ public final class LiveLedger implements Ledger {
     @Override
     public void awaitDurable() throws InterruptedException {
         ensureOpen();
+        checkNotComputing();
         if (log != null) {
             log.awaitDurable(latest());
         }
@@ -1834,6 +2150,8 @@ public final class LiveLedger implements Ledger {
     @Override
     public void checkpoint() {
         ensureOpen();
+        checkNotComputing();
+        checkHealthy();
         if (checkpointer != null) {
             // It forces the files on this thread: an interrupt would close their channels under the store's own threads
             var interrupted = Thread.interrupted();
@@ -1849,6 +2167,7 @@ public final class LiveLedger implements Ledger {
 
     @Override
     public void close() {
+        checkNotComputing();
         close(true);
     }
 
@@ -2229,6 +2548,11 @@ public final class LiveLedger implements Ledger {
     private boolean prefetchWrite(ArrayWriteBatch writes, int index, ReadPoint point, byte[] found) {
         var kind = writes.kind(index);
         if (kind != ArrayWriteBatch.PUT && kind != ArrayWriteBatch.DELETE) {
+            return false;
+        }
+        var slots = writes.slots();
+        if (slots != null && slots[index] != null) {
+            // Its slot tells whether the key exists, or it reads the key at its turn
             return false;
         }
         var state = states.get(writes.keyspace(index).name());
@@ -3008,6 +3332,27 @@ public final class LiveLedger implements Ledger {
             }
         }
 
+        /// {@return the chain of `key`, claimed for the computed write or guard `slot` of an operation that runs alone,
+        /// recording in `slot` the sequence of the last write claimed on it before}
+        Chain claimRead(KeyspaceState state, MemorySegment key, ComputeSlot slot) {
+            while (true) {
+                var chain = state.open(key);
+                var prior = chain.claimed();
+                if (prior != Chain.DROPPED && chain.claimAlone(sequence)) {
+                    slot.prior = prior;
+                    return chain;
+                }
+            }
+        }
+
+        /// Records that the commit claimed `chain` and writes nothing to it, so the prune after the commit, or its
+        /// rollback, drops it if it has no version.
+        void claimedOnly(KeyspaceState state, Chain chain) {
+            if (chain.head == null) {
+                touched.add(new Touched(state, chain, null, false));
+            }
+        }
+
         /// Applies a put of `key`, whose chain is `chain`, in the order and without the race the caller ensures.
         ///
         /// The commit's frame refers to the value rather than copying it, if it is long enough, wherever the value lies
@@ -3193,6 +3538,8 @@ public final class LiveLedger implements Ledger {
 
         void deleteRange(KeyspaceState state, MemorySegment from, MemorySegment to) {
             var stamp = nextStamp();
+            // Before the removal is visible to any write of the key space: the computed writes read before it check it
+            state.lastRangeRemoval = sequence;
             var removed = 0L;
             if (countsLater(state)) {
                 deferCount(state, from, to, stamp);

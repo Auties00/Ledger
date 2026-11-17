@@ -82,6 +82,11 @@ final class LiveTransaction implements Transaction {
     }
 
     @Override
+    public <K> long count(Keyspace<K, ?> keyspace, KeyRange<K> range) {
+        return Reads.count(state(keyspace), keyspace, range, ledger.writerPoint(applier.scanBound()));
+    }
+
+    @Override
     public <K, V> Transaction put(Keyspace<K, V> keyspace, K key, V value) {
         var state = state(keyspace);
         Objects.requireNonNull(value, "value");

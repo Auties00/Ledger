@@ -298,7 +298,8 @@ final class Checkpointer implements IdleTicker.Watched {
     /// Starts a checkpoint on a thread of its own, unless one is running; a thread the system refuses is reported as a
     /// failed checkpoint, which the next start retries.
     private void start() {
-        if (!scheduled.compareAndSet(false, true)) {
+        // A stopped log holds commits it may have lost: no checkpoint takes them, and none is started to fail
+        if (log.stopped() || !scheduled.compareAndSet(false, true)) {
             return;
         }
         try {

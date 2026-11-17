@@ -251,9 +251,13 @@ final class Reads {
     /// A resident key space returns the decoded value its version holds. Any other key space with byte array values
     /// copies the value out of the array that holds it, a version's own or a page's, rather than decoding a segment
     /// of it: the decoder's copy would zero the new array before filling it ([Segments#toBytes(byte\[\], int, int)]).
-    @SuppressWarnings("unchecked")
     static <K, V> Optional<V> get(KeyspaceState state, Keyspace<K, V> keyspace, K key, ReadPoint point) {
-        var encoded = Segments.lookupKey(keyspace.keys(), Objects.requireNonNull(key, "key"));
+        return getEncoded(state, keyspace, Segments.lookupKey(keyspace.keys(), Objects.requireNonNull(key, "key")), point);
+    }
+
+    /// {@return the value `point` sees under the key whose bytes are `encoded`}, as [#get] reads it
+    @SuppressWarnings("unchecked")
+    static <V> Optional<V> getEncoded(KeyspaceState state, Keyspace<?, V> keyspace, byte[] encoded, ReadPoint point) {
         var removals = state.removals;
         // Its decoder copies the encoding whole, so the copy here returns the same bytes
         var bytes = keyspace.values() == BuiltinCodecs.BYTES_VALUE;
@@ -286,6 +290,76 @@ final class Reads {
             }
         }
         return treeGet(keyspace, encoded, point, point.root(state), removals, bytes, !state.resident);
+    }
+
+    /// {@return the value `point` sees under `key`, decoded, or `null` if it sees none}
+    ///
+    /// The writer's read of the latest value of a key it is about to write, its chain claimed and every earlier write of
+    /// it applied: `head` is the newest version of `key` in memory, or `null`. A resident key space returns the
+    /// instance its version holds, as [#get] does, so a value read twice without a write in between is the same
+    /// instance; a key with no version in memory reads the run and the tree of `point`, which may read the file.
+    ///
+    /// @param head the newest version of `key` in memory, or `null` if there is none
+    static Object current(KeyspaceState state, Version head, MemorySegment key, ReadPoint point) {
+        var keyspace = state.keyspace;
+        var removals = state.removals;
+        var bytes = keyspace.values() == BuiltinCodecs.BYTES_VALUE;
+        var version = KeyspaceState.resolve(head, key, point.bound(), removals);
+        if (version != null) {
+            if (version == Version.HIDDEN) {
+                return null;
+            }
+            if (state.resident) {
+                return version.decoded;
+            }
+            try {
+                return bytes ? version.copyBytes() : keyspace.values().decode(version.value());
+            } catch (LogSegmentView.Retired _) {
+                checkTreeHolds(version, point);
+            }
+        }
+        var encoded = Segments.toBytes(key);
+        var run = runOf(state, point);
+        if (run != null) {
+            var entry = run.find(encoded);
+            if (entry >= 0) {
+                if (run.removes(entry) || hiddenSinceTree(encoded, point, removals)) {
+                    return null;
+                }
+                return bytes ? run.valueBytes(entry) : keyspace.values().decode(run.value(entry));
+            }
+        }
+        return treeGet(keyspace, encoded, point, point.root(state), removals, bytes, !state.resident).orElse(null);
+    }
+
+    /// {@return the entries of `range` `point` sees in `state`, as [com.github.auties00.ledger.View#count] counts
+    /// them}
+    ///
+    /// A resident key space is counted in memory alone, once its loader has put every entry there, which the count
+    /// waits for: memory then holds every entry, so a key no version at or below the bound of `point` speaks for is
+    /// absent, and no tree is read. A paged one is counted as [#count(KeyspaceState, MemorySegment, MemorySegment,
+    /// ReadPoint)] counts.
+    static <K> long count(KeyspaceState state, Keyspace<K, ?> keyspace, KeyRange<K> range, ReadPoint point) {
+        Objects.requireNonNull(range, "range");
+        var from = range.from().map(key -> Segments.encodeKey(keyspace.keys(), key)).orElse(null);
+        var to = range.to().map(key -> Segments.encodeKey(keyspace.keys(), key)).orElse(null);
+        if (from != null && to != null && Segments.compare(from, to) >= 0) {
+            return 0;
+        }
+        if (!state.resident) {
+            return count(state, from, to, point);
+        }
+        state.awaitLoaded(null);
+        var removals = state.removals;
+        var bound = point.bound();
+        var total = 0L;
+        for (var entry : state.slice(from, to).entrySet()) {
+            var version = KeyspaceState.resolve(entry.getValue().head, entry.getKey(), bound, removals);
+            if (version != null && version != Version.HIDDEN) {
+                total++;
+            }
+        }
+        return total;
     }
 
     /// Checks that the tree of `point` holds the value of `version`, which `point` sees and whose log segment a

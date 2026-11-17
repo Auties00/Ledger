@@ -6,7 +6,8 @@ package com.github.auties00.ledger;
 /// they can act on. Misuse (a closed store, an unknown key space) throws the JDK's [IllegalStateException] or
 /// [IllegalArgumentException] instead.
 public abstract sealed class LedgerException extends RuntimeException
-        permits LedgerIoException, LedgerCorruptedException, LedgerKeyException, LedgerLockedException {
+        permits LedgerIoException, LedgerCorruptedException, LedgerKeyException, LedgerLockedException,
+        LedgerConflictException {
     /// Creates an exception with `message` and `cause`.
     ///
     /// @param message the detail message

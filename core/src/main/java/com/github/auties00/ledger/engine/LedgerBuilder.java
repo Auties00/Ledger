@@ -40,6 +40,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private long segmentSize;
     private long checkpointHeap;
     private Consumer<? super LedgerException> backgroundFailures;
+    // Null for none
+    private Consumer<? super LedgerIoException> stopListener;
     private long largeValues;
     private final Map<String, Long> largeValuesByKeyspace;
     // Null for the mode the system property names
@@ -149,6 +151,12 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     @Override
     public Ledger.Options onBackgroundFailure(Consumer<? super LedgerException> listener) {
         this.backgroundFailures = Objects.requireNonNull(listener, "listener");
+        return this;
+    }
+
+    @Override
+    public Ledger.Options onStop(Consumer<? super LedgerIoException> listener) {
+        this.stopListener = Objects.requireNonNull(listener, "listener");
         return this;
     }
 
@@ -362,6 +370,9 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var checkpointer = new Checkpointer(ledger, pages, space, blobs, log, files, checkpointEvery,
                     superblock == null ? 0 : superblock.number(), deltas, deltaTable, backgroundFailures,
                     superblock == null ? 0 : superblock.epoch(), epochs[0], checkpointHeap);
+            if (stopListener != null) {
+                log.onStop(stopListener);
+            }
             ledger.attach(log, catalog, checkpointer, pages, lock);
             // Once nothing can fail: a store that failed to open would count toward the process's budget
             checkpointer.open(ledger.replayedBytes(), ledger.replayedHeap());

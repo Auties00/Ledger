@@ -148,6 +148,8 @@ class CrashRecoveryTest {
             }
             for (var keyspace : KEYSPACES) {
                 assertEquals(recovered.get(keyspace.name()).size(), ledger.size(keyspace), keyspace.name() + " count");
+                assertEquals(recovered.get(keyspace.name()).subMap("k030", "k090").size(),
+                        ledger.count(keyspace, KeyRange.between("k030", "k090")), keyspace.name() + " count of a range");
                 // A descending scan walks the chains the recovery replayed along the links its first walk sets
                 var descending = new ArrayList<String>();
                 ledger.forEach(keyspace, KeyRange.<String>all().reversed(), (key, _) -> descending.add(key));
@@ -280,6 +282,15 @@ class CrashRecoveryTest {
                 } else if (kind < 5) {
                     batch.delete(keyspace, key);
                     entries.remove(key);
+                } else if (kind < 8) {
+                    // A computed write: the model makes of the key what the function does at the batch's turn
+                    var computed = CheckpointTest.grow(entries.get(key));
+                    batch.compute(keyspace, key, CheckpointTest::grow);
+                    if (computed == null) {
+                        entries.remove(key);
+                    } else {
+                        entries.put(key, computed);
+                    }
                 } else {
                     var value = value();
                     batch.put(keyspace, key, value);

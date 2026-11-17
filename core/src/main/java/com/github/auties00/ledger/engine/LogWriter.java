@@ -394,6 +394,10 @@ final class LogWriter {
     private volatile long durable;
     private long written;
     private volatile LedgerIoException failure;
+    // Receives the failure that stops the writer, once; set before the first commit
+    private Consumer<? super LedgerIoException> stopListener;
+    // Whether the listener heard of the stop
+    private final AtomicBoolean stopReported = new AtomicBoolean();
 
     /// Prepares a segment to write frames to.
     ///
@@ -1739,7 +1743,8 @@ final class LogWriter {
     }
 
     private void stop(IOException cause) {
-        failure = new LedgerIoException("The log could not be written: commits since the last force may be lost", cause);
+        var stopped = new LedgerIoException("The log could not be written: commits since the last force may be lost", cause);
+        failure = stopped;
         durabilityLock.lock();
         try {
             durabilityChanged.signalAll();
@@ -1760,6 +1765,25 @@ final class LogWriter {
         } finally {
             queueLock.unlock();
         }
+        var listener = stopListener;
+        if (listener != null && stopReported.compareAndSet(false, true)) {
+            try {
+                listener.accept(stopped);
+            } catch (RuntimeException _) {
+                // A listener that throws loses its report, not the store
+            }
+        }
+    }
+
+    /// Makes `listener` hear of the failure that stops the writer, once, on the thread that meets it; called before
+    /// the first commit.
+    void onStop(Consumer<? super LedgerIoException> listener) {
+        this.stopListener = listener;
+    }
+
+    /// {@return whether a failed write or force stopped the writer}
+    boolean stopped() {
+        return failure != null;
     }
 
     /// {@return the latest sequence the log holds durably}

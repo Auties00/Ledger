@@ -3,6 +3,9 @@ package com.github.auties00.ledger;
 import com.github.auties00.ledger.engine.ArrayWriteBatch;
 
 import java.lang.foreign.MemorySegment;
+import java.util.List;
+import java.util.Optional;
+import java.util.function.Function;
 
 /// Writes that a [Ledger] applies atomically, in the order they were added.
 ///
@@ -15,6 +18,14 @@ import java.lang.foreign.MemorySegment;
 /// A byte array [put][#put(Keyspace, Object, Object)] to a [Keyspace.Residency#PAGED] key space of a store in a
 /// directory, long enough to go to the store's file of large values, is the exception: the batch neither encodes nor
 /// copies it, and the commit seals it into that file straight from the caller's array.
+///
+/// A batch holds at most 16,777,215 writes, each [compute][#compute] and [guard][#guard] counting as one, and each
+/// [Companion] of a compute as one more. Keys encode to 1 to [KeyCodec#MAX_LENGTH] bytes, and values to at most
+/// [ValueCodec#MAX_LENGTH], zero included.
+///
+/// A [compute][#compute] reads the latest value of its key when it is added, and a [guard][#guard] the value it holds
+/// the batch to: the commit checks, at the batch's turn, that no write of the key came in between. A batch that holds
+/// either is checked again if it is committed again after a commit of it failed.
 public sealed interface WriteBatch permits ArrayWriteBatch {
     /// Adds a write of `value` under `key`, replacing any value already there.
     ///
@@ -74,6 +85,75 @@ public sealed interface WriteBatch permits ArrayWriteBatch {
     /// @return this batch
     /// @throws IllegalArgumentException if the store was not opened with `keyspace`
     <K> WriteBatch deleteRange(Keyspace<K, ?> keyspace, KeyRange<K> range);
+
+    /// Adds a write of what `function` makes of the value under `key`, applied in order with the other writes of the
+    /// batch.
+    ///
+    /// `function` runs once now, on the calling thread, against the latest committed value (`null` if none), and its
+    /// result is encoded as [#put] would encode it: `null` removes the key, and the instance it received leaves the key
+    /// unchanged. When the batch commits, that result is written only if no write of the key came between the value it
+    /// read and the batch's turn; otherwise `function` runs again, in the order of commits, on the value that write
+    /// left, and its result is written instead. A write of the same key earlier in this batch counts as such a write:
+    /// the function then sees it. When a write of the key is already under way as it is added, the function does not
+    /// run now, only in the order of commits.
+    ///
+    /// `function` follows the rules of [Ledger#compute]: it may run twice, must depend only on the value it receives,
+    /// and must not commit, start a transaction, wait for durability or close the store. If it throws now, the batch is
+    /// left as it was and the exception propagates; if it throws in the order of commits, none of the batch's writes
+    /// apply and the commit throws it.
+    ///
+    /// @param keyspace the key space to write
+    /// @param key the key
+    /// @param function makes the new value from the latest one
+    /// @param <K> the key type
+    /// @param <V> the value type
+    /// @return the outcome of this write, readable once [Ledger#commit(WriteBatch)] returns
+    /// @throws IllegalArgumentException as [#put] does
+    /// @throws LedgerCorruptedException if the page holding the value fails authentication
+    /// @throws IllegalStateException if the store is closed, or if called from a compute function of the store
+    <K, V> Computation<V> compute(Keyspace<K, V> keyspace, K key, Function<? super V, ? extends V> function);
+
+    /// Adds a write of what `function` makes of the value under `key`, as [#compute(Keyspace, Object, Function)]
+    /// does, and keeps each of `companions` in step with it.
+    ///
+    /// Each companion holds a zero-length entry under the same key bytes while the value is a member: the commit puts
+    /// it when the value the write leaves is a member and the one it replaced was not, and removes it in the opposite
+    /// case, from the value of the function's last run. The companions' writes apply with the computed one, ordered
+    /// with every other write of their keys.
+    ///
+    /// @param keyspace the key space to write
+    /// @param key the key
+    /// @param function makes the new value from the latest one
+    /// @param companions the key spaces that index the values, each once, none of them `keyspace`
+    /// @param <K> the key type
+    /// @param <V> the value type
+    /// @return the outcome of this write, readable once [Ledger#commit(WriteBatch)] returns
+    /// @throws IllegalArgumentException as [#put] does, or if a companion's key space is `keyspace`, appears twice, or
+    ///                                  the store was not opened with it
+    /// @throws LedgerCorruptedException if the page holding the value fails authentication
+    /// @throws IllegalStateException if the store is closed, or if called from a compute function of the store
+    <K, V> Computation<V> compute(Keyspace<K, V> keyspace, K key, Function<? super V, ? extends V> function,
+                                  List<Companion<K, ? super V>> companions);
+
+    /// Holds the batch to the latest value under `key`, which it returns.
+    ///
+    /// When the batch commits, it applies only if no write of the key came between this read and the batch's turn, or
+    /// if the key holds again what this read found: no value, or a value that encodes to the same bytes. Otherwise none
+    /// of its writes apply and the commit throws [LedgerConflictException]. A write of the same key earlier in this
+    /// batch counts as such a write, so a guard goes before the batch's writes of its key. The guard writes nothing,
+    /// and the check costs the commit no read unless a write of the key, or a removal of a range of its key space, came
+    /// after the read.
+    ///
+    /// @param keyspace the key space to read
+    /// @param key the key
+    /// @param <K> the key type
+    /// @param <V> the value type
+    /// @return the value under `key`, or an empty optional if there is none
+    /// @throws IllegalArgumentException if the store was not opened with `keyspace`, or the key encodes to no bytes or
+    ///                                  more than [KeyCodec#MAX_LENGTH]
+    /// @throws LedgerCorruptedException if the page holding the value fails authentication
+    /// @throws IllegalStateException if the store is closed, or if called from a compute function of the store
+    <K, V> Optional<V> guard(Keyspace<K, V> keyspace, K key);
 
     /// {@return the number of writes added}
     int size();
