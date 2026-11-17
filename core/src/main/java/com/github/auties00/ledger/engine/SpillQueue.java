@@ -189,7 +189,8 @@ final class SpillQueue {
         return Math.clamp(maxMemory / 1024, 4L << 20, 64L << 20);
     }
 
-    /// Reads the latest durable sequence from `log` from now on, and moves values whenever the queue is over budget.
+    /// Reads the latest durable sequence from `log` from now on, and moves values whenever the queue is over budget or
+    /// holds a durable record the budget does not count.
     void useLog(LogWriter log) {
         useDurable(log::durableSequence);
     }

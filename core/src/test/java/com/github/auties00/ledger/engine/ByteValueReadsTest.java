@@ -132,7 +132,10 @@ class ByteValueReadsTest {
                 ledger.commit(ledger.newBatch().put(FILES, "alone", alone));
                 for (var key : List.of("huge", "large", "alone")) {
                     if (largeValues == Long.MAX_VALUE) {
-                        assertTrue(ownsArray(head(ledger, FILES, key)), "a value of over half a chunk is on a segment");
+                        // On an array of its own, which leaves the heap for the log once its commit is durable
+                        var version = head(ledger, FILES, key);
+                        assertTrue(ownsArray(version) || version.sourceForTests() instanceof LogValue,
+                                "a value of over half a chunk is on a segment");
                     } else {
                         // Its unit holds it, and memory keeps no copy
                         assertTrue(head(ledger, FILES, key).sourceForTests() instanceof BlobFile, "a large value kept a copy");
