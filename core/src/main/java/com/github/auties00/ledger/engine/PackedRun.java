@@ -27,7 +27,7 @@ import java.util.Arrays;
 /// replay runs and the run's after, so it is exact, never blind.
 ///
 /// Per entry it keeps the key's bytes and their end, a word of the value's place and kind, a slot of the hash table and an
-/// index of the key order; a value shorter than [SpillQueue#LOG_VALUE_MIN] lies in the replay's chunks
+/// index of the key order; a value shorter than [#LOG_VALUE_MIN] lies in the replay's chunks
 /// ([ReplayValues]), and a longer one stays in the log, where the run keeps its place, its tag and its stamp, which the
 /// tag binds, as a [LogValue] would. A message that took a chain, a version, a [LogValue], an entry of the hash index, of
 /// the dirty and blind lists, and a node of the ordered map once scanned, about 300 bytes over its key and value, takes
@@ -36,6 +36,11 @@ import java.util.Arrays;
 /// Immutable once built, so readers use it without synchronization; [#correction()] and the tree lookups it caches
 /// take a lock of their own.
 final class PackedRun {
+    /// The shortest value a run keeps in the log rather than in a chunk of the replay: a logged value takes 32 bytes of
+    /// the run's arrays, its stamp, its place, where it lies in its body and its tag, and a read back by the first
+    /// checkpoint, and a value in a chunk its bytes alone, with none of the header of the array of its own that a live
+    /// commit's value weighs the log against ([SpillQueue#LOG_VALUE_MIN]).
+    static final int LOG_VALUE_MIN = 256;
     /// The entries a run holds at most: the low bits of a slot of the hash table hold an entry's index plus one.
     static final int MAX_ENTRIES = (1 << 24) - 2;
     /// The log segments the logged values of a run may lie in at most: the high bits of a value's place in the log.
@@ -63,7 +68,7 @@ final class PackedRun {
     private static final MemorySegment EMPTY = MemorySegment.ofArray(new byte[0]).asReadOnly();
 
     static {
-        if (ReplayValues.CHUNK_BYTES > 1 << OFFSET_BITS || SpillQueue.LOG_VALUE_MIN > LENGTH_MASK) {
+        if (ReplayValues.CHUNK_BYTES > 1 << OFFSET_BITS || LOG_VALUE_MIN > LENGTH_MASK) {
             throw new ExceptionInInitializerError("A value in a chunk does not fit the word of its entry");
         }
     }

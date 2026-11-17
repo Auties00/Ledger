@@ -49,10 +49,12 @@ import java.util.zip.CRC32C;
 ///   own, of a transaction, or of one with a unit of [BlobFile]. A value a recovery copied to an array of its own
 ///   moves, to the log only;
 /// - of a commit whose values on shared arrays would take, once moved, more than half the bytes they take now
-///   ([Record#settle()]): a short value goes to an array of its own, which frees the array it shared only once every
-///   other value on it left too, so moving a commit of mostly short values, like an app-state snapshot of 100 to 300
-///   byte values, allocates about as much as it frees and makes the next checkpoint read the long ones back from the
-///   log. The commit's values on arrays of their own move all the same, each freeing its array for a [LogValue].
+///   ([Record#settle()]): a value shorter than [#LOG_VALUE_MIN] goes to an array of its own, which frees the array it
+///   shared only once every other value on it left too, so moving a commit of mostly such values, like a batch of
+///   identifiers of a few dozen bytes, allocates about as much as it frees and makes the next checkpoint read the long
+///   ones back from the log. A commit of values of [#LOG_VALUE_MIN] bytes or more, like an app-state snapshot of 100 to
+///   300 byte values, moves whole, its frame leaving the heap for a [LogValue] per value. The commit's values on arrays
+///   of their own move all the same, each freeing its array for a [LogValue].
 ///
 /// A recovery moves a value it replays that the log holds before its last budget of bytes at once, on its own thread,
 /// tagged where it lies in the frame body it came in
@@ -68,8 +70,9 @@ import java.util.zip.CRC32C;
 /// ([LiveLedger#replay(long, byte\[\], int, int, ReplayValues, LogSegmentView, long, long)]).
 final class SpillQueue {
     /// The shortest value that moves to the log: a [LogValue] takes 40 bytes, an array of the value 16 more than the
-    /// value; below it, the array costs less than a read back from the file.
-    static final int LOG_VALUE_MIN = 256;
+    /// value, 8-aligned, so from 96 bytes the log saves at least 72 bytes of heap per value, for a positioned read back
+    /// by the checkpoint that writes it; below, the array saves too little for the read.
+    static final int LOG_VALUE_MIN = 96;
     /// The bytes a [LogValue] takes on the heap.
     private static final int LOG_VALUE_BYTES = 40;
     /// The bytes of the header of an array.
@@ -600,9 +603,10 @@ final class SpillQueue {
         /// whose bytes alone the record then counts.
         ///
         /// A batch's values lie packed on arrays of about their bytes, so moving them all frees about their bytes, and
-        /// moving some frees nothing while the others keep the arrays alive; a commit of short values frees little more
-        /// than it copies, and leaves the heap it holds where it was. A value of at least [#LOG_VALUE_MIN] bytes on an
-        /// array of its own frees that array whatever its record's other values do.
+        /// moving some frees nothing while the others keep the arrays alive; a commit of values shorter than
+        /// [#LOG_VALUE_MIN] frees little more than it copies, and leaves the heap it holds where it was, while one of
+        /// longer values, which take 40 bytes each once moved, frees its arrays for a fraction of their bytes. A value of
+        /// at least [#LOG_VALUE_MIN] bytes on an array of its own frees that array whatever its record's other values do.
         ///
         /// @return [#ALL], [#OWN] or [#NONE]
         int settle() {
