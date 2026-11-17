@@ -402,18 +402,19 @@ public final class LiveLedger implements Ledger {
     /// There `body` is that of the frame at `frameOffset` of `segment`, which holds it durably, and at most `logFrom`
     /// bytes of log start at the frame. A value of the log's last budget ([SpillQueue#keepsReplayed(long)]) is copied
     /// into a chunk and listed in the queue of values that may leave the heap, as the values of a live commit are; one
-    /// before it that is at least [SpillQueue#LOG_VALUE_MIN] bytes moves to the log at once, tagged where it lies in
-    /// `body`, so the values of a long log neither stay in the heap until the first checkpoint nor are copied, and no
-    /// body outlives its commit.
+    /// before it moves to the log at once, tagged where it lies in `body`, from [PackedRun#LOG_VALUE_MIN] bytes if the
+    /// run of its key space takes it and from [SpillQueue#LOG_VALUE_MIN] if it goes to a chain, so the values of a long
+    /// log neither stay in the heap until the first checkpoint nor are copied, and no body outlives its commit.
     ///
     /// The puts and removals before the log's last budget of a paged key space go, for the keys memory holds no chain
     /// of, to a [PackedRun] of the key space rather than to chains: a value in the log, or in a chunk if shorter, and the
-    /// key, in arrays with no object per write. [#endReplay(ReplayValues)] publishes the runs. A key space's first range
-    /// removal publishes its run before it counts what it removes, and the key space's later writes go to chains, so
-    /// every range removal stamped after the run's writes is newer than all of them. A write that goes to a chain while
-    /// the run of its key space is still being built, of the log's last budget, of a value in the file of large values or
-    /// refused by the run, takes what the run holds of its key as the tree's state of it
-    /// ([#replayHint(KeyspaceState, MemorySegment, ReplayValues)]), as the trees the open found lack the run's writes.
+    /// key, in arrays with no object per write, where a logged value costs less than a chain's version and [LogValue].
+    /// [#endReplay(ReplayValues)] publishes the runs. A key space's first range removal publishes its run before it
+    /// counts what it removes, and the key space's later writes go to chains, so every range removal stamped after
+    /// the run's writes is newer than all of them. A write that goes to a chain while the run of its key space is still
+    /// being built, of the log's last budget, of a value in the file of large values or refused by the run, takes what
+    /// the run holds of its key as the tree's state of it ([#replayHint(KeyspaceState, MemorySegment, ReplayValues)]),
+    /// as the trees the open found lack the run's writes.
     ///
     /// @param values the chunks and the state of this open's replay
     /// @param segment the use of the segment that holds the frame, or `null` to move no value
@@ -520,10 +521,10 @@ public final class LiveLedger implements Ledger {
                     return;
                 }
                 var bytes = Math.toIntExact(value.byteSize());
-                var run = moves ? runFor(state, key, values, bytes >= SpillQueue.LOG_VALUE_MIN ? segment : null, bytes) : null;
+                var run = moves ? runFor(state, key, values, bytes >= PackedRun.LOG_VALUE_MIN ? segment : null, bytes) : null;
                 if (run != null) {
                     var stamp = applier.nextStamp();
-                    if (bytes >= SpillQueue.LOG_VALUE_MIN) {
+                    if (bytes >= PackedRun.LOG_VALUE_MIN) {
                         // Where the value starts in the body: the address of a slice of the body's view
                         var at = Math.toIntExact(value.address());
                         if (!noted[0]) {

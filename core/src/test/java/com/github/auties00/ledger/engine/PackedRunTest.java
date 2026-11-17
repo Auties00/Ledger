@@ -54,8 +54,9 @@ class PackedRunTest {
     private static final Keyspace<byte[], byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.bytes(), ValueCodec.bytes());
     private static final Keyspace<String, String> TEXTS = Keyspace.paged("texts", KeyCodec.utf8(), ValueCodec.utf8());
     private static final Keyspace<String, String> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
-    // Empty, short, at the log's threshold and above it
-    private static final int[] LENGTHS = {0, 40, 200, SpillQueue.LOG_VALUE_MIN, 700, 1_500};
+    // Empty, short, on both sides of a run's threshold for the log, at the queue's and above it
+    private static final int[] LENGTHS = {0, 40, PackedRun.LOG_VALUE_MIN - 1, PackedRun.LOG_VALUE_MIN, 200,
+            SpillQueue.LOG_VALUE_MIN, 700, 1_500};
     // The least value of MESSAGES that goes to the file of large values: longer than every value of LENGTHS
     private static final int LARGE_VALUES = 4 << 10;
 
@@ -614,7 +615,7 @@ class PackedRunTest {
                 assertFalse(run.removes(found));
                 var source = run.sourceForTests(found);
                 var length = entry.getValue().length;
-                if (length >= SpillQueue.LOG_VALUE_MIN) {
+                if (length >= PackedRun.LOG_VALUE_MIN) {
                     assertTrue(source instanceof LogValue, "a value of " + length + " bytes is not in the log");
                 } else if (length > 0) {
                     assertTrue(source instanceof MemorySegment chunk && chunk.byteSize() == ReplayValues.CHUNK_BYTES,

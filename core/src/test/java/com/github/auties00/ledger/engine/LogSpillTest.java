@@ -705,7 +705,7 @@ class LogSpillTest {
             assertTrue(ledger.spills().loggedValuesForTests() > 0, "the recovery moved no value to the log");
             for (var entry : expected.messages.entrySet()) {
                 var source = source(ledger, MESSAGES, key(entry.getKey()));
-                if (entry.getValue().length >= SpillQueue.LOG_VALUE_MIN) {
+                if (entry.getValue().length >= PackedRun.LOG_VALUE_MIN) {
                     assertInstanceOf(LogValue.class, source, "message " + entry.getKey());
                 } else {
                     var chunk = assertInstanceOf(MemorySegment.class, source, "message " + entry.getKey());
@@ -722,6 +722,73 @@ class LogSpillTest {
         }
         try (var ledger = open(directory, encrypted, 0)) {
             verify(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a recovery keeps in the log the values it replays to a run from the run's threshold and those it replays to chains from the queue's, and reports a run's value whose bytes in the log changed")
+    void recoveryLogsRunValuesFromTheirThreshold(boolean encrypted, @TempDir Path directory) throws Exception {
+        int[] lengths = {PackedRun.LOG_VALUE_MIN - 1, PackedRun.LOG_VALUE_MIN, 200, SpillQueue.LOG_VALUE_MIN - 1,
+                SpillQueue.LOG_VALUE_MIN};
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            // Messages from 0 replay to the run, and those from 100, after the range removal, to chains
+            for (var first : new int[]{0, 100}) {
+                if (first > 0) {
+                    ledger.commit(ledger.newBatch().deleteRange(MESSAGES, KeyRange.between(key(50), key(60))))
+                            .awaitDurable();
+                }
+                var batch = ledger.newBatch();
+                for (var i = 0; i < lengths.length; i++) {
+                    var value = new byte[lengths[i]];
+                    for (var j = 0; j < value.length; j++) {
+                        value[j] = (byte) (first * 13 + i * 7 + j);
+                    }
+                    batch.put(MESSAGES, key(first + i), value);
+                    expected.put(first + i, value);
+                }
+                ledger.commit(batch).awaitDurable();
+            }
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            assertNotNull(ledger.state(MESSAGES).run, "no run of the writes before the range removal");
+            var damaged = -1;
+            LogValue logged = null;
+            for (var entry : expected.entrySet()) {
+                var message = entry.getKey();
+                var length = entry.getValue().length;
+                var chained = head(ledger, MESSAGES, key(message)) != null;
+                assertEquals(message >= 100, chained, "message " + message + " replayed to a chain");
+                var source = source(ledger, MESSAGES, key(message));
+                if (length >= (chained ? SpillQueue.LOG_VALUE_MIN : PackedRun.LOG_VALUE_MIN)) {
+                    var found = assertInstanceOf(LogValue.class, source, "message " + message + " of " + length + " bytes");
+                    if (!chained && length == PackedRun.LOG_VALUE_MIN) {
+                        damaged = message;
+                        logged = found;
+                    }
+                } else {
+                    assertFalse(source instanceof LogValue, "message " + message + " of " + length + " bytes is in the log");
+                }
+                assertArrayEquals(entry.getValue(), ledger.get(MESSAGES, key(message)).orElseThrow(), "message " + message);
+            }
+            assertTrue(damaged >= 0, "no value of the run lies in the log at the run's threshold");
+            var position = logged.frameOffset() + LogWriter.FRAME_HEADER + logged.bodyIndex() + 3;
+            try (var channel = FileChannel.open(logged.segment().path(), StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                var one = ByteBuffer.allocate(1);
+                channel.read(one, position);
+                one.put(0, (byte) (one.get(0) ^ 0x5A)).rewind();
+                channel.write(one, position);
+            }
+            var message = damaged;
+            assertThrows(LedgerCorruptedException.class, () -> ledger.get(MESSAGES, key(message)));
+            for (var other : expected.keySet()) {
+                if (other != message) {
+                    assertArrayEquals(expected.get(other), ledger.get(MESSAGES, key(other)).orElseThrow(), "message " + other);
+                }
+            }
+            ledger.closeWithoutCheckpoint();
         }
     }
 
