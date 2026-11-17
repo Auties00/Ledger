@@ -109,16 +109,23 @@ final class TreeUpdate {
     /// The state of a key as of a checkpoint.
     ///
     /// It keeps a chain of the key and the version rather than segments of the key and the value, which it makes when
-    /// it writes the key: a checkpoint holds one state per key it takes, through the whole update.
+    /// it writes the key: a checkpoint holds one state per key it takes, through the whole update. The state of a key
+    /// only a [PackedRun] holds keeps the run and the entry alone ([#ofRun(PackedRun, int, boolean)]), and makes the
+    /// key's slice and the version when the update writes the entry into its leaf: a run of a hundred thousand entries
+    /// took a chain, a slice, a version and a place in the log for each, about 170 bytes an entry held through the
+    /// update, where this takes 32.
     ///
-    /// @param keyed a chain of the key, whose bytes the state compares and writes
-    /// @param version its version as of the checkpoint, or `null` if the key has none
+    /// @param keyed a chain of the key, whose bytes the state compares and writes; or `null` for the state of an entry
+    ///              of `run` alone
+    /// @param version its version as of the checkpoint, or `null` if the key has none; for the state of an entry of
+    ///                `run` alone, `null` for the run's value or removal, or [Version#HIDDEN] if a range removal since
+    ///                the tree removes the key
     /// @param blind the chain of the key, if a blind write the checkpoint takes needs to know whether the tree held
     ///              the key ([BlindWrites]), which the update records on it; or `null`
-    /// @param settles where the update records whether the tree held the key for the [PackedRun] that holds it
-    ///                ([PackedRun#settles()]), or `null`
+    /// @param run the run that holds the key, for which the update records whether the tree held it
+    ///            ([PackedRun#settle(int, boolean)]), or `null`
     /// @param entry the key's entry in that run, or -1
-    record Op(Chain keyed, Version version, Chain blind, byte[] settles, int entry) {
+    record Op(Chain keyed, Version version, Chain blind, PackedRun run, int entry) {
         /// Makes the state of the key of `keyed` with `version`, as [Op] does, for a key no run holds.
         Op(Chain keyed, Version version, Chain blind) {
             this(keyed, version, blind, null, -1);
@@ -129,18 +136,22 @@ final class TreeUpdate {
             this(new Chain(key, 0), value == null ? null : new Version(0, value, null, null), null);
         }
 
-        /// {@return the order of the key and `other`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
-        int compareKey(MemorySegment other) {
-            return keyed.compareKey(other);
+        /// {@return the state of the key of `entry` of `run`, which no chain holds: the run's value or removal, or none
+        /// if `hidden` by a range removal since the tree}
+        static Op ofRun(PackedRun run, int entry, boolean hidden) {
+            return new Op(null, hidden ? Version.HIDDEN : null, null, run, entry);
         }
 
-        /// {@return the value, or `null` if the key has none}
-        MemorySegment value() {
-            return version == null ? null : version.value();
+        /// {@return the order of the key and `other`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
+        int compareKey(MemorySegment other) {
+            return keyed != null ? keyed.compareKey(other) : run.compareKey(entry, other);
         }
 
         /// {@return whether the key has no value}
         boolean removes() {
+            if (keyed == null) {
+                return version == Version.HIDDEN || run.removes(entry);
+            }
             return version == null || version.removes();
         }
 
@@ -150,12 +161,15 @@ final class TreeUpdate {
         /// Such a version is at or below the cut of that checkpoint, so it is the key's state here only when a commit
         /// that replaced it rolled back, leaving the key to write as it was.
         boolean inTree() {
+            if (keyed == null) {
+                return version != Version.HIDDEN && run.inRetiredSegment(entry);
+            }
             return version != null && version.inRetiredSegment();
         }
 
         /// {@return the unit of [BlobFile] a commit wrote the value to, which the tree takes, or `null`}
         PageRef external() {
-            return version == null ? null : version.external();
+            return keyed == null || version == null ? null : version.external();
         }
 
         /// Records on the chain of a blind write, and for the run that holds the key, whether the tree held the key.
@@ -163,8 +177,8 @@ final class TreeUpdate {
             if (blind != null) {
                 blind.settle(inTree);
             }
-            if (settles != null && entry >= 0) {
-                PackedRun.settle(settles, entry, inTree);
+            if (run != null && entry >= 0) {
+                run.settle(entry, inTree);
             }
         }
     }
@@ -959,8 +973,16 @@ final class TreeUpdate {
     }
 
     private LeafEntry entry(Op op) throws IOException {
-        var key = keys.key(op.keyed());
-        var version = op.version();
+        MemorySegment key;
+        Version version;
+        if (op.keyed() == null) {
+            // Made now, for the leaf alone: the update holds the run and the entry until then
+            key = op.run().key(op.entry());
+            version = op.run().version(op.entry());
+        } else {
+            key = keys.key(op.keyed());
+            version = op.version();
+        }
         var external = op.external();
         if (external == null && version.logged()) {
             // Read from the log only where it is used: into the leaf or delta record that holds it inline, or into the
@@ -982,7 +1004,7 @@ final class TreeUpdate {
             // Copied into the leaf with an array copy, without a view of it
             return new LeafEntry(key, array, null, array.length);
         }
-        var value = op.value();
+        var value = version.value();
         var length = value.byteSize();
         if (LeafEntry.fitsInline(key.byteSize(), length)) {
             return new LeafEntry(key, value, null, (int) length);

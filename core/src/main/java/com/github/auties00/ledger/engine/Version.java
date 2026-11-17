@@ -245,6 +245,11 @@ sealed class Version permits Version.External {
         return SOURCE.getAcquire(this) instanceof LogValue;
     }
 
+    /// {@return the place in the log of the value, if it moved there ([#logged()]), or `null`}
+    LogValue logValue() {
+        return SOURCE.getAcquire(this) instanceof LogValue logged ? logged : null;
+    }
+
     /// Reads the value, which is in the log ([#logged()]), into `target` from `offset`.
     ///
     /// @throws LogSegmentView.Retired as [#value()] does

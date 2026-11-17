@@ -49,7 +49,10 @@ import java.util.function.LongSupplier;
 ///
 /// A paged key space of a store that crashed may also hold the writes its open replayed as a [PackedRun], which the
 /// readers of the tree the store opened from read as part of it ([Reads#runOf(KeyspaceState, ReadPoint)]), until every
-/// reader reads a later tree, which holds them.
+/// reader reads a later tree, which holds them. Between checkpoints, a [RunFreezer] may move the published chains whose
+/// values left their batches' arrays into such a run over the latest tree, a frozen one, and drop them: the scans and
+/// counts of ranges, which read the run once and then walk the chains, enter [#walkers] first, and the freeze drops
+/// nothing until those that may hold the run it replaced have left.
 ///
 /// Readers use it concurrently with the commits. Commits create chains before they are given a sequence; everything
 /// else changes only under it.
@@ -58,6 +61,9 @@ final class KeyspaceState {
     private static final long UNCOUNTED = Long.MIN_VALUE;
     /// The dropped chains from which [#removeDropped()] spreads the removals over the processors.
     private static final int PARALLEL_REMOVALS = 4_096;
+    /// What [#freezeAt] holds while the key space freezes no chain: before the store enables it, and until the next
+    /// cut once a freeze found most of its chains back in memory since the last one.
+    static final int NO_FREEZE = Integer.MAX_VALUE;
     /// The dropped chains the list may hold, at least, before a commit sweeps them off it; past it, as many as memory
     /// holds chains, so a sweep's steps stay within twice the drops.
     private static final int LISTED_DROPS = 4_096;
@@ -110,10 +116,26 @@ final class KeyspaceState {
     /// What the commits say about whether the values may share a [ValueSlab]'s chunks; `null` in a resident key space,
     /// whose values never do.
     final ValueSlab.Overwrites overwrites;
-    // The chains written since the last checkpoint was cut, each listed once per cut; guarded by the publishing role
+    // The chains written since the last checkpoint was cut, each listed once per cut, but for those a freeze took and
+    // has not given back; guarded by the publishing role
     ArrayList<Chain> dirty;
     // The number of the cut `dirty` collects for, guarded by the publishing role
     private int dirtyCut;
+    /// The chains listed since the last freeze or cut; written holding the publishing role, read by the commits without
+    /// it to start a freeze ([#freezeDue()]).
+    int freshDirty;
+    /// The chains the last freeze gave back as not frozen only for now: their values had yet to leave their arrays, or
+    /// a reader was below them; written holding the publishing role, read as [#freshDirty] is.
+    int deferredDirty;
+    /// The chains [#freezeDue()] waits for: [#NO_FREEZE] in a key space that freezes none, otherwise at least the
+    /// store's least, and the size of the frozen run, so the rebuilds copy at most twice the run they end with; written
+    /// by the freeze and the cut holding the publishing role, read by the commits without it.
+    int freezeAt = NO_FREEZE;
+    // The least freezeAt of the key space, set as the store opens: NO_FREEZE in one that freezes none
+    private int freezeMin = NO_FREEZE;
+    /// The scans and counts of ranges of the key space, which a freeze waits for before it drops chains, or `null` in a
+    /// key space no freeze runs on; set as the store opens.
+    RunWalkers walkers;
     // The bytes from which a value a batch puts goes to the file of large values, set while the store opens
     long largeValues = Long.MAX_VALUE;
     // Whether the key space orders its chains lazily, set while the store opens, before any chain is opened
@@ -862,7 +884,60 @@ final class KeyspaceState {
         if (chain.dirtyCut != dirtyCut) {
             chain.dirtyCut = dirtyCut;
             dirty.add(chain);
+            freshDirty++;
         }
+    }
+
+    /// Lets [RunFreezer] freeze the chains of the key space once [#freezeDue()], from `least` chains; as the store
+    /// opens, before any commit.
+    void enableFreezes(int least) {
+        freezeMin = least;
+        freezeAt = least;
+        walkers = new RunWalkers();
+    }
+
+    /// {@return whether enough chains were listed since the last freeze or cut for a freeze, in a key space whose
+    /// samples show it replaces few of its values before a checkpoint ([ValueSlab.Overwrites#spills()]): one that
+    /// replaces many keeps its values on their batches' arrays, and its keys would go from chains to the run and back;
+    /// read without the publishing role, so a commit may find it a little late}
+    boolean freezeDue() {
+        var at = freezeAt;
+        return at != NO_FREEZE && freshDirty + deferredDirty >= at && overwrites.spills();
+    }
+
+    /// {@return the least number of chains a freeze takes, or [#NO_FREEZE] in a key space that freezes none}
+    int freezeMin() {
+        return freezeMin;
+    }
+
+    /// {@return the chains listed since the last cut, which a freeze takes until it gives back those it did not drop
+    /// ([#giveBackDirty(ArrayList, int, int)]); holding the publishing role}
+    ///
+    /// A chain stays marked with the cut, so a commit that writes it meanwhile does not list it again: the freeze holds
+    /// the checkpointer's lock until it gives it back, so no cut misses it.
+    ArrayList<Chain> takeDirty() {
+        var taken = dirty;
+        dirty = new ArrayList<>();
+        freshDirty = 0;
+        deferredDirty = 0;
+        return taken;
+    }
+
+    /// Lists again `kept`, the chains a freeze took and did not drop, beside those listed since, and sets when the next
+    /// freeze is due; holding the publishing role.
+    ///
+    /// @param deferred how many of `kept` may be frozen as soon as their values leave their arrays or every reader sees
+    ///                 them, which count toward the next freeze
+    /// @param next the chains the next freeze waits for, or [#NO_FREEZE]
+    void giveBackDirty(ArrayList<Chain> kept, int deferred, int next) {
+        if (kept.size() <= dirty.size()) {
+            dirty.addAll(kept);
+        } else {
+            kept.addAll(dirty);
+            dirty = kept;
+        }
+        deferredDirty = deferred;
+        freezeAt = next;
     }
 
     /// {@return the number [#markDirty] gives the chains it lists, the cut's that [#cutDirty()] takes next}
@@ -880,6 +955,10 @@ final class KeyspaceState {
         var cut = dirty;
         dirty = new ArrayList<>();
         dirtyCut++;
+        freshDirty = 0;
+        deferredDirty = 0;
+        // A key space whose freezes found their chains written again starts over with the next interval
+        freezeAt = freezeMin;
         return cut;
     }
 
@@ -990,7 +1069,7 @@ final class KeyspaceState {
     /// the tree the store opened from ([#replayCorrection()]).
     long count(ReadPoint point) {
         var sequence = point.bound() >>> Reads.OP_BITS;
-        return known(sequence) + replayCorrection() + blind.correction(sequence, key -> Reads.inTreeOnly(this, key, point))
+        return known(sequence) + replayCorrection() + blind.correction(sequence, key -> Reads.blindInTree(this, key, point))
                 + ranges.correction(sequence);
     }
 
@@ -1018,11 +1097,25 @@ final class KeyspaceState {
         return correction;
     }
 
+    /// Makes `frozen`, the run a freeze built of the run before and of the chains it is about to drop, the run the
+    /// readers of the latest tree read, before any chain is dropped; holding the publishing role.
+    void publishFrozenRun(PackedRun frozen) {
+        run = frozen;
+    }
+
     /// Releases the run of the writes the open replayed, once every reader's tree is at or above `cutBound`, the bound of
-    /// the checkpoint every reader's tree holds, and that tree holds the run; holding the publishing role.
+    /// the checkpoint every reader's tree holds, and that tree holds the run; holding the publishing role. A frozen run
+    /// goes the same way, and its blind writes fold into the count of [#blind] once the checkpoint that took it counted
+    /// them.
     void releaseRun(long cutBound) {
         var current = run;
-        if (current != null && cutBound >= current.maxStamp() && replayed != UNCOUNTED) {
+        if (current == null || cutBound < current.maxStamp()) {
+            return;
+        }
+        if (current.frozen()) {
+            run = null;
+            blind.releaseFrozen(current);
+        } else if (replayed != UNCOUNTED) {
             run = null;
         }
     }

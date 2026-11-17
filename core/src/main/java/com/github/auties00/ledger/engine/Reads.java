@@ -25,7 +25,10 @@ import java.util.function.Function;
 /// A paged key space of a store that crashed may hold the writes its open replayed as a [PackedRun], which a reader
 /// whose tree is the one the store opened from reads as part of that tree ([#runOf(KeyspaceState, ReadPoint)]): a key
 /// of the run reads the run's entry instead of the tree's, which the same range removals hide. A reader of a later tree
-/// reads that tree alone. Without a run, a read pays one load of a field and a test for `null`.
+/// reads that tree alone. Without a run, a read pays one load of a field and a test for `null`. A frozen run
+/// ([RunFreezer]) reads the same way, over the latest tree: a read of one key reads the key's chain first and the run
+/// after, so a chain the freeze drops once its run is published is found in one or the other, and a scan or a count of
+/// a range, which load the run once, enter the key space's [RunWalkers] before they do.
 ///
 /// A resident key space reads memory alone, but for the keys its loader has not put there yet ([ResidentLoader]):
 /// those it reads from the tree alone, where every read finds them as it sees them. A read checks where a key is
@@ -132,7 +135,12 @@ final class Reads {
     /// {@return whether the tree of `point`, with the run it reads over it, holds `key`, whatever range removal since
     /// hides it}
     static boolean inTreeOnly(KeyspaceState state, MemorySegment key, ReadPoint point) {
-        var run = runOf(state, point);
+        return storedHolds(state, key, point, runOf(state, point));
+    }
+
+    /// {@return whether the tree of `point`, with `run` over it if not `null`, holds `key`, whatever range removal since
+    /// hides it}
+    private static boolean storedHolds(KeyspaceState state, MemorySegment key, ReadPoint point, PackedRun run) {
         if (run != null) {
             var entry = run.find(key);
             if (entry >= 0) {
@@ -141,6 +149,16 @@ final class Reads {
         }
         var root = point.root(state);
         return root != null && TreeSearch.contains(point.pages(), root, key);
+    }
+
+    /// {@return whether the tree a blind write of `key` would have read held it, as the trees of `point` tell, which do
+    /// not take the write ([BlindWrites]): the tree, with the run of the open's replay over it if `point` reads one}
+    ///
+    /// A frozen run is never asked: it may hold the write's own entry, or a later one of its key, while no blind write
+    /// of a key a frozen run holds is ever made, as the write finds the run's entry in its place.
+    static boolean blindInTree(KeyspaceState state, MemorySegment key, ReadPoint point) {
+        var run = runOf(state, point);
+        return storedHolds(state, key, point, run == null || run.frozen() ? null : run);
     }
 
     /// {@return whether `point` sees `key`, whose newest version in memory is `head`, as [TreeSearch#FOUND] or
@@ -205,9 +223,23 @@ final class Reads {
     /// It reads the tree's nodes on the paths to the bounds, and looks up in the tree each key of the range that has a
     /// version in memory, and each key of the range of the run it reads over the tree.
     static long count(KeyspaceState state, MemorySegment from, MemorySegment to, ReadPoint point) {
+        var walkers = state.walkers;
+        var ticket = walkers == null ? -1 : walkers.enter();
+        try {
+            return count(state, from, to, point, runOf(state, point));
+        } finally {
+            if (walkers != null) {
+                walkers.exit(ticket);
+            }
+        }
+    }
+
+    /// {@return the entries `point` sees from `from`, included, to `to`, excluded, either `null` for no bound, with
+    /// `run` the run it reads over its tree, loaded once: the chains are counted against that run, as the tree's count
+    /// is}
+    private static long count(KeyspaceState state, MemorySegment from, MemorySegment to, ReadPoint point, PackedRun run) {
         var removals = state.removals;
         var root = point.root(state);
-        var run = runOf(state, point);
         var total = 0L;
         for (var entry : state.slice(from, to).entrySet()) {
             var version = KeyspaceState.resolve(entry.getValue().head, entry.getKey(), point.bound(), removals);
@@ -215,7 +247,7 @@ final class Reads {
                 // Counted with the tree
                 continue;
             }
-            var counted = inTree(state, entry.getKey(), point, removals);
+            var counted = storedHolds(state, entry.getKey(), point, run) && !hiddenSinceTree(entry.getKey(), point, removals);
             total += (version == Version.HIDDEN ? 0 : 1) - (counted ? 1 : 0);
         }
         if (root == null && run == null) {
@@ -425,6 +457,25 @@ final class Reads {
         if (loader != null && loader.limit() != null) {
             return new ResidentScan(state, loader, point, removals, from, to, descending, consumer).run();
         }
+        // Before the run is loaded, so a freeze drops none of the chains the walk has yet to reach while it runs
+        var walkers = state.walkers;
+        var ticket = walkers == null ? -1 : walkers.enter();
+        try {
+            return walk(state, from, to, fromBytes, toBytes, descending, removals, point, wanted, consumer);
+        } finally {
+            if (walkers != null) {
+                walkers.exit(ticket);
+            }
+        }
+    }
+
+    /// Passes the entries of the range from `from`, included, to `to`, excluded, either `null` for no bound, that
+    /// `point` sees to `consumer`, as [#scan(KeyspaceState, Keyspace, KeyRange, ReadPoint, long, Visitor)] does once it
+    /// entered the key space's walkers.
+    ///
+    /// @return the number of entries passed
+    private static long walk(KeyspaceState state, MemorySegment from, MemorySegment to, byte[] fromBytes, byte[] toBytes,
+                             boolean descending, RangeRemoval[] removals, ReadPoint point, long wanted, Visitor consumer) {
         var root = point.root(state);
         var run = runOf(state, point);
         var memory = state.walk(from, to, descending);

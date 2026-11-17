@@ -44,6 +44,8 @@ sealed class Chain permits Chain.Inline8 {
     private static final int SETTLED = 1 << 27;
     private static final int IN_TREE = 1 << 28;
     private static final int LISTED = 1 << 29;
+    private static final int BLIND_REMOVES = 1 << 30;
+    private static final int FROZEN = 1 << 31;
     /// What [#blindState()] returns for a chain whose key no commit wrote blind.
     static final byte NOT_BLIND = -1;
 
@@ -329,8 +331,28 @@ sealed class Chain permits Chain.Inline8 {
     ///
     /// A chain has at most one such write, its first, since every later one finds a version in memory: so a
     /// checkpoint whose cut sees a version of the chain takes the blind write too.
-    void markBlind() {
-        SPAN.getAndBitwiseOr(this, BLIND);
+    ///
+    /// @param removes whether the write removes the key, which a run the chain is frozen into counts it as
+    ///                ([#blindRemoves()])
+    void markBlind(boolean removes) {
+        SPAN.getAndBitwiseOr(this, BLIND | (removes ? BLIND_REMOVES : 0));
+    }
+
+    /// {@return whether the blind write of the chain, if it has one, removes the key}
+    boolean blindRemoves() {
+        return ((int) SPAN.getVolatile(this) & BLIND_REMOVES) != 0;
+    }
+
+    /// Records that a freeze dropped the chain while its blind write's effect was not known, and handed that write to
+    /// the run it froze the chain into ([RunFreezer]): the next list of the blind writes leaves its slot out. Holding the
+    /// publishing role.
+    void markFrozen() {
+        SPAN.getAndBitwiseOr(this, FROZEN);
+    }
+
+    /// {@return whether a freeze handed the blind write of the chain to a run ([#markFrozen()])}
+    boolean frozen() {
+        return ((int) SPAN.getVolatile(this) & FROZEN) != 0;
     }
 
     /// Records whether the tree the blind write would have read held the key; every thread that finds out finds the

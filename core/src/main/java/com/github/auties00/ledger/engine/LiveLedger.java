@@ -208,6 +208,14 @@ public final class LiveLedger implements Ledger {
     private final ValueSlab valueSlab;
     // The paged values waiting for a checkpoint that may leave the heap for the log, or null for a store that moves none
     private SpillQueue spills;
+    // Freezes the published chains of the paged key spaces into their runs between checkpoints, or null for a store
+    // that freezes none
+    private RunFreezer freezer;
+    // The chains a paged key space lists before its first freeze of an interval, or KeyspaceState.NO_FREEZE for none
+    // but those a test asks for; set while the store opens
+    private int freezeLeast = RunFreezer.FREEZE_MIN;
+    // The runs freezes published, which the hints of a commit's lookups of the trees and runs predate if it changed
+    private volatile long freezes;
     // What a pipelined commit calls with its sequence once it has one, before it applies, or null; for tests that hold
     // a commit there. Plain: set before the committing threads start
     private LongConsumer sequencedHookForTests;
@@ -739,6 +747,18 @@ public final class LiveLedger implements Ledger {
         this.log = log;
         this.checkpointer = checkpointer;
         this.resources = resources;
+        if (pages != null) {
+            var paged = new ArrayList<KeyspaceState>();
+            for (var state : states.values()) {
+                if (!state.resident) {
+                    state.enableFreezes(freezeLeast);
+                    paged.add(state);
+                }
+            }
+            if (!paged.isEmpty()) {
+                this.freezer = new RunFreezer(this, checkpointer, pages, paged);
+            }
+        }
         if (spills != null) {
             // Before the first frame, so the writer locates the frames of every commit
             log.useSpills(spills);
@@ -778,6 +798,119 @@ public final class LiveLedger implements Ledger {
 
     ReaderTable readers() {
         return readers;
+    }
+
+    /// Makes the store freeze the published chains of its paged key spaces into their runs between checkpoints
+    /// ([RunFreezer]) once one listed `least` chains since its last freeze, or only when a test asks with
+    /// [KeyspaceState#NO_FREEZE]; while it opens, before [#attach]. A store with a data file freezes from
+    /// [RunFreezer#FREEZE_MIN] chains otherwise.
+    void useFreezes(int least) {
+        if (least < 1) {
+            throw new IllegalArgumentException("A freeze takes at least one chain: " + least);
+        }
+        this.freezeLeast = least;
+    }
+
+    /// {@return the freezer of the store, or `null` if it freezes no chain; for tests}
+    RunFreezer freezerForTests() {
+        return freezer;
+    }
+
+    /// Freezes the chains of `keyspace` that it can now, on the caller's thread; for tests.
+    ///
+    /// @return what the freeze did, or `null` if the store freezes none or a checkpoint ran or was about to
+    RunFreezer.Outcome freezeForTests(Keyspace<?, ?> keyspace) {
+        return freezer == null ? null : freezer.freezeForTests(state(keyspace));
+    }
+
+    /// {@return whether the store is closed or closing}
+    boolean isClosed() {
+        return closed;
+    }
+
+    /// {@return the latest sequence, read at each call, for the drops of chains}
+    LongSupplier latestSequence() {
+        return latestSequence;
+    }
+
+    /// Runs `work` holding the publishing role, which it gives back after, publishing what applied meanwhile.
+    void holdingPublishing(Runnable work) {
+        enterPublishing();
+        try {
+            work.run();
+        } finally {
+            exitPublishing();
+        }
+    }
+
+    /// What a freeze starts from, taken holding the publishing role ([#beginFreeze(KeyspaceState)]).
+    ///
+    /// @param taken the dirty chains of the key space, which the freeze gives back but those it drops
+    /// @param oldestBound the bound of the oldest reader, or of the latest sequence if none runs
+    /// @param treeBound the bound of the latest tree, every reader's, or -1 without one
+    /// @param base the root of the key space in the latest tree, or `null`
+    /// @param removals the range removals of the key space
+    /// @param previous the frozen run of the key space, or `null`
+    /// @param effects what the blind writes count for each entry of `previous`, or `null` without one
+    record FreezeStart(ArrayList<Chain> taken, long oldestBound, long treeBound, TreeRoot base, RangeRemoval[] removals,
+                       PackedRun previous, byte[] effects) {
+    }
+
+    /// {@return what a freeze of `state` starts from, its dirty chains taken, or `null` if it cannot run now: a reader
+    /// may read a tree older than the latest, the key space's run is one of the open's replay or a checkpoint took it,
+    /// or the store is closed}
+    ///
+    /// Called holding the checkpointer's lock, so no checkpoint cuts or publishes until the freeze ends.
+    FreezeStart beginFreeze(KeyspaceState state) {
+        enterPublishing();
+        try {
+            if (closed) {
+                return null;
+            }
+            var trees = tree;
+            // As in a maintenance: the scan must not miss a read that saw the latest sequence before
+            VarHandle.fullFence();
+            var scan = readers.scan();
+            if (trees != null && floor(scan.oldest()) != trees.sequence) {
+                // A reader may read an older tree, under which the run would lie
+                return null;
+            }
+            var treeBound = trees == null ? -1 : Reads.boundOf(trees.sequence);
+            var base = trees == null ? null : trees.root(state.id);
+            var previous = state.run;
+            byte[] effects = null;
+            if (previous != null) {
+                if (!previous.frozen() || previous.maxStamp() <= treeBound || previous.base() != base) {
+                    // The open's, or one the latest tree took, which every reader lets go of first
+                    return null;
+                }
+                effects = state.blind.effectsOf(previous);
+                if (effects == null) {
+                    return null;
+                }
+            } else if (state.blind.frozenRun() != null) {
+                // A run released whose blind writes are not folded yet
+                return null;
+            }
+            var oldest = Math.min(scan.oldest(), latest());
+            return new FreezeStart(state.takeDirty(), Reads.boundOf(oldest), treeBound, base, state.removals, previous,
+                    effects);
+        } finally {
+            exitPublishing();
+        }
+    }
+
+    /// Publishes `frozen`, the run a freeze built of the run of `state` and of chains it has yet to drop, as the run
+    /// the readers of the latest tree read; holding the publishing role.
+    void publishFrozen(KeyspaceState state, PackedRun frozen) {
+        enterPublishing();
+        try {
+            state.publishFrozenRun(frozen);
+            // Before any chain is dropped: a commit whose hints predate it looks its keys up again
+            freezes = freezes + 1;
+        } finally {
+            exitPublishing();
+        }
     }
 
     long latest() {
@@ -1025,10 +1158,10 @@ public final class LiveLedger implements Ledger {
                 var decoded = state.resident ? residentValue(state, writes.decodedValue(index), value) : null;
                 applier.put(state, applier.claim(state, writes.key(index)), writes.key(index), value, writes.ownValue(index),
                         writes.borrowed(index), writes.home(index), writes.homeArray(index), writes.homeOffset(index), decoded,
-                        hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree), units == null ? null : units[index]);
+                        hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree, freezes), units == null ? null : units[index]);
             }
             case ArrayWriteBatch.DELETE ->
-                    applier.delete(state, writes.key(index), hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree));
+                    applier.delete(state, writes.key(index), hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree, freezes));
             // The removal keeps its bounds until a checkpoint, and the batch's array may go back to the pool
             case ArrayWriteBatch.DELETE_RANGE -> applier.deleteRange(state, ownCopy(writes.key(index)), ownCopy(writes.value(index)));
             default -> throw new IllegalStateException("Unknown write kind " + writes.kind(index));
@@ -1073,7 +1206,7 @@ public final class LiveLedger implements Ledger {
                 }
             }
         }
-        var hints = found == null ? null : new Hints(trees, found);
+        var hints = found == null ? null : new Hints(trees, freezes, found);
         var pending = new PendingCommit(writes, chains, keyspaceStates, keys, decoded, units, hints);
         if (arrivalTail.commit == arrivalCursor.commit && !sequencingWanted.held() && sequencing.tryAcquireBriefly()) {
             // No commit arrived before this one: it takes its sequence without the queue, and lets the role go with
@@ -1397,7 +1530,7 @@ public final class LiveLedger implements Ledger {
             predecessor.awaitApplied();
         }
         var writes = pending.writes;
-        var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(index, tree);
+        var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(index, tree, freezes);
         var key = pending.keys[index];
         if (writes.kind(index) == ArrayWriteBatch.PUT) {
             applier.put(pending.states[index], pending.chains[index], key, writes.value(index), writes.ownValue(index),
@@ -1799,6 +1932,9 @@ public final class LiveLedger implements Ledger {
         if (checkpointer != null) {
             checkpointer.maybeStart();
         }
+        if (freezer != null) {
+            freezer.maybeStart();
+        }
     }
 
     private Commit ticket(long sequence) {
@@ -2192,6 +2328,8 @@ public final class LiveLedger implements Ledger {
     /// @return how each write learns whether its key existed, or `null` if the store has no trees
     private Hints prefetch(ArrayWriteBatch writes) {
         var trees = pages == null ? null : tree;
+        // Before the lookups: a freeze that publishes a run after it changes what they may find
+        var frozen = freezes;
         var point = trees == null ? null : new ReadPoint(Reads.boundOf(latest()), trees, pages);
         var size = writes.size();
         var found = trees == null ? null : new byte[size];
@@ -2217,7 +2355,7 @@ public final class LiveLedger implements Ledger {
                 // A helper that would not start: the lookups left unknown read the trees as the writes apply
             }
         }
-        return found == null ? null : new Hints(trees, found);
+        return found == null ? null : new Hints(trees, frozen, found);
     }
 
     /// Opens the chain of the key of write `index` if it puts, and looks the key up in the pages of the trees of
@@ -2298,15 +2436,18 @@ public final class LiveLedger implements Ledger {
     /// Whether the trees held the keys of a batch's writes, as a commit found before it was given a sequence.
     ///
     /// @param tree the trees the lookups read
+    /// @param freezes the runs freezes had published when they read them: a run frozen since may hold a key a chain
+    ///                held then, which a freeze dropped since, so the lookups no longer tell the key's state
     /// @param found per write, [TreeSearch#FOUND], [TreeSearch#ABSENT], or [TreeSearch#UNKNOWN] for one not looked up
-    record Hints(TreeVersion tree, byte[] found) {
+    record Hints(TreeVersion tree, long freezes, byte[] found) {
         /// {@return what the lookups found for write `write`, or [TreeSearch#UNKNOWN] if the writer reads trees
-        /// other than theirs}
+        /// other than theirs, or a freeze published a run since}
         ///
         /// @param current the trees the writer reads
-        byte of(int write, TreeVersion current) {
+        /// @param frozen the runs freezes have published now
+        byte of(int write, TreeVersion current, long frozen) {
             var hint = found[write];
-            return hint == TreeSearch.BLIND || tree == current ? hint : TreeSearch.UNKNOWN;
+            return hint == TreeSearch.BLIND || tree == current && freezes == frozen ? hint : TreeSearch.UNKNOWN;
         }
     }
 
@@ -2908,9 +3049,10 @@ public final class LiveLedger implements Ledger {
             deltas[deltaCount++] = delta;
         }
 
-        /// Records on `chain` that this commit writes its key blind: the tree settles what the write does to the count.
-        private void markBlind(Chain chain) {
-            chain.markBlind();
+        /// Records on `chain` that this commit writes its key blind, a removal if `removes`: the tree settles what the
+        /// write does to the count.
+        private void markBlind(Chain chain, boolean removes) {
+            chain.markBlind(removes);
         }
 
         /// Records that this commit replaces `version`, if a unit no checkpoint has taken holds its value.
@@ -2945,7 +3087,7 @@ public final class LiveLedger implements Ledger {
         /// count is not known yet, in the trees their reads keep.
         long count(KeyspaceState state) {
             var point = writerPoint(scanBound());
-            var blind = state.blind.correction(sequence - 1, key -> Reads.inTreeOnly(state, key, point));
+            var blind = state.blind.correction(sequence - 1, key -> Reads.blindInTree(state, key, point));
             return state.counts.last() + state.replayCorrection() + blind + state.ranges.correction(sequence - 1)
                     + delta(state);
         }
@@ -3091,7 +3233,7 @@ public final class LiveLedger implements Ledger {
             }
             var blind = existed == TreeSearch.UNKNOWN;
             if (blind) {
-                markBlind(chain);
+                markBlind(chain, false);
             }
             chain.attach(version);
             if (external != null) {
@@ -3178,7 +3320,7 @@ public final class LiveLedger implements Ledger {
             var version = new Version(stamp, (MemorySegment) null, null, head);
             var blind = existed == TreeSearch.UNKNOWN;
             if (blind) {
-                markBlind(chain);
+                markBlind(chain, true);
             }
             chain.attach(version);
             touched.add(new Touched(state, chain, version, blind));

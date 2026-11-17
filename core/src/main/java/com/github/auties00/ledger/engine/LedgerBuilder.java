@@ -48,6 +48,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
     private WriteThrough writeThroughWay;
     private boolean residentAtOpen;
     private long spillBudget;
+    private int freezeMin;
 
     /// Creates a builder with the default options.
     public LedgerBuilder() {
@@ -63,6 +64,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         this.largeValues = MIB;
         this.largeValuesByKeyspace = new LinkedHashMap<>();
         this.spillBudget = SpillQueue.defaultBudget(Runtime.getRuntime().maxMemory());
+        this.freezeMin = RunFreezer.FREEZE_MIN;
     }
 
     /// Runs the flushes of a store opened without a pool, and the forces of the file of large values of any store, on
@@ -102,6 +104,17 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             throw new IllegalArgumentException("The budget is negative: " + bytes);
         }
         this.spillBudget = bytes;
+        return this;
+    }
+
+    /// Sets the chains a paged key space lists before the store freezes them into its run ([RunFreezer]), so tests can
+    /// freeze without writing tens of thousands of keys; or [KeyspaceState#NO_FREEZE] for a store that freezes none but
+    /// those a test asks for ([LiveLedger#freezeForTests(com.github.auties00.ledger.Keyspace)]).
+    LedgerBuilder freezeMin(int chains) {
+        if (chains < 1) {
+            throw new IllegalArgumentException("A freeze takes at least one chain: " + chains);
+        }
+        this.freezeMin = chains;
         return this;
     }
 
@@ -262,6 +275,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             pages = PageFile.open(directory, new PageCipher(opened.keys().pageKey()), pageCache, heap);
             var ledger = new LiveLedger(keyspaces.values(), heap);
             HeapPool.join(ledger, pooledBytes());
+            ledger.useFreezes(freezeMin);
             var spills = spillBudget == Long.MAX_VALUE ? null : new SpillQueue(spillBudget, opened.keys().encrypted());
             if (spills != null) {
                 ledger.useSpills(spills);

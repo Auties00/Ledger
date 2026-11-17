@@ -33,6 +33,14 @@ import java.util.Arrays;
 /// the dirty and blind lists, and a node of the ordered map once scanned, about 300 bytes over its key and value, takes
 /// about 50 here.
 ///
+/// A [RunFreezer] builds the same arrays, between checkpoints, from the published chains of a paged key space whose
+/// values left their batches' arrays, merged with the run it replaces: a frozen run, whose entries are already in the
+/// order of their keys. Its readers are those of the latest tree, every one of which sees each of its writes, and every
+/// range removal they apply over it is newer than the entries it covers, so it reads as the replay's run does. Its
+/// writes were counted as their chains' were, by [KeyspaceState#counts] and [BlindWrites], which also holds what the
+/// blind ones among them do to the count ([BlindWrites#correction(long, java.util.function.Predicate)]), so
+/// [#correction()] does not count it; [#correction(MemorySegment, MemorySegment)] does, for the counts of ranges.
+///
 /// Immutable once built, so readers use it without synchronization; [#correction()] and the tree lookups it caches
 /// take a lock of their own.
 final class PackedRun {
@@ -59,6 +67,19 @@ final class PackedRun {
     private static final long FRAME_MASK = (1L << FRAME_BITS) - 1;
     // A slot of the hash table: the top byte of the key's hash over the entry's index plus one, 0 for none
     private static final int ENTRY_MASK = (1 << 24) - 1;
+    /// What [BlindWrites] counts for an entry of a frozen run: nothing, as its chain's writes were counted as they
+    /// committed, or its blind write's slot still counts it.
+    static final byte COUNTED = 0;
+    /// What [BlindWrites] counts for an entry of a frozen run: its chain's blind write, a put, which adds an entry
+    /// unless the tree under the run holds the key.
+    static final byte BLIND_PUT = 1;
+    /// What [BlindWrites] counts for an entry of a frozen run: its chain's blind write, a removal, which takes an entry
+    /// away if the tree under the run holds the key.
+    static final byte BLIND_REMOVE = 2;
+    /// What [BlindWrites] counts for an entry of a frozen run: nothing, as the chain it was frozen from may still hold
+    /// the key and its blind write's slot, if it has one, counts it; a later freeze that drops the chain takes the
+    /// write over.
+    static final byte SHADOWED = 3;
     private static final int TAG_MASK = ~ENTRY_MASK;
     private static final MemorySegment EMPTY = MemorySegment.ofArray(new byte[0]).asReadOnly();
 
@@ -87,8 +108,10 @@ final class PackedRun {
     private final LogSegmentView[] segments;
     // Open addressing on the hash of the keys, at most three quarters full
     private final int[] slots;
-    // The entries in the order of their keys
+    // The entries in the order of their keys, or null for a frozen run, whose entries are in that order
     private final int[] order;
+    // Whether a freeze built the run, rather than an open's replay
+    private final boolean frozen;
     private final int size;
     // The stamp of the newest write the run holds: a reader whose tree is at or above it reads the tree alone
     private final long maxStamp;
@@ -134,6 +157,41 @@ final class PackedRun {
         this.pages = pages;
         this.lock = new Object();
         this.order = sortedOrder();
+        this.frozen = false;
+    }
+
+    /// Creates a frozen run of the arrays `merge` filled, which it takes as they are.
+    private PackedRun(Merge merge, TreeRoot base, PageFile pages) {
+        this.size = merge.size;
+        this.keys = merge.keys;
+        this.keyEnds = merge.keyEnds;
+        this.keyView = MemorySegment.ofArray(keys).asReadOnly();
+        this.values = merge.values;
+        this.chunks = merge.chunks.toArray(MemorySegment[]::new);
+        this.logStamps = merge.logStamps;
+        this.logPlaces = merge.logPlaces;
+        this.logBodies = merge.logBodies;
+        this.tagHighs = merge.tagHighs;
+        this.tagLows = merge.tagLows;
+        this.segments = merge.segments.toArray(LogSegmentView[]::new);
+        this.slots = merge.slots;
+        this.maxStamp = merge.maxStamp;
+        this.base = base;
+        this.pages = pages;
+        this.lock = new Object();
+        this.order = null;
+        this.frozen = true;
+        this.inBase = merge.inBase;
+    }
+
+    /// {@return whether a freeze built the run ([RunFreezer]), rather than an open's replay}
+    boolean frozen() {
+        return frozen;
+    }
+
+    /// {@return the root of the tree the run's writes are counted against, or `null` for none}
+    TreeRoot base() {
+        return base;
     }
 
     /// {@return the stamp of the newest write the run holds}
@@ -245,6 +303,9 @@ final class PackedRun {
 
     /// {@return the version a checkpoint writes for `entry`, made for the call: a version of its value in a chunk, or in
     /// the log under the stamp its tag binds; `null` for a removal}
+    ///
+    /// A checkpoint makes it only as it writes the entry into its leaf ([TreeUpdate.Op]), so an update holds no version
+    /// per entry of the run.
     Version version(int entry) {
         var value = values[entry];
         if (value < 0) {
@@ -261,12 +322,6 @@ final class PackedRun {
         return new Version(0, chunks[chunkOf(value)], (int) (value & ((1L << OFFSET_BITS) - 1)), length, null, null);
     }
 
-    /// {@return a chain of the key of `entry` that holds a slice of the run's keys, made for a checkpoint, which keys
-    /// its states by chains ([TreeUpdate.Op])}
-    Chain keyed(int entry) {
-        return new Chain(key(entry), 0);
-    }
-
     /// {@return the position in the key order of the first entry whose key is at or after `key`, or [#size()] if none
     /// is; 0 for `null`}
     int lowerPosition(MemorySegment key) {
@@ -277,7 +332,7 @@ final class PackedRun {
         var high = size;
         while (low < high) {
             var middle = (low + high) >>> 1;
-            if (compareKey(order[middle], key) < 0) {
+            if (compareKey(entryAt(middle), key) < 0) {
                 low = middle + 1;
             } else {
                 high = middle;
@@ -288,7 +343,7 @@ final class PackedRun {
 
     /// {@return the entry at `position` of the key order}
     int entryAt(int position) {
-        return order[position];
+        return order == null ? position : order[position];
     }
 
     /// {@return the array a checkpoint records in whether the tree the store opened from holds each entry's key, as it
@@ -307,10 +362,39 @@ final class PackedRun {
         return known;
     }
 
-    /// Records whether the tree the store opened from holds the key of `entry`, as a checkpoint that merges the run into
-    /// that tree finds it; every thread that finds out finds the same answer.
-    static void settle(byte[] settles, int entry, boolean found) {
-        settles[entry] = found ? TreeSearch.FOUND : TreeSearch.ABSENT;
+    /// Records whether the tree the run's writes are counted against holds the key of `entry`, as a checkpoint that
+    /// merges the run into that tree finds it; every thread that finds out finds the same answer.
+    void settle(int entry, boolean found) {
+        settles()[entry] = found ? TreeSearch.FOUND : TreeSearch.ABSENT;
+    }
+
+    /// {@return whether the tree the run's writes are counted against holds the key of `entry`, as [TreeSearch#FOUND]
+    /// or [TreeSearch#ABSENT], looked up in that tree unless a checkpoint or an earlier call settled it}
+    ///
+    /// A lookup reads the file for a tree larger than the page cache; its answer is kept.
+    byte baseState(int entry) {
+        var known = settles();
+        var state = known[entry];
+        if (state != TreeSearch.UNKNOWN) {
+            return state;
+        }
+        synchronized (lock) {
+            state = known[entry];
+            if (state == TreeSearch.UNKNOWN) {
+                state = base != null && TreeSearch.contains(pages, base, key(entry)) ? TreeSearch.FOUND : TreeSearch.ABSENT;
+                known[entry] = state;
+            }
+            return state;
+        }
+    }
+
+    /// {@return whether the value of `entry` is in a log segment a checkpoint retired}
+    boolean inRetiredSegment(int entry) {
+        var value = values[entry];
+        if (value < 0 || (value & LOGGED) == 0) {
+            return false;
+        }
+        return segments[(int) (logPlaces[(int) value] >>> FRAME_BITS)].retired();
     }
 
     /// {@return the change the run makes to the count of its key space, against the tree the store opened from: a put of
@@ -336,7 +420,7 @@ final class PackedRun {
         var total = 0L;
         synchronized (lock) {
             for (var position = first; position < last; position++) {
-                var entry = order[position];
+                var entry = entryAt(position);
                 var state = known[entry];
                 if (state == TreeSearch.UNKNOWN) {
                     state = base != null && TreeSearch.contains(pages, base, key(entry)) ? TreeSearch.FOUND : TreeSearch.ABSENT;
@@ -430,6 +514,303 @@ final class PackedRun {
         var leftStart = keyStart(left);
         var rightStart = keyStart(right);
         return Segments.compare(keys, leftStart, keyEnds[left] - leftStart, keys, rightStart, keyEnds[right] - rightStart);
+    }
+
+    /// {@return the frozen run of `previous`, a frozen run or `null`, with the newest versions of the chains a freeze
+    /// takes merged in, over `base`, the root of the key space's latest tree in `pages`, or `null` if a limit of a run
+    /// would be passed: [#MAX_ENTRIES], [#MAX_KEY_BYTES] or [#MAX_SEGMENTS]}
+    ///
+    /// The entries come in the order of their keys, a chain's in place of the entry of `previous` of the same key. The
+    /// arrays are sized to the entries exactly, and the entries of `previous` keep their words: the new run shares
+    /// `previous`'s chunks and copies its log fields where they were, so only the values of the chains are copied, the
+    /// short ones into chunks of [ReplayValues#CHUNK_BYTES], the ones in the log as their places and tags.
+    ///
+    /// @param previousEffects what [BlindWrites] counts for each entry of `previous` ([#COUNTED], [#BLIND_PUT],
+    ///                        [#BLIND_REMOVE] or [#SHADOWED]), or `null` without one
+    /// @param chains the chains, sorted by key, of distinct keys
+    /// @param heads the newest version of each chain: a removal, or a value in the log or on an array of its own shorter
+    ///              than [SpillQueue#LOG_VALUE_MIN], at most [#MAX_VALUE_LENGTH] bytes, with no unit of [BlobFile]
+    /// @param count the chains of `chains` and `heads` to merge
+    static Merge merge(PackedRun previous, byte[] previousEffects, Chain[] chains, Version[] heads, int count,
+                       TreeRoot base, PageFile pages) {
+        if (previous != null && !previous.frozen) {
+            throw new IllegalArgumentException("Only a frozen run takes more chains");
+        }
+        var merge = new Merge(previous, chains, heads, count);
+        return merge.fill(previousEffects) ? merge.build(base, pages) : null;
+    }
+
+    /// The arrays of a frozen run, which [#merge] fills from the run it replaces and the chains a freeze takes, and what
+    /// the freeze needs to know of them.
+    static final class Merge {
+        private final PackedRun previous;
+        private final Chain[] chains;
+        private final Version[] heads;
+        private final int count;
+        // The keys of the chains, one after another, and where each ends
+        private final byte[] chainKeys;
+        private final int[] chainEnds;
+        private byte[] keys;
+        private int[] keyEnds;
+        private long[] values;
+        private byte[] inBase;
+        private final ArrayList<MemorySegment> chunks;
+        private long[] logStamps;
+        private long[] logPlaces;
+        private int[] logBodies;
+        private long[] tagHighs;
+        private int[] tagLows;
+        private final ArrayList<LogSegmentView> segments;
+        private int[] slots;
+        private long maxStamp;
+        private int size;
+        private byte[] effects;
+        private int[] entries;
+        private int replaced;
+        private PackedRun run;
+
+        private Merge(PackedRun previous, Chain[] chains, Version[] heads, int count) {
+            this.previous = previous;
+            this.chains = chains;
+            this.heads = heads;
+            this.count = count;
+            var bytes = 0L;
+            for (var i = 0; i < count; i++) {
+                bytes += chains[i].keyLength();
+            }
+            // Past the limit, no run takes them: fill() refuses before it reads a key
+            this.chainKeys = bytes > MAX_KEY_BYTES ? null : new byte[(int) bytes];
+            this.chainEnds = new int[count];
+            var at = 0;
+            for (var i = 0; i < count && chainKeys != null; i++) {
+                chains[i].copyKey(chainKeys, at);
+                at += chains[i].keyLength();
+                chainEnds[i] = at;
+            }
+            this.chunks = previous == null ? new ArrayList<>() : new ArrayList<>(Arrays.asList(previous.chunks));
+            this.segments = previous == null ? new ArrayList<>() : new ArrayList<>(Arrays.asList(previous.segments));
+            this.maxStamp = previous == null ? -1 : previous.maxStamp;
+        }
+
+        /// {@return the run the merge made}
+        PackedRun run() {
+            return run;
+        }
+
+        /// {@return what [BlindWrites] counts for each entry of the run: that of the entry of the run it replaces for a
+        /// key of both, [#SHADOWED] for the others of a chain, which the freeze changes for the chains it drops}
+        byte[] effects() {
+            return effects;
+        }
+
+        /// {@return the entry of the run that holds the version of chain `index`}
+        int entry(int index) {
+            return entries[index];
+        }
+
+        /// {@return how many of the chains replaced an entry of the run before}
+        int replaced() {
+            return replaced;
+        }
+
+        // Fills the arrays, two passes over the keys of the previous run and of the chains in their order: one to size
+        // them, one to fill them; whether the limits of a run allowed it
+        private boolean fill(byte[] previousEffects) {
+            if (chainKeys == null) {
+                return false;
+            }
+            var previousSize = previous == null ? 0 : previous.size;
+            var keyBytes = 0L;
+            var logged = 0;
+            var total = 0;
+            var p = 0;
+            var c = 0;
+            while (p < previousSize || c < count) {
+                var order = compare(p, previousSize, c);
+                if (order < 0) {
+                    keyBytes += previous.keyEnds[p] - previous.keyStart(p);
+                    p++;
+                } else {
+                    keyBytes += chainEnds[c] - chainStart(c);
+                    if (order == 0) {
+                        p++;
+                    }
+                    if (heads[c].logValue() != null) {
+                        logged++;
+                    }
+                    c++;
+                }
+                total++;
+            }
+            if (total > MAX_ENTRIES || keyBytes > MAX_KEY_BYTES) {
+                return false;
+            }
+            this.size = total;
+            this.keys = new byte[(int) keyBytes];
+            this.keyEnds = new int[total];
+            this.values = new long[total];
+            this.inBase = new byte[total];
+            this.effects = new byte[total];
+            this.entries = new int[count];
+            var previousLogged = previous == null ? 0 : previous.logStamps.length;
+            this.logStamps = previous == null ? new long[logged] : Arrays.copyOf(previous.logStamps, previousLogged + logged);
+            this.logPlaces = previous == null ? new long[logged] : Arrays.copyOf(previous.logPlaces, previousLogged + logged);
+            this.logBodies = previous == null ? new int[logged] : Arrays.copyOf(previous.logBodies, previousLogged + logged);
+            this.tagHighs = previous == null ? new long[logged] : Arrays.copyOf(previous.tagHighs, previousLogged + logged);
+            this.tagLows = previous == null ? new int[logged] : Arrays.copyOf(previous.tagLows, previousLogged + logged);
+            this.slots = new int[tableFor(total)];
+            var mask = slots.length - 1;
+            var previousKnown = previous == null ? null : previous.inBase;
+            var nextLogged = previousLogged;
+            var keyAt = 0;
+            // The chunks the short values of the chains are copied into, one after another
+            var copies = new ArrayList<byte[]>();
+            byte[] chunk = null;
+            var fill = 0;
+            var firstChunk = chunks.size();
+            // The index of the segment of the last value in the log, which the next one is most likely in
+            var lastSegment = -1;
+            p = 0;
+            c = 0;
+            for (var out = 0; out < total; out++) {
+                var order = compare(p, previousSize, c);
+                int start;
+                int length;
+                byte[] from;
+                if (order < 0) {
+                    from = previous.keys;
+                    start = previous.keyStart(p);
+                    length = previous.keyEnds[p] - start;
+                    values[out] = previous.values[p];
+                    inBase[out] = previousKnown == null ? TreeSearch.UNKNOWN : previousKnown[p];
+                    effects[out] = previousEffects == null ? COUNTED : previousEffects[p];
+                    p++;
+                } else {
+                    from = chainKeys;
+                    start = chainStart(c);
+                    length = chainEnds[c] - start;
+                    var head = heads[c];
+                    maxStamp = Math.max(maxStamp, head.stamp);
+                    if (order == 0) {
+                        inBase[out] = previousKnown == null ? TreeSearch.UNKNOWN : previousKnown[p];
+                        // A chain the previous freeze dropped had its blind write counted by its entry, which the
+                        // chain written since, counted against that entry, leaves to this one
+                        var before = previousEffects == null ? COUNTED : previousEffects[p];
+                        effects[out] = before == SHADOWED ? SHADOWED : before;
+                        replaced++;
+                        p++;
+                    } else {
+                        // Not the chain's blind state, which a write taken by an earlier tree settled against that tree
+                        inBase[out] = TreeSearch.UNKNOWN;
+                        effects[out] = SHADOWED;
+                    }
+                    if (head.removes()) {
+                        values[out] = REMOVES;
+                    } else {
+                        var logValue = head.logValue();
+                        var valueLength = head.valueLength();
+                        if (logValue != null) {
+                            var segment = lastSegment >= 0 && segments.get(lastSegment) == logValue.segment()
+                                    ? lastSegment : segmentIndex(logValue.segment());
+                            if (segment < 0) {
+                                return false;
+                            }
+                            lastSegment = segment;
+                            var index = nextLogged++;
+                            logStamps[index] = head.stamp;
+                            logPlaces[index] = (long) segment << FRAME_BITS | logValue.frameOffset();
+                            logBodies[index] = logValue.bodyIndex();
+                            tagHighs[index] = logValue.tagHigh();
+                            tagLows[index] = logValue.tagLow();
+                            values[out] = LOGGED | (long) valueLength << 32 | (index & 0xFFFF_FFFFL);
+                        } else {
+                            var own = head.ownArray();
+                            if (own == null) {
+                                throw new IllegalStateException("A version frozen into a run left the array of its own");
+                            }
+                            if (own.length == 0) {
+                                values[out] = 0;
+                            } else {
+                                if (chunk == null || fill > ReplayValues.CHUNK_BYTES - own.length) {
+                                    chunk = new byte[ReplayValues.CHUNK_BYTES];
+                                    copies.add(chunk);
+                                    fill = 0;
+                                }
+                                System.arraycopy(own, 0, chunk, fill, own.length);
+                                var chunkIndex = firstChunk + copies.size() - 1;
+                                values[out] = (long) own.length << LENGTH_SHIFT | (long) chunkIndex << OFFSET_BITS | fill;
+                                fill += own.length;
+                            }
+                        }
+                    }
+                    entries[c] = out;
+                    c++;
+                }
+                System.arraycopy(from, start, keys, keyAt, length);
+                var hash = Segments.hash(keys, keyAt, length);
+                keyAt += length;
+                keyEnds[out] = keyAt;
+                var slot = hash & mask;
+                while (slots[slot] != 0) {
+                    slot = (slot + 1) & mask;
+                }
+                slots[slot] = (hash & TAG_MASK) | (out + 1);
+            }
+            for (var i = 0; i < copies.size(); i++) {
+                var copy = copies.get(i);
+                // The last chunk only as long as its values: a freeze of a few short values takes no whole chunk
+                if (i == copies.size() - 1 && fill < copy.length) {
+                    copy = Arrays.copyOf(copy, fill);
+                }
+                chunks.add(MemorySegment.ofArray(copy).asReadOnly());
+            }
+            return true;
+        }
+
+        private Merge build(TreeRoot base, PageFile pages) {
+            run = new PackedRun(this, base, pages);
+            return this;
+        }
+
+        // Where the key of chain `index` starts in chainKeys
+        private int chainStart(int index) {
+            return index == 0 ? 0 : chainEnds[index - 1];
+        }
+
+        // The order of the previous run's entry `p` and the key of chain `c`, as a merge takes them: -1 to take the
+        // entry, 1 to take the chain, 0 for both of one key
+        private int compare(int p, int previousSize, int c) {
+            if (p >= previousSize) {
+                return 1;
+            }
+            if (c >= count) {
+                return -1;
+            }
+            var start = previous.keyStart(p);
+            var order = Segments.compare(previous.keys, start, previous.keyEnds[p] - start, chainKeys, chainStart(c),
+                    chainEnds[c] - chainStart(c));
+            return Integer.signum(order);
+        }
+
+        // The index of `segment` among the run's segments, added if new, or -1 past MAX_SEGMENTS
+        private int segmentIndex(LogSegmentView segment) {
+            for (var i = segments.size() - 1; i >= 0; i--) {
+                if (segments.get(i) == segment) {
+                    return i;
+                }
+            }
+            if (segments.size() >= MAX_SEGMENTS) {
+                return -1;
+            }
+            segments.add(segment);
+            return segments.size() - 1;
+        }
+
+        // A power of two of at least two slots, at most three quarters full with `entries`
+        private static int tableFor(int entries) {
+            var least = Math.max(2, entries + entries / 3 + 1);
+            return Integer.highestOneBit(least - 1) << 1;
+        }
     }
 
     /// Collects the writes of one paged key space as the open replays them, the newest of each key, into a [PackedRun].
@@ -685,7 +1066,7 @@ final class PackedRun {
                     current = treeHas ? TREE : NONE;
                     return treeHas;
                 }
-                var entry = run.order[position];
+                var entry = run.entryAt(position);
                 var key = run.key(entry);
                 // Where the run's entry sorts against the tree's, in the order of the scan
                 var order = -1;
