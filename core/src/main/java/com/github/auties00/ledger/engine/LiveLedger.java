@@ -2254,18 +2254,33 @@ public final class LiveLedger implements Ledger {
 
     /// Waits until memory holds the entry of every key `writes` writes in a resident key space, and every entry of a
     /// resident key space it removes a range of, before any chain of them is opened.
+    ///
+    /// It waits once per key space, for the highest key the batch writes in it, as the loader goes in key order: a
+    /// commit that loads on its own thread, the loader's not having started, loads what the whole batch needs at once.
     private void awaitLoaded(ArrayWriteBatch writes) {
         var size = writes.size();
+        var loading = new ArrayList<KeyspaceState>(2);
+        // The highest key each key space of loading needs, or null for every entry
+        var highest = new ArrayList<MemorySegment>(2);
         for (var i = 0; i < size; i++) {
-            awaitLoaded(writes, i);
+            var state = states.get(writes.keyspace(i).name());
+            if (state.loading == null) {
+                continue;
+            }
+            var key = writes.kind(i) == ArrayWriteBatch.DELETE_RANGE ? null : writes.key(i);
+            var at = loading.indexOf(state);
+            if (at < 0) {
+                loading.add(state);
+                highest.add(key);
+            } else {
+                var known = highest.get(at);
+                if (known != null && (key == null || Segments.compare(key, known) > 0)) {
+                    highest.set(at, key);
+                }
+            }
         }
-    }
-
-    /// Waits until memory holds what write `index` of `writes` writes, if it writes a resident key space.
-    private void awaitLoaded(ArrayWriteBatch writes, int index) {
-        var state = states.get(writes.keyspace(index).name());
-        if (state.loading != null) {
-            state.awaitLoaded(writes.kind(index) == ArrayWriteBatch.DELETE_RANGE ? null : writes.key(index));
+        for (var i = 0; i < loading.size(); i++) {
+            loading.get(i).awaitLoaded(highest.get(i));
         }
     }
 

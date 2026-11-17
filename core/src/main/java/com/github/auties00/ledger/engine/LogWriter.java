@@ -280,6 +280,15 @@ final class LogWriter {
     /// Starts the preparations of later segments in place of [SegmentPreparers#start(FutureTask)], for tests that hold
     /// them or start them late; the one the writer's construction starts is not passed to it.
     volatile Consumer<FutureTask<?>> starterForTests;
+    /// Runs at the start of every flush the executor runs, before it looks for a group; for tests that hold it back, so
+    /// a commit that waits alone writes its own group.
+    volatile Runnable flushHookForTests;
+    /// Runs on the thread of every force of the file of large values, before the file is forced; for tests that see
+    /// where it runs or hold it.
+    volatile Runnable unitForceHookForTests;
+    // The forces of the file of large values a commit that writes its own group started, for tests; written holding
+    // running
+    private volatile int ledUnitForces;
     // Whether zeros were asked for the segment of next, by its preparation or after it; owned by the flush task
     private boolean nextZeroed;
     // When the current segment opened, and how long the one before it took to fill, or -1; owned by the flush task
@@ -846,6 +855,10 @@ final class LogWriter {
     }
 
     private void flush() {
+        var hook = flushHookForTests;
+        if (hook != null) {
+            hook.run();
+        }
         flush(Long.MAX_VALUE);
     }
 
@@ -1466,26 +1479,50 @@ final class LogWriter {
     ///
     /// Not on a virtual thread: the flush waits for the force, and an application's virtual threads may hold every
     /// carrier for as long as they compute, which nothing preempts, so a virtual thread that had not started would hold
-    /// the group, and every commit waiting for it, until one let go. A force no thread could be started for runs here,
-    /// before the group is written.
+    /// the group, and every commit waiting for it, until one let go. A force the lane refuses, as when no thread can be
+    /// made, runs here, before the group is written, on the thread of a flush of the store's executor; a commit that
+    /// writes its own group, which never runs the force itself ([#await(FutureTask)]), starts it on a virtual thread
+    /// instead, and runs it here only if that thread cannot be started either, with its interrupt cleared until the
+    /// flush ends: an interrupt that comes during that force closes the file's channel and stops the log.
     private FutureTask<Void> forceUnits() {
         var file = blobs;
         var task = new FutureTask<Void>(() -> {
+            var hook = unitForceHookForTests;
+            if (hook != null) {
+                hook.run();
+            }
             file.force();
             return null;
         });
+        if (leading) {
+            ledUnitForces++;
+        }
         try {
             unitForces.execute(task);
         } catch (RejectedExecutionException _) {
-            task.run();
+            if (!leading) {
+                task.run();
+                return task;
+            }
+            try {
+                Thread.ofVirtual().name("ledger-blob-force").start(task);
+            } catch (RuntimeException | OutOfMemoryError _) {
+                interruptedWrite |= Thread.interrupted();
+                task.run();
+            }
         }
         return task;
     }
 
-    /// Waits for `task`, the force of the file of large values; the flush of a thread of the pool runs it itself if its
-    /// thread has not started it yet, which costs the group only the force beside its own.
+    /// {@return the forces of the file of large values a commit that writes its own group started, for tests}
+    int ledUnitForcesForTests() {
+        return ledUnitForces;
+    }
+
+    /// Waits for `task`, the force of the file of large values; a flush the executor runs, on a thread of the pool or of
+    /// a lane, runs it itself if its thread has not started it yet, which costs the group only the force beside its own.
     ///
-    /// A commit that writes its own group never runs it: an interrupt of its thread during the force would close the
+    /// A commit that writes its own group never runs it here: an interrupt of its thread during the force would close the
     /// channel the file is forced through, which a channel opened in its place could not replace, as a force through a
     /// new channel may not report a write the old one failed to make durable. An interrupt of a commit that writes its
     /// own group waits on, and is given back to the commit when the flush ends.

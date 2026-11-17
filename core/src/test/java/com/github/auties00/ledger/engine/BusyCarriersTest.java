@@ -19,9 +19,11 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Optional;
+import java.util.Queue;
 import java.util.Random;
 import java.util.TreeMap;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -30,9 +32,12 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -157,22 +162,75 @@ class BusyCarriersTest {
         return entries;
     }
 
+    /// Holds back every flush the log's executor runs until the returned handle is closed, so a commit that waits alone
+    /// for durability writes its own group: otherwise the flush its append scheduled takes the group first, every time
+    /// on most machines.
+    private static AutoCloseable holdFlushes(Ledger ledger) {
+        var log = ((LiveLedger) ledger).logForTests();
+        var released = new CountDownLatch(1);
+        log.flushHookForTests = () -> {
+            try {
+                // Bounded, so a commit that does wait for the executor fails its test where it would hang it
+                released.await(2, TimeUnit.MINUTES);
+            } catch (InterruptedException _) {
+                Thread.currentThread().interrupt();
+            }
+        };
+        return () -> {
+            log.flushHookForTests = null;
+            released.countDown();
+        };
+    }
+
+    /// {@return the threads the forces of the file of large values of `ledger` run on from now on, recorded as each
+    /// starts}
+    private static Queue<Thread> recordUnitForces(Ledger ledger) {
+        var threads = new ConcurrentLinkedQueue<Thread>();
+        ((LiveLedger) ledger).logForTests().unitForceHookForTests = () -> threads.add(Thread.currentThread());
+        return threads;
+    }
+
+    /// {@return whether `thread` is parked in the log's wait for the force of the file of large values}
+    private static boolean waitsForTheUnitForce(Thread thread) {
+        if (thread.getState() != Thread.State.WAITING) {
+            return false;
+        }
+        for (var frame : thread.getStackTrace()) {
+            if (frame.getClassName().equals(LogWriter.class.getName()) && frame.getMethodName().equals("await")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     @ParameterizedTest(name = "pool of one thread: {0}, the commit writing its own group: {1}")
     @CsvSource({"false, false", "false, true", "true, false", "true, true"})
     @DisplayName("a durable commit of a large value ends, the file of large values forced on a platform thread")
     void largeValue(boolean pool, boolean ownGroup, @TempDir Path directory) throws Exception {
         try (var ioPool = pool ? IoPool.create(1) : null; var ledger = openFiles(directory, ioPool)) {
             ledger.commit(ledger.newBatch().put(FILES, "first", bytes(1, 2 * LARGE))).awaitDurable();
-            // A commit that waits without a timeout writes its own group if no flush is writing; one with a timeout
-            // leaves it to the flush threads
-            assertTrue(callWithBusyCarriers(() -> {
-                var commit = ledger.commit(ledger.newBatch().put(FILES, "large", bytes(2, 2 * LARGE)));
-                if (!ownGroup) {
-                    return commit.awaitDurable(Duration.ofSeconds(60));
-                }
-                commit.awaitDurable();
-                return true;
-            }));
+            var log = ((LiveLedger) ledger).logForTests();
+            var led = log.ledUnitForcesForTests();
+            var forces = recordUnitForces(ledger);
+            var committer = new AtomicReference<Thread>();
+            // A commit that waits without a timeout, with the flushes held back, writes its own group; one with a timeout
+            // leaves it to the executor's flush
+            try (var _ = ownGroup ? holdFlushes(ledger) : null) {
+                assertTrue(callWithBusyCarriers(() -> {
+                    committer.set(Thread.currentThread());
+                    var commit = ledger.commit(ledger.newBatch().put(FILES, "large", bytes(2, 2 * LARGE)));
+                    if (!ownGroup) {
+                        return commit.awaitDurable(Duration.ofSeconds(60));
+                    }
+                    commit.awaitDurable();
+                    return true;
+                }));
+            }
+            assertEquals(ownGroup ? led + 1 : led, log.ledUnitForcesForTests());
+            assertFalse(forces.isEmpty(), "the file of large values was not forced");
+            for (var thread : forces) {
+                assertTrue(!thread.isVirtual() && thread != committer.get(), "the file was forced on " + thread);
+            }
             assertArrayEquals(bytes(2, 2 * LARGE), ledger.get(FILES, "large").orElseThrow());
         }
         try (var ledger = openFiles(directory, null)) {
@@ -181,30 +239,101 @@ class BusyCarriersTest {
         }
     }
 
+    @ParameterizedTest(name = "pool of one thread: {0}")
+    @ValueSource(booleans = {false, true})
+    @DisplayName("an interrupt of a commit waiting for the force of the file of large values of its own group waits on, and is given back")
+    void largeValueInterruptedInTheForce(boolean pool, @TempDir Path directory) throws Exception {
+        try (var ioPool = pool ? IoPool.create(1) : null; var ledger = openFiles(directory, ioPool)) {
+            ledger.commit(ledger.newBatch().put(FILES, "first", bytes(1, 2 * LARGE))).awaitDurable();
+            var log = ((LiveLedger) ledger).logForTests();
+            var led = log.ledUnitForcesForTests();
+            var forcing = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var forcedOn = new AtomicReference<Thread>();
+            log.unitForceHookForTests = () -> {
+                forcedOn.compareAndSet(null, Thread.currentThread());
+                forcing.countDown();
+                try {
+                    // Bounded, so a force run on the committing thread fails the test where it would hang it
+                    release.await(2, TimeUnit.MINUTES);
+                } catch (InterruptedException _) {
+                    Thread.currentThread().interrupt();
+                }
+            };
+            var interruptKept = new AtomicBoolean();
+            var failure = new AtomicReference<Throwable>();
+            try (var _ = holdFlushes(ledger)) {
+                var committer = Thread.ofPlatform().start(() -> {
+                    try {
+                        ledger.commit(ledger.newBatch().put(FILES, "large", bytes(2, 2 * LARGE))).awaitDurable();
+                        interruptKept.set(Thread.currentThread().isInterrupted());
+                    } catch (Throwable throwable) {
+                        failure.set(throwable);
+                    }
+                });
+                try {
+                    assertTrue(forcing.await(60, TimeUnit.SECONDS), "the file of large values was not forced");
+                    assertTrue(forcedOn.get() != committer && !forcedOn.get().isVirtual(), "the file was forced on " + forcedOn.get());
+                    // Parked in the wait for the lane's force, past the write and the force of its group
+                    var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+                    while (!waitsForTheUnitForce(committer)) {
+                        assertTrue(System.nanoTime() < deadline, "the commit does not wait for the force");
+                        Thread.sleep(1);
+                    }
+                    committer.interrupt();
+                    committer.join(200);
+                    assertTrue(committer.isAlive(), "the interrupt ended the wait for the force");
+                } finally {
+                    release.countDown();
+                }
+                committer.join();
+            }
+            log.unitForceHookForTests = null;
+            assertNull(failure.get());
+            assertTrue(interruptKept.get(), "the interrupt was not given back");
+            assertEquals(led + 1, log.ledUnitForcesForTests());
+            // The file's channel is still open: a later group with a large value forces it
+            ledger.commit(ledger.newBatch().put(FILES, "after", bytes(3, 2 * LARGE))).awaitDurable();
+            ledger.awaitDurable();
+        }
+        try (var ledger = openFiles(directory, null)) {
+            assertArrayEquals(bytes(2, 2 * LARGE), ledger.get(FILES, "large").orElseThrow());
+            assertArrayEquals(bytes(3, 2 * LARGE), ledger.get(FILES, "after").orElseThrow());
+        }
+    }
+
     @Test
-    @DisplayName("an interrupt of a commit that writes its own group with a large value leaves the file of large values to force")
+    @DisplayName("interrupts at any point of commits that write their own group with a large value leave the file of large values to force")
     void largeValueInterrupts(@TempDir Path directory) throws Exception {
         var commits = 40;
         try (var ledger = openFiles(directory, null)) {
-            for (var i = 0; i < commits; i++) {
-                var index = i;
-                var committer = Thread.ofPlatform().start(() -> {
-                    try {
-                        ledger.commit(ledger.newBatch().put(FILES, "v" + index, bytes(index, 2 * LARGE))).awaitDurable();
-                    } catch (InterruptedException _) {
-                        // The commit stays, durable with the next group
+            // The first large value of an open waits for the flush to make the open's epoch durable
+            ledger.commit(ledger.newBatch().put(FILES, "first", bytes(-1, 2 * LARGE))).awaitDurable();
+            var log = ((LiveLedger) ledger).logForTests();
+            var led = log.ledUnitForcesForTests();
+            try (var _ = holdFlushes(ledger)) {
+                for (var i = 0; i < commits; i++) {
+                    var index = i;
+                    var committer = Thread.ofPlatform().start(() -> {
+                        try {
+                            ledger.commit(ledger.newBatch().put(FILES, "v" + index, bytes(index, 2 * LARGE))).awaitDurable();
+                        } catch (InterruptedException _) {
+                            // The commit stays, durable with the next group
+                        }
+                    });
+                    // At a different point of the commit each time, its force included
+                    var until = System.nanoTime() + ThreadLocalRandom.current().nextLong(2_000_000);
+                    while (System.nanoTime() < until) {
+                        Thread.onSpinWait();
                     }
-                });
-                // At a different point of the commit each time, its force included
-                var until = System.nanoTime() + ThreadLocalRandom.current().nextLong(2_000_000);
-                while (System.nanoTime() < until) {
-                    Thread.onSpinWait();
+                    committer.interrupt();
+                    committer.join();
                 }
-                committer.interrupt();
-                committer.join();
+                // Nothing interrupts it, so it writes its own group, with the frames of the commits interrupted before theirs
+                ledger.commit(ledger.newBatch().put(FILES, "last", bytes(commits, 2 * LARGE))).awaitDurable();
             }
-            ledger.commit(ledger.newBatch().put(FILES, "last", bytes(commits, 2 * LARGE))).awaitDurable();
             ledger.awaitDurable();
+            assertTrue(log.ledUnitForcesForTests() > led, "no commit wrote its own group");
         }
         try (var ledger = openFiles(directory, null)) {
             for (var i = 0; i <= commits; i++) {
@@ -271,6 +400,66 @@ class BusyCarriersTest {
             assertEquals(model, contents(ledger, SESSIONS));
         }
         try (var ledger = openSessions(directory, true)) {
+            assertEquals(model, contents(ledger, SESSIONS));
+        }
+    }
+
+    @Test
+    @DisplayName("a batch that waits for the load of a resident key space whose thread never starts loads up to its last key at once")
+    void residentBatch(@TempDir Path directory) throws Exception {
+        var model = populateSessions(directory);
+        try (var ledger = openSessions(directory, false)) {
+            var live = (LiveLedger) ledger;
+            var loads = new ConcurrentLinkedQueue<Thread>();
+            live.hookResidentLoadsForTests(runs -> {
+                if (runs == 0) {
+                    loads.add(Thread.currentThread());
+                }
+            });
+            var committer = new AtomicReference<Thread>();
+            callWithBusyCarriers(() -> {
+                committer.set(Thread.currentThread());
+                // The first use starts the loader
+                assertEquals(Optional.of(sessionValue(0)), ledger.get(SESSIONS, session(0)));
+                var batch = ledger.newBatch();
+                for (var k = 1; k <= 11; k++) {
+                    batch.put(SESSIONS, session(k * 100), "batch " + k);
+                }
+                ledger.commit(batch).awaitDurable();
+                return null;
+            });
+            for (var k = 1; k <= 11; k++) {
+                model.put(session(k * 100), "batch " + k);
+            }
+            assertEquals(1, loads.stream().filter(thread -> thread == committer.get()).count(), "loads on the committing thread");
+            assertEquals(model, contents(ledger, SESSIONS));
+        }
+    }
+
+    @Test
+    @DisplayName("a write that waits for the load of a resident key space with carriers free leaves the load to the loader's thread")
+    void residentWriteWithFreeCarriers(@TempDir Path directory) throws Exception {
+        var model = populateSessions(directory);
+        try (var ledger = openSessions(directory, false)) {
+            var live = (LiveLedger) ledger;
+            var loads = new ConcurrentLinkedQueue<Thread>();
+            live.hookResidentLoadsForTests(runs -> {
+                if (runs == 0) {
+                    loads.add(Thread.currentThread());
+                }
+            });
+            assertEquals(Optional.of(sessionValue(0)), ledger.get(SESSIONS, session(0)));
+            ledger.commit(ledger.newBatch().put(SESSIONS, session(SESSION_ENTRIES - 1), "last")).awaitDurable();
+            model.put(session(SESSION_ENTRIES - 1), "last");
+            var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+            while (!live.residentLoadedForTests(SESSIONS)) {
+                assertTrue(System.nanoTime() < deadline, "the load did not end");
+                Thread.sleep(1);
+            }
+            assertFalse(loads.isEmpty());
+            for (var thread : loads) {
+                assertTrue(thread.isVirtual(), "loaded on " + thread);
+            }
             assertEquals(model, contents(ledger, SESSIONS));
         }
     }
