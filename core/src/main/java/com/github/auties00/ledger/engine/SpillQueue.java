@@ -58,10 +58,10 @@ import java.util.zip.CRC32C;
 ///   the log. The commit's values on arrays of their own move all the same, each freeing its array for a [LogValue].
 ///   Unless the commit holds more such values than twice the budget, and at least [#CHUNKS_MIN] bytes, that lie back
 ///   to back on their arrays: each array then leaves the heap whole for one [LogChunk], which the next checkpoint reads
-///   back in one read rather than one per value. A thread of its own tags the blocks of those arrays while the log
-///   writes the commit's frame ([Record#tagAhead(SpillQueue)]), and a wait for such a commit to be durable moves its
-///   values on the waiting thread before it returns ([#moveOwn(long)]), rather than leaving them to the thread that
-///   moves values, which would take them only after the commit returned.
+///   back in one read rather than one per value. A thread of its own checks those arrays and tags their blocks while
+///   the log writes the commit's frame ([Record#prepareAhead(SpillQueue)]), and a wait for such a commit to be durable
+///   moves its values on the waiting thread before it returns ([#moveOwn(long)]), rather than leaving them to the
+///   thread that moves values, which would take them only after the commit returned.
 ///
 /// A recovery moves a value it replays that the log holds before its last budget of bytes at once, on its own thread,
 /// tagged where it lies in the frame body it came in
@@ -85,10 +85,10 @@ final class SpillQueue {
     /// when they would not pay to move one by one: twice the least budget, so an app-state snapshot of tens of
     /// thousands of entries, which the next checkpoint takes from the heap, stays there.
     static final long CHUNKS_MIN = 8L << 20;
-    /// The most nanoseconds a move waits for the thread that tags a record's blocks ahead
-    /// ([Record#tagAhead(SpillQueue)]), which takes tens of milliseconds for the runs of a 20 MB commit while the JVM
-    /// still interprets its loop.
-    static final long TAGS_WAIT = 2_000_000_000L;
+    /// The most nanoseconds a move waits for the thread that prepares a record's runs ahead
+    /// ([Record#prepareAhead(SpillQueue)]), which takes tens of milliseconds for the runs of a 20 MB commit while the
+    /// JVM still interprets its loops.
+    static final long PREPARE_WAIT = 2_000_000_000L;
     /// The bytes of the header of an array.
     private static final int ARRAY_HEADER = 16;
     /// The shortest values whose record moves to the log although the log wrote its group through: a value that long
@@ -162,14 +162,14 @@ final class SpillQueue {
     // The chunks checkpoints read whole so far, and the bytes of the log the reads of chunks read, for tests
     private final AtomicLong materializations = new AtomicLong();
     private final AtomicLong chunkBytesRead = new AtomicLong();
-    // The runs of values whose block tags a thread computed ahead of their move, for tests
-    private final AtomicLong taggedAhead = new AtomicLong();
-    // Whether the blocks of a record whose values move an array at a time are tagged ahead of the move, and what the
-    // thread that tags them runs once it starts, before it tags; for tests
-    private volatile boolean tagsAhead = true;
-    private volatile Runnable tagHookForTests;
-    // The most nanoseconds a move waits for the thread that tags ahead, TAGS_WAIT but in tests
-    private volatile long tagsWait = TAGS_WAIT;
+    // The runs of values a thread prepared ahead of their move, for tests
+    private final AtomicLong preparedAhead = new AtomicLong();
+    // Whether the runs of a record whose values move an array at a time are prepared ahead of the move, and what the
+    // thread that prepares them runs once it starts, before it prepares them; for tests
+    private volatile boolean prepareAhead = true;
+    private volatile Runnable prepareHookForTests;
+    // The most nanoseconds a move waits for the thread that prepares ahead, PREPARE_WAIT but in tests
+    private volatile long prepareWait = PREPARE_WAIT;
 
     /// Creates the queue of a store.
     ///
@@ -195,26 +195,26 @@ final class SpillQueue {
         this.chunksMin = bytes;
     }
 
-    /// Sets whether a thread tags the blocks of a record whose values move an array at a time ahead of their move
-    /// ([Record#tagAhead(SpillQueue)]); for tests.
-    void tagsAheadForTests(boolean ahead) {
-        this.tagsAhead = ahead;
+    /// Sets whether a thread prepares the runs of a record whose values move an array at a time ahead of their move
+    /// ([Record#prepareAhead(SpillQueue)]); for tests.
+    void prepareAheadForTests(boolean ahead) {
+        this.prepareAhead = ahead;
     }
 
-    /// Makes the thread that tags the blocks of a record ahead of their move run `hook` once it starts, before it tags
-    /// them, or nothing if `null`; for tests.
-    void tagHookForTests(Runnable hook) {
-        this.tagHookForTests = hook;
+    /// Makes the thread that prepares the runs of a record ahead of their move run `hook` once it starts, before it
+    /// prepares them, or nothing if `null`; for tests.
+    void prepareHookForTests(Runnable hook) {
+        this.prepareHookForTests = hook;
     }
 
-    /// Makes `nanos` the most a move waits for the thread that tags a record's blocks ahead; for tests.
-    void tagsWaitForTests(long nanos) {
-        this.tagsWait = nanos;
+    /// Makes `nanos` the most a move waits for the thread that prepares a record's runs ahead; for tests.
+    void prepareWaitForTests(long nanos) {
+        this.prepareWait = nanos;
     }
 
-    /// {@return the runs of values whose block tags a thread computed ahead of their move; for tests}
-    long taggedAheadForTests() {
-        return taggedAhead.get();
+    /// {@return the runs of values a thread prepared ahead of their move; for tests}
+    long preparedAheadForTests() {
+        return preparedAhead.get();
     }
 
     /// {@return the pool the reads of [framed][LogValue#framed()] values take their arrays from: the process's, which
@@ -374,8 +374,8 @@ final class SpillQueue {
                 chunkRecordCount = chunkRecords.size();
             }
         }
-        if (settled == Record.CHUNKS && tagsAhead) {
-            record.tagAhead(this);
+        if (settled == Record.CHUNKS && prepareAhead) {
+            record.prepareAhead(this);
         }
         if (over()) {
             start();
@@ -485,9 +485,10 @@ final class SpillQueue {
     /// Moves the values of the commit at `sequence`, which the log holds durably, on the caller's thread, if they move
     /// an array at a time ([LogChunk]) and are still queued; or waits for the thread that moves values if it took
     /// them. A commit that waits for its frame to be durable calls it once it is: such a commit's values on shared
-    /// arrays take more than twice the budget, which a collection right after it would otherwise find on the heap. The
-    /// blocks of those arrays are tagged by then, by the thread that tags them while the log writes the frame
-    /// ([Record#tagAhead(SpillQueue)]), which the move waits for if it still tags them, or else by the move.
+    /// arrays take more than twice the budget, which a collection right after it would otherwise find on the heap. Those
+    /// arrays are checked and their blocks tagged by then, by the thread that prepares them while the log writes the
+    /// frame ([Record#prepareAhead(SpillQueue)]), which the move waits for if it still prepares them, or else by the
+    /// move.
     ///
     /// Any other commit returns at once, after one volatile read. An interrupt while waiting for the thread ends the
     /// wait, the interrupt kept, and the thread moves the values as it would. A failure to move them leaves them on the
@@ -772,15 +773,15 @@ final class SpillQueue {
         /// The verdict of [#settle(long)] that the record's values on shared arrays that lie back to back on them move
         /// an array at a time ([LogChunk]), and its values on arrays of their own one by one.
         static final int CHUNKS = 3;
-        // The states of the tags of the runs' blocks ([#tags])
-        private static final int TAGS_NONE = 0;
-        private static final int TAGS_RUNNING = 1;
-        private static final int TAGS_DONE = 2;
-        private static final VarHandle TAGS;
+        // The states of the preparation of the runs ([#preparing])
+        private static final int PREPARE_NONE = 0;
+        private static final int PREPARE_RUNNING = 1;
+        private static final int PREPARE_DONE = 2;
+        private static final VarHandle PREPARING;
 
         static {
             try {
-                TAGS = MethodHandles.lookup().findVarHandle(Record.class, "tags", int.class);
+                PREPARING = MethodHandles.lookup().findVarHandle(Record.class, "preparing", int.class);
             } catch (ReflectiveOperationException exception) {
                 throw new ExceptionInInitializerError(exception);
             }
@@ -812,16 +813,16 @@ final class SpillQueue {
         private int[] runStarts;
         private int[] runEnds;
         private int runs;
-        // The tags of the blocks of each run that a thread computed while the log wrote the frame ([#tagAhead]): per
-        // run the first polynomials, null without encryption, and the low 32 bits of the second or the CRC-32C; null
-        // until it published them, and if it failed. Written before tags becomes TAGS_DONE, read after
-        private long[][] runHighs;
-        private int[][] runLows;
-        // TAGS_NONE until the thread that tags ahead starts, or the move claims the tags first; TAGS_RUNNING while that
-        // thread computes them; TAGS_DONE once it published them, or the move claimed them
-        private volatile int tags;
-        // The thread of the move waiting for the thread that tags ahead, which that thread unparks once done
-        private volatile Thread tagWaiter;
+        // While findRuns() scans: where the last run's last value ends in the commit's body
+        private int scanBodyEnd;
+        // The runs the thread that prepares them ahead checked and tagged while the log wrote the frame
+        // ([#prepareAhead(SpillQueue)]); null until it published them, if it failed, and once released
+        private volatile Prepared prepared;
+        // PREPARE_NONE until the thread that prepares the runs ahead starts, or the move claims them first;
+        // PREPARE_RUNNING while that thread prepares them; PREPARE_DONE once it published them, or the move claimed them
+        private volatile int preparing;
+        // The thread of the move waiting for the thread that prepares the runs ahead, which that thread unparks once done
+        private volatile Thread prepareWaiter;
         // Set by the log writer as it seals the frame: the segment use, the frame's offset, where the commit's body
         // starts in the frame's body, the bytes of the frame's body, 0 if unknown, and whether the group was written
         // through
@@ -930,13 +931,12 @@ final class SpillQueue {
         /// the next, so the values the record lists of one array are one run, unless a value the record does not list,
         /// replaced by a write of the same batch or of a key space whose values stay, lies between two of them.
         ///
-        /// The frame holds each value after its put's kind, key space and key, a few bytes, but a write between two
-        /// values of an array, a value on an array of its own, can put any number of bytes between them, which a read
-        /// of their chunk would read and decrypt for nothing. So a run is cut where the bytes of the body between the
-        /// values of one block of [LogChunk#BLOCK] bytes would pass [LogChunk#GAP]: a block's bytes then lie in at
-        /// most [LogChunk#BLOCK] plus [LogChunk#GAP] bytes of the body. The runs cut from one array move only all
-        /// together, the array being freed only once every value on it moves, and only if they average
-        /// [LogChunk#PIECE_MIN] bytes; a run without a byte stays, as it frees nothing.
+        /// A [LogChunk] reads its values where the commit's frame holds them back to back as the array does, as the
+        /// section of a split frame holds the values of a rope's chunk. A write the section holds between two values of
+        /// an array, a value on an array of its own, cuts their run there, and a frame that holds each value after its
+        /// put's key leaves no two of them adjacent. The runs cut from one array move only all together, the array
+        /// being freed only once every value on it moves, and only if they average [LogChunk#PIECE_MIN] bytes; a run
+        /// without a byte stays, as it frees nothing.
         private long findRuns() {
             var capacity = 16;
             runHomes = new MemorySegment[capacity];
@@ -946,66 +946,11 @@ final class SpillQueue {
             runStarts = new int[capacity];
             runEnds = new int[capacity];
             runs = 0;
-            // Where the last run's last value ends in the commit's body, and the bytes of the body between its values
-            // in its block gapBlock
-            var bodyEnd = 0;
-            var gapBlock = -1;
-            var gapBytes = 0L;
+            scanBodyEnd = 0;
+            // One call per value: a commit of 100,000 values runs this once, in a JVM that may not have compiled the
+            // loop yet, where a step of its own is compiled after a few hundred calls
             for (var i = 0; i < count; i++) {
-                var version = versions[i];
-                var home = version.sharedSource();
-                if (home == null) {
-                    continue;
-                }
-                var offset = version.sourceOffset();
-                var length = version.valueLength();
-                var body = offsets[i];
-                var last = runs - 1;
-                if (last >= 0 && runHomes[last] == home) {
-                    if (runEnds[last] != offset || body < bodyEnd) {
-                        // A gap, a value before the run's end, or one the frame holds before the run's last value:
-                        // the run stays, and so does this value
-                        runEnds[last] = -1;
-                        continue;
-                    }
-                    var at = offset - runStarts[last];
-                    var cut = false;
-                    if (at % LogChunk.BLOCK != 0) {
-                        // A place inside a block: the body between the two values is part of the block's reads
-                        if (at / LogChunk.BLOCK != gapBlock) {
-                            gapBlock = at / LogChunk.BLOCK;
-                            gapBytes = 0;
-                        }
-                        gapBytes += body - bodyEnd;
-                        cut = gapBytes > LogChunk.GAP;
-                    }
-                    if (!cut) {
-                        runEnds[last] = offset + length;
-                        runLasts[last] = i;
-                        runValues[last]++;
-                        bodyEnd = body + length;
-                        continue;
-                    }
-                }
-                if (runs == runHomes.length) {
-                    capacity = runs * 2;
-                    runHomes = Arrays.copyOf(runHomes, capacity);
-                    runFirsts = Arrays.copyOf(runFirsts, capacity);
-                    runLasts = Arrays.copyOf(runLasts, capacity);
-                    runValues = Arrays.copyOf(runValues, capacity);
-                    runStarts = Arrays.copyOf(runStarts, capacity);
-                    runEnds = Arrays.copyOf(runEnds, capacity);
-                }
-                runHomes[runs] = home;
-                runFirsts[runs] = i;
-                runLasts[runs] = i;
-                runValues[runs] = 1;
-                runStarts[runs] = offset;
-                runEnds[runs] = offset + length;
-                runs++;
-                bodyEnd = body + length;
-                gapBlock = -1;
-                gapBytes = 0;
+                scan(i);
             }
             var runBytes = 0L;
             var first = 0;
@@ -1032,6 +977,52 @@ final class SpillQueue {
                 first = stop;
             }
             return runBytes;
+        }
+
+        /// Adds value `i` to the last run, or starts a run with it, or marks the last run as one that stays.
+        private void scan(int i) {
+            var version = versions[i];
+            var home = version.sharedSource();
+            if (home == null) {
+                return;
+            }
+            var offset = version.sourceOffset();
+            var length = version.valueLength();
+            var body = offsets[i];
+            var last = runs - 1;
+            if (last >= 0 && runHomes[last] == home) {
+                if (runEnds[last] != offset || body < scanBodyEnd) {
+                    // A gap, a value before the run's end, or one the frame holds before the run's last value: the run
+                    // stays, and so does this value
+                    runEnds[last] = -1;
+                    return;
+                }
+                if (body == scanBodyEnd) {
+                    runEnds[last] = offset + length;
+                    runLasts[last] = i;
+                    runValues[last]++;
+                    scanBodyEnd = body + length;
+                    return;
+                }
+                // Other bytes of the frame lie between the two values: a run of its own from this one
+            }
+            if (runs == runHomes.length) {
+                var capacity = runs * 2;
+                runHomes = Arrays.copyOf(runHomes, capacity);
+                runFirsts = Arrays.copyOf(runFirsts, capacity);
+                runLasts = Arrays.copyOf(runLasts, capacity);
+                runValues = Arrays.copyOf(runValues, capacity);
+                runStarts = Arrays.copyOf(runStarts, capacity);
+                runEnds = Arrays.copyOf(runEnds, capacity);
+            }
+            runHomes[runs] = home;
+            runFirsts[runs] = i;
+            runLasts[runs] = i;
+            runValues[runs] = 1;
+            runStarts[runs] = offset;
+            runEnds[runs] = offset + length;
+            runs++;
+            scanBodyEnd = body + length;
         }
 
         private void dropRuns() {
@@ -1103,33 +1094,23 @@ final class SpillQueue {
         }
 
         /// Moves each run of values on a shared array to a [LogChunk] of its place in the frame, its block tags made
-        /// from the array before any value moves. A run whose values lie apart from where the record found them stays.
+        /// from the array before any value moves: those the thread that prepares the runs ahead made, or made now. A run
+        /// whose values lie apart from where the record found them stays.
         private void spillRuns(SpillQueue queue, Crypto crypto) {
-            long[][] highs = null;
-            int[][] lows = null;
-            if (takeTags(queue)) {
-                highs = runHighs;
-                lows = runLows;
-            }
-            if (lows == null) {
-                highs = new long[runs][];
-                lows = new int[runs][];
-                for (var run = 0; run < runs; run++) {
-                    if (runEnds[run] >= 0) {
-                        tagRun(run, crypto, queue.encrypted, highs, lows);
-                    }
-                }
+            var prepared = takePrepared(queue);
+            if (prepared == null) {
+                prepared = prepareRuns(crypto, queue.encrypted);
             }
             var chunks = 0;
             var values = 0;
             for (var run = 0; run < runs; run++) {
-                if (runEnds[run] < 0) {
+                var lows = prepared.lows[run];
+                if (lows == null) {
                     continue;
                 }
-                var chunk = chunkOf(run, highs[run], lows[run]);
-                if (chunk == null) {
-                    continue;
-                }
+                var first = offsets[runFirsts[run]];
+                var chunk = new LogChunk(segment, frameOffset, runStarts[run], runEnds[run], commitStart + first, sequence,
+                        first, prepared.highs[run], lows);
                 chunks++;
                 var home = runHomes[run];
                 for (var i = runFirsts[run]; i <= runLasts[run]; i++) {
@@ -1142,92 +1123,78 @@ final class SpillQueue {
             queue.chunkedValues.addAndGet(values);
         }
 
-        /// {@return the place in the log of the values of run `run`, tagged block by block from the array they lie
-        /// on, or `null` if they no longer lie back to back where the record found them, or not in the order of the
-        /// frame}
+        /// The runs of a record checked and tagged ahead of their move, per run: the first polynomials of the tags of
+        /// its blocks, `null` without encryption, and the low 32 bits of the second or the CRC-32C, `null` for a run
+        /// that stays.
+        private record Prepared(long[][] highs, int[][] lows) {
+        }
+
+        /// {@return the runs checked and tagged on this thread}
+        private Prepared prepareRuns(Crypto crypto, boolean encrypted) {
+            var count = runs;
+            var prepared = new Prepared(new long[count][], new int[count][]);
+            for (var run = 0; run < count; run++) {
+                if (runEnds[run] >= 0) {
+                    prepareRun(run, crypto, encrypted, prepared);
+                }
+            }
+            return prepared;
+        }
+
+        /// Checks that the values of run `run` still lie back to back on their array where [#findRuns()] found them, and
+        /// in the commit's body as on the array, and tags its blocks from the bytes of the array, into `prepared`, or
+        /// leaves the run out if they do not lie so.
         ///
-        /// Values that lie in the frame's body as they lie on the array, as a split frame's section holds them, get a
-        /// chunk without a place per value ([LogChunk]).
-        ///
-        /// @param highs the first polynomials of the tags of the run's blocks ([#tagRun]), or `null` without encryption
-        /// @param lows the low 32 bits of the second polynomials of those tags, or their CRC-32C
-        private LogChunk chunkOf(int run, long[] highs, int[] lows) {
+        /// The tags are bound to the commit's sequence and to where the run's first value starts in the commit's body
+        /// ([LogChunk#place(int, int)]): the array is never written once its batch is prepared, and only the move of
+        /// this record moves its versions, so runs checked and tagged while the log writes the frame hold the bytes
+        /// the frame holds once it is durable.
+        private void prepareRun(int run, Crypto crypto, boolean encrypted, Prepared prepared) {
             var home = runHomes[run];
             var values = runValues[run];
             var start = runStarts[run];
-            var firstBody = commitStart + offsets[runFirsts[run]];
+            var first = offsets[runFirsts[run]];
             var at = 0;
             var next = start;
-            var bodyEnd = Integer.MIN_VALUE;
-            var contiguous = true;
             for (var i = runFirsts[run]; i <= runLasts[run]; i++) {
                 var version = versions[i];
                 if (version.sharedSource() != home) {
                     continue;
                 }
-                var body = commitStart + offsets[i];
-                if (at == values || version.sourceOffset() != next || body < bodyEnd) {
-                    return null;
+                if (at == values || version.sourceOffset() != next || offsets[i] - first != next - start) {
+                    return;
                 }
-                contiguous &= body - firstBody == next - start;
                 at++;
                 next += version.valueLength();
-                bodyEnd = body + version.valueLength();
             }
             if (at != values || next != runEnds[run]) {
-                return null;
+                return;
             }
-            int[] starts = null;
-            int[] bodies = null;
-            if (!contiguous) {
-                starts = new int[values + 1];
-                bodies = new int[values];
-                at = 0;
-                for (var i = runFirsts[run]; i <= runLasts[run]; i++) {
-                    var version = versions[i];
-                    if (version.sharedSource() == home) {
-                        starts[at] = version.sourceOffset();
-                        bodies[at++] = commitStart + offsets[i];
-                    }
-                }
-                starts[values] = next;
-            }
-            return new LogChunk(segment, frameOffset, start, next, firstBody, sequence, offsets[runFirsts[run]], starts,
-                    bodies, highs, lows);
-        }
-
-        /// Tags the blocks of run `run` into `highs` and `lows` at its index, from the bytes of the array it lies on,
-        /// bound to the commit's sequence and to where its first value starts in the commit's body
-        /// ([LogChunk#place(int, int)]): the array is never written once its batch is prepared, so tags made while the
-        /// log writes the frame hold the bytes the frame holds.
-        private void tagRun(int run, Crypto crypto, boolean encrypted, long[][] highs, int[][] lows) {
-            var start = runStarts[run];
-            var length = runEnds[run] - start;
+            var length = next - start;
             var bytes = crypto.scratch(length);
-            MemorySegment.copy(runHomes[run], start, MemorySegment.ofArray(bytes), 0, length);
+            MemorySegment.copy(home, start, MemorySegment.ofArray(bytes), 0, length);
             var blocks = LogChunk.blocks(length);
-            var runHighs = encrypted ? new long[blocks] : null;
-            var runLows = new int[blocks];
-            var first = offsets[runFirsts[run]];
+            var highs = encrypted ? new long[blocks] : null;
+            var lows = new int[blocks];
             for (var block = 0; block < blocks; block++) {
                 var from = block * LogChunk.BLOCK;
-                crypto.tagBlock(bytes, from, Math.min(LogChunk.BLOCK, length - from), sequence,
-                        LogChunk.place(first, block), runHighs, runLows, block);
+                crypto.tagBlock(bytes, from, Math.min(LogChunk.BLOCK, length - from), sequence, LogChunk.place(first, block),
+                        highs, lows, block);
             }
-            highs[run] = runHighs;
-            lows[run] = runLows;
+            prepared.highs[run] = highs;
+            prepared.lows[run] = lows;
         }
 
-        /// Starts a thread that tags the blocks of the runs while the log writes and forces the commit's frame, so the
-        /// move of the values, once the frame is durable, takes the tags rather than computing them on the thread of
-        /// the commit that waits for it ([SpillQueue#moveOwn(long)]). A thread the system refuses leaves them to the
-        /// move. The ciphers are taken here, so the thread takes no lock and never parks before it publishes the tags.
-        void tagAhead(SpillQueue queue) {
+        /// Starts a thread that checks and tags the runs while the log writes and forces the commit's frame, so the move
+        /// of the values, once the frame is durable, takes them rather than preparing them on the thread of the commit
+        /// that waits for it ([SpillQueue#moveOwn(long)]). A thread the system refuses leaves them to the move. The
+        /// ciphers are taken here, so the thread takes no lock and never parks before it publishes the runs.
+        void prepareAhead(SpillQueue queue) {
             var crypto = queue.takeCrypto();
             try {
-                Thread.ofVirtual().name("ledger-chunk-tags").start(() -> {
+                Thread.ofVirtual().name("ledger-chunks").start(() -> {
                     try {
-                        computeAhead(queue, crypto);
+                        runAhead(queue, crypto);
                     } finally {
                         queue.giveBack(crypto);
                     }
@@ -1237,83 +1204,68 @@ final class SpillQueue {
             }
         }
 
-        /// Tags the blocks of the runs ahead of the move, unless the move claimed them first, and publishes the tags,
-        /// none if they could not be made, waking the move if it waits for them.
-        private void computeAhead(SpillQueue queue, Crypto crypto) {
-            if (!TAGS.compareAndSet(this, TAGS_NONE, TAGS_RUNNING)) {
+        /// Prepares the runs ahead of the move, unless the move claimed them first, and publishes them, none if they
+        /// could not be prepared, waking the move if it waits for them.
+        private void runAhead(SpillQueue queue, Crypto crypto) {
+            if (!PREPARING.compareAndSet(this, PREPARE_NONE, PREPARE_RUNNING)) {
                 return;
             }
-            long[][] highs = null;
-            int[][] lows = null;
             try {
-                var hook = queue.tagHookForTests;
+                var hook = queue.prepareHookForTests;
                 if (hook != null) {
                     hook.run();
                 }
-                var encrypted = queue.encrypted;
-                var count = runs;
-                var made = new long[count][];
-                var madeLows = new int[count][];
-                for (var run = 0; run < count; run++) {
-                    if (runEnds[run] >= 0) {
-                        tagRun(run, crypto, encrypted, made, madeLows);
-                    }
-                }
-                highs = made;
-                lows = madeLows;
+                prepared = prepareRuns(crypto, queue.encrypted);
             } catch (RuntimeException | OutOfMemoryError _) {
-                // The move tags them itself; a record released meanwhile, its runs gone, is not moved at all
+                // The move prepares them itself; a record released meanwhile, its runs gone, is not moved at all
             } finally {
-                runHighs = highs;
-                runLows = lows;
-                tags = TAGS_DONE;
-                var waiter = tagWaiter;
+                preparing = PREPARE_DONE;
+                var waiter = prepareWaiter;
                 if (waiter != null) {
                     LockSupport.unpark(waiter);
                 }
             }
         }
 
-        /// {@return whether the thread that tags ahead published the tags of the runs, [#runHighs] and [#runLows]; with
-        /// `runLows` `null` if it made none, having failed; `false` if the move claimed them before that thread
-        /// started, or that thread did not end within [SpillQueue#TAGS_WAIT] nanoseconds}
+        /// {@return the runs the thread that prepares them ahead published, or `null` if the move claimed them before
+        /// that thread started, that thread failed, or it did not end within [SpillQueue#PREPARE_WAIT] nanoseconds}
         ///
-        /// Waits for that thread if it is computing them: it started, so it holds a carrier and takes no lock until it
+        /// Waits for that thread if it is preparing them: it started, so it holds a carrier and takes no lock until it
         /// is done, whatever the application's virtual threads hold. The wait is bounded all the same, the move then
-        /// tagging the blocks itself, so no move waits on a thread that lost its carrier. An interrupt does not end the
+        /// preparing the runs itself, so no move waits on a thread that lost its carrier. An interrupt does not end the
         /// wait, and is kept.
-        private boolean takeTags(SpillQueue queue) {
-            if (TAGS.compareAndSet(this, TAGS_NONE, TAGS_DONE)) {
-                return false;
+        private Prepared takePrepared(SpillQueue queue) {
+            if (PREPARING.compareAndSet(this, PREPARE_NONE, PREPARE_DONE)) {
+                return null;
             }
-            if (tags == TAGS_RUNNING) {
-                tagWaiter = Thread.currentThread();
+            if (preparing == PREPARE_RUNNING) {
+                prepareWaiter = Thread.currentThread();
                 var interrupted = false;
-                var deadline = System.nanoTime() + queue.tagsWait;
+                var deadline = System.nanoTime() + queue.prepareWait;
                 long left;
-                while (tags == TAGS_RUNNING && (left = deadline - System.nanoTime()) > 0) {
+                while (preparing == PREPARE_RUNNING && (left = deadline - System.nanoTime()) > 0) {
                     LockSupport.parkNanos(this, left);
                     interrupted |= Thread.interrupted();
                 }
-                tagWaiter = null;
+                prepareWaiter = null;
                 if (interrupted) {
                     Thread.currentThread().interrupt();
                 }
-                if (tags == TAGS_RUNNING) {
-                    return false;
+                if (preparing == PREPARE_RUNNING) {
+                    return null;
                 }
             }
-            var lows = runLows;
-            if (lows != null) {
-                var tagged = 0;
-                for (var run : lows) {
-                    if (run != null) {
-                        tagged++;
+            var ahead = prepared;
+            if (ahead != null) {
+                var runs = 0;
+                for (var lows : ahead.lows) {
+                    if (lows != null) {
+                        runs++;
                     }
                 }
-                queue.taggedAhead.addAndGet(tagged);
+                queue.preparedAhead.addAndGet(runs);
             }
-            return true;
+            return ahead;
         }
 
         /// {@return whether the values on shared arrays move an array at a time ([#CHUNKS])}
@@ -1327,8 +1279,7 @@ final class SpillQueue {
             offsets = null;
             count = 0;
             dropRuns();
-            runHighs = null;
-            runLows = null;
+            prepared = null;
         }
     }
 

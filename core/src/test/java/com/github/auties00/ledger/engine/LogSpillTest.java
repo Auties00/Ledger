@@ -1923,8 +1923,6 @@ class LogSpillTest {
             assertTrue(chunks.size() >= 15 && chunks.size() <= 17, chunks.size() + " chunks");
             assertTrue(Arrays.stream(ledger.spills().segmentsForTests()).anyMatch(number -> number == chunks.getFirst().segment().number()),
                     "the segment of the chunks is not held for readers");
-            // The commit's frame is split: its section holds the values as their arrays do
-            assertTrue(chunks.stream().allMatch(LogChunk::contiguousForTests), "a chunk keeps a place per value");
             verify(ledger, expected);
             var read = spills.chunkBytesReadForTests();
             ledger.checkpoint();
@@ -1943,16 +1941,16 @@ class LogSpillTest {
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
     @Timeout(120)
-    @DisplayName("a commit whose values move an array at a time has its blocks tagged by a thread of their own while the log writes its frame, and a wait for durability that finds that thread still tagging waits for it, then moves the values with those tags")
-    void chunkTagsMadeAhead(boolean encrypted, @TempDir Path directory) throws Exception {
+    @DisplayName("a commit whose values move an array at a time has its runs checked and tagged by a thread of their own while the log writes its frame, and a wait for durability that finds that thread still at work waits for it, then moves the values with what it prepared")
+    void chunksPreparedAhead(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         var count = 20_000;
         try (var ledger = openChunked(directory, encrypted, 16L << 20)) {
             var spills = ledger.spills();
-            var tagging = new CountDownLatch(1);
+            var preparing = new CountDownLatch(1);
             var release = new CountDownLatch(1);
-            spills.tagHookForTests(() -> {
-                tagging.countDown();
+            spills.prepareHookForTests(() -> {
+                preparing.countDown();
                 try {
                     release.await();
                 } catch (InterruptedException _) {
@@ -1977,11 +1975,11 @@ class LogSpillTest {
                     failure.set(throwable);
                 }
             });
-            assertTrue(tagging.await(60, TimeUnit.SECONDS), "no thread tagged the blocks ahead");
+            assertTrue(preparing.await(60, TimeUnit.SECONDS), "no thread prepared the runs ahead");
             while (commit.get() == null || !commit.get().isDurable()) {
                 Thread.sleep(1);
             }
-            // Durable, but its values cannot move before their tags are made
+            // Durable, but its values cannot move before their runs are checked and tagged
             committer.join(200);
             assertTrue(committer.isAlive(), "the wait for durability returned before the values moved");
             assertEquals(1, spills.chunkRecordsForTests());
@@ -1989,7 +1987,7 @@ class LogSpillTest {
             committer.join();
             assertNull(failure.get());
             var chunks = chunksOf(ledger, 0, count);
-            assertEquals(chunks.size(), spills.taggedAheadForTests(), "the move made tags of its own");
+            assertEquals(chunks.size(), spills.preparedAheadForTests(), "the move prepared runs of its own");
             assertEquals(0, spills.chunkRecordsForTests());
             assertEquals(0, spills.heldForTests());
             verify(ledger, expected);
@@ -2004,15 +2002,15 @@ class LogSpillTest {
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
     @Timeout(120)
-    @DisplayName("a move that waited its longest for the thread tagging its blocks ahead tags them itself, and the values read back as written")
-    void chunkTagsWaitIsBounded(boolean encrypted, @TempDir Path directory) throws Exception {
+    @DisplayName("a move that waited its longest for the thread preparing its runs ahead prepares them itself, and the values read back as written")
+    void chunksWaitIsBounded(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         var count = 20_000;
         var release = new CountDownLatch(1);
         try (var ledger = openChunked(directory, encrypted, 16L << 20)) {
             var spills = ledger.spills();
-            spills.tagsWaitForTests(TimeUnit.MILLISECONDS.toNanos(50));
-            spills.tagHookForTests(() -> {
+            spills.prepareWaitForTests(TimeUnit.MILLISECONDS.toNanos(50));
+            spills.prepareHookForTests(() -> {
                 try {
                     release.await();
                 } catch (InterruptedException _) {
@@ -2022,7 +2020,7 @@ class LogSpillTest {
             writeBulk(ledger, expected, 0, count, new int[]{100, 200, 300}, 0);
             var chunks = chunksOf(ledger, 0, count);
             assertTrue(chunks.size() >= 15, chunks.size() + " chunks");
-            assertEquals(0, spills.taggedAheadForTests());
+            assertEquals(0, spills.preparedAheadForTests());
             release.countDown();
             verify(ledger, expected);
             ledger.checkpoint();
@@ -2034,17 +2032,17 @@ class LogSpillTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
-    @DisplayName("a commit whose blocks no thread tagged ahead, as when the thread had not started, has them tagged by the move, and reads back as written")
-    void chunkTagsMadeByTheMove(boolean encrypted, @TempDir Path directory) throws Exception {
+    @DisplayName("a commit whose runs no thread prepared ahead, as when the thread had not started, has them checked and tagged by the move, and reads back as written")
+    void chunksPreparedByTheMove(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         var count = 20_000;
         try (var ledger = openChunked(directory, encrypted, 16L << 20)) {
             var spills = ledger.spills();
-            spills.tagsAheadForTests(false);
+            spills.prepareAheadForTests(false);
             writeBulk(ledger, expected, 0, count, new int[]{100, 200, 300}, 0);
             var chunks = chunksOf(ledger, 0, count);
             assertTrue(chunks.size() >= 15, chunks.size() + " chunks");
-            assertEquals(0, spills.taggedAheadForTests());
+            assertEquals(0, spills.preparedAheadForTests());
             verify(ledger, expected);
             ledger.checkpoint();
             verify(ledger, expected);
@@ -2132,18 +2130,16 @@ class LogSpillTest {
                 var read = spills.chunkBytesReadForTests();
                 assertArrayEquals(expected.messages.get(message), ledger.get(MESSAGES, key(message)).orElseThrow(), "message " + message);
                 shortBytes += expected.messages.get(message).length;
-                // A value of at most 300 bytes spans one or two blocks, each in at most twice its bytes of the body
+                // A value of at most 300 bytes spans one or two blocks, read as the section holds them
                 var bytes = spills.chunkBytesReadForTests() - read;
-                assertTrue(bytes <= 2 * (LogChunk.BLOCK + LogChunk.GAP), "a read of message " + message + " read " + bytes + " bytes");
+                assertTrue(bytes <= 2 * LogChunk.BLOCK, "a read of message " + message + " read " + bytes + " bytes");
             }
             verify(ledger, expected);
             var read = spills.chunkBytesReadForTests();
             ledger.checkpoint();
             assertEquals(chunks.size(), spills.materializationsForTests());
-            // Each put's kind, key space and key lie between two values, a few bytes beside one of 100 to 300
-            var materialized = spills.chunkBytesReadForTests() - read;
-            assertTrue(materialized <= shortBytes + shortBytes / 10,
-                    "the checkpoint read " + materialized + " bytes of chunks for " + shortBytes + " bytes of values");
+            // The section holds the short values back to back, the long ones between them in no chunk
+            assertEquals(shortBytes, spills.chunkBytesReadForTests() - read, "the checkpoint read other bytes of the log than the short values");
             verify(ledger, expected);
         }
         try (var ledger = openChunked(directory, true, 16L << 20)) {
@@ -2171,9 +2167,9 @@ class LogSpillTest {
                 Version.of(1L << 20 | 6, empty, 50, 0, null, null, null),
                 Version.of(1L << 20 | 7, empty, 50, 0, null, null, null),
         };
-        // Each value's place in the commit's body, after its put's key; the reordered two in the reverse of their
-        // order
-        int[] bodies = {40, 180, 320, 460, 740, 600, 880, 920};
+        // Each value's place in the commit's body, back to back as a split frame's section holds them; the reordered
+        // two in the reverse of their order
+        int[] bodies = {40, 140, 240, 340, 540, 440, 640, 640};
         var record = queue.record(1, versions.length);
         for (var i = 0; i < versions.length; i++) {
             record.add(versions[i], bodies[i], versions[i].valueLength());
@@ -2196,7 +2192,7 @@ class LogSpillTest {
     }
 
     @Test
-    @DisplayName("a run of values is cut where the frame's body between the values of one block passes its bound, into chunks that move together if they average four blocks, and stay together if they do not")
+    @DisplayName("a run of values is cut where the frame's body holds other bytes between two of them, into chunks that move together if they average four blocks, and stay together if they do not")
     void runsCutWhereTheBodyGaps(@TempDir Path directory) throws Exception {
         var queue = new SpillQueue(0, true);
         queue.chunksMinForTests(1);
@@ -2205,34 +2201,41 @@ class LogSpillTest {
         var small = MemorySegment.ofArray(new byte[2_000]).asReadOnly();
         var crowded = MemorySegment.ofArray(new byte[10_000]).asReadOnly();
         var spaced = MemorySegment.ofArray(new byte[10_000]).asReadOnly();
+        var adjacent = MemorySegment.ofArray(new byte[10_000]).asReadOnly();
         var versions = new ArrayList<Version>();
         var bodies = new ArrayList<Integer>();
         var body = 0;
-        // 100 values of 200 bytes, 10 bytes apart in the body but for 100 KiB between the 50th and the 51st
+        // 100 values of 200 bytes, back to back in the body but for 100 KiB between the 50th and the 51st
         for (var i = 0; i < 100; i++) {
-            body += i == 50 ? 100 << 10 : 10;
+            body += i == 50 ? 100 << 10 : 0;
             versions.add(Version.of(1L << 20 | versions.size(), cut, i * 200, 200, null, null, null));
             bodies.add(body);
             body += 200;
         }
         // 10 values of 200 bytes, the same gap between the 5th and the 6th: two runs of 1,000 bytes
         for (var i = 0; i < 10; i++) {
-            body += i == 5 ? 100 << 10 : 10;
+            body += i == 5 ? 100 << 10 : 0;
             versions.add(Version.of(1L << 20 | versions.size(), small, i * 200, 200, null, null, null));
             bodies.add(body);
             body += 200;
         }
-        // 100 values of 100 bytes, 300 bytes apart: more than a block between the values of every block
+        // 100 values of 100 bytes, 300 bytes apart, and 100 more 10 bytes apart, as a frame that holds each value after
+        // its put's key lays them: a run per value
         for (var i = 0; i < 100; i++) {
             body += 300;
             versions.add(Version.of(1L << 20 | versions.size(), crowded, i * 100, 100, null, null, null));
             bodies.add(body);
             body += 100;
         }
-        // 100 values of 100 bytes, 90 bytes apart: under a block between the values of each block
         for (var i = 0; i < 100; i++) {
-            body += 90;
+            body += 10;
             versions.add(Version.of(1L << 20 | versions.size(), spaced, i * 100, 100, null, null, null));
+            bodies.add(body);
+            body += 100;
+        }
+        // 100 values of 100 bytes back to back: one run
+        for (var i = 0; i < 100; i++) {
+            versions.add(Version.of(1L << 20 | versions.size(), adjacent, i * 100, 100, null, null, null));
             bodies.add(body);
             body += 100;
         }
@@ -2256,13 +2259,13 @@ class LogSpillTest {
         for (var i = 0; i < 100; i++) {
             assertSame(i < 50 ? first : second, versions.get(i).sourceForTests(), "value " + i);
         }
-        for (var i = 100; i < 210; i++) {
+        for (var i = 100; i < 310; i++) {
             assertInstanceOf(MemorySegment.class, versions.get(i).sourceForTests(), "value " + i);
         }
-        var whole = assertInstanceOf(LogChunk.class, versions.get(210).sourceForTests());
+        var whole = assertInstanceOf(LogChunk.class, versions.get(310).sourceForTests());
         assertEquals(0, whole.base());
         assertEquals(10_000, whole.end());
-        for (var i = 210; i < 310; i++) {
+        for (var i = 310; i < 410; i++) {
             assertSame(whole, versions.get(i).sourceForTests(), "value " + i);
         }
         assertEquals(0, queue.heldForTests());
@@ -2280,7 +2283,7 @@ class LogSpillTest {
         var second = Version.of(1L << 20 | 1, home, 100, 100, null, null, null);
         var record = queue.record(1, 2);
         record.add(first, 40, 100);
-        record.add(second, 180, 100);
+        record.add(second, 140, 100);
         record.locate(view, 64, 0, 0, true);
         queue.add(record);
         queue.awaitIdleForTests();
@@ -2312,7 +2315,7 @@ class LogSpillTest {
         var next = Version.of(2L << 20 | 1, home, 100, 100, null, null, null);
         var second = queue.record(2, 2);
         second.add(chunked, 40, 100);
-        second.add(next, 180, 100);
+        second.add(next, 140, 100);
         second.locate(newer, 64, 0, 0, false);
         queue.add(second);
         queue.awaitIdleForTests();
