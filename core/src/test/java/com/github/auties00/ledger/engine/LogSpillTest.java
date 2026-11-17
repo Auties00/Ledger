@@ -43,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -1839,6 +1840,27 @@ class LogSpillTest {
         ledger.commit(batch).awaitDurable();
     }
 
+    /// Opens a store as [#openSized(Path, boolean, long, Duration, long)] does, with segments of `segmentSize` bytes,
+    /// whose commits of at least 1 MiB of short values move an array at a time.
+    private static LiveLedger openChunked(Path directory, boolean encrypted, long segmentSize) {
+        var ledger = openSized(directory, encrypted, 0, Duration.ZERO, segmentSize);
+        ledger.spills().chunksMinForTests(1 << 20);
+        return ledger;
+    }
+
+    /// {@return the distinct chunks the newest versions of `messages` keys from `first` are in, each checked to be one}
+    private static List<LogChunk> chunksOf(LiveLedger ledger, int first, int messages) {
+        var chunks = new ArrayList<LogChunk>();
+        for (var message = first; message < first + messages; message++) {
+            var source = head(ledger, MESSAGES, key(message)).sourceForTests();
+            var chunk = assertInstanceOf(LogChunk.class, source, "message " + message);
+            if (chunks.stream().noneMatch(known -> known == chunk)) {
+                chunks.add(chunk);
+            }
+        }
+        return chunks;
+    }
+
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
     @DisplayName("the values a split frame leaves to its section, a value of 200 KiB on an array of its own among them, leave the heap from where the section put them, and read back as written before and after a checkpoint and a recovery")
@@ -1872,6 +1894,329 @@ class LogSpillTest {
             verify(ledger, expected);
         }
         try (var ledger = openSized(directory, encrypted, 0, Duration.ZERO, 16L << 20)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @DisplayName("a commit of short values over twice the budget leaves the heap an array at a time before its wait for durability returns, reads back as written from a get, a range and a scan, and through a checkpoint that reads each array once and keeps none, and a reopen")
+    void chunkedCommitLeavesTheHeap(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var count = 20_000;
+        int[] lengths = {100, 200, 300};
+        try (var ledger = openChunked(directory, encrypted, 16L << 20)) {
+            writeBulk(ledger, expected, 0, count, lengths, 3);
+            var spills = ledger.spills();
+            assertEquals(1, spills.chunkedRecordsForTests());
+            assertEquals(0, spills.unpaidRecordsForTests());
+            assertEquals(0, spills.chunkRecordsForTests(), "the wait for durability returned before the values moved");
+            assertEquals(0, spills.heldForTests());
+            assertEquals(count, spills.chunkedValuesForTests());
+            assertEquals(0, spills.loggedValuesForTests() + spills.copiedValuesForTests());
+            var chunks = chunksOf(ledger, 0, count);
+            assertEquals(spills.loggedChunksForTests(), chunks.size());
+            // 4 MB of values on arrays of 256 KiB
+            assertTrue(chunks.size() >= 15 && chunks.size() <= 17, chunks.size() + " chunks");
+            assertTrue(Arrays.stream(ledger.spills().segmentsForTests()).anyMatch(number -> number == chunks.getFirst().segment().number()),
+                    "the segment of the chunks is not held for readers");
+            verify(ledger, expected);
+            ledger.checkpoint();
+            assertEquals(chunks.size(), spills.materializationsForTests(), "the checkpoint read an array more than once");
+            assertEquals(0, spills.materializedForTests());
+            assertTrue(chunks.stream().noneMatch(LogChunk::materializedForTests), "the checkpoint kept an array it read whole");
+            verify(ledger, expected);
+        }
+        try (var ledger = openChunked(directory, encrypted, 16L << 20)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @Test
+    @DisplayName("a commit of short values under twice the budget, and under 8 MiB whatever the budget, stays off the queue as before")
+    void smallUnpaidCommitsStay(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = openSized(directory, true, 0, Duration.ZERO, 16L << 20)) {
+            writeBulk(ledger, expected, 0, 20_000, new int[]{100, 200, 300}, 0);
+            var spills = ledger.spills();
+            assertEquals(0, spills.chunkedRecordsForTests());
+            assertEquals(1, spills.unpaidRecordsForTests());
+            assertEquals(0, spills.heldForTests());
+            assertInstanceOf(MemorySegment.class, head(ledger, MESSAGES, key(7)).sourceForTests());
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a value of a chunk whose bytes in the log changed is reported, never returned, and the values of other chunks read on")
+    void reportsDamagedChunks(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var count = 10_000;
+        try (var ledger = openChunked(directory, encrypted, 16L << 20)) {
+            writeBulk(ledger, expected, 0, count, new int[]{100, 200, 300}, 0);
+            var damaged = 5_000;
+            var chunk = (LogChunk) head(ledger, MESSAGES, key(damaged)).sourceForTests();
+            var version = head(ledger, MESSAGES, key(damaged));
+            var position = chunk.positionForTests(version.sourceOffset()) + 3;
+            try (var channel = FileChannel.open(chunk.segment().path(), StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                var one = ByteBuffer.allocate(1);
+                channel.read(one, position);
+                one.put(0, (byte) (one.get(0) ^ 0x5A)).rewind();
+                channel.write(one, position);
+            }
+            assertThrows(LedgerCorruptedException.class, () -> ledger.get(MESSAGES, key(damaged)));
+            for (var other = 0; other < count; other += 37) {
+                if (head(ledger, MESSAGES, key(other)).sourceForTests() != chunk) {
+                    assertArrayEquals(expected.messages.get(other), ledger.get(MESSAGES, key(other)).orElseThrow(), "message " + other);
+                }
+            }
+            assertThrows(LedgerCorruptedException.class, ledger::checkpoint, "a checkpoint wrote a damaged chunk");
+            assertEquals(0, ledger.spills().materializedForTests(), "a failed checkpoint kept the arrays it read whole");
+            ledger.closeWithoutCheckpoint();
+        }
+    }
+
+    @Test
+    @DisplayName("values on arrays of their own among a commit's short values move one by one, the short ones an array at a time, and all read back as written through a checkpoint and a reopen")
+    void chunkedBesideOwnValues(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var count = 20_000;
+        var own = 1_000_000;
+        try (var ledger = openChunked(directory, true, 16L << 20)) {
+            var batch = ledger.newBatch();
+            for (var message = 0; message < count; message++) {
+                var value = new byte[100 + message % 3 * 100];
+                Arrays.fill(value, (byte) message);
+                batch.put(MESSAGES, key(message), value);
+                expected.messages.put(message, value);
+                if (message % 4_000 == 1_234) {
+                    var large = large(message, 160 << 10);
+                    batch.put(MESSAGES, key(own + message), large);
+                    expected.messages.put(own + message, large);
+                }
+            }
+            ledger.commit(batch).awaitDurable();
+            var spills = ledger.spills();
+            assertEquals(1, spills.chunkedRecordsForTests());
+            assertEquals(count, spills.chunkedValuesForTests());
+            assertEquals(5, spills.loggedValuesForTests());
+            chunksOf(ledger, 0, count);
+            for (var message = 1_234; message < count; message += 4_000) {
+                assertInstanceOf(LogValue.class, head(ledger, MESSAGES, key(own + message)).sourceForTests());
+            }
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = openChunked(directory, true, 16L << 20)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @Test
+    @DisplayName("a run of values with a gap on its array, or whose frame holds them in another order, stays on its array, while a run of another array moves to a chunk")
+    void runsWithGapsStay(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(0, true);
+        queue.chunksMinForTests(1);
+        var view = queue.segment(1, directory.resolve("1.log"), null);
+        var whole = MemorySegment.ofArray(new byte[1_000]).asReadOnly();
+        var gapped = MemorySegment.ofArray(new byte[1_000]).asReadOnly();
+        var reordered = MemorySegment.ofArray(new byte[1_000]).asReadOnly();
+        Version[] versions = {
+                Version.of(1L << 20, whole, 0, 100, null, null, null),
+                Version.of(1L << 20 | 1, whole, 100, 100, null, null, null),
+                Version.of(1L << 20 | 2, gapped, 0, 100, null, null, null),
+                Version.of(1L << 20 | 3, gapped, 150, 100, null, null, null),
+                Version.of(1L << 20 | 4, reordered, 0, 100, null, null, null),
+                Version.of(1L << 20 | 5, reordered, 100, 100, null, null, null),
+        };
+        // Each value's place in the commit's body, after its put's key; the last two in the reverse of their order
+        int[] bodies = {40, 180, 320, 460, 740, 600};
+        var record = queue.record(1, versions.length);
+        for (var i = 0; i < versions.length; i++) {
+            record.add(versions[i], bodies[i], 100);
+        }
+        record.locate(view, 64, 0, 0, false);
+        queue.add(record);
+        queue.awaitIdleForTests();
+        assertEquals(1, queue.chunkedRecordsForTests());
+        assertEquals(1, queue.loggedChunksForTests());
+        assertEquals(2, queue.chunkedValuesForTests());
+        var chunk = assertInstanceOf(LogChunk.class, versions[0].sourceForTests());
+        assertSame(chunk, versions[1].sourceForTests());
+        assertEquals(0, chunk.base());
+        assertEquals(200, chunk.end());
+        for (var i = 2; i < versions.length; i++) {
+            assertInstanceOf(MemorySegment.class, versions[i].sourceForTests(), "value " + i);
+        }
+        assertEquals(0, queue.heldForTests());
+        assertEquals(0, queue.chunkRecordsForTests());
+    }
+
+    @Test
+    @DisplayName("the values of a commit that would move an array at a time stay on the heap if the log wrote its group through, and its record leaves the queue")
+    void writtenThroughChunksStay(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(0, true);
+        queue.chunksMinForTests(1);
+        var view = queue.segment(1, directory.resolve("1.log"), null);
+        var home = MemorySegment.ofArray(new byte[1_000]).asReadOnly();
+        var first = Version.of(1L << 20, home, 0, 100, null, null, null);
+        var second = Version.of(1L << 20 | 1, home, 100, 100, null, null, null);
+        var record = queue.record(1, 2);
+        record.add(first, 40, 100);
+        record.add(second, 180, 100);
+        record.locate(view, 64, 0, 0, true);
+        queue.add(record);
+        queue.awaitIdleForTests();
+        queue.moveOwn(1);
+        assertEquals(1, queue.chunkedRecordsForTests());
+        assertEquals(0, queue.loggedChunksForTests());
+        assertInstanceOf(MemorySegment.class, first.sourceForTests());
+        assertEquals(0, queue.segmentsForTests().length, "a segment no value moved to is held");
+        assertEquals(0, queue.chunkRecordsForTests());
+    }
+
+    @Test
+    @DisplayName("a committer that moves its commit's values before an older commit's are moved keeps the segments in the order of their numbers, so a published checkpoint covers and retires both")
+    void movedOwnKeepsSegmentsInOrder(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(0, true);
+        queue.chunksMinForTests(1);
+        var durable = new java.util.concurrent.atomic.AtomicLong();
+        queue.useDurable(durable::get);
+        var older = queue.segment(1, directory.resolve("1.log"), null);
+        var newer = queue.segment(2, directory.resolve("2.log"), null);
+        // An older commit of a long value in segment 1, and a commit of short values in segment 2
+        var logged = spillable(1L << 20, 4_000);
+        var first = queue.record(1, 1);
+        first.add(logged, 0, 4_000);
+        first.locate(older, 64, 0, 0, false);
+        queue.add(first);
+        var home = MemorySegment.ofArray(new byte[1_000]).asReadOnly();
+        var chunked = Version.of(2L << 20, home, 0, 100, null, null, null);
+        var next = Version.of(2L << 20 | 1, home, 100, 100, null, null, null);
+        var second = queue.record(2, 2);
+        second.add(chunked, 40, 100);
+        second.add(next, 180, 100);
+        second.locate(newer, 64, 0, 0, false);
+        queue.add(second);
+        queue.awaitIdleForTests();
+        assertInstanceOf(MemorySegment.class, logged.sourceForTests(), "a value of a commit not durable moved");
+        durable.set(2);
+        queue.moveOwn(2);
+        assertInstanceOf(LogChunk.class, chunked.sourceForTests());
+        assertArrayEquals(new long[]{2}, queue.segmentsForTests());
+        queue.drain(durable::get);
+        assertInstanceOf(LogValue.class, logged.sourceForTests());
+        assertArrayEquals(new long[]{1, 2}, queue.segmentsForTests());
+        queue.published(2, 3, 2);
+        assertEquals(3, queue.retirableBefore(3, new ReaderTable(4, durable::get)));
+        assertEquals(0, queue.segmentsForTests().length);
+        assertTrue(older.retired() && newer.retired());
+    }
+
+    @Test
+    @DisplayName("the segment of a commit moved an array at a time stays while a snapshot of the tree before the checkpoint that makes it obsolete reads its values, and retires once the snapshot closes")
+    void chunkSegmentsStayForOlderTrees(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var count = 8_000;
+        int[] lengths = {100, 200, 300};
+        try (var ledger = openChunked(directory, true, 2L << 20)) {
+            writeBulk(ledger, expected, 0, count, lengths, 0);
+            var segment = chunksOf(ledger, 0, count).getFirst().segment().number();
+            // A second one, which the first's segment has no room for
+            writeBulk(ledger, expected, count, count, lengths, 0);
+            assertTrue(chunksOf(ledger, count, count).getFirst().segment().number() > segment);
+            var snapshot = ledger.snapshot();
+            var seen = expected.copy();
+            ledger.checkpoint();
+            assertTrue(Arrays.stream(ledger.spills().segmentsForTests()).anyMatch(number -> number == segment),
+                    "the checkpoint retired a segment a snapshot needs");
+            assertTrue(Files.exists(segmentPath(directory, segment)));
+            verifyView(snapshot, seen);
+            verify(ledger, expected);
+            snapshot.close();
+            ledger.checkpointer().tick();
+            assertTrue(Arrays.stream(ledger.spills().segmentsForTests()).noneMatch(number -> number == segment));
+            assertFalse(Files.exists(segmentPath(directory, segment)));
+            verify(ledger, expected);
+        }
+        try (var ledger = openChunked(directory, true, 2L << 20)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "with a commit moved an array at a time: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a store whose values moved to segments a checkpoint left pending, idle through many ticks, closes with a checkpoint that reads them all back, and reopens with every value")
+    void closesAfterIdleTicks(boolean chunked, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var ledger = openChunked(directory, true, 256L << 10);
+        try {
+            for (var batch = 0; batch < 20; batch++) {
+                write(ledger, expected, batch * 30, 30, 0, true);
+            }
+            if (chunked) {
+                writeBulk(ledger, expected, 10_000, 6_000, new int[]{100, 200, 300}, 0);
+            }
+            spillNow(ledger);
+            ledger.checkpoint();
+            for (var batch = 20; batch < 40; batch++) {
+                write(ledger, expected, batch * 30, 30, 1, true);
+            }
+            if (chunked) {
+                writeBulk(ledger, expected, 20_000, 6_000, new int[]{100, 200, 300}, 0);
+                chunksOf(ledger, 20_000, 6_000);
+            }
+            spillNow(ledger);
+            assertTrue(ledger.spills().loggedValuesForTests() > 0);
+            for (var tick = 0; tick < 50; tick++) {
+                ledger.checkpointer().tick();
+            }
+            verify(ledger, expected);
+        } finally {
+            ledger.close();
+        }
+        try (var reopened = openChunked(directory, true, 256L << 10)) {
+            verify(reopened, expected);
+        }
+    }
+
+    @Test
+    @DisplayName("checkpoints racing reads of values moved an array at a time read each array once, and every reader reads the values as written")
+    @Timeout(120)
+    void readersRaceChunkMaterialization(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var count = 20_000;
+        try (var ledger = openChunked(directory, true, 16L << 20)) {
+            writeBulk(ledger, expected, 0, count, new int[]{100, 200, 300}, 0);
+            chunksOf(ledger, 0, count);
+            var stop = new AtomicBoolean();
+            var failure = new AtomicReference<Throwable>();
+            var readers = new ArrayList<Thread>();
+            for (var reader = 0; reader < 4; reader++) {
+                var seed = reader;
+                readers.add(Thread.ofPlatform().start(() -> {
+                    var random = new Random(seed);
+                    try {
+                        while (!stop.get()) {
+                            var message = random.nextInt(count);
+                            assertArrayEquals(expected.messages.get(message), ledger.get(MESSAGES, key(message)).orElseThrow());
+                        }
+                    } catch (Throwable throwable) {
+                        failure.compareAndSet(null, throwable);
+                    }
+                }));
+            }
+            try {
+                ledger.checkpoint();
+            } finally {
+                stop.set(true);
+                for (var reader : readers) {
+                    reader.join();
+                }
+            }
+            if (failure.get() != null) {
+                throw new AssertionError(failure.get());
+            }
+            assertTrue(ledger.spills().materializationsForTests() <= ledger.spills().loggedChunksForTests());
             verify(ledger, expected);
         }
     }

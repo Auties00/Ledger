@@ -20,9 +20,9 @@ import java.lang.invoke.VarHandle;
 ///
 /// The value of a paged version waiting for a checkpoint may leave its batch's array, or the array of its own it came
 /// on, for the log, which holds it too ([SpillQueue]): [#spill] replaces the source, once, with a [LogValue] or with an
-/// array of the value alone. Every
-/// read loads the source once and takes the offset only with a segment, so a read that races the replacement reads
-/// either the old source with its offset or the new one, which needs none.
+/// array of the value alone, and [#spillToChunk] with the [LogChunk] that holds the values of its batch's array. Every
+/// read loads the source once and takes the offset only with a segment or a [LogChunk], where it is the same offset, so
+/// a read that races the replacement reads either the old source with its offset or the new one.
 sealed class Version permits Version.External {
     // Before HIDDEN, whose constructor uses it
     private static final VarHandle OLDER;
@@ -46,11 +46,13 @@ sealed class Version permits Version.External {
     // a resident version keeps, as does a paged one its batch gave an array of its own or whose value left the batch's
     // array, and whose segment and session, 72 bytes, a read of its encoding makes; or the BlobFile whose unit, which
     // the External names, holds the value of a paged key space alone; or the place of the value in the log
-    // ([LogValue]); or `null` if this version removes the key. A slice of its own per version was 40 of the bytes a
-    // buffered write took.
-    // Changed only by spill, from a segment or an array a recovery copied the value to, with a compare-and-set
+    // ([LogValue]), alone or with the other values of its batch's array ([LogChunk]); or `null` if this version removes
+    // the key. A slice of its own per version was 40 of the bytes a buffered write took.
+    // Changed only by spill and spillToChunk, from a segment or an array a recovery copied the value to, with a
+    // compare-and-set
     private Object source;
-    // Where the value starts in source if source is a segment, and its length
+    // Where the value starts in source if source is a segment, or in the array a LogChunk holds the values of, and its
+    // length
     private final int offset;
     private final int length;
     /// The decoded value of a resident key space, or `null`.
@@ -129,6 +131,9 @@ sealed class Version permits Version.External {
         if (held instanceof LogValue logged) {
             return MemorySegment.ofArray(logged.read(stamp, length)).asReadOnly();
         }
+        if (held instanceof LogChunk chunk) {
+            return MemorySegment.ofArray(chunk.read(offset, length)).asReadOnly();
+        }
         if (held instanceof MemorySegment whole) {
             return offset == 0 && length == whole.byteSize() ? whole : whole.asSlice(offset, length);
         }
@@ -172,6 +177,9 @@ sealed class Version permits Version.External {
         if (held instanceof LogValue logged) {
             return logged.read(stamp, length);
         }
+        if (held instanceof LogChunk chunk) {
+            return chunk.read(offset, length);
+        }
         if (held == null) {
             return null;
         }
@@ -199,7 +207,11 @@ sealed class Version permits Version.External {
     ///
     /// Only a checkpoint retires segments, so the answer does not change while one runs.
     boolean inRetiredSegment() {
-        return SOURCE.getAcquire(this) instanceof LogValue logged && logged.segment().retired();
+        return switch (SOURCE.getAcquire(this)) {
+            case LogValue logged -> logged.segment().retired();
+            case LogChunk chunk -> chunk.segment().retired();
+            case null, default -> false;
+        };
     }
 
     /// Moves the value off the segment it is part of, once: to its place in the log if it is at least
@@ -240,18 +252,44 @@ sealed class Version permits Version.External {
         return SOURCE.compareAndSet(this, held, moved);
     }
 
-    /// {@return whether the value is in the log ([LogValue]), where it stays until the version is dropped}
-    boolean logged() {
-        return SOURCE.getAcquire(this) instanceof LogValue;
+    /// Moves the value off `home`, the read-only segment of its batch's array it is part of, to `chunk`, which holds
+    /// every value of that array the commit listed, at the same offset; unless the value left `home` already.
+    ///
+    /// @return whether the value moved
+    boolean spillToChunk(MemorySegment home, LogChunk chunk) {
+        return SOURCE.compareAndSet(this, home, chunk);
     }
 
-    /// Reads the value, which is in the log ([#logged()]), into `target` from `offset`.
+    /// {@return the read-only segment of a batch's array the value is part of, or `null` if the value is anywhere else}
+    MemorySegment sharedSource() {
+        return SOURCE.getAcquire(this) instanceof MemorySegment segment ? segment : null;
+    }
+
+    /// {@return where the value starts in the segment [#sharedSource()] returns}
+    int sourceOffset() {
+        return offset;
+    }
+
+    /// {@return whether the value is in the log ([LogValue], [LogChunk]), where it stays until the version is dropped}
+    boolean logged() {
+        var held = SOURCE.getAcquire(this);
+        return held instanceof LogValue || held instanceof LogChunk;
+    }
+
+    /// Reads the value, which is in the log ([#logged()]), into `target` from `offset`, for a checkpoint: a value of a
+    /// [LogChunk] is copied from the whole chunk, which the first such read of the checkpoint reads
+    /// ([LogChunk#readMaterialized(int, int, byte\[\], int)]).
     ///
     /// @throws LogSegmentView.Retired as [#value()] does
     /// @throws com.github.auties00.ledger.LedgerIoException if the log cannot be read
     /// @throws com.github.auties00.ledger.LedgerCorruptedException if the log changed
     void readLogged(byte[] target, int offset) {
-        ((LogValue) SOURCE.getAcquire(this)).readInto(stamp, length, target, offset);
+        var held = SOURCE.getAcquire(this);
+        if (held instanceof LogChunk chunk) {
+            chunk.readMaterialized(this.offset, length, target, offset);
+        } else {
+            ((LogValue) held).readInto(stamp, length, target, offset);
+        }
     }
 
     /// {@return the unit of [BlobFile] that also holds [#value], or `null` if the value is in memory and the log only}
@@ -297,6 +335,7 @@ sealed class Version permits Version.External {
             case byte[] array -> array.length;
             case MemorySegment segment -> segment.byteSize();
             case LogValue _ -> 0;
+            case LogChunk _ -> 0;
             case BlobFile _ -> 0;
             default -> throw new IllegalStateException();
         };

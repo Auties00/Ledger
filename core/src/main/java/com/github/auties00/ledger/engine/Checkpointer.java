@@ -552,6 +552,11 @@ final class Checkpointer implements IdleTicker.Watched {
         } finally {
             // Every flush of the checkpoint gave its sealed arrays back before it returned
             Reference.reachabilityFence(poolHold);
+            var spills = ledger.spills();
+            if (spills != null) {
+                // The chunks of values it read whole, which a failed checkpoint never published
+                spills.releaseMaterialized();
+            }
             lock.unlock();
         }
     }
