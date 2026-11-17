@@ -478,13 +478,16 @@ final class SpillQueue {
             }
             take(record);
         }
-        var crypto = takeCrypto();
+        Crypto crypto = null;
         try {
+            crypto = takeCrypto();
             record.spill(this, crypto);
         } catch (RuntimeException _) {
             // The commit is durable all the same: the values left where they are stay until a checkpoint takes them
         } finally {
-            giveBack(crypto);
+            if (crypto != null) {
+                giveBack(crypto);
+            }
             moved(record);
         }
     }
