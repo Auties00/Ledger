@@ -19,17 +19,12 @@ import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Optional;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The threads a checkpoint runs on, beside each other and beside the application's.
 class CheckpointThreadsTest {
@@ -103,7 +98,7 @@ class CheckpointThreadsTest {
         try (var ledger = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.key(KEY)).keyspace(MESSAGES)
                 .checkpointEvery(1L << 40).build()) {
             write(ledger, 30_000, 1, _ -> "a".repeat(40));
-            assertEndsWithBusyCarriers(ledger::checkpoint);
+            BusyCarriersTest.assertEndsWithBusyCarriers(ledger::checkpoint);
         }
     }
 
@@ -114,7 +109,7 @@ class CheckpointThreadsTest {
         try (var pages = PageFile.open(directory, new PageCipher(new SecretKeySpec(KEY, "AES")), 1 << 20, new HeapPool(1 << 20))) {
             var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
             var writer = pages.writer(1, () -> true, () -> true);
-            assertEndsWithBusyCarriers(() -> {
+            BusyCarriersTest.assertEndsWithBusyCarriers(() -> {
                 try {
                     // Past the 32 MiB from which a checkpoint that lags forces beside its work
                     for (var i = 0; i < 8_200; i++) {
@@ -126,36 +121,6 @@ class CheckpointThreadsTest {
                     throw new UncheckedIOException(exception);
                 }
             });
-        }
-    }
-
-    static void assertEndsWithBusyCarriers(Runnable work) throws InterruptedException {
-        var carriers = Integer.getInteger("jdk.virtualThreadScheduler.parallelism", Runtime.getRuntime().availableProcessors());
-        var stop = new AtomicBoolean();
-        var computing = new CountDownLatch(carriers);
-        var threads = new ArrayList<Thread>();
-        try {
-            for (var i = 0; i < carriers; i++) {
-                threads.add(Thread.ofVirtual().start(() -> {
-                    computing.countDown();
-                    while (!stop.get()) {
-                        Thread.onSpinWait();
-                    }
-                }));
-            }
-            assertTrue(computing.await(30, TimeUnit.SECONDS), "the virtual threads did not all get a carrier");
-            var ended = new CountDownLatch(1);
-            Thread.ofPlatform().daemon().start(() -> {
-                work.run();
-                ended.countDown();
-            });
-            // Time for the work on a machine with every processor busy, far from the moment it would hang
-            assertTrue(ended.await(120, TimeUnit.SECONDS), "the work waits for a carrier");
-        } finally {
-            stop.set(true);
-            for (var thread : threads) {
-                thread.join();
-            }
         }
     }
 }

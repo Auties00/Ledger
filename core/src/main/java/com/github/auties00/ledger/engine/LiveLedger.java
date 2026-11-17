@@ -105,8 +105,8 @@ public final class LiveLedger implements Ledger {
             throw new ExceptionInInitializerError(exception);
         }
     }
-    /// The most threads a commit reads tree pages with before it is given a sequence, about the queue depth that
-    /// keeps a solid-state drive busy.
+    /// The most threads a commit reads tree pages with before it is given a sequence, its own included, about the queue
+    /// depth that keeps a solid-state drive busy.
     private static final int PREFETCH_THREADS = 32;
 
     private final Map<String, KeyspaceState> states;
@@ -2178,8 +2178,9 @@ public final class LiveLedger implements Ledger {
     /// batch puts, and says how each write learns whether its key existed.
     ///
     /// An operation that runs alone counts exactly as it applies, so here its lookups run before its turn, those that
-    /// reach the file on up to [#PREFETCH_THREADS] threads at once, and what they found serves the writes as long as
-    /// the trees are still the ones they read. The lookups do not register as a read: a lease per commit would hold
+    /// reach the file on up to [#PREFETCH_THREADS] threads at once, the commit's own and virtual threads that take the
+    /// lookups it has not ([ClaimedIndexes]), and what they found serves the writes as long as the trees are still the
+    /// ones they read. The lookups do not register as a read: a lease per commit would hold
     /// versions back and change the readers the sweep waits for at every commit. Without one, a checkpoint may reuse a
     /// page of the trees they read once newer trees replace them; the page then fails authentication, since its nonce
     /// is not the one its parent records, and the lookup leaves its write to the writer. A lookup that succeeds read
@@ -2191,44 +2192,32 @@ public final class LiveLedger implements Ledger {
     /// @return how each write learns whether its key existed, or `null` if the store has no trees
     private Hints prefetch(ArrayWriteBatch writes) {
         var trees = pages == null ? null : tree;
-        try {
-            var point = trees == null ? null : new ReadPoint(Reads.boundOf(latest()), trees, pages);
-            var size = writes.size();
-            var found = trees == null ? null : new byte[size];
-            int[] missing = null;
-            var misses = 0;
-            for (var i = 0; i < size; i++) {
-                if (!prefetchWrite(writes, i, point, found)) {
-                    continue;
-                }
-                if (missing == null) {
-                    missing = new int[16];
-                } else if (misses == missing.length) {
-                    missing = Arrays.copyOf(missing, misses * 2);
-                }
-                missing[misses++] = i;
+        var point = trees == null ? null : new ReadPoint(Reads.boundOf(latest()), trees, pages);
+        var size = writes.size();
+        var found = trees == null ? null : new byte[size];
+        int[] missing = null;
+        var misses = 0;
+        for (var i = 0; i < size; i++) {
+            if (!prefetchWrite(writes, i, point, found)) {
+                continue;
             }
-            if (misses == 1) {
-                lookUp(writes, point, found, missing, 1, 0, 1);
-            } else if (misses > 1) {
-                var threads = Math.min(PREFETCH_THREADS, misses);
-                var started = new Thread[threads];
-                var indexes = missing;
-                var count = misses;
-                for (var thread = 0; thread < threads; thread++) {
-                    var first = thread;
-                    started[thread] = Thread.ofVirtual().start(() -> lookUp(writes, point, found, indexes, count, first, threads));
-                }
-                for (var thread : started) {
-                    thread.join();
-                }
+            if (missing == null) {
+                missing = new int[16];
+            } else if (misses == missing.length) {
+                missing = Arrays.copyOf(missing, misses * 2);
             }
-            return found == null ? null : new Hints(trees, found);
-        } catch (InterruptedException _) {
-            // The commit goes on without the hints, and its lookups read the trees as it applies
-            Thread.currentThread().interrupt();
-            return null;
+            missing[misses++] = i;
         }
+        if (misses > 0) {
+            var indexes = missing;
+            try {
+                ClaimedIndexes.run("ledger-lookup", misses, Math.min(PREFETCH_THREADS, misses) - 1,
+                        index -> lookUp(writes, point, found, indexes[index]));
+            } catch (RuntimeException | OutOfMemoryError _) {
+                // A helper that would not start: the lookups left unknown read the trees as the writes apply
+            }
+        }
+        return found == null ? null : new Hints(trees, found);
     }
 
     /// Opens the chain of the key of write `index` if it puts, and looks the key up in the pages of the trees of
@@ -2280,17 +2269,14 @@ public final class LiveLedger implements Ledger {
         }
     }
 
-    /// Looks up the keys of every `step`-th write of `missing` from `first` in the trees of `point`, reading the file,
-    /// and records in `found` what each lookup found.
-    private void lookUp(ArrayWriteBatch writes, ReadPoint point, byte[] found, int[] missing, int count, int first, int step) {
-        for (var i = first; i < count; i += step) {
-            var write = missing[i];
-            try {
-                var root = point.root(states.get(writes.keyspace(write).name()));
-                found[write] = TreeSearch.contains(pages, root, writes.key(write)) ? TreeSearch.FOUND : TreeSearch.ABSENT;
-            } catch (RuntimeException _) {
-                // Left unknown: the lookup as the write applies reads the page again and reports the failure
-            }
+    /// Looks up the key of write `write` in the trees of `point`, reading the file, and records in `found` what the
+    /// lookup found.
+    private void lookUp(ArrayWriteBatch writes, ReadPoint point, byte[] found, int write) {
+        try {
+            var root = point.root(states.get(writes.keyspace(write).name()));
+            found[write] = TreeSearch.contains(pages, root, writes.key(write)) ? TreeSearch.FOUND : TreeSearch.ABSENT;
+        } catch (RuntimeException _) {
+            // Left unknown: the lookup as the write applies reads the page again and reports the failure
         }
     }
 

@@ -227,6 +227,9 @@ final class LogWriter {
     private final byte[] storeId;
     private final long segmentSize;
     private final Executor executor;
+    // Runs the forces of the file of large values beside the groups, on platform threads, one force at a time: each is
+    // done before the next is given, so an executor that runs only the last task given loses none a flush waits for
+    private final Executor unitForces;
     // Whether a task waits for a thread of the pool, which a flush of the pool gives up its thread to, or null on a lane
     // of the process's flusher, where no task of another store waits
     private final BooleanSupplier poolQueued;
@@ -393,6 +396,8 @@ final class LogWriter {
     /// @param durable the sequence the log already holds durably
     /// @param segmentSize the size past which a new segment starts
     /// @param executor runs the flush task on platform threads
+    /// @param unitForces runs the forces of the file of large values on platform threads, never on the thread of a
+    ///                   commit that writes its own group, which waits for them
     /// @param poolQueued whether a task waits for a thread of the pool, or `null` if no task of another store waits behind
     ///                   this store's flush, as on a lane of the process's flusher, which has a thread of its own: a flush
     ///                   waiting for the commits a force woke stops waiting once one does, and a flush of the pool
@@ -403,13 +408,14 @@ final class LogWriter {
     /// @param writeThrough how the segments are opened to write groups through, which the writer owns from now on
     /// @throws IOException if the segment cannot be prepared
     LogWriter(LogFiles files, StoreKeys keys, byte[] storeId, long firstSegment, long durable, long segmentSize,
-              Executor executor, BooleanSupplier poolQueued, Duration commitWindow, LogFiles.Prepared empty,
-              WriteThrough writeThrough) throws IOException {
+              Executor executor, Executor unitForces, BooleanSupplier poolQueued, Duration commitWindow,
+              LogFiles.Prepared empty, WriteThrough writeThrough) throws IOException {
         this.files = files;
         this.keys = keys;
         this.storeId = storeId;
         this.segmentSize = segmentSize;
         this.executor = executor;
+        this.unitForces = unitForces;
         this.poolQueued = poolQueued;
         this.commitWindowNanos = commitWindow.toNanos();
         this.writeThrough = writeThrough;
@@ -1456,20 +1462,37 @@ final class LogWriter {
         }
     }
 
-    /// {@return the force of the file of large values, started on a thread of its own}
+    /// {@return the force of the file of large values, started on a platform thread of [#unitForces]}
+    ///
+    /// Not on a virtual thread: the flush waits for the force, and an application's virtual threads may hold every
+    /// carrier for as long as they compute, which nothing preempts, so a virtual thread that had not started would hold
+    /// the group, and every commit waiting for it, until one let go. A force no thread could be started for runs here,
+    /// before the group is written.
     private FutureTask<Void> forceUnits() {
         var file = blobs;
         var task = new FutureTask<Void>(() -> {
             file.force();
             return null;
         });
-        Thread.ofVirtual().name("ledger-blob-force").start(task);
+        try {
+            unitForces.execute(task);
+        } catch (RejectedExecutionException _) {
+            task.run();
+        }
         return task;
     }
 
+    /// Waits for `task`, the force of the file of large values; the flush of a thread of the pool runs it itself if its
+    /// thread has not started it yet, which costs the group only the force beside its own.
     ///
-    /// An interrupt of a commit that writes its own group waits on, and is given back to the commit when the flush ends.
+    /// A commit that writes its own group never runs it: an interrupt of its thread during the force would close the
+    /// channel the file is forced through, which a channel opened in its place could not replace, as a force through a
+    /// new channel may not report a write the old one failed to make durable. An interrupt of a commit that writes its
+    /// own group waits on, and is given back to the commit when the flush ends.
     private void await(FutureTask<Void> task) throws IOException {
+        if (!leading) {
+            task.run();
+        }
         while (true) {
             try {
                 task.get();

@@ -61,6 +61,8 @@ Workloads Ledger is not built for, in `workload.limits`:
 | `SqlIndexQueryBenchmark` | The same question answered by SQLite with an index created on the spot |
 | `LargeValueBenchmark` | Values of 1 and 16 MiB |
 | `PinnedReaderBenchmark` | File growth while a long reader pins an old version |
+| `CallerThreadsBenchmark` | Durable and deferred writes from platform threads and from virtual threads, Ledger only: what the kind of the calling thread costs |
+| `CallerThreadsReadBenchmark` | Lookups by id from eight platform threads and from eight virtual threads, Ledger only |
 
 Memory, in `workload.memory`:
 

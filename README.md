@@ -8,4 +8,4 @@ Ledger is in development, and has no release yet. The repository holds:
 - `testkit`, a file system in memory that simulates losses of power and crashes of the process, which Ledger's crash tests run on and which other stores can use too;
 - the [benchmark](benchmark/README.md), which compares Ledger with MVStore, RocksDB, LMDB, SQLite and Berkeley DB on workloads modelled on [Cobalt](https://github.com/Auties00/Cobalt) and on workloads Ledger is not built for. The [Benchmark workflow](.github/workflows/benchmark.yml) runs it on Linux, Windows and macOS.
 
-Ledger requires Java 26.
+Ledger requires Java 26: its commits park a thread with a timeout and then without one, which could leave a virtual thread parked for good on the first builds of Java 25.
