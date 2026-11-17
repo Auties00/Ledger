@@ -6,6 +6,8 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.FileChannel;
@@ -159,6 +161,16 @@ final class LogWriter {
     /// What the byte at [#KEPT_MARK] holds in a segment a close kept.
     static final byte KEPT_MARK_VALUE = 1;
     private static final SecureRandom TAGS = new SecureRandom();
+    // Sets the failure that stops the writer once, so every later commit and wait throws the first one
+    private static final VarHandle FAILURE;
+
+    static {
+        try {
+            FAILURE = MethodHandles.lookup().findVarHandle(LogWriter.class, "failure", LedgerIoException.class);
+        } catch (ReflectiveOperationException exception) {
+            throw new ExceptionInInitializerError(exception);
+        }
+    }
     /// The largest size of the buffer frames are sealed into and written from: a block short of a megabyte, so the
     /// array, header included, takes at most half of a G1 region of 2 MiB and at most one region of 1 MiB, and is not
     /// allocated as a humongous object. One of exactly a megabyte is humongous at either size, and the collector counts
@@ -396,8 +408,6 @@ final class LogWriter {
     private volatile LedgerIoException failure;
     // Receives the failure that stops the writer, once; set before the first commit
     private Consumer<? super LedgerIoException> stopListener;
-    // Whether the listener heard of the stop
-    private final AtomicBoolean stopReported = new AtomicBoolean();
 
     /// Prepares a segment to write frames to.
     ///
@@ -1742,9 +1752,13 @@ final class LogWriter {
         return woken;
     }
 
+    /// Stops the writer after a failed write or force: every later commit and wait throws the failure of the first
+    /// stop, which the listener hears of; a later stop, from another failed group, changes nothing.
     private void stop(IOException cause) {
         var stopped = new LedgerIoException("The log could not be written: commits since the last force may be lost", cause);
-        failure = stopped;
+        if (!FAILURE.compareAndSet(this, null, stopped)) {
+            return;
+        }
         durabilityLock.lock();
         try {
             durabilityChanged.signalAll();
@@ -1766,7 +1780,7 @@ final class LogWriter {
             queueLock.unlock();
         }
         var listener = stopListener;
-        if (listener != null && stopReported.compareAndSet(false, true)) {
+        if (listener != null) {
             try {
                 listener.accept(stopped);
             } catch (RuntimeException _) {

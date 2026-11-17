@@ -359,7 +359,8 @@ public non-sealed interface Ledger extends View, AutoCloseable {
         /// durable commit when it is opened again. Without the listener the store learns of the stop at its next
         /// commit or wait. A store in memory never stops.
         ///
-        /// @param listener receives the failure on the thread that met it, a thread of the store's own, and must not
+        /// @param listener receives the failure on the thread that met it: a thread of the store's own, or the thread
+        ///                 of a commit or wait for durability, which may write its own group to the log; it must not
         ///                 block for long or call the store
         /// @return these options
         Options onStop(Consumer<? super LedgerIoException> listener);

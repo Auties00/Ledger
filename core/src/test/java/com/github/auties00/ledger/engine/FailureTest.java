@@ -63,8 +63,15 @@ class FailureTest {
         var stopped = stops.getFirst();
 
         // Every later write and wait fails with it; reads go on
-        assertThrows(LedgerIoException.class, () -> ledger.commit(ledger.newBatch().put(NAMES, "after", "v")));
-        assertThrows(LedgerIoException.class, () -> ledger.compute(CHATS, "chat", value -> value + "!"));
+        assertTrue(assertThrows(LedgerIoException.class, () -> ledger.commit(ledger.newBatch().put(NAMES, "after", "v"))) == stopped);
+        var refused = assertThrows(LedgerIoException.class, () -> ledger.compute(CHATS, "chat", value -> value + "!"));
+        assertTrue(refused == stopped, "a later failure replaced the first");
+        // A compute that changes nothing, a batch of only such computes and an empty batch are refused too
+        assertThrows(LedgerIoException.class, () -> ledger.compute(CHATS, "chat", value -> value));
+        var unchanged = ledger.newBatch();
+        unchanged.compute(NAMES, "durable0", value -> value);
+        assertThrows(LedgerIoException.class, () -> ledger.commit(unchanged));
+        assertThrows(LedgerIoException.class, () -> ledger.commit(ledger.newBatch()));
         assertThrows(LedgerIoException.class, ledger::awaitDurable);
         assertThrows(LedgerIoException.class, ledger::checkpoint);
         assertEquals(Optional.of("v19"), ledger.get(CHATS, "chat"));

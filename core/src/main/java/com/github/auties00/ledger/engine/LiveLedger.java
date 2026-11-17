@@ -1088,6 +1088,7 @@ public final class LiveLedger implements Ledger {
             throw new IllegalArgumentException("A batch holds at most " + Reads.MAX_OPS + " writes: " + writes.size());
         }
         if (writes.isEmpty()) {
+            checkHealthy();
             return ticket(latest());
         }
         checkNotInTransaction();
@@ -1102,7 +1103,9 @@ public final class LiveLedger implements Ledger {
                 }
             }
             if (writes.leavesUnchanged()) {
-                // Nothing to write, and nothing to check: each function's read is its own linearization point
+                // Nothing to write, and nothing to check: each function's read is its own linearization point. A
+                // stopped store still refuses the commit, as it refuses every commit
+                checkHealthy();
                 var read = writes.latestRead();
                 for (var i = 0; i < size; i++) {
                     var slot = slots[i];
