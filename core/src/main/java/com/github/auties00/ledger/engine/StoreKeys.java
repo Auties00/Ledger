@@ -40,7 +40,7 @@ final class StoreKeys {
         var master = switch (encryption.kind()) {
             case NONE -> null;
             case KEY -> encryption.key();
-            case PASSPHRASE -> pbkdf2(encryption.passphrase(), salt, iterations);
+            case PASSPHRASE -> encryption.derivedKey(salt, iterations, () -> pbkdf2(encryption.passphrase(), salt, iterations));
         };
         if (master == null) {
             return new StoreKeys(null);
