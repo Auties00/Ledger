@@ -55,12 +55,14 @@ import java.util.zip.CRC32C;
 ///   own, of a transaction, or of one with a unit of [BlobFile]. A value a recovery copied to an array of its own
 ///   moves, to the log only;
 /// - of a commit whose values on shared arrays would take, once moved, more than half the bytes they take now
-///   ([Record#settle()]): a value shorter than [#LOG_VALUE_MIN] goes to an array of its own, which frees the array it
-///   shared only once every other value on it left too, so moving a commit of mostly such values, like a batch of
-///   identifiers of a few dozen bytes, allocates about as much as it frees and makes the next checkpoint read the long
-///   ones back from the log. A commit of values of [#LOG_VALUE_MIN] bytes or more, like an app-state snapshot of 100 to
-///   300 byte values, moves whole, its frame leaving the heap for a [LogValue] per value. The commit's values on arrays
-///   of their own move all the same, each freeing its array for a [LogValue].
+///   ([Record#settle()]), a value shorter than [#PAYING_VALUE_MIN] counted at the array of its own it would take: a
+///   value shorter than [#LOG_VALUE_MIN] goes to such an array, which frees the array it shared only once every other
+///   value on it left too, and one of 96 to 255 bytes goes to the log, saving less than 216 bytes of heap for a read
+///   back of its own by the next checkpoint. So a commit of mostly short values, like an app-state snapshot of 100 to
+///   300 byte values, stays where it is rather than trade its frame for a [LogValue] and a positioned read per value, a
+///   hundred thousand of each for a snapshot, its frame leaving the heap only once the thread moved the last of them,
+///   well after the commit is durable. The commit's values on arrays of their own move all the same, each freeing its
+///   array for a [LogValue].
 ///
 /// A recovery moves a value it replays that the log holds before its last budget of bytes at once, on its own thread,
 /// tagged where it lies in the frame body it came in
@@ -75,10 +77,18 @@ import java.util.zip.CRC32C;
 /// Nothing of this is durable: a recovery replays the commits as ever, and moves the values it replays the same way
 /// ([LiveLedger#replay(long, byte\[\], int, int, ReplayValues, LogSegmentView, long, long)]).
 final class SpillQueue {
-    /// The shortest value that moves to the log: a [LogValue] takes 40 bytes, an array of the value 16 more than the
-    /// value, 8-aligned, so from 96 bytes the log saves at least 72 bytes of heap per value, for a positioned read back
-    /// by the checkpoint that writes it; below, the array saves too little for the read.
+    /// The shortest value that moves to the log rather than to an array of its own: a [LogValue] takes 40 bytes, an
+    /// array of the value 16 more than the value, 8-aligned, so from 96 bytes the log saves at least 72 bytes of heap
+    /// per value, for a positioned read back by the checkpoint that writes it; below, the log saves too little heap to
+    /// pay for the read.
     static final int LOG_VALUE_MIN = 96;
+    /// The shortest value that [Record#settle()] counts at the 40 bytes of its [LogValue]; a shorter one counts at the
+    /// array of its own it would take below [#LOG_VALUE_MIN], whether it goes to the log or not. A value of 96 to 255
+    /// bytes so moves to the log beside longer values whose move pays, as the arrays they share leave the heap only once
+    /// every value on them moved, but never makes a record's move pay alone: it saves less than 216 bytes for a read back
+    /// of its own, and a commit of thousands of them would leave its frame on the heap until the thread had tagged and
+    /// placed the last one.
+    static final int PAYING_VALUE_MIN = 256;
     /// The bytes a [LogValue] takes on the heap.
     private static final int LOG_VALUE_BYTES = 40;
     /// The bytes of the header of an array.
@@ -675,7 +685,7 @@ final class SpillQueue {
                 ownShortest = Math.min(ownShortest, length);
             } else {
                 sharedBytes += length;
-                sharedMoved += length >= LOG_VALUE_MIN ? LOG_VALUE_BYTES : (ARRAY_HEADER + length + 7) & -8;
+                sharedMoved += length >= PAYING_VALUE_MIN ? LOG_VALUE_BYTES : (ARRAY_HEADER + length + 7) & -8;
             }
         }
 
@@ -694,15 +704,15 @@ final class SpillQueue {
         }
 
         /// Decides which values move, before the record is queued: all of them if moving those on shared arrays frees
-        /// at least as much heap as it allocates, what they would take once moved (a [LogValue] for a long one and an
-        /// array of its own for a short one) being at most half of their bytes, else only those on arrays of their own,
-        /// whose bytes alone the record then counts.
+        /// at least as much heap as it allocates, what they would take once moved (a [LogValue] for one of at least
+        /// [#PAYING_VALUE_MIN] bytes and an array of its own for a shorter one, whether [#LOG_VALUE_MIN] sends it to the
+        /// log or not) being at most half of their bytes, else only those on arrays of their own, whose bytes alone the
+        /// record then counts.
         ///
         /// A batch's values lie packed on arrays of about their bytes, so moving them all frees about their bytes, and
-        /// moving some frees nothing while the others keep the arrays alive; a commit of values shorter than
-        /// [#LOG_VALUE_MIN] frees little more than it copies, and leaves the heap it holds where it was, while one of
-        /// longer values, which take 40 bytes each once moved, frees its arrays for a fraction of their bytes. A value of
-        /// at least [#LOG_VALUE_MIN] bytes on an array of its own frees that array whatever its record's other values do.
+        /// moving some frees nothing while the others keep the arrays alive; a commit of short values frees little heap
+        /// for what its move costs, and leaves the heap it holds where it was. A value of at least [#LOG_VALUE_MIN] bytes
+        /// on an array of its own frees that array whatever its record's other values do.
         ///
         /// @return [#ALL], [#OWN] or [#NONE]
         int settle() {

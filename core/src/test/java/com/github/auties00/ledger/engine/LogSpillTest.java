@@ -62,7 +62,8 @@ class LogSpillTest {
     private static final Keyspace<byte[], byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.bytes(), ValueCodec.bytes());
     private static final Keyspace<String, String> TEXTS = Keyspace.paged("texts", KeyCodec.utf8(), ValueCodec.utf8());
     private static final Keyspace<String, String> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
-    // Below LOG_VALUE_MIN, at it, below a run's minimum, and well above, in a frame of runs and in one of its own
+    // Below LOG_VALUE_MIN, between it and a run's minimum, at it, and well above, in a frame of runs and in one of its
+    // own
     private static final int[] LENGTHS = {40, 200, SpillQueue.LOG_VALUE_MIN, 700, 1_500, 5_000};
 
     private static LiveLedger open(Path directory, boolean encrypted, long budget) {
@@ -255,9 +256,10 @@ class LogSpillTest {
             for (var message : expected.messages.keySet()) {
                 var source = head(ledger, MESSAGES, key(message)).sourceForTests();
                 if (message / 40 % 2 == 0 && message % 40 == 0) {
-                    // A commit of small values alone, made while the queue held nothing, lists none
-                    var small = expected.messages.get(message).length < SpillQueue.LOG_VALUE_MIN
-                            && text(message, 0).length() < SpillQueue.LOG_VALUE_MIN;
+                    // A commit of values too short to pay for their move alone, made while the queue held nothing,
+                    // lists none
+                    var small = expected.messages.get(message).length < SpillQueue.PAYING_VALUE_MIN
+                            && text(message, 0).length() < SpillQueue.PAYING_VALUE_MIN;
                     if (small) {
                         assertInstanceOf(MemorySegment.class, source, "message " + message);
                         continue;
@@ -1012,8 +1014,9 @@ class LogSpillTest {
     void bulkCommitListsOnceJudged(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         var count = 20_000;
-        // About 4.6 MB of values, so the commit's frame is far above the largest body of a run and close to a segment
-        int[] lengths = {40, 200, SpillQueue.LOG_VALUE_MIN, 420};
+        // About 4.7 MB of values, so the commit's frame is far above the largest body of a run and close to a segment;
+        // the values of 600 bytes make the move pay, and those of 96 and 200 bytes go to the log beside them
+        int[] lengths = {40, 200, SpillQueue.LOG_VALUE_MIN, 600};
         var segmentSize = 6L << 20;
         try (var ledger = openJudged(directory, encrypted, 0, Duration.ZERO, segmentSize)) {
             var overwrites = ledger.state(MESSAGES).overwrites;
@@ -1066,15 +1069,16 @@ class LogSpillTest {
         }
     }
 
-    @Test
-    @DisplayName("a commit of values of mostly under 96 bytes, whose move would allocate more than half of what it frees, stays off the queue on its batch's arrays, and reads back as written before and after a checkpoint and a reopen")
-    void shortValuesStayOffTheQueue(@TempDir Path directory) throws Exception {
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a commit of values of 100 to 300 bytes, like an app-state snapshot, whose move pays only through values under 256 bytes, stays off the queue on its batch's arrays, while one whose longer values pay moves its values of 96 to 255 bytes to the log beside them, and both read back as written before and after a checkpoint and a reopen")
+    void shortValuesStayOffTheQueue(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         var count = 20_000;
-        // Three in four values move to arrays of their own, which take 16 bytes more than the value, and the one long
-        // enough for the log to a LogValue of 40 bytes: 288 bytes for 314
-        int[] lengths = {40, 64, 90, 120};
-        try (var ledger = openJudged(directory, true, 0, Duration.ZERO, 6L << 20)) {
+        // Two in three values count at the arrays of their own they would take, 16 bytes more than the value, though
+        // they would go to the log
+        int[] lengths = {100, 200, 300};
+        try (var ledger = openJudged(directory, encrypted, 0, Duration.ZERO, 6L << 20)) {
             writeBulk(ledger, expected, 0, count, lengths, 0);
             assertTrue(ledger.state(MESSAGES).overwrites.spills(), "values written once may not leave the heap");
             var spills = ledger.spills();
@@ -1085,45 +1089,22 @@ class LogSpillTest {
             for (var message = 0; message < count; message += 97) {
                 assertInstanceOf(MemorySegment.class, head(ledger, MESSAGES, key(message)).sourceForTests(), "message " + message);
             }
-            // Values of 300 bytes alone pay: a quarter of a commit of them is more than enough
-            writeBulk(ledger, expected, count, 1_000, new int[]{300}, 0);
+            // Values of 700 bytes pay for the move of the rest: those of 120 bytes go to the log, those of 40 to arrays
+            // of their own
+            var paying = 1_200;
+            writeBulk(ledger, expected, count, paying, new int[]{40, 120, 700}, 0);
             spillNow(ledger);
             assertEquals(1, spills.unpaidRecordsForTests(), "the commit of long values was left off the queue");
-            assertEquals(1_000, spills.loggedValuesForTests());
-            verify(ledger, expected);
-            ledger.checkpoint();
-            verify(ledger, expected);
-        }
-        try (var ledger = openJudged(directory, true, 0, Duration.ZERO, 6L << 20)) {
-            verify(ledger, expected);
-        }
-    }
-
-    @ParameterizedTest(name = "encrypted: {0}")
-    @ValueSource(booleans = {true, false})
-    @DisplayName("a commit of values of 100 to 300 bytes, like an app-state snapshot, leaves the heap whole for the log once its key space is judged, and reads back as written before and after a checkpoint and a reopen")
-    void snapshotValuesLeaveWhole(boolean encrypted, @TempDir Path directory) throws Exception {
-        var expected = new Expected();
-        var count = 20_000;
-        // Each takes a LogValue of 40 bytes once moved, under half of its bytes
-        int[] lengths = {100, 200, 300};
-        try (var ledger = openJudged(directory, encrypted, 0, Duration.ZERO, 6L << 20)) {
-            writeBulk(ledger, expected, 0, count, lengths, 0);
-            assertTrue(ledger.state(MESSAGES).overwrites.spills(), "values written once may not leave the heap");
-            var spills = ledger.spills();
-            assertEquals(0, spills.unpaidRecordsForTests(), "the commit's move was judged not to pay");
-            spillNow(ledger);
-            assertEquals(0, spills.heldForTests());
-            for (var message = 0; message < count; message++) {
+            assertEquals(2 * paying / 3, spills.loggedValuesForTests());
+            assertEquals(paying / 3, spills.copiedValuesForTests());
+            for (var message = count; message < count + paying; message++) {
                 var source = head(ledger, MESSAGES, key(message)).sourceForTests();
-                if (message < ValueSlab.Overwrites.BULK_WRITES - 1) {
-                    assertInstanceOf(MemorySegment.class, source, "message " + message + " was listed before the judgement");
+                if (expected.messages.get(message).length < SpillQueue.LOG_VALUE_MIN) {
+                    assertInstanceOf(byte[].class, source, "message " + message);
                 } else {
                     assertInstanceOf(LogValue.class, source, "message " + message);
                 }
             }
-            assertEquals(count - (ValueSlab.Overwrites.BULK_WRITES - 1), spills.loggedValuesForTests());
-            assertEquals(0, spills.copiedValuesForTests());
             verify(ledger, expected);
             ledger.checkpoint();
             verify(ledger, expected);
@@ -1143,8 +1124,7 @@ class LogSpillTest {
         try (var ledger = openSized(directory, true, 0, Duration.ZERO, 16L << 20)) {
             var batch = ledger.newBatch();
             for (var message = 0; message < shorts; message++) {
-                // Each would take an array of its own, more than half again its bytes
-                var value = new byte[message % 2 == 0 ? 40 : 90];
+                var value = new byte[message % 2 == 0 ? 100 : 200];
                 Arrays.fill(value, (byte) message);
                 batch.put(MESSAGES, key(message), value);
                 expected.messages.put(message, value);
