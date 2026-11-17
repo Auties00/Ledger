@@ -1045,11 +1045,13 @@ public final class LiveLedger implements Ledger {
                 var inTree = hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree);
                 var bulk = applier.bulkRun(state);
                 if (bulk != null) {
-                    if (applier.putToRun(bulk, state, key, value, writes, index, unit)) {
+                    // Hashed once for the chain index and the run's table
+                    var hash = Segments.hash(key);
+                    if (applier.putToRun(bulk, state, key, hash, value, writes, index, unit)) {
                         return;
                     }
                     // The run's entry, newer than the trees and unpublished, is the key's state before this write
-                    if (bulk.builder.find(key) >= 0) {
+                    if (bulk.builder.find(key, hash) >= 0) {
                         inTree = TreeSearch.FOUND;
                     }
                 }
@@ -2371,7 +2373,8 @@ public final class LiveLedger implements Ledger {
     /// Opening the chains here grows the ordered map of the key space, which a new key costs a walk down, before the
     /// turn.
     ///
-    /// The puts of the key spaces of `bulk` open no chain: a bulk commit keeps those of new keys in a run.
+    /// The puts of the key spaces of `bulk` open no chain, as a bulk commit keeps those of new keys in a run, and look
+    /// nothing up while the latest tree holds none of the key space's entries.
     ///
     /// @param bulk the key spaces the batch may keep its puts of new keys of in runs, or `null`
     /// @return how each write learns whether its key existed, or `null` if the store has no trees
@@ -2418,8 +2421,14 @@ public final class LiveLedger implements Ledger {
             return false;
         }
         var state = states.get(writes.keyspace(index).name());
+        var covered = kind == ArrayWriteBatch.PUT && bulk != null && bulk.covers(state);
+        if (covered && (point == null || point.root(state) == null)) {
+            // The key space of a run the commit keeps, whose latest tree holds no entry to look up: the write finds its
+            // chain, or the run's entry, as it applies
+            return false;
+        }
         var key = writes.key(index);
-        var chain = kind == ArrayWriteBatch.PUT && (bulk == null || !bulk.covers(state)) ? state.open(key) : state.chain(key);
+        var chain = kind == ArrayWriteBatch.PUT && !covered ? state.open(key) : state.chain(key);
         if (found == null || chain != null && chain.head != null) {
             return false;
         }
@@ -3242,7 +3251,7 @@ public final class LiveLedger implements Ledger {
                          byte inTree, PageRef external) {
             var stamp = nextStamp();
             var head = chain.head;
-            var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
+            var existed = Reads.existence(state, head, key, chain.hash, writerPoint(stamp - 1), inTree);
             if (source != null && spillRoom != REPLAYED && !state.resident && (ValueSlab.Overwrites.sampled(stamp)
                     || spillRoom >= ValueSlab.Overwrites.BULK_WRITES && !state.overwrites.judged())) {
                 state.overwrites.sample(head, length);
@@ -3371,10 +3380,11 @@ public final class LiveLedger implements Ledger {
         /// put adds an entry, which it counts. The frame records the put as any other, and the commit's record of values
         /// that may leave the heap lists its value as it would a version's.
         ///
+        /// @param hash the hash of `key`, as [Segments#hash(MemorySegment)] gives it
         /// @param unit the unit of the file of large values of the put, or `null`
         /// @return whether the run took the put; if not, the caller applies it to the key's chain
-        boolean putToRun(BulkRun bulk, KeyspaceState state, MemorySegment key, MemorySegment value, ArrayWriteBatch writes,
-                         int index, PageRef unit) {
+        boolean putToRun(BulkRun bulk, KeyspaceState state, MemorySegment key, int hash, MemorySegment value,
+                         ArrayWriteBatch writes, int index, PageRef unit) {
             if (unit != null || writes.ownValue(index) != null || writes.borrowed(index)) {
                 return false;
             }
@@ -3388,12 +3398,12 @@ public final class LiveLedger implements Ledger {
             if (builder.size() >= bulk.planned || !builder.fits(key, home, offset, length)) {
                 return false;
             }
-            var chain = state.chain(key);
-            if (chain != null && !chain.released() || builder.find(key) >= 0) {
+            var chain = state.chain(key, hash);
+            if (chain != null && !chain.released() || builder.find(key, hash) >= 0) {
                 return false;
             }
             var stamp = nextStamp();
-            var entry = builder.putHome(key, stamp, home, offset, length);
+            var entry = builder.putHome(key, hash, stamp, home, offset, length);
             if (home != null && spillRoom != REPLAYED && (ValueSlab.Overwrites.sampled(stamp)
                     || spillRoom >= ValueSlab.Overwrites.BULK_WRITES && !state.overwrites.judged())) {
                 state.overwrites.sample(null, length);
@@ -3465,7 +3475,7 @@ public final class LiveLedger implements Ledger {
         void delete(KeyspaceState state, Chain chain, MemorySegment key, byte inTree) {
             var stamp = nextStamp();
             var head = chain.head;
-            var existed = Reads.existence(state, head, key, writerPoint(stamp - 1), inTree);
+            var existed = Reads.existence(state, head, key, chain.hash, writerPoint(stamp - 1), inTree);
             if (existed == TreeSearch.ABSENT) {
                 if (head == null) {
                     // Opened for this removal: the prune after the commit publishes drops it, if it stays empty

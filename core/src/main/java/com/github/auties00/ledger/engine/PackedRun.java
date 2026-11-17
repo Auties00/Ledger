@@ -215,7 +215,11 @@ final class PackedRun {
 
     /// {@return the entry of `key`, or -1 if the run holds none}
     int find(MemorySegment key) {
-        var hash = Segments.hash(key);
+        return find(key, Segments.hash(key));
+    }
+
+    /// {@return the entry of `key`, whose hash is `hash` ([Segments#hash(MemorySegment)]), or -1 if the run holds none}
+    int find(MemorySegment key, int hash) {
         var mask = slots.length - 1;
         var tag = hash & TAG_MASK;
         for (var i = hash & mask; ; i = (i + 1) & mask) {
@@ -802,7 +806,13 @@ final class PackedRun {
 
         /// {@return the entry of `key`, or -1 if the builder holds none}
         int find(MemorySegment key) {
-            var slot = slots[slotOf(key, Segments.hash(key))];
+            return find(key, Segments.hash(key));
+        }
+
+        /// {@return the entry of `key`, whose hash is `hash` ([Segments#hash(MemorySegment)]), or -1 if the builder
+        /// holds none}
+        int find(MemorySegment key, int hash) {
+            var slot = slots[slotOf(key, hash)];
             return slot == 0 ? -1 : (slot & ENTRY_MASK) - 1;
         }
 
@@ -888,14 +898,15 @@ final class PackedRun {
         /// of `home`, a read-only view of an array a bulk commit put the value on, which no one writes and the store's
         /// pool never gets back; or of an empty value if `length` is 0.
         ///
+        /// @param hash the hash of `key`, as [Segments#hash(MemorySegment)] gives it
         /// @return the entry
         /// @throws IllegalArgumentException if the builder does not [take][#fits] the put
-        int putHome(MemorySegment key, long stamp, MemorySegment home, int offset, int length) {
+        int putHome(MemorySegment key, int hash, long stamp, MemorySegment home, int offset, int length) {
             if (!fits(key, home, offset, length)) {
                 throw new IllegalArgumentException("The run does not take the put");
             }
             if (length == 0) {
-                var entry = entry(key, stamp);
+                var entry = entry(key, hash, stamp);
                 values[entry] = 0;
                 return entry;
             }
@@ -912,7 +923,7 @@ final class PackedRun {
                     homeEntries = Arrays.copyOf(homeEntries, 2 * index);
                 }
             }
-            var entry = entry(key, stamp);
+            var entry = entry(key, hash, stamp);
             homeEntries[index]++;
             values[entry] = HOME | (long) index << HOME_INDEX_SHIFT | (long) offset << HOME_OFFSET_SHIFT | length;
             return entry;
@@ -947,9 +958,14 @@ final class PackedRun {
 
         // The entry of `key`, added if the builder holds none, whose write stamped `stamp` is the newest
         private int entry(MemorySegment key, long stamp) {
+            return entry(key, Segments.hash(key), stamp);
+        }
+
+        // The entry of `key`, whose hash is `hash`, added if the builder holds none, whose write stamped `stamp` is the
+        // newest
+        private int entry(MemorySegment key, int hash, long stamp) {
             minStamp = Math.min(minStamp, stamp);
             maxStamp = Math.max(maxStamp, stamp);
-            var hash = Segments.hash(key);
             var i = slotOf(key, hash);
             var found = slots[i];
             if (found != 0) {
