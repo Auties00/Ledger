@@ -1036,8 +1036,12 @@ public final class LiveLedger implements Ledger {
     }
 
     /// {@return the index of the hot lock of `key` of `keyspace`}
+    ///
+    /// The key space is part of the hash, so the computes of equal keys of two key spaces, such as one id in each, do
+    /// not share a lock.
     private static <K> int hotIndex(Keyspace<K, ?> keyspace, K key) {
-        return Segments.hash(Segments.lookupKey(keyspace.keys(), key)) & (HOT_LOCKS - 1);
+        var hash = Segments.hash(Segments.lookupKey(keyspace.keys(), key)) * 31 + keyspace.name().hashCode();
+        return (hash ^ hash >>> 16) & (HOT_LOCKS - 1);
     }
 
     /// {@return the lock `index` of the hot keys, of [#HOT_LOCKS], made at the first hot compute}
