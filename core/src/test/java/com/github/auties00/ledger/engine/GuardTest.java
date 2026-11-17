@@ -12,10 +12,14 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -157,6 +161,47 @@ class GuardTest {
             assertEquals(200, ledger.size(IDS));
             assertEquals(Optional.of("200"), ledger.get(COLLECTIONS, "count"));
             winners.forEach((key, name) -> assertEquals(Optional.of(name), ledger.get(IDS, key)));
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(Store.class)
+    @DisplayName("a guard compares the stored bytes at the commit's turn, running no codec there")
+    void noCodecAtTurn(Store store, @TempDir Path directory) {
+        var encoding = new AtomicBoolean(true);
+        var codec = ValueCodec.<String>of(value -> value.length(), (value, target) -> {
+            if (!encoding.get()) {
+                throw new AssertionError("encoded in the order of the commits");
+            }
+            target.copyFrom(MemorySegment.ofArray(value.getBytes(StandardCharsets.ISO_8859_1)));
+        }, source -> new String(source.toArray(ValueLayout.JAVA_BYTE), StandardCharsets.ISO_8859_1));
+        var resident = Keyspace.resident("strict.resident", KeyCodec.utf8(), codec);
+        var paged = Keyspace.paged("strict.paged", KeyCodec.utf8(), codec);
+        var options = store == Store.MEMORY ? Ledger.builder().memory()
+                : Ledger.builder().directory(directory).encryption(Encryption.none());
+        try (var ledger = options.keyspace(resident).keyspace(paged).build()) {
+            for (var keyspace : java.util.List.of(resident, paged)) {
+                ledger.commit(ledger.newBatch().put(keyspace, "k", "same"));
+                var same = ledger.newBatch();
+                same.guard(keyspace, "k");
+                // Another instance of the same bytes: the guard holds
+                ledger.commit(ledger.newBatch().put(keyspace, "k", new String("same")));
+                encoding.set(false);
+                try {
+                    ledger.commit(same);
+                } finally {
+                    encoding.set(true);
+                }
+                var moved = ledger.newBatch();
+                moved.guard(keyspace, "k");
+                ledger.commit(ledger.newBatch().put(keyspace, "k", "diff"));
+                encoding.set(false);
+                try {
+                    assertThrows(LedgerConflictException.class, () -> ledger.commit(moved));
+                } finally {
+                    encoding.set(true);
+                }
+            }
         }
     }
 }

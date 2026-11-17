@@ -947,25 +947,29 @@ public final class LiveLedger implements Ledger {
         return Set.copyOf(states.keySet());
     }
 
-    /// What a computed write or a guard read: the value, decoded, or `null` for none, the latest sequence it was read
-    /// at, and whether a write of the key was claimed after that sequence, which is under way.
-    record Observation(Object value, long sequence, boolean hot) {
+    /// What a computed write or a guard read: the value, decoded, or `null` for none, its encoding for a guard (`null`
+    /// for none, or for a computed write), the latest sequence it was read at, and whether a write of the key was
+    /// claimed after that sequence, which is under way.
+    record Observation(Object value, byte[] encoded, long sequence, boolean hot) {
     }
 
     /// {@return the latest value of the key whose bytes are `key` in `keyspace`, the sequence it was read at, and whether
     /// a write of the key is under way}
     ///
+    /// @param guard whether a guard reads it, which also reads the value's encoding, at the same sequence
     /// @throws IllegalArgumentException if the store was not opened with `keyspace`
-    Observation observe(Keyspace<?, ?> keyspace, byte[] key) {
+    Observation observe(Keyspace<?, ?> keyspace, byte[] key, boolean guard) {
         ensureOpen();
         var state = state(keyspace);
         var lease = readers.enter();
         try {
             var sequence = lease.sequence();
-            var value = Reads.getEncoded(state, keyspace, key, point(sequence)).orElse(null);
+            var point = point(sequence);
+            var value = Reads.getEncoded(state, keyspace, key, point).orElse(null);
+            var encoded = guard && value != null ? Reads.getBytes(state, key, point) : null;
             var chain = state.chain(MemorySegment.ofArray(key));
             var claimed = chain == null ? 0 : chain.claimed();
-            return new Observation(value, sequence, claimed > sequence && claimed != Chain.DROPPED);
+            return new Observation(value, encoded, sequence, claimed > sequence && claimed != Chain.DROPPED);
         } finally {
             readers.exit(lease);
         }
@@ -1657,7 +1661,7 @@ public final class LiveLedger implements Ledger {
         switch (slot.kind) {
             case ComputeSlot.GUARD -> {
                 if (!slot.unchangedSinceRead(state.droppedClaims(), state.lastRangeRemoval)
-                        && !holdsAgain(state, Reads.current(state, chain.head, key, writerPoint(applier.scanBound())), slot.observed)) {
+                        && !Arrays.equals(Reads.currentBytes(state, chain.head, key, writerPoint(applier.scanBound())), slot.observedBytes)) {
                     throw new LedgerConflictException("A value a guard read in " + state.keyspace.name() + " has changed");
                 }
                 applier.claimedOnly(state, chain);
@@ -1665,31 +1669,6 @@ public final class LiveLedger implements Ledger {
             case ComputeSlot.COMPANION -> applyCompanion(applier, slots[index - slot.primary], slot, state, chain, key);
             default -> applyCompute(applier, writes, slot, index, state, chain, key, decoded, units);
         }
-    }
-
-    /// {@return whether `current`, the latest value of a key, is what a guard read as `observed`: no value either time,
-    /// the same instance, or values that encode to the same bytes}
-    @SuppressWarnings("unchecked")
-    private static boolean holdsAgain(KeyspaceState state, Object current, Object observed) {
-        if (current == observed) {
-            return true;
-        }
-        if (current == null || observed == null) {
-            return false;
-        }
-        if (state.keyspace.values() == BuiltinCodecs.BYTES_VALUE) {
-            return Arrays.equals((byte[]) current, (byte[]) observed);
-        }
-        var codec = (ValueCodec<Object>) state.keyspace.values();
-        var length = codec.sizeOf(current);
-        if (length != codec.sizeOf(observed)) {
-            return false;
-        }
-        var left = new byte[Math.toIntExact(length)];
-        var right = new byte[left.length];
-        codec.encode(current, MemorySegment.ofArray(left));
-        codec.encode(observed, MemorySegment.ofArray(right));
-        return Arrays.equals(left, right);
     }
 
     /// Applies the computed write `index` of `writes`, as [#applySlot] does.

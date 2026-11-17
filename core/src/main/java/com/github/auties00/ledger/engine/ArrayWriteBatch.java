@@ -353,7 +353,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         }
         var store = store();
         var encoded = Segments.lookupKey(keyspace.keys(), key);
-        var observation = store.observe(keyspace, encoded);
+        var observation = store.observe(keyspace, encoded, false);
         var previous = observation.value();
         Object result = null;
         var effect = ComputeSlot.NONE;
@@ -385,9 +385,9 @@ public final class ArrayWriteBatch implements WriteBatch {
         checkOpened(keyspace);
         Objects.requireNonNull(key, "key");
         var encoded = Segments.lookupKey(keyspace.keys(), key);
-        var observation = store().observe(keyspace, encoded);
+        var observation = store().observe(keyspace, encoded, true);
         addKey(keyspace, encoded);
-        assignSlot(size - 1, ComputeSlot.guard(observation.sequence(), observation.value()));
+        assignSlot(size - 1, ComputeSlot.guard(observation.sequence(), observation.value(), observation.encoded()));
         return Optional.ofNullable((V) observation.value());
     }
 

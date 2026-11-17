@@ -13,7 +13,7 @@ import java.util.function.Predicate;
 /// applies as such. At the batch's turn the commit compares [#readSequence] with the sequence of the last write claimed
 /// on the key before its own, [#prior], which the sequencer records ([LiveLedger]): a write in between, or a range
 /// removal of the key space after the read, sends a computed write to run again in the order of the commits, and fails
-/// the commit of a guard, unless the value read then is the instance read before.
+/// the commit of a guard, unless the value read then is the instance read before, or for a guard holds the same bytes.
 ///
 /// A slot belongs to its batch, which one commit at a time applies; the commit writes the fields below the read.
 final class ComputeSlot {
@@ -37,6 +37,9 @@ final class ComputeSlot {
     final long readSequence;
     /// The value read, decoded, or `null` if the key had none.
     final Object observed;
+    /// For a guard, the encoded value read, or `null` if the key had none: the commit compares the bytes the key holds
+    /// at its turn with these, so it runs no codec in the order of the commits.
+    final byte[] observedBytes;
     /// Whether the function ran when the write was added: `false` when a write of the key was under way then.
     final boolean ran;
     /// What the run when the write was added returned.
@@ -57,12 +60,14 @@ final class ComputeSlot {
     /// The value the write left, as the commit applied it.
     Object appliedValue;
 
-    private ComputeSlot(byte kind, Function<Object, Object> function, long readSequence, Object observed, boolean ran,
-                        Object result, byte effect, BatchComputation<Object> outcome, int primary, Predicate<Object> member) {
+    private ComputeSlot(byte kind, Function<Object, Object> function, long readSequence, Object observed,
+                        byte[] observedBytes, boolean ran, Object result, byte effect, BatchComputation<Object> outcome,
+                        int primary, Predicate<Object> member) {
         this.kind = kind;
         this.function = function;
         this.readSequence = readSequence;
         this.observed = observed;
+        this.observedBytes = observedBytes;
         this.ran = ran;
         this.result = result;
         this.effect = effect;
@@ -74,17 +79,17 @@ final class ComputeSlot {
     /// {@return the slot of a computed write}
     static ComputeSlot compute(Function<Object, Object> function, long readSequence, Object observed, boolean ran,
                                Object result, byte effect, BatchComputation<Object> outcome) {
-        return new ComputeSlot(COMPUTE, function, readSequence, observed, ran, result, effect, outcome, 0, null);
+        return new ComputeSlot(COMPUTE, function, readSequence, observed, null, ran, result, effect, outcome, 0, null);
     }
 
-    /// {@return the slot of a guard of the value `observed`, read at `readSequence`}
-    static ComputeSlot guard(long readSequence, Object observed) {
-        return new ComputeSlot(GUARD, null, readSequence, observed, false, null, NONE, null, 0, null);
+    /// {@return the slot of a guard of the value `observed`, encoded as `observedBytes`, read at `readSequence`}
+    static ComputeSlot guard(long readSequence, Object observed, byte[] observedBytes) {
+        return new ComputeSlot(GUARD, null, readSequence, observed, observedBytes, false, null, NONE, null, 0, null);
     }
 
     /// {@return the slot of the write of a companion of the computed write `primary` writes before it}
     static ComputeSlot companion(int primary, Predicate<Object> member) {
-        return new ComputeSlot(COMPANION, null, 0, null, false, null, NONE, null, primary, member);
+        return new ComputeSlot(COMPANION, null, 0, null, null, false, null, NONE, null, primary, member);
     }
 
     /// {@return whether the commit can apply what the write decided when it was added, or skip the guard's read}

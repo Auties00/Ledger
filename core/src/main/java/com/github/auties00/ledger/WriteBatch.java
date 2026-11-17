@@ -140,11 +140,12 @@ public sealed interface WriteBatch permits ArrayWriteBatch {
     /// Holds the batch to the latest value under `key`, which it returns.
     ///
     /// When the batch commits, it applies only if no write of the key came between this read and the batch's turn, or
-    /// if the key holds again what this read found: no value, or a value that encodes to the same bytes. Otherwise none
-    /// of its writes apply and the commit throws [LedgerConflictException]. A write of the same key earlier in this
-    /// batch counts as such a write, so a guard goes before the batch's writes of its key. The guard writes nothing,
-    /// and the check costs the commit no read unless a write of the key, or a removal of a range of its key space, came
-    /// after the read.
+    /// if the key holds again what this read found: no value, or a value stored as the same bytes, which the commit
+    /// compares without running the key space's codec. Otherwise none of its writes apply and the commit throws
+    /// [LedgerConflictException]. A write of the same key earlier in this batch counts as such a write, so a guard goes
+    /// before the batch's writes of its key. The guard writes nothing, and the check costs the commit no read unless a
+    /// write of the key, or a removal of a range of its key space, came after the read; the read of a guard copies the
+    /// value's bytes besides decoding it.
     ///
     /// @param keyspace the key space to read
     /// @param key the key

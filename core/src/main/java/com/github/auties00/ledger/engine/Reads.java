@@ -375,6 +375,70 @@ final class Reads {
         return treeGet(keyspace, encoded, point, point.root(state), removals, bytes, !state.resident).orElse(null);
     }
 
+    /// {@return the encoded value `point` sees under the key whose bytes are `encoded`, in a new array, or `null` if it
+    /// sees none}
+    ///
+    /// The read of a guard: it finds the value where [#getEncoded] does, and copies its bytes rather than decode them.
+    static byte[] getBytes(KeyspaceState state, byte[] encoded, ReadPoint point) {
+        var removals = state.removals;
+        if (state.resident && !state.loaded(encoded)) {
+            return treeBytes(encoded, point, point.treeRoot(state), removals, false);
+        }
+        var version = KeyspaceState.resolve(state.head(encoded), encoded, point.bound(), removals);
+        return bytesOf(state, version, encoded, point);
+    }
+
+    /// {@return the encoded value `point` sees under `key`, in a new array, or `null` if it sees none}
+    ///
+    /// The writer's read of a guard at its turn, as [#current] reads a computed write's: it finds the value where
+    /// [#current] does and copies its bytes, so it runs no codec.
+    ///
+    /// @param head the newest version of `key` in memory, or `null` if there is none
+    static byte[] currentBytes(KeyspaceState state, Version head, MemorySegment key, ReadPoint point) {
+        var version = KeyspaceState.resolve(head, key, point.bound(), state.removals);
+        return bytesOf(state, version, Segments.toBytes(key), point);
+    }
+
+    /// {@return the bytes of `version`, the newest version of `key` `point` sees in memory, or else of what the run and
+    /// the tree of `point` hold under `key`, in a new array, or `null` for none}
+    private static byte[] bytesOf(KeyspaceState state, Version version, byte[] key, ReadPoint point) {
+        var removals = state.removals;
+        if (version != null) {
+            if (version == Version.HIDDEN) {
+                return null;
+            }
+            try {
+                return version.copyBytes();
+            } catch (LogSegmentView.Retired _) {
+                checkTreeHolds(version, point);
+            }
+        }
+        var run = runOf(state, point);
+        if (run != null) {
+            var entry = run.find(key);
+            if (entry >= 0) {
+                return run.removes(entry) || hiddenSinceTree(key, point, removals) ? null : run.valueBytes(entry);
+            }
+        }
+        return treeBytes(key, point, point.root(state), removals, !state.resident);
+    }
+
+    /// {@return the value of `key` in the tree of `point` under `root`, in a new array, or `null` if it holds none or a
+    /// later removal hides it}
+    ///
+    /// @param root the root of the key space's tree, or `null` if the read uses none
+    /// @param screened as for [#treeValue(byte\[\], ReadPoint, TreeRoot, RangeRemoval\[\], boolean)]
+    private static byte[] treeBytes(byte[] key, ReadPoint point, TreeRoot root, RangeRemoval[] removals, boolean screened) {
+        if (root == null) {
+            return null;
+        }
+        var screen = screened ? PageCache.POINT : PageCache.UNSCREENED;
+        var unit = TreeSearch.leaf(point.pages(), root, key, screen);
+        var entry = TreeSearch.entryOf(unit, key);
+        return entry == -1 || hiddenSinceTree(key, point, removals) ? null
+                : TreeSearch.valueBytes(point.pages(), unit, entry, screen);
+    }
+
     /// {@return the entries of `range` `point` sees in `state`, as [com.github.auties00.ledger.View#count] counts
     /// them}
     ///
