@@ -672,8 +672,11 @@ final class Checkpointer implements IdleTicker.Watched {
             var settles = run == null ? null : run.settles();
             var ops = new ArrayList<TreeUpdate.Op>(chains.length + runEntries);
             var removals = keyspace.removals();
-            // The next entry of the run in the order of the keys
+            // The next entry of the run in the order of the keys and its key, or -1 and null past the last: read once
+            // however many chains sort before it, as a key of the run is a view made for the call
             var position = 0;
+            var next = runEntries == 0 ? -1 : run.entryAt(0);
+            var runKey = next < 0 ? null : run.key(next);
             Chain previous = null;
             for (var chain : chains) {
                 if (previous != null && Chain.sameKey(previous, chain)) {
@@ -682,19 +685,23 @@ final class Checkpointer implements IdleTicker.Watched {
                 previous = chain;
                 // The run's entries of the keys before the chain's go first; one of the chain's key goes with the chain
                 var entry = -1;
-                while (position < runEntries) {
-                    var next = run.entryAt(position);
-                    var runKey = run.key(next);
+                MemorySegment entryKey = null;
+                while (next >= 0) {
                     var order = chain.compareKey(runKey);
                     if (order < 0) {
                         break;
                     }
+                    var taken = next;
+                    var takenKey = runKey;
                     position++;
+                    next = position < runEntries ? run.entryAt(position) : -1;
+                    runKey = next < 0 ? null : run.key(next);
                     if (order == 0) {
-                        entry = next;
+                        entry = taken;
+                        entryKey = takenKey;
                         break;
                     }
-                    ops.add(runOp(run, next, runKey, settles, removals, treeBound, bound));
+                    ops.add(runOp(run, taken, takenKey, settles, removals, treeBound, bound));
                 }
                 // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
                 // otherwise another one, or none
@@ -707,7 +714,7 @@ final class Checkpointer implements IdleTicker.Watched {
                     // tree is right, with the run's entry if it has one. A resident one holds every entry, so there the
                     // key is gone
                     if (entry >= 0) {
-                        ops.add(runOp(run, entry, run.key(entry), settles, removals, treeBound, bound));
+                        ops.add(runOp(run, entry, entryKey, settles, removals, treeBound, bound));
                     }
                     continue;
                 }
@@ -724,9 +731,11 @@ final class Checkpointer implements IdleTicker.Watched {
                     }
                 }
             }
-            for (; position < runEntries; position++) {
-                var next = run.entryAt(position);
-                ops.add(runOp(run, next, run.key(next), settles, removals, treeBound, bound));
+            while (next >= 0) {
+                ops.add(runOp(run, next, runKey, settles, removals, treeBound, bound));
+                position++;
+                next = position < runEntries ? run.entryAt(position) : -1;
+                runKey = next < 0 ? null : run.key(next);
             }
             var ranges = new ArrayList<TreeUpdate.Range>();
             for (var removal : keyspace.removals()) {
