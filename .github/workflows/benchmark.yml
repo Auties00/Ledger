@@ -20,7 +20,7 @@ on:
       group:
         description: Group of workloads to run
         type: choice
-        options: [all, commit, ingest, read, limits-write, limits-query, memory, large-values]
+        options: [all, commit, ingest, read, limits-write, limits-query, memory, large-values, compute]
         default: all
       jmh-args:
         description: 'Extra JMH arguments, for example: -p engine=rocksdb,sqlite -p messages=1000000'
@@ -110,6 +110,7 @@ jobs:
             memory) PATTERN='memory\.|cobalt\.ReopenBenchmark\.footprint' ;;
             # Ledger's large-value writes only, for sweeping the size from which they go to their own file
             large-values) PATTERN='limits\.LargeValueBenchmark\.writeValue' ;;
+            compute) PATTERN='cobalt\.(ChatUpdate|ChatCount)Benchmark|limits\.(ReadModifyWrite|HeadOfLine)Benchmark' ;;
             *) echo "::error::Unknown group $GROUP"; exit 1 ;;
           esac
           mkdir -p results
