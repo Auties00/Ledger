@@ -185,7 +185,11 @@ sealed class Version permits Version.External {
     /// {@return the array that is the value whole, if the version keeps its value on an array of its own, or `null`}
     ///
     /// The array is never written, and it stays the value's: a later spill moves only a value on a segment to an
-    /// array, and never moves a value off an array but to the log.
+    /// array, and never moves a value off an array but to the log. The one exception is the open's replay, which may
+    /// write the value of a replayed put of a resident key space of byte arrays into the array of the version, made by
+    /// the replay too, that the put replaces, when it has the value's length ([LiveLedger.Applier]): the two versions
+    /// then share the array, which holds the newer value, while nothing can read the older. Nothing may rely on a
+    /// version owning its array alone, by identity, for a version the replay made.
     byte[] ownArray() {
         return SOURCE.getAcquire(this) instanceof byte[] array ? array : null;
     }

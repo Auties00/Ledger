@@ -13,6 +13,7 @@ import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.WriteBatch;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
@@ -165,6 +166,10 @@ public final class LiveLedger implements Ledger {
     // The log bytes, and the heap by the log's estimate, of the commits the open replayed, which the trees lack
     private long replayedBytes;
     private long replayedHeap;
+    // The stamp of the first write the open replays, from its first replayed commit, before the store attaches its log,
+    // until endReplay, and Long.MAX_VALUE otherwise: a replayed put of a resident key space of byte arrays overwrites in
+    // place the array of a version stamped from it ([Applier#replayedArray(Version, int)])
+    private long replayedFrom = Long.MAX_VALUE;
     // Whether a prune left a chain that a later one may shorten, so the sweep has work; guarded by the publishing role
     private boolean sweepPending;
     // Whether the sweep's current pass over the store found such a chain
@@ -475,6 +480,11 @@ public final class LiveLedger implements Ledger {
             return false;
         }
         var next = new int[1];
+        // Only for the open's replay, before the store attaches its log and starts the threads that read, checkpoint
+        // or tick: a commit replayed into an open store overwrites no array
+        if (replayedFrom == Long.MAX_VALUE && log == null && checkpointer == null) {
+            replayedFrom = Reads.stamp(sequence, 0);
+        }
         var applier = new Applier(sequence, null, 4, false, false, 0, true);
         // The writes that went to runs rather than to chains
         var runWrites = new int[1];
@@ -612,6 +622,8 @@ public final class LiveLedger implements Ledger {
             publishRun(state, values.stopRun(state));
         }
         values.end(spills);
+        // No write overwrites a version's array from now on
+        replayedFrom = Long.MAX_VALUE;
     }
 
     /// {@return the builder of the run of `state` that takes a replayed write of `key`, or `null` if the write goes to a
@@ -2873,6 +2885,29 @@ public final class LiveLedger implements Ledger {
             this.spillRoom = replaying ? REPLAYED : frame == null ? 0 : spillRoom;
         }
 
+        /// {@return the array of `head`, the version a put of a value of `length` bytes this replayed commit applies
+        /// to a resident key space of byte arrays replaces, if the put may overwrite it in place: `head` was made by
+        /// the open's replay, on an array of its own of that length, and no unit of the file of large values holds it;
+        /// or `null`}
+        ///
+        /// The open's replay makes such an array for each put it replays and keeps it only on the version, so a key
+        /// overwritten with values of one length takes one array for the whole replay rather than one per put. The new
+        /// version and the one it replaces then share the array, which holds the new value, until a prune drops the
+        /// older: an exception to [Version#ownArray()]'s rule that a version's array is never written, which holds
+        /// only because nothing reads the older one's value meanwhile. No reader, snapshot, checkpoint or ticker exists
+        /// until the open returns, and every write after the replay applies with no such overwrite; the resident loader
+        /// reads only the trees' pages, and its versions, stamped by the checkpoint, come before the replay's; the spill
+        /// queue lists only versions of paged key spaces; and what the replay itself reads of a replaced version (its
+        /// existence for the counts, its stamp for the prunes, range removals and sweeps, its unit for the file of large
+        /// values) is never its value's bytes. Nothing pools or deduplicates versions' arrays by identity.
+        private byte[] replayedArray(Version head, int length) {
+            if (head == null || head.stamp < replayedFrom || head.external() != null) {
+                return null;
+            }
+            var own = head.ownArray();
+            return own != null && own.length == length && head.decoded == own ? own : null;
+        }
+
         /// {@return the version the last write of the commit added}
         Version lastVersion() {
             return touched.getLast().version();
@@ -3070,7 +3105,12 @@ public final class LiveLedger implements Ledger {
             } else if (bytes) {
                 // A byte array is its own encoding: one copy of the store's serves the reads, which return the instance
                 // the store holds, and the checkpoints, where the caller's array and a copy of it served them apart
-                var copy = Segments.toBytes(value);
+                var copy = spillRoom == REPLAYED && external == null ? replayedArray(head, length) : null;
+                if (copy != null) {
+                    MemorySegment.copy(value, ValueLayout.JAVA_BYTE, 0, copy, 0, length);
+                } else {
+                    copy = Segments.toBytes(value);
+                }
                 version = Version.ofOwn(stamp, copy, copy, head, external);
                 kept = copy;
                 keptAt = 0;
