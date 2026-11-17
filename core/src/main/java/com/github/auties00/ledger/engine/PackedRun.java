@@ -189,7 +189,10 @@ final class PackedRun {
         this.size = merge.size;
         this.keys = merge.keys;
         this.keyEnds = merge.keyEnds;
-        this.keyView = MemorySegment.ofArray(keys).asReadOnly();
+        this.keyViews = new MemorySegment[keys.length];
+        for (var i = 0; i < keys.length; i++) {
+            keyViews[i] = MemorySegment.ofArray(keys[i]).asReadOnly();
+        }
         this.values = merge.values;
         this.chunks = merge.chunks.toArray(MemorySegment[]::new);
         this.logStamps = merge.logStamps;
@@ -289,7 +292,7 @@ final class PackedRun {
     /// [Segments#compare(MemorySegment, MemorySegment)] gives}
     int compareChain(Chain chain, int entry) {
         var start = keyStart(entry);
-        return chain.compareKey(keys, start, keyEnds[entry] - start);
+        return chain.compareKey(keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK, keyEnds[entry] - start);
     }
 
     /// {@return the order of the key of `entry` and `key`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
@@ -598,7 +601,7 @@ final class PackedRun {
         private final int count;
         // Whether the keys of the chains fit a run, read from the chains in place: they are copied once, into `keys`
         private final boolean chainKeysFit;
-        private byte[] keys;
+        private byte[][] keys;
         private int[] keyEnds;
         private long[] values;
         private byte[] inBase;
@@ -669,10 +672,12 @@ final class PackedRun {
             while (p < previousSize || c < count) {
                 var order = compare(p, previousSize, c);
                 if (order < 0) {
-                    keyBytes += previous.keyEnds[p] - previous.keyStart(p);
+                    var length = previous.keyEnds[p] - previous.keyStart(p);
+                    keyBytes = keyPlace(keyBytes, length) + length;
                     p++;
                 } else {
-                    keyBytes += chains[c].keyLength();
+                    var length = chains[c].keyLength();
+                    keyBytes = keyPlace(keyBytes, length) + length;
                     if (order == 0) {
                         p++;
                     }
@@ -687,7 +692,12 @@ final class PackedRun {
                 return false;
             }
             this.size = total;
-            this.keys = new byte[(int) keyBytes];
+            // Whole chunks but the last, which is as long as the keys it holds
+            var keyChunks = (int) ((keyBytes + KEY_OFFSET_MASK) >>> KEY_CHUNK_BITS);
+            this.keys = new byte[keyChunks][];
+            for (var i = 0; i < keyChunks; i++) {
+                keys[i] = new byte[i < keyChunks - 1 ? KEY_CHUNK : (int) (keyBytes - (long) i * KEY_CHUNK)];
+            }
             this.keyEnds = new int[total];
             this.values = new long[total];
             this.inBase = new byte[total];
@@ -715,11 +725,11 @@ final class PackedRun {
             c = 0;
             for (var out = 0; out < total; out++) {
                 var order = compare(p, previousSize, c);
-                int start;
+                // The key comes from the previous run's entry at `start`, or from chain `chain`
+                var start = -1;
+                var chain = -1;
                 int length;
-                byte[] from;
                 if (order < 0) {
-                    from = previous.keys;
                     start = previous.keyStart(p);
                     length = previous.keyEnds[p] - start;
                     values[out] = previous.values[p];
@@ -727,10 +737,8 @@ final class PackedRun {
                     effects[out] = previousEffects == null ? COUNTED : previousEffects[p];
                     p++;
                 } else {
-                    from = null;
-                    start = 0;
+                    chain = c;
                     length = chains[c].keyLength();
-                    chains[c].copyKey(keys, keyAt);
                     var head = heads[c];
                     maxStamp = Math.max(maxStamp, head.stamp);
                     if (order == 0) {
@@ -788,11 +796,16 @@ final class PackedRun {
                     entries[c] = out;
                     c++;
                 }
-                if (from != null) {
-                    System.arraycopy(from, start, keys, keyAt, length);
+                var place = keyPlace(keyAt, length);
+                var keyChunk = keys[place >>> KEY_CHUNK_BITS];
+                var offset = place & KEY_OFFSET_MASK;
+                if (chain < 0) {
+                    System.arraycopy(previous.keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK, keyChunk, offset, length);
+                } else {
+                    chains[chain].copyKey(keyChunk, offset);
                 }
-                var hash = Segments.hash(keys, keyAt, length);
-                keyAt += length;
+                var hash = Segments.hash(keyChunk, offset, length);
+                keyAt = place + length;
                 keyEnds[out] = keyAt;
                 var slot = hash & mask;
                 while (slots[slot] != 0) {
@@ -826,7 +839,18 @@ final class PackedRun {
                 return -1;
             }
             var start = previous.keyStart(p);
-            return -Integer.signum(chains[c].compareKey(previous.keys, start, previous.keyEnds[p] - start));
+            return -Integer.signum(chains[c].compareKey(previous.keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK,
+                    previous.keyEnds[p] - start));
+        }
+
+        // Where a key of `length` bytes goes after the keys that end at `end`: there, or at the start of the next
+        // chunk if it does not fit the rest of the chunk
+        private static int keyPlace(int end, int length) {
+            return (end & KEY_OFFSET_MASK) + length > KEY_CHUNK ? (end + KEY_OFFSET_MASK) & ~KEY_OFFSET_MASK : end;
+        }
+
+        private static long keyPlace(long end, int length) {
+            return (end & KEY_OFFSET_MASK) + length > KEY_CHUNK ? (end + KEY_OFFSET_MASK) & ~(long) KEY_OFFSET_MASK : end;
         }
 
         // The index of `segment` among the run's segments, added if new, or -1 past MAX_SEGMENTS

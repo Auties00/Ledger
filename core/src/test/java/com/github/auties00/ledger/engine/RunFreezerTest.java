@@ -426,6 +426,52 @@ class RunFreezerTest {
         }
     }
 
+    @Test
+    @DisplayName("frozen runs whose long keys fill several chunks of the keys, one merged into the next, read, scan, count, checkpoint and reopen as the chains did")
+    void keysOverChunks(@TempDir Path directory) throws Exception {
+        Expected reopened;
+        try (var ledger = open(directory, true)) {
+            var expected = history(ledger);
+            // Keys of 700 to 1,023 bytes, so most chunks end with a key that did not fit their rest
+            writeLongTexts(ledger, expected, 0, 400, 1);
+            var first = ledger.freezeForTests(TEXTS);
+            assertEquals(400, first.dropped(), first.toString());
+            assertTrue(ledger.state(TEXTS).run.keyChunkLengthsForTests().length >= 2, "the keys took one chunk");
+            verify(ledger, expected);
+            // New keys between and after the frozen ones, and overwrites of frozen ones, merged with the run
+            writeLongTexts(ledger, expected, 200, 700, 2);
+            var second = ledger.freezeForTests(TEXTS);
+            assertEquals(500, second.dropped(), second.toString());
+            var lengths = ledger.state(TEXTS).run.keyChunkLengthsForTests();
+            assertTrue(lengths.length >= 3, "the merged keys took fewer than three chunks");
+            for (var i = 0; i < lengths.length - 1; i++) {
+                assertEquals(PackedRun.KEY_CHUNK, lengths[i], "a chunk before the last is not whole");
+            }
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+            reopened = expected;
+        }
+        try (var ledger = open(directory, true)) {
+            verify(ledger, reopened);
+        }
+    }
+
+    /// Commits texts from `first` to `last`, excluded, under keys of 700 to 1,023 bytes; durable, with every value moved
+    /// off the heap.
+    private static void writeLongTexts(LiveLedger ledger, Expected expected, int first, int last, int generation)
+            throws InterruptedException {
+        var batch = ledger.newBatch();
+        for (var id = first; id < last; id++) {
+            var key = "%05d".formatted(id) + "k".repeat(695 + (id * 37) % 324);
+            var text = text(id, generation);
+            batch.put(TEXTS, key, text);
+            expected.texts.put(key, text);
+        }
+        ledger.commit(batch).awaitDurable();
+        spillNow(ledger);
+    }
+
     @ParameterizedTest(name = "after the publication: {0}")
     @ValueSource(booleans = {true, false})
     @Timeout(60)
