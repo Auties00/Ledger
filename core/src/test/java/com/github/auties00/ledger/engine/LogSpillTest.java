@@ -1,5 +1,6 @@
 package com.github.auties00.ledger.engine;
 
+import com.github.auties00.ledger.Commit;
 import com.github.auties00.ledger.Encryption;
 import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
@@ -33,6 +34,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -44,6 +47,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1932,6 +1936,117 @@ class LogSpillTest {
             verify(ledger, expected);
         }
         try (var ledger = openChunked(directory, encrypted, 16L << 20)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @Timeout(120)
+    @DisplayName("a commit whose values move an array at a time has its blocks tagged by a thread of their own while the log writes its frame, and a wait for durability that finds that thread still tagging waits for it, then moves the values with those tags")
+    void chunkTagsMadeAhead(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var count = 20_000;
+        try (var ledger = openChunked(directory, encrypted, 16L << 20)) {
+            var spills = ledger.spills();
+            var tagging = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            spills.tagHookForTests(() -> {
+                tagging.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException _) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            var commit = new AtomicReference<Commit>();
+            var failure = new AtomicReference<Throwable>();
+            var committer = Thread.ofPlatform().start(() -> {
+                try {
+                    var batch = ledger.newBatch();
+                    for (var message = 0; message < count; message++) {
+                        var value = new byte[100 * (1 + message % 3)];
+                        Arrays.fill(value, (byte) message);
+                        batch.put(MESSAGES, key(message), value);
+                        expected.messages.put(message, value);
+                    }
+                    var made = ledger.commit(batch);
+                    commit.set(made);
+                    made.awaitDurable();
+                } catch (Throwable throwable) {
+                    failure.set(throwable);
+                }
+            });
+            assertTrue(tagging.await(60, TimeUnit.SECONDS), "no thread tagged the blocks ahead");
+            while (commit.get() == null || !commit.get().isDurable()) {
+                Thread.sleep(1);
+            }
+            // Durable, but its values cannot move before their tags are made
+            committer.join(200);
+            assertTrue(committer.isAlive(), "the wait for durability returned before the values moved");
+            assertEquals(1, spills.chunkRecordsForTests());
+            release.countDown();
+            committer.join();
+            assertNull(failure.get());
+            var chunks = chunksOf(ledger, 0, count);
+            assertEquals(chunks.size(), spills.taggedAheadForTests(), "the move made tags of its own");
+            assertEquals(0, spills.chunkRecordsForTests());
+            assertEquals(0, spills.heldForTests());
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = openChunked(directory, encrypted, 16L << 20)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @Timeout(120)
+    @DisplayName("a move that waited its longest for the thread tagging its blocks ahead tags them itself, and the values read back as written")
+    void chunkTagsWaitIsBounded(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var count = 20_000;
+        var release = new CountDownLatch(1);
+        try (var ledger = openChunked(directory, encrypted, 16L << 20)) {
+            var spills = ledger.spills();
+            spills.tagsWaitForTests(TimeUnit.MILLISECONDS.toNanos(50));
+            spills.tagHookForTests(() -> {
+                try {
+                    release.await();
+                } catch (InterruptedException _) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            writeBulk(ledger, expected, 0, count, new int[]{100, 200, 300}, 0);
+            var chunks = chunksOf(ledger, 0, count);
+            assertTrue(chunks.size() >= 15, chunks.size() + " chunks");
+            assertEquals(0, spills.taggedAheadForTests());
+            release.countDown();
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        } finally {
+            release.countDown();
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a commit whose blocks no thread tagged ahead, as when the thread had not started, has them tagged by the move, and reads back as written")
+    void chunkTagsMadeByTheMove(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var count = 20_000;
+        try (var ledger = openChunked(directory, encrypted, 16L << 20)) {
+            var spills = ledger.spills();
+            spills.tagsAheadForTests(false);
+            writeBulk(ledger, expected, 0, count, new int[]{100, 200, 300}, 0);
+            var chunks = chunksOf(ledger, 0, count);
+            assertTrue(chunks.size() >= 15, chunks.size() + " chunks");
+            assertEquals(0, spills.taggedAheadForTests());
+            verify(ledger, expected);
+            ledger.checkpoint();
             verify(ledger, expected);
         }
     }

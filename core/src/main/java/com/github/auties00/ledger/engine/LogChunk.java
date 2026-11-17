@@ -11,9 +11,9 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 /// write's kind, key space and key, the chunk keeps the place of each value in the body: at most [#GAP] bytes in all
 /// lie between the values of one block, as [SpillQueue] cuts a run of values where more lie between them. The bytes of the array
 /// are cut into blocks of [#BLOCK] bytes from [#base()], the last one shorter, and each block has a tag of its own,
-/// made from the bytes on the heap before the versions moved here: the polynomials of [SpillQueue.Crypto] over the
-/// block, bound to the frame and to the block's place in it, or the CRC-32C of the block in a store without
-/// encryption. A read of a value reads the blocks it spans, gathers their bytes from the body, decrypts them with
+/// made from the bytes on the heap while the log wrote the frame or before the versions moved here: the polynomials
+/// of [SpillQueue.Crypto] over the block, bound to the commit's sequence and to the block's place in the commit's
+/// body, or the CRC-32C of the block in a store without encryption. A read of a value reads the blocks it spans, gathers their bytes from the body, decrypts them with
 /// AES-CTR as a [LogValue]'s are, and checks every tag before it copies a byte out, so a value of a few hundred bytes
 /// takes one positioned read of at most two kilobytes per block it spans, one from a split frame's section.
 ///
@@ -49,6 +49,9 @@ final class LogChunk {
     private final int base;
     private final int end;
     private final int firstBody;
+    // The sequence of the commit and where the first value starts in its body, which the tags are bound to
+    private final long sequence;
+    private final int commitFirst;
     // Where each value starts on the array, ascending, and then where the last one ends, and where each starts in the
     // frame's body, ascending, each past the end of the one before; both null if the body holds the values back to back
     // from firstBody, as the array does
@@ -66,18 +69,22 @@ final class LogChunk {
     /// `segment`.
     ///
     /// @param firstBody where the first value starts in the frame's body
+    /// @param sequence the sequence of the commit, which the tags are bound to
+    /// @param commitFirst where the first value starts in the commit's body, which the tags are bound to
     /// @param starts where each value starts on the array, ascending without gaps, then where the last ends; or `null`
     ///               if the body holds the values back to back from `firstBody`, as the array does
     /// @param bodies where each value starts in the frame's body; `null` with `starts`
     /// @param tagHighs the first polynomial of each block's tag, or `null` without encryption
     /// @param tagLows the low 32 bits of the second polynomial of each block's tag, or its CRC-32C
-    LogChunk(LogSegmentView segment, long frameOffset, int base, int end, int firstBody, int[] starts, int[] bodies,
-             long[] tagHighs, int[] tagLows) {
+    LogChunk(LogSegmentView segment, long frameOffset, int base, int end, int firstBody, long sequence, int commitFirst,
+             int[] starts, int[] bodies, long[] tagHighs, int[] tagLows) {
         this.segment = segment;
         this.frameOffset = frameOffset;
         this.base = base;
         this.end = end;
         this.firstBody = firstBody;
+        this.sequence = sequence;
+        this.commitFirst = commitFirst;
         this.starts = starts;
         this.bodies = bodies;
         this.tagHighs = tagHighs;
@@ -91,9 +98,9 @@ final class LogChunk {
     }
 
     /// {@return the word that binds the tag of block `block` to its place: the chunk whose first value starts at
-    /// `firstBody` of its frame's body, the frame given apart}
-    static long place(int firstBody, int block) {
-        return BLOCK_MARK | (long) firstBody << 20 | block;
+    /// `commitFirst` of its commit's body, the commit given apart}
+    static long place(int commitFirst, int block) {
+        return BLOCK_MARK | (long) commitFirst << 20 | block;
     }
 
     /// {@return the segment use that wrote the frame}
@@ -245,7 +252,7 @@ final class LogChunk {
             for (var at = from; at < to; at += BLOCK) {
                 var block = (at - base) / BLOCK;
                 var length = Math.min(BLOCK, to - at);
-                if (!crypto.verifiesBlock(bytes, at - from, length, frameOffset, place(firstBody, block),
+                if (!crypto.verifiesBlock(bytes, at - from, length, sequence, place(commitFirst, block),
                         tagHighs == null ? 0 : tagHighs[block], tagLows[block])) {
                     if (segment.retired()) {
                         // Read as a preparation reused the file
