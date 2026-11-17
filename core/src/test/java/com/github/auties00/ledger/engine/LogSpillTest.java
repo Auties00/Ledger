@@ -43,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1941,12 +1942,31 @@ class LogSpillTest {
             assertEquals(1, spills.chunkedRecordsForTests());
             assertEquals(count, spills.chunkedValuesForTests());
             assertEquals(5, spills.loggedValuesForTests());
-            chunksOf(ledger, 0, count);
+            var chunks = chunksOf(ledger, 0, count);
+            assertEquals(spills.loggedChunksForTests(), chunks.size());
             for (var message = 1_234; message < count; message += 4_000) {
                 assertInstanceOf(LogValue.class, head(ledger, MESSAGES, key(own + message)).sourceForTests());
+                // The value on an array of its own lies in the frame between these two, which no chunk spans
+                assertNotSame(head(ledger, MESSAGES, key(message)).sourceForTests(),
+                        head(ledger, MESSAGES, key(message + 1)).sourceForTests(), "message " + message);
+            }
+            var shortBytes = 0L;
+            for (var message = 0; message < count; message++) {
+                var read = spills.chunkBytesReadForTests();
+                assertArrayEquals(expected.messages.get(message), ledger.get(MESSAGES, key(message)).orElseThrow(), "message " + message);
+                shortBytes += expected.messages.get(message).length;
+                // A value of at most 300 bytes spans one or two blocks, each in at most twice its bytes of the body
+                var bytes = spills.chunkBytesReadForTests() - read;
+                assertTrue(bytes <= 2 * (LogChunk.BLOCK + LogChunk.GAP), "a read of message " + message + " read " + bytes + " bytes");
             }
             verify(ledger, expected);
+            var read = spills.chunkBytesReadForTests();
             ledger.checkpoint();
+            assertEquals(chunks.size(), spills.materializationsForTests());
+            // Each put's kind, key space and key lie between two values, a few bytes beside one of 100 to 300
+            var materialized = spills.chunkBytesReadForTests() - read;
+            assertTrue(materialized <= shortBytes + shortBytes / 10,
+                    "the checkpoint read " + materialized + " bytes of chunks for " + shortBytes + " bytes of values");
             verify(ledger, expected);
         }
         try (var ledger = openChunked(directory, true, 16L << 20)) {
@@ -1955,7 +1975,7 @@ class LogSpillTest {
     }
 
     @Test
-    @DisplayName("a run of values with a gap on its array, or whose frame holds them in another order, stays on its array, while a run of another array moves to a chunk")
+    @DisplayName("a run of values with a gap on its array, whose frame holds them in another order, or without a byte, stays on its array, while a run of another array moves to a chunk")
     void runsWithGapsStay(@TempDir Path directory) throws Exception {
         var queue = new SpillQueue(0, true);
         queue.chunksMinForTests(1);
@@ -1963,6 +1983,7 @@ class LogSpillTest {
         var whole = MemorySegment.ofArray(new byte[1_000]).asReadOnly();
         var gapped = MemorySegment.ofArray(new byte[1_000]).asReadOnly();
         var reordered = MemorySegment.ofArray(new byte[1_000]).asReadOnly();
+        var empty = MemorySegment.ofArray(new byte[1_000]).asReadOnly();
         Version[] versions = {
                 Version.of(1L << 20, whole, 0, 100, null, null, null),
                 Version.of(1L << 20 | 1, whole, 100, 100, null, null, null),
@@ -1970,12 +1991,15 @@ class LogSpillTest {
                 Version.of(1L << 20 | 3, gapped, 150, 100, null, null, null),
                 Version.of(1L << 20 | 4, reordered, 0, 100, null, null, null),
                 Version.of(1L << 20 | 5, reordered, 100, 100, null, null, null),
+                Version.of(1L << 20 | 6, empty, 50, 0, null, null, null),
+                Version.of(1L << 20 | 7, empty, 50, 0, null, null, null),
         };
-        // Each value's place in the commit's body, after its put's key; the last two in the reverse of their order
-        int[] bodies = {40, 180, 320, 460, 740, 600};
+        // Each value's place in the commit's body, after its put's key; the reordered two in the reverse of their
+        // order
+        int[] bodies = {40, 180, 320, 460, 740, 600, 880, 920};
         var record = queue.record(1, versions.length);
         for (var i = 0; i < versions.length; i++) {
-            record.add(versions[i], bodies[i], 100);
+            record.add(versions[i], bodies[i], versions[i].valueLength());
         }
         record.locate(view, 64, 0, 0, false);
         queue.add(record);
@@ -1989,6 +2013,80 @@ class LogSpillTest {
         assertEquals(200, chunk.end());
         for (var i = 2; i < versions.length; i++) {
             assertInstanceOf(MemorySegment.class, versions[i].sourceForTests(), "value " + i);
+        }
+        assertEquals(0, queue.heldForTests());
+        assertEquals(0, queue.chunkRecordsForTests());
+    }
+
+    @Test
+    @DisplayName("a run of values is cut where the frame's body between the values of one block passes its bound, into chunks that move together if they average four blocks, and stay together if they do not")
+    void runsCutWhereTheBodyGaps(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(0, true);
+        queue.chunksMinForTests(1);
+        var view = queue.segment(1, directory.resolve("1.log"), null);
+        var cut = MemorySegment.ofArray(new byte[20_000]).asReadOnly();
+        var small = MemorySegment.ofArray(new byte[2_000]).asReadOnly();
+        var crowded = MemorySegment.ofArray(new byte[10_000]).asReadOnly();
+        var spaced = MemorySegment.ofArray(new byte[10_000]).asReadOnly();
+        var versions = new ArrayList<Version>();
+        var bodies = new ArrayList<Integer>();
+        var body = 0;
+        // 100 values of 200 bytes, 10 bytes apart in the body but for 100 KiB between the 50th and the 51st
+        for (var i = 0; i < 100; i++) {
+            body += i == 50 ? 100 << 10 : 10;
+            versions.add(Version.of(1L << 20 | versions.size(), cut, i * 200, 200, null, null, null));
+            bodies.add(body);
+            body += 200;
+        }
+        // 10 values of 200 bytes, the same gap between the 5th and the 6th: two runs of 1,000 bytes
+        for (var i = 0; i < 10; i++) {
+            body += i == 5 ? 100 << 10 : 10;
+            versions.add(Version.of(1L << 20 | versions.size(), small, i * 200, 200, null, null, null));
+            bodies.add(body);
+            body += 200;
+        }
+        // 100 values of 100 bytes, 300 bytes apart: more than a block between the values of every block
+        for (var i = 0; i < 100; i++) {
+            body += 300;
+            versions.add(Version.of(1L << 20 | versions.size(), crowded, i * 100, 100, null, null, null));
+            bodies.add(body);
+            body += 100;
+        }
+        // 100 values of 100 bytes, 90 bytes apart: under a block between the values of each block
+        for (var i = 0; i < 100; i++) {
+            body += 90;
+            versions.add(Version.of(1L << 20 | versions.size(), spaced, i * 100, 100, null, null, null));
+            bodies.add(body);
+            body += 100;
+        }
+        var record = queue.record(1, versions.size());
+        for (var i = 0; i < versions.size(); i++) {
+            record.add(versions.get(i), bodies.get(i), versions.get(i).valueLength());
+        }
+        record.locate(view, 64, 0, 0, false);
+        queue.add(record);
+        queue.awaitIdleForTests();
+        assertEquals(1, queue.chunkedRecordsForTests());
+        assertEquals(3, queue.loggedChunksForTests());
+        assertEquals(200, queue.chunkedValuesForTests());
+        var first = assertInstanceOf(LogChunk.class, versions.getFirst().sourceForTests());
+        var second = assertInstanceOf(LogChunk.class, versions.get(50).sourceForTests());
+        assertNotSame(first, second);
+        assertEquals(0, first.base());
+        assertEquals(10_000, first.end());
+        assertEquals(10_000, second.base());
+        assertEquals(20_000, second.end());
+        for (var i = 0; i < 100; i++) {
+            assertSame(i < 50 ? first : second, versions.get(i).sourceForTests(), "value " + i);
+        }
+        for (var i = 100; i < 210; i++) {
+            assertInstanceOf(MemorySegment.class, versions.get(i).sourceForTests(), "value " + i);
+        }
+        var whole = assertInstanceOf(LogChunk.class, versions.get(210).sourceForTests());
+        assertEquals(0, whole.base());
+        assertEquals(10_000, whole.end());
+        for (var i = 210; i < 310; i++) {
+            assertSame(whole, versions.get(i).sourceForTests(), "value " + i);
         }
         assertEquals(0, queue.heldForTests());
         assertEquals(0, queue.chunkRecordsForTests());

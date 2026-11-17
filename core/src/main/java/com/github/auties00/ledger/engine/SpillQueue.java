@@ -151,8 +151,9 @@ final class SpillQueue {
     private final AtomicLong chunkedRecords = new AtomicLong();
     private final AtomicLong loggedChunks = new AtomicLong();
     private final AtomicLong chunkedValues = new AtomicLong();
-    // The chunks checkpoints read whole so far, for tests
+    // The chunks checkpoints read whole so far, and the bytes of the log the reads of chunks read, for tests
     private final AtomicLong materializations = new AtomicLong();
+    private final AtomicLong chunkBytesRead = new AtomicLong();
 
     /// Creates the queue of a store.
     ///
@@ -488,6 +489,11 @@ final class SpillQueue {
         }
     }
 
+    /// Counts `bytes` of the log a read of a [LogChunk] read.
+    void readChunkBytes(int bytes) {
+        chunkBytesRead.addAndGet(bytes);
+    }
+
     /// Keeps `chunk`, which a checkpoint read whole, until the checkpoint ends ([#releaseMaterialized()]).
     void materialized(LogChunk chunk) {
         materializations.incrementAndGet();
@@ -651,6 +657,11 @@ final class SpillQueue {
     /// {@return the chunks checkpoints read whole so far; for tests}
     long materializationsForTests() {
         return materializations.get();
+    }
+
+    /// {@return the bytes of the log the reads of chunks read so far; for tests}
+    long chunkBytesReadForTests() {
+        return chunkBytesRead.get();
     }
 
     /// {@return the chunks a checkpoint read whole and still keeps; for tests}
@@ -830,11 +841,19 @@ final class SpillQueue {
         }
 
         /// Finds the runs of the record's values that lie back to back on one shared array, in the order of the
-        /// writes, and returns their bytes, those of runs with a gap left out.
+        /// writes, and returns their bytes, those of runs that stay left out.
         ///
         /// A batch's values of paged key spaces lie on its arrays in the order of its writes, each array filled before
         /// the next, so the values the record lists of one array are one run, unless a value the record does not list,
         /// replaced by a write of the same batch or of a key space whose values stay, lies between two of them.
+        ///
+        /// The frame holds each value after its put's kind, key space and key, a few bytes, but a write between two
+        /// values of an array, a value on an array of its own, can put any number of bytes between them, which a read
+        /// of their chunk would read and decrypt for nothing. So a run is cut where the bytes of the body between the
+        /// values of one block of [LogChunk#BLOCK] bytes would pass [LogChunk#GAP]: a block's bytes then lie in at
+        /// most [LogChunk#BLOCK] plus [LogChunk#GAP] bytes of the body. The runs cut from one array move only all
+        /// together, the array being freed only once every value on it moves, and only if they average
+        /// [LogChunk#PIECE_MIN] bytes; a run without a byte stays, as it frees nothing.
         private long findRuns() {
             var capacity = 16;
             runHomes = new MemorySegment[capacity];
@@ -844,6 +863,11 @@ final class SpillQueue {
             runStarts = new int[capacity];
             runEnds = new int[capacity];
             runs = 0;
+            // Where the last run's last value ends in the commit's body, and the bytes of the body between its values
+            // in its block gapBlock
+            var bodyEnd = 0;
+            var gapBlock = -1;
+            var gapBytes = 0L;
             for (var i = 0; i < count; i++) {
                 var version = versions[i];
                 var home = version.sharedSource();
@@ -852,17 +876,33 @@ final class SpillQueue {
                 }
                 var offset = version.sourceOffset();
                 var length = version.valueLength();
+                var body = offsets[i];
                 var last = runs - 1;
-                if (last >= 0 && runHomes[last] == home && runEnds[last] == offset) {
-                    runEnds[last] = offset + length;
-                    runLasts[last] = i;
-                    runValues[last]++;
-                    continue;
-                }
                 if (last >= 0 && runHomes[last] == home) {
-                    // A gap, or a value before the run's end: the run stays, and so does this value
-                    runEnds[last] = -1;
-                    continue;
+                    if (runEnds[last] != offset || body < bodyEnd) {
+                        // A gap, a value before the run's end, or one the frame holds before the run's last value:
+                        // the run stays, and so does this value
+                        runEnds[last] = -1;
+                        continue;
+                    }
+                    var at = offset - runStarts[last];
+                    var cut = false;
+                    if (at % LogChunk.BLOCK != 0) {
+                        // A place inside a block: the body between the two values is part of the block's reads
+                        if (at / LogChunk.BLOCK != gapBlock) {
+                            gapBlock = at / LogChunk.BLOCK;
+                            gapBytes = 0;
+                        }
+                        gapBytes += body - bodyEnd;
+                        cut = gapBytes > LogChunk.GAP;
+                    }
+                    if (!cut) {
+                        runEnds[last] = offset + length;
+                        runLasts[last] = i;
+                        runValues[last]++;
+                        bodyEnd = body + length;
+                        continue;
+                    }
                 }
                 if (runs == runHomes.length) {
                     capacity = runs * 2;
@@ -880,15 +920,33 @@ final class SpillQueue {
                 runStarts[runs] = offset;
                 runEnds[runs] = offset + length;
                 runs++;
+                bodyEnd = body + length;
+                gapBlock = -1;
+                gapBytes = 0;
             }
             var runBytes = 0L;
-            for (var run = 0; run < runs; run++) {
-                if (runEnds[run] >= 0 && runEnds[run] - runStarts[run] > LogChunk.MAX_BYTES) {
-                    runEnds[run] = -1;
+            var first = 0;
+            while (first < runs) {
+                // The runs cut from one array, which follow each other
+                var home = runHomes[first];
+                var stop = first;
+                var bytes = 0L;
+                var moves = true;
+                while (stop < runs && runHomes[stop] == home) {
+                    var length = runEnds[stop] - runStarts[stop];
+                    moves &= runEnds[stop] >= 0 && length > 0 && length <= LogChunk.MAX_BYTES;
+                    bytes += length;
+                    stop++;
                 }
-                if (runEnds[run] >= 0) {
-                    runBytes += runEnds[run] - runStarts[run];
+                moves &= stop - first == 1 || bytes >= (long) (stop - first) * LogChunk.PIECE_MIN;
+                if (moves) {
+                    runBytes += bytes;
+                } else {
+                    for (var run = first; run < stop; run++) {
+                        runEnds[run] = -1;
+                    }
                 }
+                first = stop;
             }
             return runBytes;
         }

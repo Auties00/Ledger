@@ -7,13 +7,14 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 ///
 /// The values lie on the array in the order of their writes, from [#base()] to [#end()] with no byte between them, and
 /// the commit's frame holds each one whole in that order, at a place of its body this keeps per value: the bytes
-/// between two values in the body are the next write's kind, key space and key. The bytes of the array are cut into
-/// blocks of [#BLOCK] bytes from [#base()], the last one shorter, and each block has a tag of its own, made from the
-/// bytes on the heap before the versions moved here: the polynomials of [SpillQueue.Crypto] over the block, bound to the
-/// frame and to the block's place in it, or the CRC-32C of the block in a store without encryption. A read of a value
-/// reads the blocks it spans, gathers their bytes from the body, decrypts them with AES-CTR as a [LogValue]'s are, and
-/// checks every tag before it copies a byte out, so a value of a few hundred bytes takes one positioned read of one or
-/// two kilobytes.
+/// between two values in the body are the next write's kind, key space and key, at most [#GAP] bytes in all between
+/// the values of one block, as [SpillQueue] cuts a run of values where more lie between them. The bytes of the array
+/// are cut into blocks of [#BLOCK] bytes from [#base()], the last one shorter, and each block has a tag of its own,
+/// made from the bytes on the heap before the versions moved here: the polynomials of [SpillQueue.Crypto] over the
+/// block, bound to the frame and to the block's place in it, or the CRC-32C of the block in a store without
+/// encryption. A read of a value reads the blocks it spans, gathers their bytes from the body, decrypts them with
+/// AES-CTR as a [LogValue]'s are, and checks every tag before it copies a byte out, so a value of a few hundred bytes
+/// takes one positioned read of at most two kilobytes per block it spans.
 ///
 /// A version moved here keeps its offset on the array, which places its value among the chunk's: a version holds no
 /// more than the reference.
@@ -31,6 +32,12 @@ final class LogChunk {
     static final int BLOCK = 1 << 10;
     /// The most bytes of a chunk: block indexes take 20 bits of the word that binds a tag to its place.
     static final int MAX_BYTES = BLOCK << 20;
+    /// The most bytes of the frame's body between the values of one block, which its reads read and decrypt for
+    /// nothing: the keys of a few puts, so a block lies in at most twice its bytes of the body.
+    static final int GAP = BLOCK;
+    /// The fewest bytes the chunks cut from one array take on average, as each costs about a hundred bytes and the
+    /// array is freed only once all of them move: four blocks.
+    static final int PIECE_MIN = 4 * BLOCK;
     // The coefficient that sets a block's tag apart from a value's, whose second coefficient is a byte of its stamp
     private static final long BLOCK_MARK = 1L << 60;
 
@@ -184,6 +191,9 @@ final class LogChunk {
         if (segment.retired()) {
             throw LogSegmentView.Retired.INSTANCE;
         }
+        if (from == to) {
+            return new byte[0];
+        }
         var first = valueAt(from);
         var last = valueAt(to - 1);
         var bodyFrom = bodies[first] + (from - starts[first]);
@@ -191,6 +201,7 @@ final class LogChunk {
         var span = new byte[bodyTo - bodyFrom];
         segment.readAt(span, 0, span.length, frameOffset + LogWriter.FRAME_HEADER + bodyFrom);
         var spills = segment.spills();
+        spills.readChunkBytes(span.length);
         var crypto = spills.takeCrypto();
         try {
             var key = segment.key();
