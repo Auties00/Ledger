@@ -6,15 +6,16 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 /// back to back on the array its versions kept, too short to pay a [LogValue] each.
 ///
 /// The values lie on the array in the order of their writes, from [#base()] to [#end()] with no byte between them, and
-/// the commit's frame holds each one whole in that order, at a place of its body this keeps per value: the bytes
-/// between two values in the body are the next write's kind, key space and key, at most [#GAP] bytes in all between
-/// the values of one block, as [SpillQueue] cuts a run of values where more lie between them. The bytes of the array
+/// the commit's frame holds each one whole in that order. A split frame's section holds them back to back as the array
+/// does, so the chunk keeps only where the first one starts in the body. Of a frame that holds each value after its
+/// write's kind, key space and key, the chunk keeps the place of each value in the body: at most [#GAP] bytes in all
+/// lie between the values of one block, as [SpillQueue] cuts a run of values where more lie between them. The bytes of the array
 /// are cut into blocks of [#BLOCK] bytes from [#base()], the last one shorter, and each block has a tag of its own,
 /// made from the bytes on the heap before the versions moved here: the polynomials of [SpillQueue.Crypto] over the
 /// block, bound to the frame and to the block's place in it, or the CRC-32C of the block in a store without
 /// encryption. A read of a value reads the blocks it spans, gathers their bytes from the body, decrypts them with
 /// AES-CTR as a [LogValue]'s are, and checks every tag before it copies a byte out, so a value of a few hundred bytes
-/// takes one positioned read of at most two kilobytes per block it spans.
+/// takes one positioned read of at most two kilobytes per block it spans, one from a split frame's section.
 ///
 /// A version moved here keeps its offset on the array, which places its value among the chunk's: a version holds no
 /// more than the reference.
@@ -25,8 +26,8 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 /// So the next checkpoint after a commit of a hundred thousand short values reads them back in about one read per
 /// chunk of the batch rather than one per value.
 ///
-/// It takes about 12 bytes per block and 8 per value: about 13 KiB in place of a chunk of 256 KiB of values of 200
-/// bytes.
+/// It takes about 12 bytes per block, and 8 more per value outside a split frame's section: about 3 KiB in place of a
+/// chunk of 256 KiB of values of 200 bytes, 13 KiB outside a section.
 final class LogChunk {
     /// The bytes of a block: values of a few hundred bytes span one or two.
     static final int BLOCK = 1 << 10;
@@ -43,9 +44,15 @@ final class LogChunk {
 
     private final LogSegmentView segment;
     private final long frameOffset;
-    // Where each value starts on the array, ascending, and then where the last one ends: starts[0] is the base
+    // Where the first value starts on the array, where the last one ends, and where the first starts in the frame's
+    // body
+    private final int base;
+    private final int end;
+    private final int firstBody;
+    // Where each value starts on the array, ascending, and then where the last one ends, and where each starts in the
+    // frame's body, ascending, each past the end of the one before; both null if the body holds the values back to back
+    // from firstBody, as the array does
     private final int[] starts;
-    // Where each value starts in the frame's body, ascending, each past the end of the one before
     private final int[] bodies;
     // Per block: the first polynomial of its tag, or null without encryption, and the low 32 bits of the second, or its
     // CRC-32C without encryption
@@ -55,15 +62,22 @@ final class LogChunk {
     // The chunk's bytes from the base, read whole by a checkpoint and dropped as it ends; null otherwise
     private volatile byte[] plain;
 
-    /// Makes the place of values moved from an array to the frame at `frameOffset` of `segment`.
+    /// Makes the place of the values from `base` to `end` of an array, moved to the frame at `frameOffset` of
+    /// `segment`.
     ///
-    /// @param starts where each value starts on the array, ascending without gaps, then where the last ends
-    /// @param bodies where each value starts in the frame's body
+    /// @param firstBody where the first value starts in the frame's body
+    /// @param starts where each value starts on the array, ascending without gaps, then where the last ends; or `null`
+    ///               if the body holds the values back to back from `firstBody`, as the array does
+    /// @param bodies where each value starts in the frame's body; `null` with `starts`
     /// @param tagHighs the first polynomial of each block's tag, or `null` without encryption
     /// @param tagLows the low 32 bits of the second polynomial of each block's tag, or its CRC-32C
-    LogChunk(LogSegmentView segment, long frameOffset, int[] starts, int[] bodies, long[] tagHighs, int[] tagLows) {
+    LogChunk(LogSegmentView segment, long frameOffset, int base, int end, int firstBody, int[] starts, int[] bodies,
+             long[] tagHighs, int[] tagLows) {
         this.segment = segment;
         this.frameOffset = frameOffset;
+        this.base = base;
+        this.end = end;
+        this.firstBody = firstBody;
         this.starts = starts;
         this.bodies = bodies;
         this.tagHighs = tagHighs;
@@ -94,17 +108,12 @@ final class LogChunk {
 
     /// {@return where the first value starts on the array}
     int base() {
-        return starts[0];
+        return base;
     }
 
     /// {@return where the last value ends on the array}
     int end() {
-        return starts[starts.length - 1];
-    }
-
-    /// {@return the values the chunk holds}
-    int values() {
-        return bodies.length;
+        return end;
     }
 
     /// {@return the value of `length` bytes at `offset` of the array, in an array of its own}
@@ -181,8 +190,21 @@ final class LogChunk {
     /// {@return where in its segment's file the frame holds the first byte of the value at `offset` of the array; for
     /// tests}
     long positionForTests(int offset) {
+        return frameOffset + LogWriter.FRAME_HEADER + bodyOf(offset);
+    }
+
+    /// {@return whether the chunk keeps no place per value, the body holding its values as the array does; for tests}
+    boolean contiguousForTests() {
+        return starts == null;
+    }
+
+    /// {@return where in the frame's body the byte at `offset` of the array lies, which is in the chunk}
+    private int bodyOf(int offset) {
+        if (starts == null) {
+            return firstBody + (offset - base);
+        }
         var value = valueAt(offset);
-        return frameOffset + LogWriter.FRAME_HEADER + bodies[value] + (offset - starts[value]);
+        return bodies[value] + (offset - starts[value]);
     }
 
     /// {@return the bytes of the array from `from` to `to`, both on bounds of blocks or the end, read from the frame and
@@ -194,11 +216,10 @@ final class LogChunk {
         if (from == to) {
             return new byte[0];
         }
-        var first = valueAt(from);
-        var last = valueAt(to - 1);
-        var bodyFrom = bodies[first] + (from - starts[first]);
-        var bodyTo = bodies[last] + (to - starts[last]);
-        var span = new byte[bodyTo - bodyFrom];
+        var first = starts == null ? 0 : valueAt(from);
+        var last = starts == null ? 0 : valueAt(to - 1);
+        var bodyFrom = bodyOf(from);
+        var span = new byte[bodyOf(to - 1) + 1 - bodyFrom];
         segment.readAt(span, 0, span.length, frameOffset + LogWriter.FRAME_HEADER + bodyFrom);
         var spills = segment.spills();
         spills.readChunkBytes(span.length);
@@ -210,7 +231,8 @@ final class LogChunk {
             }
             byte[] bytes;
             if (first == last) {
-                // One value spans every block read: its bytes are the span's
+                // One value spans every block read, or the body holds the values as the array does: the bytes are the
+                // span's
                 bytes = span;
             } else {
                 bytes = new byte[to - from];
@@ -220,8 +242,6 @@ final class LogChunk {
                     System.arraycopy(span, bodies[value] + (start - starts[value]) - bodyFrom, bytes, start - from, stop - start);
                 }
             }
-            var base = base();
-            var firstBody = bodies[0];
             for (var at = from; at < to; at += BLOCK) {
                 var block = (at - base) / BLOCK;
                 var length = Math.min(BLOCK, to - at);

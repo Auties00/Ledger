@@ -1919,9 +1919,14 @@ class LogSpillTest {
             assertTrue(chunks.size() >= 15 && chunks.size() <= 17, chunks.size() + " chunks");
             assertTrue(Arrays.stream(ledger.spills().segmentsForTests()).anyMatch(number -> number == chunks.getFirst().segment().number()),
                     "the segment of the chunks is not held for readers");
+            // The commit's frame is split: its section holds the values as their arrays do
+            assertTrue(chunks.stream().allMatch(LogChunk::contiguousForTests), "a chunk keeps a place per value");
             verify(ledger, expected);
+            var read = spills.chunkBytesReadForTests();
             ledger.checkpoint();
             assertEquals(chunks.size(), spills.materializationsForTests(), "the checkpoint read an array more than once");
+            assertEquals(chunks.stream().mapToLong(chunk -> chunk.end() - chunk.base()).sum(), spills.chunkBytesReadForTests() - read,
+                    "the checkpoint read other bytes of the log than the chunks' values");
             assertEquals(0, spills.materializedForTests());
             assertTrue(chunks.stream().noneMatch(LogChunk::materializedForTests), "the checkpoint kept an array it read whole");
             verify(ledger, expected);

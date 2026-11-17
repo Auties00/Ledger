@@ -1061,14 +1061,18 @@ final class SpillQueue {
         /// {@return the place in the log of the values of run `run`, tagged block by block from the array they lie
         /// on, or `null` if they no longer lie back to back where the record found them, or not in the order of the
         /// frame}
+        ///
+        /// Values that lie in the frame's body as they lie on the array, as a split frame's section holds them, get a
+        /// chunk without a place per value ([LogChunk]).
         private LogChunk chunkOf(int run, Crypto crypto, boolean encrypted) {
             var home = runHomes[run];
             var values = runValues[run];
-            var starts = new int[values + 1];
-            var bodies = new int[values];
+            var start = runStarts[run];
+            var firstBody = commitStart + offsets[runFirsts[run]];
             var at = 0;
-            var next = runStarts[run];
+            var next = start;
             var bodyEnd = Integer.MIN_VALUE;
+            var contiguous = true;
             for (var i = runFirsts[run]; i <= runLasts[run]; i++) {
                 var version = versions[i];
                 if (version.sharedSource() != home) {
@@ -1078,16 +1082,29 @@ final class SpillQueue {
                 if (at == values || version.sourceOffset() != next || body < bodyEnd) {
                     return null;
                 }
-                starts[at] = next;
-                bodies[at++] = body;
+                contiguous &= body - firstBody == next - start;
+                at++;
                 next += version.valueLength();
                 bodyEnd = body + version.valueLength();
             }
             if (at != values || next != runEnds[run]) {
                 return null;
             }
-            starts[values] = next;
-            var start = starts[0];
+            int[] starts = null;
+            int[] bodies = null;
+            if (!contiguous) {
+                starts = new int[values + 1];
+                bodies = new int[values];
+                at = 0;
+                for (var i = runFirsts[run]; i <= runLasts[run]; i++) {
+                    var version = versions[i];
+                    if (version.sharedSource() == home) {
+                        starts[at] = version.sourceOffset();
+                        bodies[at++] = commitStart + offsets[i];
+                    }
+                }
+                starts[values] = next;
+            }
             var length = next - start;
             var bytes = crypto.scratch(length);
             MemorySegment.copy(home, start, MemorySegment.ofArray(bytes), 0, length);
@@ -1097,9 +1114,9 @@ final class SpillQueue {
             for (var block = 0; block < blocks; block++) {
                 var from = block * LogChunk.BLOCK;
                 crypto.tagBlock(bytes, from, Math.min(LogChunk.BLOCK, length - from), frameOffset,
-                        LogChunk.place(bodies[0], block), highs, lows, block);
+                        LogChunk.place(firstBody, block), highs, lows, block);
             }
-            return new LogChunk(segment, frameOffset, starts, bodies, highs, lows);
+            return new LogChunk(segment, frameOffset, start, next, firstBody, starts, bodies, highs, lows);
         }
 
         /// {@return whether the values on shared arrays move an array at a time ([#CHUNKS])}
