@@ -25,7 +25,7 @@ class PassphraseKeysTest {
     private static final Keyspace<String, String> NAMES = Keyspace.paged("names", KeyCodec.utf8(), ValueCodec.utf8());
 
     @Test
-    @DisplayName("derives once per salt, hands out copies, and forgets on destroy")
+    @DisplayName("derives once per salt, hands out copies, and forgets when told to and on destroy")
     void memoised() {
         var spec = EncryptionSpec.passphrase("secret".toCharArray());
         var derivations = new AtomicInteger();
@@ -50,12 +50,23 @@ class PassphraseKeysTest {
             return new byte[]{1};
         });
         assertEquals(3, derivations.get());
+        // Forgetting keeps the passphrase: the next open derives again
+        ((Encryption) spec).forgetDerivedKeys();
+        spec.derivedKey(salt, 10, () -> {
+            derivations.incrementAndGet();
+            return new byte[]{42};
+        });
+        assertEquals(4, derivations.get());
+        assertArrayEquals(new char[]{'s', 'e', 'c', 'r', 'e', 't'}, spec.passphrase());
         spec.destroy();
         spec.derivedKey(salt, 10, () -> {
             derivations.incrementAndGet();
             return new byte[]{1};
         });
-        assertEquals(4, derivations.get());
+        assertEquals(5, derivations.get());
+        // Nothing to forget without a passphrase
+        Encryption.key(new byte[32]).forgetDerivedKeys();
+        Encryption.none().forgetDerivedKeys();
     }
 
     @Test
@@ -70,6 +81,10 @@ class PassphraseKeysTest {
             assertEquals(Optional.of("b"), ledger.get(NAMES, "a"));
         }
         System.out.printf("reopen with a known passphrase: %.1f ms%n", (System.nanoTime() - started) / 1e6);
+        encryption.forgetDerivedKeys();
+        try (var ledger = Ledger.builder().directory(directory).encryption(encryption).keyspace(NAMES).build()) {
+            assertEquals(Optional.of("b"), ledger.get(NAMES, "a"));
+        }
         assertThrows(LedgerKeyException.class, () -> Ledger.builder().directory(directory)
                 .encryption(Encryption.passphrase("wrong".toCharArray())).keyspace(NAMES).build());
     }

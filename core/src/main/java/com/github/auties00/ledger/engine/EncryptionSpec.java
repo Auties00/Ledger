@@ -13,7 +13,7 @@ import java.util.function.Supplier;
 /// A passphrase keeps the master keys it was stretched into, one per salt, so a store opened again with the same
 /// instance, as an application does at each reconnection, pays the derivation once: about half a second of one
 /// processor at [StoreKeys#PASSPHRASE_ITERATIONS] iterations. They live as long as the instance, which holds the
-/// passphrase anyway, until [#destroy()].
+/// passphrase anyway, until [#forgetDerivedKeys()] or [#destroy()].
 public final class EncryptionSpec implements Encryption {
     /// No encryption.
     public static final EncryptionSpec NONE = new EncryptionSpec(Kind.NONE, null, null);
@@ -93,14 +93,8 @@ public final class EncryptionSpec implements Encryption {
         }
     }
 
-    /// Clears the copy of the secret and the keys derived from it.
-    public void destroy() {
-        if (key != null) {
-            Arrays.fill(key, (byte) 0);
-        }
-        if (passphrase != null) {
-            Arrays.fill(passphrase, '\0');
-        }
+    @Override
+    public void forgetDerivedKeys() {
         if (derived != null) {
             synchronized (derived) {
                 for (var master : derived.values()) {
@@ -109,6 +103,17 @@ public final class EncryptionSpec implements Encryption {
                 derived.clear();
             }
         }
+    }
+
+    /// Clears the copy of the secret and the keys derived from it.
+    public void destroy() {
+        if (key != null) {
+            Arrays.fill(key, (byte) 0);
+        }
+        if (passphrase != null) {
+            Arrays.fill(passphrase, '\0');
+        }
+        forgetDerivedKeys();
     }
 
     @Override

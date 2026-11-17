@@ -24,14 +24,21 @@ public sealed interface Encryption permits EncryptionSpec {
     /// {@return encryption under a key derived from `passphrase`}
     ///
     /// The key is derived with PBKDF2-HMAC-SHA256 over a random salt the store keeps, at 600,000 iterations, which
-    /// costs about half a second each time the store opens. The store copies the passphrase; the caller may clear
-    /// its array afterward.
+    /// costs about half a second. The returned instance keeps the master key it derived for each salt, at most sixteen,
+    /// so a store opened again with it skips the derivation; they stay in memory, beside the copy of the passphrase,
+    /// until [#forgetDerivedKeys()]. The store copies the passphrase; the caller may clear its array afterward.
     ///
     /// @param passphrase the passphrase, not empty
     /// @throws IllegalArgumentException if `passphrase` is empty
     static Encryption passphrase(char[] passphrase) {
         return EncryptionSpec.passphrase(passphrase);
     }
+
+    /// Clears and drops the master keys this instance derived from its passphrase, so the next store opened with it
+    /// derives its key again; a store already open keeps the key it holds.
+    ///
+    /// Encryption under a key or none derives nothing, and this does nothing.
+    void forgetDerivedKeys();
 
     /// {@return no encryption: the files hold their data in plaintext}
     ///
