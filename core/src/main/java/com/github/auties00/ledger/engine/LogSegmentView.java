@@ -14,7 +14,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
 /// One use of a log segment, the writing of one open or the frames one recovery replayed, as the values that left the
-/// heap for it are read back from ([LogValue]).
+/// heap for it are read back from ([LogValue], [LogChunk]).
 ///
 /// The segment stays in place while a reader may need such a value from it. A checkpoint retires it through
 /// [#retire()] before it renames or deletes the file ([SpillQueue#retirableBefore(long, ReaderTable)]); from then on a
@@ -77,6 +77,11 @@ final class LogSegmentView {
     /// {@return the key of the use, or `null` for a store without encryption}
     SecretKeySpec key() {
         return key;
+    }
+
+    /// {@return the queue whose values moved here}
+    SpillQueue spills() {
+        return spills;
     }
 
     /// {@return whether a checkpoint retired the segment}
@@ -237,6 +242,18 @@ final class LogSegmentView {
                 pool.releaseCollectable(plain);
             }
         }
+    }
+
+    /// Reads the `length` bytes at `position` of the file, as they are on it, into `target` from `offset`, [#SLICE]
+    /// bytes per read of the channel at most; for the reads of a [LogChunk].
+    ///
+    /// @throws Retired if a checkpoint retired the segment, or retires it as the bytes are read
+    /// @throws LedgerIoException if the segment cannot be read
+    void readAt(byte[] target, int offset, int length, long position) {
+        if (retired) {
+            throw Retired.INSTANCE;
+        }
+        readFully(ByteBuffer.wrap(target), offset, length, position);
     }
 
     /// Reads `length` bytes at `position` of the file into `buffer` from `offset`, whatever the buffer's position and

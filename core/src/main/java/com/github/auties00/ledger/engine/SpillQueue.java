@@ -49,10 +49,15 @@ import java.util.zip.CRC32C;
 ///   own, of a transaction, or of one with a unit of [BlobFile]. A value a recovery copied to an array of its own
 ///   moves, to the log only;
 /// - of a commit whose values on shared arrays would take, once moved, more than half the bytes they take now
-///   ([Record#settle()]): a short value goes to an array of its own, which frees the array it shared only once every
-///   other value on it left too, so moving a commit of mostly short values, like an app-state snapshot of 100 to 300
-///   byte values, allocates about as much as it frees and makes the next checkpoint read the long ones back from the
-///   log. The commit's values on arrays of their own move all the same, each freeing its array for a [LogValue].
+///   ([Record#settle(long)]): a short value goes to an array of its own, which frees the array it shared only once
+///   every other value on it left too, so moving a commit of mostly short values, like an app-state snapshot of 100 to
+///   300 byte values, allocates about as much as it frees and makes the next checkpoint read the long ones back from
+///   the log. The commit's values on arrays of their own move all the same, each freeing its array for a [LogValue].
+///   Unless the commit holds more such values than twice the budget, and at least [#CHUNKS_MIN] bytes, that lie back
+///   to back on their arrays: each array then leaves the heap whole for one [LogChunk], which the next checkpoint reads
+///   back in one read rather than one per value. A wait for such a commit to be durable moves its values on the
+///   waiting thread before it returns ([#moveOwn(long)]), rather than leaving them to the thread that moves values,
+///   which would take them only after the commit returned.
 ///
 /// A recovery moves a value it replays that the log holds before its last budget of bytes at once, on its own thread,
 /// tagged where it lies in the frame body it came in
@@ -72,6 +77,10 @@ final class SpillQueue {
     static final int LOG_VALUE_MIN = 256;
     /// The bytes a [LogValue] takes on the heap.
     private static final int LOG_VALUE_BYTES = 40;
+    /// The least bytes of the values of a commit on shared arrays that leave the heap an array at a time ([LogChunk])
+    /// when they would not pay to move one by one: twice the least budget, so an app-state snapshot of tens of
+    /// thousands of entries, which the next checkpoint takes from the heap, stays there.
+    static final long CHUNKS_MIN = 8L << 20;
     /// The bytes of the header of an array.
     private static final int ARRAY_HEADER = 16;
     /// The shortest values whose record moves to the log although the log wrote its group through: a value that long
@@ -97,6 +106,9 @@ final class SpillQueue {
     private final long budget;
     // The held bytes the thread moves values down to
     private final long lowWater;
+    // The least bytes of a commit's values on shared arrays that move an array at a time: CHUNKS_MIN, or twice the
+    // budget if more
+    private long chunksMin;
     private final boolean encrypted;
     // The two points the polynomials of the tags are evaluated at, from 1 to PRIME - 1, drawn for this open at the
     // first value moved or read back and never stored; null before, and without encryption
@@ -108,6 +120,13 @@ final class SpillQueue {
     private final ArrayList<LogSegmentView> segments;
     // The bytes of values the records of the queue list; written holding the lock
     private volatile long held;
+    // The records whose values move an array at a time that are queued or moving, oldest first; guarded by the lock,
+    // which a committer waiting for the thread to move its record waits on
+    private final ArrayList<Record> chunkRecords;
+    // The size of chunkRecords, which a commit that waited to be durable reads without the lock; written holding it
+    private volatile int chunkRecordCount;
+    // The chunks a checkpoint read whole, whose bytes it keeps until it ends; guarded by the lock
+    private final ArrayList<LogChunk> materialized;
     // Whether the thread that moves values runs
     private final AtomicBoolean running;
     private volatile boolean closed;
@@ -128,6 +147,12 @@ final class SpillQueue {
     private final AtomicLong drainedRecords = new AtomicLong();
     // The records whose values on shared arrays stay, as their move would not pay, for tests
     private final AtomicLong unpaidRecords = new AtomicLong();
+    // The records whose values move an array at a time, the chunks made of them and the values they hold, for tests
+    private final AtomicLong chunkedRecords = new AtomicLong();
+    private final AtomicLong loggedChunks = new AtomicLong();
+    private final AtomicLong chunkedValues = new AtomicLong();
+    // The chunks checkpoints read whole so far, for tests
+    private final AtomicLong materializations = new AtomicLong();
 
     /// Creates the queue of a store.
     ///
@@ -136,13 +161,21 @@ final class SpillQueue {
     SpillQueue(long budget, boolean encrypted) {
         this.budget = budget;
         this.lowWater = budget - budget / 4;
+        this.chunksMin = Math.max(CHUNKS_MIN, 2 * budget);
         this.encrypted = encrypted;
         this.lock = new Object();
         this.records = new ArrayDeque<>();
         this.segments = new ArrayList<>();
+        this.chunkRecords = new ArrayList<>();
+        this.materialized = new ArrayList<>();
         this.running = new AtomicBoolean();
         this.cryptos = new AtomicReferenceArray<>(Math.max(4, 2 * Runtime.getRuntime().availableProcessors()));
         this.pool = HeapPool.process();
+    }
+
+    /// Makes `bytes` the least bytes of a commit's values on shared arrays that move an array at a time; for tests.
+    void chunksMinForTests(long bytes) {
+        this.chunksMin = bytes;
     }
 
     /// {@return the pool the reads of [framed][LogValue#framed()] values take their arrays from: the process's, which
@@ -226,10 +259,26 @@ final class SpillQueue {
     /// retires segments sees the commit.
     void noteReplayed(long sequence, LogSegmentView segment) {
         synchronized (lock) {
-            if (segment.note(sequence)) {
-                segments.add(segment);
-            }
+            note(segment, sequence);
         }
+    }
+
+    /// Records that values of the commit at `sequence` move to `segment`, which joins the segments in the order of
+    /// their numbers if it is the first; holding the lock.
+    ///
+    /// The thread that moves values takes the records oldest first, but a committer takes its own record past older
+    /// ones ([#moveOwn(long)]), so a segment may be noted after a later one: [#published(long, long, long)] and
+    /// [#retirableBefore(long, ReaderTable)] stop at the first segment past their bound, and would never reach an older
+    /// one behind it.
+    private void note(LogSegmentView segment, long sequence) {
+        if (!segment.note(sequence)) {
+            return;
+        }
+        var at = segments.size();
+        while (at > 0 && segments.get(at - 1).number() > segment.number()) {
+            at--;
+        }
+        segments.add(at, segment);
     }
 
     /// Moves the value of `version`, which a recovery replayed from `frame`, at once to its place in the log, on the
@@ -265,8 +314,10 @@ final class SpillQueue {
         if (record.count == 0) {
             return;
         }
-        var settled = record.settle();
-        if (settled != Record.ALL) {
+        var settled = record.settle(chunksMin);
+        if (settled == Record.CHUNKS) {
+            chunkedRecords.incrementAndGet();
+        } else if (settled != Record.ALL) {
             unpaidRecords.incrementAndGet();
             if (settled == Record.NONE) {
                 record.release();
@@ -279,6 +330,10 @@ final class SpillQueue {
             }
             records.addLast(record);
             held = held + record.bytes;
+            if (settled == Record.CHUNKS) {
+                chunkRecords.add(record);
+                chunkRecordCount = chunkRecords.size();
+            }
         }
         if (over()) {
             start();
@@ -349,20 +404,105 @@ final class SpillQueue {
                         return;
                     }
                     records.pollFirst();
-                    held = held - record.bytes;
-                    drainedRecords.incrementAndGet();
-                    if (record.logs()) {
-                        // Before any value moves there, so a checkpoint that retires segments sees the commit
-                        var segment = record.segment;
-                        if (segment.note(record.sequence)) {
-                            segments.add(segment);
-                        }
+                    take(record);
+                }
+                try {
+                    record.spill(this, crypto);
+                } finally {
+                    if (record.chunked) {
+                        moved(record);
                     }
                 }
-                record.spill(this, crypto);
             }
         } finally {
             giveBack(crypto);
+        }
+    }
+
+    /// Takes `record`, out of the queue, to move its values; holding the lock.
+    private void take(Record record) {
+        held = held - record.bytes;
+        drainedRecords.incrementAndGet();
+        if (record.logs()) {
+            // Before any value moves there, so a checkpoint that retires segments sees the commit
+            note(record.segment, record.sequence);
+        }
+    }
+
+    /// Records that the values of `record`, which move an array at a time, moved or stay, waking a committer that
+    /// waits for them.
+    private void moved(Record record) {
+        synchronized (lock) {
+            if (chunkRecords.remove(record)) {
+                chunkRecordCount = chunkRecords.size();
+                lock.notifyAll();
+            }
+        }
+    }
+
+    /// Moves the values of the commit at `sequence`, which the log holds durably, on the caller's thread, if they move
+    /// an array at a time ([LogChunk]) and are still queued; or waits for the thread that moves values if it took
+    /// them. A commit that waits for its frame to be durable calls it once it is: such a commit's values on shared
+    /// arrays take more than twice the budget, which a collection right after it would otherwise find on the heap.
+    ///
+    /// Any other commit returns at once, after one volatile read. An interrupt while waiting for the thread ends the
+    /// wait, the interrupt kept, and the thread moves the values as it would. A failure to move them leaves them on the
+    /// heap, which the caller, whose commit is durable, never sees.
+    void moveOwn(long sequence) {
+        if (chunkRecordCount == 0) {
+            return;
+        }
+        Record record = null;
+        synchronized (lock) {
+            for (var queued : chunkRecords) {
+                if (queued.sequence == sequence) {
+                    record = queued;
+                    break;
+                }
+            }
+            if (record == null || closed || sequence > durable.getAsLong()) {
+                return;
+            }
+            if (!records.remove(record)) {
+                // The thread that moves values took it
+                while (!closed && chunkRecords.contains(record)) {
+                    try {
+                        lock.wait();
+                    } catch (InterruptedException _) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+                return;
+            }
+            take(record);
+        }
+        var crypto = takeCrypto();
+        try {
+            record.spill(this, crypto);
+        } catch (RuntimeException _) {
+            // The commit is durable all the same: the values left where they are stay until a checkpoint takes them
+        } finally {
+            giveBack(crypto);
+            moved(record);
+        }
+    }
+
+    /// Keeps `chunk`, which a checkpoint read whole, until the checkpoint ends ([#releaseMaterialized()]).
+    void materialized(LogChunk chunk) {
+        materializations.incrementAndGet();
+        synchronized (lock) {
+            materialized.add(chunk);
+        }
+    }
+
+    /// Lets go of the bytes of the chunks a checkpoint read whole, as it ends, whether it was published or failed.
+    void releaseMaterialized() {
+        synchronized (lock) {
+            for (var chunk : materialized) {
+                chunk.dropMaterialized();
+            }
+            materialized.clear();
         }
     }
 
@@ -376,6 +516,10 @@ final class SpillQueue {
                 records.pollFirst();
                 held = held - record.bytes;
                 record.release();
+                if (record.chunked && chunkRecords.remove(record)) {
+                    chunkRecordCount = chunkRecords.size();
+                    lock.notifyAll();
+                }
             }
             for (var segment : segments) {
                 if (segment.number() >= logStart) {
@@ -384,6 +528,7 @@ final class SpillQueue {
                 segment.cover(latest);
             }
         }
+        releaseMaterialized();
     }
 
     /// Retires, from the oldest, the segments before `first` that values moved to and that no reader may need any
@@ -442,7 +587,11 @@ final class SpillQueue {
             }
             records.clear();
             held = 0;
+            chunkRecords.clear();
+            chunkRecordCount = 0;
+            lock.notifyAll();
         }
+        releaseMaterialized();
         retireAll();
     }
 
@@ -474,9 +623,41 @@ final class SpillQueue {
     }
 
     /// {@return the records whose values on shared arrays stay where they are, as moving them would not pay
-    /// ([Record#settle()]), whether or not the record's values on arrays of their own move; for tests}
+    /// ([Record#settle(long)]), whether or not the record's values on arrays of their own move; for tests}
     long unpaidRecordsForTests() {
         return unpaidRecords.get();
+    }
+
+    /// {@return the records whose values on shared arrays move an array at a time ([Record#CHUNKS]); for tests}
+    long chunkedRecordsForTests() {
+        return chunkedRecords.get();
+    }
+
+    /// {@return the chunks values moved to so far ([LogChunk]); for tests}
+    long loggedChunksForTests() {
+        return loggedChunks.get();
+    }
+
+    /// {@return the values moved to chunks so far; for tests}
+    long chunkedValuesForTests() {
+        return chunkedValues.get();
+    }
+
+    /// {@return the records whose values move an array at a time that are queued or moving; for tests}
+    int chunkRecordsForTests() {
+        return chunkRecordCount;
+    }
+
+    /// {@return the chunks checkpoints read whole so far; for tests}
+    long materializationsForTests() {
+        return materializations.get();
+    }
+
+    /// {@return the chunks a checkpoint read whole and still keeps; for tests}
+    int materializedForTests() {
+        synchronized (lock) {
+            return materialized.size();
+        }
     }
 
     /// {@return the segments values moved to that no checkpoint retired, by number; for tests}
@@ -525,12 +706,15 @@ final class SpillQueue {
         // Where each value starts in the body of its commit
         private int[] offsets;
         private int count;
-        /// The verdict of [#settle()] that every value of the record may move.
+        /// The verdict of [#settle(long)] that every value of the record may move.
         static final int ALL = 0;
-        /// The verdict of [#settle()] that only the record's values on arrays of their own may move.
+        /// The verdict of [#settle(long)] that only the record's values on arrays of their own may move.
         static final int OWN = 1;
-        /// The verdict of [#settle()] that no value of the record moves.
+        /// The verdict of [#settle(long)] that no value of the record moves.
         static final int NONE = 2;
+        /// The verdict of [#settle(long)] that the record's values on shared arrays that lie back to back on them move
+        /// an array at a time ([LogChunk]), and its values on arrays of their own one by one.
+        static final int CHUNKS = 3;
 
         // The bytes of the values the record moves, whether one is at least LOG_VALUE_MIN, and the bytes of the
         // shortest
@@ -543,8 +727,21 @@ final class SpillQueue {
         private long sharedMoved;
         private long ownBytes;
         private int ownShortest = Integer.MAX_VALUE;
-        // Whether only the values on arrays of their own move ([#settle()])
+        // Whether only the values on arrays of their own move one by one ([#settle(long)])
         private boolean ownOnly;
+        // Whether the values on shared arrays move an array at a time ([#CHUNKS])
+        private boolean chunked;
+        // In a record whose values move an array at a time, the runs of its values that lie back to back on one shared
+        // array, in the order of the writes: the read-only segment of the array, the first and last index of the run's
+        // values among the versions, the values in it, where the first starts on the array and where the last ends;
+        // an end of -1 marks a run with a gap, which stays
+        private MemorySegment[] runHomes;
+        private int[] runFirsts;
+        private int[] runLasts;
+        private int[] runValues;
+        private int[] runStarts;
+        private int[] runEnds;
+        private int runs;
         // Set by the log writer as it seals the frame: the segment use, the frame's offset, where the commit's body
         // starts in the frame's body, the bytes of the frame's body, 0 if unknown, and whether the group was written
         // through
@@ -597,25 +794,113 @@ final class SpillQueue {
         /// Decides which values move, before the record is queued: all of them if moving those on shared arrays frees
         /// at least as much heap as it allocates, what they would take once moved (a [LogValue] for a long one and an
         /// array of its own for a short one) being at most half of their bytes, else only those on arrays of their own,
-        /// whose bytes alone the record then counts.
+        /// whose bytes alone the record then counts; unless at least `chunksMin` bytes of the values on shared arrays
+        /// lie in runs, back to back on one array each, which then move an array at a time, and count with those on
+        /// arrays of their own.
         ///
         /// A batch's values lie packed on arrays of about their bytes, so moving them all frees about their bytes, and
         /// moving some frees nothing while the others keep the arrays alive; a commit of short values frees little more
         /// than it copies, and leaves the heap it holds where it was. A value of at least [#LOG_VALUE_MIN] bytes on an
-        /// array of its own frees that array whatever its record's other values do.
+        /// array of its own frees that array whatever its record's other values do. A run of short values on one array
+        /// moves for about 13 bytes per 1 KiB of the array, and frees it once its run is all the array holds.
         ///
-        /// @return [#ALL], [#OWN] or [#NONE]
-        int settle() {
+        /// @return [#ALL], [#OWN], [#NONE] or [#CHUNKS]
+        int settle(long chunksMin) {
             if (sharedMoved <= sharedBytes / 2) {
                 return ALL;
             }
-            if (ownBytes == 0) {
+            if (ownBytes != 0) {
+                ownOnly = true;
+                shortest = ownShortest;
+            }
+            if (sharedBytes >= chunksMin) {
+                var runBytes = findRuns();
+                if (runBytes >= chunksMin) {
+                    chunked = true;
+                    bytes = runBytes + ownBytes;
+                    return CHUNKS;
+                }
+                dropRuns();
+            }
+            if (!ownOnly) {
                 return NONE;
             }
-            ownOnly = true;
             bytes = ownBytes;
-            shortest = ownShortest;
             return OWN;
+        }
+
+        /// Finds the runs of the record's values that lie back to back on one shared array, in the order of the
+        /// writes, and returns their bytes, those of runs with a gap left out.
+        ///
+        /// A batch's values of paged key spaces lie on its arrays in the order of its writes, each array filled before
+        /// the next, so the values the record lists of one array are one run, unless a value the record does not list,
+        /// replaced by a write of the same batch or of a key space whose values stay, lies between two of them.
+        private long findRuns() {
+            var capacity = 16;
+            runHomes = new MemorySegment[capacity];
+            runFirsts = new int[capacity];
+            runLasts = new int[capacity];
+            runValues = new int[capacity];
+            runStarts = new int[capacity];
+            runEnds = new int[capacity];
+            runs = 0;
+            for (var i = 0; i < count; i++) {
+                var version = versions[i];
+                var home = version.sharedSource();
+                if (home == null) {
+                    continue;
+                }
+                var offset = version.sourceOffset();
+                var length = version.valueLength();
+                var last = runs - 1;
+                if (last >= 0 && runHomes[last] == home && runEnds[last] == offset) {
+                    runEnds[last] = offset + length;
+                    runLasts[last] = i;
+                    runValues[last]++;
+                    continue;
+                }
+                if (last >= 0 && runHomes[last] == home) {
+                    // A gap, or a value before the run's end: the run stays, and so does this value
+                    runEnds[last] = -1;
+                    continue;
+                }
+                if (runs == runHomes.length) {
+                    capacity = runs * 2;
+                    runHomes = Arrays.copyOf(runHomes, capacity);
+                    runFirsts = Arrays.copyOf(runFirsts, capacity);
+                    runLasts = Arrays.copyOf(runLasts, capacity);
+                    runValues = Arrays.copyOf(runValues, capacity);
+                    runStarts = Arrays.copyOf(runStarts, capacity);
+                    runEnds = Arrays.copyOf(runEnds, capacity);
+                }
+                runHomes[runs] = home;
+                runFirsts[runs] = i;
+                runLasts[runs] = i;
+                runValues[runs] = 1;
+                runStarts[runs] = offset;
+                runEnds[runs] = offset + length;
+                runs++;
+            }
+            var runBytes = 0L;
+            for (var run = 0; run < runs; run++) {
+                if (runEnds[run] >= 0 && runEnds[run] - runStarts[run] > LogChunk.MAX_BYTES) {
+                    runEnds[run] = -1;
+                }
+                if (runEnds[run] >= 0) {
+                    runBytes += runEnds[run] - runStarts[run];
+                }
+            }
+            return runBytes;
+        }
+
+        private void dropRuns() {
+            runHomes = null;
+            runFirsts = null;
+            runLasts = null;
+            runValues = null;
+            runStarts = null;
+            runEnds = null;
+            runs = 0;
         }
 
         /// {@return the sequence of the commit}
@@ -623,36 +908,131 @@ final class SpillQueue {
             return sequence;
         }
 
-        /// {@return whether values move to the log: some are long enough, and its frame is in a segment's cache or every
-        /// value is long enough to read back from the device}
+        /// {@return whether values move to the log: some are long enough, or move an array at a time, and its frame is
+        /// in a segment's cache or every value is long enough to read back from the device}
         private boolean logs() {
-            return large && segment != null && (!through || shortest >= THROUGH_VALUE_MIN);
+            if (segment == null) {
+                return false;
+            }
+            if (chunked) {
+                return !through || ownOnly && ownShortest >= THROUGH_VALUE_MIN;
+            }
+            return large && (!through || shortest >= THROUGH_VALUE_MIN);
         }
 
         /// Moves the values, unless a long one cannot move to the log, then forgets them.
+        ///
+        /// The runs of values that move an array at a time stay in a group the log wrote through, whose pages that
+        /// write took out of the system's cache: a read of one of them would go to the device.
         private void spill(SpillQueue queue, Crypto crypto) {
-            if (!large || logs()) {
-                var logged = 0;
-                var copied = 0;
-                for (var i = 0; i < count; i++) {
-                    var version = versions[i];
-                    // A value on a shared array stays on a segment until a spill moves it, so one on an array is on its own
-                    if (ownOnly && version.ownArray() == null) {
-                        continue;
-                    }
-                    var framed = segment != null && framesAlone(segment, frameBody, version.valueLength()) ? frameBody : 0;
-                    if (version.spill(crypto, segment, frameOffset, commitStart + offsets[i], framed, null)) {
-                        if (version.valueLength() >= LOG_VALUE_MIN) {
-                            logged++;
-                        } else {
-                            copied++;
-                        }
-                    }
+            if (chunked) {
+                if (segment != null && !through) {
+                    spillRuns(queue, crypto);
                 }
-                queue.loggedValues.addAndGet(logged);
-                queue.copiedValues.addAndGet(copied);
+                if (ownOnly && segment != null && (!through || ownShortest >= THROUGH_VALUE_MIN)) {
+                    spillValues(queue, crypto);
+                }
+            } else if (!large || logs()) {
+                spillValues(queue, crypto);
             }
             release();
+        }
+
+        /// Moves the values one by one: to the log, or to arrays of their own.
+        private void spillValues(SpillQueue queue, Crypto crypto) {
+            var logged = 0;
+            var copied = 0;
+            for (var i = 0; i < count; i++) {
+                var version = versions[i];
+                // A value on a shared array stays on a segment until a spill moves it, so one on an array is on its own
+                if (ownOnly && version.ownArray() == null) {
+                    continue;
+                }
+                var framed = segment != null && framesAlone(segment, frameBody, version.valueLength()) ? frameBody : 0;
+                if (version.spill(crypto, segment, frameOffset, commitStart + offsets[i], framed, null)) {
+                    if (version.valueLength() >= LOG_VALUE_MIN) {
+                        logged++;
+                    } else {
+                        copied++;
+                    }
+                }
+            }
+            queue.loggedValues.addAndGet(logged);
+            queue.copiedValues.addAndGet(copied);
+        }
+
+        /// Moves each run of values on a shared array to a [LogChunk] of its place in the frame, its block tags made
+        /// from the array before any value moves. A run whose values lie apart from where the record found them stays.
+        private void spillRuns(SpillQueue queue, Crypto crypto) {
+            var chunks = 0;
+            var values = 0;
+            for (var run = 0; run < runs; run++) {
+                if (runEnds[run] < 0) {
+                    continue;
+                }
+                var chunk = chunkOf(run, crypto, queue.encrypted);
+                if (chunk == null) {
+                    continue;
+                }
+                chunks++;
+                var home = runHomes[run];
+                for (var i = runFirsts[run]; i <= runLasts[run]; i++) {
+                    if (versions[i].spillToChunk(home, chunk)) {
+                        values++;
+                    }
+                }
+            }
+            queue.loggedChunks.addAndGet(chunks);
+            queue.chunkedValues.addAndGet(values);
+        }
+
+        /// {@return the place in the log of the values of run `run`, tagged block by block from the array they lie
+        /// on, or `null` if they no longer lie back to back where the record found them, or not in the order of the
+        /// frame}
+        private LogChunk chunkOf(int run, Crypto crypto, boolean encrypted) {
+            var home = runHomes[run];
+            var values = runValues[run];
+            var starts = new int[values + 1];
+            var bodies = new int[values];
+            var at = 0;
+            var next = runStarts[run];
+            var bodyEnd = Integer.MIN_VALUE;
+            for (var i = runFirsts[run]; i <= runLasts[run]; i++) {
+                var version = versions[i];
+                if (version.sharedSource() != home) {
+                    continue;
+                }
+                var body = commitStart + offsets[i];
+                if (at == values || version.sourceOffset() != next || body < bodyEnd) {
+                    return null;
+                }
+                starts[at] = next;
+                bodies[at++] = body;
+                next += version.valueLength();
+                bodyEnd = body + version.valueLength();
+            }
+            if (at != values || next != runEnds[run]) {
+                return null;
+            }
+            starts[values] = next;
+            var start = starts[0];
+            var length = next - start;
+            var bytes = crypto.scratch(length);
+            MemorySegment.copy(home, start, MemorySegment.ofArray(bytes), 0, length);
+            var blocks = LogChunk.blocks(length);
+            var highs = encrypted ? new long[blocks] : null;
+            var lows = new int[blocks];
+            for (var block = 0; block < blocks; block++) {
+                var from = block * LogChunk.BLOCK;
+                crypto.tagBlock(bytes, from, Math.min(LogChunk.BLOCK, length - from), frameOffset,
+                        LogChunk.place(bodies[0], block), highs, lows, block);
+            }
+            return new LogChunk(segment, frameOffset, starts, bodies, highs, lows);
+        }
+
+        /// {@return whether the values on shared arrays move an array at a time ([#CHUNKS])}
+        boolean chunked() {
+            return chunked;
         }
 
         /// Forgets the values.
@@ -660,6 +1040,7 @@ final class SpillQueue {
             versions = null;
             offsets = null;
             count = 0;
+            dropRuns();
         }
     }
 
@@ -928,20 +1309,56 @@ final class SpillQueue {
             return ((first ^ logged.tagHigh()) | ((int) second ^ logged.tagLow())) == 0;
         }
 
+        /// Tags the `length` bytes at `offset` of `block`, block `index` of a [LogChunk] of the frame at `frameOffset`,
+        /// bound to its place by `place` ([LogChunk#place(int, int)]): the first polynomial goes to `highs`, unless
+        /// it is `null`, as it is without encryption, and the low 32 bits of the second, or the CRC-32C of the block
+        /// without encryption, to `lows`.
+        void tagBlock(byte[] block, int offset, int length, long frameOffset, long place, long[] highs, int[] lows,
+                      int index) {
+            if (keys == null) {
+                crc.reset();
+                crc.update(block, offset, length);
+                lows[index] = (int) crc.getValue();
+                return;
+            }
+            tag(block, offset, length, frameOffset, place);
+            highs[index] = first;
+            lows[index] = (int) second;
+        }
+
+        /// {@return whether the `length` bytes at `offset` of `block` are the block of a [LogChunk] whose tag is
+        /// `high` and `low`, of the frame at `frameOffset` and bound to its place by `place`}
+        boolean verifiesBlock(byte[] block, int offset, int length, long frameOffset, long place, long high, int low) {
+            if (keys == null) {
+                crc.reset();
+                crc.update(block, offset, length);
+                return (int) crc.getValue() == low;
+            }
+            tag(block, offset, length, frameOffset, place);
+            // Every bit compared whatever the first that differs
+            return ((first ^ high) | ((int) second ^ low)) == 0;
+        }
+
         /// Evaluates the two polynomials of the tag of the `length` bytes at `offset` of `value`, the value of the
         /// version stamped `stamp`, into [#first] and [#second]: by Horner's rule, the coefficients 1, the stamp in two
         /// words, the value in words of 7 bytes, the last one shorter, and the length, four of the value's words at a
         /// time while four whole ones are left.
         private void tag(byte[] value, int offset, int length, long stamp) {
+            tag(value, offset, length, stamp >>> 8, stamp & 0xFF);
+        }
+
+        /// Evaluates the two polynomials of a tag into [#first] and [#second], as [#tag(byte\[\], int, int, long)]
+        /// does, with `head` and `tail` for the two coefficients after the leading 1, each below 2^61.
+        private void tag(byte[] value, int offset, int length, long head, long tail) {
             var x = keys[0];
             var y = keys[1];
             // The leading coefficient 1, so no coefficient after it can be dropped as a leading zero
             var a = x;
             var b = y;
-            var word = stamp >>> 8;
+            var word = head;
             a = multiply(a + word, x);
             b = multiply(b + word, y);
-            word = stamp & 0xFF;
+            word = tail;
             a = multiply(a + word, x);
             b = multiply(b + word, y);
             var end = offset + length;

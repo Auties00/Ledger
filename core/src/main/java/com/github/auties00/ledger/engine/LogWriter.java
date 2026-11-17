@@ -1726,6 +1726,15 @@ final class LogWriter {
         await(sequence, -1);
     }
 
+    /// Moves the values of the commit at `sequence`, durable now, that leave the heap an array at a time on the
+    /// committing thread ([SpillQueue#moveOwn(long)]), if the store moves values.
+    void moveOwn(long sequence) {
+        var queue = spills;
+        if (queue != null) {
+            queue.moveOwn(sequence);
+        }
+    }
+
     /// Waits until the commit at `sequence` is durable or `timeout` elapses.
     ///
     /// @return whether it is durable
