@@ -63,7 +63,8 @@ final class BlindWrites {
 
     /// Folds into one total the listed writes at or below `oldest` whose effect is known, so the counts of the
     /// readers, none older than `oldest`, no longer walk them, and the writes of a frozen run no reader reads any more
-    /// once their count is known; holding the publishing role.
+    /// once their count is known; holding the publishing role. It stops at the first write a freeze handed to its run
+    /// ([Chain#frozen()]), which [#publishFrozen(Listing, PackedRun, byte\[\], boolean)] takes out of the list.
     ///
     /// @param oldest the sequence of the oldest read, or the latest sequence if none runs
     void fold(long oldest) {
@@ -78,8 +79,11 @@ final class BlindWrites {
         }
         var next = start;
         while (next < end && (current.writes[next] >>> 1) <= oldest) {
-            var state = current.chains[next].blindState();
-            if (state == TreeSearch.UNKNOWN) {
+            var chain = current.chains[next];
+            var state = chain.blindState();
+            // A write a freeze handed to its run stays until the publication that makes the run count it takes it out:
+            // folded before, a count settled since, it would count in the total and in the run
+            if (state == TreeSearch.UNKNOWN || chain.frozen()) {
                 break;
             }
             folded += effect(state, current.writes[next]);

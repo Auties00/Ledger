@@ -219,6 +219,10 @@ public final class LiveLedger implements Ledger {
     // What a pipelined commit calls with its sequence once it has one, before it applies, or null; for tests that hold
     // a commit there. Plain: set before the committing threads start
     private LongConsumer sequencedHookForTests;
+    // What a pipelined commit calls with its sequence once it applied its writes, before it is marked applied, or null;
+    // a hook that throws fails the commit, which takes its writes back. For tests; plain: set before the committing
+    // threads start
+    private LongConsumer appliedHookForTests;
     // What a prune on a committing thread runs once it found the version a reader keeps below another it keeps, before
     // it links the two, or null; for tests that run a maintenance there. Plain: set before the committing threads start
     private Runnable pruneHookForTests;
@@ -376,6 +380,13 @@ public final class LiveLedger implements Ledger {
     /// for tests that hold a commit between the two, set before the threads that commit start.
     void hookSequencedForTests(LongConsumer hook) {
         sequencedHookForTests = hook;
+    }
+
+    /// Makes each pipelined commit call `hook` with its sequence once it applied its writes, before the commits behind it
+    /// on its keys apply theirs, or none if `null`; a hook that throws fails the commit as a write that cannot be applied
+    /// does. For tests, set before the threads that commit start.
+    void hookAppliedForTests(LongConsumer hook) {
+        appliedHookForTests = hook;
     }
 
     /// Makes each prune on a committing thread run `hook` once it found the version a reader keeps below another it
@@ -1512,6 +1523,10 @@ public final class LiveLedger implements Ledger {
             var size = writes.size();
             for (var i = 0; i < size; i++) {
                 applyWrite(pending, applier, i);
+            }
+            var hook = appliedHookForTests;
+            if (hook != null) {
+                hook.accept(pending.sequence);
             }
         } catch (Throwable failure) {
             applier.rollback();
@@ -3552,6 +3567,9 @@ public final class LiveLedger implements Ledger {
                     if (head != null) {
                         chain.attach(null);
                     }
+                    // A commit queued behind this one on the key keeps the chain: its write is the chain's first, and
+                    // a freeze takes the kind of a blind first write from the chain
+                    chain.clearBlind();
                     write.state().dropRolledBack(chain, sequence);
                 } else if (version != head) {
                     chain.head = version;

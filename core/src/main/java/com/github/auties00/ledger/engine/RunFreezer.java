@@ -73,6 +73,9 @@ final class RunFreezer {
     // What a freeze runs once it published its run, before it waits for the walks and drops chains, or null; for tests
     // that write or read there. Plain: set before the freeze runs
     private Runnable publishedHookForTests;
+    // What a freeze runs after each hold of the publishing role that drops chains, without the role, or null; for
+    // tests that count or commit between the drops and the publication of the list. Plain: set before the freeze runs
+    private Runnable droppedHookForTests;
 
     RunFreezer(LiveLedger ledger, Checkpointer checkpointer, PageFile pages, List<KeyspaceState> states) {
         this.ledger = ledger;
@@ -105,6 +108,12 @@ final class RunFreezer {
     /// its chains; for tests that write or read there.
     void publishedHookForTests(Runnable hook) {
         this.publishedHookForTests = hook;
+    }
+
+    /// Makes every freeze run `hook` after each hold of the publishing role that drops chains, before it publishes
+    /// the list of the blind writes; for tests that count or commit there.
+    void droppedHookForTests(Runnable hook) {
+        this.droppedHookForTests = hook;
     }
 
     /// {@return the freezes that dropped chains so far; for tests}
@@ -321,6 +330,10 @@ final class RunFreezer {
                         }
                     });
                     handed += handedHere[0];
+                    var dropHook = droppedHookForTests;
+                    if (dropHook != null) {
+                        dropHook.run();
+                    }
                 }
                 if (!dropped.isEmpty()) {
                     freezes++;

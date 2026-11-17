@@ -329,13 +329,20 @@ sealed class Chain permits Chain.Inline8 {
 
     /// Records that a commit wrote the key without knowing whether the tree held it ([BlindWrites]).
     ///
-    /// A chain has at most one such write, its first, since every later one finds a version in memory: so a
-    /// checkpoint whose cut sees a version of the chain takes the blind write too.
+    /// A chain has at most one such write, its first, since every later one finds a version in memory, and a commit
+    /// taken back that wrote it forgets it ([#clearBlind()]): so a checkpoint whose cut sees a version of the chain
+    /// takes the blind write too.
     ///
     /// @param removes whether the write removes the key, which a run the chain is frozen into counts it as
     ///                ([#blindRemoves()])
     void markBlind(boolean removes) {
         SPAN.getAndBitwiseOr(this, BLIND | (removes ? BLIND_REMOVES : 0));
+    }
+
+    /// Forgets the blind write of the chain and what is known of it, as a commit taken back that leaves the chain empty
+    /// does: no commit listed the write, and the write the next commit makes of the key is the chain's first.
+    void clearBlind() {
+        SPAN.getAndBitwiseAnd(this, ~(BLIND | SETTLED | IN_TREE | BLIND_REMOVES));
     }
 
     /// {@return whether the blind write of the chain, if it has one, removes the key}

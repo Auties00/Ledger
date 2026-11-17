@@ -30,6 +30,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -380,6 +381,117 @@ class RunFreezerTest {
         }
         try (var ledger = open(directory, encrypted)) {
             verify(ledger, reopened);
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    @DisplayName("a count and the folds of the publisher between two holds of the drops, once blind writes were handed over, count each write once, and the checkpoint agrees")
+    void foldBetweenDrops(@TempDir Path directory) throws Exception {
+        try (var ledger = open(directory, true)) {
+            var expected = history(ledger);
+            // Keys memory and the tree lack, all blind: three holds of drops, the first handing its writes over
+            write(ledger, expected, 1_000, 1_768, 1, 1);
+            var counted = new ArrayList<Long>();
+            var failure = new AtomicReference<Throwable>();
+            var holds = new int[1];
+            ledger.freezerForTests().droppedHookForTests(() -> {
+                if (holds[0]++ != 0) {
+                    return;
+                }
+                try {
+                    // Settles every listed write, those the first hold handed over among them
+                    counted.add(ledger.size(MESSAGES));
+                    // Enough passes of the publisher for it to maintain the store twice, folding what it may
+                    for (var i = 0; i < 40; i++) {
+                        ledger.commit(ledger.newBatch().put(CHATS, "fold", "pass " + i));
+                    }
+                    counted.add(ledger.size(MESSAGES));
+                } catch (Throwable throwable) {
+                    failure.set(throwable);
+                }
+            });
+            var outcome = ledger.freezeForTests(MESSAGES);
+            ledger.freezerForTests().droppedHookForTests(null);
+            assertNull(failure.get());
+            assertEquals(768, outcome.dropped(), outcome.toString());
+            assertEquals(256, outcome.handed(), "the first hold did not hand its writes over, or a later one did");
+            var size = (long) expected.messages.size();
+            assertEquals(List.of(size, size), counted, "counted between the drops");
+            assertEquals(size, ledger.size(MESSAGES));
+            ledger.commit(ledger.newBatch().put(CHATS, "fold", "after"));
+            assertEquals(size, ledger.size(MESSAGES));
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    @DisplayName("a blind put queued behind a pipelined blind removal of the same key that is taken back freezes as a put, and the count stays exact")
+    void rolledBackBlindRemoval(@TempDir Path directory) throws Exception {
+        try (var ledger = open(directory, false)) {
+            var expected = history(ledger);
+            var abort = new IllegalStateException("abort");
+            var removing = new AtomicReference<Thread>();
+            var removal = new AtomicLong(-1);
+            var queued = new CountDownLatch(1);
+            var putting = new AtomicReference<Thread>();
+            var failures = new ConcurrentLinkedQueue<Throwable>();
+            var put = value(10, 7);
+            ledger.hookSequencedForTests(sequence -> {
+                if (Thread.currentThread() != removing.get()) {
+                    queued.countDown();
+                    return;
+                }
+                removal.set(sequence);
+                // Sequenced behind the removal on the key, it applies once the removal was taken back
+                putting.set(Thread.ofPlatform().start(() -> {
+                    try {
+                        ledger.commit(ledger.newBatch().put(MESSAGES, key(10), put)).awaitDurable();
+                    } catch (Throwable throwable) {
+                        failures.add(throwable);
+                    }
+                }));
+                try {
+                    assertTrue(queued.await(30, TimeUnit.SECONDS), "the put was not sequenced");
+                } catch (InterruptedException exception) {
+                    throw new IllegalStateException(exception);
+                }
+            });
+            ledger.hookAppliedForTests(sequence -> {
+                if (sequence == removal.get()) {
+                    throw abort;
+                }
+            });
+            var thrown = new AtomicReference<Throwable>();
+            var thread = Thread.ofPlatform().unstarted(() -> {
+                try {
+                    ledger.commit(ledger.newBatch().delete(MESSAGES, key(10)));
+                } catch (Throwable throwable) {
+                    thrown.set(throwable);
+                }
+            });
+            removing.set(thread);
+            thread.start();
+            thread.join();
+            while (putting.get() == null) {
+                Thread.onSpinWait();
+            }
+            putting.get().join();
+            ledger.hookSequencedForTests(null);
+            ledger.hookAppliedForTests(null);
+            assertSame(abort, thrown.get(), "the removal was not taken back");
+            assertTrue(failures.isEmpty(), failures.toString());
+            expected.messages.put(10, put);
+            spillNow(ledger);
+            // No count before the freeze, which would settle the put
+            var outcome = ledger.freezeForTests(MESSAGES);
+            assertEquals(1, outcome.dropped(), outcome.toString());
+            assertEquals(1, outcome.handed(), outcome.toString());
+            assertEquals(expected.messages.size(), ledger.size(MESSAGES));
+            ledger.checkpoint();
+            verify(ledger, expected);
         }
     }
 
