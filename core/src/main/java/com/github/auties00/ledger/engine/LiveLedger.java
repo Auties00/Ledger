@@ -47,7 +47,9 @@ import java.util.function.LongSupplier;
 /// applies its writes once the commits before it on the same keys have applied theirs, and the thread holding the
 /// publishing role publishes the applied commits in the order of their sequences by advancing [#latest]. Readers see
 /// a commit whole or not at all. Transactions and batches with a range removal run alone instead: they hold both roles
-/// once every commit given a sequence has published. A batch's range removal counts the entries it removes after the
+/// once every commit given a sequence has published. So does a bulk commit: a batch of at least [#BULK_RUN_WRITES]
+/// puts to a paged key space whose latest tree holds none of its entries, which keeps its puts of new keys in a
+/// [PackedRun] rather than on chains. A batch's range removal counts the entries it removes after the
 /// commit, on a thread of its own, against a read registered at the commit before ([PendingRanges]).
 ///
 /// After publishing, the publisher prunes the versions no reader can need any more, applies the range removals every
@@ -95,6 +97,11 @@ public final class LiveLedger implements Ledger {
     static final int FORGET_AFTER_WRITES = 1_024;
     /// The spill room of the [Applier] of a commit a recovery replays.
     private static final int REPLAYED = -1;
+    /// The puts to one paged key space from which a batch is a bulk commit there, if the latest tree holds none of the
+    /// key space's entries: it runs alone and keeps its puts of new keys in a [PackedRun], about 60 bytes over the key
+    /// each, where a chain, a version and the commit's record of the write took about 160. Fewer go to chains, which a
+    /// commit of a few writes holds no lock for.
+    static final int BULK_RUN_WRITES = 2_048;
     private static final VarHandle LAST_PUBLISHED;
     private static final VarHandle LATEST;
 
@@ -968,7 +975,9 @@ public final class LiveLedger implements Ledger {
             if (unloaded.get() != 0) {
                 awaitLoaded(writes);
             }
-            commit = writes.removesRanges() ? commitAlone(writes, units, outcome) : commitPipelined(writes, units, outcome);
+            var bulk = bulkPlan(writes);
+            commit = writes.removesRanges() || bulk != null ? commitAlone(writes, units, outcome, bulk)
+                    : commitPipelined(writes, units, outcome);
         } finally {
             if (outcome != null && (outcome[0] == null || !outcome[0].logged())) {
                 // No log frame names them
@@ -992,9 +1001,15 @@ public final class LiveLedger implements Ledger {
     /// wait for those reads before its frame is queued. Each such count starts on a thread of its own once the commit
     /// is published, beside the log's force.
     ///
+    /// A bulk commit runs alone too ([#bulkPlan(ArrayWriteBatch)]): holding both roles, every commit before it has
+    /// published and none after it is given a sequence until it has, and no checkpoint publishes or prunes, so a key of
+    /// such a key space with no chain is one the commit's own writes are the first of, which it counts as it applies
+    /// them. A key space that no longer qualifies once the roles are held takes the commit's writes to chains.
+    ///
     /// @param outcome receives the writes as applied, or `null`
-    private Commit commitAlone(ArrayWriteBatch writes, PageRef[] units, Applier[] outcome) {
-        var hints = prefetch(writes);
+    /// @param bulk the key spaces the batch may keep its puts of new keys of in runs, or `null`
+    private Commit commitAlone(ArrayWriteBatch writes, PageRef[] units, Applier[] outcome, BulkPlan bulk) {
+        var hints = prefetch(writes, bulk);
         Applier applier = null;
         enterExclusive();
         try {
@@ -1004,6 +1019,9 @@ public final class LiveLedger implements Ledger {
                     pages != null && log != null, writes.sharesChunk(), spillRoom(writes));
             if (outcome != null) {
                 outcome[0] = applier;
+            }
+            if (bulk != null) {
+                applier.startRuns(bulk);
             }
             try {
                 var size = writes.size();
@@ -1036,17 +1054,181 @@ public final class LiveLedger implements Ledger {
         var state = states.get(writes.keyspace(index).name());
         switch (writes.kind(index)) {
             case ArrayWriteBatch.PUT -> {
+                var key = writes.key(index);
                 var value = writes.value(index);
+                var unit = units == null ? null : units[index];
+                var inTree = hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree);
+                var bulk = applier.bulkRun(state);
+                if (bulk != null) {
+                    if (applier.putToRun(bulk, state, key, value, writes, index, unit)) {
+                        return;
+                    }
+                    // The run's entry, newer than the trees and unpublished, is the key's state before this write
+                    if (bulk.builder.find(key) >= 0) {
+                        inTree = TreeSearch.FOUND;
+                    }
+                }
                 var decoded = state.resident ? residentValue(state, writes.decodedValue(index), value) : null;
-                applier.put(state, applier.claim(state, writes.key(index)), writes.key(index), value, writes.ownValue(index),
+                applier.put(state, applier.claim(state, key), key, value, writes.ownValue(index),
                         writes.borrowed(index), writes.home(index), writes.homeArray(index), writes.homeOffset(index), decoded,
-                        hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree), units == null ? null : units[index]);
+                        inTree, unit);
             }
-            case ArrayWriteBatch.DELETE ->
-                    applier.delete(state, writes.key(index), hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree));
+            case ArrayWriteBatch.DELETE -> {
+                var key = writes.key(index);
+                var inTree = hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree);
+                var bulk = applier.bulkRun(state);
+                if (bulk != null && bulk.builder.find(key) >= 0) {
+                    // Removed on a chain over the run's entry, which the run keeps
+                    inTree = TreeSearch.FOUND;
+                }
+                applier.delete(state, key, inTree);
+            }
             // The removal keeps its bounds until a checkpoint, and the batch's array may go back to the pool
             case ArrayWriteBatch.DELETE_RANGE -> applier.deleteRange(state, ownCopy(writes.key(index)), ownCopy(writes.value(index)));
             default -> throw new IllegalStateException("Unknown write kind " + writes.kind(index));
+        }
+    }
+
+    /// {@return the paged key spaces `writes` may keep its puts of new keys of in runs ([PackedRun]) as a bulk commit,
+    /// with the puts and the bytes of their keys of each, or `null` if there is none}
+    ///
+    /// A key space qualifies with at least [#BULK_RUN_WRITES] puts in the batch and no range removal of it, in a store
+    /// with a data file and a log, if no run is in memory for it, the latest tree holds none of its entries and no range
+    /// removal is stamped after that tree: a reader of a run applies the range removals since its tree to the run's
+    /// entries, which only removals newer than the run may do. The batch counts its puts in one pass, which only a batch
+    /// of that many writes makes.
+    private BulkPlan bulkPlan(ArrayWriteBatch writes) {
+        var size = writes.size();
+        if (pages == null || log == null || size < BULK_RUN_WRITES) {
+            return null;
+        }
+        var trees = tree;
+        var any = false;
+        for (var state : sweepOrder) {
+            if (bulkEligible(state, trees)) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) {
+            return null;
+        }
+        // The key spaces the batch writes, the puts to each, the bytes of their keys and whether one removes a range
+        var keyspaces = new Keyspace<?, ?>[2];
+        var puts = new int[2];
+        var keyBytes = new long[2];
+        var ranges = new boolean[2];
+        var count = 0;
+        var last = -1;
+        for (var i = 0; i < size; i++) {
+            var keyspace = writes.keyspace(i);
+            if (last < 0 || keyspaces[last] != keyspace) {
+                last = -1;
+                for (var k = 0; k < count; k++) {
+                    if (keyspaces[k] == keyspace) {
+                        last = k;
+                        break;
+                    }
+                }
+                if (last < 0) {
+                    if (count == keyspaces.length) {
+                        keyspaces = Arrays.copyOf(keyspaces, 2 * count);
+                        puts = Arrays.copyOf(puts, 2 * count);
+                        keyBytes = Arrays.copyOf(keyBytes, 2 * count);
+                        ranges = Arrays.copyOf(ranges, 2 * count);
+                    }
+                    keyspaces[count] = keyspace;
+                    last = count++;
+                }
+            }
+            var kind = writes.kind(i);
+            if (kind == ArrayWriteBatch.PUT) {
+                puts[last]++;
+                keyBytes[last] += writes.keyLength(i);
+            } else if (kind == ArrayWriteBatch.DELETE_RANGE) {
+                ranges[last] = true;
+            }
+        }
+        // By key space: two equal instances of one name are one key space
+        var keyspaceStates = new KeyspaceState[count];
+        for (var k = 0; k < count; k++) {
+            var state = states.get(keyspaces[k].name());
+            keyspaceStates[k] = state;
+            for (var j = 0; j < k; j++) {
+                if (keyspaceStates[j] == state) {
+                    puts[j] += puts[k];
+                    keyBytes[j] += keyBytes[k];
+                    ranges[j] |= ranges[k];
+                    keyspaceStates[k] = null;
+                    break;
+                }
+            }
+        }
+        var planned = 0;
+        var chosen = new KeyspaceState[count];
+        var chosenPuts = new int[count];
+        var chosenKeyBytes = new long[count];
+        for (var k = 0; k < count; k++) {
+            var state = keyspaceStates[k];
+            if (state != null && puts[k] >= BULK_RUN_WRITES && !ranges[k] && bulkEligible(state, trees)) {
+                chosen[planned] = state;
+                chosenPuts[planned] = puts[k];
+                chosenKeyBytes[planned++] = keyBytes[k];
+            }
+        }
+        return planned == 0 ? null : new BulkPlan(Arrays.copyOf(chosen, planned), Arrays.copyOf(chosenPuts, planned),
+                Arrays.copyOf(chosenKeyBytes, planned));
+    }
+
+    /// {@return whether a bulk commit may keep its puts of new keys of `state` in a run, `trees` being the latest
+    /// trees: a paged key space with no run in memory, none of whose entries `trees` holds, with no range removal
+    /// stamped after them}
+    ///
+    /// No chain of a key the trees lack is then dropped before a newer tree holds its key: a key of the key space with
+    /// no chain, once every commit before the bulk commit has published, is one no tree and no commit holds.
+    private boolean bulkEligible(KeyspaceState state, TreeVersion trees) {
+        if (state.resident || state.run != null || trees != null && trees.root(state.id) != null) {
+            return false;
+        }
+        var treeBound = trees == null ? -1 : Reads.boundOf(trees.sequence);
+        for (var removal : state.removals) {
+            if (removal.stamp() > treeBound) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// The paged key spaces a batch may keep its puts of new keys of in runs, as a bulk commit.
+    ///
+    /// @param states the key spaces
+    /// @param puts the puts of the batch to each
+    /// @param keyBytes the bytes of the keys of those puts
+    record BulkPlan(KeyspaceState[] states, int[] puts, long[] keyBytes) {
+        /// {@return whether the batch may keep its puts of new keys of `state` in a run}
+        boolean covers(KeyspaceState state) {
+            for (var planned : states) {
+                if (planned == state) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    /// The run a bulk commit builds of its puts of new keys of one key space.
+    private static final class BulkRun {
+        private final KeyspaceState state;
+        private final PackedRun.Builder builder;
+        // The puts of the batch to the key space, the most the run takes
+        private final int planned;
+        // The entries the commit's record of values that may leave the heap lists, made at the first, or null
+        private SpillQueue.RunValues listed;
+
+        private BulkRun(KeyspaceState state, int planned, long keyBytes) {
+            this.state = state;
+            this.builder = new PackedRun.Builder(planned, keyBytes);
+            this.planned = planned;
         }
     }
 
@@ -2205,8 +2387,11 @@ public final class LiveLedger implements Ledger {
     /// Opening the chains here grows the ordered map of the key space, which a new key costs a walk down, before the
     /// turn.
     ///
+    /// The puts of the key spaces of `bulk` open no chain: a bulk commit keeps those of new keys in a run.
+    ///
+    /// @param bulk the key spaces the batch may keep its puts of new keys of in runs, or `null`
     /// @return how each write learns whether its key existed, or `null` if the store has no trees
-    private Hints prefetch(ArrayWriteBatch writes) {
+    private Hints prefetch(ArrayWriteBatch writes, BulkPlan bulk) {
         var trees = pages == null ? null : tree;
         var point = trees == null ? null : new ReadPoint(Reads.boundOf(latest()), trees, pages);
         var size = writes.size();
@@ -2214,7 +2399,7 @@ public final class LiveLedger implements Ledger {
         int[] missing = null;
         var misses = 0;
         for (var i = 0; i < size; i++) {
-            if (!prefetchWrite(writes, i, point, found)) {
+            if (!prefetchWrite(writes, i, point, found, bulk)) {
                 continue;
             }
             if (missing == null) {
@@ -2241,15 +2426,16 @@ public final class LiveLedger implements Ledger {
     ///
     /// @param point the latest trees, or `null` if the store has none
     /// @param found receives what the lookup found, or `null` if the store has no trees
+    /// @param bulk the key spaces whose puts open no chain, or `null`
     /// @return whether the lookup has to read the file
-    private boolean prefetchWrite(ArrayWriteBatch writes, int index, ReadPoint point, byte[] found) {
+    private boolean prefetchWrite(ArrayWriteBatch writes, int index, ReadPoint point, byte[] found, BulkPlan bulk) {
         var kind = writes.kind(index);
         if (kind != ArrayWriteBatch.PUT && kind != ArrayWriteBatch.DELETE) {
             return false;
         }
         var state = states.get(writes.keyspace(index).name());
         var key = writes.key(index);
-        var chain = kind == ArrayWriteBatch.PUT ? state.open(key) : state.chain(key);
+        var chain = kind == ArrayWriteBatch.PUT && (bulk == null || !bulk.covers(state)) ? state.open(key) : state.chain(key);
         if (found == null || chain != null && chain.head != null) {
             return false;
         }
@@ -2840,6 +3026,12 @@ public final class LiveLedger implements Ledger {
         private final boolean sharesChunk;
         // The range removals this commit counts after it is published, or null before any
         private ArrayList<PendingRanges.Removal> deferred;
+        // The runs of a bulk commit's puts of new keys, one per key space, or null for a commit that keeps none
+        private BulkRun[] bulkRuns;
+        // The puts the runs may take in all, which the commit's record of values lists apart from its versions
+        private int bulkPuts;
+        // The puts the runs took, which the log's estimate of the commit's heap counts as writes
+        private int runWrites;
         // Whether the publication of the commit listed them with their key spaces
         private boolean deferredListed;
         // The room for values of the record of the values the commit's puts keep on their batch's arrays, which may
@@ -3171,13 +3363,123 @@ public final class LiveLedger implements Ledger {
         /// Lists `version`, whose value of `length` bytes the commit's frame now ends with, among the values that may
         /// leave the heap for the log.
         private void listSpill(Version version, int length) {
+            // A put ends with its value, whether the frame copies it or refers to it
+            spillRecord().add(version, frame.size() - length, length);
+        }
+
+        /// {@return the record of the values of the commit that may leave the heap for the log, made at the first}
+        private SpillQueue.Record spillRecord() {
             var record = frame.spill();
             if (record == null) {
-                record = spills.record(sequence, spillRoom > 0 ? spillRoom : -1 - spillRoom);
+                // The puts the runs take list apart, in the runs' entries
+                record = spills.record(sequence, spillRoom > 0 ? Math.max(1, spillRoom - bulkPuts) : -1 - spillRoom);
                 frame.spill(record);
             }
-            // A put ends with its value, whether the frame copies it or refers to it
-            record.add(version, frame.size() - length, length);
+            return record;
+        }
+
+        /// Starts a run of the puts of new keys of each key space of `plan` that still qualifies
+        /// ([#bulkEligible(KeyspaceState, TreeVersion)]), now that the commit holds both roles.
+        void startRuns(BulkPlan plan) {
+            var trees = tree;
+            var started = 0;
+            var runs = new BulkRun[plan.states().length];
+            for (var i = 0; i < runs.length; i++) {
+                var state = plan.states()[i];
+                if (bulkEligible(state, trees)) {
+                    runs[started++] = new BulkRun(state, plan.puts()[i], plan.keyBytes()[i]);
+                    bulkPuts += plan.puts()[i];
+                }
+            }
+            bulkRuns = started == 0 ? null : Arrays.copyOf(runs, started);
+        }
+
+        /// {@return the run this commit keeps its puts of new keys of `state` in, or `null`}
+        BulkRun bulkRun(KeyspaceState state) {
+            var runs = bulkRuns;
+            if (runs == null) {
+                return null;
+            }
+            for (var run : runs) {
+                if (run.state == state) {
+                    return run;
+                }
+            }
+            return null;
+        }
+
+        /// Applies the put of write `index` of `writes`, of `key` and `value`, to the run `bulk`, if memory holds no chain
+        /// of the key nor the run an entry of it, and the value lies on a home of the batch the run can name.
+        ///
+        /// The commit runs alone, so a key memory holds no chain of is one no tree holds and no commit before wrote: the
+        /// put adds an entry, which it counts. The frame records the put as any other, and the commit's record of values
+        /// that may leave the heap lists its value as it would a version's.
+        ///
+        /// @param unit the unit of the file of large values of the put, or `null`
+        /// @return whether the run took the put; if not, the caller applies it to the key's chain
+        boolean putToRun(BulkRun bulk, KeyspaceState state, MemorySegment key, MemorySegment value, ArrayWriteBatch writes,
+                         int index, PageRef unit) {
+            if (unit != null || writes.ownValue(index) != null || writes.borrowed(index)) {
+                return false;
+            }
+            var length = Math.toIntExact(value.byteSize());
+            var home = writes.home(index);
+            if (home == null && length > 0) {
+                return false;
+            }
+            var offset = writes.homeOffset(index);
+            var builder = bulk.builder;
+            if (builder.size() >= bulk.planned || !builder.fits(key, home, offset, length)) {
+                return false;
+            }
+            var chain = state.chain(key);
+            if (chain != null && !chain.released() || builder.find(key) >= 0) {
+                return false;
+            }
+            var stamp = nextStamp();
+            var entry = builder.putHome(key, stamp, home, offset, length);
+            if (home != null && spillRoom != REPLAYED && (ValueSlab.Overwrites.sampled(stamp)
+                    || spillRoom >= ValueSlab.Overwrites.BULK_WRITES && !state.overwrites.judged())) {
+                state.overwrites.sample(null, length);
+            }
+            addDelta(state, 1);
+            runWrites++;
+            if (frame != null) {
+                var kept = writes.homeArray(index);
+                if (kept != null && length >= frame.referable()) {
+                    frame.put(state.id, key, kept, offset, length);
+                } else {
+                    frame.put(state.id, key, value);
+                }
+                if (spillRoom > 0 && home != null && state.overwrites.spills()) {
+                    if (bulk.listed == null) {
+                        bulk.listed = new SpillQueue.RunValues(bulk.planned);
+                    }
+                    // A put ends with its value, whether the frame copies it or refers to it
+                    spillRecord().addRun(bulk.listed, entry, (int) (stamp & Reads.MAX_OPS), frame.size() - length, length);
+                }
+            }
+            return true;
+        }
+
+        /// Builds the runs of the commit's puts of new keys and makes each part of its key space, before the commit's
+        /// sequence is visible: a reader below it does not read the run ([Reads#runOf(KeyspaceState, ReadPoint)]).
+        private void publishRuns() {
+            var runs = bulkRuns;
+            if (runs == null) {
+                return;
+            }
+            bulkRuns = null;
+            for (var bulk : runs) {
+                if (bulk.builder.isEmpty()) {
+                    continue;
+                }
+                var run = bulk.builder.buildCommitted(pages);
+                if (bulk.listed != null) {
+                    bulk.listed.run(run);
+                }
+                bulk.state.publishBulkRun(run);
+            }
         }
 
         void delete(KeyspaceState state, MemorySegment key) {
@@ -3353,20 +3655,21 @@ public final class LiveLedger implements Ledger {
             // Queued before it is visible, so the log holds every commit a reader can see, in order
             if (frame != null) {
                 try {
-                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size(), sharesChunk);
+                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size() + runWrites, sharesChunk);
                     logged = true;
                 } catch (RuntimeException exception) {
                     rollback();
                     throw exception;
                 }
             }
+            publishRuns();
             publishCounted();
         }
 
         /// Adds the commit's frame, if it is journaled, to `batch`.
         void queueFrame(LogWriter.Batch batch) {
             if (frame != null) {
-                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size(), sharesChunk);
+                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size() + runWrites, sharesChunk);
             }
         }
 
@@ -3376,6 +3679,7 @@ public final class LiveLedger implements Ledger {
         /// @param queued whether the batch is queued; `false` for a store with no log
         void publishQueued(boolean queued) {
             logged = queued && frame != null;
+            publishRuns();
             publishCounted();
             LATEST.setRelease(published, sequence);
         }
@@ -3441,6 +3745,9 @@ public final class LiveLedger implements Ledger {
         void rollback() {
             assert !logged : "a commit whose frame the log queued is taken back";
             discardFrame();
+            // Never published: no reader saw the runs, and the deltas that counted their puts go with the commit
+            bulkRuns = null;
+            runWrites = 0;
             for (var write : touched) {
                 var chain = write.chain();
                 var head = chain.head;

@@ -49,7 +49,9 @@ import java.util.function.LongSupplier;
 ///
 /// A paged key space of a store that crashed may also hold the writes its open replayed as a [PackedRun], which the
 /// readers of the tree the store opened from read as part of it ([Reads#runOf(KeyspaceState, ReadPoint)]), until every
-/// reader reads a later tree, which holds them.
+/// reader reads a later tree, which holds them. So may one a bulk commit wrote while its latest tree held none of its
+/// entries: the readers at or after the commit read that run as part of their trees, until every reader reads a tree
+/// that holds the commit.
 ///
 /// Readers use it concurrently with the commits. Commits create chains before they are given a sequence; everything
 /// else changes only under it.
@@ -96,8 +98,10 @@ final class KeyspaceState {
     // The writes whose effect on the count the trees settle
     final BlindWrites blind;
     /// The writes the open replayed into the key space as a run, which the readers of the tree the store opened from
-    /// read as part of it, or `null`: none was replayed, or every reader reads a later tree. Published by the open's
-    /// replay, before any reader exists, and cleared holding the publishing role.
+    /// read as part of it, or those of a bulk commit, which the readers at or after the commit read as part of their
+    /// trees; or `null`: none was replayed and no bulk commit made one, or every reader reads a tree that holds it.
+    /// Published by the open's replay, before any reader exists, or by the bulk commit, holding both roles before its
+    /// sequence is visible, and cleared holding the publishing role.
     volatile PackedRun run;
     // The change the run makes to the count, against the tree the store opened from: 0 without one, UNCOUNTED until
     // known. Kept once the run is gone, as the counts of the commits leave the run's writes out
@@ -1004,11 +1008,23 @@ final class KeyspaceState {
         this.run = run;
     }
 
+    /// Makes `run`, the puts of new keys a bulk commit counted as it applied them, part of the tree of every reader at
+    /// or after the commit; called by the commit, holding both roles, before its sequence is visible.
+    ///
+    /// The run makes no correction to the count, so what [#replayCorrection()] keeps of a replay's run stays as it is.
+    void publishBulkRun(PackedRun run) {
+        if (!run.committed()) {
+            throw new IllegalArgumentException("A run a replay made is no bulk commit's");
+        }
+        this.run = run;
+    }
+
     /// {@return the change the writes the open replayed as a run make to the count of the key space, against the tree
     /// the store opened from, counted at the first call; 0 if there are none}
     ///
     /// Only a reader of the tree the store opened from, or the checkpoint that merges the run into it, counts it: the
-    /// run is released once every reader reads a later tree, and only after it is counted.
+    /// run is released once every reader reads a later tree, and only after it is counted. A bulk commit's run, which
+    /// its commit counted, changes nothing here; what a replay's run released before it changed stays.
     long replayCorrection() {
         var correction = replayed;
         if (correction == UNCOUNTED) {
@@ -1022,7 +1038,7 @@ final class KeyspaceState {
     /// the checkpoint every reader's tree holds, and that tree holds the run; holding the publishing role.
     void releaseRun(long cutBound) {
         var current = run;
-        if (current != null && cutBound >= current.maxStamp() && replayed != UNCOUNTED) {
+        if (current != null && cutBound >= current.maxStamp() && (current.committed() || replayed != UNCOUNTED)) {
             run = null;
         }
     }

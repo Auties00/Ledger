@@ -703,6 +703,14 @@ public final class ArrayWriteBatch implements WriteBatch {
         return span(index, 0);
     }
 
+    /// {@return the bytes of the encoded key of write `index`, or of the lower bound of a range; 0 if a range has none}
+    ///
+    /// @param index the write
+    int keyLength(int index) {
+        Objects.checkIndex(index, size);
+        return spans[index * 4] == ABSENT ? 0 : (int) spans[index * 4 + 1];
+    }
+
     /// {@return the encoded value of write `index`, or the upper bound of a range; `null` for a removal of one key or a
     /// range without an upper bound}
     ///
