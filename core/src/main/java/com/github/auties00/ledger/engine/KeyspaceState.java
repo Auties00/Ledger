@@ -190,6 +190,12 @@ final class KeyspaceState {
         return index.holdsNone() ? null : index.get(key, Segments.hash(key));
     }
 
+    /// {@return the chain of `key`, whose hash is `hash` ([Segments#hash(MemorySegment)]), or `null` if memory holds
+    /// none}
+    Chain chain(MemorySegment key, int hash) {
+        return index.holdsNone() ? null : index.get(key, hash);
+    }
+
     /// {@return the bytes of the copies of the keys in the chunks of the key space's slab; for tests}
     ///
     /// @see KeySlab#usedForTests()
