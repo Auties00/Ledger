@@ -201,6 +201,17 @@ class LogSpillTest {
         return run.sourceForTests(entry);
     }
 
+    /// {@return whether the value of `key` lies on its batch's array: a version's segment, or a home of a bulk commit's
+    /// run}
+    private static boolean onHome(LiveLedger ledger, Keyspace<?, ?> keyspace, byte[] key) {
+        var version = head(ledger, keyspace, key);
+        if (version != null) {
+            return version.sourceForTests() instanceof MemorySegment;
+        }
+        var run = ledger.state(keyspace).run;
+        return run != null && run.onHomeForTests(run.find(MemorySegment.ofArray(key)));
+    }
+
     /// Checks every way a read returns the values of `expected`.
     private static void verify(Ledger ledger, Expected expected) {
         verifyView(ledger, expected);
@@ -1041,14 +1052,16 @@ class LogSpillTest {
             var logged = 0;
             var copied = 0;
             for (var message = 0; message < count; message++) {
-                var source = head(ledger, MESSAGES, key(message)).sourceForTests();
+                // The bulk commit keeps the values in its run: a short one moves to a chunk of the run's own
+                var source = source(ledger, MESSAGES, key(message));
                 if (message < ValueSlab.Overwrites.BULK_WRITES - 1) {
-                    assertInstanceOf(MemorySegment.class, source, "message " + message + " was listed before the judgement");
+                    assertTrue(onHome(ledger, MESSAGES, key(message)), "message " + message + " was listed before the judgement");
                 } else if (expected.messages.get(message).length >= SpillQueue.LOG_VALUE_MIN) {
                     assertInstanceOf(LogValue.class, source, "message " + message);
                     logged++;
                 } else {
-                    assertInstanceOf(byte[].class, source, "message " + message);
+                    assertInstanceOf(MemorySegment.class, source, "message " + message);
+                    assertFalse(onHome(ledger, MESSAGES, key(message)), "message " + message);
                     copied++;
                 }
             }
@@ -1087,7 +1100,7 @@ class LogSpillTest {
             spillNow(ledger);
             assertEquals(0, spills.loggedValuesForTests() + spills.copiedValuesForTests());
             for (var message = 0; message < count; message += 97) {
-                assertInstanceOf(MemorySegment.class, head(ledger, MESSAGES, key(message)).sourceForTests(), "message " + message);
+                assertTrue(onHome(ledger, MESSAGES, key(message)), "message " + message);
             }
             // Values of 700 bytes pay for the move of the rest: those of 120 bytes go to the log, those of 40 to arrays
             // of their own
@@ -1141,7 +1154,7 @@ class LogSpillTest {
             assertEquals(0, spills.copiedValuesForTests());
             assertInstanceOf(LogValue.class, head(ledger, MESSAGES, key(own)).sourceForTests());
             for (var message = 0; message < shorts; message += 97) {
-                assertInstanceOf(MemorySegment.class, head(ledger, MESSAGES, key(message)).sourceForTests(), "message " + message);
+                assertTrue(onHome(ledger, MESSAGES, key(message)), "message " + message);
             }
             verify(ledger, expected);
             ledger.checkpoint();

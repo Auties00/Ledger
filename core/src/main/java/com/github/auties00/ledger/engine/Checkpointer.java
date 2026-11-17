@@ -87,6 +87,9 @@ final class Checkpointer implements IdleTicker.Watched {
     private final LogFiles files;
     private final long every;
     private final ReentrantLock lock;
+    // What a checkpoint runs once it cut its commits, before it builds its trees, or null; for tests that commit there.
+    // Plain: set before the checkpoints start
+    private Runnable cutHookForTests;
     private final AtomicBoolean scheduled;
     // Whether a thread is finishing the sweep of the store
     private final AtomicBoolean sweeping;
@@ -278,6 +281,11 @@ final class Checkpointer implements IdleTicker.Watched {
         }
     }
 
+    /// Runs `hook` in each checkpoint once it cut its commits, before it builds its trees; for tests that commit there.
+    void hookCutForTests(Runnable hook) {
+        this.cutHookForTests = hook;
+    }
+
     /// {@return whether a checkpoint started on a thread of its own has not ended; for tests}
     boolean startedForTests() {
         return scheduled.get();
@@ -447,6 +455,10 @@ final class Checkpointer implements IdleTicker.Watched {
                     retire(log.nextOpenSegment(), SPARES);
                 }
                 return;
+            }
+            var hook = cutHookForTests;
+            if (hook != null) {
+                hook.run();
             }
             cutBytes = cut.logBytes();
             poolHold = pages.pool().hold();
@@ -637,7 +649,8 @@ final class Checkpointer implements IdleTicker.Watched {
     /// space ([PackedRun]) with the keys written since: a key's version at the cut wins over the run's entry, which
     /// is the key's state where no version is at or below the cut. The update records whether the tree held each key of
     /// the run, which counts the run's writes. A checkpoint that fails leaves the run to the next one, which merges it
-    /// again, over the same trees.
+    /// again, over the same trees. A checkpoint whose cut is at or after a bulk commit merges the commit's run the same
+    /// way, over trees older than the commit, which hold none of its keys; its commit counted it.
     ///
     /// @param adopted receives the units of the file of large values the trees take
     private TreeRoot[] build(LiveLedger.Cut cut, TreeUpdate update, Set<PageRef> adopted) throws IOException {
@@ -649,9 +662,10 @@ final class Checkpointer implements IdleTicker.Watched {
             // Listed in the order of their writes, off the publishing role: sorted here
             var chains = keyspace.dirty().toArray(Chain[]::new);
             ChainSort.sort(chains);
-            // The run the open replayed, if the trees the checkpoint updates are those the store opened from
+            // The run the open replayed, if the trees the checkpoint updates are those the store opened from, or a bulk
+            // commit's at or below the cut, if they are older than the commit
             var run = state.run;
-            if (run != null && run.maxStamp() <= treeBound) {
+            if (run != null && (run.maxStamp() <= treeBound || run.minStamp() > bound)) {
                 run = null;
             }
             var runEntries = run == null ? 0 : run.size();
