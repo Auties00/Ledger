@@ -5,6 +5,7 @@ import com.github.auties00.ledger.LedgerException;
 
 import java.lang.foreign.MemorySegment;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -30,8 +31,8 @@ import java.util.function.IntConsumer;
 ///
 /// An application's virtual threads may hold every carrier for as long as they compute, which nothing preempts, so the
 /// loader's thread may not start for as long: a write that waits for the loader then loads on its own thread instead,
-/// up to its key, and hands the rest to a new thread ([Attempt]); a close that stops the loader makes sure it never
-/// runs.
+/// once the thread has had [#START_GUARD_NANOS] to start, up to its key, and hands the rest to a new thread
+/// ([Attempt]); a close that stops the loader makes sure it never runs.
 final class ResidentLoader {
     /// The threads a loader running beside the store reads the leaves on.
     private static final int THREADS = 2;
@@ -39,6 +40,12 @@ final class ResidentLoader {
     /// the first use, and each run after takes twice as many, up to one [PageFile#readAll(List, byte, int)] call per
     /// thread.
     private static final int FIRST_RUN = 16;
+    /// How long a write waits for the thread of an attempt to start, from the attempt's launch, before it takes the
+    /// attempt: a thread just launched has seldom been scheduled yet, so writes that took an attempt at once would load
+    /// a part each on their own threads while the carriers are free, each part a walk of the tree from where the last
+    /// stopped. As long as the guard of a parked commit ([PendingCommit#PARK_NANOS]), and far more than a free carrier
+    /// takes to start a thread.
+    private static final long START_GUARD_NANOS = TimeUnit.MILLISECONDS.toNanos(50);
     private static final int IDLE = 0;
     private static final int RUNNING = 1;
     private static final int FAILED = 2;
@@ -126,8 +133,9 @@ final class ResidentLoader {
     /// Waits until memory holds the entry of `key`, if it has one, or every entry if `key` is `null`; starts the loader
     /// first, again if it failed.
     ///
-    /// If the thread of the attempt running has not started, it runs the attempt on the calling thread, up to `key`,
-    /// then starts a thread for the rest.
+    /// If the thread of the attempt running has not started within [#START_GUARD_NANOS] of its launch, it runs the
+    /// attempt on the calling thread, up to `key`, then starts a thread for the rest. The caller's interrupt status is
+    /// kept, and does not end the wait.
     ///
     /// @throws IllegalStateException if the store closes meanwhile
     /// @throws LedgerCorruptedException if the load it waited for failed, its failure as the cause: a new exception, so
@@ -138,6 +146,7 @@ final class ResidentLoader {
             return;
         }
         hurried = true;
+        var interrupted = false;
         lock.lock();
         try {
             var attempt = launch(true);
@@ -154,14 +163,25 @@ final class ResidentLoader {
                     continue;
                 }
                 var unstarted = current;
-                if (status == RUNNING && unstarted.take()) {
-                    lock.unlock();
-                    try {
-                        unstarted.perform(key);
-                    } finally {
-                        lock.lock();
+                if (status == RUNNING && !unstarted.claimed()) {
+                    var left = unstarted.launched + START_GUARD_NANOS - System.nanoTime();
+                    if (left > 0) {
+                        try {
+                            progress.awaitNanos(left);
+                        } catch (InterruptedException _) {
+                            interrupted = true;
+                        }
+                        continue;
                     }
-                    continue;
+                    if (unstarted.take()) {
+                        lock.unlock();
+                        try {
+                            unstarted.perform(key);
+                        } finally {
+                            lock.lock();
+                        }
+                        continue;
+                    }
                 }
                 progress.awaitUninterruptibly();
             }
@@ -174,6 +194,9 @@ final class ResidentLoader {
             }
         } finally {
             lock.unlock();
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -436,10 +459,13 @@ final class ResidentLoader {
         private final AtomicBoolean claimed;
         // Released once the attempt ended, its failure reported, or once it was cancelled
         private final CountDownLatch done;
+        // When the attempt was made, just before its thread was started, in nanoseconds
+        private final long launched;
 
         private Attempt() {
             this.claimed = new AtomicBoolean();
             this.done = new CountDownLatch(1);
+            this.launched = System.nanoTime();
         }
 
         /// Loads every entry, on the attempt's own thread, unless the attempt was taken or cancelled.
@@ -448,6 +474,11 @@ final class ResidentLoader {
             if (take() && perform(null) instanceof Error error) {
                 throw error;
             }
+        }
+
+        /// {@return whether the attempt was taken or cancelled}
+        boolean claimed() {
+            return claimed.get();
         }
 
         /// {@return whether the caller took the attempt, which it then runs with [#perform(MemorySegment)]}

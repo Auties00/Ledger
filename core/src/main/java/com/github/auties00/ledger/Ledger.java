@@ -96,13 +96,14 @@ import java.util.function.Consumer;
 /// the pages of the trees its writes need, which the cache does not hold, on the calling thread and on virtual threads
 /// of its own that help it, before it waits for the writer. A thread that waits for the work of one of the store's
 /// virtual threads does that work itself if the thread has not started, so an application's virtual threads holding
-/// every carrier hold up no commit, open or read of a caller on a platform thread. On Windows a commit whose thread
-/// writes its own group through to stable storage holds a virtual thread's carrier while the device takes the write,
-/// as the JDK lends a carrier only for its own blocking calls. The entries of a
-/// [resident][Keyspace.Residency#RESIDENT] key space are read into memory on virtual threads of the store's own, from
-/// the first use of the key space after the store opens, unless [Options#loadResidentAtOpen(boolean)] has the open
-/// read them. The store counts the entries a batch's range removal takes away on a virtual thread of its own, after
-/// the commit.
+/// every carrier before such a thread starts hold up no commit, open or read of a caller on a platform thread; one
+/// that started and then parks, as on a lock another thread holds, needs a carrier again to finish its work, and holds
+/// up whatever waits for it until one is free. On Windows a commit whose thread writes its own group through to stable
+/// storage holds a virtual thread's carrier while the device takes the write, as the JDK lends a carrier only for its
+/// own blocking calls. The entries of a [resident][Keyspace.Residency#RESIDENT] key space are read into memory on
+/// virtual threads of the store's own, from the first use of the key space after the store opens, unless
+/// [Options#loadResidentAtOpen(boolean)] has the open read them. The store counts the entries a batch's range removal
+/// takes away on a virtual thread of its own, after the commit.
 ///
 /// # Lifecycle
 /// A store holds an exclusive lock on its directory from [Options#build()] until [#close()]: one process, and one

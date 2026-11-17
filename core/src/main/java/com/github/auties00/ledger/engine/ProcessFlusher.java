@@ -12,15 +12,18 @@ import java.util.concurrent.locks.LockSupport;
 /// The flush threads the stores opened without a pool share: daemon platform threads named `ledger-io-N`, made as
 /// flushes need them and ended after [#KEEP_ALIVE_SECONDS] without one, so a process holding many idle stores holds
 /// few threads, and none once they have been idle that long. No store closes it. Every store, with a pool or not,
-/// forces its file of large values on them too, beside the flush that waits for the force.
+/// gives them the forces of its file of large values too, beside the flush that waits for the force; a flush the
+/// store's executor runs does a force itself if no thread has started it yet, so a thread mostly forces the file for a
+/// commit that writes its own group.
 ///
 /// Each store's log runs its flushes on a lane of its own ([#lane()]), and the forces of its file of large values on
-/// another, which holds a thread while it has a task to run and gives it back once it has none. A flush given to a lane that holds a thread, running a flush or about to,
-/// costs its caller one atomic add: the thread runs it next, as the thread of a pool of the store's own would take it
-/// from its queue, and nothing waits for a thread to come back or makes one. A flush given to a lane that holds none
-/// takes the thread that waited the least, which for one busy store is the thread of its last flush, and only when
-/// every thread runs another store's flushes is a thread made, on the caller's thread. A store's log runs one flush at
-/// a time, so the flusher holds a thread per store flushing at the same moment.
+/// another; a lane holds a thread while it has a task to run and gives it back once it has none. A task given to a
+/// lane that holds a thread, running a task or about to, costs its caller one atomic add: the thread runs it next, as
+/// the thread of a pool of the store's own would take it from its queue, and nothing waits for a thread to come back
+/// or makes one. A task given to a lane that holds none takes the thread that waited the least, which for one busy
+/// store is the thread of its last flush, and only when every thread runs another lane's tasks is a thread made, on
+/// the caller's thread. A lane runs one task at a time, so the flusher holds a thread per lane busy at the same
+/// moment.
 ///
 /// It is safe for concurrent use.
 final class ProcessFlusher {
@@ -66,12 +69,13 @@ final class ProcessFlusher {
     /// {@return a new lane, the executor of one store's flushes, or of the forces of its file of large values}
     ///
     /// A lane runs one task at a time, and runs again after every task given to it: the tasks given while one runs, or
-    /// waits for its thread, are run once after it, as the last of them given. Every task of a log is its flush, which
-    /// writes whatever the queue holds when it runs, so one run serves every flush given before it starts; a force of
-    /// the file of large values is given only once the one before it is done. A task that
-    /// throws is reported to its thread's uncaught exception handler, and the lane goes on. A task the lane cannot get a
-    /// thread for is refused with [RejectedExecutionException], and the tasks given while it was refused are dropped
-    /// with it: the log stops on the refusal.
+    /// waits for its thread, are run once after it, as the last of them given. A flush writes whatever the queue holds
+    /// when it runs, so one run serves every flush given before it starts; a force of the file of large values is given
+    /// only once the one before it is done, so none is left behind. A task that throws is reported to its thread's
+    /// uncaught exception handler, and the lane goes on. A task the lane cannot get a thread for is refused with
+    /// [RejectedExecutionException], and the tasks given while it was refused are dropped with it: the log stops on a
+    /// refused flush, and runs a refused force on the thread that gave it, or on a virtual thread for a commit that
+    /// writes its own group.
     Executor lane() {
         return new Lane(this);
     }
@@ -121,7 +125,7 @@ final class ProcessFlusher {
         try {
             var thread = factory.newThread(started);
             if (thread == null) {
-                throw new RejectedExecutionException("No thread could be made for a flush");
+                throw new RejectedExecutionException("No thread could be made for a task");
             }
             started.thread = thread;
             thread.start();
@@ -130,12 +134,12 @@ final class ProcessFlusher {
                 threads--;
             }
             throw failure instanceof RejectedExecutionException rejected ? rejected
-                    : new RejectedExecutionException("No thread could be started for a flush", failure);
+                    : new RejectedExecutionException("No thread could be started for a task", failure);
         }
     }
 
-    /// The executor of one store's flushes: a count of the tasks given since its thread last looked, 0 while it holds
-    /// no thread.
+    /// The executor of one store's flushes, or of the forces of its file of large values: a count of the tasks given
+    /// since its thread last looked, 0 while it holds no thread.
     private static final class Lane implements Executor {
         private static final VarHandle REQUESTS;
 
