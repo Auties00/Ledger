@@ -462,8 +462,11 @@ class CheckpointTest {
                 }
                 ledger.commit(batch);
                 var live = (LiveLedger) ledger;
-                assertEquals(5_000, live.state(MESSAGES).chains());
+                // A bulk commit into an empty key space keeps its puts in a run, not on chains
+                assertEquals(0, live.state(MESSAGES).chains());
+                assertEquals(5_000, live.state(MESSAGES).run.size());
                 ledger.checkpoint();
+                assertNull(live.state(MESSAGES).run, "the run outlived the checkpoint that took it");
                 // The next commit's maintenance and the checkpoint's pruning drop what the tree holds
                 ledger.commit(ledger.newBatch().put(MESSAGES, "after", "x"));
                 assertTrue(live.state(MESSAGES).chains() <= 1, () -> live.state(MESSAGES).chains() + " chains in memory");

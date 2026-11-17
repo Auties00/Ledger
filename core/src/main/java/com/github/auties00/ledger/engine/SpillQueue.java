@@ -54,6 +54,9 @@ import java.util.zip.CRC32C;
 ///   byte values, allocates about as much as it frees and makes the next checkpoint read the long ones back from the
 ///   log. The commit's values on arrays of their own move all the same, each freeing its array for a [LogValue].
 ///
+/// The puts a bulk commit keeps in a run of its own ([PackedRun]) list in its record as the run's entries rather than as
+/// versions, and move as a version's value would, each by one switch of the entry's word ([RunValues]).
+///
 /// A recovery moves a value it replays that the log holds before its last budget of bytes at once, on its own thread,
 /// tagged where it lies in the frame body it came in
 /// ([#moveReplayed(Crypto, Version, LogSegmentView, long, int, byte\[\])]), so no version keeps a body past its commit
@@ -262,7 +265,7 @@ final class SpillQueue {
     /// Queues `record`, of a published commit after every one queued, and starts moving values if the queue is over
     /// its budget.
     void add(Record record) {
-        if (record.count == 0) {
+        if (record.count == 0 && record.runs == null) {
             return;
         }
         var settled = record.settle();
@@ -364,6 +367,12 @@ final class SpillQueue {
         } finally {
             giveBack(crypto);
         }
+    }
+
+    /// Moves the values of every record whose commit `durableSequence` gives durable, whatever the budget, on the
+    /// caller's thread; for tests.
+    void drainAllForTests(LongSupplier durableSequence) {
+        drain(durableSequence, -1);
     }
 
     /// Drops the records of the commits up to `cut`, which a checkpoint just published holds, and records that it holds
@@ -525,6 +534,8 @@ final class SpillQueue {
         // Where each value starts in the body of its commit
         private int[] offsets;
         private int count;
+        // The entries of the runs of the commit's bulk puts it lists, a run's at a time, or null before the first
+        private RunValues[] runs;
         /// The verdict of [#settle()] that every value of the record may move.
         static final int ALL = 0;
         /// The verdict of [#settle()] that only the record's values on arrays of their own may move.
@@ -578,6 +589,34 @@ final class SpillQueue {
                 sharedBytes += length;
                 sharedMoved += length >= LOG_VALUE_MIN ? LOG_VALUE_BYTES : (ARRAY_HEADER + length + 7) & -8;
             }
+        }
+
+        /// Lists `entry` of the run `values` names, whose value of `length` bytes starts at `offset` of the commit's
+        /// body, the write `op` of the commit's batch, on an array other values share.
+        void addRun(RunValues values, int entry, int op, int offset, int length) {
+            if (runs == null) {
+                runs = new RunValues[]{values};
+            } else if (runs[runs.length - 1] != values && !lists(values)) {
+                // One per key space a bulk commit keeps a run of, which the writes of a batch may interleave
+                runs = Arrays.copyOf(runs, runs.length + 1);
+                runs[runs.length - 1] = values;
+            }
+            values.add(entry, op, offset);
+            bytes += length;
+            large |= length >= LOG_VALUE_MIN;
+            shortest = Math.min(shortest, length);
+            sharedBytes += length;
+            sharedMoved += length >= LOG_VALUE_MIN ? LOG_VALUE_BYTES : (ARRAY_HEADER + length + 7) & -8;
+        }
+
+        // Whether the record lists entries of the run `values` names already
+        private boolean lists(RunValues values) {
+            for (var listed : runs) {
+                if (listed == values) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /// Records where the log wrote the frame of the commit: at `frameOffset` of the use `segment`, the commit's body
@@ -649,6 +688,12 @@ final class SpillQueue {
                         }
                     }
                 }
+                // On arrays other values share, so they stay when only the values on arrays of their own move
+                for (var i = 0; runs != null && !ownOnly && i < runs.length; i++) {
+                    var moved = runs[i].spill(crypto, segment, frameOffset, commitStart, frameBody, sequence);
+                    logged += moved[0];
+                    copied += moved[1];
+                }
                 queue.loggedValues.addAndGet(logged);
                 queue.copiedValues.addAndGet(copied);
             }
@@ -660,6 +705,53 @@ final class SpillQueue {
             versions = null;
             offsets = null;
             count = 0;
+            runs = null;
+        }
+    }
+
+    /// The entries of the run of a bulk commit's puts to one key space that a [Record] lists: where each value starts in
+    /// the commit's body and the position of its write in the batch, which its tag binds.
+    ///
+    /// Filled while the commit applies, before its run is built; the commit gives it the run before it queues the record.
+    static final class RunValues {
+        private PackedRun run;
+        private int[] entries;
+        private int[] offsets;
+        private int[] ops;
+        private int count;
+
+        /// Creates the list of the entries of a run, with room for `capacity` of them.
+        RunValues(int capacity) {
+            var room = Math.max(1, capacity);
+            this.entries = new int[room];
+            this.offsets = new int[room];
+            this.ops = new int[room];
+        }
+
+        private void add(int entry, int op, int offset) {
+            if (count == entries.length) {
+                entries = Arrays.copyOf(entries, 2 * count);
+                offsets = Arrays.copyOf(offsets, 2 * count);
+                ops = Arrays.copyOf(ops, 2 * count);
+            }
+            entries[count] = entry;
+            offsets[count] = offset;
+            ops[count++] = op;
+        }
+
+        /// Names the run the entries are of, built once the commit applied.
+        void run(PackedRun run) {
+            this.run = run;
+        }
+
+        /// {@return the values moved to the log and to a chunk, in this order: the run's [PackedRun#spill]}
+        private int[] spill(Crypto crypto, LogSegmentView segment, long frameOffset, int commitStart, int frameBody,
+                            long sequence) {
+            var target = run;
+            if (target == null || count == 0) {
+                return new int[2];
+            }
+            return target.spill(crypto, segment, frameOffset, commitStart, frameBody, sequence, entries, offsets, ops, count);
         }
     }
 

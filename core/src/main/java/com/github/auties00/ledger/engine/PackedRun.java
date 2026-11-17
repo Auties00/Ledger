@@ -2,6 +2,8 @@ package com.github.auties00.ledger.engine;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.Arrays;
 
@@ -33,8 +35,20 @@ import java.util.Arrays;
 /// the dirty and blind lists, and a node of the ordered map once scanned, about 300 bytes over its key and value, takes
 /// about 50 here.
 ///
-/// Immutable once built, so readers use it without synchronization; [#correction()] and the tree lookups it caches
-/// take a lock of their own.
+/// A bulk commit makes a run too ([#committed()]): the puts of new keys of a paged key space whose latest tree holds
+/// none of its entries, at least [LiveLedger#BULK_RUN_WRITES] of them in one batch, which the commit counts as it
+/// applies them, so the run makes no [#correction()] to the count. Such a run is part of the tree of every reader at or
+/// after its commit ([#minStamp()]) and of none before, until a checkpoint at or after the commit takes it, as every
+/// checkpoint after an open takes a replay's. Its values lie where the batch put them, on the arrays the commit's
+/// versions would have sliced (its homes), until the queue of values that may leave the heap moves them as it moves
+/// the values of versions ([#spill]): a value of at least [SpillQueue#LOG_VALUE_MIN] bytes to the log, a shorter one
+/// to a chunk of the run's own. Once no entry is on a home any more, the run lets go of it. The order of the keys of
+/// such a run is made at the first scan, count or checkpoint that needs it, not by the commit.
+///
+/// Immutable once built but for the place of the values of a bulk commit's run, which the spill switches with one
+/// release store of the entry's word after it published where the value went, so readers use it without
+/// synchronization: every read of a word is an acquire. [#correction()], the tree lookups it caches and the order of
+/// the keys made late take a lock of their own.
 final class PackedRun {
     /// The entries a run holds at most: the low bits of a slot of the hash table hold an entry's index plus one.
     static final int MAX_ENTRIES = (1 << 24) - 2;
@@ -44,16 +58,27 @@ final class PackedRun {
     static final int MAX_VALUE_LENGTH = (1 << 30) - 1;
     /// The bytes the keys of a run take at most, all in one array whose length doubles as the builder grows.
     static final int MAX_KEY_BYTES = 1 << 30;
+    /// The longest value of a bulk commit's run on its home: the bits of the word of an entry that hold its length.
+    static final int MAX_HOME_LENGTH = (1 << 20) - 1;
+    /// The farthest a value of a bulk commit's run starts in its home: the bits of the word that hold its offset.
+    static final int MAX_HOME_OFFSET = (1 << 21) - 1;
+    /// The homes a bulk commit's run may have at most: the bits of the word that hold the index of a value's home.
+    static final int MAX_HOMES = 1 << 20;
     // The kind and place of a value, in the word of an entry: the sign bit for a removal; then a bit for a value in the
-    // log, whose length and index among the logged values follow; otherwise the length, the chunk and the offset of a
-    // value in a chunk of the replay
+    // log, whose length and index among the logged values follow; then a bit for a value on a home of a bulk commit's
+    // run, whose home, offset and length follow; otherwise the length, the chunk and the offset of a value in a chunk
     private static final long REMOVES = 1L << 63;
     private static final long LOGGED = 1L << 62;
+    private static final long HOME = 1L << 61;
     private static final int OFFSET_BITS = 20;
     private static final int CHUNK_BITS = 24;
     private static final int LENGTH_SHIFT = OFFSET_BITS + CHUNK_BITS;
-    private static final long LENGTH_MASK = (1L << (62 - LENGTH_SHIFT)) - 1;
+    private static final long LENGTH_MASK = (1L << (61 - LENGTH_SHIFT)) - 1;
     private static final long LOGGED_LENGTH_MASK = (1L << 30) - 1;
+    private static final int HOME_OFFSET_SHIFT = 20;
+    private static final int HOME_INDEX_SHIFT = 41;
+    private static final VarHandle WORDS = MethodHandles.arrayElementVarHandle(long[].class);
+    private static final VarHandle HOMES = MethodHandles.arrayElementVarHandle(MemorySegment[].class);
     // A value's place in the log: the index of its segment in the table above the bits of where its frame starts
     private static final int FRAME_BITS = 48;
     private static final long FRAME_MASK = (1L << FRAME_BITS) - 1;
@@ -63,7 +88,8 @@ final class PackedRun {
     private static final MemorySegment EMPTY = MemorySegment.ofArray(new byte[0]).asReadOnly();
 
     static {
-        if (ReplayValues.CHUNK_BYTES > 1 << OFFSET_BITS || SpillQueue.LOG_VALUE_MIN > LENGTH_MASK) {
+        if (ReplayValues.CHUNK_BYTES > 1 << OFFSET_BITS || SpillQueue.LOG_VALUE_MIN > LENGTH_MASK
+                || ArrayWriteBatch.CHUNK_BYTES > 1 << OFFSET_BITS) {
             throw new ExceptionInInitializerError("A value in a chunk does not fit the word of its entry");
         }
     }
@@ -73,73 +99,111 @@ final class PackedRun {
     private final int[] keyEnds;
     // A read-only view of `keys`, which the slices of a key are made of
     private final MemorySegment keyView;
-    // The kind and place of each entry's value
+    // The kind and place of each entry's value, read with an acquire: the spill of a bulk commit's run switches it
     private final long[] values;
-    // The read-only views of the replay's chunks the short values lie in
-    private final MemorySegment[] chunks;
-    // Per logged value: the stamp of its write, which its tag binds; the segment index and frame offset; where it lies in
-    // the frame's body; and its tag ([LogValue])
-    private final long[] logStamps;
-    private final long[] logPlaces;
-    private final int[] logBodies;
-    private final long[] tagHighs;
-    private final int[] tagLows;
-    private final LogSegmentView[] segments;
+    // The chunks and the places in the log the values lie in; replaced, by the spill of a bulk commit's run alone, before
+    // any word refers to what it adds
+    private volatile Places places;
+    // The read-only views of the arrays a bulk commit put the values of its run on, by the index a word holds; an
+    // element is set to null, with a release store, once no word refers to it. Null for a replay's run
+    private final MemorySegment[] homes;
+    // Per home, the entries whose value is still on it; written by the spill alone
+    private final int[] homeEntries;
     // Open addressing on the hash of the keys, at most three quarters full
     private final int[] slots;
-    // The entries in the order of their keys
-    private final int[] order;
+    // The entries in the order of their keys; null until the first need for a bulk commit's run
+    private volatile int[] order;
     private final int size;
-    // The stamp of the newest write the run holds: a reader whose tree is at or above it reads the tree alone
+    // The stamps of the oldest and of the newest write the run holds: a reader below the oldest does not read the run,
+    // and one whose tree is at or above the newest reads the tree alone
+    private final long minStamp;
     private final long maxStamp;
+    // Whether the commit that made the run counted its writes, as a bulk commit does
+    private final boolean committed;
     // The root of the key space's tree the store opened from, or null, and the file it is in: what the run's writes are
     // counted against
     private final TreeRoot base;
     private final PageFile pages;
-    // Guards the lookups of the keys in `base` that the count of the run makes
+    // Guards the lookups of the keys in `base` that the count of the run makes, and the late sort of a bulk commit's run
     private final Object lock;
     // Per entry, whether `base` holds its key, as TreeSearch.FOUND or ABSENT, or UNKNOWN; made at the first need
     private volatile byte[] inBase;
 
-    /// Creates the run of the writes `builder` recorded, which lets go of its arrays as it copies each, so the arrays
-    /// the builder grew and their trimmed copies are never all live at once.
-    private PackedRun(Builder builder, TreeRoot base, PageFile pages) {
+    /// Creates the run of the writes `builder` recorded, which lets go of its arrays as it hands each over, so the arrays
+    /// the builder grew and their trimmed copies are never all live at once; an array the builder filled exactly is
+    /// handed over as it is.
+    ///
+    /// @param committed whether the writes are a bulk commit's, which counted them and whose order is made late
+    private PackedRun(Builder builder, TreeRoot base, PageFile pages, boolean committed) {
         var size = builder.size;
         this.size = size;
-        this.keys = Arrays.copyOf(builder.keys, builder.keyBytes);
+        this.keys = trim(builder.keys, builder.keyBytes);
         builder.keys = null;
-        this.keyEnds = Arrays.copyOf(builder.keyEnds, size);
+        this.keyEnds = trim(builder.keyEnds, size);
         builder.keyEnds = null;
         this.keyView = MemorySegment.ofArray(keys).asReadOnly();
-        this.values = Arrays.copyOf(builder.values, size);
+        this.values = trim(builder.values, size);
         builder.values = null;
-        this.chunks = builder.chunks.toArray(MemorySegment[]::new);
         var logged = builder.logged;
-        this.logStamps = Arrays.copyOf(builder.logStamps, logged);
+        this.places = new Places(builder.chunks.toArray(MemorySegment[]::new), trim(builder.logStamps, logged),
+                trim(builder.logPlaces, logged), trim(builder.logBodies, logged), trim(builder.tagHighs, logged),
+                trim(builder.tagLows, logged), builder.segments.toArray(LogSegmentView[]::new));
         builder.logStamps = null;
-        this.logPlaces = Arrays.copyOf(builder.logPlaces, logged);
         builder.logPlaces = null;
-        this.logBodies = Arrays.copyOf(builder.logBodies, logged);
         builder.logBodies = null;
-        this.tagHighs = Arrays.copyOf(builder.tagHighs, logged);
         builder.tagHighs = null;
-        this.tagLows = Arrays.copyOf(builder.tagLows, logged);
         builder.tagLows = null;
-        this.segments = builder.segments.toArray(LogSegmentView[]::new);
+        if (builder.homes == null) {
+            this.homes = committed ? new MemorySegment[0] : null;
+            this.homeEntries = committed ? new int[0] : null;
+        } else {
+            this.homes = builder.homes.toArray(MemorySegment[]::new);
+            this.homeEntries = Arrays.copyOf(builder.homeEntries, homes.length);
+            builder.homes = null;
+            builder.homeEntries = null;
+        }
         // Kept as the builder filled it: the entries keep their indexes, and the table is at most three quarters full
         this.slots = builder.slots;
         builder.slots = null;
+        this.minStamp = builder.minStamp;
         this.maxStamp = builder.maxStamp;
+        this.committed = committed;
         this.base = base;
         this.pages = pages;
         this.lock = new Object();
-        this.order = sortedOrder();
+        this.order = committed ? null : sortedOrder();
+    }
+
+    private static byte[] trim(byte[] array, int length) {
+        return array.length == length ? array : Arrays.copyOf(array, length);
+    }
+
+    private static int[] trim(int[] array, int length) {
+        return array.length == length ? array : Arrays.copyOf(array, length);
+    }
+
+    private static long[] trim(long[] array, int length) {
+        return array.length == length ? array : Arrays.copyOf(array, length);
+    }
+
+    /// {@return the stamp of the oldest write the run holds}
+    ///
+    /// A reader below it reads no write of the run: only a bulk commit's run has readers older than its writes, and
+    /// they see none of the commit.
+    long minStamp() {
+        return minStamp;
+    }
+
+    /// {@return whether the commit that made the run counted its writes, so the run makes no [#correction()] to the
+    /// count of its key space: a bulk commit's run}
+    boolean committed() {
+        return committed;
     }
 
     /// {@return the stamp of the newest write the run holds}
     ///
     /// A reader takes the run as part of its tree while that tree's bound is below it: then the tree is the one the
-    /// store opened from, or there is none.
+    /// store opened from, or one older than the bulk commit that made the run, or there is none.
     long maxStamp() {
         return maxStamp;
     }
@@ -193,7 +257,12 @@ final class PackedRun {
 
     /// {@return whether `entry` removes its key}
     boolean removes(int entry) {
-        return values[entry] < 0;
+        return word(entry) < 0;
+    }
+
+    // The word of `entry`, as the last switch of a spill left it
+    private long word(int entry) {
+        return (long) WORDS.getAcquire(values, entry);
     }
 
     /// {@return the key of `entry`, a read-only slice of the run's keys}
@@ -208,7 +277,7 @@ final class PackedRun {
         return Segments.compare(keys, start, keyEnds[entry] - start, key);
     }
 
-    /// {@return the value of `entry`, which puts its key, read-only: a slice of a chunk of the replay, or read from the
+    /// {@return the value of `entry`, which puts its key, read-only: a slice of a chunk or of a home, or read from the
     /// log into an array of its own}
     ///
     /// @throws IllegalStateException if the value is in a log segment a checkpoint retired, which only a reader of a
@@ -216,49 +285,89 @@ final class PackedRun {
     /// @throws com.github.auties00.ledger.LedgerIoException if the value is in the log and cannot be read
     /// @throws com.github.auties00.ledger.LedgerCorruptedException if the value is in the log and the log changed
     MemorySegment value(int entry) {
-        var value = values[entry];
-        if ((value & LOGGED) != 0) {
-            return MemorySegment.ofArray(readLogged(value)).asReadOnly();
+        var value = word(entry);
+        while (true) {
+            if ((value & LOGGED) != 0) {
+                return MemorySegment.ofArray(readLogged(value)).asReadOnly();
+            }
+            if ((value & HOME) != 0) {
+                var home = home(value);
+                if (home == null) {
+                    // Every value on it moved before the run let go of it: the word says where this one went
+                    value = word(entry);
+                    continue;
+                }
+                return home.asSlice(homeOffset(value), homeLength(value));
+            }
+            var length = (int) ((value >>> LENGTH_SHIFT) & LENGTH_MASK);
+            if (length == 0) {
+                return EMPTY;
+            }
+            return places.chunks()[chunkOf(value)].asSlice(value & ((1L << OFFSET_BITS) - 1), length);
         }
-        var length = (int) ((value >>> LENGTH_SHIFT) & LENGTH_MASK);
-        if (length == 0) {
-            return EMPTY;
-        }
-        return chunks[chunkOf(value)].asSlice(value & ((1L << OFFSET_BITS) - 1), length);
     }
 
     /// {@return the value of `entry`, which puts its key, in a new array}
     ///
     /// @throws IllegalStateException as [#value(int)] does
     byte[] valueBytes(int entry) {
-        var value = values[entry];
-        if ((value & LOGGED) != 0) {
-            return readLogged(value);
+        var value = word(entry);
+        while (true) {
+            if ((value & LOGGED) != 0) {
+                return readLogged(value);
+            }
+            MemorySegment source;
+            long offset;
+            int length;
+            if ((value & HOME) != 0) {
+                source = home(value);
+                if (source == null) {
+                    value = word(entry);
+                    continue;
+                }
+                offset = homeOffset(value);
+                length = homeLength(value);
+            } else {
+                length = (int) ((value >>> LENGTH_SHIFT) & LENGTH_MASK);
+                source = length == 0 ? null : places.chunks()[chunkOf(value)];
+                offset = value & ((1L << OFFSET_BITS) - 1);
+            }
+            var copy = new byte[length];
+            if (length > 0) {
+                MemorySegment.copy(source, ValueLayout.JAVA_BYTE, offset, copy, 0, length);
+            }
+            return copy;
         }
-        var length = (int) ((value >>> LENGTH_SHIFT) & LENGTH_MASK);
-        var copy = new byte[length];
-        if (length > 0) {
-            MemorySegment.copy(chunks[chunkOf(value)], ValueLayout.JAVA_BYTE, value & ((1L << OFFSET_BITS) - 1), copy, 0, length);
-        }
-        return copy;
     }
 
-    /// {@return the version a checkpoint writes for `entry`, made for the call: a version of its value in a chunk, or in
-    /// the log under the stamp its tag binds; `null` for a removal}
+    /// {@return the version a checkpoint writes for `entry`, made for the call: a version of its value in a chunk or on
+    /// a home, or in the log under the stamp its tag binds; `null` for a removal}
     Version version(int entry) {
-        var value = values[entry];
-        if (value < 0) {
-            return null;
+        var value = word(entry);
+        while (true) {
+            if (value < 0) {
+                return null;
+            }
+            if ((value & LOGGED) != 0) {
+                var index = (int) value;
+                var places = this.places;
+                return Version.ofLogged(places.logStamps()[index], logged(places, index),
+                        (int) ((value >>> 32) & LOGGED_LENGTH_MASK));
+            }
+            if ((value & HOME) != 0) {
+                var home = home(value);
+                if (home == null) {
+                    value = word(entry);
+                    continue;
+                }
+                return new Version(0, home, homeOffset(value), homeLength(value), null, null);
+            }
+            var length = (int) ((value >>> LENGTH_SHIFT) & LENGTH_MASK);
+            if (length == 0) {
+                return new Version(0, EMPTY, null, null);
+            }
+            return new Version(0, places.chunks()[chunkOf(value)], (int) (value & ((1L << OFFSET_BITS) - 1)), length, null, null);
         }
-        if ((value & LOGGED) != 0) {
-            var index = (int) value;
-            return Version.ofLogged(logStamps[index], logged(index), (int) ((value >>> 32) & LOGGED_LENGTH_MASK));
-        }
-        var length = (int) ((value >>> LENGTH_SHIFT) & LENGTH_MASK);
-        if (length == 0) {
-            return new Version(0, EMPTY, null, null);
-        }
-        return new Version(0, chunks[chunkOf(value)], (int) (value & ((1L << OFFSET_BITS) - 1)), length, null, null);
     }
 
     /// {@return a chain of the key of `entry` that holds a slice of the run's keys, made for a checkpoint, which keys
@@ -273,6 +382,7 @@ final class PackedRun {
         if (key == null) {
             return 0;
         }
+        var order = order();
         var low = 0;
         var high = size;
         while (low < high) {
@@ -288,7 +398,22 @@ final class PackedRun {
 
     /// {@return the entry at `position` of the key order}
     int entryAt(int position) {
-        return order[position];
+        return order()[position];
+    }
+
+    /// {@return the entries in the order of their keys, sorted at the first call for a bulk commit's run}
+    private int[] order() {
+        var sorted = order;
+        if (sorted == null) {
+            synchronized (lock) {
+                sorted = order;
+                if (sorted == null) {
+                    sorted = sortedOrder();
+                    order = sorted;
+                }
+            }
+        }
+        return sorted;
     }
 
     /// {@return the array a checkpoint records in whether the tree the store opened from holds each entry's key, as it
@@ -333,6 +458,7 @@ final class PackedRun {
     // The change the entries at positions first to last, excluded, of the key order make to the count of `base`
     private long countBetween(int first, int last) {
         var known = settles();
+        var order = order();
         var total = 0L;
         synchronized (lock) {
             for (var position = first; position < last; position++) {
@@ -342,7 +468,7 @@ final class PackedRun {
                     state = base != null && TreeSearch.contains(pages, base, key(entry)) ? TreeSearch.FOUND : TreeSearch.ABSENT;
                     known[entry] = state;
                 }
-                if (values[entry] < 0) {
+                if (word(entry) < 0) {
                     total -= state == TreeSearch.FOUND ? 1 : 0;
                 } else {
                     total += state == TreeSearch.FOUND ? 0 : 1;
@@ -353,16 +479,40 @@ final class PackedRun {
     }
 
     /// {@return where the value of `entry` lies, for tests: the [LogValue] of a value in the log, the chunk of one in a
-    /// chunk of the replay, or `null` for an empty value or a removal}
+    /// chunk, the home of one on a home, or `null` for an empty value or a removal}
     Object sourceForTests(int entry) {
-        var value = values[entry];
+        var value = word(entry);
         if (value < 0) {
             return null;
         }
         if ((value & LOGGED) != 0) {
-            return logged((int) value);
+            return logged(places, (int) value);
         }
-        return ((value >>> LENGTH_SHIFT) & LENGTH_MASK) == 0 ? null : chunks[chunkOf(value)];
+        if ((value & HOME) != 0) {
+            return homes[homeIndex(value)];
+        }
+        return ((value >>> LENGTH_SHIFT) & LENGTH_MASK) == 0 ? null : places.chunks()[chunkOf(value)];
+    }
+
+    /// {@return whether the value of `entry` is on a home of a bulk commit's run, for tests}
+    boolean onHomeForTests(int entry) {
+        return onHome(word(entry));
+    }
+
+    /// {@return the homes of a bulk commit's run the run still holds, for tests}
+    int homesForTests() {
+        var held = 0;
+        for (var i = 0; homes != null && i < homes.length; i++) {
+            if (HOMES.getAcquire(homes, i) != null) {
+                held++;
+            }
+        }
+        return held;
+    }
+
+    /// {@return whether the order of the keys is made, for tests}
+    boolean orderedForTests() {
+        return order != null;
     }
 
     private int keyStart(int entry) {
@@ -373,20 +523,177 @@ final class PackedRun {
         return (int) ((value >>> OFFSET_BITS) & ((1L << CHUNK_BITS) - 1));
     }
 
-    // The place in the log of logged value `index`, made for the read
-    private LogValue logged(int index) {
-        var place = logPlaces[index];
-        return new LogValue(segments[(int) (place >>> FRAME_BITS)], place & FRAME_MASK, logBodies[index], tagHighs[index], tagLows[index]);
+    // Whether the word `value` is of a value on a home: a logged value's length may reach the bit of the kind
+    private static boolean onHome(long value) {
+        return (value & (REMOVES | LOGGED | HOME)) == HOME;
+    }
+
+    private static int homeIndex(long value) {
+        return (int) ((value >>> HOME_INDEX_SHIFT) & (MAX_HOMES - 1));
+    }
+
+    private static int homeOffset(long value) {
+        return (int) ((value >>> HOME_OFFSET_SHIFT) & MAX_HOME_OFFSET);
+    }
+
+    private static int homeLength(long value) {
+        return (int) (value & MAX_HOME_LENGTH);
+    }
+
+    // The home the word `value` of a value on a home names, or null once the run let go of it
+    private MemorySegment home(long value) {
+        return (MemorySegment) HOMES.getAcquire(homes, homeIndex(value));
+    }
+
+    // The place in the log of logged value `index` of `places`, made for the read
+    private static LogValue logged(Places places, int index) {
+        var place = places.logPlaces()[index];
+        return new LogValue(places.segments()[(int) (place >>> FRAME_BITS)], place & FRAME_MASK, places.logBodies()[index],
+                places.tagHighs()[index], places.tagLows()[index]);
     }
 
     // The logged value of an entry whose word is `value`, read from the log
     private byte[] readLogged(long value) {
         var index = (int) value;
+        var places = this.places;
         try {
-            return logged(index).read(logStamps[index], (int) ((value >>> 32) & LOGGED_LENGTH_MASK));
+            return logged(places, index).read(places.logStamps()[index], (int) ((value >>> 32) & LOGGED_LENGTH_MASK));
         } catch (LogSegmentView.Retired _) {
             throw new IllegalStateException("A value in a retired log segment is newer than the tree of its reader");
         }
+    }
+
+    /// Moves the values of `count` entries of a bulk commit's run off their homes, as [Version#spill] moves the value
+    /// of a version: one of at least [SpillQueue#LOG_VALUE_MIN] bytes to its place in the log, where the frame at
+    /// `frameOffset` of `segment` holds it durably, a shorter one to a chunk of the run's own; then lets go of each home
+    /// no entry is on any more.
+    ///
+    /// The run publishes where the values go before it switches the word of any entry, each with a release store, so a
+    /// reader that loads a switched word finds the value there; one that loaded the word before reads the home it
+    /// holds, which no one writes and the store's pool never gets back. Called by the one thread that drains the
+    /// commit's record.
+    ///
+    /// @param crypto the caller's, until it gives it back
+    /// @param segment the segment use that holds the commit's frame, or `null` if no value goes to the log
+    /// @param commitStart where the commit's body starts in the frame's body
+    /// @param frameBody the bytes of the frame's body, or 0 if they are not known, so no value is authenticated by the
+    ///                  frame's tag ([LogValue#framed()])
+    /// @param sequence the commit's sequence, which the tags bind with the position of each write in the batch
+    /// @param entries the entries, each listed once
+    /// @param offsets where each entry's value starts in the commit's body
+    /// @param ops the position of each entry's write in the batch
+    /// @return the values moved to the log and to a chunk, in this order
+    int[] spill(SpillQueue.Crypto crypto, LogSegmentView segment, long frameOffset, int commitStart, int frameBody,
+                long sequence, int[] entries, int[] offsets, int[] ops, int count) {
+        // Where the values go, laid out before anything moves
+        var logged = 0;
+        var chunkSizes = new int[4];
+        var chunkCount = 0;
+        var fill = ArrayWriteBatch.CHUNK_BYTES;
+        for (var i = 0; i < count; i++) {
+            var value = word(entries[i]);
+            if (!onHome(value)) {
+                continue;
+            }
+            var length = homeLength(value);
+            if (length >= SpillQueue.LOG_VALUE_MIN) {
+                if (segment != null) {
+                    logged++;
+                }
+            } else if (length > 0) {
+                if (fill + length > ArrayWriteBatch.CHUNK_BYTES) {
+                    if (chunkCount == chunkSizes.length) {
+                        chunkSizes = Arrays.copyOf(chunkSizes, 2 * chunkCount);
+                    }
+                    chunkCount++;
+                    fill = 0;
+                }
+                fill += length;
+                chunkSizes[chunkCount - 1] = fill;
+            }
+        }
+        if (logged == 0 && chunkCount == 0) {
+            return new int[2];
+        }
+        var before = places;
+        var firstChunk = before.chunks().length;
+        if (firstChunk + chunkCount > 1 << CHUNK_BITS) {
+            return new int[2];
+        }
+        var chunkArrays = new byte[chunkCount][];
+        var chunks = Arrays.copyOf(before.chunks(), firstChunk + chunkCount);
+        for (var c = 0; c < chunkCount; c++) {
+            chunkArrays[c] = new byte[chunkSizes[c]];
+            chunks[firstChunk + c] = MemorySegment.ofArray(chunkArrays[c]).asReadOnly();
+        }
+        var firstLogged = before.logStamps().length;
+        var total = firstLogged + logged;
+        var segments = before.segments();
+        var segmentIndex = -1;
+        if (logged > 0) {
+            segmentIndex = Arrays.asList(segments).indexOf(segment);
+            if (segmentIndex < 0) {
+                segments = Arrays.copyOf(segments, segments.length + 1);
+                segmentIndex = segments.length - 1;
+                segments[segmentIndex] = segment;
+            }
+        }
+        var after = new Places(chunks, Arrays.copyOf(before.logStamps(), total), Arrays.copyOf(before.logPlaces(), total),
+                Arrays.copyOf(before.logBodies(), total), Arrays.copyOf(before.tagHighs(), total),
+                Arrays.copyOf(before.tagLows(), total), segments);
+        // Published before the first word that refers to what it adds; written below only at indexes no word refers to
+        // yet, each before the release store of the word that does
+        places = after;
+        var nextLogged = firstLogged;
+        var chunk = firstChunk - 1;
+        fill = ArrayWriteBatch.CHUNK_BYTES;
+        var copied = 0;
+        for (var i = 0; i < count; i++) {
+            var entry = entries[i];
+            var value = word(entry);
+            if (!onHome(value)) {
+                continue;
+            }
+            var homeIndex = homeIndex(value);
+            var home = homes[homeIndex];
+            var offset = homeOffset(value);
+            var length = homeLength(value);
+            long moved;
+            if (length >= SpillQueue.LOG_VALUE_MIN) {
+                if (segment == null) {
+                    continue;
+                }
+                var bodyIndex = commitStart + offsets[i];
+                var stamp = Reads.stamp(sequence, ops[i]);
+                var place = SpillQueue.framesAlone(segment, frameBody, length)
+                        ? LogValue.framed(segment, frameOffset, bodyIndex, frameBody)
+                        : crypto.logValue(segment, frameOffset, bodyIndex, stamp, home, offset, length);
+                var index = nextLogged++;
+                after.logStamps()[index] = stamp;
+                after.logPlaces()[index] = (long) segmentIndex << FRAME_BITS | place.frameOffset();
+                after.logBodies()[index] = place.bodyIndex();
+                after.tagHighs()[index] = place.tagHigh();
+                after.tagLows()[index] = place.tagLow();
+                moved = LOGGED | (long) length << 32 | (index & 0xFFFF_FFFFL);
+            } else if (length > 0) {
+                if (fill + length > ArrayWriteBatch.CHUNK_BYTES) {
+                    chunk++;
+                    fill = 0;
+                }
+                MemorySegment.copy(home, ValueLayout.JAVA_BYTE, offset, chunkArrays[chunk - firstChunk], fill, length);
+                moved = (long) length << LENGTH_SHIFT | (long) chunk << OFFSET_BITS | fill;
+                fill += length;
+                copied++;
+            } else {
+                continue;
+            }
+            WORDS.setRelease(values, entry, moved);
+            if (--homeEntries[homeIndex] == 0) {
+                // No word names it any more: a reader that loaded one before finds it gone and loads the word again
+                HOMES.setRelease(homes, homeIndex, (MemorySegment) null);
+            }
+        }
+        return new int[]{nextLogged - firstLogged, copied};
     }
 
     // The entries sorted by key: a merge sort of their indexes, which moves no key
@@ -434,8 +741,9 @@ final class PackedRun {
 
     /// Collects the writes of one paged key space as the open replays them, the newest of each key, into a [PackedRun].
     ///
-    /// Used by the replay alone, on the opening thread, which builds the run once and uses the builder no more: the run
-    /// takes its arrays or copies of them, and the builder lets go of them.
+    /// Used by the replay, on the opening thread, and by a bulk commit, on its committing thread, each of which builds
+    /// the run once and uses the builder no more: the run takes its arrays or copies of them, and the builder lets go of
+    /// them.
     static final class Builder {
         private static final int FIRST_ENTRIES = 64;
         private byte[] keys;
@@ -452,12 +760,24 @@ final class PackedRun {
         private int logged;
         private final ArrayList<LogSegmentView> segments;
         private int[] slots;
+        private long minStamp;
         private long maxStamp;
+        // The homes of a bulk commit's values, the last one added, and the entries on each; null for a replay's builder
+        private ArrayList<MemorySegment> homes;
+        private int[] homeEntries;
+        private MemorySegment lastHome;
 
         Builder() {
-            this.keys = new byte[FIRST_ENTRIES * 32];
-            this.keyEnds = new int[FIRST_ENTRIES];
-            this.values = new long[FIRST_ENTRIES];
+            this(FIRST_ENTRIES, FIRST_ENTRIES * 32L);
+        }
+
+        /// Creates a builder with room for `entries` entries of `keyBytes` bytes of keys in all, which it takes without
+        /// growing an array: a bulk commit knows both before it applies.
+        Builder(int entries, long keyBytes) {
+            var capacity = Math.max(1, entries);
+            this.keys = new byte[(int) Math.clamp(keyBytes, 1, MAX_KEY_BYTES)];
+            this.keyEnds = new int[capacity];
+            this.values = new long[capacity];
             this.chunks = new ArrayList<>();
             this.logStamps = new long[0];
             this.logPlaces = new long[0];
@@ -465,7 +785,13 @@ final class PackedRun {
             this.tagHighs = new long[0];
             this.tagLows = new int[0];
             this.segments = new ArrayList<>();
-            this.slots = new int[2 * FIRST_ENTRIES];
+            // The least power of two the entries fill at most three quarters of, as the table grows past that
+            var table = 2;
+            while (4L * capacity > 3L * table) {
+                table *= 2;
+            }
+            this.slots = new int[table];
+            this.minStamp = Long.MAX_VALUE;
             this.maxStamp = -1;
         }
 
@@ -544,6 +870,54 @@ final class PackedRun {
             values[entry] = LOGGED | (long) length << 32 | (index & 0xFFFF_FFFFL);
         }
 
+        /// {@return the entries the builder holds}
+        int size() {
+            return size;
+        }
+
+        /// {@return whether [#putHome] takes a put of `key` of the `length` bytes at `offset` of `home`: the place of the
+        /// value fits the word of an entry, and the builder has room}
+        boolean fits(MemorySegment key, MemorySegment home, int offset, int length) {
+            if (length > MAX_HOME_LENGTH || offset > MAX_HOME_OFFSET || !takes(key, null, length)) {
+                return false;
+            }
+            return length == 0 || home == lastHome || homes == null || homes.size() < MAX_HOMES;
+        }
+
+        /// Records a put of `key`, which the builder holds no entry of, stamped `stamp`, of the `length` bytes at `offset`
+        /// of `home`, a read-only view of an array a bulk commit put the value on, which no one writes and the store's
+        /// pool never gets back; or of an empty value if `length` is 0.
+        ///
+        /// @return the entry
+        /// @throws IllegalArgumentException if the builder does not [take][#fits] the put
+        int putHome(MemorySegment key, long stamp, MemorySegment home, int offset, int length) {
+            if (!fits(key, home, offset, length)) {
+                throw new IllegalArgumentException("The run does not take the put");
+            }
+            if (length == 0) {
+                var entry = entry(key, stamp);
+                values[entry] = 0;
+                return entry;
+            }
+            if (homes == null) {
+                homes = new ArrayList<>();
+                homeEntries = new int[8];
+            }
+            var index = homes.size() - 1;
+            if (home != lastHome) {
+                homes.add(home);
+                lastHome = home;
+                index++;
+                if (index == homeEntries.length) {
+                    homeEntries = Arrays.copyOf(homeEntries, 2 * index);
+                }
+            }
+            var entry = entry(key, stamp);
+            homeEntries[index]++;
+            values[entry] = HOME | (long) index << HOME_INDEX_SHIFT | (long) offset << HOME_OFFSET_SHIFT | length;
+            return entry;
+        }
+
         /// Records a removal of `key`, stamped `stamp`.
         void delete(MemorySegment key, long stamp) {
             // Found or added first: adding may replace the array
@@ -573,6 +947,7 @@ final class PackedRun {
 
         // The entry of `key`, added if the builder holds none, whose write stamped `stamp` is the newest
         private int entry(MemorySegment key, long stamp) {
+            minStamp = Math.min(minStamp, stamp);
             maxStamp = Math.max(maxStamp, stamp);
             var hash = Segments.hash(key);
             var i = slotOf(key, hash);
@@ -624,7 +999,15 @@ final class PackedRun {
         ///
         /// The builder holds nothing after.
         PackedRun build(TreeRoot base, PageFile pages) {
-            return new PackedRun(this, base, pages);
+            return new PackedRun(this, base, pages, false);
+        }
+
+        /// {@return the run of the puts of new keys a bulk commit recorded and counted, none of which the latest tree of
+        /// `pages` held when the commit applied, nor any tree a reader that reads the run reads}
+        ///
+        /// The builder holds nothing after.
+        PackedRun buildCommitted(PageFile pages) {
+            return new PackedRun(this, null, pages, true);
         }
     }
 
@@ -640,6 +1023,8 @@ final class PackedRun {
         private static final int RUN = 1;
         private static final int TREE = 2;
         private final PackedRun run;
+        // The run's entries in the order of their keys
+        private final int[] order;
         private final TreeCursor tree;
         private final boolean descending;
         // The positions of the key order in the range: from `first`, included, to `last`, excluded
@@ -660,6 +1045,7 @@ final class PackedRun {
         /// bound, merged over `tree`, a cursor of the same range and order, or none if `null`.
         Cursor(PackedRun run, TreeCursor tree, MemorySegment from, MemorySegment to, boolean descending) {
             this.run = run;
+            this.order = run.order();
             this.tree = tree;
             this.descending = descending;
             this.first = run.lowerPosition(from);
@@ -685,7 +1071,7 @@ final class PackedRun {
                     current = treeHas ? TREE : NONE;
                     return treeHas;
                 }
-                var entry = run.order[position];
+                var entry = order[position];
                 var key = run.key(entry);
                 // Where the run's entry sorts against the tree's, in the order of the scan
                 var order = -1;
@@ -742,5 +1128,18 @@ final class PackedRun {
                 tree.release();
             }
         }
+    }
+
+    /// Where the values of a run that are not on a home lie.
+    ///
+    /// @param chunks the read-only views of the chunks the short values lie in
+    /// @param logStamps per logged value, the stamp of its write, which its tag binds
+    /// @param logPlaces per logged value, the index of its segment in `segments` over where its frame starts
+    /// @param logBodies per logged value, where it lies in its frame's body
+    /// @param tagHighs per logged value, the first part of its tag ([LogValue])
+    /// @param tagLows per logged value, the second part of its tag
+    /// @param segments the segment uses the logged values are in
+    private record Places(MemorySegment[] chunks, long[] logStamps, long[] logPlaces, int[] logBodies, long[] tagHighs,
+                          int[] tagLows, LogSegmentView[] segments) {
     }
 }

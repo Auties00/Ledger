@@ -25,7 +25,9 @@ import java.util.function.Function;
 /// A paged key space of a store that crashed may hold the writes its open replayed as a [PackedRun], which a reader
 /// whose tree is the one the store opened from reads as part of that tree ([#runOf(KeyspaceState, ReadPoint)]): a key
 /// of the run reads the run's entry instead of the tree's, which the same range removals hide. A reader of a later tree
-/// reads that tree alone. Without a run, a read pays one load of a field and a test for `null`.
+/// reads that tree alone. A bulk commit into a paged key space whose latest tree holds none of its entries leaves its
+/// puts in such a run too, which a reader at or after the commit reads as part of its tree, and one before does not.
+/// Without a run, a read pays one load of a field and a test for `null`.
 ///
 /// A resident key space reads memory alone, but for the keys its loader has not put there yet ([ResidentLoader]):
 /// those it reads from the tree alone, where every read finds them as it sees them. A read checks where a key is
@@ -58,13 +60,15 @@ final class Reads {
         return state.resident && decoded != null ? (V) decoded : keyspace.values().decode(value);
     }
 
-    /// {@return the run of the writes the open replayed into `state` that `point` reads as part of its tree, or `null`}
+    /// {@return the run of the writes the open replayed into `state`, or of a bulk commit's, that `point` reads as part
+    /// of its tree, or `null`}
     ///
-    /// The run is part of the tree a reader reads while that tree is the one the store opened from, or the reader
-    /// reads none: every checkpoint after the open holds every write of the run.
+    /// The run is part of the tree a reader reads while that tree is older than the run's writes, or the reader reads
+    /// none, and the reader sees them: every checkpoint after the open holds every write of the replay's run, every one
+    /// at or after a bulk commit every write of its run, and a reader before a bulk commit sees none of its writes.
     static PackedRun runOf(KeyspaceState state, ReadPoint point) {
         var run = state.run;
-        return run == null || run.maxStamp() <= point.treeBound() ? null : run;
+        return run == null || run.maxStamp() <= point.treeBound() || run.minStamp() > point.bound() ? null : run;
     }
 
     /// {@return whether a range removal the tree of `point` does not hold, and `point` sees, covers `key`}
