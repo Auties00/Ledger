@@ -35,7 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// What the versions of the commits an open replays keep: copies of their paged values in shared chunks or arrays of
-/// their own, never the decrypted frame bodies, with the values, counts and range removals unchanged through reads,
+/// their own, those of 128 KiB or more moved on to the log, never the decrypted frame bodies, with the values, counts and range removals unchanged through reads,
 /// scans, checkpoints, later writes, concurrent readers and further crashes.
 class ReplayValuesTest {
     private static final byte[] KEY = new byte[32];
@@ -49,7 +49,8 @@ class ReplayValuesTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
-    @DisplayName("a replayed paged value is on a chunk of its own replay or an array of its own, never on its frame body, and reads, scans and checkpoints return it unchanged")
+    @Timeout(120)
+    @DisplayName("a replayed paged value is on a chunk of its own replay or an array of its own, which one of 128 KiB or more leaves for the log, never on its frame body, and reads, scans and checkpoints return it unchanged")
     void replayedValuesLeaveTheBody(boolean encrypted, @TempDir Path directory) throws Exception {
         var encryption = encrypted ? Encryption.key(KEY) : Encryption.none();
         var expected = expectedValues();
@@ -85,6 +86,12 @@ class ReplayValuesTest {
                     assertEquals(ReplayValues.CHUNK_BYTES, chunk.byteSize(), "the chunk of a value of " + length + " bytes");
                     assertTrue(chunk.isReadOnly());
                     chunks.add(chunk);
+                } else if (length >= SpillQueue.THROUGH_VALUE_MIN) {
+                    // Copied to an array of its own, then moved to the log outside the budget once the queue's thread runs
+                    while (!(version.sourceForTests() instanceof LogValue)) {
+                        assertInstanceOf(byte[].class, version.sourceForTests(), "a value of " + length + " bytes");
+                        Thread.sleep(1);
+                    }
                 } else {
                     var own = assertInstanceOf(byte[].class, source, "a value of " + length + " bytes");
                     assertEquals(length, own.length);

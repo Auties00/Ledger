@@ -1535,7 +1535,7 @@ class LogSpillTest {
     @DisplayName("a batch a hot slab takes beside values on arrays of their own lists them in a record with room for those values only, not for every write")
     void ownValueRecordsHaveOwnRoom(@TempDir Path directory) throws Exception {
         var expected = new TreeMap<Integer, byte[]>();
-        // A budget no commit here passes, so the records stay queued
+        // A budget no commit here passes, which the records of values of 256 KiB on arrays of their own leave outside
         try (var ledger = open(directory, true, 64L << 20)) {
             ledger.valueSlab().forceHotForTests(1L << 20);
             com.github.auties00.ledger.Commit last = null;
@@ -1554,8 +1554,13 @@ class LogSpillTest {
                 }
                 last = ledger.commit(writes);
             }
-            assertArrayEquals(new int[]{2, 2, 2}, ledger.spills().recordRoomsForTests(), "the room of the queued records");
             last.awaitDurable();
+            spillNow(ledger);
+            var spills = ledger.spills();
+            assertEquals(3, spills.drainedRecordsForTests(), "records drained");
+            assertEquals(6, spills.drainedRoomForTests(), "the room of the drained records");
+            assertEquals(6, spills.loggedValuesForTests(), "values moved to the log");
+            assertEquals(0, spills.heldForTests(), "bytes the budget counts");
             verifyLarge(ledger, expected);
             ledger.checkpoint();
             verifyLarge(ledger, expected);
@@ -1572,7 +1577,11 @@ class LogSpillTest {
         var record = queue.record(1, 1);
         record.add(alone, 0, length);
         record.locate(view, 64, 0, 0, true);
+        // Outside the budget, durable as a queue without a log takes every commit, so it moves at once
         queue.add(record);
+        queue.awaitIdleForTests();
+        assertInstanceOf(LogValue.class, alone.sourceForTests(), "a long value alone in a group written through");
+        assertEquals(0, queue.heldForTests());
         var beside = Version.ofOwn(2L << 20, large(2, length), null, null, null);
         var small = spillable(2L << 20 | 1, 4_000);
         var mixed = queue.record(2, 2);
@@ -1631,6 +1640,234 @@ class LogSpillTest {
         }
         try (var ledger = Ledger.builder().directory(directory).encryption(Encryption.key(KEY))
                 .keyspace(MESSAGES).keyspace(TEXTS).keyspace(CHATS).build()) {
+            verifyLarge(ledger, expected);
+        }
+    }
+
+    /// {@return a record of the commit at `sequence` whose frame is at `frameOffset` of `view`, listing `version`, a
+    /// value of `length` bytes}
+    private static SpillQueue.Record listed(SpillQueue queue, long sequence, LogSegmentView view, long frameOffset,
+                                            Version version, int length) {
+        var record = queue.record(sequence, 1);
+        record.add(version, 0, length);
+        record.locate(view, frameOffset, 0, 0, false);
+        return record;
+    }
+
+    @Test
+    @DisplayName("records of values of 128 KiB or more on arrays of their own leave the heap once durable outside the budget, interleaved in commit order with the records the budget counts, which alone count in the held bytes")
+    void ownLongValuesSkipTheBudget(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(10_000, true);
+        var durable = new java.util.concurrent.atomic.AtomicLong();
+        queue.useDurable(durable::get);
+        var own = large(0, SpillQueue.THROUGH_VALUE_MIN);
+        var versions = new Version[7];
+        var views = new LogSegmentView[7];
+        for (var sequence = 1; sequence <= 6; sequence++) {
+            views[sequence] = queue.segment(sequence, directory.resolve(sequence + ".log"), null);
+            // Even sequences list a long value on an array of its own, odd ones a value of a shared array
+            var eager = sequence % 2 == 0;
+            var length = eager ? own.length : 4_000;
+            versions[sequence] = eager ? Version.ofOwn((long) sequence << 20, own, null, null, null) : spillable((long) sequence << 20, length);
+            queue.add(listed(queue, sequence, views[sequence], 64, versions[sequence], length));
+        }
+        queue.awaitIdleForTests();
+        assertEquals(12_000, queue.heldForTests(), "bytes the budget counts");
+        assertArrayEquals(new long[]{2, 4, 6}, queue.eagerSequencesForTests(), "records outside the budget");
+        assertEquals(0, queue.drainedRecordsForTests(), "records drained before any commit is durable");
+        durable.set(4);
+        queue.durableAdvanced();
+        queue.awaitIdleForTests();
+        for (var sequence = 1; sequence <= 4; sequence++) {
+            assertInstanceOf(LogValue.class, versions[sequence].sourceForTests(), "commit " + sequence);
+        }
+        assertInstanceOf(MemorySegment.class, versions[5].sourceForTests(), "a durable commit's value under the budget");
+        assertInstanceOf(byte[].class, versions[6].sourceForTests(), "a commit not durable yet");
+        assertEquals(4_000, queue.heldForTests(), "bytes the budget counts");
+        assertArrayEquals(new long[]{6}, queue.eagerSequencesForTests(), "records outside the budget");
+        assertArrayEquals(new long[]{1, 2, 3, 4}, queue.segmentsForTests());
+        assertEquals(4, queue.drainedRecordsForTests());
+        // A checkpoint holding commit 5 drops its record, not the later one
+        queue.published(5, 1, 6);
+        assertEquals(0, queue.heldForTests());
+        assertArrayEquals(new long[]{6}, queue.eagerSequencesForTests());
+        queue.published(6, 1, 6);
+        assertArrayEquals(new long[0], queue.eagerSequencesForTests());
+        durable.set(6);
+        queue.durableAdvanced();
+        queue.awaitIdleForTests();
+        assertInstanceOf(byte[].class, versions[6].sourceForTests(), "a value a checkpoint holds before it moved");
+        assertEquals(4, queue.drainedRecordsForTests());
+    }
+
+    @Test
+    @DisplayName("a record the budget kept queued in an older segment while records outside it moved to a newer one notes its segment in order, so a checkpoint covers it and keeps it for a reader between its commit and the checkpoint")
+    void segmentsStayOrdered(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(10_000, true);
+        queue.useDurable(() -> 2);
+        var first = queue.segment(1, directory.resolve("1.log"), null);
+        var second = queue.segment(2, directory.resolve("2.log"), null);
+        var counted = spillable(1L << 20, 4_000);
+        queue.add(listed(queue, 1, first, 64, counted, 4_000));
+        var own = Version.ofOwn(2L << 20, large(2, SpillQueue.THROUGH_VALUE_MIN), null, null, null);
+        queue.add(listed(queue, 2, second, 64, own, SpillQueue.THROUGH_VALUE_MIN));
+        queue.awaitIdleForTests();
+        assertInstanceOf(LogValue.class, own.sourceForTests(), "a durable value outside the budget");
+        assertInstanceOf(MemorySegment.class, counted.sourceForTests(), "a value under the budget");
+        assertArrayEquals(new long[]{2}, queue.segmentsForTests());
+        // Over the budget: commit 1 moves, commit 3 is not durable
+        queue.add(listed(queue, 3, second, 1 << 20, spillable(3L << 20, 8_000), 8_000));
+        queue.awaitIdleForTests();
+        assertInstanceOf(LogValue.class, counted.sourceForTests(), "a durable value over the budget");
+        assertArrayEquals(new long[]{1, 2}, queue.segmentsForTests(), "the segments by number");
+        var latest = new java.util.concurrent.atomic.AtomicLong(1);
+        var readers = new ReaderTable(16, latest::get);
+        var reader = readers.register();
+        latest.set(3);
+        // A checkpoint holding commit 2 that keeps the log from segment 2
+        queue.published(2, 2, 2);
+        assertEquals(1, queue.retirableBefore(2, readers), "the first segment kept for a reader at commit 1");
+        assertFalse(first.retired());
+        readers.unregister(reader);
+        assertEquals(2, queue.retirableBefore(2, readers));
+        assertTrue(first.retired());
+        assertFalse(second.retired());
+        assertArrayEquals(new long[]{2}, queue.segmentsForTests());
+    }
+
+    @Test
+    @DisplayName("a record outside the budget queued after its commit became durable moves without another durable group, one queued before moves at the next, and a checkpoint or a close drops one still queued")
+    void ownLongValuesMoveOnceDurable(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(64L << 20, true);
+        var durable = new java.util.concurrent.atomic.AtomicLong(1);
+        queue.useDurable(durable::get);
+        var view = queue.segment(1, directory.resolve("1.log"), null);
+        var own = large(0, SpillQueue.THROUGH_VALUE_MIN);
+        var versions = new Version[5];
+        for (var sequence = 1; sequence < versions.length; sequence++) {
+            versions[sequence] = Version.ofOwn((long) sequence << 20, own, null, null, null);
+        }
+        queue.add(listed(queue, 1, view, 64, versions[1], own.length));
+        queue.awaitIdleForTests();
+        assertInstanceOf(LogValue.class, versions[1].sourceForTests(), "a record queued once durable");
+        queue.add(listed(queue, 2, view, 1 << 20, versions[2], own.length));
+        queue.awaitIdleForTests();
+        assertInstanceOf(byte[].class, versions[2].sourceForTests(), "a record not durable yet");
+        assertArrayEquals(new long[]{2}, queue.eagerSequencesForTests());
+        durable.set(2);
+        queue.durableAdvanced();
+        queue.awaitIdleForTests();
+        assertInstanceOf(LogValue.class, versions[2].sourceForTests(), "a record durable at the next group");
+        assertArrayEquals(new long[0], queue.eagerSequencesForTests());
+        queue.add(listed(queue, 3, view, 2 << 20, versions[3], own.length));
+        queue.published(3, 0, 3);
+        assertArrayEquals(new long[0], queue.eagerSequencesForTests(), "records a checkpoint holds");
+        queue.add(listed(queue, 4, view, 3 << 20, versions[4], own.length));
+        queue.close();
+        assertArrayEquals(new long[0], queue.eagerSequencesForTests(), "records of a closed queue");
+        durable.set(4);
+        queue.durableAdvanced();
+        queue.awaitIdleForTests();
+        assertInstanceOf(byte[].class, versions[3].sourceForTests());
+        assertInstanceOf(byte[].class, versions[4].sourceForTests());
+        assertEquals(2, queue.loggedValuesForTests(), "values moved to the log");
+    }
+
+    @Test
+    @Timeout(60)
+    @DisplayName("a record outside the budget queued while the log makes its commit durable moves, whichever of the two comes first")
+    void ownLongValuesRaceDurability(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(64L << 20, true);
+        var durable = new java.util.concurrent.atomic.AtomicLong();
+        queue.useDurable(durable::get);
+        var view = queue.segment(1, directory.resolve("1.log"), null);
+        var own = large(0, SpillQueue.THROUGH_VALUE_MIN);
+        var barrier = new java.util.concurrent.CyclicBarrier(2);
+        var commits = 500;
+        var versions = new Version[commits + 1];
+        for (var sequence = 1; sequence <= commits; sequence++) {
+            versions[sequence] = Version.ofOwn((long) sequence << 20, own, null, null, null);
+        }
+        var log = Thread.ofPlatform().start(() -> {
+            try {
+                for (var sequence = 1; sequence <= commits; sequence++) {
+                    barrier.await();
+                    durable.set(sequence);
+                    queue.durableAdvanced();
+                }
+            } catch (Exception exception) {
+                throw new IllegalStateException(exception);
+            }
+        });
+        for (var sequence = 1; sequence <= commits; sequence++) {
+            var record = listed(queue, sequence, view, 64L + ((long) sequence << 20), versions[sequence], own.length);
+            barrier.await();
+            queue.add(record);
+        }
+        log.join();
+        for (var sequence = 1; sequence <= commits; sequence++) {
+            while (!(versions[sequence].sourceForTests() instanceof LogValue)) {
+                Thread.sleep(1);
+            }
+        }
+        assertEquals(commits, queue.loggedValuesForTests(), "values moved to the log");
+    }
+
+    @Test
+    @Timeout(120)
+    @DisplayName("a commit under the budget whose segment no value moved to yet, then a value of 256 KiB that moves at once to a newer segment, keeps the older segment for a snapshot from between its commit and a checkpoint that keeps the log from the newer one")
+    void budgetedOlderSegmentKeptForReaders(@TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = openSized(directory, true, 64 << 10, Duration.ZERO, 1L << 20)) {
+            var log = ledger.log();
+            // Ten values of 1,500 bytes on their batch's arrays, a record the budget counts and keeps
+            var batch = ledger.newBatch();
+            for (var message = 0; message < 10; message++) {
+                var value = large(message, 1_500);
+                batch.put(MESSAGES, key(message), value);
+                expected.put(message, value);
+            }
+            ledger.commit(batch).awaitDurable();
+            var older = log.currentSegment();
+            var old = ledger.snapshot();
+            var seen = new TreeMap<>(expected);
+            // Resident values, which never move, until the log rolls to a newer segment
+            for (var filler = 0; log.currentSegment() == older; filler++) {
+                ledger.commit(ledger.newBatch().put(CHATS, "f" + filler, "x".repeat(100_000))).awaitDurable();
+            }
+            var newer = log.currentSegment();
+            var own = large(50, 256 << 10);
+            ledger.commit(ledger.newBatch().put(MESSAGES, key(50), own)).awaitDurable();
+            expected.put(50, own);
+            var spills = ledger.spills();
+            while (!(head(ledger, MESSAGES, key(50)).sourceForTests() instanceof LogValue)) {
+                Thread.sleep(1);
+            }
+            assertInstanceOf(MemorySegment.class, head(ledger, MESSAGES, key(0)).sourceForTests(), "a value under the budget");
+            // Commits of short values until the queue passes its budget and the older commit's values move
+            for (var message = 100; !(head(ledger, MESSAGES, key(0)).sourceForTests() instanceof LogValue); message += 10) {
+                assertTrue(message < 1_000, "the older commit's values never moved");
+                var more = ledger.newBatch();
+                for (var i = message; i < message + 10; i++) {
+                    var value = large(i, 1_500);
+                    more.put(MESSAGES, key(i), value);
+                    expected.put(i, value);
+                }
+                ledger.commit(more).awaitDurable();
+                spills.awaitIdleForTests();
+            }
+            assertEquals(newer, log.currentSegment(), "the log rolled again");
+            assertArrayEquals(new long[]{older, newer}, spills.segmentsForTests(), "the segments by number");
+            ledger.checkpoint();
+            var kept = spills.segmentsForTests();
+            assertTrue(kept.length > 0 && kept[0] == older, "the checkpoint retired a segment a snapshot needs");
+            verifyLarge(old, seen);
+            old.close();
+            ledger.checkpointer().tick();
+            assertTrue(Arrays.stream(spills.segmentsForTests()).noneMatch(number -> number == older));
+            verifyLarge(ledger, expected);
+        }
+        try (var ledger = openSized(directory, true, 64 << 10, Duration.ZERO, 1L << 20)) {
             verifyLarge(ledger, expected);
         }
     }
