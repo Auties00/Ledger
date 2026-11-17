@@ -31,7 +31,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /// counts of ranges that may still hold the run before ([RunWalkers]), drops the chains a few hundred at a time holding
 /// the publishing role, as the sweep prunes them, and gives back the list of the chains it did not drop. A chain a
 /// commit wrote again meanwhile stays, and shadows its entry. The blind writes of the chains it drops move from the
-/// key space's [BlindWrites] to the run's entries, in one publication of the list.
+/// key space's [BlindWrites] to the run's entries, in one publication of the list. A checkpoint that starts or waits
+/// for the lock meanwhile ([Checkpointer#wanted()]) waits for no merge and no drop: the freeze gives the chains back
+/// unmerged if it has not published its run, and otherwise drops no more of them, leaving the rest beside their
+/// entries for the checkpoint to take.
 ///
 /// It runs once the key space listed at least the store's least number of chains since its last freeze, and as many
 /// as its frozen run holds, so the rebuilds copy at most twice the run they end with; and once more as the log nears
@@ -91,7 +94,7 @@ final class RunFreezer {
     /// checkpoint, unless one runs; called by a commit once it published, without a role. A thread the system refuses
     /// leaves the chains as they are.
     void maybeStart() {
-        if (running.get() || !due() || checkpointer.busy() || System.nanoTime() - quietUntil < 0) {
+        if (running.get() || !due() || checkpointer.wanted() || System.nanoTime() - quietUntil < 0) {
             return;
         }
         if (!running.compareAndSet(false, true)) {
@@ -171,7 +174,7 @@ final class RunFreezer {
                 nearCutDone = checkpointer.cutBytes();
             }
             for (var state : states) {
-                if (ledger.isClosed()) {
+                if (ledger.isClosed() || checkpointer.wanted()) {
                     return;
                 }
                 if ((state.freezeDue() || near && nearDue(state)) && !freeze(state).started()) {
@@ -269,6 +272,10 @@ final class RunFreezer {
             }
             kept.addAll(rejected);
             count = checked;
+            if (checkpointer.wanted()) {
+                // The checkpoint takes the chains as they are, and waits for no merge
+                return new Outcome(count, 0, 0, true);
+            }
             // Most of what the key space listed is not ready: the next freeze waits for twice as many, so chains whose
             // values stay on their arrays do not start one freeze after another
             var few = count < threshold / 2;
@@ -289,16 +296,22 @@ final class RunFreezer {
             if ((long) merge.replaced() * CHURN_SHARE > count) {
                 next = KeyspaceState.NO_FREEZE;
             }
+            if (checkpointer.wanted()) {
+                // Nothing published yet: the checkpoint takes the chains and the run before, as if no freeze ran
+                merge = null;
+                return new Outcome(count, 0, 0, true);
+            }
             ledger.publishFrozen(state, merge.run());
             published = true;
             var hook = publishedHookForTests;
             if (hook != null) {
                 hook.run();
             }
-            if (state.walkers.await(GRACE_NANOS)) {
+            if (!checkpointer.wanted() && state.walkers.await(GRACE_NANOS)) {
                 var latest = ledger.latestSequence();
                 var effects = merge.effects();
-                for (var from = 0; from < count; from += DROP_CHUNK) {
+                // A checkpoint that comes meanwhile takes the chains left beside their entries, which shadow them
+                for (var from = 0; from < count && !checkpointer.wanted(); from += DROP_CHUNK) {
                     var first = from;
                     var to = Math.min(count, from + DROP_CHUNK);
                     var finalChains = chains;

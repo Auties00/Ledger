@@ -426,6 +426,63 @@ class RunFreezerTest {
         }
     }
 
+    @ParameterizedTest(name = "after the publication: {0}")
+    @ValueSource(booleans = {true, false})
+    @Timeout(60)
+    @DisplayName("a checkpoint that waits for the lock while a freeze holds it stops the drops, takes the chains the freeze left beside their entries, and every read and count stays exact")
+    void checkpointStopsTheDrops(boolean published, @TempDir Path directory) throws Exception {
+        Expected reopened;
+        try (var ledger = open(directory, true)) {
+            var expected = history(ledger);
+            // Keys memory and the tree lack, all blind: three holds of drops
+            write(ledger, expected, 1_000, 1_768, 1, 1);
+            var state = ledger.state(MESSAGES);
+            var chains = state.chains();
+            var failure = new AtomicReference<Throwable>();
+            var checkpoint = new AtomicReference<Thread>();
+            Runnable waitingCheckpoint = () -> {
+                if (checkpoint.get() != null) {
+                    return;
+                }
+                checkpoint.set(Thread.ofPlatform().start(() -> {
+                    try {
+                        ledger.checkpoint();
+                    } catch (Throwable throwable) {
+                        failure.set(throwable);
+                    }
+                }));
+                // Until the checkpoint waits for the lock the freeze holds
+                while (!ledger.checkpointer().wanted()) {
+                    Thread.onSpinWait();
+                }
+            };
+            if (published) {
+                ledger.freezerForTests().publishedHookForTests(waitingCheckpoint);
+            } else {
+                ledger.freezerForTests().droppedHookForTests(waitingCheckpoint);
+            }
+            var outcome = ledger.freezeForTests(MESSAGES);
+            ledger.freezerForTests().publishedHookForTests(null);
+            ledger.freezerForTests().droppedHookForTests(null);
+            checkpoint.get().join();
+            assertNull(failure.get());
+            assertTrue(outcome.started(), outcome.toString());
+            assertEquals(768, outcome.candidates(), outcome.toString());
+            // Published: no drop; one hold: its 256 chains and their blind writes, and no more
+            assertEquals(published ? 0 : 256, outcome.dropped(), outcome.toString());
+            assertEquals(outcome.dropped(), outcome.handed(), outcome.toString());
+            assertEquals(0, state.chains(), "the checkpoint left chains, of " + chains);
+            assertEquals(expected.messages.size(), ledger.size(MESSAGES));
+            ledger.commit(ledger.newBatch().put(CHATS, "after", "checkpoint")).awaitDurable();
+            assertNull(state.run, "the checkpoint kept the frozen run");
+            verify(ledger, expected);
+            reopened = expected;
+        }
+        try (var ledger = open(directory, true)) {
+            verify(ledger, reopened);
+        }
+    }
+
     @Test
     @Timeout(60)
     @DisplayName("a blind put queued behind a pipelined blind removal of the same key that is taken back freezes as a put, and the count stays exact")

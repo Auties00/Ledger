@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Condition;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
@@ -88,6 +89,9 @@ final class Checkpointer implements IdleTicker.Watched {
     private final long every;
     private final ReentrantLock lock;
     private final AtomicBoolean scheduled;
+    // The calls of run that have not returned, those waiting for the lock among them: a freeze that holds the lock
+    // stops early once it sees one
+    private final AtomicInteger runs;
     // Whether a thread is finishing the sweep of the store
     private final AtomicBoolean sweeping;
     private final SecureRandom random;
@@ -153,6 +157,7 @@ final class Checkpointer implements IdleTicker.Watched {
         this.deltaTable = deltaTable;
         this.lock = new ReentrantLock();
         this.scheduled = new AtomicBoolean();
+        this.runs = new AtomicInteger();
         this.sweeping = new AtomicBoolean();
         this.random = new SecureRandom();
         this.failures = failures;
@@ -299,9 +304,10 @@ final class Checkpointer implements IdleTicker.Watched {
         return cutBytes;
     }
 
-    /// {@return whether a checkpoint started on a thread of its own has not ended}
-    boolean busy() {
-        return scheduled.get();
+    /// {@return whether a checkpoint runs, waits for the lock or is about to start: a [RunFreezer] holding the lock then
+    /// lets it go as soon as it can, as the checkpoint takes the chains it would freeze}
+    boolean wanted() {
+        return scheduled.get() || runs.get() > 0;
     }
 
     /// Takes the lock checkpoints run under, for a [RunFreezer], unless a checkpoint runs or is about to, or the store
@@ -309,10 +315,10 @@ final class Checkpointer implements IdleTicker.Watched {
     ///
     /// @return whether it took it, which [#unlockFreeze()] then gives back
     boolean lockForFreeze() {
-        if (closed || stopped != null || scheduled.get() || !lock.tryLock()) {
+        if (closed || stopped != null || wanted() || !lock.tryLock()) {
             return false;
         }
-        if (closed || scheduled.get()) {
+        if (closed || wanted()) {
             lock.unlock();
             return false;
         }
@@ -462,6 +468,8 @@ final class Checkpointer implements IdleTicker.Watched {
     /// @throws LedgerIoException if the checkpoint cannot be written; the store goes on, and the next one retries
     void run(boolean closing) {
         Object poolHold = null;
+        // Before the lock: a freeze that holds it sees the checkpoint waiting and lets it go early
+        runs.incrementAndGet();
         lock.lock();
         try {
             if (closed && !closing) {
@@ -589,6 +597,7 @@ final class Checkpointer implements IdleTicker.Watched {
             // Every flush of the checkpoint gave its sealed arrays back before it returned
             Reference.reachabilityFence(poolHold);
             lock.unlock();
+            runs.decrementAndGet();
         }
     }
 
