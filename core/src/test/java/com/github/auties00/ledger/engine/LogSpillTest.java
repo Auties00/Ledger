@@ -31,6 +31,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -61,7 +62,7 @@ class LogSpillTest {
     private static final Keyspace<byte[], byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.bytes(), ValueCodec.bytes());
     private static final Keyspace<String, String> TEXTS = Keyspace.paged("texts", KeyCodec.utf8(), ValueCodec.utf8());
     private static final Keyspace<String, String> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
-    // Below LOG_VALUE_MIN, at it, and well above, in a frame of runs and in one of its own
+    // Below LOG_VALUE_MIN, at it, below a run's minimum, and well above, in a frame of runs and in one of its own
     private static final int[] LENGTHS = {40, 200, SpillQueue.LOG_VALUE_MIN, 700, 1_500, 5_000};
 
     private static LiveLedger open(Path directory, boolean encrypted, long budget) {
@@ -537,6 +538,91 @@ class LogSpillTest {
     }
 
     @Test
+    @Timeout(120)
+    @DisplayName("values moved to segments beside checkpoints that leave them pending keep those segments through idle ticks that retire the segments before them, and a close checkpoints them from the log")
+    void pendingValuesKeepTheirSegments(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var message = 0;
+        try (var ledger = openSized(directory, true, 0, Duration.ZERO, 256 << 10)) {
+            var pending = 0;
+            for (var round = 0; round < 4; round++) {
+                // Values moved before the checkpoint, which takes them
+                for (var batch = 0; batch < 6; batch++, message += 30) {
+                    write(ledger, expected, message, 30, 0, true);
+                }
+                spillNow(ledger);
+                // A snapshot of the tree before the checkpoint holds the segments it makes obsolete back, so the idle
+                // ticks after it closes retire them
+                var snapshot = ledger.snapshot();
+                var seen = expected.copy();
+                // Commits moved while the checkpoint runs, which it may cut before or after
+                var first = message;
+                var failure = new AtomicReference<Throwable>();
+                var writer = Thread.ofPlatform().start(() -> {
+                    try {
+                        for (var batch = 0; batch < 6; batch++) {
+                            write(ledger, expected, first + batch * 30, 30, 0, true);
+                            spillNow(ledger);
+                        }
+                    } catch (Throwable throwable) {
+                        failure.set(throwable);
+                    }
+                });
+                ledger.checkpoint();
+                writer.join();
+                if (failure.get() != null) {
+                    throw new AssertionError(failure.get());
+                }
+                message += 6 * 30;
+                // Commits moved after the checkpoint, which it leaves pending
+                for (var batch = 0; batch < 3; batch++, message += 30) {
+                    write(ledger, expected, message, 30, 0, true);
+                }
+                spillNow(ledger);
+                verifyView(snapshot, seen);
+                snapshot.close();
+                for (var tick = 0; tick < 3; tick++) {
+                    ledger.checkpointer().tick();
+                    pending = Math.max(pending, assertSegmentsKept(ledger, directory, expected));
+                }
+                verify(ledger, expected);
+            }
+            assertTrue(pending > 0, "no value moved to the log was left pending");
+        }
+        try (var ledger = openSized(directory, true, 0, Duration.ZERO, 256 << 10)) {
+            verify(ledger, expected);
+        }
+    }
+
+    /// Checks that the segment of every version of `expected`'s keys whose value moved to the log is in place or
+    /// retired, never gone while a reader may still read the value from it, and returns how many such versions have
+    /// their segment in place.
+    private static int assertSegmentsKept(LiveLedger ledger, Path directory, Expected expected) {
+        var kept = 0;
+        var keys = new ArrayList<Map.Entry<Keyspace<?, ?>, byte[]>>();
+        for (var message : expected.messages.keySet()) {
+            keys.add(Map.entry(MESSAGES, key(message)));
+        }
+        for (var text : expected.texts.keySet()) {
+            keys.add(Map.entry(TEXTS, text.getBytes(StandardCharsets.UTF_8)));
+        }
+        for (var key : keys) {
+            for (var version = head(ledger, key.getKey(), key.getValue()); version != null; version = version.older) {
+                if (version.sourceForTests() instanceof LogValue logged) {
+                    // A segment retires before its file goes, so a file found gone was retired first
+                    var present = Files.exists(segmentPath(directory, logged.segment().number()));
+                    assertTrue(present || logged.segment().retired(),
+                            "segment " + logged.segment().number() + " is gone but not retired");
+                    if (present && !logged.segment().retired()) {
+                        kept++;
+                    }
+                }
+            }
+        }
+        return kept;
+    }
+
+    @Test
     @DisplayName("a snapshot from before the moved values holds no segment back, and reads at the latest commit find those values in the tree once their segments retire")
     void readsRetiredValuesFromTheTree(@TempDir Path directory) throws Exception {
         var expected = new Expected();
@@ -705,7 +791,9 @@ class LogSpillTest {
             assertTrue(ledger.spills().loggedValuesForTests() > 0, "the recovery moved no value to the log");
             for (var entry : expected.messages.entrySet()) {
                 var source = source(ledger, MESSAGES, key(entry.getKey()));
-                if (entry.getValue().length >= PackedRun.LOG_VALUE_MIN) {
+                // A write the replay sent to a chain moves as a live commit's value does, one of a run from the run's minimum
+                var logged = head(ledger, MESSAGES, key(entry.getKey())) != null ? SpillQueue.LOG_VALUE_MIN : PackedRun.LOG_VALUE_MIN;
+                if (entry.getValue().length >= logged) {
                     assertInstanceOf(LogValue.class, source, "message " + entry.getKey());
                 } else {
                     var chunk = assertInstanceOf(MemorySegment.class, source, "message " + entry.getKey());
@@ -979,12 +1067,13 @@ class LogSpillTest {
     }
 
     @Test
-    @DisplayName("a commit of values of 100 to 300 bytes, whose move would allocate more than half of what it frees, stays off the queue on its batch's arrays, and reads back as written before and after a checkpoint and a reopen")
+    @DisplayName("a commit of values of mostly under 96 bytes, whose move would allocate more than half of what it frees, stays off the queue on its batch's arrays, and reads back as written before and after a checkpoint and a reopen")
     void shortValuesStayOffTheQueue(@TempDir Path directory) throws Exception {
         var expected = new Expected();
         var count = 20_000;
-        // Two in three values move to arrays of their own, which take 16 bytes more than the value
-        int[] lengths = {100, 200, 300};
+        // Three in four values move to arrays of their own, which take 16 bytes more than the value, and the one long
+        // enough for the log to a LogValue of 40 bytes: 288 bytes for 314
+        int[] lengths = {40, 64, 90, 120};
         try (var ledger = openJudged(directory, true, 0, Duration.ZERO, 6L << 20)) {
             writeBulk(ledger, expected, 0, count, lengths, 0);
             assertTrue(ledger.state(MESSAGES).overwrites.spills(), "values written once may not leave the heap");
@@ -1010,6 +1099,40 @@ class LogSpillTest {
         }
     }
 
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a commit of values of 100 to 300 bytes, like an app-state snapshot, leaves the heap whole for the log once its key space is judged, and reads back as written before and after a checkpoint and a reopen")
+    void snapshotValuesLeaveWhole(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var count = 20_000;
+        // Each takes a LogValue of 40 bytes once moved, under half of its bytes
+        int[] lengths = {100, 200, 300};
+        try (var ledger = openJudged(directory, encrypted, 0, Duration.ZERO, 6L << 20)) {
+            writeBulk(ledger, expected, 0, count, lengths, 0);
+            assertTrue(ledger.state(MESSAGES).overwrites.spills(), "values written once may not leave the heap");
+            var spills = ledger.spills();
+            assertEquals(0, spills.unpaidRecordsForTests(), "the commit's move was judged not to pay");
+            spillNow(ledger);
+            assertEquals(0, spills.heldForTests());
+            for (var message = 0; message < count; message++) {
+                var source = head(ledger, MESSAGES, key(message)).sourceForTests();
+                if (message < ValueSlab.Overwrites.BULK_WRITES - 1) {
+                    assertInstanceOf(MemorySegment.class, source, "message " + message + " was listed before the judgement");
+                } else {
+                    assertInstanceOf(LogValue.class, source, "message " + message);
+                }
+            }
+            assertEquals(count - (ValueSlab.Overwrites.BULK_WRITES - 1), spills.loggedValuesForTests());
+            assertEquals(0, spills.copiedValuesForTests());
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = openJudged(directory, encrypted, 0, Duration.ZERO, 6L << 20)) {
+            verify(ledger, expected);
+        }
+    }
+
     @ParameterizedTest(name = "{0} bytes")
     @ValueSource(ints = {160 << 10, 256 << 10})
     @DisplayName("a value on an array of its own leaves the heap for the log beside thousands of short values, which stay on their batch's arrays")
@@ -1020,7 +1143,8 @@ class LogSpillTest {
         try (var ledger = openSized(directory, true, 0, Duration.ZERO, 16L << 20)) {
             var batch = ledger.newBatch();
             for (var message = 0; message < shorts; message++) {
-                var value = new byte[message % 2 == 0 ? 100 : 200];
+                // Each would take an array of its own, more than half again its bytes
+                var value = new byte[message % 2 == 0 ? 40 : 90];
                 Arrays.fill(value, (byte) message);
                 batch.put(MESSAGES, key(message), value);
                 expected.messages.put(message, value);
