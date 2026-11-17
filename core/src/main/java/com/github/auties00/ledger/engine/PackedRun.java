@@ -260,6 +260,13 @@ final class PackedRun {
         return keyView.asSlice(start, keyEnds[entry] - start);
     }
 
+    /// {@return the order of the key of `chain` and the key of `entry`, read in place, as
+    /// [Segments#compare(MemorySegment, MemorySegment)] gives}
+    int compareChain(Chain chain, int entry) {
+        var start = keyStart(entry);
+        return chain.compareKey(keys, start, keyEnds[entry] - start);
+    }
+
     /// {@return the order of the key of `entry` and `key`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
     int compareKey(int entry, MemorySegment key) {
         var start = keyStart(entry);
@@ -547,9 +554,8 @@ final class PackedRun {
         private final Chain[] chains;
         private final Version[] heads;
         private final int count;
-        // The keys of the chains, one after another, and where each ends
-        private final byte[] chainKeys;
-        private final int[] chainEnds;
+        // Whether the keys of the chains fit a run, read from the chains in place: they are copied once, into `keys`
+        private final boolean chainKeysFit;
         private byte[] keys;
         private int[] keyEnds;
         private long[] values;
@@ -579,14 +585,7 @@ final class PackedRun {
                 bytes += chains[i].keyLength();
             }
             // Past the limit, no run takes them: fill() refuses before it reads a key
-            this.chainKeys = bytes > MAX_KEY_BYTES ? null : new byte[(int) bytes];
-            this.chainEnds = new int[count];
-            var at = 0;
-            for (var i = 0; i < count && chainKeys != null; i++) {
-                chains[i].copyKey(chainKeys, at);
-                at += chains[i].keyLength();
-                chainEnds[i] = at;
-            }
+            this.chainKeysFit = bytes <= MAX_KEY_BYTES;
             this.chunks = previous == null ? new ArrayList<>() : new ArrayList<>(Arrays.asList(previous.chunks));
             this.segments = previous == null ? new ArrayList<>() : new ArrayList<>(Arrays.asList(previous.segments));
             this.maxStamp = previous == null ? -1 : previous.maxStamp;
@@ -616,7 +615,7 @@ final class PackedRun {
         // Fills the arrays, two passes over the keys of the previous run and of the chains in their order: one to size
         // them, one to fill them; whether the limits of a run allowed it
         private boolean fill(byte[] previousEffects) {
-            if (chainKeys == null) {
+            if (!chainKeysFit) {
                 return false;
             }
             var previousSize = previous == null ? 0 : previous.size;
@@ -631,7 +630,7 @@ final class PackedRun {
                     keyBytes += previous.keyEnds[p] - previous.keyStart(p);
                     p++;
                 } else {
-                    keyBytes += chainEnds[c] - chainStart(c);
+                    keyBytes += chains[c].keyLength();
                     if (order == 0) {
                         p++;
                     }
@@ -686,9 +685,10 @@ final class PackedRun {
                     effects[out] = previousEffects == null ? COUNTED : previousEffects[p];
                     p++;
                 } else {
-                    from = chainKeys;
-                    start = chainStart(c);
-                    length = chainEnds[c] - start;
+                    from = null;
+                    start = 0;
+                    length = chains[c].keyLength();
+                    chains[c].copyKey(keys, keyAt);
                     var head = heads[c];
                     maxStamp = Math.max(maxStamp, head.stamp);
                     if (order == 0) {
@@ -746,7 +746,9 @@ final class PackedRun {
                     entries[c] = out;
                     c++;
                 }
-                System.arraycopy(from, start, keys, keyAt, length);
+                if (from != null) {
+                    System.arraycopy(from, start, keys, keyAt, length);
+                }
                 var hash = Segments.hash(keys, keyAt, length);
                 keyAt += length;
                 keyEnds[out] = keyAt;
@@ -772,11 +774,6 @@ final class PackedRun {
             return this;
         }
 
-        // Where the key of chain `index` starts in chainKeys
-        private int chainStart(int index) {
-            return index == 0 ? 0 : chainEnds[index - 1];
-        }
-
         // The order of the previous run's entry `p` and the key of chain `c`, as a merge takes them: -1 to take the
         // entry, 1 to take the chain, 0 for both of one key
         private int compare(int p, int previousSize, int c) {
@@ -787,9 +784,7 @@ final class PackedRun {
                 return -1;
             }
             var start = previous.keyStart(p);
-            var order = Segments.compare(previous.keys, start, previous.keyEnds[p] - start, chainKeys, chainStart(c),
-                    chainEnds[c] - chainStart(c));
-            return Integer.signum(order);
+            return -Integer.signum(chains[c].compareKey(previous.keys, start, previous.keyEnds[p] - start));
         }
 
         // The index of `segment` among the run's segments, added if new, or -1 past MAX_SEGMENTS

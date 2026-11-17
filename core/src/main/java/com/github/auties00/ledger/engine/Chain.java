@@ -454,6 +454,22 @@ sealed class Chain permits Chain.Inline8 {
         return Integer.compare(leftLength, rightLength);
     }
 
+    /// {@return the order of the key and the `length` bytes of `other` at `from`, as
+    /// [Segments#compare(MemorySegment, MemorySegment)] gives, reading neither through a copy}
+    int compareKey(byte[] other, int from, int length) {
+        var own = keyLength();
+        var common = Math.min(own, length);
+        // As compareKeys: words zero past a key's end order as its bytes, and equal common words as the lengths
+        for (var at = 0; at < common; at += Long.BYTES) {
+            var word = word(at);
+            var otherWord = Segments.word(other, from + at, from + length);
+            if (word != otherWord) {
+                return Long.compareUnsigned(word, otherWord);
+            }
+        }
+        return Integer.compare(own, length);
+    }
+
     /// {@return the order of the key and `other`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
     int compareKey(MemorySegment other) {
         return keyChunk == null ? compareInline(other) : Segments.compare(keyChunk, keyOffset(), keyLength(), other, 0, other.byteSize());

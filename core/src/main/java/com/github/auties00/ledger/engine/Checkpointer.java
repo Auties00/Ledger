@@ -718,8 +718,7 @@ final class Checkpointer implements IdleTicker.Watched {
                 var entry = -1;
                 while (position < runEntries) {
                     var next = run.entryAt(position);
-                    var runKey = run.key(next);
-                    var order = chain.compareKey(runKey);
+                    var order = run.compareChain(chain, next);
                     if (order < 0) {
                         break;
                     }

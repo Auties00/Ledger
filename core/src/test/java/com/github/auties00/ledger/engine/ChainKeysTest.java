@@ -85,6 +85,8 @@ class ChainKeysTest {
                         assertEquals(expected == 0, leftChain.keyEquals(segment), "keyEquals: " + name);
                     }
                     assertEquals(expected == 0, leftChain.keyEquals(right.clone()), "keyEquals of an array: " + name);
+                    assertEquals(expected, Integer.signum(leftChain.compareKey(embedded(right), 5, right.length)),
+                            "compareKey of a range of an array: " + name);
                     for (var rightChain : chains.get(j)) {
                         assertEquals(expected, Integer.signum(Chain.compareKeys(leftChain, rightChain)), "compareKeys: " + name);
                         assertEquals(expected, Integer.signum(Chain.BY_KEY.compare(leftChain, rightChain)), "BY_KEY: " + name);
@@ -113,6 +115,7 @@ class ChainKeysTest {
             var rightChain = forms(slab, right, random).get(random.nextInt(3));
             assertEquals(expected, Integer.signum(Chain.compareKeys(leftChain, rightChain)));
             assertEquals(expected, Integer.signum(leftChain.compareKey(MemorySegment.ofArray(right))));
+            assertEquals(expected, Integer.signum(leftChain.compareKey(embedded(right), 5, right.length)));
             assertEquals(expected == 0, Chain.sameKey(leftChain, rightChain));
             assertEquals(expected == 0, leftChain.keyEquals(MemorySegment.ofArray(right)));
             checkAlone(leftChain, left);
@@ -242,6 +245,14 @@ class ChainKeysTest {
             word |= b << (56 - 8 * i);
         }
         return word;
+    }
+
+    // `key` at offset 5 of a larger array, between bytes of 0xFF a comparison past either end of the range would read
+    private static byte[] embedded(byte[] key) {
+        var array = new byte[key.length + 13];
+        Arrays.fill(array, (byte) 0xFF);
+        System.arraycopy(key, 0, array, 5, key.length);
+        return array;
     }
 
     // A chain of `key` in each form: in the slab (its own words up to INLINE bytes), at an offset of a shared
