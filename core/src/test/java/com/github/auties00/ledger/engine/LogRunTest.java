@@ -10,6 +10,7 @@ import com.github.auties00.ledger.LedgerIoException;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.testkit.ChangeInterceptor;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.io.TempDir;
@@ -1323,6 +1324,119 @@ class LogRunTest {
                 log.close();
             }
             References.assertSealedAsCopied(log);
+        }
+    }
+
+    @Nested
+    @DisplayName("recovery that opens frames into the arrays of frames it replayed")
+    class Recycled {
+        @AfterEach
+        void defaultReadAhead() {
+            FrameReadAhead.framesForTests(-1);
+        }
+
+        /// {@return what recovery tells a sink that releases every frame if `releases`, and none otherwise: each
+        /// catalog entry, epoch and commit in order, a commit with whether its body is the one written}
+        private static List<String> replay(Log log, boolean releases) throws IOException {
+            var told = new ArrayList<String>();
+            LogRecovery.replay(log.files, log.keys, STORE_ID, 0, 0, new LogRecovery.Sink() {
+                @Override
+                public void catalog(int keyspace, String name) {
+                    told.add("catalog " + keyspace + " " + name);
+                }
+
+                @Override
+                public boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment,
+                                      long frameOffset, long logFrom) {
+                    var written = log.bodies.get((int) sequence - 1);
+                    told.add("commit " + sequence + " " + Arrays.equals(body, start, start + length, written, 0, written.length));
+                    return true;
+                }
+
+                @Override
+                public void epoch(int epoch) {
+                    told.add("epoch " + epoch);
+                }
+
+                @Override
+                public boolean releasesFrame() {
+                    return releases;
+                }
+            }, null);
+            return told;
+        }
+
+        /// {@return the events [#replay(Log, boolean)] gives for every commit of `log` up to `last`, whole, with
+        /// `between` after commit `at`}
+        private static List<String> expected(long last, long at, List<String> between) {
+            var expected = new ArrayList<String>();
+            for (var sequence = 1L; sequence <= last; sequence++) {
+                expected.add("commit " + sequence + " true");
+                if (sequence == at) {
+                    expected.addAll(between);
+                }
+            }
+            return expected;
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}, frames read ahead: {1}")
+        @CsvSource({"true, 0", "true, 3", "false, 0"})
+        @DisplayName("replays frames that grow and shrink, runs, a catalog and an epoch, each from an array an earlier frame held, as from new arrays")
+        void growingAndShrinking(boolean encrypted, int ahead, @TempDir Path directory) throws Exception {
+            FrameReadAhead.framesForTests(ahead);
+            var log = new Log(directory, encrypted, 64L << 20);
+            log.group(300_000);
+            log.group(20, 80);
+            // Longer than the buffer, and than half a region
+            log.group(1_500_000);
+            log.group(2_000);
+            var catalog = new FrameBody();
+            catalog.catalog(5, "later");
+            log.writer.append(FrameBody.CATALOG, log.last(), catalog);
+            var at = log.last();
+            log.writer.append(FrameBody.EPOCH, log.last(), FrameBody.epoch(7));
+            log.group(600_000);
+            log.group(40);
+            log.group(5, 3_000);
+            // Longer than the read-ahead reads, which no spare keeps
+            log.group(9_000_000);
+            log.group(100);
+            log.group(200_000);
+            log.group(3, 120_000);
+            log.close();
+            var before = FrameReadAhead.Spares.reusedForTests();
+            var recycled = replay(log, true);
+            var reused = FrameReadAhead.Spares.reusedForTests() - before;
+            var expected = expected(log.last(), at, List.of("catalog 5 later", "epoch 7"));
+            assertEquals(expected, recycled);
+            assertEquals(expected, replay(log, false));
+            assertTrue(reused > 0, "no array was opened into again");
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}, frames read ahead: {1}, {2}")
+        @CsvSource({"true, 0, cut", "true, 0, flipped", "true, 3, cut", "true, 3, flipped", "false, 0, cut", "false, 0, flipped"})
+        @DisplayName("stops at a torn last frame shorter than the frames before it, never replaying an older frame's bytes left in its array")
+        void tornLast(boolean encrypted, int ahead, String damage, @TempDir Path directory) throws Exception {
+            FrameReadAhead.framesForTests(ahead);
+            var log = new Log(directory, encrypted, 64L << 20);
+            for (var i = 0; i < 6; i++) {
+                log.group(200_000 - i * 30_000);
+            }
+            log.group(4, 2_000);
+            log.group(600);
+            var start = log.writer.groupStart();
+            var segment = log.files.segment(log.writer.currentSegment());
+            log.close();
+            if (damage.equals("cut")) {
+                try (var channel = FileChannel.open(segment, StandardOpenOption.WRITE)) {
+                    channel.truncate(start + LogWriter.FRAME_HEADER + 100);
+                }
+            } else {
+                var bytes = Files.readAllBytes(segment);
+                bytes[(int) start + LogWriter.FRAME_HEADER + 100] ^= 1;
+                Files.write(segment, bytes);
+            }
+            assertEquals(expected(log.last() - 1, -1, List.of()), replay(log, true));
         }
     }
 }

@@ -317,6 +317,11 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                         public void epoch(int epoch) {
                             epochs[0] = Integer.compareUnsigned(epoch, epochs[0]) > 0 ? epoch : epochs[0];
                         }
+
+                        @Override
+                        public boolean releasesFrame() {
+                            return values.releasesFrame();
+                        }
                     }, spills);
             ledger.endReplay(values);
             blobs.begin(epochs[0] + 1);
