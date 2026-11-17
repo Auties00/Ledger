@@ -43,6 +43,8 @@ final class ReplayValues {
     private MemorySegment frameView;
     // The ciphers that tag the values moved to the log, taken at the first, or null
     private SpillQueue.Crypto crypto;
+    // Whether something the replay keeps refers to the body of a frame it replayed since releasesFrame last answered
+    private boolean frameKept;
     // The runs being built, by key space, and the key spaces that replay to chains from a range removal on
     private final IdentityHashMap<KeyspaceState, PackedRun.Builder> runs = new IdentityHashMap<>();
     private final Set<KeyspaceState> toChains = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -74,12 +76,29 @@ final class ReplayValues {
     }
 
     /// {@return a read-only segment of the whole of `body`, a frame body, the same for the commits of a run}
+    ///
+    /// Recovery opens later frames into the arrays of frames nothing refers to ([#releasesFrame()]), so the segment
+    /// may be that of an array a frame before held: it views the whole array, whatever frame it holds.
     MemorySegment frame(byte[] body) {
         if (frame != body) {
             frame = body;
             frameView = MemorySegment.ofArray(body).asReadOnly();
         }
         return frameView;
+    }
+
+    /// Records that something the replay keeps refers to the body of the frame it replays, whose array recovery then
+    /// never opens another frame into.
+    void keepFrame() {
+        frameKept = true;
+    }
+
+    /// {@return whether nothing the replay keeps refers to the bodies of the frames it replayed since the last call},
+    /// which the next call answers for the frames after them.
+    boolean releasesFrame() {
+        var released = !frameKept;
+        frameKept = false;
+        return released;
     }
 
     /// {@return the [SpillQueue.Crypto] of the replay, taken from `queue` at the first call}

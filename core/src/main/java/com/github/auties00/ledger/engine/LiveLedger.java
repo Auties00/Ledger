@@ -386,10 +386,13 @@ public final class LiveLedger implements Ledger {
     /// values lacks one of its units.
     ///
     /// The units are read before anything applies, and taken again from the free pages once the commit applies. What
-    /// the commit leaves in memory until a checkpoint takes it keeps nothing of `body`, which the open drops once the
-    /// commit applies: the bounds of range removals are copied into arrays of their own, resident values as at every
-    /// put, and the values of paged key spaces into the chunks of `values`, but in a store that moves values off the
-    /// heap.
+    /// the commit leaves in memory until a checkpoint takes it keeps nothing of `body`, whose array the open opens a
+    /// later frame into once the frame's commits apply, unless `values` was told to keep it
+    /// ([ReplayValues#keepFrame()]): the keys are copied by their chains and runs, the bounds of range removals into
+    /// arrays of their own, resident values as at every put, and the values of paged key spaces into the chunks of
+    /// `values`, but in a store that moves values off the heap. The decoder of a resident key space reads its value
+    /// where it lies in `body`: an untrusted one gets a copy, which it may keep, and a trusted one must copy what it
+    /// keeps ([ValueCodec#ofTrusted]), as the store reuses its memory once the call returns.
     ///
     /// There `body` is that of the frame at `frameOffset` of `segment`, which holds it durably, and at most `logFrom`
     /// bytes of log start at the frame. A value of the log's last budget ([SpillQueue#keepsReplayed(long)]) is copied
@@ -424,9 +427,10 @@ public final class LiveLedger implements Ledger {
         var missing = new boolean[1];
         // The puts the queue lists, for the room of the commit's record
         var listed = new int[1];
-        FrameBody.readCommit(body, view, start, length, new FrameBody.Visitor() {
+        // The kinds and key spaces of the writes alone, with no slice of a key or a value
+        FrameBody.readCommitKinds(body, start, length, new FrameBody.KindVisitor() {
             @Override
-            public void put(int keyspace, MemorySegment key, MemorySegment value) {
+            public void put(int keyspace) {
                 loadForReplay(keyspace);
                 if (queue != null && !moves) {
                     var state = byId.get(keyspace);
@@ -437,17 +441,12 @@ public final class LiveLedger implements Ledger {
             }
 
             @Override
-            public void delete(int keyspace, MemorySegment key) {
+            public void remove(int keyspace) {
                 loadForReplay(keyspace);
             }
 
             @Override
-            public void deleteRange(int keyspace, MemorySegment from, MemorySegment to) {
-                loadForReplay(keyspace);
-            }
-
-            @Override
-            public void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
+            public void putExternal(int keyspace, long length, PageRef ref) {
                 loadForReplay(keyspace);
                 if (blobs == null || missing[0]) {
                     missing[0] = true;
@@ -542,7 +541,10 @@ public final class LiveLedger implements Ledger {
                         queue.noteReplayed(sequence, segment);
                         noted[0] = true;
                     }
-                    queue.moveReplayed(values.crypto(queue), applier.lastVersion(), segment, frameOffset, at, body);
+                    if (!queue.moveReplayed(values.crypto(queue), applier.lastVersion(), segment, frameOffset, at, body)) {
+                        // The version stays on the body, which no later frame may then be opened into
+                        values.keepFrame();
+                    }
                     return;
                 }
                 var at = replayPaged(applier, state, key, value, values, replayHint(state, key, values));

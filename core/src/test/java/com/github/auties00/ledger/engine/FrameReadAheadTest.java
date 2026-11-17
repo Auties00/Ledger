@@ -26,6 +26,8 @@ import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// Recovery with the frames of an encrypted log opened ahead ([FrameReadAhead]): it takes most frames as read ahead,
@@ -144,6 +146,52 @@ class FrameReadAheadTest {
             position += LogWriter.FRAME_HEADER + ByteBuffer.wrap(bytes).getInt(position + 4);
         }
         return offsets;
+    }
+
+    @Test
+    @DisplayName("gives a new array an eighth more room, never past the multiple of half the smallest region that holds its length")
+    void spareRoom() {
+        var step = FrameReadAhead.Spares.STEP;
+        for (var length : new int[]{1, 4_000, 300_000, 460_000, 470_000, step - 64, step - 63, 900_000, step * 2 - 64,
+                step * 2, 3_000_000, (int) FrameReadAhead.AHEAD_BYTES - 1, (int) FrameReadAhead.AHEAD_BYTES}) {
+            var room = FrameReadAhead.Spares.room(length);
+            assertTrue(room >= length, "room " + room + " for " + length);
+            assertTrue(room <= FrameReadAhead.AHEAD_BYTES, "room " + room + " for " + length);
+            // With its header, in the same multiple of half the smallest region as an array of the length alone
+            assertEquals((length + 64L + step - 1) / step, (room + 64L + step - 1) / step, "room " + room + " for " + length);
+        }
+        assertEquals(4_096, FrameReadAhead.Spares.room(1));
+        assertEquals((300_000 + 37_500 + 4_095) & ~4_095, FrameReadAhead.Spares.room(300_000));
+        assertEquals(step - 64, FrameReadAhead.Spares.room(470_000));
+    }
+
+    @Test
+    @DisplayName("hands out a spare long enough, drops shorter ones and those over four times longer than half a region, and keeps none for a frame the read-ahead leaves to recovery")
+    void spareChoice() {
+        var spares = new FrameReadAhead.Spares();
+        var small = spares.takeBody(1_000);
+        var large = spares.takeBody(3_000_000);
+        spares.giveBody(small);
+        spares.giveBody(large);
+        var taken = spares.takeBody(10_000);
+        assertNotSame(small, taken);
+        assertNotSame(large, taken);
+        spares.giveBody(taken);
+        assertSame(taken, spares.takeBody(9_000));
+        var big = spares.takeBody(2_000_000);
+        spares.giveBody(big);
+        assertSame(big, spares.takeBody(1_000_000));
+        var mid = spares.takeBody(400_000);
+        spares.giveBody(mid);
+        assertSame(mid, spares.takeBody(10));
+        var huge = spares.takeBody((int) FrameReadAhead.AHEAD_BYTES + 1);
+        assertEquals(FrameReadAhead.AHEAD_BYTES + 1, huge.length);
+        spares.giveBody(huge);
+        assertNotSame(huge, spares.takeBody(100));
+        var sealed = spares.takeSealed(5_000);
+        spares.giveSealed(sealed);
+        assertNotSame(sealed, spares.takeBody(5_000));
+        assertSame(sealed, spares.takeSealed(5_000));
     }
 
     @Test
