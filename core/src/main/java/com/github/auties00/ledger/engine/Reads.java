@@ -133,6 +133,12 @@ final class Reads {
         return inTreeOnly(state, key, point) && !hiddenSinceTree(key, point, removals);
     }
 
+    /// {@return whether the tree of `point`, with the run it reads over it, holds `key`, whose hash is `hash`
+    /// ([Segments#hash(MemorySegment)]), and no later removal `point` sees hides it}
+    static boolean inTree(KeyspaceState state, MemorySegment key, int hash, ReadPoint point, RangeRemoval[] removals) {
+        return inTreeOnly(state, key, hash, point) && !hiddenSinceTree(key, point, removals);
+    }
+
     /// {@return whether the tree of `point`, with the run it reads over it, holds `key`, whatever range removal since
     /// hides it}
     static boolean inTreeOnly(KeyspaceState state, MemorySegment key, ReadPoint point) {
@@ -147,10 +153,26 @@ final class Reads {
         return root != null && TreeSearch.contains(point.pages(), root, key);
     }
 
-    /// {@return whether `point` sees `key`, whose newest version in memory is `head`, as [TreeSearch#FOUND] or
-    /// [TreeSearch#ABSENT] when memory or a range removal since the tree tells, or [TreeSearch#UNKNOWN] when only the
-    /// tree does}
-    static byte existsInMemory(KeyspaceState state, Version head, MemorySegment key, ReadPoint point) {
+    /// {@return whether the tree of `point`, with the run it reads over it, holds `key`, whose hash is `hash`
+    /// ([Segments#hash(MemorySegment)]), whatever range removal since hides it}
+    ///
+    /// A writer passes the hash its chain of the key keeps, so a key space with a run hashes no key twice.
+    static boolean inTreeOnly(KeyspaceState state, MemorySegment key, int hash, ReadPoint point) {
+        var run = runOf(state, point);
+        if (run != null) {
+            var entry = run.find(key, hash);
+            if (entry >= 0) {
+                return !run.removes(entry);
+            }
+        }
+        var root = point.root(state);
+        return root != null && TreeSearch.contains(point.pages(), root, key);
+    }
+
+    /// {@return whether `point` sees `key`, whose newest version in memory is `head` and whose hash is `hash`
+    /// ([Segments#hash(MemorySegment)]), as [TreeSearch#FOUND] or [TreeSearch#ABSENT] when memory or a range removal
+    /// since the tree tells, or [TreeSearch#UNKNOWN] when only the tree does}
+    static byte existsInMemory(KeyspaceState state, Version head, MemorySegment key, int hash, ReadPoint point) {
         var removals = state.removals;
         var version = KeyspaceState.resolve(head, key, point.bound(), removals);
         if (version != null) {
@@ -158,7 +180,7 @@ final class Reads {
         }
         var run = runOf(state, point);
         if (run != null) {
-            var entry = run.find(key);
+            var entry = run.find(key, hash);
             if (entry >= 0) {
                 return run.removes(entry) || hiddenSinceTree(key, point, removals) ? TreeSearch.ABSENT : TreeSearch.FOUND;
             }
@@ -173,13 +195,17 @@ final class Reads {
     /// [TreeSearch#ABSENT], or [TreeSearch#UNKNOWN] for a blind write: one hinted [TreeSearch#BLIND] that only the tree
     /// could answer}
     ///
+    /// A writer passes the hash its chain of the key keeps, which a lookup in the run read over the tree takes, so a key
+    /// space with a run hashes no key twice.
+    ///
+    /// @param hash the hash of `key`, as [Segments#hash(MemorySegment)] gives it
     /// @param inTree whether the tree of `point` holds `key`, as a lookup of that same tree found it,
     ///               [TreeSearch#UNKNOWN] to look it up, or [TreeSearch#BLIND] not to
-    static byte existence(KeyspaceState state, Version head, MemorySegment key, ReadPoint point, byte inTree) {
+    static byte existence(KeyspaceState state, Version head, MemorySegment key, int hash, ReadPoint point, byte inTree) {
         if (inTree == TreeSearch.BLIND) {
-            return existsInMemory(state, head, key, point);
+            return existsInMemory(state, head, key, hash, point);
         }
-        return exists(state, head, key, point, inTree) ? TreeSearch.FOUND : TreeSearch.ABSENT;
+        return exists(state, head, key, hash, point, inTree) ? TreeSearch.FOUND : TreeSearch.ABSENT;
     }
 
     /// {@return whether `point` sees `key`}
@@ -200,6 +226,24 @@ final class Reads {
         }
         if (inTree == TreeSearch.UNKNOWN) {
             return inTree(state, key, point, removals);
+        }
+        return inTree == TreeSearch.FOUND && !hiddenSinceTree(key, point, removals);
+    }
+
+    /// {@return whether `point` sees `key`, whose newest version in memory is `head` and whose hash is `hash`
+    /// ([Segments#hash(MemorySegment)])}
+    ///
+    /// @param head the newest version of `key` in memory, or `null` if there is none
+    /// @param inTree whether the tree `point` reads holds `key`, with the run it reads over it, as a lookup of that same
+    ///               tree found it, or [TreeSearch#UNKNOWN] to look it up
+    static boolean exists(KeyspaceState state, Version head, MemorySegment key, int hash, ReadPoint point, byte inTree) {
+        var removals = state.removals;
+        var version = KeyspaceState.resolve(head, key, point.bound(), removals);
+        if (version != null) {
+            return version != Version.HIDDEN;
+        }
+        if (inTree == TreeSearch.UNKNOWN) {
+            return inTree(state, key, hash, point, removals);
         }
         return inTree == TreeSearch.FOUND && !hiddenSinceTree(key, point, removals);
     }
