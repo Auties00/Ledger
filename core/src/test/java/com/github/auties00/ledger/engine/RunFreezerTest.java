@@ -912,6 +912,45 @@ class RunFreezerTest {
         }
     }
 
+    @Test
+    @Timeout(60)
+    @DisplayName("a freeze that ran long keeps the next from starting for eight times as long, however many chains the commits list meanwhile")
+    void pacedFreezes(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, true, 64)) {
+            var slowed = new AtomicBoolean();
+            ledger.freezerForTests().publishedHookForTests(() -> {
+                if (slowed.compareAndSet(false, true)) {
+                    try {
+                        Thread.sleep(150);
+                    } catch (InterruptedException exception) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+            for (var first = 0; first < 600; first += 50) {
+                write(ledger, expected, first, first + 50, 1, 0);
+            }
+            assertTrue(awaitFreezes(ledger, 1), "the store froze nothing on its own");
+            // The run that froze also freezes the other key space before it ends
+            while (ledger.freezerForTests().runningForTests()) {
+                Thread.sleep(1);
+            }
+            var ended = System.nanoTime();
+            var frozen = ledger.freezerForTests().freezesForTests();
+            // Enough chains for several freezes, listed well within the pace of the first, over 1.2 s
+            for (var first = 1_000; first < 1_600; first += 50) {
+                write(ledger, expected, first, first + 50, 1, 1);
+                if (System.nanoTime() - ended < TimeUnit.MILLISECONDS.toNanos(400)) {
+                    assertEquals(frozen, ledger.freezerForTests().freezesForTests(), "a freeze started within the pace");
+                }
+            }
+            assertTrue(awaitFreezes(ledger, frozen + 1), "no freeze started once the pace allowed");
+            ledger.freezerForTests().publishedHookForTests(null);
+            verify(ledger, expected);
+        }
+    }
+
     private static boolean awaitFreezes(LiveLedger ledger, long freezes) throws InterruptedException {
         var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
         while (ledger.freezerForTests().freezesForTests() < freezes) {

@@ -128,8 +128,8 @@ final class KeyspaceState {
     /// a reader was below them; written holding the publishing role, read as [#freshDirty] is.
     int deferredDirty;
     /// The chains [#freezeDue()] waits for: [#NO_FREEZE] in a key space that freezes none, otherwise at least the
-    /// store's least, and the size of the frozen run, so the rebuilds copy at most twice the run they end with; written
-    /// by the freeze and the cut holding the publishing role, read by the commits without it.
+    /// store's least, and the size of the frozen run, so the rebuilds copy the run they end with a few times at most;
+    /// written by the freeze and the cut holding the publishing role, read by the commits without it.
     int freezeAt = NO_FREEZE;
     // The least freezeAt of the key space, set as the store opens: NO_FREEZE in one that freezes none
     private int freezeMin = NO_FREEZE;

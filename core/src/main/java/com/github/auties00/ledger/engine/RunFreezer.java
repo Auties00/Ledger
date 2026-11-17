@@ -36,15 +36,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /// unmerged if it has not published its run, and otherwise drops no more of them, leaving the rest beside their
 /// entries for the checkpoint to take.
 ///
-/// It runs once the key space listed at least the store's least number of chains since its last freeze, and as many
-/// as its frozen run holds, so the rebuilds copy at most twice the run they end with; and once more as the log nears
+/// It runs once the key space listed at least the store's least number of chains since its last freeze, and as many as
+/// its frozen run holds, so the rebuilds copy the run they end with a few times at most; and once more as the log nears
 /// the next checkpoint, so that checkpoint starts with most of the chains frozen. Only a key space whose samples show
 /// it replaces few of its values before a checkpoint freezes ([ValueSlab.Overwrites#spills()]), and one whose freeze
 /// finds a quarter of its chains' keys frozen and dropped already, written again since, freezes no more until the next
-/// cut: overwritten keys would only go from chains to the run and back. A chain an earlier freeze left beside its entry,
-/// as its wait for the walkers ran out or a checkpoint came, is not one. A freeze that finds fewer chains ready than half of
-/// those it waited for doubles the wait, so chains whose values never leave their arrays do not start one freeze after
-/// another.
+/// cut: overwritten keys would only go from chains to the run and back. A chain an earlier freeze left beside its
+/// entry, as its wait for the walkers ran out or a checkpoint came, is not one. A freeze that finds fewer chains ready
+/// than half of those it waited for doubles the wait, so chains whose values never leave their arrays do not start one
+/// freeze after another; and no freeze starts for [#PACE] times as long as the last one ran, so freezes take a bounded
+/// share of a processor however fast the commits list chains.
 final class RunFreezer {
     /// The chains a paged key space lists before its first freeze of a checkpoint interval, by default.
     static final int FREEZE_MIN = 16_384;
@@ -60,6 +61,10 @@ final class RunFreezer {
     /// How long no freeze starts after one could not run: a checkpoint ran or was about to, or a reader held an older
     /// tree, or a run a checkpoint took waited for one, none of which the commits that ask meanwhile change.
     private static final long QUIET_NANOS = 20_000_000L;
+    /// How many times as long as a freeze ran no other starts after it, its waits included: freezes take at most a
+    /// ninth of the time, so a store that lists chains faster than a freeze merges them, as an ingest of a history does,
+    /// freezes fewer and larger batches and leaves more of them to its checkpoints than one that writes steadily.
+    private static final int PACE = 8;
 
     private final LiveLedger ledger;
     private final Checkpointer checkpointer;
@@ -120,6 +125,11 @@ final class RunFreezer {
         this.droppedHookForTests = hook;
     }
 
+    /// {@return whether a freeze runs on its thread; for tests}
+    boolean runningForTests() {
+        return running.get();
+    }
+
     /// {@return the freezes that dropped chains so far; for tests}
     long freezesForTests() {
         return freezes;
@@ -149,11 +159,18 @@ final class RunFreezer {
     }
 
     private void run() {
+        var started = System.nanoTime();
         try {
             freezeDue();
         } catch (RuntimeException _) {
             // The chains a failed freeze took went back; the next one tries again
         } finally {
+            // Before the next may start: no commit starts one before the pace allows
+            var ended = System.nanoTime();
+            var paced = ended + (ended - started) * PACE;
+            if (paced - quietUntil > 0) {
+                quietUntil = paced;
+            }
             running.set(false);
         }
         // Commits that came while it ran found it running
