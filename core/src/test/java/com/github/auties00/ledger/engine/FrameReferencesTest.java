@@ -919,6 +919,26 @@ class FrameReferencesTest {
         assertEquals(null, reads.get(1).value());
     }
 
+    @Test
+    @DisplayName("a split body whose own part takes more than a run's body starts on a chunk of the pool, which goes back to it once the body is released, and one whose own part is smaller, or that has no pool, takes an array of its own")
+    void splitOwnPartOnAPoolChunk() {
+        var pool = new HeapPool(1L << 24, false);
+        var acquires = pool.acquiresForTests();
+        var large = FrameBody.forSplit(LogWriter.RUN_MAX_BODY, pool);
+        assertEquals(acquires + 1, pool.acquiresForTests(), "the own part did not take a chunk of the pool");
+        assertEquals(FrameBody.CHUNK_BYTES, large.chunk(0).length);
+        assertTrue(large.holdsPoolForTests());
+        large.put(1, utf8("session"), utf8("resident"));
+        large.finishSplit();
+        var pooled = pool.pooledBytesForTests();
+        large.release();
+        assertEquals(pooled + FrameBody.CHUNK_BYTES, pool.pooledBytesForTests(), "the chunk did not go back to the pool");
+        var small = FrameBody.forSplit(LogWriter.RUN_MAX_BODY - Integer.BYTES - 1, pool);
+        assertTrue(small.chunk(0).length < FrameBody.CHUNK_BYTES);
+        assertEquals(acquires + 1, pool.acquiresForTests(), "a small own part took a chunk of the pool");
+        assertTrue(FrameBody.forSplit(LogWriter.RUN_MAX_BODY, null).chunk(0).length < FrameBody.CHUNK_BYTES);
+    }
+
     /// {@return the bytes of a split body of two puts that leave their values to the section, and one inline}
     private static byte[] splitBytes() {
         var body = FrameBody.forSplit(16, null);

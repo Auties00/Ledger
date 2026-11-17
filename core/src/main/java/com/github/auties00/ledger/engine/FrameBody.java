@@ -227,9 +227,15 @@ final class FrameBody {
 
     /// {@return an empty split body with room for `capacity` bytes of writes before it grows, besides its own length}
     ///
+    /// An own part of more than [LogWriter#RUN_MAX_BODY] bytes starts on a chunk of `pool`, which goes back to it once
+    /// the frame is sealed, as the commit's body unsplit, its section included, would have from a chunk's bytes on: on
+    /// an array of its own, every such commit would allocate the array.
+    ///
     /// @param pool the pool, or `null` for a body of one array
     static FrameBody forSplit(int capacity, HeapPool pool) {
-        var body = new FrameBody(Integer.BYTES + capacity, SPLIT_REFERABLE, pool);
+        var own = Integer.BYTES + capacity;
+        var body = new FrameBody(pool != null && own > LogWriter.RUN_MAX_BODY ? Math.max(own, CHUNK_BYTES) : own,
+                SPLIT_REFERABLE, pool);
         // The own length, which finishSplit() writes
         body.used = Integer.BYTES;
         return body;
