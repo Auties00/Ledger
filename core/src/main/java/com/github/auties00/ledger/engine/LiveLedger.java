@@ -407,11 +407,12 @@ public final class LiveLedger implements Ledger {
     /// refused by the run, takes what the run holds of its key as the tree's state of it
     /// ([#replayHint(KeyspaceState, MemorySegment, ReplayValues)]), as the trees the open found lack the run's writes.
     ///
+    /// @param split whether the body is split, that of a frame of type [FrameBody#COMMIT_SPLIT]
     /// @param values the chunks and the state of this open's replay
     /// @param segment the use of the segment that holds the frame, or `null` to move no value
     /// @return whether it replayed the commit
-    boolean replay(long sequence, byte[] body, int start, int length, ReplayValues values, LogSegmentView segment,
-                   long frameOffset, long logFrom) {
+    boolean replay(long sequence, byte[] body, int start, int length, boolean split, ReplayValues values,
+                   LogSegmentView segment, long frameOffset, long logFrom) {
         var view = values.frame(body);
         var queue = segment == null ? null : spills;
         // Whether the values go to the log at once rather than to chunks the queue lists
@@ -424,7 +425,7 @@ public final class LiveLedger implements Ledger {
         var missing = new boolean[1];
         // The puts the queue lists, for the room of the commit's record
         var listed = new int[1];
-        FrameBody.readCommit(body, view, start, length, new FrameBody.Visitor() {
+        FrameBody.readCommit(body, view, start, length, split, new FrameBody.Visitor() {
             @Override
             public void put(int keyspace, MemorySegment key, MemorySegment value) {
                 loadForReplay(keyspace);
@@ -483,7 +484,7 @@ public final class LiveLedger implements Ledger {
         var record = new SpillQueue.Record[1];
         // Whether the segment recorded the commit, before its first value moves there
         var noted = new boolean[1];
-        FrameBody.readCommit(body, view, start, length, new FrameBody.Visitor() {
+        FrameBody.readCommit(body, view, start, length, split, new FrameBody.Visitor() {
             @Override
             public void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
                 var unit = units.get(next[0]++);
@@ -995,6 +996,7 @@ public final class LiveLedger implements Ledger {
                 for (var i = 0; i < size; i++) {
                     applyAlone(writes, i, applier, hints, units);
                 }
+                applier.finishFrame();
             } catch (RuntimeException | Error throwable) {
                 // A resident value whose decoder throws, or a tree that cannot be read, stops the batch
                 applier.rollback();
@@ -1380,6 +1382,7 @@ public final class LiveLedger implements Ledger {
             for (var i = 0; i < size; i++) {
                 applyWrite(pending, applier, i);
             }
+            applier.finishFrame();
         } catch (Throwable failure) {
             applier.rollback();
             pending.failure = failure;
@@ -3103,12 +3106,17 @@ public final class LiveLedger implements Ledger {
                 addDelta(state, 1);
             }
             if (frame != null) {
+                var sectioned = false;
                 if (external != null) {
                     frame.putExternal(state.id, key, length, external);
                     unitBytes += length;
                     if (state.resident) {
                         unitHeap += length;
                     }
+                } else if (kept != null && !state.resident && frame.split()) {
+                    // Left on the array the version keeps, which no one writes or pools: the frame's section refers to it
+                    frame.putSection(state.id, key, kept, keptAt, length);
+                    sectioned = true;
                 } else if (kept != null && length >= frame.referable()) {
                     frame.put(state.id, key, kept, keptAt, length);
                 } else {
@@ -3119,21 +3127,32 @@ public final class LiveLedger implements Ledger {
                 if (spillRoom != 0 && spillRoom != REPLAYED && external == null && !state.resident && (own != null
                         ? length >= SpillQueue.LOG_VALUE_MIN
                         : spillRoom > 0 && source != null && state.overwrites.spills())) {
-                    listSpill(version, length);
+                    listSpill(version, length, sectioned);
                 }
             }
         }
 
-        /// Lists `version`, whose value of `length` bytes the commit's frame now ends with, among the values that may
-        /// leave the heap for the log.
-        private void listSpill(Version version, int length) {
+        /// Lists `version`, whose value of `length` bytes the last put of the commit's frame holds, among the values that
+        /// may leave the heap for the log.
+        ///
+        /// @param sectioned whether the put left the value to the section of a split frame, where the record finds it
+        ///                  once [FrameBody#finishSplit()] placed the section
+        private void listSpill(Version version, int length, boolean sectioned) {
             var record = frame.spill();
             if (record == null) {
                 record = spills.record(sequence, spillRoom > 0 ? spillRoom : -1 - spillRoom);
                 frame.spill(record);
             }
-            // A put ends with its value, whether the frame copies it or refers to it
-            record.add(version, frame.size() - length, length);
+            // A put ends with its value, whether the frame copies it or refers to it, or ends the section so far
+            record.add(version, sectioned ? frame.sectionOffset(length) : frame.valueOffset(length), length);
+        }
+
+        /// Ends the commit's frame once its last write is in, if it is split ([FrameBody#finishSplit()]); not for a
+        /// commit taken back.
+        void finishFrame() {
+            if (frame != null && frame.split()) {
+                frame.finishSplit();
+            }
         }
 
         void delete(KeyspaceState state, MemorySegment key) {
@@ -3309,7 +3328,7 @@ public final class LiveLedger implements Ledger {
             // Queued before it is visible, so the log holds every commit a reader can see, in order
             if (frame != null) {
                 try {
-                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size(), sharesChunk);
+                    log.append(frame.commitType(), sequence, frame, unitBytes, unitHeap, touched.size(), sharesChunk);
                     logged = true;
                 } catch (RuntimeException exception) {
                     rollback();
@@ -3322,7 +3341,7 @@ public final class LiveLedger implements Ledger {
         /// Adds the commit's frame, if it is journaled, to `batch`.
         void queueFrame(LogWriter.Batch batch) {
             if (frame != null) {
-                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size(), sharesChunk);
+                batch.add(frame.commitType(), sequence, frame, unitBytes, unitHeap, touched.size(), sharesChunk);
             }
         }
 

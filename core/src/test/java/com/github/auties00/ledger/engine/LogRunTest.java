@@ -322,7 +322,7 @@ class LogRunTest {
                 }
 
                 @Override
-                public boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset,
+                public boolean commit(long sequence, byte[] body, int start, int length, boolean split, LogSegmentView segment, long frameOffset,
                                       long logFrom) {
                     told.put(sequence, new long[]{segment.number(), frameOffset, logFrom});
                     return true;
@@ -357,7 +357,7 @@ class LogRunTest {
                 }
 
                 @Override
-                public boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset,
+                public boolean commit(long sequence, byte[] body, int start, int length, boolean split, LogSegmentView segment, long frameOffset,
                                       long logFrom) {
                     if (sequence == missing) {
                         return false;

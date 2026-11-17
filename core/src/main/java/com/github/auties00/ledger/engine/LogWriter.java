@@ -118,7 +118,9 @@ import java.util.zip.CRC32C;
 /// ones, and the hashing of its header whatever its length, which for the frame of a commit of one small write was most
 /// of the time a flush took, and a message below 512 bytes never reaches the vectorized GCM. A frame of at most
 /// [#RUN_MAX_BODY] bytes, a run or not, is gathered into the output whole, the values its bodies refer to included,
-/// then sealed in place in one call. A run of one commit is written as the frame of that commit. Runs never cross a
+/// then sealed in place in one call. A run of one commit is written as the frame of that commit. A frame of type
+/// [FrameBody#COMMIT_SPLIT] never joins a run: its body is the commit's own part and the section after it, whose
+/// pieces of a batch's chunks go to the cipher as they are. Runs never cross a
 /// group or a segment, so a group starts, ends and rolls over at the frames it would one frame per commit; a group
 /// torn by a crash drops its runs whole, commits of a group never acknowledged durable.
 ///
@@ -136,9 +138,10 @@ final class LogWriter {
     static final int MAGIC = 0x4C474631;
     static final byte GROUP_START = 1;
     static final long SEGMENT_MAGIC = 0x4C475345474D4E54L;
-    /// The version of the segments a writer starts: from 3 a segment may hold frames of type [FrameBody#COMMITS], so a
-    /// build that reads only earlier versions refuses it by its version and not at the first such frame.
-    static final int SEGMENT_VERSION = 3;
+    /// The version of the segments a writer starts: from 3 a segment may hold frames of type [FrameBody#COMMITS], from
+    /// 4 frames of type [FrameBody#COMMIT_SPLIT], so a build that reads only earlier versions refuses it by its version
+    /// and not at the first such frame.
+    static final int SEGMENT_VERSION = 4;
     /// The oldest version recovery reads, whose frame types the current version all has.
     static final int OLDEST_SEGMENT_VERSION = 2;
     static final int TAG_BYTES = 16;

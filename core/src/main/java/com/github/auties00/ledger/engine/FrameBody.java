@@ -1,5 +1,6 @@
 package com.github.auties00.ledger.engine;
 
+import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.LedgerCorruptedException;
 
 import java.lang.foreign.MemorySegment;
@@ -16,6 +17,16 @@ import java.util.Arrays;
 /// delete    1, id, key length, key
 /// range     2, id, lower bound length, lower bound, upper bound length, upper bound   (0: no bound)
 /// external  3, id, key length, key, value length, reference of the value's unit in ledger.blobs (20)
+/// ```
+///
+/// A split commit body, that of a frame of type [#COMMIT_SPLIT], starts with the length of its own part as four
+/// little-endian bytes, those four included; the writes follow as in a commit body, but that a put may leave its value
+/// to the section, which holds the values of those puts back to back in the order of the writes, from the end of the
+/// own part to the end of the body:
+///
+/// ```text
+/// split     own length (4), write, write, ..., section
+/// section   4, id, key length, key, value length   (the value: the next value length bytes of the section)
 /// ```
 ///
 /// A catalog body is entries of an id and a name; an epoch body is the epoch. A run body is the bodies of commits of
@@ -41,6 +52,16 @@ import java.util.Arrays;
 /// A referred array is one no one writes and the store's [HeapPool] never hands out, so a frame may wait in the log's
 /// queue while the batch it came from starts again on other arrays. It keeps the whole array reachable meanwhile, a
 /// slab's chunk for a value of a few hundred bytes, until the writer seals it; the queue's limit bounds that.
+///
+/// The body of a large commit whose paged values lie in the order of its writes on arrays the versions keep
+/// ([ArrayWriteBatch#valuesInOrder()]) is [split][#split()]: it copies none of those values, and refers to them as its
+/// section, one reference per run of values that follow one another on an array, about one per chunk of the batch's
+/// rope, which the writer hands to the cipher as they are. A section refers only to a chunk of the rope that its values
+/// keep as their home, or the copy of it they keep instead, to the array a batch packed its values into, or to a
+/// value's array of its own: arrays that never come from the pool or go back to it ([ArrayWriteBatch#finish()] keeps
+/// the chunks a prepare exposed), and that no one writes once the batch is prepared, so they hold the commit's bytes
+/// until the writer has sealed the frame however soon the batch starts again. The applier ends such a body with
+/// [#finishSplit()] once its last write is in, and the log lets go of the arrays as it [releases][#release()] it.
 ///
 /// A body made with a [HeapPool] keeps its own bytes past [#CHUNK_BYTES] in chunks of that size from the pool, every
 /// one but the last full, rather than in one array of megabytes that the collector would give regions of their own and
@@ -69,6 +90,8 @@ final class FrameBody {
     /// A frame holding a run of commits of consecutive sequences, from the one it carries, which [LogWriter] seals as
     /// one message.
     static final byte COMMITS = 4;
+    /// A frame holding a commit as a split body: its own part, then the values its puts leave to the section.
+    static final byte COMMIT_SPLIT = 5;
     /// The bytes of a chunk of a body made with a pool: the size of the chunks of a batch's rope, so the frames of a
     /// history sync hand theirs on to the next batches; below half the smallest region of the G1 collector; and a
     /// multiple of the slice [LogWriter] seals at a time, so no slice spans two chunks.
@@ -82,17 +105,23 @@ final class FrameBody {
     static final int SEALED_REFERABLE = 2 << 10;
     /// What [#referable()] is for a body that refers to no value.
     static final int NOT_REFERABLE = Integer.MAX_VALUE;
+    /// What [#referable()] is for a split body, which refers to no value a put offers, only to those it leaves to the
+    /// section ([#putSection]): longer than any value, as [#NOT_REFERABLE] is.
+    static final int SPLIT_REFERABLE = Integer.MAX_VALUE - 1;
     /// The longest body: the longest whose frame AES-GCM can seal and recovery can read into one array, which the JVM
     /// limits to a few bytes under 2 GiB, with the frame's header and its tag or checksum.
     static final int MAX_BYTES = Integer.MAX_VALUE - 8 - LogWriter.FRAME_HEADER - Math.max(LogWriter.TAG_BYTES, Integer.BYTES);
     /// The most bytes a write takes beside its keys, value and unit reference, which [#checkRoom(long)] counts and a
     /// write checks the room of its array for: a kind and three numbers of up to ten bytes.
     static final int WRITE_FIELDS = 1 + 3 * 10;
+    /// The most bytes a body made for a commit has room for at first, however many its writes take.
+    private static final long MAX_CAPACITY = 64L << 20;
 
     private static final byte PUT = 0;
     private static final byte DELETE = 1;
     private static final byte RANGE = 2;
     private static final byte EXTERNAL = 3;
+    private static final byte PUT_SECTION = 4;
     // The ints of laterSpans per reference: where in data the value belongs, where it starts in its array, its length
     private static final int SPAN_FIELDS = 3;
     // The references after the first a body makes room for when it needs a second
@@ -165,14 +194,23 @@ final class FrameBody {
     /// A commit whose body takes at most [LogWriter#RUN_MAX_BODY] bytes by [#capacityFor(ArrayWriteBatch, PageRef\[\])],
     /// which never estimates less than a body takes, refers to its values of [#RUN_REFERABLE] bytes or more, which its
     /// room leaves out: every put of a batch offers its value on an array, but one whose value is in its unit. Such a
-    /// commit has few writes, and only one with a value that long visits them. The body of any other commit refers to
-    /// nothing, as the writer seals it slice by slice from the body itself, and keeps its bytes past [#CHUNK_BYTES] in
-    /// chunks from `pool`.
+    /// commit has few writes, and only one with a value that long visits them. A larger commit whose paged values lie
+    /// in the order of its writes on the arrays the versions keep, more than [LogWriter#RUN_MAX_BODY] bytes of those it
+    /// leaves to a section, gets a [split][#split()] body, with room for its writes but those values. The body of any
+    /// other commit refers to nothing, as the writer seals it slice by slice from the body itself. Either keeps its own
+    /// bytes past [#CHUNK_BYTES] in chunks from `pool`.
     ///
     /// @param pool the pool, or `null` for a body of one array
     static FrameBody forCommit(ArrayWriteBatch writes, PageRef[] units, HeapPool pool) {
-        var capacity = capacityFor(writes, units);
+        var estimate = estimateFor(writes, units);
+        var capacity = (int) Math.min(estimate, MAX_CAPACITY);
         if (capacity > LogWriter.RUN_MAX_BODY) {
+            if (writes.valuesInOrder()) {
+                var section = sectionBytes(writes, units);
+                if (section > LogWriter.RUN_MAX_BODY) {
+                    return forSplit((int) Math.min(Math.max(0, estimate - section), MAX_CAPACITY), pool);
+                }
+            }
             return new FrameBody(capacity, NOT_REFERABLE, pool);
         }
         if (writes.largestValueBytes() < RUN_REFERABLE) {
@@ -187,6 +225,16 @@ final class FrameBody {
         return new FrameBody(capacity, RUN_REFERABLE);
     }
 
+    /// {@return an empty split body with room for `capacity` bytes of writes before it grows, besides its own length}
+    ///
+    /// @param pool the pool, or `null` for a body of one array
+    static FrameBody forSplit(int capacity, HeapPool pool) {
+        var body = new FrameBody(Integer.BYTES + capacity, SPLIT_REFERABLE, pool);
+        // The own length, which finishSplit() writes
+        body.used = Integer.BYTES;
+        return body;
+    }
+
     /// {@return the bytes the body of a commit of `writes` takes, its large values in their units, near enough that it
     /// seldom grows}
     ///
@@ -196,6 +244,12 @@ final class FrameBody {
     /// The encodings of the batch hold its keys, values and bounds, and the bytes a write whose codec threw had
     /// reserved, which only make the estimate larger: only a commit with large values visits its writes.
     static int capacityFor(ArrayWriteBatch writes, PageRef[] units) {
+        return (int) Math.min(estimateFor(writes, units), MAX_CAPACITY);
+    }
+
+    /// {@return the bytes the body of a commit of `writes` takes, as [#capacityFor(ArrayWriteBatch, PageRef\[\])]
+    /// estimates them, without its bound}
+    private static long estimateFor(ArrayWriteBatch writes, PageRef[] units) {
         // The kind, the key space and the lengths of each write, as variable-length numbers, and what they encode
         var bytes = 16 + 16L * writes.size() + writes.encodedBytes();
         if (units != null) {
@@ -206,7 +260,24 @@ final class FrameBody {
                 }
             }
         }
-        return (int) Math.min(bytes, 64L << 20);
+        return bytes;
+    }
+
+    /// {@return the bytes of the values a split body of a commit of `writes` leaves to its section: those of its puts
+    /// to paged key spaces that no unit of the file of large values holds}
+    ///
+    /// Such a value lies on the batch's arrays the versions keep, or on an array of its own that the batch did not
+    /// borrow: a borrowed one always has a unit, whose reference the body holds instead.
+    static long sectionBytes(ArrayWriteBatch writes, PageRef[] units) {
+        var bytes = writes.pagedValueBytes() + writes.pagedOwnBytes();
+        if (units != null) {
+            for (var i = 0; i < units.length; i++) {
+                if (units[i] != null && writes.keyspace(i).residency() == Keyspace.Residency.PAGED && !writes.borrowed(i)) {
+                    bytes -= writes.valueBytes(i);
+                }
+            }
+        }
+        return bytes;
     }
 
     /// {@return the bytes of a body of one array that refers to no value; only the first [#size()] are meaningful}
@@ -241,6 +312,29 @@ final class FrameBody {
     /// {@return the length of the body, the values it refers to included}
     int size() {
         return ownBytes() + referred.bytes;
+    }
+
+    /// {@return whether the body is split: its own part, then the values its puts leave to the section}
+    boolean split() {
+        return referred.referable == SPLIT_REFERABLE;
+    }
+
+    /// {@return the type of the frame of a commit with this body: [#COMMIT_SPLIT] for a split body, [#COMMIT]
+    /// otherwise}
+    byte commitType() {
+        return split() ? COMMIT_SPLIT : COMMIT;
+    }
+
+    /// {@return where in the body the value of `length` bytes the last put copied or referred to starts}
+    int valueOffset(int length) {
+        return (split() ? ownBytes() : size()) - length;
+    }
+
+    /// {@return where the value of `length` bytes the last [#putSection] left to the section starts in it, as `-1`
+    /// minus that offset: [SpillQueue.Record#resolveSection(int)] makes it the place in the body once
+    /// [#finishSplit()] knows where the section starts}
+    int sectionOffset(int length) {
+        return -1 - (referred.bytes - length);
     }
 
     /// {@return the bytes the body holds itself, in its chunks or its one array}
@@ -294,15 +388,16 @@ final class FrameBody {
         }
     }
 
-    /// Gives the body's pooled arrays back to its pool, once the log sealed its frame and never reads it again; a body
-    /// made without a pool keeps its array, and the arrays a body refers to are never the pool's. A second call does
-    /// nothing.
+    /// Gives the body's pooled arrays back to its pool, once the log sealed its frame and never reads it again, and lets
+    /// go of the arrays it refers to, which are never the pool's, so a body something still holds keeps none of them
+    /// reachable; a body made without a pool keeps its array and its references. A second call does nothing.
     void release() {
         var pooled = this.pooled;
         if (pooled == null || pooled.state == RELEASED) {
             return;
         }
         pooled.state = RELEASED;
+        referred = References.none(referred.referable);
         if (pooled.chunks != null) {
             for (var i = 0; i < pooled.chunkCount; i++) {
                 assert poison(pooled.chunks[i]);
@@ -370,6 +465,7 @@ final class FrameBody {
     ///
     /// The runs of a chunked body are split at its chunks' ends, so no piece spans two arrays.
     int pieces() {
+        assert !split() || finished() : "a split body read before finishSplit()";
         var spread = spread();
         return spread == null ? 2 * references() + 1 : spread.count;
     }
@@ -538,12 +634,86 @@ final class FrameBody {
         }
     }
 
+    /// Records, in a split body, a put whose value is the `length` bytes at `offset` of `array`, which it leaves to the
+    /// section: the value follows the values the puts before it left there, by reference, and the body holds only the
+    /// put's key and lengths.
+    ///
+    /// A value that starts on `array` where the section's last reference ends extends that reference, so the values of
+    /// a chunk of a batch's rope, which follow one another in the order of the writes, take one reference.
+    ///
+    /// @param array an array no one writes from now on and the store's pool never hands out
+    void putSection(int keyspace, MemorySegment key, byte[] array, int offset, int length) {
+        assert split() : "a section put to a body that is not split";
+        var keyLength = key.byteSize();
+        if (data.length - used < WRITE_FIELDS + keyLength) {
+            writeByte(PUT_SECTION);
+            writeVarInt(keyspace);
+            writeSegment(key);
+            writeVarInt(length);
+        } else {
+            data[used++] = PUT_SECTION;
+            putVarInt(keyspace);
+            putSegment(key, (int) keyLength);
+            putVarInt(length);
+        }
+        if (length == 0) {
+            return;
+        }
+        var references = referred;
+        if (references.count == 0) {
+            // Placed by finishSplit(), once the own part is complete
+            referred = new References(SPLIT_REFERABLE, array, -1, offset, length);
+        } else if (!references.extend(array, offset, length)) {
+            references.add(array, -1, offset, length);
+        }
+    }
+
+    /// Ends a split body once its last write is in: its section starts where its own part ends, whose length goes into
+    /// its first four bytes, and the values of the commit listed to leave the heap for the frame learn where in the body
+    /// the section put them. Called by the commit's applier before the frame is queued, and never on a body whose commit
+    /// was taken back.
+    void finishSplit() {
+        assert split() : "a body that is not split";
+        var own = ownBytes();
+        var references = referred;
+        for (var reference = 0; reference < references.count; reference++) {
+            references.place(reference, own);
+        }
+        var pooled = this.pooled;
+        var first = pooled != null && pooled.chunks != null ? pooled.chunks[0] : data;
+        first[0] = (byte) own;
+        first[1] = (byte) (own >>> 8);
+        first[2] = (byte) (own >>> 16);
+        first[3] = (byte) (own >>> 24);
+        if (pooled != null) {
+            // Pieces made before the section was placed
+            pooled.spread = null;
+        }
+        if (spill != null) {
+            spill.resolveSection(own);
+        }
+        assert finished();
+    }
+
+    /// {@return whether every reference of a split body is placed where its own part ends, as [#finishSplit()] leaves
+    /// them}
+    private boolean finished() {
+        var own = ownBytes();
+        for (var reference = 0; reference < referred.count; reference++) {
+            if (referred.at(reference) != own) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /// The values a body refers to, in order, and the shortest it refers to.
     private static final class References {
         // What a body that refers to no value holds, by the shortest value it would refer to; never changed
         private static final References NONE = new References(NOT_REFERABLE);
         private static final References RUN = new References(RUN_REFERABLE);
         private static final References SEALED = new References(SEALED_REFERABLE);
+        private static final References SPLIT = new References(SPLIT_REFERABLE);
 
         // The shortest value the body refers to
         private final int referable;
@@ -552,11 +722,11 @@ final class FrameBody {
         private int bytes;
         // The first, in fields of its own, as the body of a commit of one value has no other: its array, where in the
         // body's own bytes its value belongs, counted over the chunks, and where in its array the value starts and how
-        // long it is
+        // long it is; where it belongs and its length change only in a split body, as its section grows and ends
         private final byte[] firstArray;
-        private final int firstAt;
+        private int firstAt;
         private final int firstOffset;
-        private final int firstLength;
+        private int firstLength;
         // The references after the first, in order, or null before the second
         private byte[][] laterArrays;
         private int[] laterSpans;
@@ -589,6 +759,7 @@ final class FrameBody {
                 case NOT_REFERABLE -> NONE;
                 case RUN_REFERABLE -> RUN;
                 case SEALED_REFERABLE -> SEALED;
+                case SPLIT_REFERABLE -> SPLIT;
                 default -> new References(referable);
             };
         }
@@ -610,6 +781,32 @@ final class FrameBody {
             laterSpans[span + 2] = length;
             count++;
             bytes += length;
+        }
+
+        /// Extends the last reference by the `length` bytes at `offset` of `array`, if they follow its bytes there.
+        ///
+        /// @return whether it did
+        boolean extend(byte[] array, int offset, int length) {
+            var last = count - 1;
+            if (array(last) != array || offset(last) + length(last) != offset) {
+                return false;
+            }
+            if (last == 0) {
+                firstLength += length;
+            } else {
+                laterSpans[(last - 1) * SPAN_FIELDS + 2] += length;
+            }
+            bytes += length;
+            return true;
+        }
+
+        /// Records that the value of reference `reference` belongs at `at` of the body's own bytes.
+        void place(int reference, int at) {
+            if (reference == 0) {
+                firstAt = at;
+            } else {
+                laterSpans[(reference - 1) * SPAN_FIELDS] = at;
+            }
         }
 
         /// {@return the array of reference `reference`}
@@ -969,11 +1166,41 @@ final class FrameBody {
     /// Reads the commit body that is the `length` bytes at `start` of `body`, passing each write to `visitor`.
     ///
     /// The segments the visitor receives are slices of `view`, a read-only segment of the whole of `body`, which the
-    /// caller must not change afterward: the address of each is where it starts in `body`.
+    /// caller must not change afterward: the address of each is where it starts in `body`, the value a put of a split
+    /// body left to the section included.
     ///
-    /// @throws LedgerCorruptedException if the body is malformed
-    static void readCommit(byte[] body, MemorySegment view, int start, int length, Visitor visitor) {
-        var reader = new Reader(body, view, start, start + length);
+    /// @param split whether the body is split, that of a frame of type [#COMMIT_SPLIT]
+    /// @throws LedgerCorruptedException if the body is malformed: for a split body also if its own length lies outside
+    ///         it, a value runs past the section, or the values do not end where the body does
+    static void readCommit(byte[] body, MemorySegment view, int start, int length, boolean split, Visitor visitor) {
+        var end = start + length;
+        if (!split) {
+            readWrites(new Reader(body, view, start, end), null, visitor);
+            return;
+        }
+        if (length < Integer.BYTES) {
+            throw new LedgerCorruptedException("A log frame holds a split commit shorter than its own length", null);
+        }
+        var own = (body[start] & 0xFF) | (body[start + 1] & 0xFF) << 8 | (body[start + 2] & 0xFF) << 16
+                | (body[start + 3] & 0xFF) << 24;
+        if (own < Integer.BYTES || own > length) {
+            throw new LedgerCorruptedException("A log frame holds a split commit whose own length " + Integer.toUnsignedString(own)
+                    + " lies outside its " + length + " bytes", null);
+        }
+        var section = new Reader(body, view, start + own, end);
+        readWrites(new Reader(body, view, start + Integer.BYTES, start + own), section, visitor);
+        if (section.position != end) {
+            throw new LedgerCorruptedException("A log frame holds a split commit whose values end " + (end - section.position)
+                    + " bytes before it", null);
+        }
+    }
+
+    /// Reads the writes `reader` holds, passing each to `visitor`, and the value of each put that left it to the
+    /// section from `section`.
+    ///
+    /// @param section the reader of the section of a split body, or `null` for a body that has none
+    /// @throws LedgerCorruptedException if the writes are malformed or a value runs past the section
+    private static void readWrites(Reader reader, Reader section, Visitor visitor) {
         while (reader.position < reader.end) {
             var kind = reader.readByte();
             var keyspace = Math.toIntExact(reader.readVarInt());
@@ -982,6 +1209,13 @@ final class FrameBody {
                 case DELETE -> visitor.delete(keyspace, reader.readSegment());
                 case RANGE -> visitor.deleteRange(keyspace, reader.readOptional(), reader.readOptional());
                 case EXTERNAL -> visitor.putExternal(keyspace, reader.readSegment(), reader.readVarInt(), reader.readRef());
+                case PUT_SECTION -> {
+                    if (section == null) {
+                        throw new LedgerCorruptedException("A log frame holds a section put outside a split commit", null);
+                    }
+                    var key = reader.readSegment();
+                    visitor.put(keyspace, key, section.readSegment(reader.readVarInt()));
+                }
                 default -> throw new LedgerCorruptedException("A log frame holds an unknown write kind " + kind, null);
             }
         }
@@ -1117,7 +1351,12 @@ final class FrameBody {
         }
 
         MemorySegment readSegment() {
-            var length = readLength();
+            return readSegment(readVarInt());
+        }
+
+        /// {@return the next `length` bytes, checked against what is left}
+        MemorySegment readSegment(long length) {
+            check(length);
             var segment = memory.asSlice(position, length);
             position += (int) length;
             return segment;

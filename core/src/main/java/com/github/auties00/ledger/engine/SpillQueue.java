@@ -561,6 +561,9 @@ final class SpillQueue {
         }
 
         /// Lists `version`, whose value of `length` bytes starts at `offset` of the commit's body.
+        ///
+        /// @param offset where the value starts in the commit's body; or, for a value a split body left to its section,
+        ///               `-1` minus where it starts in the section, until [#resolveSection(int)]
         void add(Version version, int offset, int length) {
             if (count == versions.length) {
                 versions = Arrays.copyOf(versions, count * 2);
@@ -577,6 +580,17 @@ final class SpillQueue {
             } else {
                 sharedBytes += length;
                 sharedMoved += length >= LOG_VALUE_MIN ? LOG_VALUE_BYTES : (ARRAY_HEADER + length + 7) & -8;
+            }
+        }
+
+        /// Makes the offsets of the values the commit's split body left to its section, which [#add] took as `-1` minus
+        /// where each starts in the section, the offsets of those values in the body, whose section starts at
+        /// `sectionStart`; the other offsets stay. Called once the body is complete, before the record is queued.
+        void resolveSection(int sectionStart) {
+            for (var i = 0; i < count; i++) {
+                if (offsets[i] < 0) {
+                    offsets[i] = sectionStart + (-1 - offsets[i]);
+                }
             }
         }
 

@@ -138,7 +138,7 @@ class RecoveryBufferTest {
         }
 
         boolean holdsCommits() {
-            return type == FrameBody.COMMIT || type == FrameBody.COMMITS;
+            return type == FrameBody.COMMIT || type == FrameBody.COMMITS || type == FrameBody.COMMIT_SPLIT;
         }
     }
 

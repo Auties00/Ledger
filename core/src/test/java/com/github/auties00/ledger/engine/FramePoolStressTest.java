@@ -320,7 +320,7 @@ class FramePoolStressTest {
         var disk = CrashFileSystem.create();
         try (var pool = IoPool.create(1)) {
             var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(disk.getPath("/store"))
-                    .encryption(Encryption.key(KEY)).keyspace(NAMES).commitWindow(Duration.ZERO).ioPool(pool))
+                    .encryption(Encryption.key(KEY)).keyspace(NAMES).keyspace(CHATS).commitWindow(Duration.ZERO).ioPool(pool))
                     .segmentSize(1L << 20)
                     .build();
             try {
@@ -398,8 +398,9 @@ class FramePoolStressTest {
             this.thread = new Thread(() -> {
                 try {
                     var batch = ledger.newBatch();
+                    // Resident values, which the frame copies: a paged key space's would leave its own bytes below a chunk
                     for (var write = 0; write < LARGE_WRITES; write++) {
-                        batch.put(NAMES, key(committer, write), value(committer, 0, write));
+                        batch.put(CHATS, key(committer, write), value(committer, 0, write));
                     }
                     ledger.commit(batch);
                 } catch (Throwable throwable) {

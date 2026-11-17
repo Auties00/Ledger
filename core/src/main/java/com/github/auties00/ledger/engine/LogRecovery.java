@@ -86,12 +86,14 @@ final class LogRecovery {
         ///
         /// `body` is a new array no one else writes, which the commits of a run share.
         ///
+        /// @param split whether the body is split, that of a frame of type [FrameBody#COMMIT_SPLIT]; a run holds no such
+        ///              body
         /// @param segment the use, or `null` if the recovery moves no value off the heap
         /// @param logFrom the bytes of log from the start of the frame to the end of the log, at most: the frames a
         ///                recovery that moves values off the heap still replays lie there, and 0 without one
         /// @return whether it replayed the commit; it changed nothing if not
-        boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset,
-                       long logFrom);
+        boolean commit(long sequence, byte[] body, int start, int length, boolean split, LogSegmentView segment,
+                       long frameOffset, long logFrom);
 
         void epoch(int epoch);
     }
@@ -244,13 +246,13 @@ final class LogRecovery {
                     lastWritten = path;
                     var replayed = true;
                     switch (type) {
-                        case FrameBody.COMMIT -> {
+                        case FrameBody.COMMIT, FrameBody.COMMIT_SPLIT -> {
                             if (sequence > checkpoint) {
                                 if (sequence != last + 1) {
                                     throw new LedgerCorruptedException(path + " holds commit " + sequence + " after commit " + last, null);
                                 }
-                                replayed = sink.commit(sequence, body, 0, body.length, view, position,
-                                        spills == null ? 0 : segmentEnd - position + after[index]);
+                                replayed = sink.commit(sequence, body, 0, body.length, type == FrameBody.COMMIT_SPLIT, view,
+                                        position, spills == null ? 0 : segmentEnd - position + after[index]);
                                 if (replayed) {
                                     last = sequence;
                                 }
@@ -269,7 +271,7 @@ final class LogRecovery {
                                     throw new LedgerCorruptedException(path + " holds commit " + next + " after commit " + last, null);
                                 }
                                 var length = commits.next();
-                                replayed = sink.commit(next, body, commits.start(), length, view, position,
+                                replayed = sink.commit(next, body, commits.start(), length, false, view, position,
                                         spills == null ? 0 : segmentEnd - position + after[index]);
                                 if (replayed) {
                                     last = next;

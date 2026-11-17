@@ -6,6 +6,7 @@ import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
+import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.Transaction;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.testkit.ChangeInterceptor;
@@ -743,5 +744,298 @@ class FrameReferencesTest {
             }));
             assertEquals(2, ledger.size(MESSAGES));
         }
+    }
+
+    /// A write of a commit body as recovery reads it: its key space, key, and value or `null`, with where the value
+    /// lies in the body.
+    private record Read(int keyspace, byte[] key, byte[] value, long at) {
+    }
+
+    /// {@return the puts and removals of the commit body `bytes`, read as recovery reads them}
+    private static List<Read> read(byte[] bytes, boolean split) {
+        var reads = new ArrayList<Read>();
+        var view = MemorySegment.ofArray(bytes).asReadOnly();
+        FrameBody.readCommit(bytes, view, 0, bytes.length, split, new FrameBody.Visitor() {
+            @Override
+            public void put(int keyspace, MemorySegment key, MemorySegment value) {
+                reads.add(new Read(keyspace, key.toArray(ValueLayout.JAVA_BYTE), value.toArray(ValueLayout.JAVA_BYTE), value.address()));
+            }
+
+            @Override
+            public void delete(int keyspace, MemorySegment key) {
+                reads.add(new Read(keyspace, key.toArray(ValueLayout.JAVA_BYTE), null, -1));
+            }
+
+            @Override
+            public void deleteRange(int keyspace, MemorySegment from, MemorySegment to) {
+                throw new AssertionError("no range removal was written");
+            }
+
+            @Override
+            public void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
+                throw new AssertionError("no unit was written");
+            }
+        });
+        return reads;
+    }
+
+    /// {@return the own length a split body's bytes start with}
+    private static int ownLength(byte[] bytes) {
+        return (bytes[0] & 0xFF) | (bytes[1] & 0xFF) << 8 | (bytes[2] & 0xFF) << 16 | (bytes[3] & 0xFF) << 24;
+    }
+
+    @Test
+    @DisplayName("a split body takes the paged values of a rope batch as a reference per run of a chunk, reads back every write, and keeps its bytes once the batch starts again")
+    void splitBody() {
+        var random = new Random(41);
+        var pool = new HeapPool(1L << 28, false);
+        var batch = new ArrayWriteBatch(this, pool, BY_NAME);
+        var values = new ArrayList<byte[]>();
+        for (var i = 0; i < 400; i++) {
+            // One value on an array of its own in the middle of the rope's values, and a resident one
+            var value = pattern(random, i == 200 ? 200_000 : 1_000 + random.nextInt(400));
+            batch.put(i == 300 ? SESSIONS : MESSAGES, "message" + i, value);
+            values.add(value);
+        }
+        batch.prepare(false, null, Map.of());
+        assertTrue(batch.valuesInOrder());
+        assertTrue(batch.chunksForTests() > 1, "the batch is no rope");
+        var body = FrameBody.forCommit(batch, null, pool);
+        assertTrue(body.split());
+        assertEquals(FrameBody.COMMIT_SPLIT, body.commitType());
+        assertEquals(FrameBody.sectionBytes(batch, null), values.stream().mapToLong(value -> value.length).sum() - values.get(300).length);
+        // Where each run of the section would break: a new array, or a value that does not follow the last on it
+        var runs = 0;
+        byte[] last = null;
+        var end = 0;
+        var section = 0L;
+        for (var i = 0; i < batch.size(); i++) {
+            var key = batch.key(i);
+            var length = (int) batch.valueBytes(i);
+            if (batch.keyspace(i).residency() == Keyspace.Residency.RESIDENT) {
+                body.put(1, key, batch.value(i));
+                continue;
+            }
+            var own = batch.ownValue(i);
+            var array = own != null ? own : batch.homeArray(i);
+            var offset = own != null ? 0 : batch.homeOffset(i);
+            if (array != last || offset != end) {
+                runs++;
+            }
+            last = array;
+            end = offset + length;
+            body.putSection(0, key, array, offset, length);
+            assertEquals(-1 - section, body.sectionOffset(length));
+            section += length;
+        }
+        body.finishSplit();
+        assertEquals(runs, body.references());
+        // The own value breaks the run of its chunk, and the rope's last chunk is a copy
+        assertTrue(runs <= batch.chunksForTests() + 2, runs + " references for " + batch.chunksForTests() + " chunks");
+        var expected = body.toBytes();
+        assertEquals(body.size(), expected.length);
+        var own = ownLength(expected);
+        assertEquals(expected.length - section, own);
+        var reads = read(expected, true);
+        assertEquals(values.size(), reads.size());
+        var next = (long) own;
+        for (var i = 0; i < reads.size(); i++) {
+            var read = reads.get(i);
+            assertArrayEquals(values.get(i), read.value(), "write " + i);
+            assertArrayEquals(("message" + i).getBytes(StandardCharsets.UTF_8), read.key());
+            if (i == 300) {
+                assertTrue(read.at() < own, "the resident value is in the own part");
+            } else {
+                // The values of the section, back to back, as a slice of the body
+                assertEquals(next, read.at(), "where write " + i + " lies");
+                next += read.value().length;
+            }
+        }
+        assertEquals(expected.length, next);
+        // The batch starts again on chunks of the pool, which never are the section's
+        batch.finish();
+        for (var i = 0; i < 400; i++) {
+            batch.put(MESSAGES, "again" + i, new byte[1_200]);
+        }
+        assertArrayEquals(expected, body.toBytes());
+        body.release();
+        assertEquals(0, body.references(), "a released body keeps the arrays it referred to");
+    }
+
+    @Test
+    @DisplayName("a section extends its last reference only by a value that follows it on the same array")
+    void sectionRuns() {
+        var first = new byte[100];
+        var second = new byte[100];
+        new Random(5).nextBytes(first);
+        new Random(6).nextBytes(second);
+        var body = FrameBody.forSplit(16, null);
+        body.putSection(0, utf8("a"), first, 0, 10);
+        // An inline put between two values of the section is in the own part, which breaks no run
+        body.put(1, utf8("inline"), utf8("held"));
+        body.putSection(0, utf8("b"), first, 10, 5);
+        assertEquals(1, body.references());
+        // A gap
+        body.putSection(0, utf8("c"), first, 20, 5);
+        assertEquals(2, body.references());
+        // Another array at the offset the last reference ends at
+        body.putSection(0, utf8("d"), second, 25, 5);
+        assertEquals(3, body.references());
+        body.putSection(0, utf8("e"), second, 30, 0);
+        body.putSection(0, utf8("f"), second, 30, 7);
+        assertEquals(3, body.references());
+        // An array before the last one, at the end of its reference
+        body.putSection(0, utf8("g"), first, 25, 3);
+        assertEquals(4, body.references());
+        body.finishSplit();
+        var bytes = body.toBytes();
+        var reads = read(bytes, true);
+        assertEquals(List.of("a", "inline", "b", "c", "d", "e", "f", "g"),
+                reads.stream().map(read -> new String(read.key(), StandardCharsets.UTF_8)).toList());
+        assertArrayEquals(Arrays.copyOfRange(first, 0, 10), reads.get(0).value());
+        assertArrayEquals("held".getBytes(StandardCharsets.UTF_8), reads.get(1).value());
+        assertArrayEquals(Arrays.copyOfRange(first, 10, 15), reads.get(2).value());
+        assertArrayEquals(Arrays.copyOfRange(first, 20, 25), reads.get(3).value());
+        assertArrayEquals(Arrays.copyOfRange(second, 25, 30), reads.get(4).value());
+        assertArrayEquals(new byte[0], reads.get(5).value());
+        assertArrayEquals(Arrays.copyOfRange(second, 30, 37), reads.get(6).value());
+        assertArrayEquals(Arrays.copyOfRange(first, 25, 28), reads.get(7).value());
+        assertEquals(bytes.length - 10 - 5 - 5 - 5 - 7 - 3, ownLength(bytes));
+    }
+
+    @Test
+    @DisplayName("a split body whose section stays empty is its own part alone, its own length the body's")
+    void emptySection() {
+        var body = FrameBody.forSplit(16, new HeapPool(1L << 24, false));
+        body.put(1, utf8("session"), utf8("resident"));
+        body.delete(0, utf8("removed"));
+        body.finishSplit();
+        assertEquals(0, body.references());
+        var bytes = body.toBytes();
+        assertEquals(bytes.length, ownLength(bytes));
+        var reads = read(bytes, true);
+        assertEquals(2, reads.size());
+        assertArrayEquals("resident".getBytes(StandardCharsets.UTF_8), reads.get(0).value());
+        assertEquals(null, reads.get(1).value());
+    }
+
+    /// {@return the bytes of a split body of two puts that leave their values to the section, and one inline}
+    private static byte[] splitBytes() {
+        var body = FrameBody.forSplit(16, null);
+        var values = new byte[64];
+        new Random(9).nextBytes(values);
+        body.putSection(0, utf8("a"), values, 0, 30);
+        body.put(1, utf8("b"), utf8("inline"));
+        body.putSection(0, utf8("c"), values, 30, 34);
+        body.finishSplit();
+        return body.toBytes();
+    }
+
+    static Stream<Arguments> malformedSplits() {
+        var valid = splitBytes();
+        var own = ownLength(valid);
+        return Stream.of(
+                Arguments.of("an own length below its own four bytes", withOwnLength(valid, 3)),
+                Arguments.of("an own length past the body", withOwnLength(valid, valid.length + 1)),
+                Arguments.of("a negative own length", withOwnLength(valid, -1)),
+                Arguments.of("a body shorter than its own length", Arrays.copyOf(valid, 3)),
+                Arguments.of("a value that runs past the section", Arrays.copyOf(valid, valid.length - 1)),
+                Arguments.of("bytes after the last value", Arrays.copyOf(valid, valid.length + 1)),
+                Arguments.of("an own part that ends inside a write", withOwnLength(valid, own - 1)));
+    }
+
+    private static byte[] withOwnLength(byte[] bytes, int own) {
+        var copy = bytes.clone();
+        copy[0] = (byte) own;
+        copy[1] = (byte) (own >>> 8);
+        copy[2] = (byte) (own >>> 16);
+        copy[3] = (byte) (own >>> 24);
+        return copy;
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("malformedSplits")
+    @DisplayName("recovery refuses a malformed split body")
+    void malformedSplit(String ignored, byte[] bytes) {
+        assertThrows(LedgerCorruptedException.class, () -> read(bytes, true));
+    }
+
+    @Test
+    @DisplayName("recovery refuses a section put in a body that is not split")
+    void sectionOutsideSplit() {
+        var valid = splitBytes();
+        var own = ownLength(valid);
+        // The writes of the own part, read as the body of a frame of type COMMIT
+        var writes = Arrays.copyOfRange(valid, 4, own);
+        assertThrows(LedgerCorruptedException.class, () -> read(writes, false));
+        // And a split body read as one that is not
+        assertThrows(LedgerCorruptedException.class, () -> read(valid, false));
+    }
+
+    static Stream<Arguments> splitStores() {
+        return Stream.of(Arguments.of(true, 1L << 20), Arguments.of(false, 1L << 20), Arguments.of(true, 64L << 10),
+                Arguments.of(false, 64L << 10));
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}, large values from {1}")
+    @MethodSource("splitStores")
+    @DisplayName("queues a split frame for a rope batch, which keeps its values while the batch starts again at once on pooled chunks, and recovers them")
+    void splitFrames(boolean encrypted, long largeValues) throws Exception {
+        withSlab(false, pool -> {
+            var random = new Random(largeValues + (encrypted ? 1 : 0));
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, byte[]>();
+            CrashFileSystem survivor;
+            try (var ledger = open(disk.getPath("/store"), encrypted, largeValues)) {
+                ledger.awaitDurable();
+                // A unit first, whose epoch frame is then durable: a commit with a unit waits for it
+                var unit = pattern(random, 100_000);
+                ledger.commit(ledger.newBatch().put(MESSAGES, "unit", unit)).awaitDurable();
+                model.put(id(MESSAGES, "unit"), unit);
+                var reached = new CountDownLatch(1);
+                var open = stallLog(disk, reached);
+                var queue = ((LiveLedger) ledger).logForTests();
+                Commit last = null;
+                try {
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "first", new byte[300]));
+                    model.put(id(MESSAGES, "first"), new byte[300]);
+                    assertTrue(reached.await(2, TimeUnit.MINUTES));
+                    var batch = ledger.newBatch();
+                    for (var round = 0; round < 4; round++) {
+                        for (var i = 0; i < 300; i++) {
+                            var key = "r" + round + ":" + i;
+                            // A value of 200 KiB on an array of its own, below the default large values; values of
+                            // 64 to 128 KiB on the rope, which the smaller large values send to units
+                            var length = i == 150 ? 200 << 10 : i % 97 == 5 ? 70_000 + random.nextInt(50_000) : 1_000 + random.nextInt(1_000);
+                            var value = pattern(random, length);
+                            batch.put(MESSAGES, key, value);
+                            model.put(id(MESSAGES, key), value);
+                        }
+                        var session = "s" + round;
+                        var state = pattern(random, 3_000);
+                        batch.put(SESSIONS, session, state);
+                        model.put(id(SESSIONS, session), state);
+                        // The same batch starts again right after, on chunks of the pool, while the frame waits
+                        last = ledger.commit(batch);
+                        var frame = queue.queuedForTests().getLast();
+                        assertTrue(frame.split(), "the frame of round " + round + " is not split");
+                        assertTrue(frame.references() < 40, frame.references() + " references");
+                        assertTrue(frame.pieceArray(0).length < 64 << 10, "the frame copies its values");
+                    }
+                    pool.assertNoneFree(ledger);
+                    verify(ledger, model);
+                } finally {
+                    open.countDown();
+                }
+                last.awaitDurable();
+                verify(ledger, model);
+                survivor = disk.afterPowerLoss(new Random(7));
+            }
+            try (var ledger = open(survivor.getPath("/store"), encrypted, largeValues)) {
+                verify(ledger, model);
+                ledger.checkpoint();
+                verify(ledger, model);
+            }
+        });
     }
 }
