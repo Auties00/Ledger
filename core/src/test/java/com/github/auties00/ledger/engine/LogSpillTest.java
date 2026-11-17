@@ -1703,7 +1703,7 @@ class LogSpillTest {
                 ledger.commit(more).awaitDurable();
                 spills.awaitIdleForTests();
             }
-            assertEquals(newer, log.currentSegment(), "the log rolled again");
+            assertEquals(newer, log.currentSegment(), "the log did not roll again");
             assertArrayEquals(new long[]{older, newer}, spills.segmentsForTests(), "the segments by number");
             ledger.checkpoint();
             var kept = spills.segmentsForTests();
