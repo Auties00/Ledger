@@ -92,10 +92,13 @@ import java.util.function.Consumer;
 /// on virtual threads of its own beside it. A store that went quiet, or kept older versions in memory for a snapshot
 /// that closed, lets go of them on a platform thread of its own, started at most once every 30 seconds. A read of a
 /// page the cache does not hold reads the file on the calling thread. A commit writes its large values on the calling
-/// thread, and reads the pages of the trees its writes need, which the cache does not hold, on virtual threads of its
-/// own, before it waits for the writer. On Windows a commit whose thread writes its own group through to stable
-/// storage holds a virtual thread's carrier while the device takes the
-/// write, as the JDK lends a carrier only for its own blocking calls. The entries of a
+/// thread, which the store forces beside its log on the platform threads the stores of the process share, and reads
+/// the pages of the trees its writes need, which the cache does not hold, on the calling thread and on virtual threads
+/// of its own that help it, before it waits for the writer. A thread that waits for the work of one of the store's
+/// virtual threads does that work itself if the thread has not started, so an application's virtual threads holding
+/// every carrier hold up no commit, open or read of a caller on a platform thread. On Windows a commit whose thread
+/// writes its own group through to stable storage holds a virtual thread's carrier while the device takes the write,
+/// as the JDK lends a carrier only for its own blocking calls. The entries of a
 /// [resident][Keyspace.Residency#RESIDENT] key space are read into memory on virtual threads of the store's own, from
 /// the first use of the key space after the store opens, unless [Options#loadResidentAtOpen(boolean)] has the open
 /// read them. The store counts the entries a batch's range removal takes away on a virtual thread of its own, after

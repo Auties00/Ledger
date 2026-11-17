@@ -65,8 +65,8 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
         this.spillBudget = SpillQueue.defaultBudget(Runtime.getRuntime().maxMemory());
     }
 
-    /// Runs the flushes of a store opened without a pool on `flusher` in place of the process's; for tests that count
-    /// its threads or make them fail to start.
+    /// Runs the flushes of a store opened without a pool, and the forces of the file of large values of any store, on
+    /// `flusher` in place of the process's; for tests that count its threads or make them fail to start.
     LedgerBuilder flusher(ProcessFlusher flusher) {
         this.flusher = flusher;
         return this;
@@ -321,10 +321,12 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             ledger.endReplay(values);
             blobs.begin(epochs[0] + 1);
             var catalog = ledger.assignIds();
-            // Without a pool of the user's, a lane of the flusher the stores of the process share, which no store closes
+            // Without a pool of the user's, a lane of the flusher the stores of the process share, which no store closes;
+            // the forces of the file of large values take a lane of it whatever runs the flushes, as the flush waits for
+            // them on its own thread, which a pool of one thread would leave none beside
             var pool = (PlatformIoPool) ioPool;
-            var executor = pool != null ? pool.executor()
-                    : (flusher != null ? flusher : ProcessFlusher.process()).lane();
+            var shared = flusher != null ? flusher : ProcessFlusher.process();
+            var executor = pool != null ? pool.executor() : shared.lane();
             // Numbers only grow, past every segment and the first one the checkpoint may need
             var first = Math.max(recovered.lastSegment() + 1, Math.max(firstSegment, 1));
             var empty = recovered.empty();
@@ -353,7 +355,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             var through = writeThroughWay != null ? writeThroughWay
                     : WriteThrough.of(writeThrough != null ? writeThrough : WriteThrough.Mode.fromProperty(), logDirectory);
             var log = new LogWriter(files, opened.keys(), opened.header().storeId(), first, recovered.lastSequence(),
-                    segmentSize, executor, pool != null ? pool::queued : null, commitWindow, empty, through);
+                    segmentSize, executor, shared.lane(), pool != null ? pool::queued : null, commitWindow, empty, through);
             var deltaTable = superblock == null ? null : superblock.deltaTable();
             var deltas = deltaTable == null ? DeltaTable.EMPTY
                     : DeltaTable.decode(pages.read(deltaTable, PageFormat.DELTA_TABLE, false));

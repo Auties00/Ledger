@@ -104,7 +104,7 @@ jobs:
             commit) PATTERN='cobalt\.(DurableCommit|GroupCommit|OfflineDrain|WebhookInbox)Benchmark' ;;
             ingest) PATTERN='cobalt\.(HistoryIngest|AppStateSync|ChatDelete)Benchmark' ;;
             read) PATTERN='cobalt\.(ChatPage|MessageLookup|Reopen)Benchmark' ;;
-            limits-write) PATTERN='limits\.(RandomOverwrite|ParallelWriters|PinnedReader|LargeValue)Benchmark' ;;
+            limits-write) PATTERN='limits\.(RandomOverwrite|ParallelWriters|PinnedReader|LargeValue|CallerThreads|CallerThreadsRead)Benchmark' ;;
             limits-query) PATTERN='limits\.(AdHocQuery|SqlIndexQuery|MultiProcessWriters)Benchmark' ;;
             # Every workload that measures memory, and the design measurement of the memory pipeline
             memory) PATTERN='memory\.|cobalt\.ReopenBenchmark\.footprint' ;;

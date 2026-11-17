@@ -4,6 +4,8 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.LedgerException;
 
 import java.lang.foreign.MemorySegment;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
@@ -25,6 +27,11 @@ import java.util.function.IntConsumer;
 /// open; or on the opening thread ([#loadNow()]), on as many threads as the data file has read channels. Once a thread
 /// waits for it or a long scan reads beside it ([#awaitRun(MemorySegment)]), its next runs take every read channel too,
 /// since a read or a write is waiting for them.
+///
+/// An application's virtual threads may hold every carrier for as long as they compute, which nothing preempts, so the
+/// loader's thread may not start for as long: a write that waits for the loader then loads on its own thread instead,
+/// up to its key, and hands the rest to a new thread ([Attempt]); a close that stops the loader makes sure it never
+/// runs.
 final class ResidentLoader {
     /// The threads a loader running beside the store reads the leaves on.
     private static final int THREADS = 2;
@@ -62,8 +69,8 @@ final class ResidentLoader {
     private volatile int status;
     // Set as the store closes: the loader stops before its next run, and no thread starts it again
     private volatile boolean stopping;
-    // The thread of the last attempt, guarded by the lock
-    private Thread thread;
+    // The last attempt started, guarded by the lock
+    private Attempt current;
     // The attempts started and the last that failed, with its failure; guarded by the lock
     private int attempts;
     private int failedAttempt;
@@ -119,30 +126,60 @@ final class ResidentLoader {
     /// Waits until memory holds the entry of `key`, if it has one, or every entry if `key` is `null`; starts the loader
     /// first, again if it failed.
     ///
+    /// If the thread of the attempt running has not started, it runs the attempt on the calling thread, up to `key`,
+    /// then starts a thread for the rest.
+    ///
     /// @throws IllegalStateException if the store closes meanwhile
     /// @throws LedgerCorruptedException if the load it waited for failed, its failure as the cause: a new exception, so
     ///                                  its frames are the caller's, and a codec's exception of any type is told apart
     ///                                  from the one a closed store throws
     void await(MemorySegment key) {
-        if (key == null ? complete : holds(key)) {
+        if (loaded(key)) {
             return;
         }
         hurried = true;
         lock.lock();
         try {
             var attempt = launch(true);
-            while (!(key == null ? complete : holds(key))) {
+            while (!loaded(key)) {
                 if (stopping) {
                     throw new IllegalStateException("The store is closed");
                 }
                 if (status == FAILED && failedAttempt >= attempt) {
                     throw loadFailure(failure);
                 }
+                if (status == IDLE) {
+                    // An attempt a waiter ran up to its own key, before it started the next
+                    attempt = launch(true);
+                    continue;
+                }
+                var unstarted = current;
+                if (status == RUNNING && unstarted.take()) {
+                    lock.unlock();
+                    try {
+                        unstarted.perform(key);
+                    } finally {
+                        lock.lock();
+                    }
+                    continue;
+                }
                 progress.awaitUninterruptibly();
+            }
+            if (status == IDLE) {
+                try {
+                    launch(false);
+                } catch (RuntimeException | OutOfMemoryError _) {
+                    // Recorded as the attempt's failure: the next write that waits starts it again
+                }
             }
         } finally {
             lock.unlock();
         }
+    }
+
+    /// {@return whether memory holds the entry of `key`, if it has one, or every entry if `key` is `null`}
+    private boolean loaded(MemorySegment key) {
+        return key == null ? complete : holds(key);
     }
 
     /// Has the next runs read on every read channel and, if the loader is reading the run that holds the keys next to
@@ -185,42 +222,39 @@ final class ResidentLoader {
         }
         attempts++;
         status = RUNNING;
+        var attempt = new Attempt();
+        current = attempt;
         try {
-            thread = Thread.ofVirtual().name("ledger-resident-load").start(this::run);
+            Thread.ofVirtual().name("ledger-resident-load").start(attempt);
         } catch (RuntimeException | Error refused) {
-            // As under a limit of memory: left running, every write of an unloaded key would wait for good
+            // As under a limit of memory: the attempt would wait for a write to take it, and start() would never retry
+            attempt.cancel();
             ended(refused);
             throw refused;
         }
         return attempts;
     }
 
-    /// Stops the loader before its next run and waits for its thread, as the store closes; no thread starts it again.
+    /// Stops the loader before its next run and waits for the attempt running, as the store closes; no thread starts it
+    /// again. An attempt whose thread has not started never runs.
     void stop() {
-        Thread running;
+        Attempt running;
         lock.lock();
         try {
             stopping = true;
             progress.signalAll();
-            running = status == RUNNING ? thread : null;
+            running = status == RUNNING ? current : null;
         } finally {
             lock.unlock();
         }
         if (running == null) {
             return;
         }
-        var interrupted = false;
-        while (true) {
-            try {
-                running.join();
-                break;
-            } catch (InterruptedException _) {
-                interrupted = true;
-            }
+        if (running.cancel()) {
+            ended(null);
+            return;
         }
-        if (interrupted) {
-            Thread.currentThread().interrupt();
-        }
+        running.awaitDone();
     }
 
     /// Loads every entry on the calling thread, while the store opens.
@@ -228,23 +262,7 @@ final class ResidentLoader {
     /// @throws LedgerCorruptedException if a node fails authentication
     /// @throws com.github.auties00.ledger.LedgerIoException if the file cannot be read
     void loadNow() {
-        load(PageFile.READ_CHANNELS, PageFile.READ_CHANNELS * PageFile.RUN_PAGES);
-    }
-
-    private void run() {
-        Throwable failed = null;
-        try {
-            load(THREADS, FIRST_RUN);
-        } catch (RuntimeException | Error throwable) {
-            failed = throwable;
-        }
-        var reported = ended(failed);
-        if (reported != null) {
-            report(reported);
-        }
-        if (failed instanceof Error error) {
-            throw error;
-        }
+        load(PageFile.READ_CHANNELS, PageFile.READ_CHANNELS * PageFile.RUN_PAGES, null);
     }
 
     /// Records how the attempt ended, `failed` or not, and wakes the writes waiting for it.
@@ -283,7 +301,10 @@ final class ResidentLoader {
     /// Installs the entries from [#below] on, `firstRun` leaves first and twice as many each run after, up to
     /// `threads` reads of [PageFile#RUN_PAGES] pages a run; once [#hurried], every run takes all it can on every read
     /// channel.
-    private void load(int threads, int firstRun) {
+    ///
+    /// @param until the key whose entry it stops once memory holds, before its next run; or `null`, to install every
+    ///              entry
+    private void load(int threads, int firstRun, MemorySegment until) {
         var readers = ledger.readers();
         // The registration keeps the tree and its pages, which a checkpoint published meanwhile would free
         var sequence = readers.register();
@@ -298,7 +319,7 @@ final class ResidentLoader {
                 var run = firstRun;
                 var runs = 0;
                 for (var start = 0; start < leaves.size(); ) {
-                    if (stopping) {
+                    if (stopping || (until != null && holds(until))) {
                         return;
                     }
                     if (hurried && width < PageFile.READ_CHANNELS) {
@@ -405,6 +426,80 @@ final class ResidentLoader {
         var hook = stepHookForTests;
         if (hook != null) {
             hook.accept(runs);
+        }
+    }
+
+    /// One attempt to load: its own virtual thread runs it, unless a write that waits for the loader takes it first
+    /// ([#await(MemorySegment)]) or a close cancels it ([#stop()]); the first to come decides, so it runs at most once.
+    private final class Attempt implements Runnable {
+        // Set by the first to take or cancel the attempt
+        private final AtomicBoolean claimed;
+        // Released once the attempt ended, its failure reported, or once it was cancelled
+        private final CountDownLatch done;
+
+        private Attempt() {
+            this.claimed = new AtomicBoolean();
+            this.done = new CountDownLatch(1);
+        }
+
+        /// Loads every entry, on the attempt's own thread, unless the attempt was taken or cancelled.
+        @Override
+        public void run() {
+            if (take() && perform(null) instanceof Error error) {
+                throw error;
+            }
+        }
+
+        /// {@return whether the caller took the attempt, which it then runs with [#perform(MemorySegment)]}
+        boolean take() {
+            return claimed.compareAndSet(false, true);
+        }
+
+        /// {@return whether the attempt was cancelled before anyone took it, so it never runs}
+        boolean cancel() {
+            if (!claimed.compareAndSet(false, true)) {
+                return false;
+            }
+            done.countDown();
+            return true;
+        }
+
+        /// Loads up to `until`, or every entry if `null`, then records how the attempt ended, waking the writes waiting
+        /// for it, and reports its failure.
+        ///
+        /// @return the failure, or `null`
+        Throwable perform(MemorySegment until) {
+            Throwable failed = null;
+            try {
+                try {
+                    load(THREADS, FIRST_RUN, until);
+                } catch (RuntimeException | Error throwable) {
+                    failed = throwable;
+                }
+                var reported = ended(failed);
+                if (reported != null) {
+                    report(reported);
+                }
+                return failed;
+            } finally {
+                done.countDown();
+            }
+        }
+
+        /// Waits until the attempt ended, whatever the interrupt status of the caller, which it keeps.
+        void awaitDone() {
+            var interrupted = false;
+            while (true) {
+                try {
+                    done.await();
+                    break;
+                } catch (InterruptedException _) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 }

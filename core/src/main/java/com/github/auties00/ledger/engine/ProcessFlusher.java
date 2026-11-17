@@ -11,10 +11,11 @@ import java.util.concurrent.locks.LockSupport;
 
 /// The flush threads the stores opened without a pool share: daemon platform threads named `ledger-io-N`, made as
 /// flushes need them and ended after [#KEEP_ALIVE_SECONDS] without one, so a process holding many idle stores holds
-/// few threads, and none once they have been idle that long. No store closes it.
+/// few threads, and none once they have been idle that long. No store closes it. Every store, with a pool or not,
+/// forces its file of large values on them too, beside the flush that waits for the force.
 ///
-/// Each store's log runs its flushes on a lane of its own ([#lane()]), which holds a thread while it has a flush to
-/// run and gives it back once it has none. A flush given to a lane that holds a thread, running a flush or about to,
+/// Each store's log runs its flushes on a lane of its own ([#lane()]), and the forces of its file of large values on
+/// another, which holds a thread while it has a task to run and gives it back once it has none. A flush given to a lane that holds a thread, running a flush or about to,
 /// costs its caller one atomic add: the thread runs it next, as the thread of a pool of the store's own would take it
 /// from its queue, and nothing waits for a thread to come back or makes one. A flush given to a lane that holds none
 /// takes the thread that waited the least, which for one busy store is the thread of its last flush, and only when
@@ -62,11 +63,12 @@ final class ProcessFlusher {
         }
     }
 
-    /// {@return a new lane, the executor of one store's flushes}
+    /// {@return a new lane, the executor of one store's flushes, or of the forces of its file of large values}
     ///
     /// A lane runs one task at a time, and runs again after every task given to it: the tasks given while one runs, or
     /// waits for its thread, are run once after it, as the last of them given. Every task of a log is its flush, which
-    /// writes whatever the queue holds when it runs, so one run serves every flush given before it starts. A task that
+    /// writes whatever the queue holds when it runs, so one run serves every flush given before it starts; a force of
+    /// the file of large values is given only once the one before it is done. A task that
     /// throws is reported to its thread's uncaught exception handler, and the lane goes on. A task the lane cannot get a
     /// thread for is refused with [RejectedExecutionException], and the tasks given while it was refused are dropped
     /// with it: the log stops on the refusal.

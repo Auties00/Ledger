@@ -86,7 +86,7 @@ class ClaimedIndexesTest {
     void busyCarriers() throws Exception {
         var size = 64;
         var done = new AtomicInteger();
-        CheckpointThreadsTest.assertEndsWithBusyCarriers(() -> ClaimedIndexes.run("test-claimed", size, 8, _ -> done.incrementAndGet()));
+        BusyCarriersTest.assertEndsWithBusyCarriers(() -> ClaimedIndexes.run("test-claimed", size, 8, _ -> done.incrementAndGet()));
         assertEquals(size, done.get());
     }
 
