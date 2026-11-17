@@ -44,8 +44,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /// cut: overwritten keys would only go from chains to the run and back. A chain an earlier freeze left beside its
 /// entry, as its wait for the walkers ran out or a checkpoint came, is not one. A freeze that finds fewer chains ready
 /// than half of those it waited for doubles the wait, so chains whose values never leave their arrays do not start one
-/// freeze after another; and no freeze starts for [#PACE] times as long as the last one ran, so freezes take a bounded
-/// share of a processor however fast the commits list chains.
+/// freeze after another. The freezes take at most a [#SHARE] of the time since the store opened: one starts only once
+/// that share, less what the freezes took, pays for the least number of chains a key space waits for, at the cost a
+/// chain took in the last freeze, and takes no more chains than it pays for, the oldest listed first, so a store that
+/// lists chains faster than its share freezes them, as an ingest of a history does, leaves the rest to its checkpoints.
 final class RunFreezer {
     /// The chains a paged key space lists before its first freeze of a checkpoint interval, by default.
     static final int FREEZE_MIN = 16_384;
@@ -61,10 +63,14 @@ final class RunFreezer {
     /// How long no freeze starts after one could not run: a checkpoint ran or was about to, or a reader held an older
     /// tree, or a run a checkpoint took waited for one, none of which the commits that ask meanwhile change.
     private static final long QUIET_NANOS = 20_000_000L;
-    /// How many times as long as a freeze ran no other starts after it, its waits included: freezes take at most a
-    /// ninth of the time, so a store that lists chains faster than a freeze merges them, as an ingest of a history does,
-    /// freezes fewer and larger batches and leaves more of them to its checkpoints than one that writes steadily.
-    private static final int PACE = 8;
+    /// The share of the time since the store opened that its freezes may take, waits included, one in 24: a freeze
+    /// costs about a microsecond of a processor per chain, which a store that lists chains faster than its share pays
+    /// for, as an ingest of a history does, leaves most of them to its checkpoints, while one that writes steadily
+    /// freezes most of its own.
+    private static final int SHARE = 24;
+    /// What a freeze is taken to cost per chain it takes, and per four entries of the run before it copies, until one
+    /// ran: a cold one measured 2 to 5 microseconds a chain, a warm one about one.
+    private static final long FIRST_NANOS_PER_CHAIN = 2_000;
 
     private final LiveLedger ledger;
     private final Checkpointer checkpointer;
@@ -79,6 +85,12 @@ final class RunFreezer {
     private volatile long freezes;
     // Before this time, by System.nanoTime(), no commit starts a freeze
     private volatile long quietUntil;
+    // When the store opened, by System.nanoTime(): its freezes take a SHARE of the time since
+    private final long opened;
+    // The time the freezes took so far, and what one took per chain it took (and per four entries of the run before it
+    // copied); the freeze's alone, read by commits without synchronization to start one
+    private volatile long spentNanos;
+    private volatile long nanosPerChain;
     // What a freeze runs once it published its run, before it waits for the walks and drops chains, or null; for tests
     // that write or read there. Plain: set before the freeze runs
     private Runnable publishedHookForTests;
@@ -94,13 +106,16 @@ final class RunFreezer {
         this.running = new AtomicBoolean();
         this.nearCutDone = Long.MIN_VALUE;
         this.quietUntil = System.nanoTime();
+        this.opened = quietUntil;
+        this.nanosPerChain = FIRST_NANOS_PER_CHAIN;
     }
 
     /// Starts a freeze on a thread of its own if a key space listed enough chains for one, or the log nears the next
     /// checkpoint, unless one runs; called by a commit once it published, without a role. A thread the system refuses
     /// leaves the chains as they are.
     void maybeStart() {
-        if (running.get() || !due() || checkpointer.wanted() || System.nanoTime() - quietUntil < 0) {
+        if (running.get() || !due() || checkpointer.wanted() || System.nanoTime() - quietUntil < 0
+                || budget() < nanosPerChain * leastFreeze()) {
             return;
         }
         if (!running.compareAndSet(false, true)) {
@@ -123,6 +138,20 @@ final class RunFreezer {
     /// the list of the blind writes; for tests that count or commit there.
     void droppedHookForTests(Runnable hook) {
         this.droppedHookForTests = hook;
+    }
+
+    // The least number of chains any key space waits for, which the budget pays for before a freeze starts
+    private long leastFreeze() {
+        var least = (long) KeyspaceState.NO_FREEZE;
+        for (var i = 0; i < states.size(); i++) {
+            least = Math.min(least, states.get(i).freezeMin());
+        }
+        return least;
+    }
+
+    /// {@return the time the freezes may take now: a [#SHARE] of the time since the store opened, less what they took}
+    private long budget() {
+        return (System.nanoTime() - opened) / SHARE - spentNanos;
     }
 
     /// {@return whether a freeze runs on its thread; for tests}
@@ -159,18 +188,11 @@ final class RunFreezer {
     }
 
     private void run() {
-        var started = System.nanoTime();
         try {
             freezeDue();
         } catch (RuntimeException _) {
             // The chains a failed freeze took went back; the next one tries again
         } finally {
-            // Before the next may start: no commit starts one before the pace allows
-            var ended = System.nanoTime();
-            var paced = ended + (ended - started) * PACE;
-            if (paced - quietUntil > 0) {
-                quietUntil = paced;
-            }
             running.set(false);
         }
         // Commits that came while it ran found it running
@@ -195,7 +217,7 @@ final class RunFreezer {
                 if (ledger.isClosed() || checkpointer.wanted()) {
                     return;
                 }
-                if ((state.freezeDue() || near && nearDue(state)) && !freeze(state).started()) {
+                if ((state.freezeDue() || near && nearDue(state)) && !freeze(state, true).started()) {
                     quietUntil = System.nanoTime() + QUIET_NANOS;
                 }
             }
@@ -213,7 +235,7 @@ final class RunFreezer {
             return null;
         }
         try {
-            return freeze(state);
+            return freeze(state, false);
         } finally {
             checkpointer.unlockFreeze();
         }
@@ -231,7 +253,27 @@ final class RunFreezer {
     }
 
     /// Freezes the chains of `state` it can now, holding the checkpointer's lock.
-    private Outcome freeze(KeyspaceState state) {
+    ///
+    /// @param budgeted whether the [#budget()] bounds it, as it does every freeze but those of tests
+    private Outcome freeze(KeyspaceState state, boolean budgeted) {
+        if (budgeted && most(state, state.run, true) < state.freezeMin() / 4) {
+            // The budget pays for too few chains for now: the list stays as it is
+            return Outcome.NOT_STARTED;
+        }
+        var began = System.nanoTime();
+        try {
+            return freeze(state, budgeted, began);
+        } finally {
+            if (budgeted) {
+                // Before the next key space's freeze: its budget is what is left
+                spentNanos += System.nanoTime() - began;
+            }
+        }
+    }
+
+    /// Freezes the chains of `state` as [#freeze(KeyspaceState, boolean)] does, which started at `began`, by
+    /// System.nanoTime(), and measures what a chain took.
+    private Outcome freeze(KeyspaceState state, boolean budgeted, long began) {
         var start = ledger.beginFreeze(state);
         if (start == null) {
             return Outcome.NOT_STARTED;
@@ -253,9 +295,21 @@ final class RunFreezer {
         var published = false;
         var handed = 0;
         var removals = since(start.removals(), start.treeBound());
+        var capped = false;
         try {
-            candidates = new Chain[taken.size()];
-            for (var chain : taken) {
+            var most = most(state, start.previous(), budgeted);
+            var previousSize = start.previous() == null ? 0 : start.previous().size();
+            var takenSize = taken.size();
+            candidates = new Chain[Math.min(takenSize, most)];
+            for (var i = 0; i < takenSize; i++) {
+                if (found == most) {
+                    // The most a freeze takes: the rest, unread, wait for the next one, once the budget allows
+                    kept.addAll(taken.subList(i, takenSize));
+                    deferred += takenSize - i;
+                    capped = true;
+                    break;
+                }
+                var chain = taken.get(i);
                 var verdict = verdict(chain, chain.head, start, removals);
                 if (verdict == FREEZES) {
                     candidates[found++] = chain;
@@ -296,7 +350,7 @@ final class RunFreezer {
             }
             // Most of what the key space listed is not ready: the next freeze waits for twice as many, so chains whose
             // values stay on their arrays do not start one freeze after another
-            var few = count < threshold / 2;
+            var few = !capped && count < threshold / 2;
             if (few) {
                 next = threshold > KeyspaceState.NO_FREEZE / 2 ? KeyspaceState.NO_FREEZE : 2 * threshold;
             }
@@ -370,6 +424,9 @@ final class RunFreezer {
                     freezes++;
                 }
             }
+            // What it took per chain, the copy of the run before counted as a quarter of a chain per entry
+            var measured = (System.nanoTime() - began) / Math.max(1, count + previousSize / 4);
+            nanosPerChain = Math.max(1, (nanosPerChain + measured) / 2);
             return new Outcome(count, dropped.cardinality(), handed, true);
         } finally {
             if (count < 0) {
@@ -418,6 +475,19 @@ final class RunFreezer {
         }
         state.removeDropped();
         state.pruneListed(Long.MIN_VALUE);
+    }
+
+    /// {@return the most chains a freeze of `state` over `previous` takes, the oldest listed first: twice as many as it
+    /// waits for, or as `previous` holds, and if `budgeted` no more than the [#budget()] pays for once it paid for the
+    /// copy of `previous`; unbounded in a key space that freezes only when a test asks}
+    private int most(KeyspaceState state, PackedRun previous, boolean budgeted) {
+        var least = state.freezeMin();
+        if (least == KeyspaceState.NO_FREEZE) {
+            return Integer.MAX_VALUE;
+        }
+        var previousSize = previous == null ? 0 : previous.size();
+        var paid = budgeted ? budget() / nanosPerChain - previousSize / 4 : Long.MAX_VALUE;
+        return (int) Math.max(0, Math.min(2L * Math.max(least, previousSize), paid));
     }
 
     // What a freeze makes of a chain: it freezes it, it may later, or it will not before the next cut

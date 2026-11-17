@@ -914,7 +914,7 @@ class RunFreezerTest {
 
     @Test
     @Timeout(60)
-    @DisplayName("a freeze that ran long keeps the next from starting for eight times as long, however many chains the commits list meanwhile")
+    @DisplayName("a freeze that ran long keeps the next from starting until the store ran 24 times as long, however many chains the commits list meanwhile")
     void pacedFreezes(@TempDir Path directory) throws Exception {
         var expected = new Expected();
         try (var ledger = open(directory, true, 64)) {
@@ -947,6 +947,34 @@ class RunFreezerTest {
             }
             assertTrue(awaitFreezes(ledger, frozen + 1), "no freeze started once the pace allowed");
             ledger.freezerForTests().publishedHookForTests(null);
+            verify(ledger, expected);
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    @DisplayName("a freeze takes at most twice the chains it waits for, the oldest listed, however many a commit listed at once")
+    void boundedFreezes(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, true, 64)) {
+            // The runs as the first freeze published its own, the first of either key space
+            var first = new AtomicReference<List<Integer>>();
+            ledger.freezerForTests().publishedHookForTests(() -> {
+                var sizes = new ArrayList<Integer>();
+                for (var keyspace : List.of(ledger.state(MESSAGES), ledger.state(TEXTS))) {
+                    sizes.add(keyspace.run == null ? 0 : keyspace.run.size());
+                }
+                first.compareAndSet(null, sizes);
+            });
+            // One commit lists 600 chains per key space, all of them ready once its values left the batch
+            write(ledger, expected, 0, 600, 1, 0);
+            assertTrue(awaitFreezes(ledger, 1), "the store froze nothing on its own");
+            ledger.freezerForTests().publishedHookForTests(null);
+            var sizes = first.get();
+            assertTrue(sizes.stream().allMatch(size -> size <= 128) && sizes.stream().anyMatch(size -> size > 0),
+                    "the first freeze took " + sizes);
+            verify(ledger, expected);
+            ledger.checkpoint();
             verify(ledger, expected);
         }
     }
