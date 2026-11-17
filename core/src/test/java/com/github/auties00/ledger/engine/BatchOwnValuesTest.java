@@ -206,7 +206,7 @@ class BatchOwnValuesTest {
     class Store {
         @ParameterizedTest(name = "{0} bytes")
         @ValueSource(ints = {OWN - 1, OWN, 1 << 20, (1 << 20) + 1})
-        @DisplayName("keeps a paged value on an array of the value's length from half a chunk on, past a commit, a checkpoint and a reopen")
+        @DisplayName("puts a paged value on an array of the value's length from half a chunk on, which leaves the heap for the log once durable, and reads it past a commit, a checkpoint and a reopen")
         void paged(int length, @TempDir Path directory) throws Exception {
             var caller = value(length, length);
             var expected = caller.clone();
@@ -217,6 +217,8 @@ class BatchOwnValuesTest {
                 // until the commit returns
                 var borrowed = ((ArrayWriteBatch) batch).borrowed(1);
                 assertEquals(length >= 1 << 20, borrowed);
+                var own = ((ArrayWriteBatch) batch).ownValue(1);
+                assertEquals(length >= OWN, own != null);
                 if (!borrowed) {
                     caller[0]++;
                 }
@@ -228,10 +230,20 @@ class BatchOwnValuesTest {
                     // array nor a copy of it
                     assertInstanceOf(BlobFile.class, version.sourceForTests());
                     assertEquals(0, version.sourceBytesForTests());
+                } else if (own != null) {
+                    // An array of its own of 128 KiB or more leaves the heap for the log once its commit is durable, on
+                    // the spill queue's thread, which may have moved it already
+                    assertNotSame(caller, own);
+                    assertEquals(length, own.length);
+                    var source = version.sourceForTests();
+                    assertTrue(source == own || source instanceof LogValue, "the value is on " + source);
+                    ledger.spills().drain(ledger.log()::durableSequence);
+                    ledger.spills().awaitIdleForTests();
+                    assertInstanceOf(LogValue.class, version.sourceForTests());
+                    assertEquals(0, version.sourceBytesForTests());
                 } else {
                     assertEquals(length, version.sourceBytesForTests());
-                    assertEquals(length >= OWN, version.sourceForTests() instanceof byte[]);
-                    assertNotSame(caller, version.sourceForTests());
+                    assertFalse(version.sourceForTests() instanceof byte[]);
                 }
                 assertArrayEquals(expected, ledger.get(MESSAGES, new byte[]{1}).orElseThrow());
                 ledger.checkpoint();

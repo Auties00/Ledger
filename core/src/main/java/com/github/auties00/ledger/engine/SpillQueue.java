@@ -33,6 +33,12 @@ import java.util.zip.CRC32C;
 /// newest values, those of the budget, stay where they are, so reads of recent writes do not change; a read of a value
 /// in the log reads it back with one positioned read.
 ///
+/// A record whose every value is at least [#THROUGH_VALUE_MIN] bytes on an array of its own is not counted in the
+/// budget: its values leave the heap as soon as its frame is durable, in the order of the commits with the records of
+/// the budget, as one positioned read brings such a value back about as fast as it was written, a framed one
+/// authenticated by its frame's tag, where keeping it would hold an array of 128 KiB or more per commit. The first read
+/// of such a value written moments ago reads it back from the log.
+///
 /// A record leaves the queue once its values moved, or once a published checkpoint holds its commit. Values are not
 /// moved:
 /// - of a batch's shared arrays in a key space until samples of its puts show that it replaces or removes few of
@@ -41,8 +47,8 @@ import java.util.zip.CRC32C;
 ///   tag of its bytes for nothing. A version listed and then replaced counts in the held bytes until its record
 ///   leaves, a share of them the samples keep under an eighth. A value on an array of its own moves without them: the
 ///   array is the value's alone and lives as long as its version in any case, so the record keeps no other bytes
-///   alive. In a key space that replaces such values before a checkpoint, the arrays it replaced stay until their
-///   records leave, at most the budget of them, and the thread tags some of them for nothing;
+///   alive. In a key space that replaces such values before a checkpoint, the thread tags some of them for nothing,
+///   and those of a record the budget counts stay until it leaves, at most the budget of them;
 /// - of a group the log wrote through to stable storage, whose pages that write took out of the system's cache, so a
 ///   read back would go to the device, unless every value the record lists is at least [#THROUGH_VALUE_MIN] bytes;
 /// - of a batch on a [ValueSlab]'s chunks, which the slab bounds already, even beside a value on an array of its
@@ -102,11 +108,17 @@ final class SpillQueue {
     // first value moved or read back and never stored; null before, and without encryption
     private volatile long[] tagKeys;
     private final Object lock;
-    // The records not taken, oldest first; guarded by the lock
+    // The records not taken that the budget counts, oldest first; guarded by the lock
     private final ArrayDeque<Record> records;
-    // The segments values moved to, by number, which no checkpoint has retired; guarded by the lock
+    // The records not taken whose values all leave once durable, outside the budget ([Record#eager()]), oldest first;
+    // guarded by the lock
+    private final ArrayDeque<Record> eager;
+    // The sequence of the first record of eager, Long.MAX_VALUE when it is empty, which the log's durability path
+    // reads without the lock; written holding the lock
+    private volatile long eagerHead = Long.MAX_VALUE;
+    // The segments values moved to, ordered by number, which no checkpoint has retired; guarded by the lock
     private final ArrayList<LogSegmentView> segments;
-    // The bytes of values the records of the queue list; written holding the lock
+    // The bytes of values the records of the queue the budget counts list; written holding the lock
     private volatile long held;
     // Whether the thread that moves values runs
     private final AtomicBoolean running;
@@ -126,6 +138,8 @@ final class SpillQueue {
     private final AtomicLong loggedValues = new AtomicLong();
     private final AtomicLong copiedValues = new AtomicLong();
     private final AtomicLong drainedRecords = new AtomicLong();
+    // The room for values of the records drained, for tests; guarded by the lock
+    private long drainedRoom;
     // The records whose values on shared arrays stay, as their move would not pay, for tests
     private final AtomicLong unpaidRecords = new AtomicLong();
 
@@ -139,6 +153,7 @@ final class SpillQueue {
         this.encrypted = encrypted;
         this.lock = new Object();
         this.records = new ArrayDeque<>();
+        this.eager = new ArrayDeque<>();
         this.segments = new ArrayList<>();
         this.running = new AtomicBoolean();
         this.cryptos = new AtomicReferenceArray<>(Math.max(4, 2 * Runtime.getRuntime().availableProcessors()));
@@ -174,16 +189,17 @@ final class SpillQueue {
         return Math.clamp(maxMemory / 1024, 4L << 20, 64L << 20);
     }
 
-    /// Reads the latest durable sequence from `log` from now on, and moves values whenever the queue is over budget.
+    /// Reads the latest durable sequence from `log` from now on, and moves values whenever the queue is over budget or
+    /// holds a durable record the budget does not count.
     void useLog(LogWriter log) {
         useDurable(log::durableSequence);
     }
 
     /// Reads the latest durable sequence from `durableSequence` from now on, a thread moving values included, and moves
-    /// values whenever the queue is over budget.
+    /// values whenever the queue is over budget or holds a durable record the budget does not count.
     void useDurable(LongSupplier durableSequence) {
         this.durable = durableSequence;
-        if (over()) {
+        if (over() || eagerDurable(durableSequence)) {
             start();
         }
     }
@@ -226,10 +242,27 @@ final class SpillQueue {
     /// retires segments sees the commit.
     void noteReplayed(long sequence, LogSegmentView segment) {
         synchronized (lock) {
-            if (segment.note(sequence)) {
-                segments.add(segment);
-            }
+            note(segment, sequence);
         }
+    }
+
+    /// Records that the values of the commit at `sequence` move to `segment`, which joins the segments at its place by
+    /// number if it is the first commit to; holding the lock.
+    ///
+    /// The segments stay ordered by number whatever order commits move in: a record of the budget may stay queued while
+    /// later records outside it move to newer segments, and [#published(long, long, long)],
+    /// [#retirableBefore(long, ReaderTable)] and [#holdsBack()] stop at the first segment past their bound.
+    private void note(LogSegmentView segment, long sequence) {
+        if (!segment.note(sequence)) {
+            return;
+        }
+        var number = segment.number();
+        var at = segments.size();
+        // Nearly always the newest, so the search starts from the end
+        while (at > 0 && segments.get(at - 1).number() > number) {
+            at--;
+        }
+        segments.add(at, segment);
     }
 
     /// Moves the value of `version`, which a recovery replayed from `frame`, at once to its place in the log, on the
@@ -260,7 +293,7 @@ final class SpillQueue {
     }
 
     /// Queues `record`, of a published commit after every one queued, and starts moving values if the queue is over
-    /// its budget.
+    /// its budget, or if the budget does not count the record ([Record#eager()]) and its commit is durable already.
     void add(Record record) {
         if (record.count == 0) {
             return;
@@ -273,24 +306,42 @@ final class SpillQueue {
                 return;
             }
         }
+        var outside = record.eager();
         synchronized (lock) {
             if (closed) {
                 return;
             }
-            records.addLast(record);
-            held = held + record.bytes;
+            if (outside) {
+                if (eager.isEmpty()) {
+                    eagerHead = record.sequence;
+                }
+                eager.addLast(record);
+            } else {
+                records.addLast(record);
+                held = held + record.bytes;
+            }
         }
-        if (over()) {
+        // The log may have made the group durable, and found no record to move, before the record was queued: the
+        // write of the head above and the read of the durable sequence here, both volatile, order against the log's
+        // write of the durable sequence and read of the head in durableAdvanced, so one of the two starts the thread
+        if (outside ? record.sequence <= current.getAsLong() : over()) {
             start();
         }
     }
 
-    /// Starts moving values if the queue is over its budget; called by the log as a group becomes durable, which may
-    /// make the oldest record's values movable.
+    /// Starts moving values if the queue is over its budget or its oldest record the budget does not count is durable;
+    /// called by the log as a group becomes durable, which may make the oldest record's values movable. Takes no lock.
     void durableAdvanced() {
-        if (over() && !running.get()) {
+        if (!running.get() && (over() || eagerDurable(current))) {
             start();
         }
+    }
+
+    /// {@return whether the oldest record the budget does not count is durable by `durableSequence`, without the lock}
+    private boolean eagerDurable(LongSupplier durableSequence) {
+        var head = eagerHead;
+        // Before the store has a log every sequence is durable, Long.MAX_VALUE included, which no record has
+        return head != Long.MAX_VALUE && head <= durableSequence.getAsLong();
     }
 
     /// Starts the thread that moves values, unless it runs; a thread the system refuses leaves the values where they
@@ -318,9 +369,13 @@ final class SpillQueue {
         }
     }
 
-    /// {@return whether the queue is over its budget and its oldest record's frame is durable}
+    /// {@return whether the oldest record the budget does not count is durable, or the queue is over its budget and its
+    /// oldest record's frame is durable}
     private boolean movable() {
         var log = durable;
+        if (eagerDurable(log)) {
+            return true;
+        }
         if (!over()) {
             return false;
         }
@@ -330,33 +385,48 @@ final class SpillQueue {
         }
     }
 
-    /// Moves the values of the oldest records whose commits `durableSequence` gives durable, while the queue holds more
-    /// than three quarters of its budget, on the caller's thread.
+    /// Moves the values of the oldest records whose commits `durableSequence` gives durable: those the budget does not
+    /// count, and those it counts while the queue holds more than three quarters of its budget, on the caller's thread.
     void drain(LongSupplier durableSequence) {
         drain(durableSequence, lowWater);
     }
 
-    /// Moves the values of the oldest records whose commits `durableSequence` gives durable, while the queue holds more
-    /// than `downTo` bytes, on the caller's thread.
+    /// Moves the values of the oldest records whose commits `durableSequence` gives durable, in the order of their
+    /// commits: those the budget does not count, and those it counts while the queue holds more than `downTo` bytes,
+    /// on the caller's thread.
     private void drain(LongSupplier durableSequence, long downTo) {
         var crypto = takeCrypto();
         try {
             while (!closed) {
                 Record record;
                 synchronized (lock) {
-                    record = records.peekFirst();
-                    if (record == null || held <= downTo || record.sequence > durableSequence.getAsLong()) {
+                    // Read before the records' locations, which the log writer sets before their frames are durable
+                    var durableNow = durableSequence.getAsLong();
+                    var counted = records.peekFirst();
+                    if (counted != null && (held <= downTo || counted.sequence > durableNow)) {
+                        counted = null;
+                    }
+                    var outside = eager.peekFirst();
+                    if (outside != null && outside.sequence > durableNow) {
+                        outside = null;
+                    }
+                    if (outside != null && (counted == null || outside.sequence < counted.sequence)) {
+                        record = outside;
+                        eager.pollFirst();
+                        var next = eager.peekFirst();
+                        eagerHead = next == null ? Long.MAX_VALUE : next.sequence;
+                    } else if (counted != null) {
+                        record = counted;
+                        records.pollFirst();
+                        held = held - record.bytes;
+                    } else {
                         return;
                     }
-                    records.pollFirst();
-                    held = held - record.bytes;
                     drainedRecords.incrementAndGet();
+                    drainedRoom += record.versions.length;
                     if (record.logs()) {
                         // Before any value moves there, so a checkpoint that retires segments sees the commit
-                        var segment = record.segment;
-                        if (segment.note(record.sequence)) {
-                            segments.add(segment);
-                        }
+                        note(record.segment, record.sequence);
                     }
                 }
                 record.spill(this, crypto);
@@ -376,6 +446,13 @@ final class SpillQueue {
                 records.pollFirst();
                 held = held - record.bytes;
                 record.release();
+            }
+            if ((record = eager.peekFirst()) != null && record.sequence <= cut) {
+                do {
+                    eager.pollFirst();
+                    record.release();
+                } while ((record = eager.peekFirst()) != null && record.sequence <= cut);
+                eagerHead = record == null ? Long.MAX_VALUE : record.sequence;
             }
             for (var segment : segments) {
                 if (segment.number() >= logStart) {
@@ -442,13 +519,32 @@ final class SpillQueue {
             }
             records.clear();
             held = 0;
+            for (var record : eager) {
+                record.release();
+            }
+            eager.clear();
+            eagerHead = Long.MAX_VALUE;
         }
         retireAll();
     }
 
-    /// {@return the bytes of values the queued records list; for tests}
+    /// {@return the bytes of values the queued records the budget counts list; for tests}
     long heldForTests() {
         return held;
+    }
+
+    /// {@return the sequences of the queued records the budget does not count, oldest first; for tests}
+    long[] eagerSequencesForTests() {
+        synchronized (lock) {
+            return eager.stream().mapToLong(Record::sequence).toArray();
+        }
+    }
+
+    /// {@return the room for values of the records whose values a drain took to move so far; for tests}
+    long drainedRoomForTests() {
+        synchronized (lock) {
+            return drainedRoom;
+        }
     }
 
     /// {@return the values moved to the log so far; for tests}
@@ -461,7 +557,7 @@ final class SpillQueue {
         return copiedValues.get();
     }
 
-    /// {@return the room for values of each record the queue holds, oldest first; for tests}
+    /// {@return the room for values of each record the queue holds that the budget counts, oldest first; for tests}
     int[] recordRoomsForTests() {
         synchronized (lock) {
             return records.stream().mapToInt(record -> record.versions.length).toArray();
@@ -616,6 +712,14 @@ final class SpillQueue {
             bytes = ownBytes;
             shortest = ownShortest;
             return OWN;
+        }
+
+        /// {@return whether, once [settled][#settle()], every value the record moves is on an array of its own and at
+        /// least [#THROUGH_VALUE_MIN] bytes, so it leaves the heap once durable outside the budget}
+        ///
+        /// Such a record moves to the log even of a group written through ([#logs()]).
+        boolean eager() {
+            return ownBytes > 0 && bytes == ownBytes && ownShortest >= THROUGH_VALUE_MIN;
         }
 
         /// {@return the sequence of the commit}

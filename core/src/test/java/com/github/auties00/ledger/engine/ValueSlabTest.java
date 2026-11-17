@@ -30,6 +30,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The chunks a store's fastest commits keep their small values on: when the slab takes a value, that what a version
@@ -129,14 +130,22 @@ class ValueSlabTest {
         }
 
         @Test
-        @DisplayName("in one batch, the values a hot slab takes go to it and the one it cannot take to an array of its own")
+        @DisplayName("in one batch, the values a hot slab takes go to it and the one it cannot take to an array of its own, which leaves the heap for the log once durable")
         void partly(@TempDir Path directory) throws Exception {
             try (var ledger = hot(directory)) {
                 var large = ArrayWriteBatch.CHUNK_BYTES;
-                ledger.commit(ledger.newBatch().put(MESSAGES, new byte[]{1}, filled(300, 1)).put(MESSAGES, new byte[]{2}, filled(large, 2))
-                        .put(MESSAGES, new byte[]{3}, filled(400, 3))).awaitDurable();
+                var batch = ledger.newBatch().put(MESSAGES, new byte[]{1}, filled(300, 1)).put(MESSAGES, new byte[]{2}, filled(large, 2))
+                        .put(MESSAGES, new byte[]{3}, filled(400, 3));
+                var own = ((ArrayWriteBatch) batch).ownValue(1);
+                assertEquals(large, own.length);
+                ledger.commit(batch).awaitDurable();
                 assertEquals(CHUNK, head(ledger, MESSAGES, new byte[]{1}).sourceBytesForTests());
-                assertEquals(large, head(ledger, MESSAGES, new byte[]{2}).sourceBytesForTests());
+                // The spill queue's thread moves it once its commit is durable, and may have already
+                var source = head(ledger, MESSAGES, new byte[]{2}).sourceForTests();
+                assertTrue(source == own || source instanceof LogValue, "the value is on " + source);
+                ledger.spills().drain(ledger.log()::durableSequence);
+                ledger.spills().awaitIdleForTests();
+                assertInstanceOf(LogValue.class, head(ledger, MESSAGES, new byte[]{2}).sourceForTests());
                 assertEquals(CHUNK, head(ledger, MESSAGES, new byte[]{3}).sourceBytesForTests());
                 assertArrayEquals(filled(300, 1), ledger.get(MESSAGES, new byte[]{1}).orElseThrow());
                 assertArrayEquals(filled(large, 2), ledger.get(MESSAGES, new byte[]{2}).orElseThrow());
