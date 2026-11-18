@@ -272,7 +272,7 @@ class CachedUnitsTest {
     }
 
     @Test
-    @DisplayName("screens a branch of level 1 as a leaf, at a point read's third read, and caches one of level 2 at once, and gives a refused unit back weakly only under its key, nonce and pages, leaving it refused")
+    @DisplayName("screens a branch of level 1 as a leaf and caches one of level 2 at once, and gives a refused unit back weakly only under its key, nonce and pages, leaving it refused")
     void screensBranchesAndRecallsWeakly() {
         var cache = PageCache.isolated(64L << 20);
         IdleTicker.unwatch(cache);
@@ -298,12 +298,9 @@ class CachedUnitsTest {
             assertSame(parentUnit, cache.recallWeak(parent), "a unit a weak recall left refused");
             assertEquals(refusals, cache.refusalsForTests(), "refusals of weak recalls");
 
-            // A point read's second read leaves it where it was, refused, and its third takes it back for good
+            // The second read takes it back for good
             assertSame(parentUnit, cache.recall(key, parent, PageCache.POINT));
-            assertNull(cache.peek(parent), "a branch of level 1 read twice");
-            assertSame(parentUnit, cache.recallWeak(key, parent), "a branch of level 1 a point read refused twice");
-            assertSame(parentUnit, cache.recall(key, parent, PageCache.POINT));
-            assertSame(parentUnit, cache.peek(parent), "a branch of level 1 read three times");
+            assertSame(parentUnit, cache.peek(parent), "a branch of level 1 read twice");
             assertNull(cache.recallWeak(key, parent), "a unit the cache took back");
         } finally {
             cache.close();

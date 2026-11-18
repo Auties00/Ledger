@@ -488,7 +488,7 @@ class CheckpointSaturationTest {
         }
 
         @Test
-        @DisplayName("keeps a leaf only the checkpoint read out of the leaves a scan used, so neither its first three scans nor the next checkpoint cache it, and a scan caches its replacement at the first read")
+        @DisplayName("keeps a leaf only the checkpoint read out of the leaves a scan used, so neither its first two scans nor the next checkpoint cache it, and a scan caches its replacement at the first read")
         void keptLeafUnreadByScan(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
                 var leaf = tree.path(key(100)).getLast();
@@ -496,7 +496,7 @@ class CheckpointSaturationTest {
                 tree.apply(List.of(new TreeUpdate.Op(segment((new String(key(100)) + "a").getBytes()), null)), tree.unsaturated());
                 assertEquals(leaf, tree.path(key(100)).getLast(), "the leaf the removal left");
                 assertNull(tree.cache.peek(leaf), "the leaf only the checkpoint read, past the doorkeeper");
-                for (var read = 1; read <= 3; read++) {
+                for (var read = 1; read <= 2; read++) {
                     TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN);
                     assertNull(tree.cache.peek(leaf), "the leaf after a scan's read " + read);
                     assertEquals(read, tree.pages.reads(leaf), "the reads of the leaf");
@@ -506,25 +506,25 @@ class CheckpointSaturationTest {
                 assertNull(tree.cache.peek(replacement), "the replacement of the leaf only the checkpoint read");
                 assertEquals(0, tree.pages.reads(replacement), "the replacement counts as read");
                 TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN);
-                assertTrue(tree.cache.referencedForTests(replacement), "the replacement of a leaf scans read three times, at a scan's first read");
+                assertTrue(tree.cache.referencedForTests(replacement), "the replacement of a leaf scans read twice, at a scan's first read");
                 assertArrayEquals(new byte[151], tree.read(key(100)));
                 tree.verify(KEYS, 7, 150);
             }
         }
 
         @Test
-        @DisplayName("caches at its fourth version the leaf that replaces one a scan refused, for a scan that reads each version once")
+        @DisplayName("caches at its third version the leaf that replaces one a scan refused, for a scan that reads each version once")
         void readOncePerVersionByScan(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
-                for (var round = 0; round < 7; round++) {
+                for (var round = 0; round < 6; round++) {
                     var leaf = tree.path(key(100)).getLast();
-                    if (round < 4) {
+                    if (round < 3) {
                         assertNull(tree.cache.peek(leaf), "the leaf of key 100 before the scan of round " + round);
                     } else {
                         assertNotNull(tree.cache.peek(leaf), "the leaf of key 100 before the scan of round " + round);
                     }
                     TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN);
-                    if (round < 3) {
+                    if (round < 2) {
                         assertNull(tree.cache.peek(leaf), "the leaf the scan of round " + round + " refused");
                         assertEquals(round + 1, tree.pages.reads(leaf), "the reads of the leaf in round " + round);
                     } else {
@@ -539,13 +539,13 @@ class CheckpointSaturationTest {
                     assertFalse(tree.cache.seen(unread), "the leaf of key 5,000 seen in round " + round);
                 }
                 assertEquals(0, tree.cache.doorkeeperForTests().rotationsForTests(), "doorkeeper rotations");
-                assertArrayEquals(new byte[157], tree.read(key(100)));
-                assertArrayEquals(new byte[157], tree.read(key(5_000)));
+                assertArrayEquals(new byte[156], tree.read(key(100)));
+                assertArrayEquals(new byte[156], tree.read(key(5_000)));
             }
         }
 
         @Test
-        @DisplayName("caches at a point read's first read the leaf that replaces one a scan read once, and at a scan's third read the leaf that replaces one a point read read once")
+        @DisplayName("caches at a point read's first read the leaf that replaces one a scan read once, and at a scan's second read the leaf that replaces one a point read read once")
         void mixedReaders(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
                 TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.SCAN);
@@ -560,13 +560,10 @@ class CheckpointSaturationTest {
                 assertNull(tree.cache.peek(pointed), "the replacement of the leaf a point read read once");
                 TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.POINT);
                 assertTrue(tree.cache.referencedForTests(scanned), "the replacement of the leaf a scan read once, at a point read's first read");
-                for (var read = 1; read <= 2; read++) {
-                    TreeSearch.leaf(tree.pages, tree.root, key(5_000), PageCache.SCAN);
-                    assertNull(tree.cache.peek(pointed), "the replacement of the leaf a point read read once, at a scan's read " + read);
-                    assertEquals(read + 1, tree.pages.reads(pointed), "the reads of the replacement after a scan's read " + read);
-                }
                 TreeSearch.leaf(tree.pages, tree.root, key(5_000), PageCache.SCAN);
-                assertTrue(tree.cache.referencedForTests(pointed), "the replacement of the leaf a point read read once, at a scan's third read");
+                assertNull(tree.cache.peek(pointed), "the replacement of the leaf a point read read once, at a scan's first read");
+                TreeSearch.leaf(tree.pages, tree.root, key(5_000), PageCache.SCAN);
+                assertTrue(tree.cache.referencedForTests(pointed), "the replacement of the leaf a point read read once, at a scan's second read");
                 assertArrayEquals(new byte[151], tree.read(key(100)));
                 assertArrayEquals(new byte[151], tree.read(key(5_000)));
                 tree.verify(KEYS, 7, 150);

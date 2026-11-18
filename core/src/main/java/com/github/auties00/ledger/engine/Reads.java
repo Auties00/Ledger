@@ -99,9 +99,9 @@ final class Reads {
     ///
     /// @param root the root of the key space's tree, or `null` if the read uses none
     /// @param screened whether the units it reads go to the cache only if it
-    ///                 [admits][PageCache#admits(long, PageRef, int)] them as a point read's, its leaf at its
-    ///                 second read and a branch of level 1 at its third: the leaves of a resident key space leave
-    ///                 the cache once its loader holds their entries, so screening them would only read them twice
+    ///                 [admits][PageCache#admits(long, PageRef, int)] them, at their second read as a point read's:
+    ///                 the leaves of a resident key space leave the cache once its loader holds their entries, so
+    ///                 screening them would only read them twice
     private static MemorySegment treeValue(byte[] key, ReadPoint point, TreeRoot root, RangeRemoval[] removals,
                                            boolean screened) {
         if (root == null) {

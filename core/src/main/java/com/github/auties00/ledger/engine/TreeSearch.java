@@ -55,8 +55,7 @@ final class TreeSearch {
     ///
     /// @param screen the screening of a leaf or a branch of level 1 under the root read from the file, which goes to the
     ///               cache only if it [admits][PageCache#admits(long, PageRef, int)] it: [PageCache#UNSCREENED],
-    ///               [PageCache#POINT] or [PageCache#SCAN], a point read's branch of level 1 at its third read and
-    ///               its leaf at its second; the root and the branches of level 2 or more always do
+    ///               [PageCache#POINT] or [PageCache#SCAN]; the root and the branches of level 2 or more always do
     static byte[] leaf(PageFile pages, TreeRoot root, byte[] key, int screen) {
         var unit = pages.read(root.ref(), PageFile.NODE, true);
         while (!TreeNodes.isLeaf(unit)) {

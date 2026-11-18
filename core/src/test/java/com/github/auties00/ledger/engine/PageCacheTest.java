@@ -607,7 +607,7 @@ class PageCacheTest {
         }
 
         @Test
-        @DisplayName("caches a branch of level 2 or more at its first read, recording nothing, and screens one of level 1 as a leaf, but at a point read's third read")
+        @DisplayName("caches a branch of level 2 or more at its first read, recording nothing, and screens one of level 1 as a leaf")
         void branches() {
             var cache = screening(LIMIT);
             for (var level = 2; level <= 4; level++) {
@@ -625,18 +625,8 @@ class PageCacheTest {
             assertNull(cache.peek(ref), "a branch of level 1 read once");
             assertTrue(cache.seen(ref), "a branch of level 1 the doorkeeper recorded");
             assertSame(branch, cache.recall(ref, PageCache.POINT), "a branch of level 1 read twice");
-            assertNull(cache.peek(ref), "a branch of level 1 a point read read twice");
-            assertEquals(2, cache.reads(ref));
-            assertEquals(0, cache.doorkeeperForTests().thriceKeysForTests(), "a point read started the third filter");
-            assertSame(branch, cache.recall(ref, PageCache.POINT), "a branch of level 1 read three times");
             assertSame(branch, cache.peek(ref));
-            // A point read's leaf of the same store still takes two reads
-            var leaf = page(5);
-            cache.putScreened(leaf, unit(leaf), PageCache.POINT);
-            var second = unit(leaf);
-            cache.putScreened(leaf, second, PageCache.POINT);
-            assertSame(second, cache.peek(leaf), "a leaf a point read read twice");
-            // A scan's read of one takes it at its fourth read, as a leaf's
+            // A scan's read of one takes it at its third read, as a leaf's
             var scanned = page(1);
             var scannedBranch = new byte[PageFormat.SIZE];
             PageFile.header(scannedBranch, PageFormat.BRANCH, 1, scanned.page(), 1, 0, scanned.nonceHigh(), scanned.nonceLow());
@@ -644,8 +634,6 @@ class PageCacheTest {
             assertSame(scannedBranch, cache.recall(scanned, PageCache.SCAN), "a branch of level 1 a scan read twice");
             assertNull(cache.peek(scanned), "a branch of level 1 a scan read twice");
             assertSame(scannedBranch, cache.recall(scanned, PageCache.SCAN), "a branch of level 1 a scan read three times");
-            assertNull(cache.peek(scanned), "a branch of level 1 a scan read three times");
-            assertSame(scannedBranch, cache.recall(scanned, PageCache.SCAN), "a branch of level 1 a scan read four times");
             assertSame(scannedBranch, cache.peek(scanned));
         }
 
@@ -686,20 +674,17 @@ class PageCacheTest {
         }
 
         @Test
-        @DisplayName("caches a unit a scan reads at its fourth read, not at its first, second or third, and one a point read reads at its second")
-        void fourthRead() {
+        @DisplayName("caches a unit a scan reads at its third read, not at its first or second, and one a point read reads at its second")
+        void thirdRead() {
             var cache = screening(LIMIT);
             cache.putScreened(page(0), unit(page(0)), PageCache.SCAN);
             assertNull(cache.peek(page(0)), "a scan's first read");
             cache.putScreened(page(0), unit(page(0)), PageCache.SCAN);
             assertNull(cache.peek(page(0)), "a scan's second read");
-            cache.putScreened(page(0), unit(page(0)), PageCache.SCAN);
-            assertNull(cache.peek(page(0)), "a scan's third read");
             assertEquals(0, cache.size());
-            assertEquals(3, cache.reads(page(0)));
-            var fourth = unit(page(0));
-            cache.putScreened(page(0), fourth, PageCache.SCAN);
-            assertSame(fourth, cache.peek(page(0)), "a scan's fourth read");
+            var third = unit(page(0));
+            cache.putScreened(page(0), third, PageCache.SCAN);
+            assertSame(third, cache.peek(page(0)), "a scan's third read");
             assertTrue(cache.referencedForTests(page(0)));
             cache.putScreened(page(1), unit(page(1)), PageCache.SCAN);
             var point = unit(page(1));
@@ -708,18 +693,16 @@ class PageCacheTest {
         }
 
         @Test
-        @DisplayName("of a scan recalls at the second and third reads the very array it refused, leaving it uncached and in its slot, and caches it at the fourth")
+        @DisplayName("of a scan recalls at the second read the very array it refused, leaving it uncached and in its slot, and caches it at the third")
         void scanRecall() {
             var cache = screening(LIMIT);
             var first = unit(page(0));
             cache.putScreened(page(0), first, PageCache.SCAN);
-            for (var read = 2; read <= 3; read++) {
-                assertSame(first, cache.recall(page(0), PageCache.SCAN), "read " + read);
-                assertNull(cache.peek(page(0)));
-                assertEquals(0, cache.size());
-                assertEquals(0, cache.clockLengthForTests());
-            }
-            assertSame(first, cache.recall(page(0), PageCache.SCAN), "the fourth read");
+            assertSame(first, cache.recall(page(0), PageCache.SCAN), "the second read");
+            assertNull(cache.peek(page(0)));
+            assertEquals(0, cache.size());
+            assertEquals(0, cache.clockLengthForTests());
+            assertSame(first, cache.recall(page(0), PageCache.SCAN), "the third read");
             assertSame(first, cache.peek(page(0)));
             assertTrue(cache.referencedForTests(page(0)));
             assertEquals(PageFormat.SIZE, cache.size());
@@ -745,9 +728,6 @@ class PageCacheTest {
             assertNull(cache.peek(page(0)), "the second read, from the file");
             assertEquals(2, cache.reads(page(0)));
             assertSame(second, cache.recall(page(0), PageCache.SCAN), "the third read");
-            assertNull(cache.peek(page(0)), "the third read");
-            assertEquals(3, cache.reads(page(0)));
-            assertSame(second, cache.recall(page(0), PageCache.SCAN), "the fourth read");
             assertSame(second, cache.peek(page(0)));
         }
 
@@ -1127,7 +1107,7 @@ class PageCacheTest {
         }
 
         @Test
-        @DisplayName("counts the reads of a key to three, admits a scan's at the fourth, a point read's branch's at the third and a point read's at the second, and starts its second and third filters only at their first records")
+        @DisplayName("counts the reads of a key to two, admits a scan's at the third and a point read's at the second, and starts its second filter only at a scan's second read")
         void counts() {
             var doorkeeper = new Doorkeeper();
             var most = Doorkeeper.FIRST_KEYS;
@@ -1139,236 +1119,105 @@ class PageCacheTest {
             assertEquals(0, doorkeeper.twiceKeysForTests(), "a point read started the second filter");
             var point = doorkeeper.bytesForTests();
 
-            assertFalse(doorkeeper.admit(2, 1, most, 3));
+            assertFalse(doorkeeper.admit(2, 1, most, 2));
             assertEquals(1, doorkeeper.reads(2, 1));
             assertEquals(0, doorkeeper.twiceKeysForTests(), "a scan's first read started the second filter");
-            assertFalse(doorkeeper.admit(2, 1, most, 3));
+            assertFalse(doorkeeper.admit(2, 1, most, 2));
             assertEquals(2, doorkeeper.reads(2, 1));
             assertTrue(doorkeeper.twiceKeysForTests() > 0, "the second filter never started");
-            assertEquals(0, doorkeeper.thriceKeysForTests(), "a scan's second read started the third filter");
             assertTrue(doorkeeper.bytesForTests() > point, "the bytes of the second filter");
-            var twice = doorkeeper.bytesForTests();
-            assertFalse(doorkeeper.admit(2, 1, most, 3));
-            assertEquals(3, doorkeeper.reads(2, 1));
-            assertTrue(doorkeeper.holds(2, 1));
-            assertTrue(doorkeeper.thriceKeysForTests() > 0, "the third filter never started");
-            assertTrue(doorkeeper.bytesForTests() > twice, "the bytes of the third filter");
-            assertEquals(doorkeeper.onceKeysForTests() + doorkeeper.twiceKeysForTests() + doorkeeper.thriceKeysForTests(),
-                    doorkeeper.keysForTests());
-            assertTrue(doorkeeper.admit(2, 1, most, 3));
-            assertTrue(doorkeeper.admit(2, 1, most, 2), "a point read's branch of a key a scan read three times");
-            assertTrue(doorkeeper.admit(2, 1, most, 1), "a point read of a key a scan read three times");
+            assertEquals(doorkeeper.onceKeysForTests() + doorkeeper.twiceKeysForTests(), doorkeeper.keysForTests());
+            assertTrue(doorkeeper.admit(2, 1, most, 2));
+            assertTrue(doorkeeper.admit(2, 1, most, 1), "a point read of a key a scan read twice");
 
-            // A key a point read recorded takes two more reads of a scan, and one a scan recorded none of a point read
+            // A key a point read recorded takes one more read of a scan, and one a scan recorded none of a point read
             assertFalse(doorkeeper.admit(3, 1, most, 1));
-            assertFalse(doorkeeper.admit(3, 1, most, 3));
-            assertFalse(doorkeeper.admit(3, 1, most, 3));
-            assertTrue(doorkeeper.admit(3, 1, most, 3));
-
-            // A point read's branch of level 1 is cached at its third read, and one a scan read twice at its first
-            assertFalse(doorkeeper.admit(4, 1, most, 2));
-            assertFalse(doorkeeper.admit(4, 1, most, 2));
-            assertEquals(2, doorkeeper.reads(4, 1));
-            assertTrue(doorkeeper.admit(4, 1, most, 2));
-            assertFalse(doorkeeper.admit(6, 1, most, 3));
-            assertFalse(doorkeeper.admit(6, 1, most, 3));
-            assertTrue(doorkeeper.admit(6, 1, most, 2), "a point read's branch a scan read twice");
+            assertFalse(doorkeeper.admit(3, 1, most, 2));
+            assertTrue(doorkeeper.admit(3, 1, most, 2));
         }
 
         @Test
-        @DisplayName("never starts its third filter for point reads, of leaves or of branches, expected or not")
-        void pointReadsHoldTwoFilters() {
-            var doorkeeper = new Doorkeeper();
-            var most = Doorkeeper.FIRST_KEYS;
-            for (var key = 0; key < 4 * most; key++) {
-                for (var read = 0; read < 3; read++) {
-                    doorkeeper.admit(key, 1, most, 1 + (key & 1));
-                }
-                doorkeeper.expect(key + (1L << 40), 1, most, 1 + key % 4);
-                doorkeeper.admit(key + (1L << 40), 1, most, 2);
-                doorkeeper.remember(key + (1L << 41), 1, most);
-            }
-            assertTrue(doorkeeper.twiceKeysForTests() > 0, "a point read's branch never started the second filter");
-            assertEquals(0, doorkeeper.thriceKeysForTests(), "a point read started the third filter");
-            assertTrue(doorkeeper.bytesForTests() <= 2 * TWO_GENERATIONS, doorkeeper.bytesForTests() + " bytes");
-        }
-
-        @Test
-        @DisplayName("records an eviction as a read of a point read, then of a point read's branch once the second filter started, and of a scan once a scan's third read started the third")
-        void evictionsCountAll() {
+        @DisplayName("records an eviction as a read of a point read, and of a scan once a scan's second read started its second filter")
+        void evictionsCountTwice() {
             var doorkeeper = new Doorkeeper();
             var most = Doorkeeper.FIRST_KEYS;
             doorkeeper.admit(100, 1, most, 1);
             doorkeeper.remember(1, 1, most);
-            assertEquals(1, doorkeeper.reads(1, 1), "an eviction before any second read");
+            assertEquals(1, doorkeeper.reads(1, 1), "an eviction before any scan's second read");
             assertEquals(0, doorkeeper.twiceKeysForTests(), "an eviction started the second filter");
             assertTrue(doorkeeper.admit(1, 1, most, 1));
             doorkeeper.admit(101, 1, most, 2);
             doorkeeper.admit(101, 1, most, 2);
             doorkeeper.remember(2, 1, most);
-            assertEquals(2, doorkeeper.reads(2, 1), "an eviction after a second read");
-            assertEquals(0, doorkeeper.thriceKeysForTests(), "an eviction started the third filter");
-            assertTrue(doorkeeper.admit(2, 1, most, 2), "a point read's branch of an evicted key");
-            doorkeeper.admit(102, 1, most, 3);
-            doorkeeper.admit(102, 1, most, 3);
-            doorkeeper.admit(102, 1, most, 3);
-            doorkeeper.remember(3, 1, most);
-            assertEquals(3, doorkeeper.reads(3, 1), "an eviction after a scan's third read");
-            assertTrue(doorkeeper.admit(3, 1, most, 3), "a scan's read of an evicted key");
+            assertEquals(2, doorkeeper.reads(2, 1), "an eviction after a scan's second read");
+            assertTrue(doorkeeper.admit(2, 1, most, 2), "a scan's read of an evicted key");
         }
 
         @Test
-        @DisplayName("counts a key only the third filter holds, once the second forgot it, as read three times by every read")
-        void thriceAloneCounts() {
-            var doorkeeper = new Doorkeeper();
-            var most = Doorkeeper.FIRST_KEYS;
-            for (var key = 1; key <= 2; key++) {
-                for (var read = 0; read < 3; read++) {
-                    assertFalse(doorkeeper.admit(key, 1, most, 3));
-                }
-            }
-            doorkeeper.forgetTwiceForTests(most);
-            assertTrue(doorkeeper.twiceKeysForTests() > 0);
-            for (var key = 1; key <= 2; key++) {
-                assertEquals(3, doorkeeper.reads(key, 1), "key " + key);
-            }
-            assertTrue(doorkeeper.admit(1, 1, most, 2), "a point read's branch only the third filter holds");
-            assertTrue(doorkeeper.admit(2, 1, most, 3), "a scan's read of a key only the third filter holds");
-            assertTrue(doorkeeper.admit(2, 1, most, 3), "a scan's read of a key only the third filter holds, again");
-
-            // A key the second filter forgot that only the first holds takes the reads it lacks again, and no more
-            assertFalse(doorkeeper.admit(3, 1, most, 3));
-            assertFalse(doorkeeper.admit(3, 1, most, 3));
-            doorkeeper.forgetTwiceForTests(most);
-            assertEquals(1, doorkeeper.reads(3, 1));
-            assertFalse(doorkeeper.admit(3, 1, most, 3));
-            assertFalse(doorkeeper.admit(3, 1, most, 3));
-            assertTrue(doorkeeper.admit(3, 1, most, 3));
-        }
-
-        @Test
-        @DisplayName("hides the three expectations from holds and reads, and counts a key expected after one, two or three reads, or more, as read that often")
+        @DisplayName("hides both expectations from holds and reads, admits a key expected after one read at a point read's first read and a scan's second, and one expected after two at the first read of either")
         void expectations() {
             var doorkeeper = new Doorkeeper();
             var most = Doorkeeper.FIRST_KEYS;
             doorkeeper.expect(1, 1, most, 1);
             assertFalse(doorkeeper.admit(1, 1, most, 1), "an expectation before the first record");
-            // Keys 10 + 10 * r + n: expected after r reads, read with n reads needed
-            for (var reads = 1; reads <= 4; reads++) {
-                for (var needed = 1; needed <= 3; needed++) {
-                    doorkeeper.expect(10L * reads + needed, 1, most, reads);
-                }
-            }
-            for (var key = 11; key <= 43; key++) {
+            doorkeeper.expect(10, 1, most, 1);
+            doorkeeper.expect(11, 1, most, 1);
+            doorkeeper.expect(20, 1, most, 2);
+            doorkeeper.expect(21, 1, most, 2);
+            for (var key : new long[]{10, 11, 20, 21}) {
                 assertFalse(doorkeeper.holds(key, 1), "key " + key + " held");
                 assertEquals(0, doorkeeper.reads(key, 1), "key " + key + " read");
             }
-            for (var reads = 1; reads <= 4; reads++) {
-                for (var needed = 1; needed <= 3; needed++) {
-                    var key = 10L * reads + needed;
-                    var counted = Math.min(reads, 3);
-                    // A key expected after r reads takes the reads it needs past them, one a read
-                    for (var read = counted; read < needed; read++) {
-                        assertFalse(doorkeeper.admit(key, 1, most, needed), "key " + key + " at read " + (read - counted + 1));
-                        assertEquals(read + 1, doorkeeper.reads(key, 1), "key " + key + " after a refusal");
-                    }
-                    assertTrue(doorkeeper.admit(key, 1, most, needed), "key " + key + " expected after " + reads
-                            + " reads, needing " + needed);
-                    if (counted >= needed) {
-                        assertEquals(0, doorkeeper.reads(key, 1), "a key admitted as expected counts no read");
-                    }
-                }
-            }
+            assertTrue(doorkeeper.admit(10, 1, most, 1), "a point read of a key expected after one read");
+            assertFalse(doorkeeper.admit(11, 1, most, 2), "a scan's first read of a key expected after one read");
+            assertEquals(2, doorkeeper.reads(11, 1));
+            assertTrue(doorkeeper.admit(11, 1, most, 2), "a scan's second read of a key expected after one read");
+            assertTrue(doorkeeper.admit(20, 1, most, 1), "a point read of a key expected after two reads");
+            assertTrue(doorkeeper.admit(21, 1, most, 2), "a scan's first read of a key expected after two reads");
+            assertEquals(0, doorkeeper.reads(10, 1), "a key admitted as expected counts no read");
+            assertEquals(0, doorkeeper.reads(21, 1), "a key admitted as expected counts no read");
         }
 
         @Test
-        @DisplayName("lets go of the three filters as it closes, and records nothing after it")
-        void closeAll() {
+        @DisplayName("lets go of both filters as it closes, and records nothing after it")
+        void closeBoth() {
             var doorkeeper = new Doorkeeper();
-            for (var read = 0; read < 3; read++) {
-                doorkeeper.admit(1, 1, Doorkeeper.FIRST_KEYS, 3);
-            }
-            assertTrue(doorkeeper.thriceKeysForTests() > 0);
+            doorkeeper.admit(1, 1, Doorkeeper.FIRST_KEYS, 2);
+            doorkeeper.admit(1, 1, Doorkeeper.FIRST_KEYS, 2);
+            assertTrue(doorkeeper.twiceKeysForTests() > 0);
             doorkeeper.close();
             assertEquals(0, doorkeeper.bytesForTests());
-            assertEquals(0, doorkeeper.keysForTests());
-            for (var read = 0; read < 4; read++) {
-                assertFalse(doorkeeper.admit(2, 1, Doorkeeper.FIRST_KEYS, 3));
-            }
+            assertFalse(doorkeeper.admit(2, 1, Doorkeeper.FIRST_KEYS, 2));
+            assertFalse(doorkeeper.admit(2, 1, Doorkeeper.FIRST_KEYS, 2));
+            assertFalse(doorkeeper.admit(2, 1, Doorkeeper.FIRST_KEYS, 2));
             doorkeeper.remember(3, 1, Doorkeeper.FIRST_KEYS);
-            doorkeeper.expect(4, 1, Doorkeeper.FIRST_KEYS, 3);
+            doorkeeper.expect(4, 1, Doorkeeper.FIRST_KEYS, 2);
             assertEquals(0, doorkeeper.bytesForTests());
             assertEquals(0, doorkeeper.reads(1, 1));
-            assertFalse(doorkeeper.holds(1, 1));
         }
 
         @Test
-        @DisplayName("holds no filter once it closed while scans on many threads start its third")
-        void closeRacingThirdFilter() throws Exception {
-            for (var round = 0; round < 200; round++) {
-                var doorkeeper = new Doorkeeper();
-                var most = Doorkeeper.FIRST_KEYS;
-                for (var key = 0; key < 64; key++) {
-                    doorkeeper.admit(key, 1, most, 3);
-                    doorkeeper.admit(key, 1, most, 3);
-                }
-                assertEquals(0, doorkeeper.thriceKeysForTests());
-                var start = new CountDownLatch(1);
-                var failure = new AtomicReference<Throwable>();
-                var threads = new ArrayList<Thread>();
-                for (var t = 0; t < 4; t++) {
-                    var first = t * 16;
-                    threads.add(Thread.ofPlatform().start(() -> {
-                        try {
-                            start.await();
-                            for (var key = first; key < first + 16; key++) {
-                                doorkeeper.admit(key, 1, most, 3);
-                                doorkeeper.remember(key, 1, most);
-                                doorkeeper.reads(key, 1);
-                            }
-                        } catch (Throwable e) {
-                            failure.compareAndSet(null, e);
-                        }
-                    }));
-                }
-                start.countDown();
-                doorkeeper.close();
-                for (var thread : threads) {
-                    thread.join(TimeUnit.SECONDS.toMillis(30));
-                    assertFalse(thread.isAlive());
-                }
-                assertNull(failure.get());
-                assertEquals(0, doorkeeper.bytesForTests(), "bits held after the close, round " + round);
-                assertEquals(0, doorkeeper.thriceKeysForTests(), "a third filter started after the close, round " + round);
-                assertFalse(doorkeeper.admit(0, 1, most, 3));
-                assertEquals(0, doorkeeper.reads(0, 1));
-            }
-        }
-
-        @Test
-        @DisplayName("grows and rotates its three filters each on its own, bounded to two generations each, under scans' reads of many keys")
+        @DisplayName("grows and rotates its two filters each on its own, bounded to two generations each, under scans' reads of many keys")
         void scanRotation() {
             var doorkeeper = new Doorkeeper();
             var most = Doorkeeper.FIRST_KEYS;
             for (var i = 0; i < 10 * most; i++) {
-                doorkeeper.admit(i, 7, most, 3);
+                doorkeeper.admit(i, 7, most, 2);
                 if (i % 2 == 0) {
-                    doorkeeper.admit(i, 7, most, 3);
-                    doorkeeper.admit(i, 7, most, 3);
+                    doorkeeper.admit(i, 7, most, 2);
                 }
-                assertTrue(doorkeeper.bytesForTests() <= 3 * TWO_GENERATIONS, doorkeeper.bytesForTests() + " bytes");
+                assertTrue(doorkeeper.bytesForTests() <= 2 * TWO_GENERATIONS, doorkeeper.bytesForTests() + " bytes");
             }
-            assertTrue(doorkeeper.rotationsForTests() >= 12, doorkeeper.rotationsForTests() + " rotations");
+            assertTrue(doorkeeper.rotationsForTests() >= 8, doorkeeper.rotationsForTests() + " rotations");
             assertEquals(most, doorkeeper.onceKeysForTests());
             assertEquals(most, doorkeeper.twiceKeysForTests());
-            assertEquals(most, doorkeeper.thriceKeysForTests());
-            var thrice = 0;
+            var twice = 0;
             for (var i = 10 * most - most; i < 10 * most; i += 2) {
-                if (doorkeeper.reads(i, 7) == 3) {
-                    thrice++;
+                if (doorkeeper.reads(i, 7) == 2) {
+                    twice++;
                 }
             }
-            assertTrue(thrice >= most / 2 * 9 / 10, thrice + " of the last keys read three times counted three times");
+            assertTrue(twice >= most / 2 * 9 / 10, twice + " of the last keys read twice counted twice");
         }
     }
 
