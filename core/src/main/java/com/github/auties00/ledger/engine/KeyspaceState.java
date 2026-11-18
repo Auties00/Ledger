@@ -277,6 +277,7 @@ final class KeyspaceState {
             index.remove(chain);
         }
         var created = keys.chain(key, hash);
+        Diag.CREATED.incrementAndGet();
         created.head = head;
         if (index.putIfAbsent(created) != null) {
             return;
@@ -330,6 +331,7 @@ final class KeyspaceState {
         }
         if (chain == null) {
             var created = keys.chain(key, hash);
+        Diag.CREATED.incrementAndGet();
             chain = index.putIfAbsent(created);
             if (chain == null) {
                 chain = created;

@@ -860,7 +860,7 @@ public final class ArrayWriteBatch implements WriteBatch {
             return;
         }
         var paged = pagedValueBytes;
-        if (paged > 0 && size <= SLAB_WRITES && slab != null && !slab.off() && placeOnSlab(slab, states)) {
+        if (paged > 0 && size <= SLAB_WRITES && slab != null && !slab.off() && Diag.slab(placeOnSlab(slab, states))) {
             return;
         }
         // A batch of resident writes alone keeps them on its array as before, where the store's rule for resident

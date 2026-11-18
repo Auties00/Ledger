@@ -951,6 +951,7 @@ public final class LiveLedger implements Ledger {
 
     @Override
     public Commit commit(WriteBatch batch) {
+        Diag.commit(this, states.values());
         Objects.requireNonNull(batch, "batch");
         if (!(batch instanceof ArrayWriteBatch writes) || writes.owner() != this) {
             throw new IllegalArgumentException("Another store created the batch");
@@ -3431,6 +3432,7 @@ public final class LiveLedger implements Ledger {
                         ? length >= SpillQueue.LOG_VALUE_MIN
                         : spillRoom > 0 && source != null && state.overwrites.spills())) {
                     listSpill(version, length);
+                    Diag.LISTED.incrementAndGet();
                 }
             }
         }
