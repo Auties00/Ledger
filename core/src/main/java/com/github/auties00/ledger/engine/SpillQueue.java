@@ -33,8 +33,8 @@ import java.util.zip.CRC32C;
 /// newest values, those of the budget, stay where they are, so reads of recent writes do not change; a read of a value
 /// in the log reads it back with one positioned read.
 ///
-/// A record whose every value is at least [#THROUGH_VALUE_MIN] bytes on an array of its own is not counted in the
-/// budget: its values leave the heap as soon as its frame is durable, in the order of the commits with the records of
+/// A record whose every value that moves is at least [#THROUGH_VALUE_MIN] bytes on an array of its own
+/// ([Record#eager()]) is not counted in the budget: its values leave the heap as soon as its frame is durable, in the order of the commits with the records of
 /// the budget, as one positioned read brings such a value back about as fast as it was written, a framed one
 /// authenticated by its frame's tag, where keeping it would hold an array of 128 KiB or more per commit. The first read
 /// of such a value written moments ago reads it back from the log.
@@ -55,10 +55,11 @@ import java.util.zip.CRC32C;
 ///   own, of a transaction, or of one with a unit of [BlobFile]. A value a recovery copied to an array of its own
 ///   moves, to the log only;
 /// - of a commit whose values on shared arrays would take, once moved, more than half the bytes they take now
-///   ([Record#settle()]), a value shorter than [#PAYING_VALUE_MIN] counted at the array of its own it would take: a
-///   value shorter than [#LOG_VALUE_MIN] goes to such an array, which frees the array it shared only once every other
-///   value on it left too, and one of 96 to 255 bytes goes to the log, saving less than 216 bytes of heap for a read
-///   back of its own by the next checkpoint. So a commit of mostly short values, like an app-state snapshot of 100 to
+///   ([Record#settle()]), a value shorter than [#PAYING_VALUE_MIN] counted at the array of its own it would take, or
+///   at its length if a bulk commit's run packs it in a chunk of its own: a value shorter than [#LOG_VALUE_MIN] goes
+///   to such an array or chunk, which frees the array it shared only once every other value on it left too, and one
+///   of 96 to 255 bytes goes to the log, saving less than 216 bytes of heap for a read back of its own by the next
+///   checkpoint. So a commit of mostly short values, like an app-state snapshot of 100 to
 ///   300 byte values, stays where it is rather than trade its frame for a [LogValue] and a positioned read per value, a
 ///   hundred thousand of each for a snapshot, its frame leaving the heap only once the thread moved the last of them,
 ///   well after the commit is durable. The commit's values on arrays of their own move all the same, each freeing its
@@ -80,10 +81,12 @@ import java.util.zip.CRC32C;
 /// Nothing of this is durable: a recovery replays the commits as ever, and moves the values it replays the same way
 /// ([LiveLedger#replay(long, byte\[\], int, int, ReplayValues, LogSegmentView, long, long)]).
 final class SpillQueue {
-    /// The shortest value that moves to the log rather than to an array of its own: a [LogValue] takes 40 bytes, an
-    /// array of the value 16 more than the value, 8-aligned, so from 96 bytes the log saves at least 72 bytes of heap
-    /// per value, for a positioned read back by the checkpoint that writes it; below, the log saves too little heap to
-    /// pay for the read.
+    /// The shortest value that moves to the log rather than to an array of its own, or of a [PackedRun] to a chunk of
+    /// the run's: a [LogValue] takes 40 bytes, an array of the value 16 more than the value, 8-aligned, so from 96 bytes
+    /// the log saves at least 72 bytes of heap per value, and a value a run keeps in the log takes 32 bytes of the run's
+    /// arrays (its stamp, its place, where it lies in its body and its tag) where one in a chunk takes its length, a
+    /// third or less from 96 bytes; each for a positioned read back by the checkpoint that writes it. Below, the log
+    /// saves too little heap to pay for the read.
     static final int LOG_VALUE_MIN = 96;
     /// The shortest value that [Record#settle()] counts at the 40 bytes of its [LogValue]; a shorter one counts at the
     /// array of its own it would take below [#LOG_VALUE_MIN], whether it goes to the log or not. A value of 96 to 255
@@ -402,24 +405,36 @@ final class SpillQueue {
     }
 
     /// Moves the values of the oldest records whose commits `durableSequence` gives durable: those the budget does not
-    /// count, and those it counts while the queue holds more than three quarters of its budget, on the caller's thread.
+    /// count, and those it counts once the queue holds more than its budget, until it holds three quarters of it, on the
+    /// caller's thread.
     void drain(LongSupplier durableSequence) {
         drain(durableSequence, lowWater);
     }
 
     /// Moves the values of the oldest records whose commits `durableSequence` gives durable, in the order of their
-    /// commits: those the budget does not count, and those it counts while the queue holds more than `downTo` bytes,
-    /// on the caller's thread.
+    /// commits, on the caller's thread: those the budget does not count, and those it counts once the queue holds more
+    /// than its budget, until it holds `downTo` bytes or fewer, or from the first if `downTo` is negative.
+    ///
+    /// A drain a durable record outside the budget started moves no record the budget counts while the queue holds no
+    /// more than its budget, so the newest values of the budget stay where they are whatever lengths are committed.
     private void drain(LongSupplier durableSequence, long downTo) {
         var crypto = takeCrypto();
+        // Whether the drain moves records the budget counts: from when the queue holds more than its budget to when it
+        // holds downTo bytes or fewer
+        var trimming = downTo < 0;
         try {
             while (!closed) {
                 Record record;
                 synchronized (lock) {
                     // Read before the records' locations, which the log writer sets before their frames are durable
                     var durableNow = durableSequence.getAsLong();
+                    if (held > budget) {
+                        trimming = true;
+                    } else if (held <= downTo) {
+                        trimming = false;
+                    }
                     var counted = records.peekFirst();
-                    if (counted != null && (held <= downTo || counted.sequence > durableNow)) {
+                    if (counted != null && (!trimming || counted.sequence > durableNow)) {
                         counted = null;
                     }
                     var outside = eager.peekFirst();
@@ -702,6 +717,9 @@ final class SpillQueue {
 
         /// Lists `entry` of the run `values` names, whose value of `length` bytes starts at `offset` of the commit's
         /// body, the write `op` of the commit's batch, on an array other values share.
+        ///
+        /// A value shorter than [#LOG_VALUE_MIN] counts in the verdict at its length, the bytes it takes packed in a
+        /// chunk of the run's own ([PackedRun#spill]), where a version's would take an array of its own.
         void addRun(RunValues values, int entry, int op, int offset, int length) {
             if (runs == null) {
                 runs = new RunValues[]{values};
@@ -715,7 +733,8 @@ final class SpillQueue {
             large |= length >= LOG_VALUE_MIN;
             shortest = Math.min(shortest, length);
             sharedBytes += length;
-            sharedMoved += length >= PAYING_VALUE_MIN ? LOG_VALUE_BYTES : (ARRAY_HEADER + length + 7) & -8;
+            sharedMoved += length >= PAYING_VALUE_MIN ? LOG_VALUE_BYTES
+                    : length >= LOG_VALUE_MIN ? (ARRAY_HEADER + length + 7) & -8 : length;
         }
 
         // Whether the record lists entries of the run `values` names already
@@ -745,7 +764,8 @@ final class SpillQueue {
         /// Decides which values move, before the record is queued: all of them if moving those on shared arrays frees
         /// at least as much heap as it allocates, what they would take once moved (a [LogValue] for one of at least
         /// [#PAYING_VALUE_MIN] bytes and an array of its own for a shorter one, whether [#LOG_VALUE_MIN] sends it to the
-        /// log or not) being at most half of their bytes, else only those on arrays of their own, whose bytes alone the
+        /// log or not, but its length for an entry of a bulk commit's run shorter than [#LOG_VALUE_MIN], which a chunk
+        /// of the run packs) being at most half of their bytes, else only those on arrays of their own, whose bytes alone the
         /// record then counts.
         ///
         /// A batch's values lie packed on arrays of about their bytes, so moving them all frees about their bytes, and
