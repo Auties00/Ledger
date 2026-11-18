@@ -211,9 +211,8 @@ final class Checkpointer implements IdleTicker.Watched {
     /// those writes in memory, more than their bytes in the log, for as long as it stayed open.
     ///
     /// It also finishes, on a thread of its own, a sweep the commits have not, however busy the store: they sweep a few
-    /// chains each, and a store with none would never do so; it lets go of the last commit the pipeline holds on to
-    /// ([LiveLedger#forgetLastCommits()]), and folds the blind writes a reader closed since kept listed
-    /// ([LiveLedger#foldIdleBlindWrites()]).
+    /// chains each, and a store with none would never do so; and it lets go of the last commit the pipeline holds on
+    /// to ([LiveLedger#forgetLastCommits()]).
     @Override
     public void tick() {
         var appended = log.appendedBytes();
@@ -222,7 +221,6 @@ final class Checkpointer implements IdleTicker.Watched {
         slab.tick(idle);
         if (!closed) {
             ledger.forgetLastCommits();
-            ledger.foldIdleBlindWrites();
             dropReleased();
         }
         if (!closed && ledger.sweepWaiting()) {

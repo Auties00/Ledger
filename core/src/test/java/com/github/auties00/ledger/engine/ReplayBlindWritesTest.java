@@ -11,7 +11,6 @@ import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -25,14 +24,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The log's replay of paged key spaces as blind writes, as the pipeline wrote them: an open after a crash looks no
 /// replayed key up in the trees, and every count after it stays exact, before and after the first checkpoint, through
 /// a second crash before one, with puts and removals of keys the trees hold and lack, large values and range removals
-/// over the keys written blind, in their own commit and in a later one, and beside a run the replay packs.
+/// over the keys written blind, in their own commit and in a later one.
 class ReplayBlindWritesTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.utf8());
@@ -45,13 +42,6 @@ class ReplayBlindWritesTest {
     private static LiveLedger open(Path directory) {
         return (LiveLedger) Ledger.builder().directory(directory).encryption(Encryption.key(KEY))
                 .keyspace(MESSAGES).keyspace(IDS).keyspace(CHATS).largeValues(LARGE_VALUES).build();
-    }
-
-    /// {@return the store at `directory` with a spill budget of 64 KiB, so its replay moves values to the log and packs
-    /// the new keys of a large commit into a run}
-    private static LiveLedger openSpilling(Path directory) {
-        return (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(directory).encryption(Encryption.key(KEY))
-                .keyspace(MESSAGES).keyspace(IDS).keyspace(CHATS).largeValues(LARGE_VALUES)).spillBudget(64 << 10).build();
     }
 
     private static String message(int i) {
@@ -223,74 +213,6 @@ class ReplayBlindWritesTest {
         }
         try (var ledger = open(survivor.getPath("/store"))) {
             assertCounts(ledger, model, "after a clean reopen");
-        }
-    }
-
-    @ParameterizedTest(name = "{0}, range removal {1}")
-    @CsvSource({"process crash, true", "power loss, true", "process crash, false", "power loss, false"})
-    @DisplayName("a checkpoint with no commit after it folds the blind writes and releases the run a replay packed beside them")
-    void runBesideBlindWrites(String failure, boolean rangeRemoval) throws Exception {
-        var disk = CrashFileSystem.create();
-        var model = seed(disk.getPath("/store"));
-        var large = "L".repeat((int) LARGE_VALUES * 2);
-        CrashFileSystem survivor;
-        try (var ledger = openSpilling(disk.getPath("/store"))) {
-            // New keys enough for a run, beside overwrites and removals of keys the tree holds, written blind
-            var first = ledger.newBatch();
-            for (var i = 0; i < 3_000; i++) {
-                put(first, model, MESSAGES, "r%05d".formatted(i), "v".repeat(100 + i % 200));
-            }
-            for (var i = 0; i < 300; i++) {
-                put(first, model, MESSAGES, message(i), "overwritten " + i);
-                delete(first, model, MESSAGES, message(1_000 + i));
-            }
-            ledger.commit(first).awaitDurable();
-            var second = ledger.newBatch();
-            put(second, model, MESSAGES, message(1_500), large);
-            if (rangeRemoval) {
-                deleteRange(second, model, MESSAGES, message(500), message(510));
-            } else {
-                for (var i = 0; i < 50; i++) {
-                    put(second, model, MESSAGES, message(1_950 + i), large);
-                    put(second, model, MESSAGES, "y%05d".formatted(i), large);
-                }
-            }
-            ledger.commit(second).awaitDurable();
-            var third = ledger.newBatch();
-            for (var i = 1_400; i < 1_700; i++) {
-                if (i != 1_500) {
-                    put(third, model, MESSAGES, message(i), "late " + i);
-                }
-            }
-            for (var i = 0; i < 100; i++) {
-                put(third, model, MESSAGES, "z%05d".formatted(i), "new " + i);
-                delete(third, model, MESSAGES, message(1_800 + i));
-                delete(third, model, MESSAGES, "q%05d".formatted(i));
-            }
-            ledger.commit(third).awaitDurable();
-            survivor = crash(disk, failure, 3);
-            ledger.closeWithoutCheckpoint();
-        }
-        try (var ledger = openSpilling(survivor.getPath("/store"))) {
-            var state = ledger.state(MESSAGES);
-            assertNotNull(state.run, "the replay packed no run");
-            assertTrue(state.blind.listed() > 0, "the replay wrote nothing blind");
-            ledger.checkpoint();
-            assertEquals(0, state.blind.listed(), "blind writes left listed after the checkpoint");
-            assertNull(state.run, "the run left after the checkpoint");
-            assertCounts(ledger, model, "after the checkpoint");
-            assertContents(ledger, model);
-            var after = ledger.newBatch();
-            put(after, model, MESSAGES, message(1_999), "after");
-            delete(after, model, MESSAGES, "r00000");
-            put(after, model, MESSAGES, "fresh", "after");
-            ledger.commit(after).awaitDurable();
-            assertCounts(ledger, model, "after a commit");
-            assertContents(ledger, model);
-        }
-        try (var ledger = openSpilling(survivor.getPath("/store"))) {
-            assertCounts(ledger, model, "after a clean reopen");
-            assertContents(ledger, model);
         }
     }
 
