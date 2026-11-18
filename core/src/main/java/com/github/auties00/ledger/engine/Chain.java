@@ -433,7 +433,8 @@ sealed class Chain permits Chain.Inline8 {
     /// {@return the order of the key and the `length` bytes at `from` of `other`, as
     /// [Segments#compare(MemorySegment, MemorySegment)] gives}
     ///
-    /// A checkpoint compares the chains it takes with the keys of a [PackedRun] so, without a view of each key.
+    /// A checkpoint compares the chains it takes with the keys of a [PackedRun] this way, without making a view of each
+    /// key.
     int compareKey(MemorySegment other, long from, long length) {
         if (keyChunk != null) {
             return Segments.compare(keyChunk, keyOffset(), keyLength(), other, from, length);

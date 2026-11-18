@@ -203,7 +203,8 @@ final class KeyspaceState {
     ///
     /// A writer passes the hash its chain of the key keeps, so the lookup in the run hashes nothing. A bulk commit's run
     /// is one commit, and a replay's is taken whole by the first checkpoint after the open, so the run's newest stamp
-    /// tells for each of its entries whether a tree holds it.
+    /// tells for each of its entries whether a tree holds it. The range removals since the run are not applied to its
+    /// entry: a writer that found the key absent counts its write as replacing nothing instead of calling this.
     long replacedStamp(Version head, MemorySegment key, int hash) {
         if (head != null) {
             return ValueSlab.Overwrites.stampOf(head);

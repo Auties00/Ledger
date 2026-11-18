@@ -306,6 +306,9 @@ final class LogWriter {
     // The buffer frames are sealed into and written from, a slice at a time whatever their size; it grows up to OUTPUT
     // while a group needs more, so a group that fits is written with one call
     private byte[] output;
+    // The buffer over the whole of output that drains write it through, made again only when output is replaced, so a
+    // drain allocates nothing whatever the compiler inlines
+    private ByteBuffer outputBuffer;
     // The bytes of output not written yet
     private int used;
     // The groups in a row written since one asked the output for more than SMALL_GROUP bytes
@@ -1574,7 +1577,12 @@ final class LogWriter {
         lastDrainLength = used;
         while (true) {
             try {
-                var buffer = ByteBuffer.wrap(output, 0, used);
+                var buffer = outputBuffer;
+                if (buffer == null || buffer.array() != output) {
+                    buffer = ByteBuffer.wrap(output);
+                    outputBuffer = buffer;
+                }
+                buffer.clear().limit(used);
                 while (buffer.hasRemaining()) {
                     position += channel.write(buffer, position);
                 }
@@ -1676,9 +1684,11 @@ final class LogWriter {
         }
     }
 
-    /// {@return the GCM nonce of the frame at `offset` of its segment}
+    /// {@return the GCM nonce of the frame at `offset` of its segment: four zero bytes, then the offset big-endian}
     static byte[] nonce(long offset) {
-        return ByteBuffer.allocate(12).putInt(0).putLong(offset).array();
+        var nonce = new byte[12];
+        Bytes.i64(nonce, Integer.BYTES, offset);
+        return nonce;
     }
 
     /// Makes the commits up to `sequence`, and the first `frames` frames, durable, wakes the commits waiting for them

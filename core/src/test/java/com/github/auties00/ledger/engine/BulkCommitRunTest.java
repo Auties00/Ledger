@@ -36,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -431,6 +432,95 @@ class BulkCommitRunTest {
             }
             assertEquals(records, ledger.spills().recordRoomsForTests().length, "an overwrite queued a record of its value");
             assertEquals(bulk, state.run != null, "a checkpoint merged the run");
+        }
+    }
+
+    /// Fills `keys` keys of [#MESSAGES] with `value`, by one bulk commit or by commits of 1,000 puts, checks that the
+    /// key space's values may then leave the heap and returns the key space's state.
+    private static KeyspaceState fill(LiveLedger ledger, boolean bulk, int keys, byte[] value)
+            throws InterruptedException {
+        var state = ledger.state(MESSAGES);
+        var size = bulk ? keys : 1_000;
+        for (var first = 0; first < keys; first += size) {
+            var batch = ledger.newBatch();
+            for (var message = first; message < first + size; message++) {
+                batch.put(MESSAGES, key(message), value);
+            }
+            ledger.commit(batch).awaitDurable();
+        }
+        assertEquals(bulk, state.run != null);
+        assertTrue(state.overwrites.spills(), "values written once may not leave the heap");
+        return state;
+    }
+
+    @ParameterizedTest(name = "first written by a bulk commit: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a removal of a key a bulk commit's run holds counts as one of a value in memory, so removals of a key space a bulk commit filled stop its values leaving the heap as those of one filled by small commits do")
+    void removalsOfRunKeys(boolean bulk, @TempDir Path directory) throws Exception {
+        var keys = 6_000;
+        var value = new byte[512];
+        try (var ledger = open(directory, false, 1L << 30)) {
+            var state = fill(ledger, bulk, keys, value);
+            // Each key removed by a commit of its own beside a put of a new key, one in 64 of each sampled: the
+            // removals over values no checkpoint took are past the eighth of the puts that stops the values leaving
+            for (var message = 0; message < keys; message++) {
+                ledger.commit(ledger.newBatch().delete(MESSAGES, key(message)));
+                ledger.commit(ledger.newBatch().put(MESSAGES, key(keys + message), value));
+            }
+            assertFalse(state.overwrites.spills(), "the removals counted as removals of keys memory did not hold");
+            assertEquals(bulk, state.run != null, "a checkpoint merged the run");
+            assertEquals(keys, ledger.size(MESSAGES));
+        }
+    }
+
+    @ParameterizedTest(name = "first written by a bulk commit: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a put of a key a range removal hid after a bulk commit's run or a chain held it counts as a put of a new key, so the values of a key space refilled after a range removal still leave the heap")
+    void putsAfterRangeRemoval(boolean bulk, @TempDir Path directory) throws Exception {
+        var keys = 6_000;
+        var value = new byte[512];
+        try (var ledger = open(directory, false, 1L << 30)) {
+            var state = fill(ledger, bulk, keys, value);
+            ledger.commit(ledger.newBatch().deleteRange(MESSAGES, KeyRange.all())).awaitDurable();
+            assertEquals(0, ledger.size(MESSAGES));
+            for (var message = 0; message < keys; message++) {
+                ledger.commit(ledger.newBatch().put(MESSAGES, key(message), value));
+            }
+            assertTrue(state.overwrites.spills(), "puts of keys a range removal hid counted as overwrites");
+            assertEquals(keys, ledger.size(MESSAGES));
+        }
+    }
+
+    @Test
+    @DisplayName("an overwrite of a key the run of an open's replay holds counts as one of a value in memory until the first checkpoint takes the run")
+    void overwritesOfReplayRunKeys(@TempDir Path directory) throws Exception {
+        var keys = 6_000;
+        var value = new byte[512];
+        try (var ledger = open(directory, false, 1L << 30)) {
+            fill(ledger, false, keys, value);
+            ledger.closeWithoutCheckpoint();
+        }
+        // A budget of 0 replays every put into a run
+        try (var ledger = open(directory, false, 0)) {
+            var state = ledger.state(MESSAGES);
+            var run = state.run;
+            assertNotNull(run, "the replay packed no run");
+            assertFalse(run.committed());
+            assertEquals(0, state.chains());
+            // Puts of new keys, all sampled in a commit of 1,000 until the first judgement, let the values leave the
+            // heap
+            var batch = ledger.newBatch();
+            for (var message = keys; message < keys + 1_000; message++) {
+                batch.put(MESSAGES, key(message), value);
+            }
+            ledger.commit(batch).awaitDurable();
+            assertTrue(state.overwrites.spills(), "values written once may not leave the heap");
+            for (var message = 0; message < keys; message++) {
+                ledger.commit(ledger.newBatch().put(MESSAGES, key(message), value));
+            }
+            assertFalse(state.overwrites.spills(), "the overwrites counted as puts of new keys");
+            assertSame(run, state.run, "a checkpoint merged the run");
+            assertEquals(keys + 1_000, ledger.size(MESSAGES));
         }
     }
 

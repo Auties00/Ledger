@@ -7,6 +7,7 @@ import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.WriteBatch;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.Arrays;
 import java.util.Map;
 import java.util.Objects;
@@ -231,8 +232,8 @@ public final class ArrayWriteBatch implements WriteBatch {
             return putOnRope(keyspace, key, value, keyLength, (int) valueLength);
         }
         var valueOffset = keyOffset + keyLength;
-        keyspace.keys().encode(key, memory.asSlice(keyOffset, keyLength));
-        keyspace.values().encode(value, memory.asSlice(valueOffset, valueLength));
+        encodeAt(keyspace.keys(), key, keyOffset, keyLength);
+        encodeAt(keyspace.values(), value, valueOffset, valueLength);
         add(PUT, keyspace, keyspace.residency() == Keyspace.Residency.RESIDENT ? value : null,
                 keyOffset, keyLength, valueOffset, valueLength);
         return this;
@@ -322,8 +323,28 @@ public final class ArrayWriteBatch implements WriteBatch {
             keyspace.keys().encode(key, slot(offset, length));
             return offset;
         }
-        keyspace.keys().encode(key, memory.asSlice(offset, length));
+        encodeAt(keyspace.keys(), key, offset, length);
         return offset;
+    }
+
+    /// Writes the encoding of `key`, of `length` bytes, at `offset` of the batch's array; a byte array, its own
+    /// encoding, with no slice of the array, which a put whose codec call the compiler does not inline allocates.
+    private <K> void encodeAt(KeyCodec<K> codec, K key, long offset, long length) {
+        if (codec == BuiltinCodecs.BYTES_KEY) {
+            MemorySegment.copy((byte[]) key, 0, memory, ValueLayout.JAVA_BYTE, offset, (int) length);
+        } else {
+            codec.encode(key, memory.asSlice(offset, length));
+        }
+    }
+
+    /// Writes the encoding of `value`, of `length` bytes, at `offset` of the batch's array, as
+    /// [#encodeAt(KeyCodec, Object, long, long)] writes a key.
+    private <V> void encodeAt(ValueCodec<V> codec, V value, long offset, long length) {
+        if (codec == BuiltinCodecs.BYTES_VALUE) {
+            MemorySegment.copy((byte[]) value, 0, memory, ValueLayout.JAVA_BYTE, offset, (int) length);
+        } else {
+            codec.encode(value, memory.asSlice(offset, length));
+        }
     }
 
     /// {@return whether `keyspace` is resident and of byte arrays, whose versions the store always gives an array of
