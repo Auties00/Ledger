@@ -715,7 +715,7 @@ final class SpillQueue {
             large |= length >= LOG_VALUE_MIN;
             shortest = Math.min(shortest, length);
             sharedBytes += length;
-            sharedMoved += length >= LOG_VALUE_MIN ? LOG_VALUE_BYTES : (ARRAY_HEADER + length + 7) & -8;
+            sharedMoved += length >= PAYING_VALUE_MIN ? LOG_VALUE_BYTES : (ARRAY_HEADER + length + 7) & -8;
         }
 
         // Whether the record lists entries of the run `values` names already
