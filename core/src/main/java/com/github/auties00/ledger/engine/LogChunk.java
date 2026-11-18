@@ -2,6 +2,9 @@ package com.github.auties00.ledger.engine;
 
 import com.github.auties00.ledger.LedgerCorruptedException;
 
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+
 /// Where the log holds the values of one array of a batch that left the heap as one ([SpillQueue]): values a commit put
 /// back to back on the array its versions kept, too short to pay a [LogValue] each.
 ///
@@ -17,6 +20,12 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 ///
 /// A version moved here keeps its offset on the array, which places its value among the chunk's: a version holds no
 /// more than the reference.
+///
+/// A chunk is made, and the versions moved to it, while the log still writes the commit's frame: until the frame is
+/// durable and the commit's record moves its values ([#locate(LogSegmentView, long, int)]) the chunk keeps the array
+/// and reads its values from it, so the move once the frame is durable takes one write per chunk rather than one per
+/// value. A chunk whose frame the log wrote through, or whose record a checkpoint published first, keeps the array for
+/// good, as its versions would have.
 ///
 /// A checkpoint, which writes every value of the chunk into its trees, reads the whole chunk once
 /// ([#readMaterialized(int, int, byte\[\], int)]): one sequential read of exactly its bytes, every block checked, kept
@@ -36,13 +45,14 @@ final class LogChunk {
     // The coefficient that sets a block's tag apart from a value's, whose second coefficient is a byte of its stamp
     private static final long BLOCK_MARK = 1L << 60;
 
-    private final LogSegmentView segment;
-    private final long frameOffset;
-    // Where the first value starts on the array, where the last one ends, and where the first starts in the frame's
-    // body
+    // The segment use, the frame's offset in it and where the first value starts in the frame's body: set once, by
+    // place, before the array is let go, and read only once a read finds it gone
+    private LogSegmentView segment;
+    private long frameOffset;
+    private int firstBody;
+    // Where the first value starts on the array and where the last one ends
     private final int base;
     private final int end;
-    private final int firstBody;
     // The sequence of the commit and where the first value starts in its body, which the tags are bound to
     private final long sequence;
     private final int commitFirst;
@@ -53,6 +63,8 @@ final class LogChunk {
     private final Object lock;
     // The chunk's bytes from the base, read whole by a checkpoint and dropped as it ends; null otherwise
     private volatile byte[] plain;
+    // The read-only segment of the array the values lie on, until the chunk is placed in the log; null from then on
+    private volatile MemorySegment home;
 
     /// Makes the place of the values from `base` to `end` of an array, moved to the frame at `frameOffset` of
     /// `segment`, which holds them back to back from `firstBody` of its body.
@@ -63,16 +75,47 @@ final class LogChunk {
     /// @param tagLows the low 32 bits of the second polynomial of each block's tag, or its CRC-32C
     LogChunk(LogSegmentView segment, long frameOffset, int base, int end, int firstBody, long sequence, int commitFirst,
              long[] tagHighs, int[] tagLows) {
+        this(base, end, sequence, commitFirst, tagHighs, tagLows, null);
         this.segment = segment;
         this.frameOffset = frameOffset;
+        this.firstBody = firstBody;
+    }
+
+    /// Makes the place of the values from `base` to `end` of `home`, the read-only segment of their array, which the
+    /// chunk reads them from until [#locate(LogSegmentView, long, int)] places it in the log.
+    ///
+    /// @param sequence the sequence of the commit, which the tags are bound to
+    /// @param commitFirst where the first value starts in the commit's body, which the tags are bound to
+    /// @param tagHighs the first polynomial of each block's tag, or `null` without encryption
+    /// @param tagLows the low 32 bits of the second polynomial of each block's tag, or its CRC-32C
+    LogChunk(int base, int end, long sequence, int commitFirst, long[] tagHighs, int[] tagLows, MemorySegment home) {
         this.base = base;
         this.end = end;
-        this.firstBody = firstBody;
         this.sequence = sequence;
         this.commitFirst = commitFirst;
         this.tagHighs = tagHighs;
         this.tagLows = tagLows;
         this.lock = new Object();
+        this.home = home;
+    }
+
+    /// Places a chunk made on its array in the log, once its frame is durable: at `frameOffset` of `segment`, the first
+    /// value at `firstBody` of the frame's body; then lets go of the array, so reads from then on read the log.
+    void locate(LogSegmentView segment, long frameOffset, int firstBody) {
+        this.segment = segment;
+        this.frameOffset = frameOffset;
+        this.firstBody = firstBody;
+        home = null;
+    }
+
+    /// {@return whether the chunk is placed in a segment a checkpoint retired; never for a chunk still on its array}
+    boolean retired() {
+        return home == null && segment.retired();
+    }
+
+    /// {@return whether the chunk still reads its values from their array; for tests}
+    boolean onArrayForTests() {
+        return home != null;
     }
 
     /// {@return the number of blocks of the `length` bytes of a chunk}
@@ -86,7 +129,7 @@ final class LogChunk {
         return BLOCK_MARK | (long) commitFirst << 20 | block;
     }
 
-    /// {@return the segment use that wrote the frame}
+    /// {@return the segment use that wrote the frame, or `null` while the chunk is on its array}
     LogSegmentView segment() {
         return segment;
     }
@@ -124,6 +167,11 @@ final class LogChunk {
     /// @throws com.github.auties00.ledger.LedgerIoException if the segment cannot be read
     /// @throws LedgerCorruptedException if the bytes read are not those the chunk held
     void readInto(int offset, int length, byte[] target, int targetOffset) {
+        var array = home;
+        if (array != null) {
+            MemorySegment.copy(array, ValueLayout.JAVA_BYTE, offset, target, targetOffset, length);
+            return;
+        }
         var held = plain;
         if (held != null) {
             System.arraycopy(held, offset - base, target, targetOffset, length);
@@ -147,6 +195,11 @@ final class LogChunk {
     /// @throws com.github.auties00.ledger.LedgerIoException if the segment cannot be read
     /// @throws LedgerCorruptedException if the bytes read are not those the chunk held
     void readMaterialized(int offset, int length, byte[] target, int targetOffset) {
+        var array = home;
+        if (array != null) {
+            MemorySegment.copy(array, ValueLayout.JAVA_BYTE, offset, target, targetOffset, length);
+            return;
+        }
         var held = plain;
         if (held == null) {
             var read = false;

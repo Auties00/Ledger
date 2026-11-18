@@ -209,7 +209,7 @@ sealed class Version permits Version.External {
     boolean inRetiredSegment() {
         return switch (SOURCE.getAcquire(this)) {
             case LogValue logged -> logged.segment().retired();
-            case LogChunk chunk -> chunk.segment().retired();
+            case LogChunk chunk -> chunk.retired();
             case null, default -> false;
         };
     }

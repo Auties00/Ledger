@@ -58,9 +58,10 @@ import java.util.zip.CRC32C;
 ///   Unless the commit holds more such values than twice the budget, and at least [#CHUNKS_MIN] bytes, that lie back
 ///   to back on their arrays: each array then leaves the heap whole for one [LogChunk], which the next checkpoint reads
 ///   back in one read rather than one per value. A thread of its own tags the blocks of those arrays while the log
-///   writes the commit's frame ([Record#prepareAhead(SpillQueue)]), and a wait for such a commit to be durable
-///   moves its values on the waiting thread before it returns ([#moveOwn(long)]), rather than leaving them to the
-///   thread that moves values, which would take them only after the commit returned.
+///   writes the commit's frame, and moves their versions to chunks that keep the arrays until the frame is durable
+///   ([Record#prepareAhead(SpillQueue)]); a wait for such a commit to be durable places those chunks in the log, which
+///   lets go of the arrays, before it returns ([#moveOwn(long)]), rather than leaving them to the thread that moves
+///   values, which would take them only after the commit returned.
 ///
 /// A recovery moves a value it replays that the log holds before its last budget of bytes at once, on its own thread,
 /// tagged where it lies in the frame body it came in
@@ -768,8 +769,10 @@ final class SpillQueue {
     static final class Record {
         private final long sequence;
         private Version[] versions;
-        // Where each value starts in the body of its commit
+        // Where each value starts in the body of its commit; or, for a value a split body left to its section, -1 minus
+        // where it starts in the section, which starts at sectionStart of the body ([#bodyOffset(int)])
         private int[] offsets;
+        private int sectionStart;
         private int count;
         /// The verdict of [#settle(long)] that every value of the record may move.
         static final int ALL = 0;
@@ -862,15 +865,20 @@ final class SpillQueue {
             }
         }
 
-        /// Makes the offsets of the values the commit's split body left to its section, which [#add] took as `-1` minus
-        /// where each starts in the section, the offsets of those values in the body, whose section starts at
-        /// `sectionStart`; the other offsets stay. Called once the body is complete, before the record is queued.
+        /// Records that the commit's split body, complete, starts its section at `sectionStart`, which places the values
+        /// [#add] took as `-1` minus where each starts in the section ([#bodyOffset(int)]). Called before the record is
+        /// queued.
+        ///
+        /// The offsets stay as listed and are placed as the move reads them, on the thread that moves the values, rather
+        /// than in a pass over every value here, on the commit's thread.
         void resolveSection(int sectionStart) {
-            for (var i = 0; i < count; i++) {
-                if (offsets[i] < 0) {
-                    offsets[i] = sectionStart + (-1 - offsets[i]);
-                }
-            }
+            this.sectionStart = sectionStart;
+        }
+
+        /// {@return where value `i` starts in the commit's body}
+        private int bodyOffset(int i) {
+            var offset = offsets[i];
+            return offset >= 0 ? offset : sectionStart + (-1 - offset);
         }
 
         /// Records where the log wrote the frame of the commit: at `frameOffset` of the use `segment`, the commit's body
@@ -1045,7 +1053,7 @@ final class SpillQueue {
                     continue;
                 }
                 var framed = segment != null && framesAlone(segment, frameBody, version.valueLength()) ? frameBody : 0;
-                if (version.spill(crypto, segment, frameOffset, commitStart + offsets[i], framed, null)) {
+                if (version.spill(crypto, segment, frameOffset, commitStart + bodyOffset(i), framed, null)) {
                     if (version.valueLength() >= LOG_VALUE_MIN) {
                         logged++;
                     } else {
@@ -1058,8 +1066,10 @@ final class SpillQueue {
         }
 
         /// Moves each run of values on a shared array to a [LogChunk] of its place in the frame, its block tags made
-        /// from the array before any value moves: those the thread that prepares the runs ahead made, or made now. A run
-        /// whose values lie apart from where the record found them stays.
+        /// from the array before any value moves: those the thread that prepares the runs ahead made, or made now. A
+        /// chunk that thread made on the array, its versions moved to it, is placed in the log, which lets go of the
+        /// array; the versions of any other run move here, one by one. A run whose values lie apart from where the
+        /// record found them stays.
         private void spillRuns(SpillQueue queue, Crypto crypto) {
             var runs = this.runs;
             var prepared = takePrepared(queue, runs);
@@ -1073,10 +1083,17 @@ final class SpillQueue {
                 if (lows == null) {
                     continue;
                 }
-                var first = offsets[runs.firsts[run]];
+                var first = bodyOffset(runs.firsts[run]);
+                chunks++;
+                var made = prepared.chunks[run];
+                if (made != null) {
+                    // Its versions moved to it as the log wrote the frame: placing it lets go of the array
+                    made.locate(segment, frameOffset, commitStart + first);
+                    values += prepared.moved[run];
+                    continue;
+                }
                 var chunk = new LogChunk(segment, frameOffset, runs.starts[run], runs.ends[run], commitStart + first,
                         sequence, first, prepared.highs[run], lows);
-                chunks++;
                 var home = runs.homes[run];
                 for (var i = runs.firsts[run]; i <= runs.lasts[run]; i++) {
                     if (versions[i].spillToChunk(home, chunk)) {
@@ -1091,7 +1108,7 @@ final class SpillQueue {
         /// {@return the tags of the blocks of `runs`, the runs of this record, made on this thread}
         private Prepared prepareRuns(Runs runs, Crypto crypto, boolean encrypted) {
             var count = runs.count;
-            var prepared = new Prepared(new long[count][], new int[count][]);
+            var prepared = new Prepared(new long[count][], new int[count][], new LogChunk[count], new int[count]);
             for (var run = 0; run < count; run++) {
                 if (runs.ends[run] >= 0) {
                     prepareRun(runs, run, crypto, encrypted, prepared);
@@ -1110,7 +1127,7 @@ final class SpillQueue {
         private void prepareRun(Runs runs, int run, Crypto crypto, boolean encrypted, Prepared prepared) {
             var home = runs.homes[run];
             var start = runs.starts[run];
-            var first = offsets[runs.firsts[run]];
+            var first = bodyOffset(runs.firsts[run]);
             var length = runs.ends[run] - start;
             var bytes = crypto.scratch(length);
             MemorySegment.copy(home, start, MemorySegment.ofArray(bytes), 0, length);
@@ -1127,9 +1144,10 @@ final class SpillQueue {
         }
 
         /// Starts a thread that tags the runs' blocks while the log seals, writes and forces the commit's frame, as the
-        /// record is queued, so the move of the values, once the frame is durable, takes the tags rather than making
-        /// them on the thread of the commit that waits for it ([SpillQueue#moveOwn(long)]). A thread the system refuses
-        /// leaves them to the move.
+        /// record is queued, and moves the runs' versions to chunks on their arrays ([#moveToChunks(Runs, Prepared)]),
+        /// so the move of the values, once the frame is durable, takes the tags and places the chunks rather than
+        /// making them and moving a hundred thousand versions on the thread of the commit that waits for it
+        /// ([SpillQueue#moveOwn(long)]). A thread the system refuses leaves them to the move.
         ///
         /// The commit's thread does nothing more here: the thread takes the ciphers, the first of which draws the keys
         /// of the tags, and the class it runs is not a lambda, whose first use links a call site, each a cost a fresh
@@ -1186,15 +1204,50 @@ final class SpillQueue {
                 if (hook != null) {
                     hook.run();
                 }
-                runs.prepared = prepareRuns(runs, crypto, queue.encrypted);
+                if (runs.preparing.get() != Runs.PREPARE_RUNNING) {
+                    return;
+                }
+                var prepared = prepareRuns(runs, crypto, queue.encrypted);
+                // Published before the versions move, so a failure halfway leaves the move the runs not moved yet
+                runs.prepared = prepared;
+                moveToChunks(runs, prepared);
             } catch (RuntimeException | OutOfMemoryError _) {
                 // The move prepares them itself; a record released meanwhile, its versions gone, is not moved at all
             } finally {
-                runs.preparing.set(Runs.PREPARE_DONE);
+                runs.preparing.compareAndSet(Runs.PREPARE_RUNNING, Runs.PREPARE_DONE);
                 var waiter = runs.waiter;
                 if (waiter != null) {
                     LockSupport.unpark(waiter);
                 }
+            }
+        }
+
+        /// Moves the versions of each prepared run of `runs` to a [LogChunk] that keeps their array until the move
+        /// places it in the log, so the move, once the frame is durable, takes one write per chunk rather than one per
+        /// value. Stops once the move gave up waiting for this thread, which then moves the remaining runs itself.
+        ///
+        /// A version moves from its array with a compare-and-set, as the move's own would, so a run both move ends with
+        /// each version on one chunk or the other, each of which reads it right.
+        private void moveToChunks(Runs runs, Prepared prepared) {
+            for (var run = 0; run < runs.count; run++) {
+                var lows = prepared.lows[run];
+                if (lows == null) {
+                    continue;
+                }
+                if (runs.preparing.get() != Runs.PREPARE_RUNNING) {
+                    return;
+                }
+                var home = runs.homes[run];
+                var chunk = new LogChunk(runs.starts[run], runs.ends[run], sequence, bodyOffset(runs.firsts[run]),
+                        prepared.highs[run], lows, home);
+                var moved = 0;
+                for (var i = runs.firsts[run]; i <= runs.lasts[run]; i++) {
+                    if (versions[i].spillToChunk(home, chunk)) {
+                        moved++;
+                    }
+                }
+                prepared.moved[run] = moved;
+                prepared.chunks[run] = chunk;
             }
         }
 
@@ -1222,7 +1275,7 @@ final class SpillQueue {
                 if (interrupted) {
                     Thread.currentThread().interrupt();
                 }
-                if (runs.preparing.get() == Runs.PREPARE_RUNNING) {
+                if (runs.preparing.compareAndSet(Runs.PREPARE_RUNNING, Runs.PREPARE_ABANDONED)) {
                     return null;
                 }
             }
@@ -1261,6 +1314,7 @@ final class SpillQueue {
         private static final int PREPARE_NONE = 0;
         private static final int PREPARE_RUNNING = 1;
         private static final int PREPARE_DONE = 2;
+        private static final int PREPARE_ABANDONED = 3;
 
         // Per run: the read-only segment of the array, the first and last index of its values among the record's
         // versions, the values in it, where the first starts on the array and where the last ends; an end of -1 marks
@@ -1279,8 +1333,9 @@ final class SpillQueue {
         // them, and if it failed
         private volatile Prepared prepared;
         // PREPARE_NONE until the thread that prepares the runs ahead starts, or the move claims them first;
-        // PREPARE_RUNNING while that thread prepares them; PREPARE_DONE once it published them, or the move claimed
-        // them. An atomic integer, not a field handle, whose first use in a fresh JVM links its call sites on the commit's
+        // PREPARE_RUNNING while that thread prepares them and moves their versions to chunks on their arrays;
+        // PREPARE_DONE once it published them, or the move claimed them; PREPARE_ABANDONED once the move stopped
+        // waiting for that thread, which then moves no more versions. An atomic integer, not a field handle, whose first use in a fresh JVM links its call sites on the commit's
         // thread
         private final AtomicInteger preparing = new AtomicInteger();
         // The thread of the move waiting for the thread that prepares the runs ahead, which that thread unparks once done
@@ -1318,8 +1373,10 @@ final class SpillQueue {
     }
 
     /// The tags of the blocks of a record's runs, made ahead of their move, per run: the first polynomials, `null`
-    /// without encryption, and the low 32 bits of the second or the CRC-32C, `null` for a run that stays.
-    private record Prepared(long[][] highs, int[][] lows) {
+    /// without encryption, and the low 32 bits of the second or the CRC-32C, `null` for a run that stays; and the chunk
+    /// on its array that the thread preparing the runs moved the run's versions to, with the number it moved, or `null`
+    /// for a run whose versions are still on their array.
+    private record Prepared(long[][] highs, int[][] lows, LogChunk[] chunks, int[] moved) {
     }
 
     /// The ciphers of one thread at a time: those that authenticate a value moved to the log and decrypt it back.

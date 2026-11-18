@@ -1919,6 +1919,7 @@ class LogSpillTest {
             assertEquals(0, spills.loggedValuesForTests() + spills.copiedValuesForTests());
             var chunks = chunksOf(ledger, 0, count);
             assertEquals(spills.loggedChunksForTests(), chunks.size());
+            assertTrue(chunks.stream().noneMatch(LogChunk::onArrayForTests), "a chunk kept its array past the wait for durability");
             // 4 MB of values on arrays of 256 KiB
             assertTrue(chunks.size() >= 15 && chunks.size() <= 17, chunks.size() + " chunks");
             assertTrue(Arrays.stream(ledger.spills().segmentsForTests()).anyMatch(number -> number == chunks.getFirst().segment().number()),
@@ -1988,6 +1989,7 @@ class LogSpillTest {
             assertNull(failure.get());
             var chunks = chunksOf(ledger, 0, count);
             assertEquals(chunks.size(), spills.preparedAheadForTests(), "the move prepared runs of its own");
+            assertTrue(chunks.stream().noneMatch(LogChunk::onArrayForTests), "a chunk made ahead kept its array past the move");
             assertEquals(0, spills.chunkRecordsForTests());
             assertEquals(0, spills.heldForTests());
             verify(ledger, expected);
@@ -2290,7 +2292,15 @@ class LogSpillTest {
         queue.moveOwn(1);
         assertEquals(1, queue.chunkedRecordsForTests());
         assertEquals(0, queue.loggedChunksForTests());
-        assertInstanceOf(MemorySegment.class, first.sourceForTests());
+        for (var version : List.of(first, second)) {
+            // The thread that prepares the runs ahead may have moved the version to a chunk, which keeps the array
+            if (version.sourceForTests() instanceof LogChunk chunk) {
+                assertTrue(chunk.onArrayForTests(), "a chunk of a group written through let go of its array");
+            } else {
+                assertInstanceOf(MemorySegment.class, version.sourceForTests());
+            }
+            assertArrayEquals(new byte[100], version.copyBytes());
+        }
         assertEquals(0, queue.segmentsForTests().length, "a segment no value moved to is held");
         assertEquals(0, queue.chunkRecordsForTests());
     }
