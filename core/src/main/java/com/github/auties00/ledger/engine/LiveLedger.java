@@ -101,7 +101,7 @@ public final class LiveLedger implements Ledger {
     /// key space's entries: it runs alone and keeps its puts of new keys in a [PackedRun], about 60 bytes over the key
     /// each, where a chain, a version and the commit's record of the write took about 160. Fewer go to chains, which a
     /// commit of a few writes holds no lock for.
-    static final int BULK_RUN_WRITES = 2_048;
+    static final int BULK_RUN_WRITES = Integer.MAX_VALUE;
     private static final VarHandle LAST_PUBLISHED;
     private static final VarHandle LATEST;
 
