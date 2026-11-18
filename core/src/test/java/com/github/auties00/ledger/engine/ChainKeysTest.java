@@ -95,6 +95,40 @@ class ChainKeysTest {
         }
     }
 
+    @Test
+    @DisplayName("compares a chain with the keys of a packed run in the run's arrays as their bytes, whichever way the chain holds its key")
+    void againstRunKeys() {
+        var random = new SplittableRandom(0x5EED5L);
+        var keys = new ArrayList<byte[]>();
+        for (var key : keys(random)) {
+            // A run holds no empty key
+            if (key.length > 0 && keys.stream().noneMatch(other -> Arrays.equals(other, key))) {
+                keys.add(key);
+            }
+        }
+        var builder = new PackedRun.Builder();
+        var stamp = 0L;
+        // Keys of odd lengths first, so the others start at every offset of a word in the run's chunk
+        for (var i = 0; i < 13; i++) {
+            builder.put(MemorySegment.ofArray(bytes(random, 41 + i)), stamp++, null, 0, 0);
+        }
+        for (var key : keys) {
+            builder.put(MemorySegment.ofArray(key.clone()), stamp++, null, 0, 0);
+        }
+        var run = builder.build(null, null);
+        var slab = new KeySlab();
+        for (var left : keys) {
+            for (var chain : forms(slab, left, random)) {
+                for (var entry = 0; entry < run.size(); entry++) {
+                    var right = Segments.toBytes(run.key(entry));
+                    var expected = Integer.signum(Arrays.compareUnsigned(left, right));
+                    assertEquals(expected, Integer.signum(run.compareChain(chain, entry)),
+                            () -> HexFormat.of().formatHex(left) + " against " + HexFormat.of().formatHex(right));
+                }
+            }
+        }
+    }
+
     @ParameterizedTest(name = "{0}-byte keys")
     @ValueSource(ints = {0, 1, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32, 33, 40})
     @DisplayName("orders random keys of one length, and keys one byte past or short of it, as their bytes")

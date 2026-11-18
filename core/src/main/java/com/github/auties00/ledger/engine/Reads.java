@@ -34,6 +34,10 @@ import java.util.function.Function;
 /// before it reads memory, so the chains the loader installed before it moved past the key are there. A scan does so
 /// as it advances ([ResidentScan]).
 final class Reads {
+    /// What [#knownExistence(KeyspaceState, Version, MemorySegment, int, long, TreeVersion, byte)] gives for a key only
+    /// a [ReadPoint] accounts for.
+    static final byte NEEDS_POINT = -1;
+
     /// The bits of a stamp that number the writes of one batch.
     static final int OP_BITS = 24;
     /// The most writes one batch holds.
@@ -189,6 +193,45 @@ final class Reads {
             return TreeSearch.ABSENT;
         }
         return TreeSearch.UNKNOWN;
+    }
+
+    /// {@return whether a writer at `bound` over the latest trees `trees` sees `key`, whose newest version in memory is
+    /// `head` and whose hash is `hash` ([Segments#hash(MemorySegment)]), as [TreeSearch#FOUND] or [TreeSearch#ABSENT]
+    /// when no range removal is listed and its version in memory, `inTree` or, with no trees, the run tells;
+    /// [#NEEDS_POINT] otherwise, which only [#existence(KeyspaceState, Version, MemorySegment, int, ReadPoint, byte)]
+    /// answers}
+    ///
+    /// It answers as that method would, without the [ReadPoint] it takes: a write whose key memory, the commit's
+    /// lookup or the run of a store with no checkpoint yet accounts for, most of them, makes none.
+    ///
+    /// @param trees the latest trees, or `null` if the store has none
+    /// @param inTree whether `trees` hold `key`, with the run they read over them, as a lookup found it,
+    ///               [TreeSearch#UNKNOWN] or [TreeSearch#BLIND]
+    static byte knownExistence(KeyspaceState state, Version head, MemorySegment key, int hash, long bound,
+                               TreeVersion trees, byte inTree) {
+        var removals = state.removals;
+        var version = KeyspaceState.resolve(head, key, bound, removals);
+        if (version != null) {
+            return version != Version.HIDDEN ? TreeSearch.FOUND : TreeSearch.ABSENT;
+        }
+        if (removals.length != 0) {
+            return NEEDS_POINT;
+        }
+        if (inTree == TreeSearch.FOUND || inTree == TreeSearch.ABSENT) {
+            return inTree;
+        }
+        if (trees != null) {
+            return NEEDS_POINT;
+        }
+        // No tree: the run a reader at the bound reads, if any, holds what the store holds of the key beyond memory
+        var run = state.run;
+        if (run != null && run.maxStamp() > -1 && run.minStamp() <= bound) {
+            var entry = run.find(key, hash);
+            if (entry >= 0) {
+                return run.removes(entry) ? TreeSearch.ABSENT : TreeSearch.FOUND;
+            }
+        }
+        return TreeSearch.ABSENT;
     }
 
     /// {@return whether `point` sees `key`, whose newest version in memory is `head`, as [TreeSearch#FOUND] or

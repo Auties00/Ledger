@@ -3101,12 +3101,9 @@ public final class LiveLedger implements Ledger {
         private final boolean sharesChunk;
         // The range removals this commit counts after it is published, or null before any
         private ArrayList<PendingRanges.Removal> deferred;
-        // The runs of a bulk commit's puts of new keys, one per key space, or null for a commit that keeps none
+        // The runs of a bulk commit's puts of new keys, one per key space, or null for a commit that keeps none; the
+        // counts of the runs are read from them, so a commit of chains alone pays one field for them
         private BulkRun[] bulkRuns;
-        // The puts the runs may take in all, which the commit's record of values lists apart from its versions
-        private int bulkPuts;
-        // The puts the runs took, which the log's estimate of the commit's heap counts as writes
-        private int runWrites;
         // Whether the publication of the commit listed them with their key spaces
         private boolean deferredListed;
         // The room for values of the record of the values the commit's puts keep on their batch's arrays, which may
@@ -3356,10 +3353,15 @@ public final class LiveLedger implements Ledger {
                          byte inTree, PageRef external) {
             var stamp = nextStamp();
             var head = chain.head;
-            var existed = Reads.existence(state, head, key, chain.hash, writerPoint(stamp - 1), inTree);
+            var existed = Reads.knownExistence(state, head, key, chain.hash, stamp - 1, tree, inTree);
+            if (existed == Reads.NEEDS_POINT) {
+                existed = Reads.existence(state, head, key, chain.hash, writerPoint(stamp - 1), inTree);
+            }
             if (source != null && spillRoom != REPLAYED && !state.resident && (ValueSlab.Overwrites.sampled(stamp)
                     || spillRoom >= ValueSlab.Overwrites.BULK_WRITES && !state.overwrites.judged())) {
-                state.overwrites.sample(state.replacedStamp(head, key, chain.hash), length);
+                // A key the commit finds absent, which a range removal since may hide from the run, replaces nothing
+                state.overwrites.sample(existed == TreeSearch.ABSENT ? ValueSlab.Overwrites.NOTHING
+                        : state.replacedStamp(head, key, chain.hash), length);
             }
             Version version;
             var bytes = state.resident && state.keyspace.values() == BuiltinCodecs.BYTES_VALUE;
@@ -3447,7 +3449,7 @@ public final class LiveLedger implements Ledger {
             var record = frame.spill();
             if (record == null) {
                 // The puts the runs take list apart, in the runs' entries
-                record = spills.record(sequence, spillRoom > 0 ? Math.max(1, spillRoom - bulkPuts) : -1 - spillRoom);
+                record = spills.record(sequence, spillRoom > 0 ? Math.max(1, spillRoom - bulkPuts()) : -1 - spillRoom);
                 frame.spill(record);
             }
             return record;
@@ -3463,10 +3465,35 @@ public final class LiveLedger implements Ledger {
                 var state = plan.states()[i];
                 if (bulkEligible(state, trees)) {
                     runs[started++] = new BulkRun(state, plan.puts()[i], plan.keyBytes()[i]);
-                    bulkPuts += plan.puts()[i];
                 }
             }
             bulkRuns = started == 0 ? null : Arrays.copyOf(runs, started);
+        }
+
+        /// {@return the puts the commit's runs may take in all, which its record of values lists apart from its
+        /// versions}
+        private int bulkPuts() {
+            var runs = bulkRuns;
+            var puts = 0;
+            if (runs != null) {
+                for (var run : runs) {
+                    puts += run.planned;
+                }
+            }
+            return puts;
+        }
+
+        /// {@return the puts the commit's runs took, which the log's estimate of the commit's heap counts as writes; 0
+        /// once the commit published them}
+        private int runWrites() {
+            var runs = bulkRuns;
+            var writes = 0;
+            if (runs != null) {
+                for (var run : runs) {
+                    writes += run.builder.size();
+                }
+            }
+            return writes;
         }
 
         /// {@return the run this commit keeps its puts of new keys of `state` in, or `null`}
@@ -3519,7 +3546,6 @@ public final class LiveLedger implements Ledger {
                 state.overwrites.sample(ValueSlab.Overwrites.NOTHING, length);
             }
             addDelta(state, 1);
-            runWrites++;
             if (frame != null) {
                 var kept = writes.homeArray(index);
                 if (kept != null && length >= frame.referable()) {
@@ -3585,7 +3611,10 @@ public final class LiveLedger implements Ledger {
         void delete(KeyspaceState state, Chain chain, MemorySegment key, byte inTree) {
             var stamp = nextStamp();
             var head = chain.head;
-            var existed = Reads.existence(state, head, key, chain.hash, writerPoint(stamp - 1), inTree);
+            var existed = Reads.knownExistence(state, head, key, chain.hash, stamp - 1, tree, inTree);
+            if (existed == Reads.NEEDS_POINT) {
+                existed = Reads.existence(state, head, key, chain.hash, writerPoint(stamp - 1), inTree);
+            }
             if (existed == TreeSearch.ABSENT) {
                 if (head == null) {
                     // Opened for this removal: the prune after the commit publishes drops it, if it stays empty
@@ -3731,7 +3760,8 @@ public final class LiveLedger implements Ledger {
             // Queued before it is visible, so the log holds every commit a reader can see, in order
             if (frame != null) {
                 try {
-                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size() + runWrites, sharesChunk);
+                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size() + runWrites(),
+                            sharesChunk);
                     logged = true;
                 } catch (RuntimeException exception) {
                     rollback();
@@ -3745,7 +3775,8 @@ public final class LiveLedger implements Ledger {
         /// Adds the commit's frame, if it is journaled, to `batch`.
         void queueFrame(LogWriter.Batch batch) {
             if (frame != null) {
-                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size() + runWrites, sharesChunk);
+                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size() + runWrites(),
+                        sharesChunk);
             }
         }
 
@@ -3823,7 +3854,6 @@ public final class LiveLedger implements Ledger {
             discardFrame();
             // Never published: no reader saw the runs, and the deltas that counted their puts go with the commit
             bulkRuns = null;
-            runWrites = 0;
             for (var write : touched) {
                 var chain = write.chain();
                 var head = chain.head;

@@ -117,26 +117,20 @@ final class TreeUpdate {
     /// @param version its version as of the checkpoint, or `null` if the key has none
     /// @param blind the chain of the key, if a blind write the checkpoint takes needs to know whether the tree held
     ///              the key ([BlindWrites]), which the update records on it; or `null`
-    /// @param settles where the update records whether the tree held the key for the [PackedRun] that holds it
-    ///                ([PackedRun#settles()]), or `null`
-    /// @param entry the key's entry in that run, or -1
-    /// @param run the run whose entry `entry` is the key's, if `keyed` is `null`; or `null`
-    record Op(Chain keyed, Version version, Chain blind, byte[] settles, int entry, PackedRun run) {
+    /// @param run the [PackedRun] whose entry `entry` is the key's, which the update tells whether the tree held the
+    ///            key ([PackedRun#settles()]); or `null`
+    /// @param entry the key's entry in `run`, or -1
+    record Op(Chain keyed, Version version, Chain blind, PackedRun run, int entry) {
         /// Makes the state of the key of `keyed` with `version`, as [Op] does, for a key no run holds.
         Op(Chain keyed, Version version, Chain blind) {
-            this(keyed, version, blind, null, -1, null);
+            this(keyed, version, blind, null, -1);
         }
 
-        /// Makes the state of the key of `keyed` with `version`, as [Op] does, whose entry `entry` of a run records in
-        /// `settles` whether the tree held it.
-        Op(Chain keyed, Version version, Chain blind, byte[] settles, int entry) {
-            this(keyed, version, blind, settles, entry, null);
-        }
-
-        /// Makes the state of the key of entry `entry` of `run`, which no chain the checkpoint takes holds, with
-        /// `version`, as [Op] does.
-        Op(PackedRun run, int entry, Version version, byte[] settles) {
-            this(null, version, null, settles, entry, run);
+        /// Makes the state of the key of entry `entry` of `run` with `version`, as [Op] does, kept as the run's entry:
+        /// either no chain the checkpoint takes holds the key, or the key's chain has no version at the cut, as a
+        /// commit that wrote it rolled back.
+        Op(PackedRun run, int entry, Version version) {
+            this(null, version, null, run, entry);
         }
 
         /// Makes the state of `key` with `value`, or with none if `null`.
@@ -183,8 +177,8 @@ final class TreeUpdate {
             if (blind != null) {
                 blind.settle(inTree);
             }
-            if (settles != null && entry >= 0) {
-                PackedRun.settle(settles, entry, inTree);
+            if (run != null && entry >= 0) {
+                PackedRun.settle(run.settles(), entry, inTree);
             }
         }
     }

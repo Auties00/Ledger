@@ -671,7 +671,6 @@ final class Checkpointer implements IdleTicker.Watched {
                 run = null;
             }
             var runEntries = run == null ? 0 : run.size();
-            var settles = run == null ? null : run.settles();
             var ops = new ArrayList<TreeUpdate.Op>(chains.length + runEntries);
             var removals = keyspace.removals();
             // The next entry of the run in the order of the keys, or -1 past the last, compared with the chains in the
@@ -698,7 +697,7 @@ final class Checkpointer implements IdleTicker.Watched {
                         entry = taken;
                         break;
                     }
-                    ops.add(runOp(run, taken, settles, removals, treeBound, bound));
+                    ops.add(runOp(run, taken, removals, treeBound, bound));
                 }
                 // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
                 // otherwise another one, or none
@@ -711,7 +710,7 @@ final class Checkpointer implements IdleTicker.Watched {
                     // tree is right, with the run's entry if it has one. A resident one holds every entry, so there the
                     // key is gone
                     if (entry >= 0) {
-                        ops.add(runOp(run, entry, settles, removals, treeBound, bound));
+                        ops.add(runOp(run, entry, removals, treeBound, bound));
                     }
                     continue;
                 }
@@ -719,9 +718,9 @@ final class Checkpointer implements IdleTicker.Watched {
                 // the leaf the update merges tells whether the tree held the key
                 var blind = current != null && current.blindState() == TreeSearch.UNKNOWN ? current : null;
                 if (version == null || version == Version.HIDDEN) {
-                    ops.add(new TreeUpdate.Op(chain, null, blind, settles, entry));
+                    ops.add(new TreeUpdate.Op(chain, null, blind, run, entry));
                 } else {
-                    ops.add(new TreeUpdate.Op(chain, version, blind, settles, entry));
+                    ops.add(new TreeUpdate.Op(chain, version, blind, run, entry));
                     var external = version.external();
                     if (external != null) {
                         adopted.add(external);
@@ -729,7 +728,7 @@ final class Checkpointer implements IdleTicker.Watched {
                 }
             }
             while (next >= 0) {
-                ops.add(runOp(run, next, settles, removals, treeBound, bound));
+                ops.add(runOp(run, next, removals, treeBound, bound));
                 position++;
                 next = position < runEntries ? run.entryAt(position) : -1;
             }
@@ -769,10 +768,7 @@ final class Checkpointer implements IdleTicker.Watched {
     /// {@return the state of the key of `entry` of `run` as of the cut: the run's value, or none if the entry removes
     /// the key or a range removal since the trees `treeBound` holds, and within `bound`, covers it, every such removal
     /// being newer than the run's writes}
-    ///
-    /// @param settles where the update records whether the tree held the key ([PackedRun#settles()])
-    private static TreeUpdate.Op runOp(PackedRun run, int entry, byte[] settles, RangeRemoval[] removals, long treeBound,
-                                       long bound) {
+    private static TreeUpdate.Op runOp(PackedRun run, int entry, RangeRemoval[] removals, long treeBound, long bound) {
         var version = run.version(entry);
         if (version != null) {
             // A view of the key only for a removal that may cover it
@@ -789,7 +785,7 @@ final class Checkpointer implements IdleTicker.Watched {
                 }
             }
         }
-        return new TreeUpdate.Op(run, entry, version, settles);
+        return new TreeUpdate.Op(run, entry, version);
     }
 
     private PageRef writeCatalog(LiveLedger.Cut cut, TreeRoot[] roots, PageFile.Writer writer, TreeUpdate update) throws IOException {
