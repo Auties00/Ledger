@@ -3514,6 +3514,7 @@ public final class LiveLedger implements Ledger {
             }
             var stamp = nextStamp();
             var entry = builder.putHome(key, hash, stamp, home, offset, length);
+            state.open(key, hash);
             if (home != null && spillRoom != REPLAYED && (ValueSlab.Overwrites.sampled(stamp)
                     || spillRoom >= ValueSlab.Overwrites.BULK_WRITES && !state.overwrites.judged())) {
                 state.overwrites.sample(ValueSlab.Overwrites.NOTHING, length);
