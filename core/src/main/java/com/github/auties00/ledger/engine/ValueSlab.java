@@ -519,6 +519,11 @@ final class ValueSlab {
     /// the limit of the share is `TOLERATED / (average + TOLERATED)`: two thirds for values of 128 bytes, a fifth for
     /// values of 1 KiB.
     ///
+    /// A value replaced is one no checkpoint has taken yet: a version, or an entry of a [PackedRun] that a bulk commit or
+    /// the open's replay left in memory, which stays there until the checkpoint that merges the run, whichever chain
+    /// replaced it. A put over a run's entry counts as an overwrite like one over a version: counted as a fresh put, the
+    /// overwrites of a key space just filled by a bulk commit would read as inserts until most of its keys had a chain.
+    ///
     /// A share is that of a whole interval between two checkpoints, since it grows over one, from none right after a
     /// checkpoint; the last interval counts for half of what is settled, so a burst of overwrites does not stop the
     /// slab for good. One put or removal in 64 is [sampled][#sampled(long)] by its stamp, on its committing thread,
@@ -536,6 +541,8 @@ final class ValueSlab {
     /// puts, which judges it positive until its next judgement. A value on an array of its own lists whatever the
     /// verdict: no other value shares its array.
     static final class Overwrites {
+        /// The stamp of no value replaced, below every bound of a checkpoint.
+        static final long NOTHING = Long.MIN_VALUE;
         /// The top bits of a write's hashed stamp that are clear when it is sampled.
         private static final int SAMPLE_BITS = 6;
         /// The bytes the dead values may cost each value left at the limit of the share: twice the 120 or so an array
@@ -621,13 +628,14 @@ final class ValueSlab {
             spills = true;
         }
 
-        /// Counts a put of a value of `length` bytes that replaced `head`, the newest version in memory, if any.
-        void sample(Version head, int length) {
+        /// Counts a put of a value of `length` bytes that replaced a value in memory written at `replaced`, as
+        /// [KeyspaceState#replacedStamp(Version, MemorySegment, int)] gives it, or [#NOTHING].
+        void sample(long replaced, int length) {
             var sampled = puts + 1;
             var average = averageBytes;
             averageBytes = average == 0 ? length : average + ((length - average) >> 4);
-            var over = replaced;
-            if (head != null && !head.removes() && head.stamp > cutBound) {
+            var over = this.replaced;
+            if (replaced > cutBound) {
                 over++;
             }
             if (sampled >= MAX_SAMPLES) {
@@ -635,18 +643,25 @@ final class ValueSlab {
                 over >>= 1;
             }
             puts = sampled;
-            replaced = over;
+            this.replaced = over;
             if (sampled % JUDGE_EVERY == 0) {
                 judge(Math.max(settled, share(sampled, over)));
             }
         }
 
-        /// Counts a removal of `head`, the newest version in memory, if any, as a replacement of the value it holds.
-        void sampleRemoval(Version head) {
-            var over = replaced;
-            if (head != null && !head.removes() && head.stamp > cutBound && over < MAX_SAMPLES) {
-                replaced = over + 1;
+        /// Counts a removal of a value in memory written at `replaced`, as
+        /// [KeyspaceState#replacedStamp(Version, MemorySegment, int)] gives it, or [#NOTHING], as a replacement of it.
+        void sampleRemoval(long replaced) {
+            var over = this.replaced;
+            if (replaced > cutBound && over < MAX_SAMPLES) {
+                this.replaced = over + 1;
             }
+        }
+
+        /// {@return the stamp of the value `head`, the newest version in memory, holds, or [#NOTHING] if there is none
+        /// or it removes its key}
+        static long stampOf(Version head) {
+            return head == null || head.removes() ? NOTHING : head.stamp;
         }
 
         /// Ends the interval at a checkpoint, whose readers' bound is `bound`.

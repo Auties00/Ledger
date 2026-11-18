@@ -3359,7 +3359,7 @@ public final class LiveLedger implements Ledger {
             var existed = Reads.existence(state, head, key, chain.hash, writerPoint(stamp - 1), inTree);
             if (source != null && spillRoom != REPLAYED && !state.resident && (ValueSlab.Overwrites.sampled(stamp)
                     || spillRoom >= ValueSlab.Overwrites.BULK_WRITES && !state.overwrites.judged())) {
-                state.overwrites.sample(head, length);
+                state.overwrites.sample(state.replacedStamp(head, key, chain.hash), length);
             }
             Version version;
             var bytes = state.resident && state.keyspace.values() == BuiltinCodecs.BYTES_VALUE;
@@ -3516,7 +3516,7 @@ public final class LiveLedger implements Ledger {
             var entry = builder.putHome(key, hash, stamp, home, offset, length);
             if (home != null && spillRoom != REPLAYED && (ValueSlab.Overwrites.sampled(stamp)
                     || spillRoom >= ValueSlab.Overwrites.BULK_WRITES && !state.overwrites.judged())) {
-                state.overwrites.sample(null, length);
+                state.overwrites.sample(ValueSlab.Overwrites.NOTHING, length);
             }
             addDelta(state, 1);
             runWrites++;
@@ -3595,7 +3595,7 @@ public final class LiveLedger implements Ledger {
             }
             // A recovery's removals count for nothing: the puts of its commits are not sampled either
             if (frame != null && !state.resident && ValueSlab.Overwrites.sampled(stamp)) {
-                state.overwrites.sampleRemoval(head);
+                state.overwrites.sampleRemoval(state.replacedStamp(head, key, chain.hash));
             }
             var version = new Version(stamp, (MemorySegment) null, null, head);
             var blind = existed == TreeSearch.UNKNOWN;

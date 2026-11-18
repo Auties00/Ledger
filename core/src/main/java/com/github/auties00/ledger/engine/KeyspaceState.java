@@ -196,6 +196,26 @@ final class KeyspaceState {
         return index.holdsNone() ? null : index.get(key, hash);
     }
 
+    /// {@return the stamp of the value in memory that a write of `key`, whose hash is `hash` ([Segments#hash(MemorySegment)])
+    /// and whose newest version in memory is `head`, replaces: that of `head`, or with no version that of the run's
+    /// entry of the key, the run's newest ([PackedRun#maxStamp()]), which no tree holds while it is above the bound of
+    /// the last checkpoint; [ValueSlab.Overwrites#NOTHING] if the write replaces no value in memory}
+    ///
+    /// A writer passes the hash its chain of the key keeps, so the lookup in the run hashes nothing. A bulk commit's run
+    /// is one commit, and a replay's is taken whole by the first checkpoint after the open, so the run's newest stamp
+    /// tells for each of its entries whether a tree holds it.
+    long replacedStamp(Version head, MemorySegment key, int hash) {
+        if (head != null) {
+            return ValueSlab.Overwrites.stampOf(head);
+        }
+        var held = run;
+        if (held == null) {
+            return ValueSlab.Overwrites.NOTHING;
+        }
+        var entry = held.find(key, hash);
+        return entry < 0 || held.removes(entry) ? ValueSlab.Overwrites.NOTHING : held.maxStamp();
+    }
+
     /// {@return the bytes of the copies of the keys in the chunks of the key space's slab; for tests}
     ///
     /// @see KeySlab#usedForTests()
