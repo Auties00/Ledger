@@ -197,8 +197,9 @@ class ScreenedReadsTest {
                 }
                 assertNull(tree.cache.peek(firstParent), "a branch of level 1 among the first units the scan reads");
                 assertNotNull(tree.cache.peek(lastParent), "a branch of level 1 past them");
+                assertEquals(1, tree.cache.reads(firstParent), "the reads of the branch the doorkeeper saw");
+                // The table of refused units holds its units weakly, so a collection during the scan may clear it
                 var refusedParent = tree.cache.recallWeak(PageCache.dataKey(firstParent.page(), firstParent.slot()), firstParent);
-                assertNotNull(refusedParent, "the branch of level 1 the first scan refused");
                 for (var scan = 2; scan <= 3; scan++) {
                     cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
                     assertTrue(cursor.next());
@@ -207,7 +208,11 @@ class ScreenedReadsTest {
                 }
                 cursor = new TreeCursor(tree.pages, tree.root, null, null, false, 0, true);
                 assertTrue(cursor.next());
-                assertSame(refusedParent, tree.cache.peek(firstParent), "a branch of level 1 the scan read four times");
+                var cachedParent = tree.cache.peek(firstParent);
+                assertNotNull(cachedParent, "a branch of level 1 the scan read four times");
+                if (refusedParent != null) {
+                    assertArrayEquals(refusedParent, cachedParent, "the branch the refused table held");
+                }
                 assertTrue(tree.cache.referencedForTests(firstParent));
                 // A scan that does not screen caches the branches of level 1 it reads at once
                 tree.cache.clearForTests();
