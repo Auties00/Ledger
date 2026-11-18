@@ -46,8 +46,6 @@ final class Doorkeeper {
     static final double FALSE_POSITIVES = 0.02;
     /// The most reads it counts, those a scan asks for before the one that caches a unit.
     static final int MOST_READS = 3;
-    /// What [#count(long, long, int, int)] returns for a read it admits.
-    static final int ADMITTED = 0;
     /// The salt of the nonce under which a unit is recorded as expected after three reads of the unit it replaces
     /// ([#expect(long, long, int, int)]): the fractional part of the golden ratio, which no nonce of the unit's page is
     /// but by chance.
@@ -82,28 +80,15 @@ final class Doorkeeper {
     /// {@return whether the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh` had `reads` reads
     /// before this one, or is expected after as many, and records this read if not}
     ///
-    /// It decides as [#count(long, long, int, int)] does.
-    ///
-    /// @param most the most keys a generation may hold, at which it rotates rather than grow
-    /// @param reads the reads before this one the unit needs, 1, 2 or 3
-    boolean admit(long key, long nonceHigh, int most, int reads) {
-        return count(key, nonceHigh, most, reads) == ADMITTED;
-    }
-
-    /// {@return [#ADMITTED] if the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh` had `reads`
-    /// reads before this one, or is expected after as many; otherwise the reads it counts for the unit with this one,
-    /// which it records, 1, 2 or 3}
-    ///
     /// The reads it counts for a unit are the most of those a filter holds it for, 3, 2 or 1, and of those it is
     /// expected after. A read is admitted if they are at least `reads`; otherwise the filter of one read more records
     /// it, or the first if it counts none. A unit only the third filter holds, as one whose record in the second a
     /// rotation forgot, so still counts three reads. A unit admitted because it was expected is not recorded as seen:
-    /// the cache takes it as an entry a read used, which is what tells the next checkpoint that a read used it. A
-    /// doorkeeper that closed records nothing and counts 1.
+    /// the cache takes it as an entry a read used, which is what tells the next checkpoint that a read used it.
     ///
     /// @param most the most keys a generation may hold, at which it rotates rather than grow
     /// @param reads the reads before this one the unit needs, 1, 2 or 3
-    int count(long key, long nonceHigh, int most, int reads) {
+    boolean admit(long key, long nonceHigh, int most, int reads) {
         var hash = hash(key, nonceHigh);
         var once = this.once.filter;
         if (once == null) {
@@ -111,35 +96,21 @@ final class Doorkeeper {
             if (once != null) {
                 this.once.add(once, hash, most);
             }
-            return 1;
+            return false;
         }
         var seen = reads < 2 ? seen(once, hash, key, nonceHigh) : counted(once, hash, key, nonceHigh);
         if (seen >= reads) {
-            return ADMITTED;
+            return true;
         }
-        add(seen == 0 ? this.once : seen == 1 ? this.twice : this.thrice, hash, most);
-        return seen + 1;
-    }
-
-    /// Records a read of the unit at `key` sealed under a nonce whose first 8 bytes are `nonceHigh` in the filter of
-    /// `reads` reads, as [#count(long, long, int, int)] records a read that brings the reads it counts to `reads`,
-    /// without testing what the filters hold: the caller counted the reads before it itself.
-    ///
-    /// @param most the most keys a generation may hold, at which it rotates rather than grow
-    /// @param reads the reads of the unit with this one, 1, 2 or 3
-    void record(long key, long nonceHigh, int most, int reads) {
-        add(reads == 1 ? once : reads == 2 ? twice : thrice, hash(key, nonceHigh), most);
-    }
-
-    /// Records the key whose hash is `hash` in `counted`, starting it if no record did yet.
-    private void add(Counted counted, long hash, int most) {
-        var filter = counted.filter;
+        var next = seen == 0 ? this.once : seen == 1 ? this.twice : this.thrice;
+        var filter = seen == 0 ? once : next.filter;
         if (filter == null) {
-            filter = counted.start(most);
+            filter = next.start(most);
         }
         if (filter != null) {
-            counted.add(filter, hash, most);
+            next.add(filter, hash, most);
         }
+        return false;
     }
 
     /// {@return 1 if a filter holds the unit whose hash is `hash` or it is expected, after any number of reads, and 0
