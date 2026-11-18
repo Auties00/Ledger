@@ -309,9 +309,10 @@ class CheckpointTest {
             }
         }
 
-        @Test
-        @DisplayName("stay listed past the checkpoint for a snapshot older than them, which counts exactly, until a commit after it closes")
-        void snapshotAcrossFold(@TempDir Path directory) {
+        @ParameterizedTest(name = "{0}")
+        @ValueSource(strings = {"idle tick", "sweep", "commit"})
+        @DisplayName("stay listed past the checkpoint for a snapshot older than them, which counts exactly, and fold once it closes, with no commit")
+        void snapshotAcrossFold(String folder, @TempDir Path directory) throws InterruptedException {
             try (var ledger = open(directory, MESSAGES, CHATS)) {
                 var live = (LiveLedger) ledger;
                 var seed = ledger.newBatch();
@@ -329,9 +330,25 @@ class CheckpointTest {
                     assertEquals(100, before.size(MESSAGES));
                     assertEquals(110, ledger.size(MESSAGES));
                 }
-                ledger.commit(ledger.newBatch().put(CHATS, "chat", "v"));
+                // Closing the snapshot folds nothing by itself
+                assertEquals(110, live.state(MESSAGES).blind.listed());
+                switch (folder) {
+                    case "idle tick" -> live.checkpointer().tick();
+                    case "sweep" -> live.finishSweep();
+                    default -> ledger.commit(ledger.newBatch().put(CHATS, "chat", "v"));
+                }
                 assertEquals(0, live.state(MESSAGES).blind.listed());
                 assertEquals(110, ledger.size(MESSAGES));
+                try (var after = ledger.snapshot()) {
+                    assertEquals(110, after.size(MESSAGES));
+                }
+                // A blind write after the fold counts on top of the folded total
+                ledger.commit(ledger.newBatch().put(MESSAGES, "k300", "w").delete(MESSAGES, "k0"));
+                assertEquals(110, ledger.size(MESSAGES));
+            }
+            try (var reopened = open(directory, MESSAGES, CHATS)) {
+                assertEquals(110, reopened.size(MESSAGES));
+                assertEquals(110, reopened.range(MESSAGES, KeyRange.all(), 1_000).size());
             }
         }
 
