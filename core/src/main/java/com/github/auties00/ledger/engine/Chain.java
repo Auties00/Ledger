@@ -430,6 +430,26 @@ sealed class Chain permits Chain.Inline8 {
         return keyChunk == null ? compareInline(other) : Segments.compare(keyChunk, keyOffset(), keyLength(), other, 0, other.byteSize());
     }
 
+    /// {@return the order of the key and the `length` bytes at `from` of `other`, as
+    /// [Segments#compare(MemorySegment, MemorySegment)] gives}
+    ///
+    /// A checkpoint compares the chains it takes with the keys of a [PackedRun] so, without a view of each key.
+    int compareKey(MemorySegment other, long from, long length) {
+        if (keyChunk != null) {
+            return Segments.compare(keyChunk, keyOffset(), keyLength(), other, from, length);
+        }
+        var keyLength = keyLength();
+        var common = Math.min(keyLength, length);
+        for (var at = 0; at < common; at += Long.BYTES) {
+            var word = inlineWord(at >>> 3);
+            var otherWord = Segments.word(other, from + at, from + length);
+            if (word != otherWord) {
+                return Long.compareUnsigned(word, otherWord);
+            }
+        }
+        return Long.compare(keyLength, length);
+    }
+
     // As compareKey for a key in words of the chain, in the order compareKeys gives
     private int compareInline(MemorySegment other) {
         var length = keyLength();
