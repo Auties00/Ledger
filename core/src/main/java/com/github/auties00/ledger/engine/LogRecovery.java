@@ -244,6 +244,10 @@ final class LogRecovery {
                         break;
                     }
                     lastWritten = path;
+                    if (type == FrameBody.COMMIT_SPLIT && version < LogWriter.SPLIT_SEGMENT_VERSION) {
+                        throw new LedgerCorruptedException(path + " holds a split commit in a segment of version " + version
+                                + ", whose segments hold none", null);
+                    }
                     var replayed = true;
                     switch (type) {
                         case FrameBody.COMMIT, FrameBody.COMMIT_SPLIT -> {

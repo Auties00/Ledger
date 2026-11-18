@@ -137,6 +137,81 @@ class CrashRecoveryTest {
                 .keyspace(MESSAGES).keyspace(CHATS).build().close());
     }
 
+    @Test
+    @DisplayName("reads a split frame back from a segment of the current version, and refuses one in a segment of an older version, naming it")
+    void splitFrameInOlderSegment() throws Exception {
+        var disk = CrashFileSystem.create();
+        var directory = disk.getPath("/store");
+        var expected = new TreeMap<String, String>();
+        try (var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(directory).encryption(Encryption.none())
+                .keyspace(MESSAGES).keyspace(CHATS))
+                .segmentSize(4L << 20)
+                .build()) {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < 300; i++) {
+                var value = "v".repeat(1_000 + i);
+                batch.put(MESSAGES, "k%04d".formatted(i), value);
+                expected.put("k%04d".formatted(i), value);
+            }
+            ledger.commit(batch).awaitDurable();
+            ledger.closeWithoutCheckpoint();
+        }
+        List<Path> segments;
+        try (var files = Files.walk(directory)) {
+            segments = files.filter(path -> path.toString().endsWith(".log")).toList();
+        }
+        var split = false;
+        for (var segment : segments) {
+            split |= holdsSplitFrame(segment);
+        }
+        assertTrue(split, "no split frame in the log");
+        var copy = disk.afterProcessCrash();
+        try (var ledger = Ledger.builder().directory(copy.getPath("/store")).encryption(Encryption.none())
+                .keyspace(MESSAGES).keyspace(CHATS).build()) {
+            var read = new TreeMap<String, String>();
+            ledger.forEach(MESSAGES, KeyRange.all(), (key, value) -> {
+                read.put(key, value);
+                return true;
+            });
+            assertEquals(expected, read);
+        }
+        for (var segment : segments) {
+            setVersion(segment, LogWriter.SPLIT_SEGMENT_VERSION - 1);
+        }
+        var failure = assertThrows(LedgerCorruptedException.class, () -> Ledger.builder().directory(directory)
+                .encryption(Encryption.none()).keyspace(MESSAGES).keyspace(CHATS).build().close());
+        assertTrue(failure.getMessage().contains("version " + (LogWriter.SPLIT_SEGMENT_VERSION - 1)), failure::getMessage);
+    }
+
+    /// {@return whether `segment` holds a frame of type [FrameBody#COMMIT_SPLIT] with an intact header}
+    private static boolean holdsSplitFrame(Path segment) throws Exception {
+        var bytes = Files.readAllBytes(segment);
+        var buffer = ByteBuffer.wrap(bytes);
+        var crc = new CRC32C();
+        for (var at = LogWriter.SEGMENT_HEADER; at + LogWriter.FRAME_HEADER <= bytes.length; at++) {
+            if (buffer.getInt(at) != LogWriter.MAGIC || bytes[at + 16] != FrameBody.COMMIT_SPLIT) {
+                continue;
+            }
+            crc.reset();
+            crc.update(bytes, at, LogWriter.FRAME_HEADER - Integer.BYTES);
+            if ((int) crc.getValue() == buffer.getInt(at + LogWriter.FRAME_HEADER - Integer.BYTES)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Gives the segment at `path` the version `version`, its header intact.
+    private static void setVersion(Path path, int version) throws Exception {
+        var bytes = Files.readAllBytes(path);
+        var buffer = ByteBuffer.wrap(bytes);
+        buffer.putInt(8, version);
+        var crc = new CRC32C();
+        crc.update(bytes, 0, LogWriter.HEADER_CRC_OFFSET);
+        buffer.putInt(LogWriter.HEADER_CRC_OFFSET, (int) crc.getValue());
+        Files.write(path, bytes);
+    }
+
     /// Damages the body of the first split frame of `segment` as `damage` says, and writes the frame's checksum anew,
     /// so recovery reads the body rather than taking the frame for torn.
     ///

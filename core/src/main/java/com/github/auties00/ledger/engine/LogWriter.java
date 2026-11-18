@@ -142,6 +142,9 @@ final class LogWriter {
     /// 4 frames of type [FrameBody#COMMIT_SPLIT], so a build that reads only earlier versions refuses it by its version
     /// and not at the first such frame.
     static final int SEGMENT_VERSION = 4;
+    /// The oldest version whose segments may hold frames of type [FrameBody#COMMIT_SPLIT]: recovery refuses one in an
+    /// older segment, which no writer of this store put there.
+    static final int SPLIT_SEGMENT_VERSION = 4;
     /// The oldest version recovery reads, whose frame types the current version all has.
     static final int OLDEST_SEGMENT_VERSION = 2;
     static final int TAG_BYTES = 16;

@@ -1677,16 +1677,43 @@ class LogSpillTest {
     @MethodSource("seeds")
     @DisplayName("a store that moves every value it can recovers a state between its last durable commit and its last visible one, whatever point a crash or a loss of power stops it at")
     void recoversAfterCrash(int seed) throws Exception {
+        recoversAfterCrash(seed, false);
+    }
+
+    static IntStream chunkedSeeds() {
+        return IntStream.range(0, 24);
+    }
+
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("chunkedSeeds")
+    @DisplayName("a store whose large commits of short values leave the heap an array at a time recovers a state between its last durable commit and its last visible one, whether a crash or a loss of power stops it as the frame of such a commit is written, between its force and the move of its values to chunks, or after")
+    void recoversChunkedAfterCrash(int seed) throws Exception {
+        recoversAfterCrash(seed, true);
+    }
+
+    /// Runs the workload of `seed` once to count its changes, then again on a disk that stops at one of them, for a
+    /// chunked workload half the time at a force, and checks what the store recovers and that it goes on writing.
+    ///
+    /// @param chunked whether the workload makes commits of short values that move an array at a time
+    private static void recoversAfterCrash(int seed, boolean chunked) throws Exception {
         var encrypted = seed % 2 == 0;
         var dry = CrashFileSystem.create();
-        new Workload(seed, encrypted).run(dry.getPath("/store"));
+        var counted = new Workload(seed, encrypted, chunked);
+        counted.run(dry.getPath("/store"));
+        if (chunked) {
+            assertTrue(counted.chunkedRecords > 0, "the workload moved no commit an array at a time");
+        }
         var disk = CrashFileSystem.create();
         var random = new Random(seed * 7919L + 3);
-        disk.stopAfter(random.nextLong(dry.changes() + 1));
-        var workload = new Workload(seed, encrypted);
+        if (chunked && random.nextBoolean()) {
+            disk.stopAtForce(random.nextLong(dry.forces() + 1));
+        } else {
+            disk.stopAfter(random.nextLong(dry.changes() + 1));
+        }
+        var workload = new Workload(seed, encrypted, chunked);
         workload.run(disk.getPath("/store"));
         var survivor = seed % 3 == 0 ? disk.afterProcessCrash() : disk.afterPowerLoss(new Random(random.nextLong()));
-        try (var ledger = open(survivor.getPath("/store"), encrypted, 0)) {
+        try (var ledger = workload.open(survivor.getPath("/store"))) {
             Expected match = null;
             for (var commit = workload.durable; commit <= workload.visible; commit++) {
                 if (matches(ledger, workload.history.get(commit))) {
@@ -1704,7 +1731,7 @@ class LogSpillTest {
             ledger.checkpoint();
             verify(ledger, after);
             ledger.close();
-            try (var reopened = open(survivor.getPath("/store"), encrypted, 0)) {
+            try (var reopened = workload.open(survivor.getPath("/store"))) {
                 verify(reopened, after);
             }
         }
@@ -1738,37 +1765,55 @@ class LogSpillTest {
     }
 
     /// A workload drawn from a seed: batches, some durable and some of one value on an array of its own, keys written
-    /// again, removals, checkpoints and reopens, the queue moving every durable value; and the state after each commit,
-    /// the last it made visible and the last it knows durable.
+    /// again, removals, checkpoints and reopens, the queue moving every durable value, and, if chunked, commits of
+    /// thousands of short values that move an array at a time; and the state after each commit, the last it made
+    /// visible and the last it knows durable.
     private static final class Workload {
         private final Random random;
         private final boolean encrypted;
+        private final boolean chunked;
         final List<Expected> history;
         Expected state;
         int visible;
         int durable;
+        // The commits whose values were to move an array at a time, in the opens this workload closed
+        long chunkedRecords;
 
         Workload(int seed, boolean encrypted) {
+            this(seed, encrypted, false);
+        }
+
+        Workload(int seed, boolean encrypted, boolean chunked) {
             this.random = new Random(seed);
             this.encrypted = encrypted;
+            this.chunked = chunked;
             this.history = new ArrayList<>();
             this.state = new Expected();
             history.add(state.copy());
         }
 
+        /// Opens the store as the workload does: with segments of 16 MiB whose commits of at least 1 MiB of short
+        /// values move an array at a time if it is chunked.
+        LiveLedger open(Path directory) {
+            return chunked ? openChunked(directory, encrypted, 16L << 20) : LogSpillTest.open(directory, encrypted, 0);
+        }
+
         void run(Path directory) {
             LiveLedger ledger = null;
             try {
-                ledger = open(directory, encrypted, 0);
+                ledger = open(directory);
                 for (var step = 0; step < 40; step++) {
                     var choice = random.nextInt(20);
-                    if (choice == 0) {
+                    if (chunked && (step == 5 || choice == 4)) {
+                        bulk(ledger, step);
+                    } else if (choice == 0) {
                         ledger.checkpoint();
                         durable = visible;
                     } else if (choice == 1) {
+                        chunkedRecords += ledger.spills().chunkedRecordsForTests();
                         ledger.close();
                         durable = visible;
-                        ledger = open(directory, encrypted, 0);
+                        ledger = open(directory);
                     } else if (choice == 3) {
                         // A value on an array of its own, which moves to the log whatever the key space's samples
                         var next = state.copy();
@@ -1803,6 +1848,7 @@ class LogSpillTest {
                         }
                     }
                 }
+                chunkedRecords += ledger.spills().chunkedRecordsForTests();
                 ledger.close();
                 durable = visible;
             } catch (Exception | AssertionError failure) {
@@ -1813,6 +1859,26 @@ class LogSpillTest {
                         // The file system stopped: closing only lets go of the threads
                     }
                 }
+            }
+        }
+
+        /// Commits 6,000 messages of 100 to 300 bytes in one batch, about 1.2 MB of short values that would not pay to
+        /// move one by one, from one of a few first keys, so a later such commit replaces the values of an earlier one.
+        private void bulk(LiveLedger ledger, int step) throws InterruptedException {
+            var next = state.copy();
+            var first = 10_000 + random.nextInt(3) * 3_000;
+            var batch = ledger.newBatch();
+            for (var message = first; message < first + 6_000; message++) {
+                var value = new byte[100 * (1 + message % 3)];
+                Arrays.fill(value, (byte) (message * 7 + step));
+                batch.put(MESSAGES, key(message), value);
+                next.messages.put(message, value);
+            }
+            var commit = ledger.commit(batch);
+            commit(next);
+            if (random.nextBoolean()) {
+                commit.awaitDurable();
+                durable = visible;
             }
         }
 
