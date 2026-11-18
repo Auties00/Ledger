@@ -2337,9 +2337,9 @@ public final class LiveLedger implements Ledger {
     /// its cut: left to the sweep, which visits a few chains a commit, a resident key written in a burst kept one older
     /// version until enough commits came after.
     ///
-    /// It also folds the blind writes of each key space that the checkpoint settled and every reader sees, so a store
-    /// that commits nothing more after the checkpoint lets go of their chains, which the prune dropped from the index
-    /// but the list of blind writes still held, key included.
+    /// It also folds the blind writes of each key space whose effect is known, as the checkpoint made every write up
+    /// to its cut, and that every reader sees, so a store that commits nothing more after the checkpoint lets go of
+    /// their chains, which the prune dropped from the index but the list of blind writes still held, key included.
     void pruneCut(Cut cut) {
         for (var keyspace : cut.keyspaces()) {
             var state = keyspace.state();
@@ -2366,8 +2366,9 @@ public final class LiveLedger implements Ledger {
             }
             state.removeDropped();
             state.pruneListed(keyspace.number());
-            // Read without the role: every blind write the cut took was listed before the cut, holding the role, and
-            // one listed since is above the cut and not settled, so no fold here could take it
+            // Read without the role: every blind write the cut settled was listed before the cut, holding the role,
+            // so the read misses none of them; one listed since, which a count may have settled, is folded by the
+            // maintenance of its own commit or a later one, so missing it here only defers its fold
             if (state.run != null || state.blind.listed() > 0) {
                 enterPublishing();
                 try {
@@ -2851,9 +2852,11 @@ public final class LiveLedger implements Ledger {
                 // As in a maintenance: the scan must not miss a read that saw the latest sequence before
                 VarHandle.fullFence();
                 var scan = readers.scan();
-                var bounds = bounds(scan.active());
+                var active = scan.active();
+                var bounds = bounds(active);
                 var cutBound = Reads.boundOf(floor(scan.oldest()));
                 sweep(bounds, cutBound, SWEEP_CHUNK);
+                foldBlindWrites(active[active.length - 1]);
                 more = sweepEnds - endsBefore < SWEEP_PASSES && (sweepPending
                         ? sweptBounds == null || !sameReaders(bounds, cutBound, sweptBounds, sweptCutBound)
                         : sweepWanted.held());
@@ -2877,6 +2880,55 @@ public final class LiveLedger implements Ledger {
         }
         for (var state : sweepOrder) {
             state.removeDropped();
+        }
+    }
+
+    /// Folds the blind writes every reader sees whose effect is known, unless another thread holds or wants the
+    /// publishing role or no key space has one listed; at a tick of the [IdleTicker].
+    ///
+    /// The maintenance of a commit and the prune after a checkpoint fold them otherwise, so the writes a reader older
+    /// than them kept listed through the prune, a snapshot opened before a burst, kept their chains and keys once it
+    /// closed until the next commit, which a store that commits nothing more never makes.
+    void foldIdleBlindWrites() {
+        if (closed || !blindWritesListed() || publishingWanted.held() || !publishing.tryAcquire()) {
+            return;
+        }
+        try {
+            // After the role, which a close of the store holds as it marks it closed
+            if (closed) {
+                return;
+            }
+            // As in a maintenance: the scan must not miss a read that saw the latest sequence before
+            VarHandle.fullFence();
+            var active = readers.scan().active();
+            foldBlindWrites(active[active.length - 1]);
+        } finally {
+            publishing.release();
+        }
+        // What applied while this thread held the role, whose committing threads may have parked for it
+        publishApplied();
+    }
+
+    /// {@return whether some key space lists blind writes}
+    ///
+    /// A read without the publishing role: one that misses a write just listed leaves it to the maintenance of its
+    /// commit.
+    private boolean blindWritesListed() {
+        for (var state : sweepOrder) {
+            if (state.blind.listed() > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Folds the blind writes of every key space at or below `oldest` whose effect is known; holding the publishing
+    /// role.
+    ///
+    /// @param oldest the sequence of the oldest read, or the latest sequence if none runs
+    private void foldBlindWrites(long oldest) {
+        for (var state : sweepOrder) {
+            state.blind.fold(oldest);
         }
     }
 

@@ -15,9 +15,9 @@ import java.util.function.Predicate;
 ///
 /// The count a reader at sequence `s` sees is the count of [KeyspaceState#counts], which leaves the blind writes out,
 /// plus [#correction(long, Predicate)] at `s`. The writes are listed in the order of their sequences by the
-/// publisher, holding the publishing role. Holding it too, the maintenance of a commit and the prune after a
-/// checkpoint fold into one total those every reader sees and whose effect is known, the prune so that a store that
-/// commits nothing more lets go of the chains the checkpoint settled; any thread reads them.
+/// publisher, holding the publishing role. Holding it too, the maintenance of a commit, the prune after a checkpoint,
+/// the sweep and the idle tick fold into one total those every reader sees and whose effect is known, the last three
+/// so that a store that commits nothing more lets go of their chains; any thread reads them.
 final class BlindWrites {
     private static final int INITIAL_CAPACITY = 64;
     // The arrays of a run with no write listed, which no one writes, as the next write copies them: a key space with
@@ -57,7 +57,8 @@ final class BlindWrites {
 
     /// Folds into one total the listed writes at or below `oldest` whose effect is known, so the counts of the
     /// readers, none older than `oldest`, no longer walk them and their chains can go; holding the publishing role, at
-    /// the maintenance of a commit and at the prune after a checkpoint, which settled the writes it took.
+    /// the maintenance of a commit, at the prune after a checkpoint, which made the effect of every write up to its cut
+    /// known, and at the sweep and the idle tick, for writes a reader older than them kept listed through the prune.
     ///
     /// @param oldest the sequence of the oldest read, or the latest sequence if none runs
     void fold(long oldest) {
