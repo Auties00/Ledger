@@ -2336,10 +2336,6 @@ public final class LiveLedger implements Ledger {
     /// A resident key keeps its newest version, but loses those its writes kept for the checkpoint, which read as of
     /// its cut: left to the sweep, which visits a few chains a commit, a resident key written in a burst kept one older
     /// version until enough commits came after.
-    ///
-    /// It also folds the blind writes of each key space that the checkpoint settled and every reader sees, so a store
-    /// that commits nothing more after the checkpoint lets go of their chains, which the prune dropped from the index
-    /// but the list of blind writes still held, key included.
     void pruneCut(Cut cut) {
         for (var keyspace : cut.keyspaces()) {
             var state = keyspace.state();
@@ -2366,20 +2362,11 @@ public final class LiveLedger implements Ledger {
             }
             state.removeDropped();
             state.pruneListed(keyspace.number());
-            // Read without the role: every blind write the cut took was listed before the cut, holding the role, and
-            // one listed since is above the cut and not settled, so no fold here could take it
-            if (state.run != null || state.blind.listed() > 0) {
+            if (state.run != null) {
                 enterPublishing();
                 try {
-                    // The latest sequence was stored with a release store: the scan must not miss a read that saw the
-                    // one before
                     VarHandle.fullFence();
-                    var scan = readers.scan();
-                    var active = scan.active();
-                    state.blind.fold(active[active.length - 1]);
-                    if (state.run != null) {
-                        state.releaseRun(Reads.boundOf(floor(scan.oldest())));
-                    }
+                    state.releaseRun(Reads.boundOf(floor(readers.scan().oldest())));
                 } finally {
                     exitPublishing();
                 }
