@@ -398,6 +398,42 @@ class BulkCommitRunTest {
         CheckpointTest.verifyPages(directory, encrypted);
     }
 
+    @ParameterizedTest(name = "first written by a bulk commit: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("an overwrite of a key a bulk commit's run holds counts as one of a value in memory, so the overwrites of a key space a bulk commit filled stop listing their values for the log as those of one filled by small commits do")
+    void overwritesOfRunKeys(boolean bulk, @TempDir Path directory) throws Exception {
+        var keys = 6_000;
+        var value = new byte[512];
+        // A budget no commit reaches, so every record listed stays queued
+        try (var ledger = open(directory, false, 1L << 30)) {
+            var state = ledger.state(MESSAGES);
+            var size = bulk ? keys : 1_000;
+            for (var first = 0; first < keys; first += size) {
+                var batch = ledger.newBatch();
+                for (var message = first; message < first + size; message++) {
+                    batch.put(MESSAGES, key(message), value);
+                }
+                ledger.commit(batch).awaitDurable();
+            }
+            assertEquals(bulk, state.run != null);
+            assertTrue(state.overwrites.spills(), "values written once may not leave the heap");
+            // Each key overwritten once by a commit of its own, one in 64 of them sampled, every one over a value no
+            // checkpoint took: about 94 samples against the 157 of the first writes, past the eighth that stops the
+            // values leaving the heap at the judgement of the 192nd
+            for (var message = 0; message < keys; message++) {
+                ledger.commit(ledger.newBatch().put(MESSAGES, key(message), value));
+            }
+            assertFalse(state.overwrites.spills(), "the overwrites counted as puts of new keys");
+            // An overwrite then lists no value for the log, and its commit queues no record
+            var records = ledger.spills().recordRoomsForTests().length;
+            for (var message = 0; message < 1_000; message++) {
+                ledger.commit(ledger.newBatch().put(MESSAGES, key(message), value));
+            }
+            assertEquals(records, ledger.spills().recordRoomsForTests().length, "an overwrite queued a record of its value");
+            assertEquals(bulk, state.run != null, "a checkpoint merged the run");
+        }
+    }
+
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
     @DisplayName("a store that crashes after a bulk commit, its values moved or not, recovers it from the log")

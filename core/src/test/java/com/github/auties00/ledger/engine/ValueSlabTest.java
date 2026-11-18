@@ -929,7 +929,7 @@ class ValueSlabTest {
         // An interval of `samples` puts of `length` bytes, the first `overwritten` of which replace a version in no tree
         private static void interval(ValueSlab.Overwrites overwrites, int samples, int overwritten, int length, long bound) {
             for (var i = 0; i < samples; i++) {
-                overwrites.sample(i < overwritten ? version(bound + 1) : null, length);
+                overwrites.sample(ValueSlab.Overwrites.stampOf(i < overwritten ? version(bound + 1) : null), length);
             }
         }
 
@@ -941,7 +941,7 @@ class ValueSlabTest {
             assertTrue(overwrites.worthwhile());
             // Overwrites last, so the share so far passes no limit before the cut
             for (var i = 0; i < 1_000; i++) {
-                overwrites.sample(i >= 1_000 - overwritten ? version(1) : null, length);
+                overwrites.sample(ValueSlab.Overwrites.stampOf(i >= 1_000 - overwritten ? version(1) : null), length);
             }
             overwrites.cut(0);
             assertEquals(worthwhile, overwrites.worthwhile());
@@ -952,10 +952,10 @@ class ValueSlabTest {
         void early() {
             var overwrites = new ValueSlab.Overwrites();
             for (var i = 0; i < 63; i++) {
-                overwrites.sample(version(1), 1_024);
+                overwrites.sample(ValueSlab.Overwrites.stampOf(version(1)), 1_024);
             }
             assertTrue(overwrites.worthwhile());
-            overwrites.sample(version(1), 1_024);
+            overwrites.sample(ValueSlab.Overwrites.stampOf(version(1)), 1_024);
             assertFalse(overwrites.worthwhile());
         }
 
@@ -977,8 +977,8 @@ class ValueSlabTest {
             var overwrites = new ValueSlab.Overwrites();
             overwrites.cut(100);
             for (var i = 0; i < 1_000; i++) {
-                overwrites.sample(version(100), 1_024);
-                overwrites.sample(new Version(200, (MemorySegment) null, null, null), 1_024);
+                overwrites.sample(ValueSlab.Overwrites.stampOf(version(100)), 1_024);
+                overwrites.sample(ValueSlab.Overwrites.stampOf(new Version(200, (MemorySegment) null, null, null)), 1_024);
             }
             overwrites.cut(200);
             assertTrue(overwrites.worthwhile());
@@ -993,17 +993,17 @@ class ValueSlabTest {
             var dying = new ValueSlab.Overwrites();
             dying.cut(100);
             for (var i = 0; i < 64; i++) {
-                dying.sample(null, 4_096);
-                dying.sampleRemoval(version(101));
+                dying.sample(ValueSlab.Overwrites.stampOf(null), 4_096);
+                dying.sampleRemoval(ValueSlab.Overwrites.stampOf(version(101)));
             }
             assertFalse(dying.worthwhile());
             var kept = new ValueSlab.Overwrites();
             kept.cut(100);
             for (var i = 0; i < 64; i++) {
-                kept.sample(null, 4_096);
-                kept.sampleRemoval(version(100));
-                kept.sampleRemoval(new Version(200, (MemorySegment) null, null, null));
-                kept.sampleRemoval(null);
+                kept.sample(ValueSlab.Overwrites.stampOf(null), 4_096);
+                kept.sampleRemoval(ValueSlab.Overwrites.stampOf(version(100)));
+                kept.sampleRemoval(ValueSlab.Overwrites.stampOf(new Version(200, (MemorySegment) null, null, null)));
+                kept.sampleRemoval(ValueSlab.Overwrites.stampOf(null));
             }
             assertTrue(kept.worthwhile());
             kept.cut(200);
@@ -1072,7 +1072,7 @@ class ValueSlabTest {
             assertFalse(overwrites.judged(), "forcing the verdict judged the samples");
             interval(overwrites, 63, 0, 128, 0);
             assertFalse(overwrites.judged());
-            overwrites.sample(null, 128);
+            overwrites.sample(ValueSlab.Overwrites.stampOf(null), 128);
             assertTrue(overwrites.judged());
             overwrites.cut(1_000);
             assertTrue(overwrites.judged(), "a cut cleared the judgement");
@@ -1082,7 +1082,7 @@ class ValueSlabTest {
             assertFalse(dying.judged(), "a cut of 63 samples judged them");
             interval(dying, 63, 63, 128, 1_000);
             assertFalse(dying.judged(), "the counters restart at a cut, so 64 more are needed");
-            dying.sample(version(1_001), 128);
+            dying.sample(ValueSlab.Overwrites.stampOf(version(1_001)), 128);
             assertTrue(dying.judged());
             assertFalse(dying.spills(), "a judgement that replaced every value lets them leave the heap");
         }
@@ -1098,7 +1098,7 @@ class ValueSlabTest {
                 threads.add(Thread.ofPlatform().start(() -> {
                     try {
                         for (var i = 0; i < 200_000; i++) {
-                            overwrites.sample(version(1L << 40), 128);
+                            overwrites.sample(ValueSlab.Overwrites.stampOf(version(1L << 40)), 128);
                             if (i % 10_000 == 0) {
                                 overwrites.cut(0);
                             }
