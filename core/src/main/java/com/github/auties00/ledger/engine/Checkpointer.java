@@ -674,11 +674,10 @@ final class Checkpointer implements IdleTicker.Watched {
             var settles = run == null ? null : run.settles();
             var ops = new ArrayList<TreeUpdate.Op>(chains.length + runEntries);
             var removals = keyspace.removals();
-            // The next entry of the run in the order of the keys and its key, or -1 and null past the last: read once
-            // however many chains sort before it, as a key of the run is a view made for the call
+            // The next entry of the run in the order of the keys, or -1 past the last, compared with the chains in the
+            // run's arrays: the states of the run's keys hold the run, not a chain and a view of each key
             var position = 0;
             var next = runEntries == 0 ? -1 : run.entryAt(0);
-            var runKey = next < 0 ? null : run.key(next);
             Chain previous = null;
             for (var chain : chains) {
                 if (previous != null && Chain.sameKey(previous, chain)) {
@@ -687,23 +686,19 @@ final class Checkpointer implements IdleTicker.Watched {
                 previous = chain;
                 // The run's entries of the keys before the chain's go first; one of the chain's key goes with the chain
                 var entry = -1;
-                MemorySegment entryKey = null;
                 while (next >= 0) {
-                    var order = chain.compareKey(runKey);
+                    var order = run.compareChain(chain, next);
                     if (order < 0) {
                         break;
                     }
                     var taken = next;
-                    var takenKey = runKey;
                     position++;
                     next = position < runEntries ? run.entryAt(position) : -1;
-                    runKey = next < 0 ? null : run.key(next);
                     if (order == 0) {
                         entry = taken;
-                        entryKey = takenKey;
                         break;
                     }
-                    ops.add(runOp(run, taken, takenKey, settles, removals, treeBound, bound));
+                    ops.add(runOp(run, taken, settles, removals, treeBound, bound));
                 }
                 // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
                 // otherwise another one, or none
@@ -716,7 +711,7 @@ final class Checkpointer implements IdleTicker.Watched {
                     // tree is right, with the run's entry if it has one. A resident one holds every entry, so there the
                     // key is gone
                     if (entry >= 0) {
-                        ops.add(runOp(run, entry, entryKey, settles, removals, treeBound, bound));
+                        ops.add(runOp(run, entry, settles, removals, treeBound, bound));
                     }
                     continue;
                 }
@@ -734,10 +729,9 @@ final class Checkpointer implements IdleTicker.Watched {
                 }
             }
             while (next >= 0) {
-                ops.add(runOp(run, next, runKey, settles, removals, treeBound, bound));
+                ops.add(runOp(run, next, settles, removals, treeBound, bound));
                 position++;
                 next = position < runEntries ? run.entryAt(position) : -1;
-                runKey = next < 0 ? null : run.key(next);
             }
             var ranges = new ArrayList<TreeUpdate.Range>();
             for (var removal : keyspace.removals()) {
@@ -772,23 +766,30 @@ final class Checkpointer implements IdleTicker.Watched {
         return roots;
     }
 
-    /// {@return the state of the key of `entry` of `run`, `key`, as of the cut: the run's value, or none if the entry
-    /// removes the key or a range removal since the trees `treeBound` holds, and within `bound`, covers it, every such
-    /// removal being newer than the run's writes}
+    /// {@return the state of the key of `entry` of `run` as of the cut: the run's value, or none if the entry removes
+    /// the key or a range removal since the trees `treeBound` holds, and within `bound`, covers it, every such removal
+    /// being newer than the run's writes}
     ///
     /// @param settles where the update records whether the tree held the key ([PackedRun#settles()])
-    private static TreeUpdate.Op runOp(PackedRun run, int entry, MemorySegment key, byte[] settles, RangeRemoval[] removals,
-                                       long treeBound, long bound) {
+    private static TreeUpdate.Op runOp(PackedRun run, int entry, byte[] settles, RangeRemoval[] removals, long treeBound,
+                                       long bound) {
         var version = run.version(entry);
         if (version != null) {
+            // A view of the key only for a removal that may cover it
+            MemorySegment key = null;
             for (var removal : removals) {
-                if (removal.stamp() > treeBound && removal.stamp() <= bound && removal.covers(key)) {
-                    version = null;
-                    break;
+                if (removal.stamp() > treeBound && removal.stamp() <= bound) {
+                    if (key == null) {
+                        key = run.key(entry);
+                    }
+                    if (removal.covers(key)) {
+                        version = null;
+                        break;
+                    }
                 }
             }
         }
-        return new TreeUpdate.Op(new Chain(key, 0), version, null, settles, entry);
+        return new TreeUpdate.Op(run, entry, version, settles);
     }
 
     private PageRef writeCatalog(LiveLedger.Cut cut, TreeRoot[] roots, PageFile.Writer writer, TreeUpdate update) throws IOException {

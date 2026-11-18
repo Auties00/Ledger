@@ -300,6 +300,13 @@ final class PackedRun {
         return keyViews[start >>> KEY_CHUNK_BITS].asSlice(start & KEY_OFFSET_MASK, keyEnds[entry] - start);
     }
 
+    /// {@return the order of the key of `chain` and that of `entry`, as [Segments#compare(MemorySegment, MemorySegment)]
+    /// gives, without a view of the entry's key}
+    int compareChain(Chain chain, int entry) {
+        var start = keyStart(entry);
+        return chain.compareKey(keyViews[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK, keyEnds[entry] - start);
+    }
+
     /// {@return the order of the key of `entry` and `key`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
     int compareKey(int entry, MemorySegment key) {
         var start = keyStart(entry);
@@ -397,12 +404,6 @@ final class PackedRun {
             }
             return new Version(0, places.chunks()[chunkOf(value)], (int) (value & ((1L << OFFSET_BITS) - 1)), length, null, null);
         }
-    }
-
-    /// {@return a chain of the key of `entry` that holds a slice of the run's keys, made for a checkpoint, which keys
-    /// its states by chains ([TreeUpdate.Op])}
-    Chain keyed(int entry) {
-        return new Chain(key(entry), 0);
     }
 
     /// {@return the position in the key order of the first entry whose key is at or after `key`, or [#size()] if none

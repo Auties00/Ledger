@@ -108,20 +108,35 @@ final class TreeUpdate {
 
     /// The state of a key as of a checkpoint.
     ///
-    /// It keeps a chain of the key and the version rather than segments of the key and the value, which it makes when
-    /// it writes the key: a checkpoint holds one state per key it takes, through the whole update.
+    /// It keeps a chain of the key, or the run's entry of a key only a run holds, and the version rather than segments
+    /// of the key and the value, which it makes when it writes the key: a checkpoint holds one state per key it takes,
+    /// through the whole update.
     ///
-    /// @param keyed a chain of the key, whose bytes the state compares and writes
+    /// @param keyed a chain of the key, whose bytes the state compares and writes, or `null` for the entry `entry` of
+    ///              `run`, whose key the state compares in the run and writes from it
     /// @param version its version as of the checkpoint, or `null` if the key has none
     /// @param blind the chain of the key, if a blind write the checkpoint takes needs to know whether the tree held
     ///              the key ([BlindWrites]), which the update records on it; or `null`
     /// @param settles where the update records whether the tree held the key for the [PackedRun] that holds it
     ///                ([PackedRun#settles()]), or `null`
     /// @param entry the key's entry in that run, or -1
-    record Op(Chain keyed, Version version, Chain blind, byte[] settles, int entry) {
+    /// @param run the run whose entry `entry` is the key's, if `keyed` is `null`; or `null`
+    record Op(Chain keyed, Version version, Chain blind, byte[] settles, int entry, PackedRun run) {
         /// Makes the state of the key of `keyed` with `version`, as [Op] does, for a key no run holds.
         Op(Chain keyed, Version version, Chain blind) {
-            this(keyed, version, blind, null, -1);
+            this(keyed, version, blind, null, -1, null);
+        }
+
+        /// Makes the state of the key of `keyed` with `version`, as [Op] does, whose entry `entry` of a run records in
+        /// `settles` whether the tree held it.
+        Op(Chain keyed, Version version, Chain blind, byte[] settles, int entry) {
+            this(keyed, version, blind, settles, entry, null);
+        }
+
+        /// Makes the state of the key of entry `entry` of `run`, which no chain the checkpoint takes holds, with
+        /// `version`, as [Op] does.
+        Op(PackedRun run, int entry, Version version, byte[] settles) {
+            this(null, version, null, settles, entry, run);
         }
 
         /// Makes the state of `key` with `value`, or with none if `null`.
@@ -131,7 +146,12 @@ final class TreeUpdate {
 
         /// {@return the order of the key and `other`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
         int compareKey(MemorySegment other) {
-            return keyed.compareKey(other);
+            return keyed != null ? keyed.compareKey(other) : run.compareKey(entry, other);
+        }
+
+        /// {@return the key, a copy in `keys` of a chain's key in its own words, or a slice of the run's keys}
+        MemorySegment key(KeySlab keys) {
+            return keyed != null ? keys.key(keyed) : run.key(entry);
         }
 
         /// {@return the value, or `null` if the key has none}
@@ -959,7 +979,7 @@ final class TreeUpdate {
     }
 
     private LeafEntry entry(Op op) throws IOException {
-        var key = keys.key(op.keyed());
+        var key = op.key(keys);
         var version = op.version();
         var external = op.external();
         if (external == null && version.logged()) {
