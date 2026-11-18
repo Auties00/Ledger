@@ -31,9 +31,9 @@ import java.util.Arrays;
 /// replay runs and the run's after, so it is exact, never blind.
 ///
 /// Per entry it keeps the key's bytes and their end, a word of the value's place and kind, a slot of the hash table and an
-/// index of the key order; the keys lie in chunks of [#KEY_CHUNK] bytes, a value shorter than [#LOG_VALUE_MIN] in the
-/// replay's chunks ([ReplayValues]), and a longer one stays in the log, where the run keeps its place, its tag and its
-/// stamp, which the tag binds, as a [LogValue] would. A message that took a chain, a version, a [LogValue], an entry of
+/// index of the key order; the keys lie in chunks of [#KEY_CHUNK] bytes, a value shorter than
+/// [SpillQueue#LOG_VALUE_MIN] in the replay's chunks ([ReplayValues]), and a longer one stays in the log, where the run
+/// keeps its place, its tag and its stamp, which the tag binds, as a [LogValue] would. A message that took a chain, a version, a [LogValue], an entry of
 /// the hash index, of the dirty and blind lists, and a node of the ordered map once scanned, about 300 bytes over its key
 /// and value, takes about 50 here.
 ///
@@ -52,12 +52,6 @@ import java.util.Arrays;
 /// synchronization: every read of a word is an acquire. [#correction()], the tree lookups it caches and the order of
 /// the keys made late take a lock of their own.
 final class PackedRun {
-    /// The shortest value a run keeps in the log rather than in a chunk of the replay: three times the 32 bytes a
-    /// logged value takes of the run's arrays (its stamp, its place, where it lies in its body and its tag), where a
-    /// value in a chunk takes its length, so a logged value costs a third of the heap or less. A read of it before the
-    /// first checkpoint after the open, and that checkpoint, read it back from the log. A write the replay sends to a
-    /// chain moves to the log from [SpillQueue#LOG_VALUE_MIN], the break-even of a [LogValue] and its version.
-    static final int LOG_VALUE_MIN = 96;
     /// The entries a run holds at most: the low bits of a slot of the hash table hold an entry's index plus one.
     static final int MAX_ENTRIES = (1 << 24) - 2;
     /// The log segments the logged values of a run may lie in at most: the high bits of a value's place in the log.
@@ -103,7 +97,7 @@ final class PackedRun {
     private static final MemorySegment EMPTY = MemorySegment.ofArray(new byte[0]).asReadOnly();
 
     static {
-        if (ReplayValues.CHUNK_BYTES > 1 << OFFSET_BITS || LOG_VALUE_MIN > LENGTH_MASK
+        if (ReplayValues.CHUNK_BYTES > 1 << OFFSET_BITS || SpillQueue.LOG_VALUE_MIN > LENGTH_MASK
                 || ArrayWriteBatch.CHUNK_BYTES > 1 << OFFSET_BITS) {
             throw new ExceptionInInitializerError("A value in a chunk does not fit the word of its entry");
         }

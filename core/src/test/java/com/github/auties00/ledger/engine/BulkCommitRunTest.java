@@ -21,6 +21,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.TreeMap;
@@ -49,8 +50,8 @@ class BulkCommitRunTest {
     private static final Keyspace<String, String> TEXTS = Keyspace.paged("texts", KeyCodec.utf8(), ValueCodec.utf8());
     private static final Keyspace<String, String> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
     private static final int BULK = LiveLedger.BULK_RUN_WRITES + 500;
-    // Empty, short, at the log's threshold and above it
-    private static final int[] LENGTHS = {0, 40, 200, SpillQueue.LOG_VALUE_MIN, 700, 1_500};
+    // Empty, short, at the log's threshold, between it and the verdict's paying length, and above
+    private static final int[] LENGTHS = {0, 40, SpillQueue.LOG_VALUE_MIN, 200, 700, 1_500};
     // Values that move to the log once their record drains: mostly long, so the record's verdict lets all move
     private static final int[] LONG_LENGTHS = {40, SpillQueue.LOG_VALUE_MIN, 700, 1_500, 3_000};
     private static final int LARGE_VALUES = 64 << 10;
@@ -627,6 +628,117 @@ class BulkCommitRunTest {
             ledger.checkpoint();
             verify(ledger, expected);
         }
+    }
+
+    /// Checks every way a view reads `expected`, of keys of any length: point reads, encoded reads, scans both ways,
+    /// ranges and counts.
+    private static void verifyKeys(View view, TreeMap<byte[], byte[]> expected) {
+        for (var entry : expected.entrySet()) {
+            assertArrayEquals(entry.getValue(), view.get(MESSAGES, entry.getKey()).orElseThrow(),
+                    () -> "key of " + entry.getKey().length + " bytes");
+            assertArrayEquals(entry.getValue(), view.readEncoded(MESSAGES, entry.getKey(),
+                    segment -> segment.toArray(ValueLayout.JAVA_BYTE)).orElseThrow());
+        }
+        assertEquals(expected.size(), view.size(MESSAGES), "keys counted");
+        var keys = new ArrayList<byte[]>();
+        view.forEach(MESSAGES, KeyRange.all(), (key, value) -> {
+            assertArrayEquals(expected.get(key), value, "scanned value");
+            keys.add(key);
+            return true;
+        });
+        assertEquals(expected.size(), keys.size(), "keys scanned");
+        var ascending = expected.keySet().iterator();
+        for (var key : keys) {
+            assertArrayEquals(ascending.next(), key, "keys scanned out of order");
+        }
+        var descending = new ArrayList<byte[]>();
+        view.forEach(MESSAGES, KeyRange.<byte[]>all().reversed(), (key, _) -> {
+            descending.add(key);
+            return true;
+        });
+        assertEquals(expected.size(), descending.size(), "keys scanned descending");
+        var reversed = expected.descendingKeySet().iterator();
+        for (var key : descending) {
+            assertArrayEquals(reversed.next(), key, "keys scanned descending out of order");
+        }
+        var sorted = new ArrayList<>(expected.keySet());
+        for (var from = 0; from + 1 < sorted.size(); from += 397) {
+            var to = Math.min(from + 150, sorted.size() - 1);
+            var wanted = expected.subMap(sorted.get(from), sorted.get(to));
+            var range = view.range(MESSAGES, KeyRange.between(sorted.get(from), sorted.get(to)), Integer.MAX_VALUE);
+            assertEquals(wanted.size(), range.size(), "keys from " + from);
+            var index = 0;
+            for (var entry : wanted.entrySet()) {
+                assertArrayEquals(entry.getKey(), range.get(index).key());
+                assertArrayEquals(entry.getValue(), range.get(index++).value());
+            }
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a bulk commit of keys of 4 to 1,024 bytes keeps them in whole chunks of 256 KiB but the last, finds every one, and reads them through a spill under a snapshot, removals, a crash, a checkpoint and a reopen")
+    void keysSpanChunks(boolean encrypted, @TempDir Path directory) throws Exception {
+        var random = new Random(42);
+        var expected = new TreeMap<byte[], byte[]>(Arrays::compareUnsigned);
+        // Budget no commit reaches, so the values move only when the test drains the queue
+        try (var ledger = open(directory, encrypted, 1L << 30)) {
+            ledger.state(MESSAGES).overwrites.forceSpillsForTests();
+            var batch = ledger.newBatch();
+            for (var i = 0; i < 3_000; i++) {
+                // A run of keys of 1,024 bytes first, so some key does not fit the rest of its chunk and starts the next
+                var key = new byte[i < 300 ? KeyCodec.MAX_LENGTH : 4 + random.nextInt(KeyCodec.MAX_LENGTH - 3)];
+                random.nextBytes(key);
+                ByteBuffer.wrap(key).putInt(i * 7_919);
+                var value = new byte[LONG_LENGTHS[random.nextInt(LONG_LENGTHS.length)]];
+                random.nextBytes(value);
+                batch.put(MESSAGES, key, value);
+                expected.put(key, value);
+            }
+            ledger.commit(batch).awaitDurable();
+            var run = ledger.state(MESSAGES).run;
+            assertNotNull(run, "the bulk commit made no run");
+            assertTrue(run.committed());
+            assertEquals(3_000, run.size());
+            var chunks = run.keyChunkLengthsForTests();
+            assertTrue(chunks.length > 4, () -> "keys in " + Arrays.toString(chunks));
+            for (var i = 0; i < chunks.length - 1; i++) {
+                assertEquals(PackedRun.KEY_CHUNK, chunks[i], "chunk " + i + " of " + Arrays.toString(chunks));
+            }
+            assertTrue(chunks[chunks.length - 1] <= PackedRun.KEY_CHUNK);
+            for (var key : expected.keySet()) {
+                assertTrue(run.find(MemorySegment.ofArray(key)) >= 0, "the run lacks a key of " + key.length + " bytes");
+            }
+            verifyKeys(ledger, expected);
+            try (var before = ledger.snapshot()) {
+                ledger.spills().drainAllForTests(ledger.log()::durableSequence);
+                ledger.spills().awaitIdleForTests();
+                assertEquals(0, run.homesForTests(), "the run kept a home every value left");
+                verifyKeys(before, expected);
+            }
+            verifyKeys(ledger, expected);
+            batch = ledger.newBatch();
+            var index = 0;
+            for (var key : new ArrayList<>(expected.keySet())) {
+                if (index++ % 4 == 0) {
+                    batch.delete(MESSAGES, key);
+                    expected.remove(key);
+                }
+            }
+            ledger.commit(batch).awaitDurable();
+            verifyKeys(ledger, expected);
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            verifyKeys(ledger, expected);
+            ledger.checkpoint();
+            assertNull(ledger.state(MESSAGES).run);
+            verifyKeys(ledger, expected);
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            verifyKeys(ledger, expected);
+        }
+        CheckpointTest.verifyPages(directory, encrypted);
     }
 
     private static void spillNow(LiveLedger ledger) throws InterruptedException {

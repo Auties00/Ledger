@@ -409,9 +409,9 @@ public final class LiveLedger implements Ledger {
     /// There `body` is that of the frame at `frameOffset` of `segment`, which holds it durably, and at most `logFrom`
     /// bytes of log start at the frame. A value of the log's last budget ([SpillQueue#keepsReplayed(long)]) is copied
     /// into a chunk and listed in the queue of values that may leave the heap, as the values of a live commit are; one
-    /// before it moves to the log at once, tagged where it lies in `body`, from [PackedRun#LOG_VALUE_MIN] bytes if the
-    /// run of its key space takes it and from [SpillQueue#LOG_VALUE_MIN] if it goes to a chain, so the values of a long
-    /// log neither stay in the heap until the first checkpoint nor are copied, and no body outlives its commit.
+    /// before it moves to the log at once, tagged where it lies in `body`, from [SpillQueue#LOG_VALUE_MIN] bytes whether
+    /// the run of its key space takes it or it goes to a chain, so the values of a long log neither stay in the heap
+    /// until the first checkpoint nor are copied, and no body outlives its commit.
     ///
     /// The puts and removals before the log's last budget of a paged key space go, for the keys memory holds no chain
     /// of, to a [PackedRun] of the key space rather than to chains: a value in the log, or in a chunk if shorter, and the
@@ -528,10 +528,10 @@ public final class LiveLedger implements Ledger {
                     return;
                 }
                 var bytes = Math.toIntExact(value.byteSize());
-                var run = moves ? runFor(state, key, values, bytes >= PackedRun.LOG_VALUE_MIN ? segment : null, bytes) : null;
+                var run = moves ? runFor(state, key, values, bytes >= SpillQueue.LOG_VALUE_MIN ? segment : null, bytes) : null;
                 if (run != null) {
                     var stamp = applier.nextStamp();
-                    if (bytes >= PackedRun.LOG_VALUE_MIN) {
+                    if (bytes >= SpillQueue.LOG_VALUE_MIN) {
                         // Where the value starts in the body: the address of a slice of the body's view
                         var at = Math.toIntExact(value.address());
                         if (!noted[0]) {
@@ -2448,9 +2448,10 @@ public final class LiveLedger implements Ledger {
         if (found == null || chain != null && chain.head != null) {
             return false;
         }
-        // The run the open replayed is part of the tree of `point` for its readers
+        // The run the open replayed, or a bulk commit made, is part of the tree of `point` for its readers; the key's
+        // chain, of a put after a bulk commit or a replay, holds its hash already
         var run = Reads.runOf(state, point);
-        var entry = run == null ? -1 : run.find(key);
+        var entry = run == null ? -1 : run.find(key, chain != null ? chain.hash : Segments.hash(key));
         if (entry >= 0) {
             found[index] = run.removes(entry) ? TreeSearch.ABSENT : TreeSearch.FOUND;
             return false;

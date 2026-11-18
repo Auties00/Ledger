@@ -484,6 +484,31 @@ class CheckpointTest {
         }
 
         @Test
+        @DisplayName("a checkpoint takes the chains of a large commit to a paged key space its tree holds out of memory, with the next commit's maintenance")
+        void releasesChains(@TempDir Path directory) {
+            try (var ledger = open(directory, MESSAGES, CHATS)) {
+                var live = (LiveLedger) ledger;
+                // A tree that holds the key space, so the batch goes to chains rather than to a bulk commit's run
+                ledger.commit(ledger.newBatch().put(MESSAGES, "first", "x"));
+                ledger.checkpoint();
+                var batch = ledger.newBatch();
+                for (var i = 0; i < 5_000; i++) {
+                    batch.put(MESSAGES, "m%05d".formatted(i), "message " + i);
+                }
+                ledger.commit(batch);
+                assertNull(live.state(MESSAGES).run, "a bulk commit's run over a tree that holds the key space");
+                assertTrue(live.state(MESSAGES).chains() >= 5_000, () -> live.state(MESSAGES).chains() + " chains in memory");
+                ledger.checkpoint();
+                // The next commit's maintenance and the checkpoint's pruning drop what the tree holds
+                ledger.commit(ledger.newBatch().put(MESSAGES, "after", "x"));
+                assertTrue(live.state(MESSAGES).chains() <= 1, () -> live.state(MESSAGES).chains() + " chains in memory");
+                assertTrue(live.state(MESSAGES).entries.size() <= 1, () -> live.state(MESSAGES).entries.size() + " ordered");
+                assertEquals(Optional.of("message 4321"), ledger.get(MESSAGES, "m04321"));
+                assertEquals(5_002, ledger.size(MESSAGES));
+            }
+        }
+
+        @Test
         @DisplayName("the sweep shortens the chain of a resident key a snapshot held back, though nothing ordered its key space")
         void sweepsUnorderedResident(@TempDir Path directory) {
             try (var ledger = open(directory, MESSAGES, CHATS)) {

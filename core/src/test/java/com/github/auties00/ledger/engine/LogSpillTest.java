@@ -44,6 +44,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -62,9 +63,9 @@ class LogSpillTest {
     private static final Keyspace<byte[], byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.bytes(), ValueCodec.bytes());
     private static final Keyspace<String, String> TEXTS = Keyspace.paged("texts", KeyCodec.utf8(), ValueCodec.utf8());
     private static final Keyspace<String, String> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
-    // Below LOG_VALUE_MIN, between it and a run's minimum, at it, and well above, in a frame of runs and in one of its
+    // Below LOG_VALUE_MIN, at it, between it and PAYING_VALUE_MIN, and well above, in a frame of runs and in one of its
     // own
-    private static final int[] LENGTHS = {40, 200, SpillQueue.LOG_VALUE_MIN, 700, 1_500, 5_000};
+    private static final int[] LENGTHS = {40, SpillQueue.LOG_VALUE_MIN, 200, 700, 1_500, 5_000};
 
     private static LiveLedger open(Path directory, boolean encrypted, long budget) {
         return open(directory, encrypted, budget, Duration.ZERO);
@@ -804,9 +805,7 @@ class LogSpillTest {
             assertTrue(ledger.spills().loggedValuesForTests() > 0, "the recovery moved no value to the log");
             for (var entry : expected.messages.entrySet()) {
                 var source = source(ledger, MESSAGES, key(entry.getKey()));
-                // A write the replay sent to a chain moves as a live commit's value does, one of a run from the run's minimum
-                var logged = head(ledger, MESSAGES, key(entry.getKey())) != null ? SpillQueue.LOG_VALUE_MIN : PackedRun.LOG_VALUE_MIN;
-                if (entry.getValue().length >= logged) {
+                if (entry.getValue().length >= SpillQueue.LOG_VALUE_MIN) {
                     assertInstanceOf(LogValue.class, source, "message " + entry.getKey());
                 } else {
                     var chunk = assertInstanceOf(MemorySegment.class, source, "message " + entry.getKey());
@@ -828,10 +827,10 @@ class LogSpillTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
-    @DisplayName("a recovery keeps in the log the values it replays to a run from the run's threshold and those it replays to chains from the queue's, and reports a run's value whose bytes in the log changed")
-    void recoveryLogsRunValuesFromTheirThreshold(boolean encrypted, @TempDir Path directory) throws Exception {
-        int[] lengths = {PackedRun.LOG_VALUE_MIN - 1, PackedRun.LOG_VALUE_MIN, 200, SpillQueue.LOG_VALUE_MIN - 1,
-                SpillQueue.LOG_VALUE_MIN};
+    @DisplayName("a recovery keeps in the log the values it replays to a run and to chains from the queue's threshold, whatever the verdict a live commit of them would take, and reports a run's value whose bytes in the log changed")
+    void recoveryLogsReplayedValuesFromTheThreshold(boolean encrypted, @TempDir Path directory) throws Exception {
+        int[] lengths = {SpillQueue.LOG_VALUE_MIN - 1, SpillQueue.LOG_VALUE_MIN, SpillQueue.PAYING_VALUE_MIN - 1,
+                SpillQueue.PAYING_VALUE_MIN};
         var expected = new TreeMap<Integer, byte[]>();
         try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
             // Messages from 0 replay to the run, and those from 100, after the range removal, to chains
@@ -863,9 +862,9 @@ class LogSpillTest {
                 var chained = head(ledger, MESSAGES, key(message)) != null;
                 assertEquals(message >= 100, chained, "message " + message + " replayed to a chain");
                 var source = source(ledger, MESSAGES, key(message));
-                if (length >= (chained ? SpillQueue.LOG_VALUE_MIN : PackedRun.LOG_VALUE_MIN)) {
+                if (length >= SpillQueue.LOG_VALUE_MIN) {
                     var found = assertInstanceOf(LogValue.class, source, "message " + message + " of " + length + " bytes");
-                    if (!chained && length == PackedRun.LOG_VALUE_MIN) {
+                    if (!chained && length == SpillQueue.LOG_VALUE_MIN) {
                         damaged = message;
                         logged = found;
                     }
@@ -874,7 +873,7 @@ class LogSpillTest {
                 }
                 assertArrayEquals(entry.getValue(), ledger.get(MESSAGES, key(message)).orElseThrow(), "message " + message);
             }
-            assertTrue(damaged >= 0, "no value of the run lies in the log at the run's threshold");
+            assertTrue(damaged >= 0, "no value of the run lies in the log at the threshold");
             var position = logged.frameOffset() + LogWriter.FRAME_HEADER + logged.bodyIndex() + 3;
             try (var channel = FileChannel.open(logged.segment().path(), StandardOpenOption.READ, StandardOpenOption.WRITE)) {
                 var one = ByteBuffer.allocate(1);
@@ -1162,6 +1161,75 @@ class LogSpillTest {
         }
         try (var ledger = openSized(directory, true, 0, Duration.ZERO, 16L << 20)) {
             verify(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "chained: {0}, lengths: {1}")
+    @CsvSource({
+            "true, 100 200 300, false",
+            "false, 100 200 300, false",
+            "true, 255 255 255 255 255 255 255 255 255 256, false",
+            "false, 255 255 255 255 255 255 255 255 255 256, false",
+            "true, 256, true",
+            "false, 256, true",
+            "true, 90 90 90 90 90 90 90 300 300 300, false",
+            "false, 90 90 90 90 90 90 90 300 300 300, true"
+    })
+    @DisplayName("a commit's verdict counts a value from 256 bytes at its LogValue and a shorter one at the array of its own it would take, but a bulk run's value under 96 bytes at its length in the run's chunk, whether the commit goes to chains over a tree or to a bulk run, encrypted or not")
+    void verdictCountsShortValues(boolean chained, String lengthList, boolean moves, @TempDir Path directory) throws Exception {
+        // Every list holds a value of at least 256 bytes, without which a commit lists no value while the queue is
+        // within its budget
+        var lengths = Arrays.stream(lengthList.split(" ")).mapToInt(Integer::parseInt).toArray();
+        var count = 4_000;
+        for (var encrypted : new boolean[]{true, false}) {
+            var expected = new Expected();
+            var store = directory.resolve(encrypted ? "encrypted" : "plain");
+            try (var ledger = openSized(store, encrypted, 0, Duration.ZERO, 6L << 20)) {
+                if (chained) {
+                    // A tree that holds the key space, so the batch goes to chains rather than to a bulk run
+                    var seed = new byte[1_000];
+                    ledger.commit(ledger.newBatch().put(MESSAGES, key(1_000_000), seed)).awaitDurable();
+                    expected.messages.put(1_000_000, seed);
+                    ledger.checkpoint();
+                }
+                var spills = ledger.spills();
+                spillNow(ledger);
+                var unpaid = spills.unpaidRecordsForTests();
+                var logged = spills.loggedValuesForTests();
+                var copied = spills.copiedValuesForTests();
+                writeBulk(ledger, expected, 0, count, lengths, 0);
+                var run = ledger.state(MESSAGES).run;
+                if (chained) {
+                    assertNull(run, "a bulk run over a tree that holds the key space");
+                } else {
+                    assertNotNull(run, "no bulk run in an empty key space");
+                    assertTrue(run.committed());
+                }
+                assertEquals(unpaid + (moves ? 0 : 1), spills.unpaidRecordsForTests(), "records judged not to pay");
+                spillNow(ledger);
+                var longValues = 0;
+                for (var message = 0; message < count; message++) {
+                    if (lengths[message % lengths.length] >= SpillQueue.LOG_VALUE_MIN) {
+                        longValues++;
+                    }
+                }
+                if (moves) {
+                    assertEquals(logged + longValues, spills.loggedValuesForTests());
+                    assertEquals(copied + count - longValues, spills.copiedValuesForTests());
+                } else {
+                    assertEquals(logged, spills.loggedValuesForTests());
+                    assertEquals(copied, spills.copiedValuesForTests());
+                }
+                for (var message = 0; message < count; message++) {
+                    assertEquals(!moves, onHome(ledger, MESSAGES, key(message)), "message " + message);
+                }
+                verify(ledger, expected);
+                ledger.checkpoint();
+                verify(ledger, expected);
+            }
+            try (var ledger = openSized(store, encrypted, 0, Duration.ZERO, 6L << 20)) {
+                verify(ledger, expected);
+            }
         }
     }
 
@@ -1815,6 +1883,32 @@ class LogSpillTest {
         queue.awaitIdleForTests();
         assertInstanceOf(byte[].class, versions[6].sourceForTests(), "a value a checkpoint holds before it moved");
         assertEquals(4, queue.drainedRecordsForTests());
+    }
+
+    @Test
+    @DisplayName("a durable record outside the budget moves at once, but the drain it starts moves no record the budget counts while the queue holds no more than its budget, even above three quarters of it")
+    void eagerRecordsKeepTheBudget(@TempDir Path directory) throws Exception {
+        var queue = new SpillQueue(10_000, true);
+        queue.useDurable(() -> 3);
+        var view = queue.segment(1, directory.resolve("1.log"), null);
+        // Under the budget, over its three quarters
+        var counted = spillable(1L << 20, 8_000);
+        queue.add(listed(queue, 1, view, 64, counted, 8_000));
+        queue.awaitIdleForTests();
+        var own = Version.ofOwn(2L << 20, large(2, SpillQueue.THROUGH_VALUE_MIN), null, null, null);
+        queue.add(listed(queue, 2, view, 1 << 20, own, SpillQueue.THROUGH_VALUE_MIN));
+        queue.awaitIdleForTests();
+        assertInstanceOf(LogValue.class, own.sourceForTests(), "a durable value outside the budget");
+        assertInstanceOf(MemorySegment.class, counted.sourceForTests(), "a value within the budget moved");
+        assertEquals(8_000, queue.heldForTests());
+        assertEquals(1, queue.drainedRecordsForTests());
+        // Over the budget, the drain moves the oldest records down to three quarters of it
+        var newer = spillable(3L << 20, 4_000);
+        queue.add(listed(queue, 3, view, 2 << 20, newer, 4_000));
+        queue.awaitIdleForTests();
+        assertInstanceOf(LogValue.class, counted.sourceForTests(), "the oldest value over the budget");
+        assertInstanceOf(MemorySegment.class, newer.sourceForTests(), "a value within three quarters of the budget");
+        assertEquals(4_000, queue.heldForTests());
     }
 
     @Test
