@@ -196,6 +196,12 @@ final class KeyspaceState {
         return index.holdsNone() ? null : index.get(key, hash);
     }
 
+    /// {@return the chain of the key whose bytes are the `length` bytes at `from` of `array`, whose hash is `hash`
+    /// ([Segments#hash(byte\[\], int, int)]), or `null` if memory holds none}
+    Chain chain(byte[] array, int from, int length, int hash) {
+        return index.holdsNone() ? null : index.get(array, from, length, hash);
+    }
+
     /// {@return the stamp of the value in memory that a write of `key`, whose hash is `hash` ([Segments#hash(MemorySegment)])
     /// and whose newest version in memory is `head`, replaces: that of `head`, or with no version that of the run's
     /// entry of the key, the run's newest ([PackedRun#maxStamp()]), which no tree holds while it is above the bound of

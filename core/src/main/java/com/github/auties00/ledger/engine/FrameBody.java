@@ -968,8 +968,11 @@ final class FrameBody {
 
     /// Reads the commit body that is the `length` bytes at `start` of `body`, passing each write to `visitor`.
     ///
-    /// The segments the visitor receives are slices of `view`, a read-only segment of the whole of `body`, which the
-    /// caller must not change afterward: the address of each is where it starts in `body`.
+    /// The key and the value of a put or a removal reach the visitor as where they lie in `body` and how many bytes
+    /// they take, each checked against what is left of the commit body, so a replay that copies them where it keeps
+    /// them makes no slice of either. The bounds of a range removal and the key of a put of a unit of the file of large
+    /// values, rarer, are slices of `view`, a read-only segment of the whole of `body`. The caller must not change
+    /// `body` afterward.
     ///
     /// @throws LedgerCorruptedException if the body is malformed
     static void readCommit(byte[] body, MemorySegment view, int start, int length, Visitor visitor) {
@@ -978,8 +981,21 @@ final class FrameBody {
             var kind = reader.readByte();
             var keyspace = Math.toIntExact(reader.readVarInt());
             switch (kind) {
-                case PUT -> visitor.put(keyspace, reader.readSegment(), reader.readSegment());
-                case DELETE -> visitor.delete(keyspace, reader.readSegment());
+                case PUT -> {
+                    var keyLength = (int) reader.readLength();
+                    var keyAt = reader.position;
+                    reader.position += keyLength;
+                    var valueLength = (int) reader.readLength();
+                    var valueAt = reader.position;
+                    reader.position += valueLength;
+                    visitor.put(keyspace, keyAt, keyLength, valueAt, valueLength);
+                }
+                case DELETE -> {
+                    var keyLength = (int) reader.readLength();
+                    var keyAt = reader.position;
+                    reader.position += keyLength;
+                    visitor.delete(keyspace, keyAt, keyLength);
+                }
                 case RANGE -> visitor.deleteRange(keyspace, reader.readOptional(), reader.readOptional());
                 case EXTERNAL -> visitor.putExternal(keyspace, reader.readSegment(), reader.readVarInt(), reader.readRef());
                 default -> throw new LedgerCorruptedException("A log frame holds an unknown write kind " + kind, null);
@@ -1083,14 +1099,21 @@ final class FrameBody {
         }
     }
 
-    /// Receives the writes of a commit body.
+    /// Receives the writes of a commit body ([#readCommit]), in the order the commit made them.
     interface Visitor {
-        void put(int keyspace, MemorySegment key, MemorySegment value);
+        /// Receives a put to `keyspace` of the key that is the `keyLength` bytes at `keyAt` of the body, with the value
+        /// that is the `valueLength` bytes at `valueAt`.
+        void put(int keyspace, int keyAt, int keyLength, int valueAt, int valueLength);
 
-        void delete(int keyspace, MemorySegment key);
+        /// Receives a removal from `keyspace` of the key that is the `keyLength` bytes at `keyAt` of the body.
+        void delete(int keyspace, int keyAt, int keyLength);
 
+        /// Receives a range removal from `keyspace` of the keys from `from`, included, to `to`, excluded, slices of the
+        /// body's view, either `null` for no bound.
         void deleteRange(int keyspace, MemorySegment from, MemorySegment to);
 
+        /// Receives a put to `keyspace` of `key`, a slice of the body's view, with a value of `length` bytes the unit
+        /// `ref` of the file of large values holds.
         void putExternal(int keyspace, MemorySegment key, long length, PageRef ref);
     }
 

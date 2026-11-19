@@ -878,7 +878,12 @@ final class PackedRun {
         /// It stops [KeyCodec#MAX_LENGTH] bytes short of [#MAX_KEY_BYTES]: a key that does not fit the rest of a chunk
         /// starts the next one, leaving unused fewer bytes than it has.
         boolean takes(MemorySegment key, LogSegmentView segment, int length) {
-            var keyLength = key.byteSize();
+            return takes(key.byteSize(), segment, length);
+        }
+
+        /// {@return whether the builder takes a write of a key of `keyLength` bytes, as
+        /// [#takes(MemorySegment, LogSegmentView, int)] gives it of a key of that length}
+        boolean takes(long keyLength, LogSegmentView segment, int length) {
             if (size >= MAX_ENTRIES || length > MAX_VALUE_LENGTH || keyLength < 1 || keyLength > KeyCodec.MAX_LENGTH
                     || keyBytes + keyLength + KeyCodec.MAX_LENGTH > MAX_KEY_BYTES) {
                 return false;
@@ -887,10 +892,12 @@ final class PackedRun {
                     || segments.getLast() == segment;
         }
 
-        /// Records a put of `key`, stamped `stamp`, of the `length` bytes at `offset` of `chunk`, a chunk of the
-        /// replay, or of an empty value if `length` is 0.
-        void put(MemorySegment key, long stamp, MemorySegment chunk, int offset, int length) {
-            var entry = entry(key, stamp);
+        /// Records a put of the key that is the `keyLength` bytes at `keyFrom` of `keyArray`, whose hash is `hash`
+        /// ([Segments#hash(byte\[\], int, int)]), stamped `stamp`, of the `length` bytes at `offset` of `chunk`, a
+        /// chunk of the replay, or of an empty value if `length` is 0.
+        void put(byte[] keyArray, int keyFrom, int keyLength, int hash, long stamp, MemorySegment chunk, int offset,
+                 int length) {
+            var entry = entry(keyArray, keyFrom, keyLength, hash, stamp);
             if (length == 0) {
                 values[entry] = 0;
                 return;
@@ -903,9 +910,13 @@ final class PackedRun {
             values[entry] = (long) length << LENGTH_SHIFT | (long) index << OFFSET_BITS | offset;
         }
 
-        /// Records a put of `key`, stamped `stamp`, of the `length` bytes `logged` holds in the log.
-        void putLogged(MemorySegment key, long stamp, LogValue logged, int length) {
-            var entry = entry(key, stamp);
+        /// Records a put of the key that is the `keyLength` bytes at `keyFrom` of `keyArray`, whose hash is `hash`
+        /// ([Segments#hash(byte\[\], int, int)]), stamped `stamp`, of the `length` bytes in the log at `bodyIndex` of
+        /// the body of the frame at `frameOffset` of `logSegment`, under the tag of `tagHigh` and `tagLow`: the fields
+        /// of a [LogValue] of the value, which the builder keeps in its arrays.
+        void putLogged(byte[] keyArray, int keyFrom, int keyLength, int hash, long stamp, LogSegmentView logSegment,
+                       long frameOffset, int bodyIndex, long tagHigh, int tagLow, int length) {
+            var entry = entry(keyArray, keyFrom, keyLength, hash, stamp);
             var previous = values[entry];
             int index;
             if (previous >= 0 && (previous & LOGGED) != 0) {
@@ -923,15 +934,15 @@ final class PackedRun {
                 }
             }
             var segment = segments.isEmpty() ? -1 : segments.size() - 1;
-            if (segment < 0 || segments.get(segment) != logged.segment()) {
-                segments.add(logged.segment());
+            if (segment < 0 || segments.get(segment) != logSegment) {
+                segments.add(logSegment);
                 segment++;
             }
             logStamps[index] = stamp;
-            logPlaces[index] = (long) segment << FRAME_BITS | logged.frameOffset();
-            logBodies[index] = logged.bodyIndex();
-            tagHighs[index] = logged.tagHigh();
-            tagLows[index] = logged.tagLow();
+            logPlaces[index] = (long) segment << FRAME_BITS | frameOffset;
+            logBodies[index] = bodyIndex;
+            tagHighs[index] = tagHigh;
+            tagLows[index] = tagLow;
             values[entry] = LOGGED | (long) length << 32 | (index & 0xFFFF_FFFFL);
         }
 
@@ -984,10 +995,11 @@ final class PackedRun {
             return entry;
         }
 
-        /// Records a removal of `key`, stamped `stamp`.
-        void delete(MemorySegment key, long stamp) {
+        /// Records a removal of the key that is the `keyLength` bytes at `keyFrom` of `keyArray`, whose hash is `hash`
+        /// ([Segments#hash(byte\[\], int, int)]), stamped `stamp`.
+        void delete(byte[] keyArray, int keyFrom, int keyLength, int hash, long stamp) {
             // Found or added first: adding may replace the array
-            var entry = entry(key, stamp);
+            var entry = entry(keyArray, keyFrom, keyLength, hash, stamp);
             values[entry] = REMOVES;
         }
 
@@ -1012,9 +1024,25 @@ final class PackedRun {
             }
         }
 
-        // The entry of `key`, added if the builder holds none, whose write stamped `stamp` is the newest
-        private int entry(MemorySegment key, long stamp) {
-            return entry(key, Segments.hash(key), stamp);
+        // As slotOf for the key that is the keyLength bytes at keyFrom of keyArray
+        private int slotOf(byte[] keyArray, int keyFrom, int keyLength, int hash) {
+            var mask = slots.length - 1;
+            var tag = hash & TAG_MASK;
+            for (var i = hash & mask; ; i = (i + 1) & mask) {
+                var slot = slots[i];
+                if (slot == 0) {
+                    return i;
+                }
+                if ((slot & TAG_MASK) == tag) {
+                    var entry = (slot & ENTRY_MASK) - 1;
+                    var start = keyStart(keyEnds, entry);
+                    var length = keyEnds[entry] - start;
+                    if (length == keyLength && Segments.compare(keyChunks.get(start >>> KEY_CHUNK_BITS),
+                            start & KEY_OFFSET_MASK, length, keyArray, keyFrom, keyLength) == 0) {
+                        return i;
+                    }
+                }
+            }
         }
 
         // The entry of `key`, whose hash is `hash`, added if the builder holds none, whose write stamped `stamp` is the
@@ -1027,14 +1055,35 @@ final class PackedRun {
             if (found != 0) {
                 return (found & ENTRY_MASK) - 1;
             }
-            var tag = hash & TAG_MASK;
+            var length = Math.toIntExact(key.byteSize());
+            var entry = place(length);
+            MemorySegment.copy(key, ValueLayout.JAVA_BYTE, 0, keys, (keyBytes - length) & KEY_OFFSET_MASK, length);
+            return add(i, hash, entry);
+        }
+
+        // As entry for the key that is the length bytes at from of array
+        private int entry(byte[] array, int from, int length, int hash, long stamp) {
+            minStamp = Math.min(minStamp, stamp);
+            maxStamp = Math.max(maxStamp, stamp);
+            var i = slotOf(array, from, length, hash);
+            var found = slots[i];
+            if (found != 0) {
+                return (found & ENTRY_MASK) - 1;
+            }
+            var entry = place(length);
+            System.arraycopy(array, from, keys, (keyBytes - length) & KEY_OFFSET_MASK, length);
+            return add(i, hash, entry);
+        }
+
+        // Adds an entry of a key of `length` bytes, whose bytes the caller then copies into the last `length` bytes
+        // `keyBytes` reaches in `keys`, a chunk of its own or the rest of the last one
+        private int place(int length) {
             var entry = size;
             if (entry == values.length) {
                 var capacity = 2 * entry;
                 keyEnds = Arrays.copyOf(keyEnds, capacity);
                 values = Arrays.copyOf(values, capacity);
             }
-            var length = Math.toIntExact(key.byteSize());
             var start = keyBytes;
             if ((start & KEY_OFFSET_MASK) + length > KEY_CHUNK) {
                 // The rest of the chunk is too short: the key starts the next one
@@ -1049,11 +1098,16 @@ final class PackedRun {
                 keys = Arrays.copyOf(keys, Math.min(KEY_CHUNK, Math.max(offset + length, 2 * keys.length)));
                 keyChunks.set(keyChunks.size() - 1, keys);
             }
-            MemorySegment.copy(key, ValueLayout.JAVA_BYTE, 0, keys, offset, length);
             keyBytes = start + length;
             keyEnds[entry] = keyBytes;
             size = entry + 1;
-            slots[i] = tag | (entry + 1);
+            return entry;
+        }
+
+        // Puts `entry`, whose key's hash is `hash`, in the empty slot `i` of the hash table, which doubles past three
+        // quarters full
+        private int add(int i, int hash, int entry) {
+            slots[i] = (hash & TAG_MASK) | (entry + 1);
             if (4L * size > 3L * slots.length) {
                 grow();
             }
