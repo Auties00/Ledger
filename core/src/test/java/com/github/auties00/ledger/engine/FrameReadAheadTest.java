@@ -19,6 +19,8 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Random;
 import java.util.TreeMap;
@@ -161,8 +163,28 @@ class FrameReadAheadTest {
             assertEquals((length + 64L + step - 1) / step, (room + 64L + step - 1) / step, "room " + room + " for " + length);
         }
         assertEquals(4_096, FrameReadAhead.Spares.room(1));
-        assertEquals((300_000 + 37_500 + 4_095) & ~4_095, FrameReadAhead.Spares.room(300_000));
+        assertEquals(8_192, FrameReadAhead.Spares.room(4_000));
+        assertEquals(200_704, FrameReadAhead.Spares.room(100_000));
+        assertEquals(step - 64, FrameReadAhead.Spares.room(300_000));
         assertEquals(step - 64, FrameReadAhead.Spares.room(470_000));
+        assertEquals(2 * step - 64, FrameReadAhead.Spares.room(600_000));
+    }
+
+    @Test
+    @DisplayName("frames that each grow by a tenth take a new array only once they outgrow twice the frame the spare was made for")
+    void growingFramesKeepTheirSpares() {
+        var spares = new FrameReadAhead.Spares();
+        var arrays = Collections.newSetFromMap(new IdentityHashMap<byte[], Boolean>());
+        var frames = 0;
+        for (var length = 10_000; length < 2_000_000; length += length / 10) {
+            var body = spares.takeBody(length);
+            assertTrue(body.length >= length);
+            arrays.add(body);
+            spares.giveBody(body);
+            frames++;
+        }
+        // Twice the room every time a frame outgrows the array, up to the multiples of the step that cap it
+        assertTrue(arrays.size() <= 12, arrays.size() + " arrays for " + frames + " frames");
     }
 
     @Test

@@ -256,6 +256,11 @@ final class SpillQueue {
         return logFrom <= budget;
     }
 
+    /// {@return the bytes of the log's last budget, whose values a recovery keeps on the heap ([#keepsReplayed(long)])}
+    long replayBudget() {
+        return budget;
+    }
+
     /// Records that a recovery moves values of the commit at `sequence` it replays to `segment`, before the first
     /// one moves there ([#moveReplayed(Crypto, Version, LogSegmentView, long, int, byte\[\])]), so a checkpoint that
     /// retires segments sees the commit.

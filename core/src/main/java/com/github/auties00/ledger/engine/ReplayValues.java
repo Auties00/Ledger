@@ -32,6 +32,13 @@ final class ReplayValues {
     static final int CHUNK_BYTES = FrameBody.CHUNK_BYTES;
     /// The most bytes of a value that shares a chunk, a sixteenth of one, which bounds what a chunk leaves unused.
     static final int SHARED_BYTES = CHUNK_BYTES / 16;
+    /// The entries from which a run's builder, once full, grows to the entries the rest of the log is expected to add
+    /// rather than to twice its entries ([#reserve(PackedRun.Builder, long)]).
+    static final int RESERVE_AT = 4096;
+    /// The entries up to which a reservation may give a builder more than twice its entries, at most sixteen times:
+    /// the arrays of 262,144 entries take 11.5 MB at most (12 bytes per entry, 32 more per value in the log), so an
+    /// estimate too high costs that much at most past what doubling would have taken.
+    static final int RESERVE_ENTRIES = 1 << 18;
 
     // The chunk values are copied into, its read-only view, and the bytes of it they took; null before the first one
     private byte[] chunk;
@@ -48,6 +55,44 @@ final class ReplayValues {
     // The runs being built, by key space, and the key spaces that replay to chains from a range removal on
     private final IdentityHashMap<KeyspaceState, PackedRun.Builder> runs = new IdentityHashMap<>();
     private final Set<KeyspaceState> toChains = Collections.newSetFromMap(new IdentityHashMap<>());
+    // The bytes of log at most from the frame being replayed to the end
+    private long logFrom;
+    // Per run being built, the bytes of log at most from the frame of its first write to the end
+    private final IdentityHashMap<PackedRun.Builder, Long> origins = new IdentityHashMap<>();
+
+    /// Records that the replay reaches a frame that `logFrom` bytes of log at most start from: a run made from now on
+    /// takes its first write there, which [#reserve(PackedRun.Builder, long)] measures the run's rate from.
+    void reached(long logFrom) {
+        this.logFrom = logFrom;
+    }
+
+    /// Makes `run`, full with at least [#RESERVE_AT] entries, grow next to the entries the frames before the log's last
+    /// `budget` bytes are expected to give it: the entries per byte of log it took from the frame of its first write to
+    /// the frame being replayed, times the bytes from that first frame to the last budget, and a sixteenth more.
+    ///
+    /// The room is at least a quarter more than the run holds, so the growth stays geometric when the estimate is low,
+    /// and at most sixteen times the entries up to [#RESERVE_ENTRIES] entries and twice them past that, so an estimate
+    /// too high (a log whose later frames overwrite the keys of its first ones) takes little more than doubling would.
+    /// Nothing for a run that is not full, nor while the replay is still in the frame of the run's first write, whose
+    /// writes give no rate: the arrays then double.
+    void reserve(PackedRun.Builder run, long budget) {
+        var size = run.size();
+        if (size < RESERVE_AT || size < run.capacity()) {
+            return;
+        }
+        var origin = origins.get(run);
+        if (origin == null) {
+            return;
+        }
+        var done = origin - logFrom;
+        var moved = origin - budget;
+        if (done <= 0 || moved <= done) {
+            return;
+        }
+        var expected = (long) ((double) size * moved / done);
+        var most = Math.max(2L * size, Math.min(16L * size, RESERVE_ENTRIES));
+        run.reserve((int) Math.min(PackedRun.MAX_ENTRIES, Math.clamp(expected + expected / 16, size + size / 4, most)));
+    }
 
     /// {@return whether a value of `length` bytes shares a chunk, rather than taking an array of its own}
     static boolean shared(int length) {
@@ -133,6 +178,7 @@ final class ReplayValues {
         if (run == null && !toChains.contains(state)) {
             run = new PackedRun.Builder();
             runs.put(state, run);
+            origins.put(run, logFrom);
         }
         return run;
     }
@@ -141,7 +187,11 @@ final class ReplayValues {
     /// key space replays to chains}
     PackedRun.Builder stopRun(KeyspaceState state) {
         toChains.add(state);
-        return runs.remove(state);
+        var run = runs.remove(state);
+        if (run != null) {
+            origins.remove(run);
+        }
+        return run;
     }
 
     /// {@return the builder of the run of `state`, or `null` if it has none: no write went to it yet, or the key space

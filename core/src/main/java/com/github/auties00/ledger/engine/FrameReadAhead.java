@@ -227,16 +227,19 @@ final class FrameReadAhead implements AutoCloseable {
     /// The arrays and ciphers the read-aheads of one recovery share with it, so the frames of every segment are read
     /// and opened into the arrays the earlier ones were.
     ///
-    /// An array is handed out for a frame of at least its length: a spare long enough, or a new one with an eighth more
-    /// room, so frames that differ a little in length share their arrays and the arrays settle at the longest frame. The
-    /// room never takes an array past a multiple of [#STEP], so it never gives an array more regions of G1 than its
-    /// frame's length needs, nor makes one humongous that its length alone would not. A spare shorter than the frame is
-    /// dropped, as is one more than four times as long and longer than [#STEP], so a few long frames leave no long
-    /// arrays to the short ones after them; an array for a frame longer than [#AHEAD_BYTES], which the read-ahead leaves
-    /// to recovery, is never kept. Each array passes between the frame it holds and the queue, so the spares hold at
-    /// most the arrays of the frames open at once.
+    /// An array is handed out for a frame of at least its length: a spare long enough, or a new one of twice its
+    /// length, so a frame longer than every one before it, up to twice the length of the one an array was made for,
+    /// still finds a spare rather than dropping the spares in turn, and a log of growing frames makes a few arrays
+    /// rather than one per new longest frame. The room never takes an array past a multiple of [#STEP], so it never
+    /// gives an array more regions of G1 than its frame's length needs, nor makes one humongous that its length alone
+    /// would not: every frame longer than half a [#STEP] takes the whole multiple that holds it. A spare shorter than
+    /// the frame is dropped, as is one more than four times as long and longer than [#STEP], so a few long frames leave
+    /// no long arrays to the short ones after them; an array for a frame longer than [#AHEAD_BYTES], which the
+    /// read-ahead leaves to recovery, is never kept. Each array passes between the frame it holds and the queue, so the
+    /// spares hold at most the arrays of the frames open at once.
     ///
-    /// Shared by the replaying thread and the read-aheads' virtual threads. One recovery makes one and drops it after.
+    /// Shared by the replaying thread and the read-aheads' virtual threads. One recovery makes one and drops it after,
+    /// and takes from it the bodies of the frames it reads itself too, those of a plain log included.
     static final class Spares {
         /// Half the smallest region of G1, the granularity of the room an array is given.
         static final int STEP = 1 << 19;
@@ -310,11 +313,11 @@ final class FrameReadAhead implements AutoCloseable {
             }
         }
 
-        /// {@return the length of a new array for a frame of `length` bytes, at most [#AHEAD_BYTES]: an eighth more,
+        /// {@return the length of a new array for a frame of `length` bytes, at most [#AHEAD_BYTES]: twice `length`,
         /// rounded up to 4 KiB, but never past the multiple of [#STEP] that holds an array of `length` bytes, nor past
         /// [#AHEAD_BYTES]}
         static int room(int length) {
-            var roomy = ((long) length + (length >>> 3) + 4095) & ~4095L;
+            var roomy = (2L * length + 4095) & ~4095L;
             var limit = ((long) length + HEADER + STEP - 1) / STEP * STEP - HEADER;
             return (int) Math.min(Math.min(roomy, limit), AHEAD_BYTES);
         }
