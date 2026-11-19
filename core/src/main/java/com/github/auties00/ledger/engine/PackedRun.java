@@ -1225,7 +1225,7 @@ final class PackedRun {
             this.firstChunk = 0;
             this.firstHome = 0;
             this.firstChunkBytes = (int) Math.clamp(keyBytes, 1, KEY_CHUNK);
-            storage.keys = new byte[0][];
+            storage.keys = new byte[][]{new byte[firstChunkBytes]};
             storage.keyViews = new MemorySegment[0];
             storage.keyEnds = new int[capacity];
             storage.words = new long[0][];
@@ -1269,6 +1269,13 @@ final class PackedRun {
                 storage.keyEnds = Arrays.copyOf(keyEnds, (int) Math.min(MAX_ENTRIES, Math.max(needed, keyEnds.length + (keyEnds.length >> 1))));
             }
             addWordChunks(needed);
+            // The commit's keys start a chunk of their own, made here rather than at the first key, so a put takes no
+            // branch only the first of each commit takes, which the compiler would leave out of a commit's loop and
+            // then deoptimize the loop at the next commit's first key
+            var keys = Arrays.copyOf(storage.keys, firstChunk + 1);
+            keys[firstChunk] = new byte[firstChunkBytes];
+            storage.keys = keys;
+            storage.keyBytes = firstChunk << KEY_CHUNK_BITS;
             if (4L * needed > 3L * storage.slots.length) {
                 rehash(tableFor(needed));
             }
@@ -1364,11 +1371,10 @@ final class PackedRun {
                     || segments.getLast() == segment;
         }
 
-        // Where the next key starts at the earliest: past the keys of the run, at the start of a chunk for the
-        // builder's first
+        // Where the next key starts at the earliest: past the keys of the run, the builder's first in the chunk the
+        // builder made for its keys
         private long nextKeyStart() {
-            var start = (long) storage.keyBytes;
-            return storage.keys.length == firstChunk ? (start + KEY_OFFSET_MASK) & ~KEY_OFFSET_MASK : start;
+            return storage.keyBytes;
         }
 
         /// Records a put of the key that is the `keyLength` bytes at `keyFrom` of `keyArray`, whose hash is `hash`
@@ -1474,30 +1480,33 @@ final class PackedRun {
                 setWord(entry, 0);
                 return entry;
             }
-            int index;
-            if (home != lastHome) {
-                // A home of the builder's own, whose entries the spill of no other commit counts down
-                index = storage.homeCount++;
-                var chunk = index >>> HOME_CHUNK_BITS;
-                var homes = storage.homes;
-                if (chunk == homes.length) {
-                    var grownHomes = Arrays.copyOf(homes, chunk + 1);
-                    grownHomes[chunk] = new MemorySegment[HOME_CHUNK];
-                    var grownCounts = Arrays.copyOf(storage.homeEntries, chunk + 1);
-                    grownCounts[chunk] = new int[HOME_CHUNK];
-                    storage.homes = grownHomes;
-                    storage.homeEntries = grownCounts;
-                    homes = grownHomes;
-                }
-                homes[chunk][index & HOME_MASK] = home;
-                lastHome = home;
-            } else {
-                index = storage.homeCount - 1;
-            }
+            // The puts of a batch lie on few homes: a new one is added out of line, so the put stays small enough for
+            // the compiler to inline it into the commit's loop
+            var index = home == lastHome ? storage.homeCount - 1 : addHome(home);
             var entry = entry(key, hash, stamp);
             storage.homeEntries[index >>> HOME_CHUNK_BITS][index & HOME_MASK]++;
             setWord(entry, HOME | (long) index << HOME_INDEX_SHIFT | (long) offset << HOME_OFFSET_SHIFT | length);
             return entry;
+        }
+
+        // Adds `home`, a home of the builder's own, whose entries the spill of no other commit counts down, as the last
+        // home; returns its index
+        private int addHome(MemorySegment home) {
+            var index = storage.homeCount++;
+            var chunk = index >>> HOME_CHUNK_BITS;
+            var homes = storage.homes;
+            if (chunk == homes.length) {
+                var grownHomes = Arrays.copyOf(homes, chunk + 1);
+                grownHomes[chunk] = new MemorySegment[HOME_CHUNK];
+                var grownCounts = Arrays.copyOf(storage.homeEntries, chunk + 1);
+                grownCounts[chunk] = new int[HOME_CHUNK];
+                storage.homes = grownHomes;
+                storage.homeEntries = grownCounts;
+                homes = grownHomes;
+            }
+            homes[chunk][index & HOME_MASK] = home;
+            lastHome = home;
+            return index;
         }
 
         /// Records a removal of the key that is the `keyLength` bytes at `keyFrom` of `keyArray`, whose hash is `hash`
@@ -1601,8 +1610,8 @@ final class PackedRun {
         private byte[] place(int length) {
             roomFor(storage.entries);
             var start = storage.keyBytes;
-            if (storage.keys.length == firstChunk || (start & KEY_OFFSET_MASK) + length > KEY_CHUNK) {
-                // The builder's first key, or the rest of the chunk is too short: the key starts the next one
+            if ((start & KEY_OFFSET_MASK) + length > KEY_CHUNK) {
+                // The rest of the chunk is too short: the key starts the next one
                 start = (start + KEY_OFFSET_MASK) & ~KEY_OFFSET_MASK;
             }
             var offset = start & KEY_OFFSET_MASK;
@@ -1610,7 +1619,7 @@ final class PackedRun {
             var keys = storage.keys;
             byte[] chunk;
             if (chunkIndex == keys.length) {
-                chunk = new byte[keys.length == firstChunk ? Math.max(firstChunkBytes, length) : KEY_CHUNK];
+                chunk = new byte[KEY_CHUNK];
                 keys = Arrays.copyOf(keys, chunkIndex + 1);
                 keys[chunkIndex] = chunk;
                 storage.keys = keys;
