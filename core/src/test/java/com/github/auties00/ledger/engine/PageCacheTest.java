@@ -4,6 +4,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
@@ -607,7 +609,7 @@ class PageCacheTest {
         }
 
         @Test
-        @DisplayName("caches a branch of level 2 or more at its first read, recording nothing, and screens one of level 1 as a leaf, but at a point read's third read")
+        @DisplayName("caches a branch of level 2 or more at its first read, recording nothing, and screens one of level 1 as a leaf, but at a point read's fourth read through recalls")
         void branches() {
             var cache = screening(LIMIT);
             for (var level = 2; level <= 4; level++) {
@@ -629,6 +631,9 @@ class PageCacheTest {
             assertEquals(2, cache.reads(ref));
             assertEquals(0, cache.doorkeeperForTests().thriceKeysForTests(), "a point read started the third filter");
             assertSame(branch, cache.recall(ref, PageCache.POINT), "a branch of level 1 read three times");
+            assertNull(cache.peek(ref), "a branch of level 1 a point read recalled twice");
+            assertEquals(0, cache.doorkeeperForTests().thriceKeysForTests(), "a point read's recall started the third filter");
+            assertSame(branch, cache.recall(ref, PageCache.POINT), "a branch of level 1 read four times");
             assertSame(branch, cache.peek(ref));
             // A point read's leaf of the same store still takes two reads
             var leaf = page(5);
@@ -636,7 +641,7 @@ class PageCacheTest {
             var second = unit(leaf);
             cache.putScreened(leaf, second, PageCache.POINT);
             assertSame(second, cache.peek(leaf), "a leaf a point read read twice");
-            // A scan's read of one takes it at its fourth read, as a leaf's
+            // A scan's read of one takes it at its fifth read through recalls, as a leaf's
             var scanned = page(1);
             var scannedBranch = new byte[PageFormat.SIZE];
             PageFile.header(scannedBranch, PageFormat.BRANCH, 1, scanned.page(), 1, 0, scanned.nonceHigh(), scanned.nonceLow());
@@ -646,6 +651,8 @@ class PageCacheTest {
             assertSame(scannedBranch, cache.recall(scanned, PageCache.SCAN), "a branch of level 1 a scan read three times");
             assertNull(cache.peek(scanned), "a branch of level 1 a scan read three times");
             assertSame(scannedBranch, cache.recall(scanned, PageCache.SCAN), "a branch of level 1 a scan read four times");
+            assertNull(cache.peek(scanned), "a branch of level 1 a scan read four times");
+            assertSame(scannedBranch, cache.recall(scanned, PageCache.SCAN), "a branch of level 1 a scan read five times");
             assertSame(scannedBranch, cache.peek(scanned));
         }
 
@@ -670,13 +677,17 @@ class PageCacheTest {
         }
 
         @Test
-        @DisplayName("recalls the very array of a unit it refused, which its second read then neither reads nor opens, as an entry a read used")
+        @DisplayName("recalls the very array of a unit it refused, which its second read then neither reads nor opens, and caches it at a point read's third read, as an entry a read used")
         void recall() {
             var cache = screening(LIMIT);
             var first = unit(page(0));
             cache.putScreened(page(0), first, PageCache.POINT);
             assertNull(cache.peek(page(0)));
-            assertSame(first, cache.recall(page(0), PageCache.POINT));
+            assertSame(first, cache.recall(page(0), PageCache.POINT), "the second read");
+            assertNull(cache.peek(page(0)), "the second read, a recall");
+            assertEquals(0, cache.size());
+            assertEquals(1, cache.reads(page(0)), "the reads the doorkeeper counts after a recall past a point read's");
+            assertSame(first, cache.recall(page(0), PageCache.POINT), "the third read");
             assertSame(first, cache.peek(page(0)));
             assertTrue(cache.referencedForTests(page(0)));
             assertEquals(PageFormat.SIZE, cache.size());
@@ -708,18 +719,18 @@ class PageCacheTest {
         }
 
         @Test
-        @DisplayName("of a scan recalls at the second and third reads the very array it refused, leaving it uncached and in its slot, and caches it at the fourth")
+        @DisplayName("of a scan recalls at the second, third and fourth reads the very array it refused, leaving it uncached and in its slot, and caches it at the fifth")
         void scanRecall() {
             var cache = screening(LIMIT);
             var first = unit(page(0));
             cache.putScreened(page(0), first, PageCache.SCAN);
-            for (var read = 2; read <= 3; read++) {
+            for (var read = 2; read <= 4; read++) {
                 assertSame(first, cache.recall(page(0), PageCache.SCAN), "read " + read);
                 assertNull(cache.peek(page(0)));
                 assertEquals(0, cache.size());
                 assertEquals(0, cache.clockLengthForTests());
             }
-            assertSame(first, cache.recall(page(0), PageCache.SCAN), "the fourth read");
+            assertSame(first, cache.recall(page(0), PageCache.SCAN), "the fifth read");
             assertSame(first, cache.peek(page(0)));
             assertTrue(cache.referencedForTests(page(0)));
             assertEquals(PageFormat.SIZE, cache.size());
@@ -728,11 +739,13 @@ class PageCacheTest {
             var other = unit(page(1));
             cache.putScreened(page(1), other, PageCache.SCAN);
             assertSame(other, cache.recall(page(1), PageCache.POINT), "a point read of a unit a scan refused");
-            assertSame(other, cache.peek(page(1)), "cached at a point read's second read");
+            assertNull(cache.peek(page(1)), "a point read's second read, a recall");
+            assertSame(other, cache.recall(page(1), PageCache.POINT), "a point read's third read");
+            assertSame(other, cache.peek(page(1)), "cached at a point read's third read");
         }
 
         @Test
-        @DisplayName("of a scan counts a recall as a read only when it finds the array, so a second read whose array the collector took is refused again")
+        @DisplayName("of a scan counts a recall as a read only when it finds the array, so a second read whose array the collector took is refused again, and the recalls after it cache the unit at the fifth read")
         void scanRecallOfCollected() {
             var cache = screening(LIMIT);
             cache.putScreened(page(0), unit(page(0)), PageCache.SCAN);
@@ -748,11 +761,14 @@ class PageCacheTest {
             assertNull(cache.peek(page(0)), "the third read");
             assertEquals(3, cache.reads(page(0)));
             assertSame(second, cache.recall(page(0), PageCache.SCAN), "the fourth read");
+            assertNull(cache.peek(page(0)), "the fourth read");
+            assertEquals(3, cache.reads(page(0)), "the reads the doorkeeper counts, as many as a read from the file needs");
+            assertSame(second, cache.recall(page(0), PageCache.SCAN), "the fifth read");
             assertSame(second, cache.peek(page(0)));
         }
 
         @Test
-        @DisplayName("of a scan counts the reads of a unit it refused on the refusal, so a recall caches it at the fourth read though the doorkeeper forgot a read, and records each read for a read from the file")
+        @DisplayName("of a scan counts the reads of a unit it refused on the refusal, so a recall caches it at the fifth read though the doorkeeper forgot a read, and records each read for a read from the file")
         void scanRecallCounts() {
             var cache = screening(LIMIT);
             var first = unit(page(0));
@@ -765,17 +781,99 @@ class PageCacheTest {
             assertNull(cache.peek(page(0)), "the third read");
             assertEquals(3, cache.reads(page(0)), "the reads the third recall recorded");
             assertSame(first, cache.recall(page(0), PageCache.SCAN), "the fourth read");
-            assertSame(first, cache.peek(page(0)), "cached at the fourth read");
+            assertNull(cache.peek(page(0)), "the fourth read");
+            assertSame(first, cache.recall(page(0), PageCache.SCAN), "the fifth read");
+            assertSame(first, cache.peek(page(0)), "cached at the fifth read");
 
             var other = unit(page(1));
             cache.putScreened(page(1), other, PageCache.SCAN);
             assertSame(other, cache.recall(page(1), PageCache.SCAN), "the second read");
             assertSame(other, cache.recall(page(1), PageCache.SCAN), "the third read");
             // As a collection that took the array would leave the table of refused units
-            cache.clearForTests();
+            cache.forgetRefusedForTests();
             var fourth = unit(page(1));
             cache.putScreened(page(1), fourth, PageCache.SCAN);
             assertSame(fourth, cache.peek(page(1)), "a fourth read from the file, after three the doorkeeper recorded");
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @CsvSource({
+                "a point read's leaf, false, 1",
+                "a point read's branch of level 1, true, 1",
+                "a scan's leaf, false, 3",
+                "a scan's branch of level 1, true, 3"
+        })
+        @DisplayName("caches a unit it refused a read later through recalls than from the file, and at the read a read from the file needs once the collector took the array, after any number of recalls")
+        void recallsCacheAReadLater(String name, boolean branch, int screen) {
+            // The reads before the one that caches a unit read from the file: one for a point read's leaf, two for its
+            // branch of level 1, three for a scan's units
+            var needed = screen == PageCache.POINT && branch ? 2 : screen;
+            var ref = page(0);
+            var cache = screening(LIMIT);
+            var held = node(ref, branch);
+            cache.putScreened(ref, held, screen);
+            for (var read = 2; read <= needed + 1; read++) {
+                assertSame(held, cache.recall(ref, screen), "recall at read " + read);
+                assertNull(cache.peek(ref), "recall at read " + read);
+            }
+            assertSame(held, cache.recall(ref, screen), "recall at read " + (needed + 2));
+            assertSame(held, cache.peek(ref), "cached through recalls at read " + (needed + 2));
+            if (screen == PageCache.POINT) {
+                assertEquals(0, cache.doorkeeperForTests().thriceKeysForTests(), "a point read started the third filter");
+            }
+
+            // The collector takes the array after some recalls: the reads from the file that follow cache the unit at
+            // the read a read from the file needs, or at the next if the recalls passed it
+            for (var recalls = 0; recalls <= needed; recalls++) {
+                var other = page(10 + recalls);
+                var each = screening(LIMIT);
+                var first = node(other, branch);
+                each.putScreened(other, first, screen);
+                for (var recall = 0; recall < recalls; recall++) {
+                    assertSame(first, each.recall(other, screen), "recall " + (recall + 1) + " of " + recalls);
+                    assertNull(each.peek(other), "recall " + (recall + 1) + " of " + recalls);
+                }
+                each.forgetRefusedForTests();
+                var reads = 1 + recalls;
+                while (reads < needed) {
+                    each.putScreened(other, node(other, branch), screen);
+                    reads++;
+                    assertNull(each.peek(other), "read " + reads + " from the file, after " + recalls + " recalls");
+                }
+                var cached = node(other, branch);
+                each.putScreened(other, cached, screen);
+                assertSame(cached, each.peek(other), "read " + (reads + 1) + ", from the file, after " + recalls + " recalls");
+            }
+        }
+
+        @Test
+        @DisplayName("starts no filter of the doorkeeper past those a read from the file needs as point reads recall leaves and branches of level 1 to their admission")
+        void pointRecallsFilters() {
+            var cache = screening(LIMIT);
+            var held = new ArrayList<byte[]>();
+            for (var i = 0; i < 64; i++) {
+                var leaf = unit(page(i));
+                held.add(leaf);
+                cache.putScreened(page(i), leaf, PageCache.POINT);
+                assertSame(leaf, cache.recall(page(i), PageCache.POINT));
+                assertSame(leaf, cache.recall(page(i), PageCache.POINT));
+                assertSame(leaf, cache.peek(page(i)), "leaf " + i);
+            }
+            var doorkeeper = cache.doorkeeperForTests();
+            assertEquals(0, doorkeeper.twiceKeysForTests(), "the recalls of point reads of leaves started the second filter");
+            assertEquals(0, doorkeeper.thriceKeysForTests());
+            for (var i = 100; i < 164; i++) {
+                var branch = node(page(i), true);
+                held.add(branch);
+                cache.putScreened(page(i), branch, PageCache.POINT);
+                for (var recall = 0; recall < 3; recall++) {
+                    assertSame(branch, cache.recall(page(i), PageCache.POINT));
+                }
+                assertSame(branch, cache.peek(page(i)), "branch " + i);
+            }
+            assertTrue(doorkeeper.twiceKeysForTests() > 0, "the second filter a point read's branch of level 1 asks for");
+            assertEquals(0, doorkeeper.thriceKeysForTests(), "the recalls of point reads of branches started the third filter");
+            assertEquals(128, held.size());
         }
 
         @Test
@@ -1001,7 +1099,7 @@ class PageCacheTest {
         }
 
         @Test
-        @DisplayName("caches once a unit that several scans miss three times at once, recalls included, and keeps the clock exact")
+        @DisplayName("caches once a unit that several scans miss four times at once, recalls included, and keeps the clock exact")
         void racingScans() throws Exception {
             var cache = screening(LIMIT);
             var failure = new AtomicReference<Throwable>();
@@ -1013,7 +1111,7 @@ class PageCacheTest {
                     threads.add(Thread.ofPlatform().start(() -> {
                         try {
                             start.await();
-                            for (var read = 0; read < 3; read++) {
+                            for (var read = 0; read < 4; read++) {
                                 if (cache.get(ref) == null && cache.recall(ref, PageCache.SCAN) == null) {
                                     cache.putScreened(ref, unit(ref), PageCache.SCAN);
                                 }
@@ -1028,7 +1126,7 @@ class PageCacheTest {
                     thread.join();
                 }
                 assertNull(failure.get());
-                assertNotNull(cache.peek(ref), "a unit every scan read three times, " + key);
+                assertNotNull(cache.peek(ref), "a unit every scan read four times, " + key);
             }
             assertEquals(200, cache.clockLengthForTests());
             assertEquals(200L * PageFormat.SIZE, cache.size());
@@ -1407,6 +1505,14 @@ class PageCacheTest {
     private static byte[] unit(PageRef ref) {
         var unit = new byte[ref.pages() * PageFormat.SIZE];
         PageFile.header(unit, PageFormat.LEAF, 0, ref.page(), ref.pages(), 0, ref.nonceHigh(), ref.nonceLow());
+        return unit;
+    }
+
+    /// A leaf, or a branch of level 1, with the header `ref` names.
+    private static byte[] node(PageRef ref, boolean branch) {
+        var unit = new byte[ref.pages() * PageFormat.SIZE];
+        PageFile.header(unit, branch ? PageFormat.BRANCH : PageFormat.LEAF, branch ? 1 : 0, ref.page(), ref.pages(), 0,
+                ref.nonceHigh(), ref.nonceLow());
         return unit;
     }
 
