@@ -179,6 +179,9 @@ public final class LiveLedger implements Ledger {
     private boolean replayingOpen;
     // The replayed puts of the open that wrote their value into the array of the version they replace, for tests
     private int replayedInPlace;
+    // The rooms the open's replay asked its runs' builders for ([ReplayValues#reserve(PackedRun.Builder, long)]), for
+    // tests
+    private int replayReservations;
     // Whether a prune left a chain that a later one may shorten, so the sweep has work; guarded by the publishing role
     private boolean sweepPending;
     // Whether the sweep's current pass over the store found such a chain
@@ -447,7 +450,7 @@ public final class LiveLedger implements Ledger {
         // The puts the queue lists, for the room of the commit's record
         var listed = new int[1];
         // The writes that may go to chains, which size the applier's list of the keys the commit touched: not those of
-        // a key space whose writes go to its run, nearly all of a long log's
+        // a key space whose writes go to its run, nearly all of a long log's, but all of one that replays to chains
         var chained = new int[1];
         // The kinds and key spaces of the writes alone, with no slice of a key or a value
         FrameBody.readCommitKinds(body, start, length, new FrameBody.KindVisitor() {
@@ -459,7 +462,7 @@ public final class LiveLedger implements Ledger {
                     return;
                 }
                 var blind = replayHint(state) == TreeSearch.BLIND;
-                if (!blind || !moves) {
+                if (!blind || !moves || values.toChains(state)) {
                     chained[0]++;
                 }
                 if (blind && queue != null && !moves) {
@@ -471,7 +474,7 @@ public final class LiveLedger implements Ledger {
             public void remove(int keyspace) {
                 loadForReplay(keyspace);
                 var state = byId.get(keyspace);
-                if (state != null && (!moves || replayHint(state) != TreeSearch.BLIND)) {
+                if (state != null && (!moves || replayHint(state) != TreeSearch.BLIND || values.toChains(state))) {
                     chained[0]++;
                 }
             }
@@ -599,7 +602,9 @@ public final class LiveLedger implements Ledger {
                     }
                     return;
                 }
-                var at = replayPaged(applier, state, key, value, values, replayHint(state, key, values));
+                // The key's hash, when the run's lookup took it, serves the claim of its chain too
+                var chain = moves ? applier.claim(state, key, hash) : applier.claim(state, key);
+                var at = replayPaged(applier, state, chain, key, value, values, replayHint(state, key, values));
                 if (queue != null && !moves) {
                     if (record[0] == null) {
                         record[0] = queue.record(sequence, listed[0]);
@@ -668,6 +673,7 @@ public final class LiveLedger implements Ledger {
             publishRun(state, values.stopRun(state));
         }
         values.end(spills);
+        replayReservations += values.reservations();
         // No write overwrites a version's array from now on
         replayingOpen = false;
     }
@@ -703,12 +709,13 @@ public final class LiveLedger implements Ledger {
     /// Applies a replayed put of `value`, a slice of a frame body, to `state`, a paged key space of a store with pages,
     /// on a copy the version keeps: in a chunk of `values`, or on an array of its own.
     ///
+    /// @param chain the chain of `key`, which the caller claimed ([Applier#claim(KeyspaceState, MemorySegment)])
+    ///
     /// @param inTree the state of `key` before the put, as [#replayHint(KeyspaceState, MemorySegment, ReplayValues)]
     ///               gives it
     /// @return where the copy starts in the chunk, or 0 on an array of its own
-    private static int replayPaged(Applier applier, KeyspaceState state, MemorySegment key, MemorySegment value,
-                                   ReplayValues values, byte inTree) {
-        var chain = applier.claim(state, key);
+    private static int replayPaged(Applier applier, KeyspaceState state, Chain chain, MemorySegment key,
+                                   MemorySegment value, ReplayValues values, byte inTree) {
         var length = Math.toIntExact(value.byteSize());
         if (!ReplayValues.shared(length)) {
             var own = Segments.toBytes(value);
@@ -781,6 +788,12 @@ public final class LiveLedger implements Ledger {
     /// ([Applier#replayedArray(Version, int)]); for tests}
     int replayedInPlaceForTests() {
         return replayedInPlace;
+    }
+
+    /// {@return the rooms the open's replay asked its runs' builders for ([ReplayValues#reserve(PackedRun.Builder,
+    /// long)]); for tests}
+    int replayReservationsForTests() {
+        return replayReservations;
     }
 
     /// Gives an id to every key space the store does not know yet.

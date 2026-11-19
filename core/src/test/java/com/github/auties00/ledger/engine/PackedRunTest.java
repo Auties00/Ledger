@@ -1377,6 +1377,7 @@ class PackedRunTest {
             var run = ledger.state(MESSAGES).run;
             assertNotNull(run, "the replay built no run");
             assertTrue(run.size() > ReplayValues.RESERVE_AT, "the run holds " + run.size() + " entries");
+            assertTrue(ledger.replayReservationsForTests() > 0, "the replay grew its run by doubling alone");
             var lengths = run.arrayLengthsForTests();
             assertEquals(run.size(), lengths[0]);
             assertEquals(run.size(), lengths[1]);
