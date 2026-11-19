@@ -532,6 +532,42 @@ class LogOutputSizeTest {
         survivesPowerLoss(disk, encrypted, model);
     }
 
+    @ParameterizedTest(name = "encrypted: {0}, spare kept: {1}")
+    @CsvSource({"true, true", "true, false", "false, true", "false, false"})
+    @DisplayName("keeps the write through's buffer for groups that alternate between one block and a few after a group too large for one write, while the output swings between a block and the spare")
+    void throughBufferAfterLargeGroup(boolean encrypted, boolean keep) throws Exception {
+        var disk = CrashFileSystem.create();
+        var model = new TreeMap<String, String>();
+        var allocations = new AtomicInteger();
+        var way = new WriteThrough(WriteThrough.Kind.DSYNC, null);
+        way.allocatorForTests = size -> {
+            allocations.incrementAndGet();
+            return Arena.ofAuto().allocate(size, LogWriter.ALIGNMENT);
+        };
+        try (var ledger = open(disk.getPath("/store"), encrypted, way)) {
+            var log = log(ledger);
+            log.keepSpareForTests = keep;
+            commit(ledger, model, "first", 500);
+            var commits = 0;
+            // Segments enough for a checkpoint to leave spares, which groups are written through into
+            while (log.currentSegment() < 8) {
+                commit(ledger, model, "w" + commits++, 500);
+            }
+            // A group too large for one write takes the output to its largest size, given back once it is durable
+            commitBatch(ledger, model, "big", 300, 4_000);
+            ledger.checkpoint();
+            var through = log.writtenThrough();
+            var allocationsBefore = allocations.get();
+            for (var i = 0; i < 200; i++) {
+                commit(ledger, model, "a" + i, i % 2 == 0 ? 500 : 6_000);
+            }
+            assertTrue(log.writtenThrough() - through >= 50, "groups written through: " + (log.writtenThrough() - through));
+            assertTrue(allocations.get() - allocationsBefore <= 1,
+                    "the write through's buffer was replaced " + (allocations.get() - allocationsBefore) + " times");
+        }
+        survivesPowerLoss(disk, encrypted, model);
+    }
+
     @ParameterizedTest(name = "encrypted: {0}")
     @CsvSource({"true", "false"})
     @DisplayName("goes back to one block after a large group once a run of small groups follows it, and not before")

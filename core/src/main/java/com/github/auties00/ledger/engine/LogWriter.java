@@ -1761,7 +1761,7 @@ final class LogWriter {
         lastDrainLength = used;
         while (throughFile != null) {
             try {
-                throughFile.write(output, used, output.length, start);
+                throughFile.write(output, used, start);
                 position = start + used;
                 used = 0;
                 forcedPosition = position;
