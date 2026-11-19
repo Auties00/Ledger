@@ -33,14 +33,17 @@ import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.function.IntUnaryOperator;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -1153,5 +1156,337 @@ class PackedRunTest {
             assertNull(ledger.state(CHATS).run, "a resident key space built a run");
             verify(ledger, expected);
         }
+    }
+
+    /// Puts message `id` into `builder`, stamped `stamp`: in the log for three of every four ids, at a body index of
+    /// `id` plus `generation` so an overwrite is told apart, and in `chunk` for the rest.
+    private static void putReserved(PackedRun.Builder builder, int id, long stamp, int generation, MemorySegment chunk) {
+        var key = key(id % 4, id);
+        if (id % 4 == 3) {
+            put(builder, key, stamp, chunk, id % 32, 8);
+        } else {
+            putLogged(builder, key, stamp, 64, id + generation, id, generation);
+        }
+    }
+
+    /// Puts `key` into `builder` as the replay does, a value of `length` bytes at `offset` of `chunk`, or none.
+    private static void put(PackedRun.Builder builder, byte[] key, long stamp, MemorySegment chunk, int offset, int length) {
+        builder.put(key, 0, key.length, Segments.hash(key, 0, key.length), stamp, chunk, offset, length);
+    }
+
+    /// Puts `key` into `builder` as the replay does, a value of 300 bytes in the log, at `bodyIndex` of the frame at
+    /// `frameOffset` of no segment, with the tag `tagHigh` and `tagLow`.
+    private static void putLogged(PackedRun.Builder builder, byte[] key, long stamp, long frameOffset, int bodyIndex,
+                                  long tagHigh, int tagLow) {
+        builder.putLogged(key, 0, key.length, Segments.hash(key, 0, key.length), stamp, null, frameOffset, bodyIndex,
+                tagHigh, tagLow, 300);
+    }
+
+    @Test
+    @DisplayName("a builder asked for room grows its arrays of the entries to it when they are next full and those of the logged values to their share, doubles after, never shrinks an array, and builds a run trimmed to its entries")
+    void builderReserves() {
+        var chunk = MemorySegment.ofArray(new byte[64]).asReadOnly();
+        var builder = new PackedRun.Builder();
+        var stamp = 0L;
+        for (var id = 0; id < 4_096; id++) {
+            putReserved(builder, id, stamp++, 0, chunk);
+        }
+        assertEquals(4_096, builder.capacity());
+        assertArrayEquals(new int[]{4_096, 4_096, 4_096, 4_096, 4_096}, builder.loggedLengthsForTests());
+        builder.reserve(10_000);
+        // Overwrites take no room, so the arrays wait for the next new key
+        putReserved(builder, 5, stamp++, 1, chunk);
+        assertEquals(4_096, builder.capacity());
+        putReserved(builder, 4_096, stamp++, 0, chunk);
+        assertEquals(10_000, builder.capacity());
+        // Three quarters of the entries were logged, and a sixteenth more
+        var share = 10_000 * 3_072 / 4_096 + 10_000 / 16;
+        assertArrayEquals(new int[]{share, share, share, share, share}, builder.loggedLengthsForTests());
+        for (var id = 4_097; id < 10_001; id++) {
+            putReserved(builder, id, stamp++, 0, chunk);
+        }
+        assertEquals(20_000, builder.capacity(), "the growth after the reserved one did not double");
+        for (var id = 10_001; id < 20_000; id++) {
+            putReserved(builder, id, stamp++, 0, chunk);
+        }
+        builder.reserve(5_000);
+        putReserved(builder, 20_000, stamp++, 0, chunk);
+        assertEquals(40_000, builder.capacity(), "room below the entries held did not leave the arrays to double");
+        var run = builder.build(null, null);
+        assertEquals(20_001, run.size());
+        var lengths = run.arrayLengthsForTests();
+        assertEquals(20_001, lengths[0]);
+        assertEquals(20_001, lengths[1]);
+        for (var i = 2; i < lengths.length; i++) {
+            assertEquals(15_001, lengths[i], "logged values trimmed");
+        }
+        for (var id = 0; id <= 20_000; id++) {
+            var entry = run.find(MemorySegment.ofArray(key(id % 4, id)));
+            assertTrue(entry >= 0, "lost key " + id);
+            var source = run.sourceForTests(entry);
+            if (id % 4 == 3) {
+                assertSame(chunk, source);
+            } else {
+                var logged = assertInstanceOf(LogValue.class, source);
+                var generation = id == 5 ? 1 : 0;
+                assertEquals(id + generation, logged.bodyIndex(), "body of " + id);
+                assertEquals(id, logged.tagHigh());
+                assertEquals(generation, logged.tagLow());
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("room for fewer logged values than a builder holds, left by overwrites of logged values with short ones, never shrinks their arrays")
+    void reserveKeepsOrphanedLoggedValues() {
+        var chunk = MemorySegment.ofArray(new byte[64]).asReadOnly();
+        var builder = new PackedRun.Builder();
+        var stamp = 0L;
+        for (var id = 0; id < 4_096; id++) {
+            putLogged(builder, key(id % 4, id), stamp++, 0, id, 0, 0);
+        }
+        // Each overwrite by a short value and then by a logged one leaves the first logged place unused
+        for (var id = 0; id < 4_096; id++) {
+            var key = key(id % 4, id);
+            put(builder, key, stamp++, chunk, 0, 8);
+            putLogged(builder, key, stamp++, 0, -id, 0, 0);
+        }
+        assertArrayEquals(new int[]{8_192, 8_192, 8_192, 8_192, 8_192}, builder.loggedLengthsForTests());
+        builder.reserve(6_000);
+        put(builder, key(0, 4_096), stamp, chunk, 0, 8);
+        assertEquals(6_000, builder.capacity());
+        assertArrayEquals(new int[]{8_192, 8_192, 8_192, 8_192, 8_192}, builder.loggedLengthsForTests());
+        var run = builder.build(null, null);
+        var lengths = run.arrayLengthsForTests();
+        assertEquals(4_097, lengths[0]);
+        assertEquals(4_097, lengths[1]);
+        for (var i = 2; i < lengths.length; i++) {
+            assertEquals(8_192, lengths[i]);
+        }
+        for (var id = 0; id < 4_096; id++) {
+            var logged = assertInstanceOf(LogValue.class, run.sourceForTests(run.find(MemorySegment.ofArray(key(id % 4, id)))));
+            assertEquals(-id, logged.bodyIndex());
+        }
+    }
+
+    /// A replay drawn as frames of the same length: the new keys and the overwrites each frame gives one run, the frames
+    /// the last budget holds, which give it none, and the most growths of its arrays from [ReplayValues#RESERVE_AT]
+    /// entries on.
+    record Reservation(String name, int frames, int budgetFrames, IntUnaryOperator fresh, IntUnaryOperator overwrites,
+                       int growths) {
+        @Override
+        public String toString() {
+            return name;
+        }
+    }
+
+    static Stream<Reservation> reservations() {
+        return Stream.of(
+                new Reservation("new keys at an even rate", 100, 0, _ -> 500, _ -> 0, 1),
+                new Reservation("new keys before the last budget", 100, 30, _ -> 500, _ -> 50, 1),
+                new Reservation("overwrites after a dense start", 100, 0, frame -> frame < 10 ? 1_000 : 0,
+                        frame -> frame < 10 ? 0 : 500, 1),
+                new Reservation("a key space first written half way", 100, 0, frame -> frame < 50 ? 0 : 1_000, _ -> 0, 1),
+                new Reservation("a sparse start before dense frames", 100, 0, frame -> frame < 50 ? 10 : 1_000, _ -> 0, 8),
+                new Reservation("one frame denser than the rest", 100, 0, frame -> frame == 0 ? 20_000 : 100, _ -> 0, 3),
+                new Reservation("past the entries a reservation multiplies by sixteen", 1_000, 0, _ -> 600, _ -> 0, 4));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("reservations")
+    @DisplayName("a run's builder, full from 4,096 entries on, grows to the entries the rest of the log is expected to give it at the rate of its frames so far, at least a quarter more and at most sixteen times up to the reservation's bound, and builds a run trimmed to its entries")
+    void replayReservesRuns(Reservation reservation) {
+        var frameBytes = 1L << 16;
+        var total = reservation.frames() * frameBytes;
+        var budget = reservation.budgetFrames() * frameBytes;
+        var values = new ReplayValues();
+        var state = new KeyspaceState(MESSAGES);
+        var random = new Random(reservation.frames());
+        var keys = 0;
+        var stamp = 0L;
+        var growths = 0;
+        for (var frame = 0; frame < reservation.frames(); frame++) {
+            var logFrom = total - frame * frameBytes;
+            if (logFrom <= budget) {
+                break;
+            }
+            values.reached(logFrom);
+            var fresh = reservation.fresh().applyAsInt(frame);
+            var writes = fresh + (keys == 0 ? 0 : reservation.overwrites().applyAsInt(frame));
+            for (var i = 0; i < writes; i++) {
+                var run = values.run(state);
+                var size = run.size();
+                var capacity = run.capacity();
+                var id = i < fresh ? keys++ : random.nextInt(keys);
+                var key = key(id % 4, id);
+                if (random.nextInt(10) == 0) {
+                    run.delete(key, 0, key.length, Segments.hash(key, 0, key.length), stamp++);
+                } else {
+                    put(run, key, stamp++, null, 0, 0);
+                }
+                if (run.capacity() != capacity) {
+                    assertEquals(capacity, size, "the arrays grew before they were full");
+                    var grown = run.capacity();
+                    assertTrue(grown >= capacity + capacity / 4, "grew from " + capacity + " to " + grown);
+                    if (capacity >= ReplayValues.RESERVE_AT) {
+                        growths++;
+                        assertTrue(grown <= Math.max(2L * capacity, Math.min(16L * capacity, ReplayValues.RESERVE_ENTRIES)),
+                                "grew from " + capacity + " to " + grown);
+                    } else {
+                        assertEquals(2 * capacity, grown, "a builder below the reservation's entries did not double");
+                    }
+                }
+                values.reserve(run, budget);
+            }
+        }
+        assertTrue(growths <= reservation.growths(), growths + " growths");
+        var run = values.stopRun(state).build(null, null);
+        assertEquals(keys, run.size());
+        var lengths = run.arrayLengthsForTests();
+        assertEquals(keys, lengths[0]);
+        assertEquals(keys, lengths[1]);
+        for (var id = 0; id < keys; id += 97) {
+            assertTrue(run.find(MemorySegment.ofArray(key(id % 4, id))) >= 0, "lost key " + id);
+        }
+    }
+
+    static Stream<Arguments> reservedRecoveries() {
+        return Stream.of(Arguments.of(true, "plateau"), Arguments.of(false, "plateau"), Arguments.of(true, "late"),
+                Arguments.of(false, "late"), Arguments.of(true, "sparse"), Arguments.of(false, "sparse"));
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}, {1}")
+    @MethodSource("reservedRecoveries")
+    @DisplayName("a store that loses power while its log holds runs of more than 4,096 entries, written densely then overwritten, late in the log or after a sparse start, recovers the state of a commit it made durable, and again after a second crash and a checkpoint")
+    void reservedRunsRecover(boolean encrypted, String shape) throws Exception {
+        var seed = shape.hashCode() + (encrypted ? 1 : 0);
+        var dry = CrashFileSystem.create();
+        var history = new ArrayList<Expected>();
+        var dense = new long[1];
+        var durable = reservedWorkload(dry.getPath("/store"), encrypted, shape, seed, history, dense);
+        assertEquals(history.size() - 1, durable, "the workload stopped on a file system that never stops");
+        var disk = CrashFileSystem.create();
+        var random = new Random(seed);
+        // A stop after the dense commits, once the log holds more than RESERVE_AT keys of the run
+        disk.stopAfter(dense[0] + random.nextLong(dry.changes() - dense[0] + 1));
+        history.clear();
+        durable = reservedWorkload(disk.getPath("/store"), encrypted, shape, seed, history, dense);
+        var survivor = disk.afterPowerLoss(new Random(random.nextLong()));
+        Expected after;
+        try (var ledger = open(survivor.getPath("/store"), encrypted, 0)) {
+            var run = ledger.state(MESSAGES).run;
+            assertNotNull(run, "the replay built no run");
+            assertTrue(run.size() > ReplayValues.RESERVE_AT, "the run holds " + run.size() + " entries");
+            var lengths = run.arrayLengthsForTests();
+            assertEquals(run.size(), lengths[0]);
+            assertEquals(run.size(), lengths[1]);
+            Expected match = null;
+            for (var commit = durable; commit < history.size() && match == null; commit++) {
+                if (matches(ledger, history.get(commit))) {
+                    match = history.get(commit);
+                }
+            }
+            if (match == null) {
+                fail("The store recovered a state no commit from " + durable + " to " + (history.size() - 1) + " left");
+            }
+            verify(ledger, match);
+            after = match.copy();
+            write(ledger, after, 1, 90_000, 20, 7);
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = open(survivor.getPath("/store"), encrypted, 0)) {
+            verify(ledger, after);
+            ledger.checkpoint();
+            assertNull(ledger.state(MESSAGES).run);
+            verify(ledger, after);
+        }
+        try (var ledger = open(survivor.getPath("/store"), encrypted, 0)) {
+            verify(ledger, after);
+        }
+    }
+
+    /// Runs the workload of `shape` on `directory`, adding the state after each commit to `history`, which starts with
+    /// the empty state, and closes the store without a checkpoint; stops at the first failure of the file system.
+    ///
+    /// @param dense where the changes of the file system stood once the dense commits were durable
+    /// @return the last commit the store made durable
+    private static int reservedWorkload(Path directory, boolean encrypted, String shape, int seed, List<Expected> history,
+                                        long[] dense) {
+        var random = new Random(seed);
+        var state = new Expected();
+        history.add(state.copy());
+        var durable = 0;
+        LiveLedger ledger = null;
+        try {
+            ledger = open(directory, encrypted, Long.MAX_VALUE);
+            var next = 0;
+            // The start: no commit, commits of texts alone, or commits of a few messages
+            for (var commit = 0; commit < 30 && !shape.equals("plateau"); commit++) {
+                var batch = ledger.newBatch();
+                var expected = state.copy();
+                for (var i = 0; i < 20; i++) {
+                    if (shape.equals("late")) {
+                        var text = text(commit * 20 + i, 0);
+                        batch.put(TEXTS, textKey(commit * 20 + i), text);
+                        expected.texts.put(textKey(commit * 20 + i), text);
+                    } else {
+                        var id = next++;
+                        var value = value(id, 0);
+                        batch.put(MESSAGES, key(id % 4, id), value);
+                        expected.put(key(id % 4, id), value);
+                    }
+                }
+                history.add(expected.copy());
+                ledger.commit(batch).awaitDurable();
+                state = expected;
+                durable = history.size() - 1;
+            }
+            // Dense commits of new keys
+            for (var commit = 0; commit < 16; commit++) {
+                var batch = ledger.newBatch();
+                var expected = state.copy();
+                for (var i = 0; i < 400; i++) {
+                    var id = next++;
+                    var value = value(id, 1);
+                    batch.put(MESSAGES, key(id % 4, id), value);
+                    expected.put(key(id % 4, id), value);
+                }
+                history.add(expected.copy());
+                ledger.commit(batch).awaitDurable();
+                state = expected;
+                durable = history.size() - 1;
+            }
+            dense[0] = ((CrashFileSystem) directory.getFileSystem()).changes();
+            // Overwrites and removals of the keys written, with no new key
+            for (var commit = 0; commit < (shape.equals("plateau") ? 24 : 4); commit++) {
+                var batch = ledger.newBatch();
+                var expected = state.copy();
+                for (var i = 0; i < 200; i++) {
+                    var id = random.nextInt(next);
+                    if (random.nextInt(8) == 0) {
+                        batch.delete(MESSAGES, key(id % 4, id));
+                        expected.delete(key(id % 4, id));
+                    } else {
+                        var value = value(id, 2 + commit);
+                        batch.put(MESSAGES, key(id % 4, id), value);
+                        expected.put(key(id % 4, id), value);
+                    }
+                }
+                history.add(expected.copy());
+                ledger.commit(batch).awaitDurable();
+                state = expected;
+                durable = history.size() - 1;
+            }
+            ledger.closeWithoutCheckpoint();
+        } catch (Exception | AssertionError failure) {
+            if (ledger != null) {
+                try {
+                    ledger.close();
+                } catch (RuntimeException _) {
+                    // The file system stopped: closing only lets go of the threads
+                }
+            }
+        }
+        return durable;
     }
 }

@@ -554,6 +554,13 @@ final class PackedRun {
         return lengths;
     }
 
+    /// {@return the lengths of the arrays of the entries and of the logged values, for tests: `keyEnds`, the words,
+    /// then the stamps, places, bodies and both parts of the tags of the logged values}
+    int[] arrayLengthsForTests() {
+        return new int[]{keyEnds.length, values.length, places.logStamps().length, places.logPlaces().length,
+                places.logBodies().length, places.tagHighs().length, places.tagLows().length};
+    }
+
     private int keyStart(int entry) {
         return keyStart(keyEnds, entry);
     }
@@ -817,6 +824,8 @@ final class PackedRun {
         private ArrayList<MemorySegment> homes;
         private int[] homeEntries;
         private MemorySegment lastHome;
+        // The entries the arrays of the entries grow to room for when they are next full, or 0 to double them
+        private int reserved;
 
         Builder() {
             this(FIRST_ENTRIES, FIRST_ENTRIES * 32L);
@@ -951,6 +960,29 @@ final class PackedRun {
             return size;
         }
 
+        /// {@return the entries the builder has room for before its arrays of the entries grow}
+        int capacity() {
+            return values.length;
+        }
+
+        /// {@return the lengths of the arrays of the logged values, for tests: their stamps, places, bodies and both
+        /// parts of their tags}
+        int[] loggedLengthsForTests() {
+            return new int[]{logStamps.length, logPlaces.length, logBodies.length, tagHighs.length, tagLows.length};
+        }
+
+        /// Makes the next growth of the arrays give them room for `capacity` entries in all, rather than for twice the
+        /// entries, if that is more than the builder holds then: the arrays of the entries take that room, and those of
+        /// the values in the log the share of it that the entries logged so far are of all the entries and a sixteenth
+        /// more, each group in one copy and only to more room than it has. The growths after that one double the arrays
+        /// again; a later call replaces the room an earlier one asked for before the arrays grew.
+        ///
+        /// The hash table keeps doubling as the entries fill it, and [#build] still trims every array to the entries
+        /// it holds, so the room changes only how many copies the arrays take on the way, not the run.
+        void reserve(int capacity) {
+            reserved = Math.min(capacity, MAX_ENTRIES);
+        }
+
         /// {@return whether [#putHome] takes a put of `key` of the `length` bytes at `offset` of `home`: the place of the
         /// value fits the word of an entry, and the builder has room}
         boolean fits(MemorySegment key, MemorySegment home, int offset, int length) {
@@ -1080,9 +1112,7 @@ final class PackedRun {
         private int place(int length) {
             var entry = size;
             if (entry == values.length) {
-                var capacity = 2 * entry;
-                keyEnds = Arrays.copyOf(keyEnds, capacity);
-                values = Arrays.copyOf(values, capacity);
+                growEntries();
             }
             var start = keyBytes;
             if ((start & KEY_OFFSET_MASK) + length > KEY_CHUNK) {
@@ -1112,6 +1142,27 @@ final class PackedRun {
                 grow();
             }
             return entry;
+        }
+
+        // Grows the arrays of the entries, full, to the room reserve asked for if that is more, and the arrays of the
+        // logged values to its logged share if that is more than their room; else doubles the arrays of the entries
+        private void growEntries() {
+            var capacity = reserved > size ? reserved : 2 * size;
+            keyEnds = Arrays.copyOf(keyEnds, capacity);
+            values = Arrays.copyOf(values, capacity);
+            if (reserved > size && logged > 0) {
+                // A sixteenth more than the share, which may grow; all of it when overwrites by short values left more
+                // logged values than entries
+                var loggedCapacity = (int) Math.min(capacity, (long) capacity * logged / size + capacity / 16);
+                if (loggedCapacity > logStamps.length) {
+                    logStamps = Arrays.copyOf(logStamps, loggedCapacity);
+                    logPlaces = Arrays.copyOf(logPlaces, loggedCapacity);
+                    logBodies = Arrays.copyOf(logBodies, loggedCapacity);
+                    tagHighs = Arrays.copyOf(tagHighs, loggedCapacity);
+                    tagLows = Arrays.copyOf(tagLows, loggedCapacity);
+                }
+            }
+            reserved = 0;
         }
 
         // Doubles the hash table, placing every entry again by the hash of its key
