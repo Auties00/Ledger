@@ -53,6 +53,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1417,6 +1418,15 @@ class WriteThroughTest {
         }
 
         /// Checks that every state a loss of power now could leave of `disk` holds `model`.
+        // The group was written from the largest output, which it gave back once durable with the queue empty
+        private static void assertLargestGivenBack(LogWriter log) {
+            assertEquals(LogWriter.ALIGNMENT, log.outputLength(), "the largest output was not given back");
+            var spare = log.spareOutputForTests();
+            assertNotNull(spare, "the group was not written from the largest output");
+            assertEquals(LogWriter.OUTPUT, spare.length);
+            log.dropSpareOutputForTests();
+        }
+
         private static void survivesPowerLoss(CrashFileSystem disk, boolean encrypted, Map<String, String> model) {
             for (var seed = 0; seed < 4; seed++) {
                 var survivor = disk.afterPowerLoss(new Random(seed));
@@ -1464,7 +1474,9 @@ class WriteThroughTest {
                 assertEquals(through + 1, log.writtenThrough(), "the small group was not written through");
                 assertEquals(allocated + 1, sizes.size(), "the buffer did not follow the output down");
                 assertEquals((long) LogWriter.ALIGNMENT, sizes.getLast());
-                // A medium group written through: the output grows to its bound, and the buffer with it once
+                // A medium group written through once the collector took the spare output: the output grows to its
+                // bound, and the buffer with it once
+                log.dropSpareOutputForTests();
                 commitBatch(ledger, model, "m", 32, 4_000, 0);
                 assertEquals(through + 2, log.writtenThrough(), "the medium group was not written through");
                 var medium = log.outputLength();
@@ -1532,6 +1544,7 @@ class WriteThroughTest {
             var model = new TreeMap<String, String>();
             try (var ledger = open(disk.getPath("/store"), encrypted, WriteThrough.Mode.DSYNC)) {
                 var log = log(ledger);
+                log.keepSpareForTests = true;
                 var fills = 0;
                 while (log.currentSegment() < 4) {
                     commitBatch(ledger, model, "f" + fills++ + "-", 64, 4_000, 0);
@@ -1551,7 +1564,7 @@ class WriteThroughTest {
                 assertEquals(LogWriter.ONE_WRITE, lastGroup(log));
                 assertEquals(through + 1, log.writtenThrough(), "the group of the most one write takes was not written through");
                 assertEquals(forces + 1, log.forces());
-                assertEquals(LogWriter.OUTPUT, log.outputLength());
+                assertLargestGivenBack(log);
                 survivesPowerLoss(disk, encrypted, model);
 
                 reachRoom(ledger, model, "q");
@@ -1561,7 +1574,7 @@ class WriteThroughTest {
                 assertEquals(LogWriter.ONE_WRITE + 1, lastGroup(log));
                 assertEquals(through, log.writtenThrough(), "a group past the most one write takes was written through");
                 assertEquals(forces + 1, log.forces(), "a group past the most one write takes was not forced once");
-                assertEquals(LogWriter.OUTPUT, log.outputLength());
+                assertLargestGivenBack(log);
                 survivesPowerLoss(disk, encrypted, model);
             }
             try (var reopened = open(disk.getPath("/store"), encrypted, WriteThrough.Mode.OFF)) {
