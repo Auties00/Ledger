@@ -90,7 +90,7 @@ class PoolHoldTest {
     }
 
     @Test
-    @DisplayName("the next body on chunks takes the chunks of the frame sealed before it, through collections while it fills, and the first collection after its release frees what is past the reserve")
+    @DisplayName("the next body on chunks takes the chunks of the frame sealed before it, through collections while it fills, and the first collection after its release frees them all, the reserve keeping none")
     void bodyKeepsChunks() {
         var pool = new HeapPool(64L << 20, false);
         var first = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
@@ -101,10 +101,11 @@ class PoolHoldTest {
         // The log seals the first frame while the next commit fills its body
         first.handOff();
         first.release();
-        assertEquals(8L * CHUNK, pool.overflowBytesForTests(), "the chunks past the reserve");
+        assertEquals(12L * CHUNK, pool.overflowBytesForTests(), "the chunks of a body of many, all in the overflow");
+        assertEquals(0, pool.reservedBytesForTests(), "the chunks of a body of many in the reserve");
         System.gc();
         System.gc();
-        assertEquals(8L * CHUNK, pool.overflowBytesForTests(), "a collection freed the chunks while a body held them");
+        assertEquals(12L * CHUNK, pool.overflowBytesForTests(), "a collection freed the chunks while a body held them");
         fillTo(next, 12 * CHUNK - 4_000);
         // The first chunk of the next body is a new one, taken before the first released its own
         var taken = chunks(next);
@@ -116,7 +117,114 @@ class PoolHoldTest {
         taken.clear();
         collectOverflow(pool);
         assertEquals(0, pool.overflowBytesForTests(), "a collection with no body open left the overflow");
-        assertEquals(HeapPool.RESERVE_PER_SIZE, pool.reservedBytesForTests());
+        assertEquals(0, pool.reservedBytesForTests(), "the chunks of the bodies the reserve kept");
+    }
+
+    @Test
+    @DisplayName("a body of one chunk gives it back to the reserve, and a body of more gives every chunk to the overflow alone")
+    void bodyChunksSkipReserve() {
+        var pool = new HeapPool(64L << 20, false);
+        pool.holdOverflowForTests(true);
+        var single = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
+        fillTo(single, CHUNK / 2);
+        assertEquals(1, single.chunkCount());
+        single.handOff();
+        single.release();
+        assertEquals(CHUNK, pool.reservedBytesForTests(CHUNK), "the chunk of a body of one");
+        assertEquals(0, pool.overflowBytesForTests());
+        // Starts on the chunk of the reserve
+        var body = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
+        fillTo(body, 4 * CHUNK - 4_000);
+        assertEquals(4, body.chunkCount());
+        var arrays = chunks(body);
+        body.handOff();
+        body.release();
+        assertEquals(0, pool.reservedBytesForTests(CHUNK), "the chunks of a body of four in the reserve");
+        assertEquals(4L * CHUNK, pool.overflowBytesForTests());
+        assertEquals(arrays, pool.freeForTests(CHUNK), "the chunks of the body, in the overflow");
+    }
+
+    @Test
+    @DisplayName("a batch's rope gives its chunks back to the overflow alone as it leaves it")
+    void ropeSkipsReserve() {
+        var pool = new HeapPool(64L << 20, false);
+        pool.holdOverflowForTests(true);
+        var batch = new ArrayWriteBatch(new Object(), pool, Map.of(MESSAGES.name(), MESSAGES));
+        var key = new byte[8];
+        for (var i = 0; batch.chunksForTests() < 4; i++) {
+            ByteBuffer.wrap(key).putInt(0, i);
+            batch.put(MESSAGES, key.clone(), new byte[10_000]);
+        }
+        var chunks = batch.chunksForTests();
+        var reserved = pool.reservedBytesForTests(CHUNK);
+        var overflow = pool.overflowBytesForTests();
+        batch.clear();
+        assertEquals(reserved, pool.reservedBytesForTests(CHUNK), "the rope's chunks in the reserve");
+        assertEquals(overflow + (long) chunks * CHUNK, pool.overflowBytesForTests(), "the rope's chunks in the overflow");
+    }
+
+    @Test
+    @DisplayName("a checkpoint gives the arrays it seals into to the overflow it holds: the reserve of no size grows by them, and the next window takes them again through collections")
+    void checkpointSkipsReserve() throws Exception {
+        var disk = CrashFileSystem.create();
+        var pool = HeapPool.process();
+        var armed = new AtomicBoolean();
+        var collections = new AtomicInteger();
+        var reused = new AtomicInteger();
+        var unit = 512 << 10;
+        try (var ledger = options(disk.getPath("/store")).build()) {
+            var key = new byte[8];
+            // Pages of a few KiB
+            for (var commit = 0; commit < 4; commit++) {
+                var batch = ledger.newBatch();
+                for (var i = 0; i < 500; i++) {
+                    ByteBuffer.wrap(key).putInt(0, commit * 1_000 + i);
+                    batch.put(MESSAGES, key.clone(), new byte[2_000]);
+                }
+                ledger.commit(batch).awaitDurable();
+            }
+            // Value units of 74 pages, sealed into arrays of 512 KiB, three to a window
+            var batch = ledger.newBatch();
+            for (var i = 0; i < 9; i++) {
+                ByteBuffer.wrap(key).putInt(0, 100_000 + i);
+                batch.put(MESSAGES, key.clone(), new byte[300_000]);
+            }
+            ledger.commit(batch).awaitDurable();
+            pool.watchForTests(new HeapPool.Watcher() {
+                @Override
+                public void acquired(byte[] array) {
+                    if (armed.get() && array.length == unit) {
+                        reused.incrementAndGet();
+                    }
+                }
+
+                @Override
+                public void released(byte[] array) {
+                    // A collection between two windows, as the checkpoint's own allocations start young ones
+                    if (armed.get() && array.length == unit && collections.get() < 3) {
+                        collections.incrementAndGet();
+                        System.gc();
+                    }
+                }
+            });
+            var before = new long[HeapPool.MAX_POOLED / 4_096 + 1];
+            for (var length = 4_096; length <= HeapPool.MAX_POOLED; length <<= 1) {
+                before[length / 4_096] = pool.reservedBytesForTests(length);
+            }
+            armed.set(true);
+            try {
+                ledger.checkpoint();
+            } finally {
+                armed.set(false);
+                pool.watchForTests(null);
+            }
+            assertTrue(collections.get() > 0, "the checkpoint sealed no value unit");
+            assertTrue(reused.get() >= 6, "the arrays of value units the later windows took again: " + reused.get());
+            for (var length = 4_096; length <= HeapPool.MAX_POOLED; length <<= 1) {
+                var after = pool.reservedBytesForTests(length);
+                assertTrue(after <= before[length / 4_096], "the reserve of " + length + " bytes grew from " + before[length / 4_096] + " to " + after);
+            }
+        }
     }
 
     @Test

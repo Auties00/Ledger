@@ -151,6 +151,19 @@ class HeapPoolTest {
         return arrays;
     }
 
+    /// Gives `count` new arrays of `length` bytes back to `pool` as a burst of work does.
+    ///
+    /// @return the arrays, by identity
+    private static List<byte[]> releaseNewBurst(HeapPool pool, int count, int length) {
+        var arrays = new ArrayList<byte[]>();
+        for (var i = 0; i < count; i++) {
+            var array = new byte[length];
+            arrays.add(array);
+            pool.releaseBurst(array);
+        }
+        return arrays;
+    }
+
     /// Runs collections until `pool` holds no overflow, at most 50.
     private static void collectOverflow(HeapPool pool) {
         for (var i = 0; i < 50 && pool.overflowBytesForTests() != 0; i++) {
@@ -178,6 +191,60 @@ class HeapPoolTest {
         releaseNew(pool, 64, HeapPool.MAX_POOLED);
         assertEquals(64L << 20, pool.pooledBytesForTests());
         Reference.reachabilityFence(hold);
+    }
+
+    @Test
+    @DisplayName("gives a burst's arrays to the overflow alone, within half the maximum for a size with its reserve and the maximum in all, and leaves the reserve as it is")
+    void releasesBurst() {
+        var pool = new HeapPool(6L << 20, false);
+        var hold = pool.hold();
+        var reserved = releaseNew(pool, 2, CHUNK);
+        assertEquals(2L * CHUNK, pool.reservedBytesForTests());
+        // Half the maximum for a size is 12 chunks, the reserve's 2 among them
+        var burst = releaseNewBurst(pool, 12, CHUNK);
+        assertEquals(2L * CHUNK, pool.reservedBytesForTests(), "the reserve after a burst");
+        assertEquals(10L * CHUNK, pool.overflowBytesForTests());
+        // A size with an empty reserve keeps it empty
+        releaseNewBurst(pool, 4, HeapPool.MAX_POOLED);
+        assertEquals(0, pool.reservedBytesForTests(HeapPool.MAX_POOLED));
+        assertEquals(10L * CHUNK + (3L << 20), pool.overflowBytesForTests(), "half the maximum of the longest arrays");
+        // The reserve's 512 KiB and the overflow's 5.5 MiB fill the maximum in all
+        releaseNewBurst(pool, 1, 64 << 10);
+        assertEquals(0, pool.reservedBytesForTests(64 << 10));
+        assertEquals(10L * CHUNK + (3L << 20), pool.overflowBytesForTests(), "an array past the maximum in all");
+        // The reserve's arrays first, then those of the burst it kept
+        for (var array : reserved) {
+            assertSame(array, pool.acquire(CHUNK), "an array of the reserve");
+        }
+        for (var i = 0; i < 10; i++) {
+            assertSame(burst.get(i), pool.acquire(CHUNK), "array " + i + " of the burst");
+        }
+        Reference.reachabilityFence(hold);
+    }
+
+    @Test
+    @DisplayName("keeps a burst's arrays through collections while the overflow is held, frees them at the first collection that finds no hold, and keeps the reserve")
+    void collectsBurst() {
+        var pool = new HeapPool(64L << 20, false);
+        var reserved = releaseNew(pool, 2, CHUNK);
+        var hold = pool.hold();
+        var burst = releaseNewBurst(pool, 6, CHUNK);
+        System.gc();
+        System.gc();
+        assertEquals(6L * CHUNK, pool.overflowBytesForTests(), "a collection freed a burst's arrays while the overflow was held");
+        var probe = new WeakReference<>(burst.getLast());
+        burst.clear();
+        Reference.reachabilityFence(hold);
+        hold = null;
+        for (var i = 0; i < 50 && probe.get() != null; i++) {
+            System.gc();
+        }
+        assertNull(probe.get(), "a collection with no hold left an array of the burst");
+        assertEquals(0, pool.overflowBytesForTests());
+        assertEquals(2L * CHUNK, pool.reservedBytesForTests());
+        for (var array : reserved) {
+            assertSame(array, pool.acquire(CHUNK), "a collection freed the reserve");
+        }
     }
 
     @Test
@@ -366,7 +433,7 @@ class HeapPoolTest {
     }
 
     @Test
-    @DisplayName("hands no array to two takers at once, nor keeps one free twice, across threads that hold, release past the reserve and trim while collections run")
+    @DisplayName("hands no array to two takers at once, nor keeps one free twice, across threads that hold, release past the reserve or as a burst and trim while collections run")
     void concurrent() throws Exception {
         var pool = new HeapPool(32L << 20, false);
         Set<byte[]> out = ConcurrentHashMap.newKeySet();
@@ -398,7 +465,12 @@ class HeapPoolTest {
                                 failures.add("an array written while out");
                             }
                             out.remove(array);
-                            pool.release(array);
+                            // A burst gives its arrays back to the overflow it holds
+                            if (hold != null && random.nextBoolean()) {
+                                pool.releaseBurst(array);
+                            } else {
+                                pool.release(array);
+                            }
                         }
                         Reference.reachabilityFence(hold);
                     }

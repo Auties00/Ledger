@@ -297,6 +297,11 @@ final class FrameBody {
     /// Gives the body's pooled arrays back to its pool, once the log sealed its frame and never reads it again; a body
     /// made without a pool keeps its array, and the arrays a body refers to are never the pool's. A second call does
     /// nothing.
+    ///
+    /// The chunks of a body of more than one go to the pool's overflow alone ([HeapPool#releaseBurst(byte\[\])]),
+    /// which the body holds until they are all back: the next large body takes them from there, and once no work
+    /// holds the overflow the first collection frees them, where the pool's reserve would keep a large commit's
+    /// chunks after it. A body of one array gives it back to the reserve, for the small commits that follow.
     void release() {
         var pooled = this.pooled;
         if (pooled == null || pooled.state == RELEASED) {
@@ -304,9 +309,14 @@ final class FrameBody {
         }
         pooled.state = RELEASED;
         if (pooled.chunks != null) {
+            var burst = pooled.chunkCount > 1;
             for (var i = 0; i < pooled.chunkCount; i++) {
                 assert poison(pooled.chunks[i]);
-                pooled.pool.release(pooled.chunks[i]);
+                if (burst) {
+                    pooled.pool.releaseBurst(pooled.chunks[i]);
+                } else {
+                    pooled.pool.release(pooled.chunks[i]);
+                }
             }
             pooled.chunks = null;
             pooled.chunkCount = 0;
