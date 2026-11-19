@@ -273,7 +273,7 @@ class ValueUnitsTest {
     }
 
     /// Takes every free array out of `pool`, failing if one is there twice.
-    private static void assertNoArrayTwice(HeapPool pool) {
+    static void assertNoArrayTwice(HeapPool pool) {
         Set<byte[]> seen = Collections.newSetFromMap(new IdentityHashMap<>());
         for (var shift = 12; shift <= 20; shift++) {
             while (true) {

@@ -35,9 +35,14 @@ final class PageFile implements AutoCloseable {
     static final int READ_CHANNELS = 8;
     /// The most pages [#readAll(List, byte, int)] and [#prefetch(PageRef\[\], int, int\[\])] read with one call.
     static final int RUN_PAGES = 64;
-    private static final int STAGED_LIMIT = 8 << 20;
     // The staged bytes a flush seals before it writes them, which bounds the sealed arrays it holds at once
     private static final long SEAL_WINDOW = 1 << 20;
+    // The queued bytes from which a writer flushes, two seal windows. They count the pages of every queued unit, value
+    // units included, and so bound from above the plaintext of the queued leaves, branches and delta pages, which a
+    // value unit does not add to until it is sealed. A gathered write never spans more than a window, so a longer queue
+    // would only sort more units before writing them, while it kept their plaintext alive long enough for collections
+    // to promote it
+    private static final long STAGED_LIMIT = 2 * SEAL_WINDOW;
     // The bytes a checkpoint writes from which it forces them beside its work, as the device takes them, instead of
     // all at once before its superblock: forced at the end, the writes of a checkpoint that rewrites hundreds of
     // megabytes kept the device idle while it built them, then made it wait seconds for them
@@ -1246,7 +1251,7 @@ final class PageFile implements AutoCloseable {
                 }
                 stagedBytes += (long) entry.ref().pages() * PageFormat.SIZE;
                 if (stagedBytes >= STAGED_LIMIT) {
-                    flush();
+                    flushQueued(false);
                 }
             }
         }
@@ -1292,14 +1297,18 @@ final class PageFile implements AutoCloseable {
         /// The units leave the queue once they are written, so a read of one meanwhile still finds it there.
         void flush() throws IOException {
             synchronized (lock) {
-                flushQueued();
+                flushQueued(true);
             }
         }
 
-        private void flushQueued() throws IOException {
+        /// Seals and writes the queued units in the order of their pages, a [#SEAL_WINDOW] at a time.
+        ///
+        /// Unless `all`, a last window shorter than [#SEAL_WINDOW] that follows others stays queued for the next flush:
+        /// written now, its few units would take a write of their own and a seal on one thread.
+        private void flushQueued(boolean all) throws IOException {
             var entries = new ArrayList<>(staged.values());
-            // A window at a time: sealing all the staged units before writing any left the pool holding a whole flush
-            // of sealed arrays, 8 MiB, from one checkpoint to the next
+            var flushed = 0L;
+            var kept = -1;
             for (var from = 0; from < entries.size(); ) {
                 var to = from;
                 var bytes = 0L;
@@ -1307,12 +1316,21 @@ final class PageFile implements AutoCloseable {
                     bytes += (long) entries.get(to).ref().pages() * PageFormat.SIZE;
                     to++;
                 }
+                if (!all && from > 0 && to == entries.size() && bytes < SEAL_WINDOW) {
+                    kept = from;
+                    break;
+                }
                 flushWindow(entries.subList(from, to));
+                flushed += bytes;
                 from = to;
             }
-            written += stagedBytes;
-            staged.clear();
-            stagedBytes = 0;
+            written += flushed;
+            stagedBytes -= flushed;
+            if (kept == -1) {
+                staged.clear();
+            } else {
+                staged.headMap(entries.get(kept).ref().page()).clear();
+            }
             forceBeside();
         }
 

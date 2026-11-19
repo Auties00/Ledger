@@ -607,7 +607,7 @@ class CheckpointSaturationTest {
         @Test
         @DisplayName("writes more than a flush holds and reads its own leaves back from the file")
         void crossesAFlush(@TempDir Path directory) throws Exception {
-            // About 13 MiB of leaves, past the 8 MiB a writer queues before it flushes
+            // About 13 MiB of leaves, past the 2 MiB a writer queues before it flushes
             var keys = 70_000;
             try (var tree = new Tree(directory, 64 * MIB)) {
                 tree.apply(ops(0, keys, 1, 150), tree.unsaturated());
@@ -632,10 +632,12 @@ class CheckpointSaturationTest {
         @Test
         @DisplayName("gives none of the plaintext of the leaves it leaves out to the pool")
         void noPooledPlaintext(@TempDir Path directory) throws Exception {
-            try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
+            // Leaves under the 2 MiB a writer queues before it flushes, so every unit of the update is still queued
+            var keys = KEYS / 4;
+            try (var tree = new Tree(directory, 64 * MIB).filled(keys)) {
                 var writer = tree.unsaturated();
                 var update = new TreeUpdate(tree.pages, writer, tree.space);
-                var root = update.apply(tree.root, ops(0, KEYS, 1, 160), List.of());
+                var root = update.apply(tree.root, ops(0, keys, 1, 160), List.of());
                 update.finishDeltas(tree.deltas);
                 var plaintext = Collections.newSetFromMap(new IdentityHashMap<byte[], Boolean>());
                 var leaves = new ArrayList<PageRef>();
@@ -871,7 +873,7 @@ class CheckpointSaturationTest {
         void failsAfterAFlush(boolean clear) throws Exception {
             var disk = CrashFileSystem.create();
             var path = disk.getPath("/store");
-            // About 12 MiB of leaves, past the 8 MiB a checkpoint queues before it flushes
+            // About 12 MiB of leaves, past the 2 MiB a checkpoint queues before it flushes
             var keys = 11_000;
             try (var ledger = options(path).build()) {
                 var live = (LiveLedger) ledger;
@@ -889,7 +891,7 @@ class CheckpointSaturationTest {
                     }
                 });
                 assertThrows(LedgerIoException.class, ledger::checkpoint);
-                // Each flush writes a window of 1 MiB at a time at least: more than 8 writes took two flushes
+                // A write holds a window of 1 MiB at most, so the leaves took more than 8: the checkpoint flushed at its limit
                 assertTrue(writes.get() > 8, "the checkpoint wrote " + writes.get() + " times");
                 disk.intercept((_, _) -> {
                 });

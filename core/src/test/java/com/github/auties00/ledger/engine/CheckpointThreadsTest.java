@@ -72,7 +72,7 @@ class CheckpointThreadsTest {
             write(ledger, count, 1, before);
             ledger.checkpoint();
             write(ledger, count, step, after);
-            // The third write: the first flush happens with the update under way, once 8 MiB are queued
+            // The third write: the first flushes happen with the update under way, once 2 MiB are queued
             failAfter.set(3);
             assertThrows(LedgerIoException.class, ledger::checkpoint);
             var atFailure = writes.get();
