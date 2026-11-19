@@ -39,7 +39,10 @@ import java.util.concurrent.atomic.AtomicLong;
 ///
 /// Units follow [PageFormat], kind [PageFormat#EXTERNAL], sealed under a key of their own. A unit's nonce is the store's
 /// epoch, which grows with every open and is made durable before the open's first unit, then a counter: no nonce
-/// repeats under the key, and whatever refers to a unit records it, so a unit left in reused pages fails the check.
+/// repeats under the key, and whatever refers to a unit records it, so a unit left in reused pages fails the check. A
+/// store that encrypts writes its units in format [PageFormat#CLOSE_TAG], whose tag follows the content, so a read
+/// opens the content alone, straight into the array it returns; its readers read units of the first format, which an
+/// earlier build wrote, as well.
 ///
 /// It is safe for concurrent use.
 final class BlobFile implements AutoCloseable {
@@ -78,6 +81,9 @@ final class BlobFile implements AutoCloseable {
     private volatile boolean epochTaken;
     // Runs before each read of a unit from the file, or null; for tests that race a read with what frees its unit
     private volatile Runnable readHookForTests;
+    // Whether a store that encrypts writes its units in the first format, as a build before CLOSE_TAG did; for tests
+    // of files that hold both
+    private volatile boolean firstFormatForTests;
 
     private BlobFile(Path path, FileChannel channel, PageCipher cipher, PageCache cache, HeapPool pool, FreeSpace space) throws IOException {
         this.path = path;
@@ -173,6 +179,9 @@ final class BlobFile implements AutoCloseable {
             }
             var header = new byte[PageFormat.HEADER];
             PageFile.header(header, PageFormat.EXTERNAL, 0, ref.page(), pages, length, ref.nonceHigh(), ref.nonceLow());
+            if (cipher.encrypts() && !firstFormatForTests) {
+                header[PageFormat.FORMAT] = PageFormat.CLOSE_TAG;
+            }
             var position = new long[]{PageFormat.offset(ref.page())};
             cipher.seal(header, value, offset, length, pages, buffer, (bytes, count) -> {
                 var start = position[0];
@@ -253,16 +262,17 @@ final class BlobFile implements AutoCloseable {
     ///
     /// The unit comes from the page cache or the file, which screens it as `screen` asks: a point read's is taken at
     /// its second read, if the cache [holds][PageCache#holds(long)] units of its size, so a value read once leaves
-    /// nothing reachable. In a store that encrypts, a unit above [HeapPool#MAX_POOLED] that the cache does not take is
-    /// read and opened into arrays of the pool's large spares ([HeapPool#acquireLarge(int)]), which go back once the
-    /// value is copied out, so the read allocates no array but the caller's; it is never kept weakly for a
-    /// [recall][PageCache#recall(long, PageRef, int)], since a later read writes the spare. In a store without
-    /// encryption such a unit is read straight into the caller's array, its header and the bytes past its content into
-    /// an array of the pool, and its checksum checked over the three ([#readContent(PageRef, int)]); one the cache
-    /// takes is read into a large spare, which is its plaintext once its checksum matches. A spare the cache takes is
-    /// zeroed past the unit's tag first, so the cache holds no byte of the unit an earlier read, of this store or of
-    /// another that shares the pool, opened into it. A value that a version names and one that a leaf of a tree points
-    /// to copy out the same way.
+    /// nothing reachable. The cache's verdict comes before the read, so a unit above [HeapPool#MAX_POOLED] that the
+    /// cache does not take is read for the caller's array alone, and never kept weakly for a
+    /// [recall][PageCache#recall(long, PageRef, int)]: in a store that encrypts, it is read up to its tag into one of the
+    /// pool's large spares ([HeapPool#acquireLarge(int)]), which goes back at the end, and its content opened straight
+    /// into the caller's array ([#openValue(PageRef, int)]); in one without encryption, it is read straight into the
+    /// caller's array, its header and the bytes past its content into an array of the pool, and its checksum checked
+    /// over the three ([#readContent(PageRef, int)]). One the cache takes is read into a large spare and opened into a
+    /// second, which the cache keeps, or, without encryption, is the spare it was read into once its checksum matches.
+    /// A spare the cache takes is zeroed past the unit's content first, so the cache holds no byte an earlier read, of
+    /// this store or of another that shares the pool, left in it. A value that a version names and one that a leaf of a
+    /// tree points to copy out the same way.
     ///
     /// @param screen the read's screening: [PageCache#UNSCREENED], [PageCache#POINT] or [PageCache#SCAN]
     /// @throws LedgerCorruptedException if the unit fails authentication, is not the one `ref` names, or does not
@@ -284,11 +294,9 @@ final class BlobFile implements AutoCloseable {
             return Segments.toBytes(held, PageFormat.HEADER, length);
         }
         var unitBytes = (long) ref.pages() * PageFormat.SIZE;
-        var encrypts = cipher.encrypts();
-        // Without encryption the cache's verdict comes first: a unit it does not take needs no array but the caller's
-        var admitted = !encrypts && cache.holds(unitBytes) && cache.admits(key, ref, screen);
-        if (!encrypts && !admitted) {
-            return readContent(ref, length);
+        // The cache's verdict comes first: a unit it does not take needs no array but the caller's
+        if (!cache.holds(unitBytes) || !cache.admits(key, ref, screen)) {
+            return cipher.encrypts() ? openValue(ref, length) : readContent(ref, length);
         }
         var plain = readUnit(ref, true, true);
         if (plain == null) {
@@ -300,18 +308,13 @@ final class BlobFile implements AutoCloseable {
             pool.releaseLarge(plain);
             throw exception;
         }
-        if (encrypts ? cache.holds(unitBytes) && cache.admits(key, ref, screen) : admitted) {
-            // A spare may be longer than the unit, and hold past the unit's tag the plaintext of an earlier read, of
-            // this store or of another that shares the pool: the cache keeps only bytes of this unit
-            Arrays.fill(plain, ref.pages() * PageFormat.SIZE - PageFormat.TAG, plain.length, (byte) 0);
-            // The cache holds it from now on, or drops it if it closed: never back to the spares, as readers may
-            // still read it
-            cache.put(key, ref, plain, true);
-            return Segments.toBytes(plain, PageFormat.HEADER, length);
-        }
-        var copy = Segments.toBytes(plain, PageFormat.HEADER, length);
-        pool.releaseLarge(plain);
-        return copy;
+        // A spare may be longer than the unit, and hold past the unit's content the bytes of an earlier read, of this
+        // store or of another that shares the pool: the cache keeps only bytes of this unit
+        Arrays.fill(plain, PageFormat.HEADER + length, plain.length, (byte) 0);
+        // The cache holds it from now on, or drops it if it closed: never back to the spares, as readers may still
+        // read it
+        cache.put(key, ref, plain, true);
+        return Segments.toBytes(plain, PageFormat.HEADER, length);
     }
 
     // Throws if `plain`, the plaintext of the unit `ref` names, does not hold a value of `length` bytes
@@ -421,13 +424,16 @@ final class BlobFile implements AutoCloseable {
     /// end unless it is the array returned (`spare`). Every array taken goes back if no channel can be taken. The
     /// channel reads at most [#BUFFER] bytes a call.
     ///
+    /// A unit of format [PageFormat#CLOSE_TAG] opens its content alone: an array of its own holds zeros past the
+    /// content, as the plaintext of a unit of the first format does up to its tag.
+    ///
     /// @param cached whether the unit is for the cache, and may end with its content
     /// @param spare whether a unit above [HeapPool#MAX_POOLED] kept whole comes back in an array of the pool's large
     ///              spares, which the caller gives back through [HeapPool#releaseLarge(byte\[\])] unless it hands it to
     ///              the cache: in a store that encrypts the unit is opened into a second spare, in one without
     ///              encryption the spare it was read into is returned once its checksum matches; such an array may be
-    ///              longer than the unit, and hold another unit's bytes past its tag, which the caller zeroes before
-    ///              the cache takes it
+    ///              longer than the unit, and hold past the unit's content, after its tag or past the end of its pages,
+    ///              the bytes of another read, which the caller zeroes before the cache takes it
     /// @throws LedgerIoException if the file cannot be read
     private byte[] readUnit(PageRef ref, boolean cached, boolean spare) {
         var hook = readHookForTests;
@@ -465,6 +471,19 @@ final class BlobFile implements AutoCloseable {
                 return null;
             }
             var keep = cached ? PageFormat.cachedLength(pages, content) : length;
+            if (cipher.encrypts() && sealed[PageFormat.FORMAT] == PageFormat.CLOSE_TAG) {
+                // Out of place, as below; a spare is left as it was past the content
+                var toSpare = spare && large && keep == length;
+                var plain = toSpare ? pool.acquireLarge(length) : new byte[keep];
+                System.arraycopy(sealed, 0, plain, 0, PageFormat.HEADER);
+                if (cipher.openContent(sealed, 0, content, plain, PageFormat.HEADER)) {
+                    return plain;
+                }
+                if (toSpare) {
+                    pool.releaseLarge(plain);
+                }
+                return null;
+            }
             if (spare && large && keep == length) {
                 if (!cipher.encrypts()) {
                     // Without encryption the bytes read are the plaintext, once their checksum matches
@@ -494,6 +513,83 @@ final class BlobFile implements AutoCloseable {
                     pool.release(sealed);
                 }
             }
+            if (interrupted[0]) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /// {@return the value of `length` bytes the unit `ref` names, above [HeapPool#MAX_POOLED], in a new array, read from
+    /// the file of a store that encrypts}
+    ///
+    /// The unit's header is read into one of the pool's large spares, which goes back at the end, and checked first. A
+    /// unit of format [PageFormat#CLOSE_TAG] is then read up to its tag into the same spare, and its content opened
+    /// straight into the array returned: the read takes one spare and copies nothing. A unit of the first format, whose
+    /// tag ends its pages, is read whole and opened into a second spare, out of which the value is copied; so is one of
+    /// either format whose header names another length, which is reported once the unit authenticates.
+    ///
+    /// @throws LedgerCorruptedException if the unit fails authentication, is not the one `ref` names, or does not hold
+    ///                                  `length` bytes
+    /// @throws LedgerIoException if the file cannot be read
+    private byte[] openValue(PageRef ref, int length) {
+        var hook = readHookForTests;
+        if (hook != null) {
+            hook.run();
+        }
+        var pages = ref.pages();
+        var unitBytes = pages * PageFormat.SIZE;
+        var position = PageFormat.offset(ref.page());
+        var sealed = pool.acquireLarge(unitBytes);
+        FileChannel taken;
+        try {
+            taken = channels.take();
+        } catch (RuntimeException | Error failure) {
+            pool.releaseLarge(sealed);
+            throw failure;
+        }
+        var through = new FileChannel[]{taken};
+        var interrupted = new boolean[1];
+        try {
+            if (!readFully(through, sealed, 0, PageFormat.HEADER, position, interrupted)) {
+                throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+            }
+            // The header is the additional data of the tag, so what it says holds once the unit authenticates
+            var content = Bytes.i32(sealed, PageFormat.LENGTH);
+            if (!ref.describes(sealed) || sealed[PageFormat.KIND] != PageFormat.EXTERNAL || !PageFormat.fits(pages, content)) {
+                throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+            }
+            var closeTag = sealed[PageFormat.FORMAT] == PageFormat.CLOSE_TAG;
+            if (closeTag && content == length) {
+                var value = new byte[length];
+                if (!readFully(through, sealed, PageFormat.HEADER, length + PageFormat.TAG, position + PageFormat.HEADER, interrupted)
+                        || !cipher.openContent(sealed, 0, length, value, 0)) {
+                    throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+                }
+                return value;
+            }
+            var rest = closeTag ? content + PageFormat.TAG : unitBytes - PageFormat.HEADER;
+            if (!readFully(through, sealed, PageFormat.HEADER, rest, position + PageFormat.HEADER, interrupted)) {
+                throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+            }
+            // Out of place, so the open runs the AES-GCM intrinsic that decrypts and authenticates in one pass
+            var plain = pool.acquireLarge(unitBytes);
+            try {
+                if (!(closeTag ? cipher.openContent(sealed, 0, content, plain, PageFormat.HEADER) : cipher.open(sealed, 0, pages, plain))) {
+                    throw new LedgerCorruptedException(path + " fails authentication at page " + ref.page(), null);
+                }
+                if (content != length) {
+                    throw new LedgerCorruptedException(path + " holds " + content + " bytes at page " + ref.page()
+                            + " for a value of " + length, null);
+                }
+                return Segments.toBytes(plain, PageFormat.HEADER, length);
+            } finally {
+                pool.releaseLarge(plain);
+            }
+        } catch (IOException exception) {
+            throw new LedgerIoException(path + " could not be read", exception);
+        } finally {
+            channels.give(through[0]);
+            pool.releaseLarge(sealed);
             if (interrupted[0]) {
                 Thread.currentThread().interrupt();
             }
@@ -706,6 +802,13 @@ final class BlobFile implements AutoCloseable {
     /// the commits and checkpoints that free its unit.
     void readHookForTests(Runnable hook) {
         this.readHookForTests = hook;
+    }
+
+    /// Makes a store that encrypts write the units that follow in the first format, whose tag ends the unit's pages,
+    /// as a build before [PageFormat#CLOSE_TAG] wrote them, or in format [PageFormat#CLOSE_TAG] again; for tests of
+    /// files that hold both.
+    void firstFormatForTests(boolean first) {
+        this.firstFormatForTests = first;
     }
 
     /// {@return the array the page cache holds for the unit `ref` names, or `null`; for tests}

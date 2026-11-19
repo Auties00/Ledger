@@ -12,6 +12,8 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.crypto.spec.SecretKeySpec;
@@ -34,6 +36,7 @@ import java.util.Random;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -638,12 +641,14 @@ class LargeValuesTest {
         }
 
         @Test
-        @DisplayName("a store caches a value read into a spare another store used for a longer unit with no byte of that unit past its own")
+        @DisplayName("a read the cache refuses gives back one spare and one it takes keeps a second, and a store caches a value read into spares another store's replay left with no byte of that store's unit past its own")
         void sparesCarryNoOtherUnit(@TempDir Path directory) throws Exception {
             HeapPool.forceRegionForTests(1 << 20);
             var pool = HeapPool.process();
+            // A spare of another length an earlier test left would take the slot of one of the first store's
+            pool.dropLargeSparesForTests();
             // Held strongly, so the spares the first store gives back are still there for the second
-            var released = Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<byte[], Boolean>()));
+            var released = Collections.synchronizedList(new ArrayList<byte[]>());
             pool.watchForTests(new HeapPool.Watcher() {
                 @Override
                 public void acquired(byte[] array) {
@@ -659,29 +664,37 @@ class LargeValuesTest {
             try {
                 // Both units round up to arrays of three regions of 1 MiB; the first fills nearly all of its array
                 var longer = value(150, (3 << 20) - 100_000);
-                try (var first = (LiveLedger) options(directory.resolve("first"), true).pageCache(256L << 20).build()) {
-                    first.commit(first.newBatch().put(FILES, "a", longer)).awaitDurable();
-                    assertArrayEquals(longer, first.get(FILES, "a").orElseThrow());
-                    assertNull(first.blobsForTests().cachedForTests(unit(first, "a")), "cached at its first read");
+                var first = (LiveLedger) options(directory.resolve("first"), true).pageCache(256L << 20).build();
+                first.commit(first.newBatch().put(FILES, "a", longer)).awaitDurable();
+                first.closeWithoutCheckpoint();
+                released.clear();
+                // The replay of the commit authenticates its unit into two spares, the second left with its plaintext
+                try (var reopened = open(directory.resolve("first"), true)) {
+                    assertArrayEquals(longer, reopened.get(FILES, "a").orElseThrow());
                 }
-                assertTrue(released.size() >= 2, "the first store's read gave back no spares");
                 var fromFirst = Collections.newSetFromMap(new IdentityHashMap<byte[], Boolean>());
                 fromFirst.addAll(released);
+                assertTrue(fromFirst.size() >= 2, "the first store's replay gave back " + fromFirst.size() + " spares");
                 var shorter = value(151, SMALL_LARGE + (1 << 20));
                 try (var second = (LiveLedger) options(directory.resolve("second"), true).pageCache(256L << 20).build()) {
                     second.commit(second.newBatch().put(FILES, "b", shorter)).awaitDurable();
-                    for (var round = 0; round < 2; round++) {
-                        assertArrayEquals(shorter, second.get(FILES, "b").orElseThrow(), "read " + round);
-                    }
                     var ref = unit(second, "b");
-                    var cached = second.blobsForTests().cachedForTests(ref);
+                    var blobs = second.blobsForTests();
+                    released.clear();
+                    assertArrayEquals(shorter, second.get(FILES, "b").orElseThrow(), "read 0");
+                    assertNull(blobs.cachedForTests(ref), "cached at its first read");
+                    assertEquals(1, released.size(), "spares given back by a read the cache refused");
+                    assertArrayEquals(shorter, second.get(FILES, "b").orElseThrow(), "read 1");
+                    var cached = blobs.cachedForTests(ref);
                     assertNotNull(cached, "not cached after two reads");
+                    assertEquals(2, released.size(), "spares given back by a read the cache took");
+                    assertFalse(released.stream().anyMatch(array -> array == cached), "the cache holds a spare the pool may hand out");
                     assertTrue(fromFirst.contains(cached), "the cache took no spare the first store used");
                     var unitBytes = ref.pages() * PageFormat.SIZE;
                     assertEquals(HeapPool.largeLength(unitBytes), cached.length);
                     assertTrue(cached.length > unitBytes + (512 << 10), "the spare is not longer than the unit");
-                    for (var at = unitBytes - PageFormat.TAG; at < cached.length; at++) {
-                        assertEquals(0, cached[at], "a byte past the unit's tag at " + at);
+                    for (var at = PageFormat.HEADER + shorter.length; at < cached.length; at++) {
+                        assertEquals(0, cached[at], "a byte past the unit's content at " + at);
                     }
                     assertArrayEquals(shorter, java.util.Arrays.copyOfRange(cached, PageFormat.HEADER, PageFormat.HEADER + shorter.length));
                 }
@@ -899,5 +912,263 @@ class LargeValuesTest {
                 }
             }
         }
+    }
+
+    @Nested
+    @DisplayName("unit formats")
+    class UnitFormats {
+        private static final Keyspace<String, byte[]> RESIDENT = Keyspace.resident("resident", KeyCodec.utf8(), ValueCodec.bytes());
+        // Above the pooled sizes, a unit of 513 pages
+        private static final int LARGE = (2 << 20) + 100;
+        private static final int SMALL = 20_000;
+
+        private static Ledger.Options cached(Path directory, boolean encrypted) {
+            return options(directory, encrypted).keyspace(RESIDENT).pageCache(256L << 20);
+        }
+
+        /// {@return the format byte of the unit `ref` names in the file of large values under `directory`}
+        private static byte format(Path directory, PageRef ref) throws IOException {
+            try (var channel = FileChannel.open(directory.resolve(BlobFile.FILE), StandardOpenOption.READ)) {
+                var header = ByteBuffer.allocate(PageFormat.HEADER);
+                channel.read(header, PageFormat.offset(ref.page()));
+                return header.get(PageFormat.FORMAT);
+            }
+        }
+
+        /// Flips the bits of the byte at `at` of the unit `ref` names in the file of large values under `directory`.
+        private static void flip(Path directory, PageRef ref, long at) throws IOException {
+            try (var channel = FileChannel.open(directory.resolve(BlobFile.FILE), StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                var position = PageFormat.offset(ref.page()) + at;
+                var bytes = ByteBuffer.allocate(1);
+                channel.read(bytes, position);
+                bytes.put(0, (byte) ~bytes.get(0));
+                channel.write(bytes.flip(), position);
+                channel.force(true);
+            }
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @ValueSource(booleans = {true, false})
+        @DisplayName("a store that encrypts writes its units with the tag after the content and zeros after the tag, one without encryption in the first format")
+        void writesFormat(boolean encrypted, @TempDir Path directory) throws Exception {
+            try (var ledger = (LiveLedger) cached(directory, encrypted).build()) {
+                for (var length : new int[]{SMALL, LARGE}) {
+                    ledger.commit(ledger.newBatch().put(FILES, "v" + length, value(length, length))).awaitDurable();
+                    var ref = Pending.unit(ledger, "v" + length);
+                    assertEquals(encrypted ? PageFormat.CLOSE_TAG : PageFormat.VERSION, format(directory, ref));
+                    if (encrypted) {
+                        try (var channel = FileChannel.open(directory.resolve(BlobFile.FILE), StandardOpenOption.READ)) {
+                            var after = PageFormat.HEADER + length + PageFormat.TAG;
+                            var zeros = ByteBuffer.allocate(ref.pages() * PageFormat.SIZE - after);
+                            channel.read(zeros, PageFormat.offset(ref.page()) + after);
+                            assertEquals(-1, zeros.flip().mismatch(ByteBuffer.allocate(zeros.remaining())), "a byte after the tag");
+                        }
+                    }
+                }
+            }
+        }
+
+        @Test
+        @DisplayName("a store holding units of both formats reads every one through misses, the cache and its hits, before a checkpoint, after it, after a crash and after a reopen")
+        void mixedFormats(@TempDir Path directory) throws Exception {
+            HeapPool.forceRegionForTests(1 << 20);
+            try {
+                var values = new LinkedHashMap<String, byte[]>();
+                var formats = new LinkedHashMap<String, Byte>();
+                var ledger = (LiveLedger) cached(directory, true).build();
+                for (var first : new boolean[]{true, false}) {
+                    ledger.blobsForTests().firstFormatForTests(first);
+                    var prefix = first ? "first-" : "close-";
+                    var batch = ledger.newBatch();
+                    for (var length : new int[]{SMALL, LARGE}) {
+                        var value = value(prefix.length() + length + (first ? 1 : 0), length);
+                        values.put(prefix + length, value);
+                        batch.put(FILES, prefix + length, value);
+                    }
+                    ledger.commit(batch).awaitDurable();
+                    for (var length : new int[]{SMALL, LARGE}) {
+                        var ref = Pending.unit(ledger, prefix + length);
+                        formats.put(prefix + length, format(directory, ref));
+                    }
+                    if (first) {
+                        // The first format's units are read from the tree's leaves, the others from the commit's versions
+                        for (var key : values.keySet()) {
+                            readThrice(ledger, key, values.get(key), true);
+                        }
+                        ledger.checkpoint();
+                    }
+                }
+                ledger.blobsForTests().firstFormatForTests(false);
+                assertEquals(PageFormat.VERSION, formats.get("first-" + SMALL));
+                assertEquals(PageFormat.VERSION, formats.get("first-" + LARGE));
+                assertEquals(PageFormat.CLOSE_TAG, formats.get("close-" + SMALL));
+                assertEquals(PageFormat.CLOSE_TAG, formats.get("close-" + LARGE));
+                ledger.clearPageCacheForTests();
+                for (var entry : values.entrySet()) {
+                    readThrice(ledger, entry.getKey(), entry.getValue(), entry.getKey().startsWith("close-"));
+                }
+                ledger.closeWithoutCheckpoint();
+                // The units of the second commit come back through the replay of the log
+                try (var reopened = (LiveLedger) cached(directory, true).build()) {
+                    for (var entry : values.entrySet()) {
+                        readThrice(reopened, entry.getKey(), entry.getValue(), false);
+                    }
+                }
+                try (var reopened = (LiveLedger) cached(directory, true).build()) {
+                    for (var entry : values.entrySet()) {
+                        readThrice(reopened, entry.getKey(), entry.getValue(), false);
+                    }
+                }
+                CheckpointTest.verifyPages(directory, true);
+            } finally {
+                HeapPool.forceRegionForTests(-1);
+            }
+        }
+
+        // Reads the value of `key` three times, as a miss the cache refuses, one it takes and a hit, and, when the
+        // commit's version names its unit, checks what the cache holds of a large one
+        private static void readThrice(LiveLedger ledger, String key, byte[] expected, boolean versioned) {
+            for (var read = 0; read < 3; read++) {
+                assertArrayEquals(expected, ledger.get(FILES, key).orElseThrow(), key + " at read " + read);
+            }
+            var view = ledger.readEncoded(FILES, key, segment -> segment.toArray(ValueLayout.JAVA_BYTE)).orElseThrow();
+            assertArrayEquals(expected, view, key + " as a view");
+            if (versioned && expected.length > HeapPool.MAX_POOLED) {
+                var cached = ledger.blobsForTests().cachedForTests(Pending.unit(ledger, key));
+                assertNotNull(cached, key + " is not cached after two reads");
+                assertArrayEquals(expected, java.util.Arrays.copyOfRange(cached, PageFormat.HEADER, PageFormat.HEADER + expected.length), key);
+                for (var at = PageFormat.HEADER + expected.length; at < cached.length; at++) {
+                    assertEquals(0, cached[at], key + " holds a byte past its content at " + at);
+                }
+            }
+        }
+
+        @ParameterizedTest(name = "{0} bytes")
+        @ValueSource(ints = {SMALL, LARGE})
+        @DisplayName("a store that encrypts reads a unit of the first format through a miss the cache refuses and one it takes, whose spare holds zeros past the content")
+        void firstFormat(int length, @TempDir Path directory) throws Exception {
+            HeapPool.forceRegionForTests(1 << 20);
+            var pool = HeapPool.process();
+            try (var ledger = (LiveLedger) cached(directory, true).build()) {
+                ledger.blobsForTests().firstFormatForTests(true);
+                var expected = value(170, length);
+                ledger.commit(ledger.newBatch().put(FILES, "v", expected)).awaitDurable();
+                var ref = Pending.unit(ledger, "v");
+                assertEquals(PageFormat.VERSION, format(directory, ref));
+                // Spares full of another read's bytes, which the cache must not keep
+                var unitBytes = ref.pages() * PageFormat.SIZE;
+                var junk = new ArrayList<byte[]>();
+                if (length > HeapPool.MAX_POOLED) {
+                    pool.dropLargeSparesForTests();
+                    for (var spare = 0; spare < HeapPool.LARGE_SPARES; spare++) {
+                        var array = pool.acquireLarge(unitBytes);
+                        java.util.Arrays.fill(array, (byte) 0x5A);
+                        junk.add(array);
+                    }
+                    junk.forEach(pool::releaseLarge);
+                }
+                readThrice(ledger, "v", expected, true);
+                if (length > HeapPool.MAX_POOLED) {
+                    var cached = ledger.blobsForTests().cachedForTests(ref);
+                    assertTrue(junk.stream().anyMatch(array -> array == cached), "the cache took no spare of another read");
+                }
+                assertEquals(PageFormat.VERSION, format(directory, ref));
+            } finally {
+                HeapPool.forceRegionForTests(-1);
+            }
+        }
+
+        @ParameterizedTest(name = "{0} bytes, resident: {1}")
+        @MethodSource("com.github.auties00.ledger.engine.LargeValuesTest#replays")
+        @DisplayName("recovery replays a durable commit whose large value is a unit with its tag after its content, into a resident and a paged key space")
+        void replays(int length, boolean resident, @TempDir Path directory) throws Exception {
+            var keyspace = resident ? RESIDENT : FILES;
+            var expected = value(180 + length, length);
+            var ledger = (LiveLedger) cached(directory, true).build();
+            ledger.commit(ledger.newBatch().put(NOTES, "before", "kept".getBytes())).awaitDurable();
+            ledger.commit(ledger.newBatch().put(keyspace, "v", expected)).awaitDurable();
+            ledger.closeWithoutCheckpoint();
+            try (var reopened = cached(directory, true).build()) {
+                assertArrayEquals("kept".getBytes(), reopened.get(NOTES, "before").orElseThrow());
+                assertArrayEquals(expected, reopened.get(keyspace, "v").orElseThrow());
+            }
+            try (var reopened = cached(directory, true).build()) {
+                assertArrayEquals(expected, reopened.get(keyspace, "v").orElseThrow());
+            }
+        }
+
+        @ParameterizedTest(name = "{0} bytes")
+        @ValueSource(ints = {SMALL, LARGE})
+        @DisplayName("ends the log at a last commit whose unit's tag was changed, as at a torn frame")
+        void tornTag(int length, @TempDir Path directory) throws Exception {
+            var ledger = (LiveLedger) cached(directory, true).build();
+            ledger.commit(ledger.newBatch().put(NOTES, "kept", "before".getBytes())).awaitDurable();
+            ledger.commit(ledger.newBatch().put(FILES, "lost", value(190, length))).awaitDurable();
+            var ref = Pending.unit(ledger, "lost");
+            ledger.closeWithoutCheckpoint();
+            flip(directory, ref, PageFormat.HEADER + length);
+            try (var reopened = cached(directory, true).build()) {
+                assertArrayEquals("before".getBytes(), reopened.get(NOTES, "kept").orElseThrow());
+                assertEquals(Optional.empty(), reopened.get(FILES, "lost"));
+                assertEquals(0, reopened.size(FILES));
+            }
+            CheckpointTest.verifyPages(directory, true);
+        }
+
+        @ParameterizedTest(name = "{0} bytes")
+        @ValueSource(ints = {SMALL, LARGE})
+        @DisplayName("refuses a log whose unit with a changed tag a later group follows: that commit was acknowledged")
+        void damagedTag(int length, @TempDir Path directory) throws Exception {
+            var ledger = (LiveLedger) cached(directory, true).build();
+            ledger.commit(ledger.newBatch().put(FILES, "damaged", value(191, length))).awaitDurable();
+            var ref = Pending.unit(ledger, "damaged");
+            ledger.commit(ledger.newBatch().put(NOTES, "later", "after".getBytes())).awaitDurable();
+            ledger.closeWithoutCheckpoint();
+            flip(directory, ref, PageFormat.HEADER + length);
+            assertThrows(LedgerCorruptedException.class, () -> cached(directory, true).build());
+        }
+
+        @ParameterizedTest(name = "{0} bytes, {1}")
+        @MethodSource("com.github.auties00.ledger.engine.LargeValuesTest#damages")
+        @DisplayName("a changed byte of a unit's header, content or tag fails its read as corruption, from the cache's miss and from a read it takes, and one of the zeros after the tag leaves it intact")
+        void damage(int length, String where, @TempDir Path directory) throws Exception {
+            var expected = value(192, length);
+            PageRef ref;
+            try (var ledger = (LiveLedger) cached(directory, true).build()) {
+                ledger.commit(ledger.newBatch().put(FILES, "v", expected)).awaitDurable();
+                ref = Pending.unit(ledger, "v");
+                ledger.checkpoint();
+            }
+            long at = switch (where) {
+                // A reserved byte, which no check but the tag's reads
+                case "header" -> 3;
+                case "length" -> PageFormat.LENGTH;
+                case "format" -> PageFormat.FORMAT;
+                case "content" -> PageFormat.HEADER + length / 2;
+                case "tag" -> PageFormat.HEADER + length + PageFormat.TAG / 2;
+                case "zeros" -> ref.pages() * PageFormat.SIZE - 1;
+                default -> throw new IllegalArgumentException(where);
+            };
+            flip(directory, ref, at);
+            try (var ledger = cached(directory, true).build()) {
+                for (var read = 0; read < 3; read++) {
+                    if (where.equals("zeros")) {
+                        assertArrayEquals(expected, ledger.get(FILES, "v").orElseThrow(), "read " + read);
+                    } else {
+                        var failure = assertThrows(LedgerCorruptedException.class, () -> ledger.get(FILES, "v"), "read " + read);
+                        assertTrue(failure.getMessage().contains("fails authentication"), failure::getMessage);
+                    }
+                }
+            }
+        }
+    }
+
+    static Stream<Arguments> replays() {
+        return Stream.of(UnitFormats.SMALL, UnitFormats.LARGE).flatMap(length -> Stream.of(true, false).map(resident -> Arguments.of(length, resident)));
+    }
+
+    static Stream<Arguments> damages() {
+        return Stream.of(UnitFormats.SMALL, UnitFormats.LARGE).flatMap(length -> Stream.of("header", "length", "format", "content", "tag", "zeros")
+                .map(where -> Arguments.of(length, where)));
     }
 }

@@ -22,9 +22,25 @@ package com.github.auties00.ledger.engine;
 ///     AES-GCM tag, 16 bytes; without encryption a CRC-32C of everything before it, then 12 zero bytes
 /// ```
 ///
-/// Every unit is of format [#VERSION], but a leaf or a branch of format [#INDEXED], which holds a search index between
-/// the offsets of its entries and the entries ([NodeIndex]). A reader finds the entries of either through their
-/// offsets, so the first format's readers read both, and a store holds nodes of both formats.
+/// Every unit of the data file is of format [#VERSION], but a leaf or a branch of format [#INDEXED], which holds a
+/// search index between the offsets of its entries and the entries ([NodeIndex]). A reader finds the entries of either
+/// through their offsets, so the first format's readers read both, and a store holds nodes of both formats.
+///
+/// A unit of the file of large values ([BlobFile]) in a store that encrypts is of format [#CLOSE_TAG], whose tag
+/// follows its content, so a reader opens the content alone, straight into an array of its length:
+///
+/// ```text
+///  0  header, as above, of format 3
+/// 32  content, encrypted
+///     AES-GCM tag, 16 bytes, over the header and the content
+///     zeros up to the end of the unit, which no tag covers and no reader reads
+/// ```
+///
+/// The format byte is in the header, the tag's additional data, so a unit read under the other format fails
+/// authentication. A store without encryption writes every unit of large values in the first format, and one that
+/// encrypts keeps the units of the first format an earlier build wrote, so the readers of the file read both. A build
+/// that reads only the first refuses the segments of a log this build wrote by their version
+/// ([LogWriter#SEGMENT_VERSION]), so it never replays a commit whose unit it would take for a torn one.
 ///
 /// The header is the additional data of the GCM tag, so a unit read at another position, or under another kind,
 /// fails authentication. The nonce of each unit is new (see [Checkpointer]), and whatever refers to a unit (a parent
@@ -41,6 +57,9 @@ final class PageFormat {
     static final byte VERSION = 1;
     /// The format of a leaf or a branch that holds a search index ([NodeIndex]).
     static final byte INDEXED = 2;
+    /// The format of a unit of the file of large values in a store that encrypts whose tag follows its content: the
+    /// content is sealed alone, and the bytes after the tag, up to the end of the unit, are zero and not authenticated.
+    static final byte CLOSE_TAG = 3;
 
     static final byte SUPERBLOCK = 1;
     static final byte LEAF = 2;
