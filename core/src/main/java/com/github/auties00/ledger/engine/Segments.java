@@ -206,6 +206,16 @@ final class Segments {
         return rest <= 0 ? 0 : tail(array, at, rest) << (Long.SIZE - Byte.SIZE * rest);
     }
 
+    /// {@return the 8 bytes at `at` of the `length` bytes at `from` of `array`, big-endian, zero past `length`: the word
+    /// [#word(byte\[\], int, int)] gives of an array that holds those bytes alone}
+    static long word(byte[] array, int from, int at, int length) {
+        if (at + Long.BYTES <= length) {
+            return Bytes.i64(array, from + at);
+        }
+        var rest = length - at;
+        return rest <= 0 ? 0 : tail(array, from + at, rest) << (Long.SIZE - Byte.SIZE * rest);
+    }
+
     /// {@return the 1 to 7 bytes at `from` of `segment`, as a big-endian number}
     private static long tail(MemorySegment segment, long from, int length) {
         var value = 0L;

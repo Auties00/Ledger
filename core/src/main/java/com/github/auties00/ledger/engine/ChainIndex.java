@@ -121,6 +121,36 @@ final class ChainIndex {
         }
     }
 
+    /// {@return the chain of the key of `hash` whose bytes are the `length` bytes at `from` of `array`, or `null` if the
+    /// index holds none}
+    ///
+    /// A lookup of a key that lies in a larger array, as [#get(byte\[\], int)] makes one of a key that is a whole array:
+    /// the replay's, of a key where it lies in its frame body.
+    Chain get(byte[] array, int from, int length, int hash) {
+        var segment = (Segment) SEGMENT_SLOTS.getAcquire(segments, segmentOf(hash));
+        if (segment == null) {
+            return null;
+        }
+        var table = segment.table;
+        var tags = table.tags;
+        var chains = table.chains;
+        var mask = tags.length - 1;
+        var tag = tag(hash);
+        for (var slot = slot(hash) & mask; ; slot = (slot + 1) & mask) {
+            var held = tags[slot];
+            if (held == 0) {
+                return null;
+            }
+            if (held == tag) {
+                // Null while an insertion that wrote the tag has not published its chain, which this lookup need not see
+                var chain = (Chain) SLOTS.getAcquire(chains, slot);
+                if (chain != null && chain.hash == hash && chain != TOMBSTONE && chain.keyEquals(array, from, length)) {
+                    return chain;
+                }
+            }
+        }
+    }
+
     /// {@return whether no segment holds a table of its own, so no lookup can find a chain}
     ///
     /// Like a lookup, it never hides a chain that was in the index when it was called and still is.

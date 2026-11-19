@@ -110,10 +110,11 @@ class ChainKeysTest {
         var stamp = 0L;
         // Keys of odd lengths first, so the others start at every offset of a word in the run's chunk
         for (var i = 0; i < 13; i++) {
-            builder.put(MemorySegment.ofArray(bytes(random, 41 + i)), stamp++, null, 0, 0);
+            var key = bytes(random, 41 + i);
+            builder.put(key, 0, key.length, Segments.hash(key), stamp++, null, 0, 0);
         }
         for (var key : keys) {
-            builder.put(MemorySegment.ofArray(key.clone()), stamp++, null, 0, 0);
+            builder.put(key, 0, key.length, Segments.hash(key), stamp++, null, 0, 0);
         }
         var run = builder.build(null, null);
         var slab = new KeySlab();
@@ -373,6 +374,58 @@ class ChainKeysTest {
             // Another form of the same key is the same key to the index
             for (var other : forms(slab, key, random)) {
                 assertSame(held.get(i), index.putIfAbsent(other));
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("hashes, reads in words, matches and finds in the hash index a key that lies at an unaligned offset of a larger array as the whole key")
+    void keysInLargerArrays() {
+        var random = new SplittableRandom(19);
+        var index = new ChainIndex();
+        var slab = new KeySlab();
+        var held = new ArrayList<Chain>();
+        var keys = keys(random);
+        for (var i = 0; i < 3_000; i++) {
+            keys.add(bytes(random, random.nextInt(LONGEST + 1)));
+        }
+        for (var key : keys) {
+            var forms = forms(slab, key, random);
+            var chain = forms.get(random.nextInt(forms.size()));
+            var found = index.putIfAbsent(chain);
+            held.add(found == null ? chain : found);
+        }
+        for (var i = 0; i < keys.size(); i++) {
+            var key = keys.get(i);
+            var from = random.nextInt(0, 24);
+            var larger = bytes(random, from + key.length + random.nextInt(0, 9));
+            System.arraycopy(key, 0, larger, from, key.length);
+            var hash = Segments.hash(MemorySegment.ofArray(key));
+            assertEquals(hash, Segments.hash(larger, from, key.length));
+            for (var at = 0; at <= key.length + Long.BYTES; at += Long.BYTES) {
+                assertEquals(Segments.word(key, at, key.length), Segments.word(larger, from, at, key.length));
+            }
+            assertSame(held.get(i), index.get(larger, from, key.length, hash));
+            for (var chain : forms(slab, key, random)) {
+                assertTrue(chain.keyEquals(larger, from, key.length));
+                // The same bytes one shorter, or with one more past them, are another key
+                if (key.length > 0) {
+                    assertFalse(chain.keyEquals(larger, from, key.length - 1));
+                }
+                if (from + key.length < larger.length) {
+                    assertFalse(chain.keyEquals(larger, from, key.length + 1));
+                }
+            }
+            // The chain of another key matches these bytes only if the keys are equal
+            var other = random.nextInt(keys.size());
+            assertEquals(Arrays.equals(key, keys.get(other)), held.get(other).keyEquals(larger, from, key.length));
+        }
+        for (var round = 0; round < 2_000; round++) {
+            var absent = bytes(random, random.nextInt(1, LONGEST + 1));
+            if (keys.stream().noneMatch(key -> Arrays.equals(key, absent))) {
+                var larger = new byte[absent.length + 5];
+                System.arraycopy(absent, 0, larger, 3, absent.length);
+                assertEquals(null, index.get(larger, 3, absent.length, Segments.hash(absent)));
             }
         }
     }

@@ -5,6 +5,7 @@ import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
+import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.ValueCodec;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -13,29 +14,50 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/// The open's replay overwriting in place the arrays of the resident versions of byte arrays it made itself: a key
-/// overwritten many times with values of the same and of other lengths reads its last value after the open, after a
-/// checkpoint and after a reopen; an array a read returned after the open is never written again; and the overwrite
-/// leaves alone the versions a unit of the file of large values holds, the versions the checkpoint loaded, those under
-/// a range removal, and those the background loader loads while the replay runs.
+/// The open's replay overwriting in place the arrays of the resident versions of byte arrays the open made, by its
+/// resident loader or by the replay itself: a key overwritten many times with values of the same and of other lengths
+/// reads its last value after the open, after a checkpoint and after a reopen; the first replayed put of a loaded key
+/// with the loaded value's length writes the loader's array; an array a read returned after the open is never written
+/// again; a store whose replay fails part way reads the data file's values at the next open; and the overwrite leaves
+/// alone the versions a unit of the file of large values holds and the arrays of a key space with a codec of its own.
+/// Range removals among the replayed writes, and removals of loaded keys put again, keep the counts.
 class ReplayResidentInPlaceTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, byte[]> SESSIONS = Keyspace.resident("sessions", KeyCodec.utf8(), ValueCodec.bytes());
     private static final Keyspace<String, String> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.utf8());
+    // Byte arrays under a codec of the user's, whose decoded value the store never takes for its encoding
+    private static final Keyspace<String, byte[]> CODED = Keyspace.resident("coded", KeyCodec.utf8(), ValueCodec.of(
+            value -> value.length,
+            (value, target) -> MemorySegment.copy(value, 0, target, ValueLayout.JAVA_BYTE, 0, value.length),
+            Segments::toBytes));
 
     private static Ledger open(Path directory, boolean encrypted, long largeValues, boolean atOpen) {
         return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
-                .keyspace(SESSIONS).keyspace(MESSAGES).checkpointEvery(1L << 40).largeValues(largeValues)
+                .keyspace(SESSIONS).keyspace(MESSAGES).keyspace(CODED).checkpointEvery(1L << 40).largeValues(largeValues)
                 .loadResidentAtOpen(atOpen))
                 .checkpointHeap(1L << 40)
                 .build();
@@ -53,11 +75,16 @@ class ReplayResidentInPlaceTest {
 
     /// Checks that `ledger` holds exactly `model` in [#SESSIONS].
     private static void check(Ledger ledger, TreeMap<String, byte[]> model) {
+        check(ledger, SESSIONS, model);
+    }
+
+    /// Checks that `ledger` holds exactly `model` in `keyspace`.
+    private static void check(Ledger ledger, Keyspace<String, byte[]> keyspace, TreeMap<String, byte[]> model) {
         for (var entry : model.entrySet()) {
-            assertArrayEquals(entry.getValue(), ledger.get(SESSIONS, entry.getKey()).orElse(null), entry.getKey());
+            assertArrayEquals(entry.getValue(), ledger.get(keyspace, entry.getKey()).orElse(null), entry.getKey());
         }
         var found = new TreeMap<String, byte[]>();
-        ledger.forEach(SESSIONS, KeyRange.all(), (key, value) -> {
+        ledger.forEach(keyspace, KeyRange.all(), (key, value) -> {
             found.put(key, value);
             return true;
         });
@@ -65,7 +92,72 @@ class ReplayResidentInPlaceTest {
         for (var entry : model.entrySet()) {
             assertArrayEquals(entry.getValue(), found.get(entry.getKey()), entry.getKey());
         }
-        assertEquals(model.size(), ledger.size(SESSIONS));
+        assertEquals(model.size(), ledger.size(keyspace));
+    }
+
+    /// Writes [#LOADED] keys of `keyspace` with values of 300 bytes and checkpoints them, then overwrites in durable
+    /// commits of a few writes the first 40 keys with values of 300 bytes, keys 40 to 49 with values of 301 bytes first
+    /// and of any length after, puts new keys, removes keys 50 and 51 and puts key 50 again; and crashes.
+    ///
+    /// @return the values the store holds, by key
+    private static TreeMap<String, byte[]> loadedThenOverwritten(Path directory, Keyspace<String, byte[]> keyspace,
+                                                                  boolean encrypted, boolean atOpen, Random random)
+            throws InterruptedException {
+        var model = new TreeMap<String, byte[]>();
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, atOpen)) {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < LOADED; i++) {
+                var value = value(random, 300);
+                batch.put(keyspace, loadedKey(i), value);
+                model.put(loadedKey(i), value);
+            }
+            ledger.commit(batch).awaitDurable();
+            ledger.checkpoint();
+            for (var commit = 0; commit < 120; commit++) {
+                var overwrites = ledger.newBatch();
+                if (commit == 0) {
+                    // Another length first, so the first replayed put of each key takes an array of its own
+                    for (var index = 40; index < 50; index++) {
+                        var value = value(random, 301);
+                        overwrites.put(keyspace, loadedKey(index), value);
+                        model.put(loadedKey(index), value);
+                    }
+                }
+                for (var i = 0; i < 3; i++) {
+                    var index = random.nextInt(50);
+                    var length = index < 40 || random.nextBoolean() ? 300 : 1 + random.nextInt(600);
+                    var value = value(random, length);
+                    overwrites.put(keyspace, loadedKey(index), value);
+                    model.put(loadedKey(index), value);
+                }
+                if (commit % 10 == 0) {
+                    var value = value(random, 300);
+                    overwrites.put(keyspace, "new" + commit, value);
+                    model.put("new" + commit, value);
+                }
+                if (commit == 30) {
+                    overwrites.delete(keyspace, loadedKey(50)).delete(keyspace, loadedKey(51));
+                    model.remove(loadedKey(50));
+                    model.remove(loadedKey(51));
+                }
+                if (commit == 60) {
+                    var value = value(random, 300);
+                    overwrites.put(keyspace, loadedKey(50), value);
+                    model.put(loadedKey(50), value);
+                }
+                overwrites.put(MESSAGES, "m" + commit, "message " + commit);
+                ledger.commit(overwrites).awaitDurable();
+            }
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+        }
+        return model;
+    }
+
+    // The keys the checkpoint holds before the replayed overwrites
+    private static final int LOADED = 2_000;
+
+    private static String loadedKey(int index) {
+        return "k%05d".formatted(index);
     }
 
     /// Overwrites a few keys `commits` times, each commit durable alone, with values whose lengths stay the same for
@@ -262,6 +354,227 @@ class ReplayResidentInPlaceTest {
             check(ledger, model);
             assertTrue(Arrays.equals(model.get("k00000"), ledger.get(SESSIONS, "k00000").orElseThrow()));
         }
+    }
+
+    @ParameterizedTest(name = "loaded at open: {0}, encrypted: {1}")
+    @CsvSource({"true, true", "false, true", "true, false", "false, false"})
+    @DisplayName("loaded keys overwritten with values of their length and of others, removed and put again, read their last values and keep the count after the open, a checkpoint and a reopen")
+    void loadedKeysOverwritten(boolean atOpen, boolean encrypted, @TempDir Path directory) throws Exception {
+        var model = loadedThenOverwritten(directory, SESSIONS, encrypted, atOpen, new Random(atOpen ? 7 : 8));
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, atOpen)) {
+            check(ledger, model);
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, !atOpen)) {
+            check(ledger, model);
+            ledger.checkpoint();
+            check(ledger, model);
+        }
+        try (var ledger = open(directory, encrypted)) {
+            check(ledger, model);
+        }
+    }
+
+    @Test
+    @DisplayName("a key space with a codec of its own reads the last values of loaded keys overwritten with values of their length")
+    void codecKeysOverwritten(@TempDir Path directory) throws Exception {
+        var model = loadedThenOverwritten(directory, CODED, true, false, new Random(9));
+        try (var ledger = open(directory, true)) {
+            check(ledger, CODED, model);
+            ledger.checkpoint();
+        }
+        try (var ledger = open(directory, true)) {
+            check(ledger, CODED, model);
+        }
+    }
+
+    @ParameterizedTest(name = "{0}, loaded at open: {1}")
+    @CsvSource({"sessions, true", "sessions, false", "coded, true", "coded, false"})
+    @DisplayName("the first replayed put of a loaded key of byte arrays with the loaded value's length writes the loader's array, and one of a key space with a codec of its own never does")
+    void loaderArraysReused(String name, boolean atOpen, @TempDir Path directory) throws Exception {
+        var keyspace = name.equals("sessions") ? SESSIONS : CODED;
+        // Each of KEYS loaded values overwritten once, with values of their length or one byte longer
+        var same = directory.resolve("same");
+        var longer = directory.resolve("longer");
+        var models = new ArrayList<TreeMap<String, byte[]>>();
+        for (var store : List.of(same, longer)) {
+            var random = new Random(12);
+            var model = new TreeMap<String, byte[]>();
+            try (var ledger = open(store, true, Long.MAX_VALUE, atOpen)) {
+                var batch = ledger.newBatch();
+                for (var i = 0; i < KEYS; i++) {
+                    var value = value(random, LENGTH);
+                    batch.put(keyspace, loadedKey(i), value);
+                    model.put(loadedKey(i), value);
+                }
+                ledger.commit(batch).awaitDurable();
+                ledger.checkpoint();
+                for (var i = 0; i < KEYS; i++) {
+                    var value = value(random, store == same ? LENGTH : LENGTH + 1);
+                    ledger.commit(ledger.newBatch().put(keyspace, loadedKey(i), value)).awaitDurable();
+                    model.put(loadedKey(i), value);
+                }
+                ((LiveLedger) ledger).closeWithoutCheckpoint();
+            }
+            models.add(model);
+        }
+        var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+        var allocated = new long[2];
+        for (var round = 0; round < 2; round++) {
+            for (var i = 0; i < 2; i++) {
+                var store = i == 0 ? same : longer;
+                var before = threads.getTotalThreadAllocatedBytes();
+                var ledger = open(store, true, Long.MAX_VALUE, atOpen);
+                // The second round, once both opens loaded their classes
+                allocated[i] = threads.getTotalThreadAllocatedBytes() - before;
+                try (ledger) {
+                    check(ledger, keyspace, models.get(i));
+                    ((LiveLedger) ledger).closeWithoutCheckpoint();
+                }
+            }
+        }
+        // The arrays the replay allocates for the longer values, and for the others only if it does not reuse
+        var saved = allocated[1] - allocated[0];
+        if (keyspace == SESSIONS) {
+            assertTrue(saved > KEYS * LENGTH * 3L / 4, "the replay reused " + saved + " bytes");
+        } else {
+            assertTrue(Math.abs(saved) < KEYS * LENGTH / 4L, "the replay reused " + saved + " bytes");
+        }
+    }
+
+    // The loaded keys of loaderArraysReused and the length of their values: the arrays a replay reuses take a megabyte,
+    // far above what the opens allocate otherwise apart
+    private static final int KEYS = 40;
+    private static final int LENGTH = 32 << 10;
+
+    @ParameterizedTest(name = "loaded at open: {0}, encrypted: {1}")
+    @CsvSource({"true, true", "false, true", "true, false"})
+    @DisplayName("a replayed range removal before puts of loaded keys with the loaded length keeps the values, the scan and the count, after a checkpoint and a reopen")
+    void rangeRemovalBeforeLoadedOverwrite(boolean atOpen, boolean encrypted, @TempDir Path directory) throws Exception {
+        var random = new Random(10);
+        var model = new TreeMap<String, byte[]>();
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, atOpen)) {
+            var batch = ledger.newBatch();
+            for (var prefix : new String[]{"a", "b", "c"}) {
+                for (var i = 0; i < 10; i++) {
+                    var value = value(random, 300);
+                    batch.put(SESSIONS, prefix + i, value);
+                    model.put(prefix + i, value);
+                }
+            }
+            ledger.commit(batch).awaitDurable();
+            ledger.checkpoint();
+            // Loaded keys outside the removal first, inside it after
+            for (var round = 0; round < 3; round++) {
+                var value = value(random, 300);
+                ledger.commit(ledger.newBatch().put(SESSIONS, "c" + round, value)).awaitDurable();
+                model.put("c" + round, value);
+            }
+            ledger.commit(ledger.newBatch().deleteRange(SESSIONS, KeyRange.between("a", "b"))).awaitDurable();
+            model.keySet().removeIf(key -> key.startsWith("a"));
+            for (var round = 0; round < 6; round++) {
+                for (var key : new String[]{"a" + round, "b" + round, "c" + (round + 3)}) {
+                    var value = value(random, 300);
+                    ledger.commit(ledger.newBatch().put(SESSIONS, key, value)).awaitDurable();
+                    model.put(key, value);
+                }
+            }
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, atOpen)) {
+            check(ledger, model);
+            ledger.checkpoint();
+            check(ledger, model);
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, !atOpen)) {
+            check(ledger, model);
+        }
+    }
+
+    @ParameterizedTest(name = "loaded at open: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("an open whose replay fails at a damaged frame after overwriting loaded arrays leaves the data file's values to the next open, with the frame restored or the log cut there")
+    void failedReplayKeepsTreeValues(boolean atOpen, @TempDir Path base) throws Exception {
+        var directory = base.resolve("store");
+        var random = new Random(11);
+        // The values after each commit, by the commit's sequence, and the checkpoint's
+        var states = new TreeMap<Long, TreeMap<String, byte[]>>();
+        var model = new TreeMap<String, byte[]>();
+        Path segment;
+        try (var ledger = open(directory, true, Long.MAX_VALUE, atOpen)) {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < 100; i++) {
+                var value = value(random, 300);
+                batch.put(SESSIONS, loadedKey(i), value);
+                model.put(loadedKey(i), value);
+            }
+            ledger.commit(batch).awaitDurable();
+            ledger.checkpoint();
+            for (var commit = 0; commit < 40; commit++) {
+                var key = loadedKey(random.nextInt(30));
+                var value = value(random, 300);
+                var done = ledger.commit(ledger.newBatch().put(SESSIONS, key, value));
+                done.awaitDurable();
+                model.put(key, value);
+                states.put(done.sequence(), new TreeMap<>(model));
+            }
+            segment = directory.resolve("log").resolve(LogWriter.segmentName(((LiveLedger) ledger).log().currentSegment()));
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+        }
+        // A copy of the crashed store, whose log is cut at the damaged frame below
+        var copy = base.resolve("cut");
+        copyTree(directory, copy);
+        var original = Files.readAllBytes(segment);
+        var frames = frames(original);
+        // A frame of a commit two thirds in, after many replayed overwrites, with forced frames after it
+        var sequences = new ArrayList<>(states.keySet());
+        var cut = sequences.get(sequences.size() * 2 / 3);
+        var at = frames.get(cut);
+        assertNotNull(at, "no frame of commit " + cut);
+        var damaged = original.clone();
+        damaged[at + LogWriter.FRAME_HEADER + 2] ^= 0x40;
+        Files.write(segment, damaged);
+        assertThrows(LedgerCorruptedException.class, () -> open(directory, true, Long.MAX_VALUE, atOpen));
+        assertThrows(LedgerCorruptedException.class, () -> open(directory, true, Long.MAX_VALUE, !atOpen));
+        Files.write(segment, original);
+        try (var ledger = open(directory, true, Long.MAX_VALUE, atOpen)) {
+            check(ledger, model);
+        }
+        // The log cut at the damaged frame: the commits before it, over the checkpoint's values
+        try (var channel = FileChannel.open(copy.resolve(directory.relativize(segment)), StandardOpenOption.WRITE)) {
+            channel.truncate(at);
+        }
+        var before = states.get(sequences.get(sequences.indexOf(cut) - 1));
+        try (var ledger = open(copy, true, Long.MAX_VALUE, atOpen)) {
+            check(ledger, before);
+        }
+    }
+
+    /// Copies the files under `from` to the same paths under `to`.
+    private static void copyTree(Path from, Path to) throws IOException {
+        try (var files = Files.walk(from)) {
+            for (var file : files.toList()) {
+                var target = to.resolve(from.relativize(file).toString());
+                if (Files.isDirectory(file)) {
+                    Files.createDirectories(target);
+                } else {
+                    Files.copy(file, target);
+                }
+            }
+        }
+    }
+
+    /// {@return where each commit frame of the log segment `bytes` starts, by the sequence its header names}
+    private static Map<Long, Integer> frames(byte[] bytes) {
+        var frames = new HashMap<Long, Integer>();
+        var buffer = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        for (var at = LogWriter.SEGMENT_HEADER; at + LogWriter.FRAME_HEADER <= bytes.length; at++) {
+            if (bytes[at] == 'L' && bytes[at + 1] == 'G' && bytes[at + 2] == 'F' && bytes[at + 3] == '1') {
+                frames.putIfAbsent(buffer.getLong(at + 8), at);
+            }
+        }
+        return frames;
     }
 
     @Test

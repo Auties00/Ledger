@@ -387,6 +387,25 @@ sealed class Chain permits Chain.Inline8 {
         return true;
     }
 
+    /// {@return whether the key's bytes are the `length` bytes at `from` of `array`}
+    ///
+    /// The lookup of a key that lies in a larger array, as a replayed write's lies in its frame body; kept apart from
+    /// [#keyEquals(byte\[\])], which every read by an array makes.
+    boolean keyEquals(byte[] array, int from, int length) {
+        if (keyChunk != null) {
+            return Segments.equal(keyChunk, keyOffset(), keyLength(), MemorySegment.ofArray(array), from, length);
+        }
+        if (keyLength() != length) {
+            return false;
+        }
+        for (var at = 0; at < length; at += Long.BYTES) {
+            if (inlineWord(at >>> 3) != Segments.word(array, from, at, length)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /// {@return whether the keys of `left` and `right` are equal}
     static boolean sameKey(Chain left, Chain right) {
         if (left.keyChunk != null && right.keyChunk != null) {
