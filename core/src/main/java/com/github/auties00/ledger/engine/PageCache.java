@@ -131,12 +131,18 @@ final class PageCache implements IdleTicker.Watched {
     private static final int RECORDS = 2;
     /// The least bytes [#admission()] gives while the limit allows it: 4,096 leaves.
     private static final long MIN_ADMISSION = 16L << 20;
-    /// The slots of a new table, and the fewest a table shrinks to: eight entries before it first grows, so a store that
+    /// The slots of a new table, and the fewest a table shrinks to: twelve entries before it first grows, so a store that
     /// reads few pages keeps a table of a few hundred bytes.
     static final int MIN_CAPACITY = 16;
     /// The most slots of a table, as three longs per slot must fit an array. At half of them, 2^28 entries of at least a
     /// page each, a terabyte of heap, the cache evicts rather than grow.
     private static final int MAX_CAPACITY = 1 << 29;
+    /// The most slots of a dense table, which grows at three quarters of its slots rather than at half and is rebuilt
+    /// once seven eighths rather than three quarters are in use or gone: 16 KB of tags, which the core's caches hold,
+    /// so the longer probes of a fuller table cost little, while a store whose cache holds a few thousand units keeps
+    /// half the slots. A larger table belongs to a cache that churns past its limit, under scans or lookups, and keeps
+    /// the shorter probes of half and three quarters.
+    static final int DENSE_CAPACITY = 4_096;
     /// The tag of a slot no entry used since its table was built; an entry's tag is odd ([Table#tag(long)]).
     private static final int EMPTY = 0;
     /// The tag of a slot whose entry left, which a probe passes over.
@@ -856,18 +862,25 @@ final class PageCache implements IdleTicker.Watched {
     }
 
     /// {@return the table to add an entry to: `table`, or one that replaces it, larger if the entries would pass half of
-    /// its slots and of the same size if the slots of departed entries took the room}
+    /// its slots, or three quarters of a table of at most [#DENSE_CAPACITY] slots, and of the same size if the entries
+    /// and the slots of departed entries would pass three quarters of its slots, or seven eighths of a table of at most
+    /// [#DENSE_CAPACITY]}
+    ///
+    /// A table keeps at least an eighth of its slots empty or departed, where a probe for a vacancy ends. A dense table
+    /// is rebuilt at seven eighths rather than at three quarters, where it grows, so one whose entries churn at its
+    /// size is rebuilt once every eighth of its slots of puts rather than at nearly every put.
     private Table roomFor(Table table) {
         var clock = table.clock;
         var capacity = table.capacity();
-        if (clock.live + 1 > capacity / 2) {
+        var dense = capacity <= DENSE_CAPACITY;
+        if (clock.live + 1 > (dense ? capacity - capacity / 4 : capacity / 2)) {
             if (capacity < MAX_CAPACITY) {
                 return rebuild(table, capacity * 2);
             }
             evictFrom(table);
         }
-        // Three quarters at most in use or gone: the slots a probe passes over cost every read that crosses them
-        return clock.live + clock.tombstones + 1 > capacity - capacity / 4 ? rebuild(table, capacity) : table;
+        // The slots a probe passes over cost every read that crosses them
+        return clock.live + clock.tombstones + 1 > capacity - capacity / (dense ? 8 : 4) ? rebuild(table, capacity) : table;
     }
 
     /// Publishes a table of `capacity` slots with the entries of `old`, in the clock's order.
