@@ -847,10 +847,13 @@ final class SpillQueue {
         }
     }
 
-    /// The entries of the run of a bulk commit's puts to one key space that a [Record] lists: where each value starts in
-    /// the commit's body and the position of its write in the batch, which its tag binds.
+    /// The entries of the run of a bulk commit's puts to one key space that a [Record] lists, by their indexes in the
+    /// arrays every view of the run shares: where each value starts in the commit's body and the position of its write
+    /// in the batch, which its tag binds.
     ///
-    /// Filled while the commit applies, before its run is built; the commit gives it the run before it queues the record.
+    /// Filled while the commit applies, before its view of the run is built; the commit gives it the view before it
+    /// queues the record. The records of the commits that appended to one run may drain beside a later commit's
+    /// append, and take turns moving values ([PackedRun#spill]).
     static final class RunValues {
         private PackedRun run;
         private int[] entries;
@@ -877,7 +880,7 @@ final class SpillQueue {
             ops[count++] = op;
         }
 
-        /// Names the run the entries are of, built once the commit applied.
+        /// Names the run the entries are of, the view built once the commit applied.
         void run(PackedRun run) {
             this.run = run;
         }

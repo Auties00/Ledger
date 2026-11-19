@@ -651,8 +651,10 @@ final class Checkpointer implements IdleTicker.Watched {
     /// space ([PackedRun]) with the keys written since: a key's version at the cut wins over the run's entry, which
     /// is the key's state where no version is at or below the cut. The update records whether the tree held each key of
     /// the run, which counts the run's writes. A checkpoint that fails leaves the run to the next one, which merges it
-    /// again, over the same trees. A checkpoint whose cut is at or after a bulk commit merges the commit's run the same
-    /// way, over trees older than the commit, which hold none of its keys; its commit counted it.
+    /// again, over the same trees. A checkpoint whose cut is at or after the bulk commits of a run merges the run's
+    /// newest view the same way, over trees older than its first commit, which hold none of its keys; its commits
+    /// counted it. Its cut closed the run to appends ([PackedRun#closeToAppends()]), so that view is at or below the
+    /// cut.
     ///
     /// @param adopted receives the units of the file of large values the trees take
     private TreeRoot[] build(LiveLedger.Cut cut, TreeUpdate update, Set<PageRef> adopted) throws IOException {
@@ -664,11 +666,14 @@ final class Checkpointer implements IdleTicker.Watched {
             // Listed in the order of their writes, off the publishing role: sorted here
             var chains = keyspace.dirty().toArray(Chain[]::new);
             ChainSort.sort(chains);
-            // The run the open replayed, if the trees the checkpoint updates are those the store opened from, or a bulk
-            // commit's at or below the cut, if they are older than the commit
+            // The run the open replayed, if the trees the checkpoint updates are those the store opened from, or the
+            // newest view of the bulk commits' run its cut closed, if they are older than the run
             var run = state.run;
             if (run != null && (run.maxStamp() <= treeBound || run.minStamp() > bound)) {
                 run = null;
+            }
+            if (run != null && run.maxStamp() > bound) {
+                throw new IllegalStateException("A run of " + state.keyspace.name() + " holds writes on both sides of the cut");
             }
             var runEntries = run == null ? 0 : run.size();
             var ops = new ArrayList<TreeUpdate.Op>(chains.length + runEntries);
