@@ -59,6 +59,8 @@ final class ReplayValues {
     private long logFrom;
     // Per run being built, the bytes of log at most from the frame of its first write to the end
     private final IdentityHashMap<PackedRun.Builder, Long> origins = new IdentityHashMap<>();
+    // The rooms reserve asked builders for, for tests
+    private int reservations;
 
     /// Records that the replay reaches a frame that `logFrom` bytes of log at most start from: a run made from now on
     /// takes its first write there, which [#reserve(PackedRun.Builder, long)] measures the run's rate from.
@@ -92,6 +94,12 @@ final class ReplayValues {
         var expected = (long) ((double) size * moved / done);
         var most = Math.max(2L * size, Math.min(16L * size, RESERVE_ENTRIES));
         run.reserve((int) Math.min(PackedRun.MAX_ENTRIES, Math.clamp(expected + expected / 16, size + size / 4, most)));
+        reservations++;
+    }
+
+    /// {@return the rooms [#reserve(PackedRun.Builder, long)] asked the builders for; for tests}
+    int reservations() {
+        return reservations;
     }
 
     /// {@return whether a value of `length` bytes shares a chunk, rather than taking an array of its own}
@@ -181,6 +189,11 @@ final class ReplayValues {
             origins.put(run, logFrom);
         }
         return run;
+    }
+
+    /// {@return whether the writes of `state` replay to chains, from its first range removal ([#stopRun(KeyspaceState)])}
+    boolean toChains(KeyspaceState state) {
+        return toChains.contains(state);
     }
 
     /// {@return the builder of the run of `state`, or `null` if it has none, which no write goes to from now on: the
