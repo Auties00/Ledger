@@ -463,6 +463,11 @@ final class FrameBody {
     /// lets go of the arrays it refers to, which are never the pool's, so a body something still holds keeps none of
     /// them reachable; a body made without a pool keeps its array and its references, but for a split body's, which it
     /// lets go of all the same. A second call does nothing.
+    ///
+    /// The chunks of a body of more than one go to the pool's overflow alone ([HeapPool#releaseBurst(byte\[\])]),
+    /// which the body holds until they are all back: the next large body takes them from there, and once no work
+    /// holds the overflow the first collection frees them, where the pool's reserve would keep a large commit's
+    /// chunks after it. A body of one array gives it back to the reserve, for the small commits that follow.
     void release() {
         if (split()) {
             // The arrays of the section, which a bulk commit's run may let go of once the value frames are durable
@@ -475,9 +480,14 @@ final class FrameBody {
         pooled.state = RELEASED;
         referred = References.none(referred.referable);
         if (pooled.chunks != null) {
+            var burst = pooled.chunkCount > 1;
             for (var i = 0; i < pooled.chunkCount; i++) {
                 assert poison(pooled.chunks[i]);
-                pooled.pool.release(pooled.chunks[i]);
+                if (burst) {
+                    pooled.pool.releaseBurst(pooled.chunks[i]);
+                } else {
+                    pooled.pool.release(pooled.chunks[i]);
+                }
             }
             pooled.chunks = null;
             pooled.chunkCount = 0;

@@ -581,6 +581,10 @@ public final class ArrayWriteBatch implements WriteBatch {
 
     /// Lets go of the rope, if the batch has one: every chunk returns to the pool but those that are their values' home,
     /// which the versions may slice and no one writes again.
+    ///
+    /// The chunks go to the pool's overflow alone ([HeapPool#releaseBurst(byte\[\])]), which the rope holds until
+    /// they are all back: the next large batch or frame body takes them from there, and once no work holds the
+    /// overflow the first collection frees them, where the pool's reserve would keep them after the batch.
     private void leaveRope() {
         if (chunks == null) {
             return;
@@ -588,7 +592,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         for (var i = 1; i < chunkCount; i++) {
             var chunk = chunks[i];
             if (chunk.home != chunk.view) {
-                scope.pool().release(chunk.array);
+                scope.pool().releaseBurst(chunk.array);
             }
         }
         chunks = null;
