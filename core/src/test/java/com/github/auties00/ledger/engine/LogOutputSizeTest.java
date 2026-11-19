@@ -37,8 +37,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// The size of the buffer the log seals its groups into: one block for a store of small commits, grown for larger
 /// groups to the bound of the group in one step and taken back, after a run of small ones, to the size that run needed,
 /// so groups of two sizes neither keep a large buffer nor make it, or the native buffer of a write through that follows
-/// it, change size group after group; and given back once a group too large for one write is durable, to be taken back
-/// by the next one while the collector has not.
+/// it, change size group after group; and, at its largest, kept from group to group while they keep coming and given
+/// back once a group leaves the queue empty, to be taken back by the next group that grows while the collector has not.
 class LogOutputSizeTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> NAMES = Keyspace.paged("names", KeyCodec.utf8(), ValueCodec.utf8());
@@ -228,12 +228,14 @@ class LogOutputSizeTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @CsvSource({"true", "false"})
-    @DisplayName("gives the output back after a group written in several calls, takes it back for the next one, and not for a medium one")
+    @DisplayName("gives the largest output back once the queue is empty and takes it back for the next group that grows, large or medium")
     void givesBack(boolean encrypted) throws Exception {
         var disk = CrashFileSystem.create();
         var model = new TreeMap<String, String>();
         try (var ledger = openLarge(disk.getPath("/store"), encrypted, null)) {
             var log = log(ledger);
+            // Held strongly too, so a collection between two groups does not take the array the test follows
+            log.keepSpareForTests = true;
             commit(ledger, model, "first", 500);
             // 300 values of 4 KB: a group of 1.2 MB, more than one write takes
             commitBatch(ledger, model, "a", 300, 4_000);
@@ -244,20 +246,27 @@ class LogOutputSizeTest {
             var allocations = log.outputAllocationsForTests();
             commit(ledger, model, "small", 500);
             assertEquals(LogWriter.ALIGNMENT, log.outputLength());
-            // A medium group grows an output of its own, leaving the spare to the collector
+            // A medium group takes the spare back too, and gives it back once it is durable
             commitBatch(ledger, model, "m", 25, 4_000);
-            var medium = log.outputLength();
-            assertTrue(medium > 100_000 && medium < 110_000, "a medium group made an output of " + medium + " bytes");
-            assertEquals(allocations + 1, log.outputAllocationsForTests());
+            assertEquals(LogWriter.ALIGNMENT, log.outputLength(), "a medium group kept the largest output");
+            assertSame(spare, log.spareOutputForTests(), "a medium group did not take the spare back");
+            assertEquals(allocations, log.outputAllocationsForTests(), "a medium group allocated an output");
             commitBatch(ledger, model, "b", 300, 4_000);
             assertEquals(LogWriter.ALIGNMENT, log.outputLength());
             assertSame(spare, log.spareOutputForTests(), "the next large group did not take the spare back");
-            assertEquals(allocations + 1, log.outputAllocationsForTests(), "the next large group allocated an output");
-            // Once the collector took the spare, the next large group allocates one output of the largest size
+            assertEquals(allocations, log.outputAllocationsForTests(), "the next large group allocated an output");
+            // Once the collector took the spare, a medium group grows an output of its own, which it keeps
             log.dropSpareOutputForTests();
             assertNull(log.spareOutputForTests());
+            commitBatch(ledger, model, "n", 25, 4_000);
+            var medium = log.outputLength();
+            assertTrue(medium > 100_000 && medium < 110_000, "a medium group made an output of " + medium + " bytes");
+            assertEquals(allocations + 1, log.outputAllocationsForTests());
+            assertNull(log.spareOutputForTests(), "an output smaller than the largest was given back");
+            // And the next large group grows it once, to the largest size, which it gives back
             commitBatch(ledger, model, "c", 300, 4_000);
             assertEquals(allocations + 2, log.outputAllocationsForTests(), "a large group grew its output more than once");
+            assertEquals(LogWriter.ALIGNMENT, log.outputLength());
             var replaced = log.spareOutputForTests();
             assertNotNull(replaced);
             assertNotSame(spare, replaced);
@@ -267,12 +276,73 @@ class LogOutputSizeTest {
                 commit(ledger, model, "after" + i, 300 + 700 * i);
                 commitBatch(ledger, model, "d" + i + "-", 270 + 10 * i, 4_000);
             }
+            assertEquals(allocations + 2, log.outputAllocationsForTests(), "a group allocated an output while the spare was reachable");
             assertTrue(log.mostGroupGrowthsForTests() <= 1, "the output grew " + log.mostGroupGrowthsForTests() + " times for one group");
             survivesPowerLossLarge(disk, encrypted, model);
         }
         try (var reopened = openLarge(disk.getPath("/store"), encrypted, null)) {
             assertEquals(model, contents(reopened));
         }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @CsvSource({"true", "false"})
+    @DisplayName("keeps the largest output for a medium group queued while a large one was written, allocating none, and gives it back after")
+    void keptWhileQueued(boolean encrypted) throws Exception {
+        var disk = CrashFileSystem.create();
+        var model = new TreeMap<String, String>();
+        var holding = new AtomicBoolean();
+        var held = new CountDownLatch(1);
+        var released = new CountDownLatch(1);
+        disk.intercept((path, kind) -> {
+            if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log") && holding.compareAndSet(true, false)) {
+                held.countDown();
+                try {
+                    released.await(1, TimeUnit.MINUTES);
+                } catch (InterruptedException _) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        try (var ledger = openLarge(disk.getPath("/store"), encrypted, null)) {
+            var log = log(ledger);
+            log.keepSpareForTests = true;
+            commit(ledger, model, "first", 500);
+            var allocations = log.outputAllocationsForTests();
+            holding.set(true);
+            // A group of 1.2 MB, written in several calls, whose force waits until the medium group is queued
+            var large = ledger.newBatch();
+            for (var i = 0; i < 300; i++) {
+                var key = "a" + i;
+                var value = "w".repeat(4_000) + i;
+                large.put(NAMES, key, value);
+                model.put(key, value);
+            }
+            var first = ledger.commit(large);
+            assertTrue(held.await(1, TimeUnit.MINUTES), "the log did not force the large group");
+            var output = log.outputLength();
+            var medium = ledger.newBatch();
+            for (var i = 0; i < 25; i++) {
+                var key = "m" + i;
+                var value = "w".repeat(4_000) + i;
+                medium.put(NAMES, key, value);
+                model.put(key, value);
+            }
+            var second = ledger.commit(medium);
+            released.countDown();
+            first.awaitDurable();
+            second.awaitDurable();
+            assertEquals(LogWriter.OUTPUT, output, "the large group was not written from the largest output");
+            assertEquals(allocations + 1, log.outputAllocationsForTests(), "the medium group allocated an output of its own");
+            assertEquals(0, log.groupGrowthsForTests(), "the medium group did not find the largest output in place");
+            assertEquals(LogWriter.ALIGNMENT, log.outputLength(), "the output was not given back once the queue was empty");
+            var spare = log.spareOutputForTests();
+            assertNotNull(spare);
+            assertEquals(LogWriter.OUTPUT, spare.length);
+        } finally {
+            released.countDown();
+        }
+        survivesPowerLossLarge(disk, encrypted, model);
     }
 
     @ParameterizedTest(name = "encrypted: {0}")
@@ -349,6 +419,7 @@ class LogOutputSizeTest {
         CrashFileSystem survivor;
         try {
             var log = log(ledger);
+            log.keepSpareForTests = true;
             commitBatch(ledger, model, "a", 300, 4_000);
             assertEquals(LogWriter.ALIGNMENT, log.outputLength());
             var spare = log.spareOutputForTests();

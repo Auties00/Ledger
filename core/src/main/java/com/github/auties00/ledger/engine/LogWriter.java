@@ -263,7 +263,7 @@ final class LogWriter {
     private boolean interruptedWrite;
     // Whether the flush running is a commit's, for its own group, which one drain writes whole
     private boolean leading;
-    // Where the last drain wrote, and how many bytes, which the output still holds until the next group is sealed
+    // Where the last drain wrote, and how many bytes, which the output holds until its group is durable
     private long lastDrainStart;
     private int lastDrainLength;
     private long segmentNumber;
@@ -310,13 +310,18 @@ final class LogWriter {
     // The buffer frames are sealed into and written from, a slice at a time whatever their size; it grows up to OUTPUT
     // while a group needs more, so a group that fits is written with one call
     private byte[] output;
-    // The output of MIN_OUTPUT bytes the writer starts with, which a group too large for one call gives the output back
-    // to, so giving it back allocates nothing
+    // The output of MIN_OUTPUT bytes the writer starts with, which an output of OUTPUT bytes is given back to once the
+    // queue is empty, so giving it back allocates nothing
     private final byte[] smallOutput;
-    // The output of OUTPUT bytes the last group too large for one call wrote from, given back once that group was
-    // durable and reached weakly, so the next such group takes it back unless the collector took it first. Its bytes are
-    // never written again: only a commit's own group rewrites its last drain, and such a group fits one write
+    // The output of OUTPUT bytes given back the last time a group left the queue empty, or a run of small groups took
+    // back, reached weakly, so the next group that grows the output takes it back unless the collector took it first.
+    // Its bytes are never written again: only a commit's own group rewrites its last drain, during its own force,
+    // before the output is given back
     private WeakReference<byte[]> spareOutput;
+    // The spare output held strongly too, for tests that check which array a group takes back
+    private byte[] keptSpareForTests;
+    // Whether a spare output given back is held strongly too, for tests
+    volatile boolean keepSpareForTests;
     // The buffer over the whole of output that drains write it through, made again only when output is replaced, so a
     // drain allocates nothing whatever the compiler inlines
     private ByteBuffer outputBuffer;
@@ -331,8 +336,6 @@ final class LogWriter {
     // The most bytes the group being written may ask the output for, at most OUTPUT: what its frames seal into, joined
     // into runs, the room the cipher's last call asks for past them and the padding to a block
     private int groupNeed;
-    // Whether the output of the group being written filled, so the group was written in several calls
-    private boolean drainedInGroup;
     // The times the output grew for the group being written, and the most it grew for one group, for tests
     private int groupGrowths;
     private volatile int mostGroupGrowths;
@@ -1045,13 +1048,20 @@ final class LogWriter {
                 group.clear();
                 flushing = group;
                 boolean roomy;
+                boolean idle;
                 queueLock.lock();
                 try {
                     pendingBytes -= bodies;
                     roomy = pendingBytes < QUEUE_LIMIT / 2;
+                    idle = queue.isEmpty();
                     queueDrained.signalAll();
                 } finally {
                     queueLock.unlock();
+                }
+                // The group is durable and no other is queued: a store whose groups keep coming keeps the largest
+                // output from one to the next, and one that stops holds it only weakly
+                if (idle && output.length == OUTPUT) {
+                    giveBackOutput();
                 }
                 publish(sequence, frames, roomy);
                 if (!leading && poolWanted()) {
@@ -1156,6 +1166,9 @@ final class LogWriter {
             // The size every group of the run fitted in, so the next ones of the same sizes do not grow it again
             var size = Math.max(MIN_OUTPUT, Integer.highestOneBit(smallPeak - 1) << 1);
             if (output.length > size) {
+                if (output.length == OUTPUT) {
+                    keepSpare(output);
+                }
                 output = size == MIN_OUTPUT ? smallOutput : new byte[size];
                 outputBuffer = null;
             }
@@ -1180,7 +1193,6 @@ final class LogWriter {
         }
         var count = group.size();
         groupNeed = groupBound(group);
-        drainedInGroup = false;
         groupGrowths = 0;
         for (var index = 0; index < count; ) {
             var frame = group.get(index);
@@ -1243,9 +1255,6 @@ final class LogWriter {
         forces++;
         if (unitForce != null) {
             await(unitForce);
-        }
-        if (drainedInGroup) {
-            giveBackOutput();
         }
         this.groupStart = start;
         groupEnd = end;
@@ -1633,7 +1642,6 @@ final class LogWriter {
                     return;
                 }
             }
-            drainedInGroup = true;
             drain();
         }
     }
@@ -1641,21 +1649,20 @@ final class LogWriter {
     /// Replaces the output with a larger one that holds its first `used` bytes where they are, for a group that asks it
     /// for `need` bytes.
     ///
-    /// A group that may ask for all of [#OUTPUT] takes back the spare output while it is reachable. Any other grows the
-    /// output to the group's bound in one step, or by a quarter if that is more, so groups of slowly growing sizes
-    /// replace it a bounded number of times; one that asks for more than its bound, which the bound rules out, doubles
-    /// it, so it never grows by the bytes of a slice at a time.
+    /// A group takes back the spare output while it is reachable, whatever it asks for: it allocates nothing, and the
+    /// output is given back again once the queue is empty. Otherwise it grows the output to the group's bound in one
+    /// step, or by a quarter if that is more, so groups of slowly growing sizes replace it a bounded number of times;
+    /// one that asks for more than its bound, which the bound rules out, doubles it, so it never grows by the bytes of a
+    /// slice at a time.
     private void grow(int need) {
         if (++groupGrowths > mostGroupGrowths) {
             mostGroupGrowths = groupGrowths;
         }
-        if (groupNeed == OUTPUT) {
-            var spare = spareOutput == null ? null : spareOutput.get();
-            if (spare != null) {
-                System.arraycopy(output, 0, spare, 0, used);
-                output = spare;
-                return;
-            }
+        var spare = spareOutput == null ? null : spareOutput.get();
+        if (spare != null) {
+            System.arraycopy(output, 0, spare, 0, used);
+            output = spare;
+            return;
         }
         var length = output.length;
         var size = need <= groupNeed ? Math.max(groupNeed, length + (length >> 2)) : Math.max(2L * length, need);
@@ -1663,20 +1670,29 @@ final class LogWriter {
         outputAllocations++;
     }
 
-    /// Gives back the output of [#OUTPUT] bytes a group written in several calls filled, once that group is durable and
-    /// the output holds none of its bytes: the next group starts from the smallest output, and the next one as large
-    /// takes the spare back while the collector has not taken it.
+    /// Gives back the output of [#OUTPUT] bytes once the group last written from it is durable and the queue is empty:
+    /// the next group starts from the smallest output, and takes the spare back if it grows while the collector has not
+    /// taken it.
     ///
-    /// A store that writes such groups now and then, as a bulk load does, so keeps a megabyte only while it writes one;
-    /// the output of a smaller group stays until [#SHRINK_AFTER] small groups take it back.
+    /// A store that writes large groups now and then, as a bulk load does, so holds a megabyte strongly only while
+    /// groups keep coming, and one whose groups keep coming neither gives the output back nor allocates another; the
+    /// output of a smaller group stays until [#SHRINK_AFTER] small groups take it back.
     private void giveBackOutput() {
         assert used == 0 && output.length == OUTPUT : "an output given back holds bytes or is not the largest";
-        var spare = spareOutput;
-        if (spare == null || spare.get() != output) {
-            spareOutput = new WeakReference<>(output);
-        }
+        keepSpare(output);
         output = smallOutput;
         outputBuffer = null;
+    }
+
+    /// Keeps `spare`, an output of [#OUTPUT] bytes no group writes from any more, weakly, for the next group that grows.
+    private void keepSpare(byte[] spare) {
+        var kept = spareOutput;
+        if (kept == null || kept.get() != spare) {
+            spareOutput = new WeakReference<>(spare);
+        }
+        if (keepSpareForTests) {
+            keptSpareForTests = spare;
+        }
     }
 
     /// Writes the bytes of the output.
@@ -2052,25 +2068,30 @@ final class LogWriter {
         return groupPeak;
     }
 
+    /// {@return the times the output grew while the last group was written, for tests: read after it is durable}
+    int groupGrowthsForTests() {
+        return groupGrowths;
+    }
+
     /// {@return the most times the output grew while one group was written, for tests}
     int mostGroupGrowthsForTests() {
         return mostGroupGrowths;
     }
 
-    /// {@return the output a group written in several calls gave back, or `null` if there is none or the collector took
-    /// it, for tests: read after a group returned}
+    /// {@return the output given back once the queue was empty, or `null` if there is none or the collector took it, for
+    /// tests: read after a group returned}
     byte[] spareOutputForTests() {
         var spare = spareOutput;
         return spare == null ? null : spare.get();
     }
 
-    /// Lets go of the output a group written in several calls gave back, as a collection would, for tests: called
-    /// between groups.
+    /// Lets go of the output given back, as a collection would, for tests: called between groups.
     void dropSpareOutputForTests() {
         var spare = spareOutput;
         if (spare != null) {
             spare.clear();
         }
+        keptSpareForTests = null;
     }
 
     /// {@return the way later segments are opened to write through, or `null` if their groups are forced, for tests}
