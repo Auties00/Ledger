@@ -298,10 +298,10 @@ final class FrameBody {
     /// made without a pool keeps its array, and the arrays a body refers to are never the pool's. A second call does
     /// nothing.
     ///
-    /// The chunks of a body of more than one go to the pool's overflow alone ([HeapPool#releaseBurst(byte\[\])]),
-    /// which the body holds until they are all back: the next large body takes them from there, and once no work
-    /// holds the overflow the first collection frees them, where the pool's reserve would keep a large commit's
-    /// chunks after it. A body of one array gives it back to the reserve, for the small commits that follow.
+    /// The chunks of a body of more than one go back as a burst's ([HeapPool#releaseBurst(byte\[\])]): the next
+    /// large body takes them again, from the reserve within its bounds and past them from the overflow this body holds
+    /// until they are all back, and once large bodies stop coming the pool's next collections free them. A body of
+    /// one array gives it back to the reserve, for the small commits that follow.
     void release() {
         var pooled = this.pooled;
         if (pooled == null || pooled.state == RELEASED) {

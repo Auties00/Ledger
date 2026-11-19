@@ -90,7 +90,7 @@ class PoolHoldTest {
     }
 
     @Test
-    @DisplayName("the next body on chunks takes the chunks of the frame sealed before it, through collections while it fills, and the first collection after its release frees them all, the reserve keeping none")
+    @DisplayName("the next body on chunks takes the chunks of the frame sealed before it, through collections while it fills, and once bodies stop the collection after the move of the reserve's chunks frees them all")
     void bodyKeepsChunks() {
         var pool = new HeapPool(64L << 20, false);
         var first = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
@@ -101,11 +101,11 @@ class PoolHoldTest {
         // The log seals the first frame while the next commit fills its body
         first.handOff();
         first.release();
-        assertEquals(12L * CHUNK, pool.overflowBytesForTests(), "the chunks of a body of many, all in the overflow");
-        assertEquals(0, pool.reservedBytesForTests(), "the chunks of a body of many in the reserve");
+        assertEquals(HeapPool.RESERVE_PER_SIZE, pool.burstBytesForTests(), "the chunks of a body of many in the reserve");
+        assertEquals(12L * CHUNK - HeapPool.RESERVE_PER_SIZE, pool.overflowBytesForTests(), "the chunks past the reserve");
         System.gc();
         System.gc();
-        assertEquals(12L * CHUNK, pool.overflowBytesForTests(), "a collection freed the chunks while a body held them");
+        assertEquals(12L * CHUNK - HeapPool.RESERVE_PER_SIZE, pool.overflowBytesForTests(), "a collection freed the chunks while a body held them");
         fillTo(next, 12 * CHUNK - 4_000);
         // The first chunk of the next body is a new one, taken before the first released its own
         var taken = chunks(next);
@@ -117,12 +117,17 @@ class PoolHoldTest {
         taken.clear();
         collectOverflow(pool);
         assertEquals(0, pool.overflowBytesForTests(), "a collection with no body open left the overflow");
-        assertEquals(0, pool.reservedBytesForTests(), "the chunks of the bodies the reserve kept");
+        assertEquals(HeapPool.RESERVE_PER_SIZE, pool.burstBytesForTests(), "the chunks of the last body in the reserve");
+        // The collection after the last body moves the reserve's chunks; the one after it frees them
+        pool.collectedForTests();
+        assertEquals(0, pool.reservedBytesForTests(), "the chunks of the bodies the reserve kept past the move");
+        collectOverflow(pool);
+        assertEquals(0, pool.overflowBytesForTests(), "a collection after the move left the chunks");
     }
 
     @Test
-    @DisplayName("a body of one chunk gives it back to the reserve, and a body of more gives every chunk to the overflow alone")
-    void bodyChunksSkipReserve() {
+    @DisplayName("a body of one chunk gives it back to the reserve, and a body of more gives its chunks back as a burst, which a collection moves to the overflow")
+    void bodyChunksAsBurst() {
         var pool = new HeapPool(64L << 20, false);
         pool.holdOverflowForTests(true);
         var single = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
@@ -139,14 +144,17 @@ class PoolHoldTest {
         var arrays = chunks(body);
         body.handOff();
         body.release();
-        assertEquals(0, pool.reservedBytesForTests(CHUNK), "the chunks of a body of four in the reserve");
+        assertEquals(4L * CHUNK, pool.burstBytesForTests(), "the chunks of a body of four in the reserve, as a burst's");
+        assertEquals(0, pool.overflowBytesForTests());
+        pool.collectedForTests();
+        assertEquals(0, pool.reservedBytesForTests(CHUNK), "the chunks of a body of four in the reserve past a collection");
         assertEquals(4L * CHUNK, pool.overflowBytesForTests());
         assertEquals(arrays, pool.freeForTests(CHUNK), "the chunks of the body, in the overflow");
     }
 
     @Test
-    @DisplayName("a batch's rope gives its chunks back to the overflow alone as it leaves it")
-    void ropeSkipsReserve() {
+    @DisplayName("a batch's rope gives its chunks back as a burst as it leaves it, which a collection moves to the overflow")
+    void ropeAsBurst() {
         var pool = new HeapPool(64L << 20, false);
         pool.holdOverflowForTests(true);
         var batch = new ArrayWriteBatch(new Object(), pool, Map.of(MESSAGES.name(), MESSAGES));
@@ -159,7 +167,12 @@ class PoolHoldTest {
         var reserved = pool.reservedBytesForTests(CHUNK);
         var overflow = pool.overflowBytesForTests();
         batch.clear();
-        assertEquals(reserved, pool.reservedBytesForTests(CHUNK), "the rope's chunks in the reserve");
+        var kept = pool.burstBytesForTests();
+        assertTrue(kept > 0, "the rope's chunks in the reserve, as a burst's");
+        assertEquals(reserved + kept, pool.reservedBytesForTests(CHUNK));
+        assertEquals(overflow + (long) chunks * CHUNK - kept, pool.overflowBytesForTests(), "the rope's chunks past the reserve");
+        pool.collectedForTests();
+        assertEquals(reserved, pool.reservedBytesForTests(CHUNK), "the rope's chunks in the reserve past a collection");
         assertEquals(overflow + (long) chunks * CHUNK, pool.overflowBytesForTests(), "the rope's chunks in the overflow");
     }
 
