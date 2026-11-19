@@ -1426,6 +1426,93 @@ class WriteThroughTest {
             }
         }
 
+        @ParameterizedTest(name = "encrypted: {0}")
+        @CsvSource({"true", "false"})
+        @DisplayName("has the write through's buffer follow it down to a block after a group too large for one write, and up to the bound of a medium group once")
+        void bufferFollows(boolean encrypted) throws Exception {
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, String>();
+            var sizes = new ArrayList<Long>();
+            var way = new WriteThrough(WriteThrough.Kind.DSYNC, null);
+            way.allocatorForTests = size -> {
+                synchronized (sizes) {
+                    sizes.add(size);
+                }
+                return Arena.ofAuto().allocate(size, LogWriter.ALIGNMENT);
+            };
+            var builder = Ledger.builder().directory(disk.getPath("/store")).encryption(encrypted ? Encryption.key(KEY) : Encryption.none()).keyspace(NAMES);
+            try (var ledger = ((LedgerBuilder) builder).segmentSize(SEGMENT).writeThrough(way).build()) {
+                var log = log(ledger);
+                var fills = 0;
+                while (log.currentSegment() < 4) {
+                    commitBatch(ledger, model, "f" + fills++ + "-", 64, 4_000, 0);
+                }
+                ledger.checkpoint();
+                reachRoom(ledger, model, "p");
+                // The filler of a quarter of a megabyte or more grew the output, and the buffer of the groups written through with it
+                var allocated = sizes.size();
+                var filled = log.outputLength();
+                assertTrue(filled > 250_000, "the filler made an output of " + filled + " bytes");
+                assertEquals((long) filled, sizes.getLast());
+                // A group too large for one write, forced: the output goes back to a block, and the buffer is not used
+                commitBatch(ledger, model, "o", 262, 4_000, 0);
+                assertEquals(LogWriter.ALIGNMENT, log.outputLength());
+                assertEquals(allocated, sizes.size());
+                // A small group written through takes a buffer of a block
+                var through = log.writtenThrough();
+                commit(ledger, model, "s");
+                assertEquals(through + 1, log.writtenThrough(), "the small group was not written through");
+                assertEquals(allocated + 1, sizes.size(), "the buffer did not follow the output down");
+                assertEquals((long) LogWriter.ALIGNMENT, sizes.getLast());
+                // A medium group written through: the output grows to its bound, and the buffer with it once
+                commitBatch(ledger, model, "m", 32, 4_000, 0);
+                assertEquals(through + 2, log.writtenThrough(), "the medium group was not written through");
+                var medium = log.outputLength();
+                assertTrue(medium > 128_000 && medium < 140_000, "a medium group made an output of " + medium + " bytes");
+                commitBatch(ledger, model, "n", 32, 4_000, 0);
+                assertEquals(through + 3, log.writtenThrough(), "the second medium group was not written through");
+                assertEquals(medium, log.outputLength());
+                assertEquals(allocated + 2, sizes.size());
+                assertEquals((long) medium, sizes.getLast());
+                survivesPowerLoss(disk, encrypted, model);
+            }
+        }
+
+        @Test
+        @DisplayName("replaces the write through's buffer only for an output larger than it, or less than half its size, and writes the bytes given whatever its size")
+        void bufferHysteresis() throws Exception {
+            var disk = CrashFileSystem.create();
+            var file = disk.getPath("/segment");
+            Files.write(file, new byte[64 << 10]);
+            var sizes = new ArrayList<Long>();
+            var way = new WriteThrough(WriteThrough.Kind.DSYNC, null);
+            way.allocatorForTests = size -> {
+                sizes.add(size);
+                return Arena.ofAuto().allocate(size, LogWriter.ALIGNMENT);
+            };
+            var handle = way.open(file);
+            try {
+                // Output sizes in blocks, and the buffer each write leaves, in blocks
+                int[][] steps = {{2, 2}, {1, 2}, {4, 4}, {3, 4}, {2, 4}, {1, 1}, {3, 3}, {2, 3}, {4, 4}};
+                var random = new Random(5);
+                for (var step : steps) {
+                    var capacity = step[0] * LogWriter.ALIGNMENT;
+                    var bytes = new byte[capacity];
+                    random.nextBytes(bytes);
+                    handle.write(bytes, capacity, capacity, 0);
+                    assertEquals((long) step[1] * LogWriter.ALIGNMENT, sizes.getLast(), "after an output of " + step[0] + " blocks");
+                    var written = new byte[capacity];
+                    try (var channel = FileChannel.open(file, StandardOpenOption.READ)) {
+                        channel.read(ByteBuffer.wrap(written), 0);
+                    }
+                    assertTrue(Arrays.equals(bytes, written), "the bytes of an output of " + step[0] + " blocks");
+                }
+                assertEquals(5, sizes.size(), "buffers allocated: " + sizes);
+            } finally {
+                handle.close();
+            }
+        }
+
         @Test
         @DisplayName("is a multiple of a block below a megabyte by its header, and holds a group of the most one write takes with its padding and the cipher's last reservation")
         void bounds() {
