@@ -928,6 +928,55 @@ class BulkCommitRunTest {
         CheckpointTest.verifyPages(directory, true);
     }
 
+    @Test
+    @DisplayName("a scan after each append, with no reader held across commits so every view before the newest is let go, sorts each entry of the run once, and a snapshot of an older view picks its order out of a newer view's")
+    void scansBetweenAppends(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var commits = 8;
+        Snapshot early = null;
+        Expected earlySeen = null;
+        try (var ledger = open(directory, true, Long.MAX_VALUE)) {
+            for (var commit = 0; commit < commits; commit++) {
+                var batch = ledger.newBatch();
+                for (var i = 0; i < BULK; i++) {
+                    var message = i * commits + commit;
+                    var value = value(message, commit, LENGTHS);
+                    batch.put(MESSAGES, key(message), value);
+                    expected.messages.put(message, value);
+                }
+                ledger.commit(batch).awaitDurable();
+                var run = ledger.state(MESSAGES).run;
+                assertEquals((commit + 1) * BULK, run.size());
+                if (commit == 2) {
+                    assertNull(run.previous(), "a view no reader reads stayed linked");
+                    // Read only after a later view made its order, which holds this view's entries
+                    early = ledger.snapshot();
+                    earlySeen = expected.copy();
+                    continue;
+                }
+                if (commit < 2) {
+                    assertNull(run.previous(), "a view no reader reads stayed linked");
+                }
+                try (var snapshot = ledger.snapshot()) {
+                    verify(snapshot, expected);
+                }
+                assertEquals(run.size(), run.sortedForTests(), "a scan sorted entries an older view had ordered");
+            }
+            var run = ledger.state(MESSAGES).run;
+            var sorted = run.sortedForTests();
+            verify(early, earlySeen);
+            assertEquals(sorted, run.sortedForTests(), "an older view sorted entries a newer view had ordered");
+            early.close();
+            verify(ledger, expected);
+            ledger.checkpoint();
+            assertNull(ledger.state(MESSAGES).run, "the run outlived the checkpoint that took it");
+            verify(ledger, expected);
+        }
+        try (var ledger = open(directory, true, Long.MAX_VALUE)) {
+            verify(ledger, expected);
+        }
+    }
+
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
     @DisplayName("a later bulk commit puts keys of the run's views on chains over their entries, removes them, and appends its new keys, counted exactly through a crash, a checkpoint and a reopen")
