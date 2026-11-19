@@ -793,6 +793,7 @@ class PackedRunTest {
             var entry = run.entryAt(position);
             var key = sorted.get(position).array();
             assertArrayEquals(key, run.key(entry).toArray(ValueLayout.JAVA_BYTE), "key at " + position);
+            assertEquals(key.length, run.keyLength(entry), "length of the key at " + position);
             assertEquals(entry, run.find(MemorySegment.ofArray(key)));
             assertEquals(entry, run.find(key));
             var value = model.get(sorted.get(position));

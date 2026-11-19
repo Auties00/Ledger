@@ -294,6 +294,11 @@ final class PackedRun {
         return (long) WORDS.getAcquire(values, entry);
     }
 
+    /// {@return the bytes of the key of `entry`}
+    int keyLength(int entry) {
+        return keyEnds[entry] - keyStart(entry);
+    }
+
     /// {@return the key of `entry`, a read-only slice of the run's keys}
     MemorySegment key(int entry) {
         var start = keyStart(entry);

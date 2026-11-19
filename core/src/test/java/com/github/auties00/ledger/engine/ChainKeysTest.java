@@ -256,6 +256,70 @@ class ChainKeysTest {
         }
     }
 
+    @Test
+    @DisplayName("copies keys of every length, from slices of a larger array, across many filled chunks and past the longest a chunk takes, into read-only copies that share no memory with them")
+    void copies() {
+        var random = new SplittableRandom(0xC0FFEEL);
+        var slab = new KeySlab();
+        var keys = new ArrayList<byte[]>();
+        var copies = new ArrayList<MemorySegment>();
+        // Up to 299 bytes, past the 256 a chunk takes; some 600 kB of keys fill many chunks of at most 4 KiB
+        for (var i = 0; i < 4_000; i++) {
+            var key = bytes(random, random.nextInt(300));
+            var at = random.nextInt(16);
+            var array = new byte[at + key.length + random.nextInt(16)];
+            System.arraycopy(key, 0, array, at, key.length);
+            var source = MemorySegment.ofArray(array).asSlice(at, key.length);
+            var copy = slab.copy(i % 2 == 0 ? source : source.asReadOnly());
+            assertTrue(copy.isReadOnly());
+            assertEquals(key.length, copy.byteSize());
+            assertTrue(copy.asOverlappingSlice(MemorySegment.ofArray(array)).isEmpty(), "a copy of " + key.length + " bytes views its key");
+            // The key's bytes change at once: the copy keeps its own
+            Arrays.fill(array, (byte) 0x5A);
+            keys.add(key);
+            copies.add(copy);
+        }
+        for (var i = 0; i < keys.size(); i++) {
+            assertArrayEquals(keys.get(i), Segments.toBytes(copies.get(i)), "copy " + i);
+        }
+        assertTrue(slab.usedForTests() > 0);
+    }
+
+    @Test
+    @DisplayName("lets threads copy keys at once, each copy holding the bytes of its own key")
+    void concurrentCopies() throws Exception {
+        var slab = new KeySlab();
+        var threads = 8;
+        var start = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(threads)) {
+            var tasks = new ArrayList<java.util.concurrent.Future<?>>();
+            for (var t = 0; t < threads; t++) {
+                var seed = t;
+                tasks.add(executor.submit(() -> {
+                    start.await();
+                    var random = new SplittableRandom(seed);
+                    var keys = new ArrayList<byte[]>();
+                    var copies = new ArrayList<MemorySegment>();
+                    for (var i = 0; i < 20_000; i++) {
+                        var key = bytes(random, random.nextInt(80));
+                        keys.add(key);
+                        copies.add(slab.copy(MemorySegment.ofArray(key)));
+                    }
+                    for (var i = 0; i < keys.size(); i++) {
+                        if (!Arrays.equals(keys.get(i), Segments.toBytes(copies.get(i)))) {
+                            throw new AssertionError("a copy holds other bytes than its key: " + HexFormat.of().formatHex(keys.get(i)));
+                        }
+                    }
+                    return null;
+                }));
+            }
+            start.countDown();
+            for (var task : tasks) {
+                task.get();
+            }
+        }
+    }
+
     // What a chain alone answers about its key: its length, its bytes, its words at every offset
     private static void checkAlone(Chain chain, byte[] key) {
         var name = HexFormat.of().formatHex(key) + (chain.inlineKey() ? " in words" : " in a segment");

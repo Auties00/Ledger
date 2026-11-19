@@ -7,22 +7,29 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.io.TempDir;
 
 import javax.crypto.spec.SecretKeySpec;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -236,6 +243,331 @@ class TreeUpdateTest {
                 // A close would wait for workers a failure of the timeout left stuck
                 workers.shutdownNow();
             }
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a tree that held no key is written in two passes into the data file a merge of every write into one list writes, unit for unit, with values on segments, own arrays, in the log and in units of the large value file, past the bytes a writer queues before it flushes")
+    void newTreeLayout(boolean encrypted, @TempDir Path directory) throws Exception {
+        var random = new Random(encrypted ? 31 : 37);
+        var writes = new ArrayList<Write>();
+        var forms = Form.values();
+        var queued = 0L;
+        for (var key : sortedKeys(random, 24_000)) {
+            var form = random.nextInt(10) == 0 ? Form.REMOVED : forms[random.nextInt(Form.REMOVED.ordinal())];
+            var value = random.nextInt(40) == 0 ? new byte[2_500 + random.nextInt(24_000)] : value(random);
+            random.nextBytes(value);
+            writes.add(new Write(key, value, form));
+            if (form != Form.REMOVED && form != Form.EXTERNAL && !TreeNodes.LeafEntry.fitsInline(key.length, value.length)) {
+                queued += (long) PageFormat.pagesFor(value.length) * PageFormat.SIZE;
+            }
+        }
+        // More than the 8 MiB a writer queues before it flushes, in value units alone
+        assertTrue(queued > 8 << 20, "the value units take " + queued + " bytes");
+        try (var log = new Log(directory.resolve("1.log"))) {
+            for (var write : writes) {
+                log.place(write.value());
+            }
+            log.write();
+            var streamed = layOut(directory.resolve("streamed"), encrypted, ops(writes, log), false, null);
+            var merged = layOut(directory.resolve("merged"), encrypted, ops(writes, log), true, null);
+            assertEquals(merged.root(), streamed.root());
+            assertEquals(merged.allocated(), streamed.allocated(), "the pages taken, in order");
+            assertEquals(-1, Arrays.mismatch(merged.file(), streamed.file()), "the data files differ");
+        }
+    }
+
+    @Test
+    @DisplayName("values a spill moves to the log or to arrays of their own between the two passes of a new tree are written where a merge of every write into one list puts them, and read back")
+    void spillBetweenPasses(@TempDir Path directory) throws Exception {
+        var random = new Random(43);
+        var writes = new ArrayList<Write>();
+        for (var key : sortedKeys(random, 20_000)) {
+            var value = switch (random.nextInt(4)) {
+                case 0 -> new byte[random.nextInt(SpillQueue.LOG_VALUE_MIN)];
+                case 1 -> new byte[SpillQueue.LOG_VALUE_MIN + random.nextInt(1_900)];
+                case 2 -> new byte[2_500 + random.nextInt(6_000)];
+                default -> value(random);
+            };
+            random.nextBytes(value);
+            writes.add(new Write(key, value, random.nextBoolean() ? Form.SEGMENT : Form.OWN));
+        }
+        var model = new TreeMap<byte[], byte[]>(UNSIGNED);
+        for (var write : writes) {
+            model.put(write.key(), write.value());
+        }
+        try (var log = new Log(directory.resolve("1.log"))) {
+            for (var write : writes) {
+                log.place(write.value());
+            }
+            log.write();
+            var ops = ops(writes, log);
+            var toLog = new AtomicInteger();
+            var toArray = new AtomicInteger();
+            Runnable spill = () -> {
+                for (var i = 0; i < ops.size(); i += 2) {
+                    var version = ops.get(i).version();
+                    if (log.spill(version, writes.get(i).value())) {
+                        (version.sourceForTests() instanceof LogValue ? toLog : toArray).incrementAndGet();
+                    }
+                }
+            };
+            var streamed = layOut(directory.resolve("streamed"), true, ops, false, spill);
+            assertTrue(toLog.get() > 0, "no value moved to the log");
+            assertTrue(toArray.get() > 0, "no value moved to an array of its own");
+            var merged = layOut(directory.resolve("merged"), true, ops(writes, log), true, null);
+            assertEquals(merged.root(), streamed.root());
+            assertEquals(-1, Arrays.mismatch(merged.file(), streamed.file()), "the data files differ");
+            var keys = new ArrayList<>(model.keySet());
+            try (var pages = PageFile.open(directory.resolve("streamed"), cipher(true), 1 << 20, new HeapPool(1 << 20))) {
+                verify(pages, streamed.root(), model, random, keys);
+                verifyNodes(pages, streamed.root());
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("writes that only remove keys, with or without removed ranges, leave a tree that held no key empty, and take and write no page")
+    void newTreeOfRemovals(@TempDir Path directory) throws Exception {
+        try (var pages = PageFile.open(directory, cipher(true), 1 << 20, new HeapPool(1 << 20))) {
+            var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+            var writer = pages.writer(3);
+            var update = new TreeUpdate(pages, writer, space);
+            var ops = new ArrayList<TreeUpdate.Op>();
+            for (var i = 0; i < 100; i++) {
+                ops.add(new TreeUpdate.Op(segment("k%03d".formatted(i).getBytes()), null));
+            }
+            var range = new TreeUpdate.Range(segment("k010".getBytes()), segment("k050".getBytes()));
+            assertNull(update.apply(null, ops, List.of(range)));
+            assertNull(update.apply(null, ops, List.of()));
+            assertNull(update.apply(null, List.of(), List.of(new TreeUpdate.Range(null, null))));
+            writer.flush();
+            assertTrue(update.allocated().isEmpty(), "pages taken: " + update.allocated());
+            assertEquals(PageFormat.FIRST_UNIT_PAGE, space.pageCount());
+        }
+        assertEquals((long) PageFormat.FIRST_UNIT_PAGE * PageFormat.SIZE, Files.size(directory.resolve(PageFile.FILE)));
+    }
+
+    @Test
+    @DisplayName("every node an update writes, in subtrees updated in parallel, as delta records and in merges of underfull nodes too, is known above by a copy of its first key that shares no array with the node's plaintext")
+    void firstKeysKeepNoUnit(@TempDir Path directory) throws Exception {
+        var random = new Random(41);
+        try (var pages = PageFile.open(directory, cipher(true), 1 << 20, new HeapPool(1 << 20));
+             var workers = new ForkJoinPool(3)) {
+            try {
+                var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+                var model = new TreeMap<byte[], byte[]>(UNSIGNED);
+                var keys = new ArrayList<byte[]>();
+                for (var i = 0; i < 60_000; i++) {
+                    keys.add("k%07d".formatted(i).getBytes());
+                }
+                var failures = new ConcurrentLinkedQueue<String>();
+                var leaves = new AtomicInteger();
+                var branches = new AtomicInteger();
+                var records = new AtomicInteger();
+                TreeRoot root = null;
+                var deltas = DeltaTable.EMPTY;
+                for (var round = 0; round < 8; round++) {
+                    var ops = new ArrayList<TreeUpdate.Op>();
+                    var ranges = new ArrayList<TreeUpdate.Range>();
+                    if (round == 6) {
+                        // A range that ends inside a leaf, leaving it under a quarter full for its neighbour to take
+                        var from = keys.get(20_003);
+                        var to = keys.get(30_011);
+                        ranges.add(new TreeUpdate.Range(segment(from), segment(to)));
+                        model.subMap(from, true, to, false).clear();
+                    }
+                    for (var key : keys) {
+                        // All keys at first, then a few, as delta records take them, then most
+                        var writes = round < 3 || round == 7 || random.nextInt(60) == 0;
+                        if (!writes) {
+                            continue;
+                        }
+                        if (round > 2 && random.nextInt(8) == 0) {
+                            model.remove(key);
+                            ops.add(new TreeUpdate.Op(segment(key), null));
+                            continue;
+                        }
+                        var value = new byte[60 + random.nextInt(80)];
+                        random.nextBytes(value);
+                        model.put(key, value);
+                        ops.add(new TreeUpdate.Op(segment(key), segment(value)));
+                    }
+                    var writer = pages.writer(random.nextLong());
+                    var update = new TreeUpdate(pages, writer, space);
+                    update.writtenHookForTests(child -> {
+                        if (child.ref().isRecord()) {
+                            records.incrementAndGet();
+                            return;
+                        }
+                        var unit = writer.staged(child.ref());
+                        if (unit == null) {
+                            // Flushed at once, as the writer had queued as much as it holds
+                            return;
+                        }
+                        (child.level() == 0 ? leaves : branches).incrementAndGet();
+                        if (MemorySegment.ofArray(unit).asOverlappingSlice(child.firstKey()).isPresent()) {
+                            failures.add("the first key of a node of level " + child.level() + " views its plaintext");
+                        }
+                        var first = child.level() == 0 ? TreeNodes.leafKey(unit, TreeNodes.entry(unit, 0)) : TreeNodes.childKey(unit, 0);
+                        if (Segments.compare(first, child.firstKey()) != 0) {
+                            failures.add("a node of level " + child.level() + " is known by another first key than its own");
+                        }
+                    });
+                    var before = root;
+                    root = workers.submit(() -> update.apply(before, ops, ranges)).get();
+                    deltas = update.finishDeltas(deltas);
+                    writer.flush();
+                    for (var unit : update.freed()) {
+                        space.release(unit.page(), unit.pages());
+                    }
+                    verifyNodes(pages, root);
+                }
+                verify(pages, root, model, random, keys);
+                verifyPages(pages, space, root, deltas);
+                assertTrue(failures.isEmpty(), () -> String.join("\n", failures));
+                assertTrue(leaves.get() > 0, "no leaf was checked");
+                assertTrue(branches.get() > 0, "no branch was checked");
+                assertTrue(records.get() > 0, "no leaf was written as a delta record");
+            } finally {
+                workers.shutdownNow();
+            }
+        }
+    }
+
+    /// How the version of a write holds its value.
+    private enum Form {
+        /// A slice of a segment, as a batch leaves it.
+        SEGMENT,
+        /// An array of its own.
+        OWN,
+        /// A place in the log.
+        LOGGED,
+        /// A unit of the large value file, which the tree takes as it is.
+        EXTERNAL,
+        /// No value: the write removes its key.
+        REMOVED
+    }
+
+    private record Write(byte[] key, byte[] value, Form form) {
+    }
+
+    private record Laid(TreeRoot root, List<PageRef> allocated, byte[] file) {
+    }
+
+    /// {@return `count` distinct random keys of 1 to 40 bytes, in order}
+    private static List<byte[]> sortedKeys(Random random, int count) {
+        var keys = new TreeSet<byte[]>(UNSIGNED);
+        while (keys.size() < count) {
+            var key = new byte[1 + random.nextInt(40)];
+            random.nextBytes(key);
+            keys.add(key);
+        }
+        return new ArrayList<>(keys);
+    }
+
+    /// {@return the states of `writes`, with versions of their own, which hold their values as each write's form says}
+    private static List<TreeUpdate.Op> ops(List<Write> writes, Log log) {
+        var ops = new ArrayList<TreeUpdate.Op>(writes.size());
+        for (var i = 0; i < writes.size(); i++) {
+            var write = writes.get(i);
+            var key = new Chain(segment(write.key()), 0);
+            var value = write.value();
+            var version = switch (write.form()) {
+                case SEGMENT -> new Version(0, segment(value), null, null);
+                case OWN -> Version.ofOwn(0, value.clone(), null, null, null);
+                case LOGGED -> log.logged(value);
+                case EXTERNAL -> Version.ofOwn(0, value.clone(), null, null,
+                        new PageRef(1 << 24 | i, PageFormat.pagesFor(value.length), 5, i));
+                case REMOVED -> null;
+            };
+            ops.add(new TreeUpdate.Op(key, version, null));
+        }
+        return ops;
+    }
+
+    /// {@return the tree `ops` leave in a new data file in `directory`, written in two passes, or from one merged list
+    /// if `merged`, with `between` run between the passes if it is not `null`}
+    private static Laid layOut(Path directory, boolean encrypted, List<TreeUpdate.Op> ops, boolean merged, Runnable between)
+            throws Exception {
+        Files.createDirectories(directory);
+        TreeRoot root;
+        List<PageRef> allocated;
+        try (var pages = PageFile.open(directory, cipher(encrypted), 1 << 20, new HeapPool(1 << 20))) {
+            var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+            var writer = pages.writer(42);
+            var update = new TreeUpdate(pages, writer, space);
+            if (between != null) {
+                update.passHookForTests(between);
+            }
+            root = merged ? update.applyMergedForTests(ops) : update.apply(null, ops, List.of());
+            writer.flush();
+            allocated = List.copyOf(update.allocated());
+            verifyNodes(pages, root);
+        }
+        return new Laid(root, allocated, Files.readAllBytes(directory.resolve(PageFile.FILE)));
+    }
+
+    private static PageCipher cipher(boolean encrypted) {
+        return new PageCipher(encrypted ? new SecretKeySpec(new byte[32], "AES") : null);
+    }
+
+    /// A segment of a log without encryption that holds values at places of their own, from which versions read them
+    /// back as a store's do once their values left the heap.
+    private static final class Log implements AutoCloseable {
+        private final Path path;
+        private final SpillQueue queue;
+        private final LogSegmentView view;
+        private final ByteArrayOutputStream bytes;
+        // Where each value's frame starts, by the value's array
+        private final IdentityHashMap<byte[], Long> places;
+
+        Log(Path path) {
+            this.path = path;
+            this.queue = new SpillQueue(0, false);
+            this.view = queue.segment(1, path, null);
+            this.bytes = new ByteArrayOutputStream();
+            this.places = new IdentityHashMap<>();
+        }
+
+        /// Places `value` as the body of a frame of its own.
+        void place(byte[] value) {
+            places.put(value, (long) bytes.size());
+            bytes.writeBytes(new byte[LogWriter.FRAME_HEADER]);
+            bytes.writeBytes(value);
+        }
+
+        /// Writes the values placed to the segment's file.
+        void write() throws IOException {
+            Files.write(path, bytes.toByteArray());
+        }
+
+        /// {@return a version of `value`, placed, that holds it in the log}
+        Version logged(byte[] value) {
+            var crypto = queue.takeCrypto();
+            try {
+                return Version.ofLogged(0, crypto.logValue(view, places.get(value), 0, 0, value, 0, value.length), value.length);
+            } finally {
+                queue.giveBack(crypto);
+            }
+        }
+
+        /// Moves the value of `version`, the bytes of `value`, placed, off its segment or array, as a spill does.
+        ///
+        /// @return whether it moved
+        boolean spill(Version version, byte[] value) {
+            var crypto = queue.takeCrypto();
+            try {
+                return version.spill(crypto, view, places.get(value), 0, 0, null);
+            } finally {
+                queue.giveBack(crypto);
+            }
+        }
+
+        @Override
+        public void close() {
+            view.retire();
         }
     }
 

@@ -664,12 +664,18 @@ final class TreeNodes {
             return SLOT + bytes();
         }
 
+        /// {@return the bytes an entry that puts a key of `keyLength` bytes with a value of `length` bytes takes in a
+        /// leaf, as [#size()] counts them, the value in a blob or a unit if `outOfLine`, else inline}
+        static int size(int keyLength, int length, boolean outOfLine) {
+            return SLOT + 2 + keyLength + 1 + (outOfLine ? 4 + PageRef.BYTES : 2 + length);
+        }
+
         /// {@return the bytes the entry takes as a leaf or a delta record holds it, without an offset or a head}
         int bytes() {
             if (isRemoved()) {
                 return 2 + (int) key.byteSize() + 1;
             }
-            return 2 + (int) key.byteSize() + 1 + (blob == null ? 2 + length : 4 + PageRef.BYTES);
+            return size((int) key.byteSize(), length, blob != null) - SLOT;
         }
 
         /// {@return whether a value of `length` bytes under a key of `keyLength` bytes is stored inline}
@@ -680,7 +686,9 @@ final class TreeNodes {
 
     /// A child of a branch, as a branch records it, and what a checkpoint knows of a node it wrote.
     ///
-    /// @param firstKey the lowest key of the subtree
+    /// @param firstKey the lowest key of the subtree: a view of the branch it was read from; for a node a checkpoint
+    ///                 just wrote, a key that keeps none of the checkpoint's units reachable; or `null` for the root an
+    ///                 update starts from
     /// @param ref the node
     /// @param count the entries of the subtree
     /// @param blobs whether a leaf of the subtree holds a value in a blob
