@@ -328,8 +328,8 @@ final class LogWriter {
     private int smallPeak;
     // The most bytes the group being written asked the output for so far
     private int groupPeak;
-    // The most bytes the group being written may ask the output for, at most OUTPUT: what its frames seal into, each
-    // counted as a frame of its own, the room the cipher's last call asks for past them and the padding to a block
+    // The most bytes the group being written may ask the output for, at most OUTPUT: what its frames seal into, joined
+    // into runs, the room the cipher's last call asks for past them and the padding to a block
     private int groupNeed;
     // Whether the output of the group being written filled, so the group was written in several calls
     private boolean drainedInGroup;
@@ -1179,7 +1179,7 @@ final class LogWriter {
             bodies += frame.body().size();
         }
         var count = group.size();
-        groupNeed = groupBound(bodies, count);
+        groupNeed = groupBound(group);
         drainedInGroup = false;
         groupGrowths = 0;
         for (var index = 0; index < count; ) {
@@ -1257,16 +1257,41 @@ final class LogWriter {
         return bodies;
     }
 
-    /// {@return the most bytes a group of `count` frames whose bodies hold `bodies` bytes asks the output for, at most
-    /// [#OUTPUT]: each frame sealed with its header, the room the cipher's last call asks for past the last one and the
-    /// padding to the next block}
+    /// {@return the most bytes `group` asks the output for, at most [#OUTPUT]: its frames sealed as [#runEnd(List, int)]
+    /// joins them, the room the cipher's last call asks for past the last one and the padding to the next block}
     ///
-    /// A run takes less than the frames it joins: one header and one tag where they take one each, for entries of at
-    /// most three bytes more than their bodies. Every call of [#room(int)] but the cipher's last asks for no more than
-    /// the frame being sealed holds, and that one for at most a tag past it. The bound is a multiple of [#ALIGNMENT], so
-    /// groups of one size keep one output of that size.
-    private int groupBound(long bodies, int count) {
-        var bytes = bodies + (long) count * (FRAME_HEADER + sealOverhead()) + 2 * TAG_BYTES;
+    /// The commits are joined into runs as a segment with room for them all would join them, each entry counted as an
+    /// entry of a run even when its run holds it alone, which takes up to three bytes less. A segment that fills ends a
+    /// run sooner, but the rollover writes out the output first, and the runs either side of it hold no more than the
+    /// ones counted. Every call of [#room(int)] but the cipher's last asks for no more than the frame being sealed holds,
+    /// and that one for at most a tag past it. The bound is a multiple of [#ALIGNMENT], so groups of one size keep one
+    /// output of that size.
+    private int groupBound(List<Queued> group) {
+        var frame = (long) FRAME_HEADER + sealOverhead();
+        var bytes = 2L * TAG_BYTES;
+        // The bytes of the entries of the run the last commit joined, or -1 if the last frame is not in a run
+        var entries = -1L;
+        var sequence = 0L;
+        for (var queued : group) {
+            var length = queued.body().size();
+            if (queued.type() == FrameBody.COMMIT && length <= RUN_MAX_BODY) {
+                var entry = FrameBody.runEntryBytes(length);
+                if (entries >= 0 && queued.sequence() == sequence + 1 && entries + entry <= RUN_BYTES) {
+                    entries += entry;
+                    bytes += entry;
+                } else {
+                    entries = entry;
+                    bytes += frame + entry;
+                }
+                sequence = queued.sequence();
+            } else {
+                entries = -1;
+                bytes += frame + length;
+            }
+            if (bytes >= OUTPUT) {
+                return OUTPUT;
+            }
+        }
         return (int) Math.min(OUTPUT, (bytes + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT);
     }
 
@@ -2020,6 +2045,11 @@ final class LogWriter {
     /// {@return the arrays the output grew into since the writer opened, for tests}
     long outputAllocationsForTests() {
         return outputAllocations;
+    }
+
+    /// {@return the most bytes the last group written asked the output for, for tests: read after it is durable}
+    int groupPeakForTests() {
+        return groupPeak;
     }
 
     /// {@return the most times the output grew while one group was written, for tests}

@@ -1,5 +1,6 @@
 package com.github.auties00.ledger.engine;
 
+import com.github.auties00.ledger.Commit;
 import com.github.auties00.ledger.Encryption;
 import com.github.auties00.ledger.IoPool;
 import com.github.auties00.ledger.KeyCodec;
@@ -171,6 +172,56 @@ class LogOutputSizeTest {
                 assertTrue(log.mostGroupGrowthsForTests() <= 1, "the output grew " + log.mostGroupGrowthsForTests() + " times for one group");
             }
             assertTrue(log.outputAllocationsForTests() > 0, "no group grew the output");
+        }
+        survivesPowerLossLarge(disk, encrypted, model);
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @CsvSource({"true", "false"})
+    @DisplayName("sizes the output of one group of thousands of small commits to the runs they seal into, below what doubling reaches")
+    void sizedByRuns(boolean encrypted) throws Exception {
+        var disk = CrashFileSystem.create();
+        var model = new TreeMap<String, String>();
+        var holding = new AtomicBoolean();
+        var held = new CountDownLatch(1);
+        var released = new CountDownLatch(1);
+        disk.intercept((path, kind) -> {
+            if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log") && holding.compareAndSet(true, false)) {
+                held.countDown();
+                try {
+                    released.await(1, TimeUnit.MINUTES);
+                } catch (InterruptedException _) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        try (var ledger = openLarge(disk.getPath("/store"), encrypted, null)) {
+            var log = log(ledger);
+            commit(ledger, model, "first", 500);
+            holding.set(true);
+            var first = ledger.commit(ledger.newBatch().put(NAMES, "held", "h"));
+            model.put("held", "h");
+            assertTrue(held.await(1, TimeUnit.MINUTES), "the log did not force the held commit");
+            // Queued behind the held force, so the next group takes them all: commits of a few dozen bytes, where a
+            // header and a tag per commit would count more than their bodies
+            Commit last = first;
+            for (var i = 0; i < 6_000; i++) {
+                var key = "s" + i;
+                var value = "v".repeat(8 + i % 9);
+                last = ledger.commit(ledger.newBatch().put(NAMES, key, value));
+                model.put(key, value);
+            }
+            released.countDown();
+            last.awaitDurable();
+            var peak = log.groupPeakForTests();
+            assertTrue(peak > 100_000, "the commits were not written as one group: the last asked for " + peak + " bytes");
+            var length = log.outputLength();
+            assertTrue(length <= peak + 2 * LogWriter.ALIGNMENT,
+                    "a group that asked for " + peak + " bytes grew the output to " + length);
+            assertTrue(length <= Integer.highestOneBit(peak - 1) << 1,
+                    "a group that asked for " + peak + " bytes grew the output to " + length + ", more than doubling would");
+        } finally {
+            released.countDown();
         }
         survivesPowerLossLarge(disk, encrypted, model);
     }
