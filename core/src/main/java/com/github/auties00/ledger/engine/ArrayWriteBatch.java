@@ -148,6 +148,8 @@ public final class ArrayWriteBatch implements WriteBatch {
     // The values in owns put to paged key spaces that the batch did not borrow, which only a value bound for the file
     // of large values is
     private int pagedOwns;
+    // The bytes of those values
+    private long pagedOwnBytes;
     // The chunks of the rope by the number a span's offset holds in its high bits, or null while the encodings are on
     // data, whose spans hold 0 there: the number 0 is no chunk's
     private Chunk[] chunks;
@@ -421,6 +423,7 @@ public final class ArrayWriteBatch implements WriteBatch {
             pagedValueBytes -= length;
             if (!borrowed) {
                 pagedOwns++;
+                pagedOwnBytes += length;
             }
         } else {
             residentValueBytes -= length;
@@ -691,6 +694,7 @@ public final class ArrayWriteBatch implements WriteBatch {
         owns = null;
         ownBytes = 0;
         pagedOwns = 0;
+        pagedOwnBytes = 0;
         leaveRope();
         // What a commit that failed prepared
         packedHome = null;
@@ -1125,6 +1129,27 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// {@return how many values the batch puts to paged key spaces on arrays of their own that it did not borrow}
     int pagedOwns() {
         return pagedOwns;
+    }
+
+    /// {@return the bytes of the values the batch puts to paged key spaces on arrays of their own that it did not
+    /// borrow}
+    long pagedOwnBytes() {
+        return pagedOwnBytes;
+    }
+
+    /// {@return the bytes of the values the batch puts to paged key spaces, those on arrays of their own aside}
+    long pagedValueBytes() {
+        return pagedValueBytes;
+    }
+
+    /// {@return whether the last prepare put the values of the paged puts the store keeps on arrays of this batch, in
+    /// the order of the writes and back to back but where a value goes elsewhere: the chunks of its rope, each filled
+    /// before the next, or the one array it packed them into}
+    ///
+    /// A log frame may then take those values as a few runs of these arrays, about one per chunk, as a split frame body
+    /// does ([FrameBody#split()]).
+    boolean valuesInOrder() {
+        return homesMode == HOMES_ROPE || homesMode == HOMES_CHUNKS;
     }
 
     /// Starts the batch again, empty, once the store has applied its writes: it hands over to the store the arrays the

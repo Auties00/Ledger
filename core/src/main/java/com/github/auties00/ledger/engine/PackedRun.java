@@ -758,17 +758,18 @@ final class PackedRun {
     /// appends beside them.
     ///
     /// @param crypto the caller's, until it gives it back
-    /// @param segment the segment use that holds the commit's frame, or `null` if no value goes to the log
-    /// @param commitStart where the commit's body starts in the frame's body
-    /// @param frameBody the bytes of the frame's body, or 0 if they are not known, so no value is authenticated by the
-    ///                  frame's tag ([LogValue#framed()])
-    /// @param sequence the commit's sequence, which the tags bind with the position of each write in the batch
+    /// @param record the record of the commit, which says where its frames lie: the segment use, or `null` if no value
+    ///               goes to the log, and the frame of each value, which a split commit's value frames may hold, the
+    ///               bytes of its body 0 if not known, so no value is authenticated by the frame's tag
+    ///               ([LogValue#framed()]); and the commit's sequence, which the tags bind with the position of each
+    ///               write in the batch
     /// @param entries the entries, each listed once
-    /// @param offsets where each entry's value starts in the commit's body
+    /// @param offsets where each entry's value starts in the commit's body, as the record lists it
     /// @param ops the position of each entry's write in the batch
     /// @return the values moved to the log and to a chunk, in this order
-    int[] spill(SpillQueue.Crypto crypto, LogSegmentView segment, long frameOffset, int commitStart, int frameBody,
-                long sequence, int[] entries, int[] offsets, int[] ops, int count) {
+    int[] spill(SpillQueue.Crypto crypto, SpillQueue.Record record, int[] entries, int[] offsets, int[] ops, int count) {
+        var segment = record.segment();
+        var sequence = record.sequence();
         var storage = this.storage;
         synchronized (storage.spillLock) {
             // Where the values go, laid out before anything moves
@@ -863,7 +864,10 @@ final class PackedRun {
                     if (segment == null) {
                         continue;
                     }
-                    var bodyIndex = commitStart + offsets[i];
+                    var listed = offsets[i];
+                    var frameOffset = record.frameOf(listed);
+                    var bodyIndex = record.indexOf(listed);
+                    var frameBody = record.bodyOf(listed);
                     var stamp = Reads.stamp(sequence, ops[i]);
                     var place = SpillQueue.framesAlone(segment, frameBody, length)
                             ? LogValue.framed(segment, frameOffset, bodyIndex, frameBody)

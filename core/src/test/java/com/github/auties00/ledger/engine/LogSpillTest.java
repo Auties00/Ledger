@@ -2417,4 +2417,63 @@ class LogSpillTest {
             history.add(next.copy());
         }
     }
+
+    /// Commits a rope batch of `count` messages from `first`, each of one of `lengths`, with a value of `ownLength`
+    /// bytes on an array of its own among them and a chat, and records them in `expected`.
+    private static void writeSplit(Ledger ledger, Expected expected, int first, int count, int[] lengths, int ownLength)
+            throws Exception {
+        var batch = ledger.newBatch();
+        for (var message = first; message < first + count; message++) {
+            var value = message == first + count / 2 ? large(message, ownLength) : new byte[lengths[message % lengths.length]];
+            if (value.length != ownLength) {
+                for (var i = 0; i < value.length; i++) {
+                    value[i] = (byte) (message * 11 + i * 3);
+                }
+            }
+            batch.put(MESSAGES, key(message), value);
+            expected.messages.put(message, value);
+            if (message % 500 == 0) {
+                batch.put(CHATS, "split" + message, "chat " + message);
+                expected.chats.put("split" + message, "chat " + message);
+            }
+        }
+        ledger.commit(batch).awaitDurable();
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("the values a split frame leaves to its section, a value of 200 KiB on an array of its own among them, leave the heap from where the section put them, and read back as written before and after a checkpoint and a recovery")
+    void splitSectionValuesMove(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var count = 2_000;
+        int[] lengths = {SpillQueue.LOG_VALUE_MIN, 700, 1_500};
+        var own = 200 << 10;
+        try (var ledger = openSized(directory, encrypted, 0, Duration.ZERO, 16L << 20)) {
+            writeSplit(ledger, expected, 0, count, lengths, own);
+            spillNow(ledger);
+            var spills = ledger.spills();
+            assertEquals(count, spills.loggedValuesForTests(), "values moved to the log");
+            for (var message = 0; message < count; message++) {
+                assertInstanceOf(LogValue.class, head(ledger, MESSAGES, key(message)).sourceForTests(), "message " + message);
+            }
+            verify(ledger, expected);
+            // The checkpoint reads them back from the section
+            ledger.checkpoint();
+            verify(ledger, expected);
+            // Replayed by the recovery, which moves them from the section again
+            writeSplit(ledger, expected, count, count, lengths, own);
+            spillNow(ledger);
+            assertInstanceOf(LogValue.class, head(ledger, MESSAGES, key(count + count / 2)).sourceForTests());
+            verify(ledger, expected);
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = openSized(directory, encrypted, 0, Duration.ZERO, 16L << 20)) {
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = openSized(directory, encrypted, 0, Duration.ZERO, 16L << 20)) {
+            verify(ledger, expected);
+        }
+    }
 }

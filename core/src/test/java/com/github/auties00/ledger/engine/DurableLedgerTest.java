@@ -669,9 +669,10 @@ class DurableLedgerTest {
             }
         }
 
-        @Test
-        @DisplayName("reads the segments of the previous version and writes none of them: a prepared one stays empty, and the writer starts a segment of the current version")
-        void previousVersion(@TempDir Path directory) throws Exception {
+        @ParameterizedTest(name = "version {0}")
+        @ValueSource(ints = {LogWriter.OLDEST_SEGMENT_VERSION, LogWriter.SEGMENT_VERSION - 1})
+        @DisplayName("reads the segments of a previous version and writes none of them: a prepared one stays empty, and the writer starts a segment of the current version")
+        void previousVersion(int previousVersion, @TempDir Path directory) throws Exception {
             var crashed = open(directory, NAMES);
             try {
                 crashed.commit(crashed.newBatch().put(NAMES, "a", "1")).awaitDurable();
@@ -681,7 +682,7 @@ class DurableLedgerTest {
             var previous = segments(directory);
             assertTrue(previous.size() > 1, "a written segment and the prepared one after it");
             for (var segment : previous) {
-                setVersion(segment, LogWriter.OLDEST_SEGMENT_VERSION);
+                setVersion(segment, previousVersion);
             }
             var reopened = open(directory, NAMES);
             try {
@@ -691,7 +692,7 @@ class DurableLedgerTest {
                 assertFalse(previous.contains(written));
                 assertEquals(LogWriter.SEGMENT_VERSION, version(written));
                 for (var segment : previous) {
-                    assertEquals(LogWriter.OLDEST_SEGMENT_VERSION, version(segment));
+                    assertEquals(previousVersion, version(segment));
                 }
             } finally {
                 crash(reopened);
