@@ -1,5 +1,6 @@
 package com.github.auties00.ledger.engine;
 
+import java.lang.ref.Cleaner;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -23,12 +24,22 @@ import java.util.concurrent.atomic.AtomicLong;
 /// time. It keeps the free arrays past the reserve, up to the bytes the stores ask it for, in an overflow it reaches
 /// only weakly, unless work that takes many arrays at once [holds][#hold()] it: a large batch's rope, the body of a
 /// large commit's frame, a checkpoint. While any such work holds it, a collection, young or full, keeps it; once none
-/// does, the first collection frees it. Such work gives its arrays back to the overflow alone
-/// ([#releaseBurst(byte\[\])]), where it finds them again for as long as it holds it, so the reserve never keeps
-/// the arrays of a burst that ended. A large commit gives back tens of megabytes of chunks as its frame is sealed,
+/// does, the first collection frees it. A large commit gives back tens of megabytes of chunks as its frame is sealed,
 /// which a pool that held every free array strongly kept for as long as the store went on taking an array of their
 /// size, and after the last store closed; the next large batch holds what is left of them from its first chunk, so
 /// large commits that follow one another reuse them, unless a collection ran between the two.
+///
+/// The chunks a large commit's body or a bulk batch's rope gives back go to the reserve within its bounds, as other
+/// arrays do, but kept apart ([#releaseBurst(byte\[\])]): such commits come one after another while a client stores
+/// large values or a history, and each takes the chunks of the one before it again. Held strongly while such commits
+/// go on, the chunks grow old after a few collections and stay; an overflow that a collection between two commits
+/// cleared would make the next commit allocate them again, and each young collection during a commit copy them,
+/// which, at the rate of a client storing large values one by one, doubles the pauses and makes G1 grow the heap to
+/// keep its time down. Each collection after such chunks came back moves them to the overflow, where the next commit
+/// takes them again; once commits stop coming, the collection after that frees them, so the reserve keeps no chunk of
+/// commits that stopped. A checkpoint, which holds the overflow from its cut to its end and comes once per many
+/// commits, gives the arrays it seals pages into to the overflow alone ([#releaseHeld(byte\[\])]), where its next
+/// window takes them again.
 ///
 /// The free arrays of a size none was taken of for a tick of the [IdleTicker], between one and two of its periods, go
 /// to the collector, the reserve's and the overflow's alike, so neither a store idle after a checkpoint, in a process
@@ -70,10 +81,22 @@ public final class HeapPool {
     /// array of one read that missed the cache and that the cache takes; a miss the cache refuses keeps one. Each more
     /// would keep the regions of a unit committed while a marking is pending.
     static final int LARGE_SPARES = 2;
+    // Moves the chunks of bursts a pool's reserve keeps to its overflow once a collection took the sentinel it
+    // registered
+    private static final Cleaner COLLECTIONS = Cleaner.create(Thread.ofVirtual().name("ledger-pool-collections").factory());
     // The region of G1 tests force, or -1 for the JVM's
     private static volatile long forcedRegionForTests = -1;
     // The free arrays of the reserve, of each size
     private final ConcurrentLinkedQueue<byte[]>[] free;
+    // The free arrays of the reserve that bursts gave back, of each size, apart from the others so that a collection
+    // can move them, and them alone, to the overflow. The reserve's counts and bounds are theirs too
+    private final ConcurrentLinkedQueue<byte[]>[] burstFree;
+    // Whether a sentinel is registered whose collection moves them; written holding the burst lock
+    private volatile boolean burstWatched;
+    private final Object burstLock;
+    // What a collection of a sentinel runs, holding the pool weakly so that a sentinel never keeps a pool alive; null
+    // for a pool whose tests move the arrays themselves
+    private final Runnable burstCheck;
     // The bytes of the reserve's free arrays
     private final AtomicLong pooledBytes;
     // The most of the stores' asks, for the process's pool: the most bytes of free arrays, the reserve's and the
@@ -180,14 +203,18 @@ public final class HeapPool {
         this(maxPooledBytes, true);
     }
 
-    /// Creates a pool that keeps at most `maxPooledBytes` of free arrays, and that the [IdleTicker] trims only if
-    /// `trimmed`; for tests that trim it themselves.
+    /// Creates a pool that keeps at most `maxPooledBytes` of free arrays, and that the [IdleTicker] trims and whose
+    /// arrays of bursts collections move only if `trimmed`; for tests that do both themselves.
     @SuppressWarnings("unchecked")
     HeapPool(long maxPooledBytes, boolean trimmed) {
         this.free = new ConcurrentLinkedQueue[MAX_SHIFT - MIN_SHIFT + 1];
+        this.burstFree = new ConcurrentLinkedQueue[free.length];
         for (var i = 0; i < free.length; i++) {
             free[i] = new ConcurrentLinkedQueue<>();
+            burstFree[i] = new ConcurrentLinkedQueue<>();
         }
+        this.burstLock = new Object();
+        this.burstCheck = trimmed ? new BurstCheck(this) : null;
         this.pooledBytes = new AtomicLong();
         this.maxPooledBytes = maxPooledBytes;
         this.pooledBySize = new AtomicLong[free.length];
@@ -275,6 +302,9 @@ public final class HeapPool {
     /// {@return a free array of the reserve of the size `index`, taken out of it, or `null` if it has none}
     private byte[] pollFree(int index) {
         var array = free[index].poll();
+        if (array == null) {
+            array = burstFree[index].poll();
+        }
         if (array != null) {
             pooledBytes.addAndGet(-array.length);
             pooledBySize[index].addAndGet(-array.length);
@@ -308,7 +338,7 @@ public final class HeapPool {
 
     /// {@return an array of at least `capacity` bytes}
     ///
-    /// A free array of the reserve comes first, then one of the overflow.
+    /// A free array of the reserve comes first, one a burst gave back after the others, then one of the overflow.
     ///
     /// @param capacity the least length, not negative
     public byte[] acquire(int capacity) {
@@ -319,6 +349,9 @@ public final class HeapPool {
         var size = shift - MIN_SHIFT;
         acquires[size]++;
         var array = free[size].poll();
+        if (array == null) {
+            array = burstFree[size].poll();
+        }
         if (array != null) {
             pooledBytes.addAndGet(-array.length);
             pooledBySize[size].addAndGet(-array.length);
@@ -344,9 +377,36 @@ public final class HeapPool {
     ///
     /// @param array an array [#acquire] returned, which the caller no longer uses
     public void release(byte[] array) {
+        releaseTo(array, free);
+    }
+
+    /// Returns `array`, one of the chunks a large commit's body or a bulk batch's rope gives back, to the pool, unless
+    /// it is not one of the pooled sizes or the pool is full.
+    ///
+    /// It goes where [#release(byte\[\])] would put it, within the same bounds, but the reserve keeps it apart from
+    /// the arrays work takes and gives back one at a time, and the first collection after it moves it to the overflow,
+    /// which the next collection frees unless work holds it or took it back. So commits that follow one another take
+    /// the chunks of the one before them from the reserve, or, after a collection, from the overflow, and give them
+    /// back to the reserve, which holds them through the next collection: the chunks grow old and stay. Once such
+    /// commits stop, the reserve keeps none past the next collection, and the one after it frees them.
+    ///
+    /// @param array an array [#acquire] returned, which the caller no longer uses
+    void releaseBurst(byte[] array) {
+        if (releaseTo(array, burstFree)) {
+            if (!burstWatched && burstCheck != null) {
+                watchCollection();
+            }
+        }
+    }
+
+    /// Returns `array` to the pool as [#release(byte\[\])] does, its reserve's share to `reserve`, the queues of the
+    /// arrays work gives back one at a time or of those bursts give back.
+    ///
+    /// @return whether the reserve took it
+    private boolean releaseTo(byte[] array, ConcurrentLinkedQueue<byte[]>[] reserve) {
         var length = array.length;
         if (Integer.bitCount(length) != 1 || length < 1 << MIN_SHIFT || length > 1 << MAX_SHIFT) {
-            return;
+            return false;
         }
         var size = Integer.numberOfTrailingZeros(length) - MIN_SHIFT;
         var max = maxPooledBytes;
@@ -357,29 +417,80 @@ public final class HeapPool {
                 if (watching != null) {
                     watching.released(array);
                 }
-                free[size].offer(array);
-                return;
+                reserve[size].offer(array);
+                return true;
             }
             pooledBytes.addAndGet(-length);
         }
         if (pooledBySize[size].addAndGet(-length) + length > perSize) {
-            return;
+            return false;
         }
         releaseToOverflow(size, array, perSize, max);
+        return false;
     }
 
-    /// Returns `array`, one of the many a burst of work gives back, to the overflow alone, never to the reserve, unless
-    /// it is not one of the pooled sizes or the pool is full.
+    /// Registers a sentinel whose collection runs [#moveBursts()], unless one is registered already.
     ///
-    /// The reserve keeps the arrays that work which takes and gives back one array at a time needs again; a burst
-    /// takes back the arrays it gave from the overflow it holds, and once it ends the first collection frees them,
-    /// where the reserve would keep up to [#RESERVE_PER_SIZE] of each size it used for as long as the store stays open.
+    /// Nothing reaches the sentinel, so the next collection, young or full, takes it.
+    private void watchCollection() {
+        synchronized (burstLock) {
+            if (!burstWatched) {
+                burstWatched = true;
+                COLLECTIONS.register(new Object(), burstCheck);
+            }
+        }
+    }
+
+    /// Moves the reserve's arrays bursts gave back to the overflow, within its bounds, once a collection took the
+    /// sentinel [#watchCollection()] registered; the next burst that gives one back registers another.
+    ///
+    /// A burst that holds the overflow takes them again from there, and the next collection frees what no work holds
+    /// or took back. A burst that gives an array back while they move registers a sentinel of its own, so none stays
+    /// in the reserve past the collection after it.
+    private void moveBursts() {
+        synchronized (burstLock) {
+            burstWatched = false;
+        }
+        var max = maxPooledBytes;
+        var perSize = max / 2;
+        for (var i = 0; i < burstFree.length; i++) {
+            byte[] array;
+            while ((array = burstFree[i].poll()) != null) {
+                pooledBytes.addAndGet(-array.length);
+                pooledBySize[i].addAndGet(-array.length);
+                offerOverflow(i, array, perSize, max);
+            }
+        }
+    }
+
+    /// What the collection of a sentinel runs: the move of its pool's arrays of bursts, if the collector has not taken
+    /// the pool.
+    private static final class BurstCheck implements Runnable {
+        private final WeakReference<HeapPool> pool;
+
+        BurstCheck(HeapPool pool) {
+            this.pool = new WeakReference<>(pool);
+        }
+
+        @Override
+        public void run() {
+            var pool = this.pool.get();
+            if (pool != null) {
+                pool.moveBursts();
+            }
+        }
+    }
+
+    /// Returns `array`, one of the arrays a checkpoint seals pages into, to the overflow alone, never to the reserve,
+    /// unless it is not one of the pooled sizes or the pool is full.
+    ///
     /// The caller holds the overflow ([#hold()]) from before its first array goes back until after its last has, so
-    /// a collection during the burst keeps them; an array given back while nothing holds the overflow is left to the
-    /// next collection.
+    /// a collection during its work keeps them and its next window takes them again; once it ends, the first
+    /// collection frees them, where the reserve would keep up to [#RESERVE_PER_SIZE] of each size it used. An array
+    /// given back while nothing holds the overflow is left to the next collection.
     ///
     /// @param array an array [#acquire] returned, which the caller no longer uses
-    void releaseBurst(byte[] array) {
+    void releaseHeld(byte[] array) {
         var length = array.length;
         if (Integer.bitCount(length) != 1 || length < 1 << MIN_SHIFT || length > 1 << MAX_SHIFT) {
             return;
@@ -393,18 +504,11 @@ public final class HeapPool {
         releaseToOverflow(size, array, perSize, max);
     }
 
-    /// Puts `array`, of the size `size`, in the overflow, unless the size would then hold more than `perSize` bytes,
-    /// the reserve's and the overflow's together, or the pool more than `max`.
+    /// Puts `array`, of the size `size`, which the caller gives back, in the overflow, unless the size would then hold
+    /// more than `perSize` bytes, the reserve's and the overflow's together, or the pool more than `max`.
     private void releaseToOverflow(int size, byte[] array, long perSize, long max) {
-        var length = array.length;
-        var set = overflow();
-        if (set.bytes[size].addAndGet(length) + pooledBySize[size].get() > perSize) {
-            set.bytes[size].addAndGet(-length);
-            return;
-        }
-        if (set.total.addAndGet(length) + pooledBytes.get() > max) {
-            set.total.addAndGet(-length);
-            set.bytes[size].addAndGet(-length);
+        var set = reserveOverflow(size, array.length, perSize, max);
+        if (set == null) {
             return;
         }
         var watching = watcher;
@@ -412,6 +516,33 @@ public final class HeapPool {
             watching.released(array);
         }
         set.free[size].offer(array);
+    }
+
+    /// Moves `array`, a free array of the size `size` taken out of the reserve, to the overflow within the bounds
+    /// [#releaseToOverflow(int, byte\[\], long, long)] keeps, or leaves it to the collector past them.
+    private void offerOverflow(int size, byte[] array, long perSize, long max) {
+        var set = reserveOverflow(size, array.length, perSize, max);
+        if (set != null) {
+            set.free[size].offer(array);
+        }
+    }
+
+    /// Counts `length` more bytes of the size `size` in the overflow, if the size then holds at most `perSize` bytes,
+    /// the reserve's and the overflow's together, and the pool at most `max`.
+    ///
+    /// @return the overflow that counts them, or `null` if they are past a bound
+    private Overflow reserveOverflow(int size, int length, long perSize, long max) {
+        var set = overflow();
+        if (set.bytes[size].addAndGet(length) + pooledBySize[size].get() > perSize) {
+            set.bytes[size].addAndGet(-length);
+            return null;
+        }
+        if (set.total.addAndGet(length) + pooledBytes.get() > max) {
+            set.total.addAndGet(-length);
+            set.bytes[size].addAndGet(-length);
+            return null;
+        }
+        return set;
     }
 
     /// {@return the length of the array [#acquireLarge(int)] gives for `capacity` bytes: if the bytes and the array's
@@ -737,6 +868,28 @@ public final class HeapPool {
         return pooledBySize[Integer.numberOfTrailingZeros(length) - MIN_SHIFT].get();
     }
 
+    /// {@return the bytes of the reserve's free arrays that bursts gave back; for tests}
+    long burstBytesForTests() {
+        var total = 0L;
+        for (var queue : burstFree) {
+            for (var array : queue) {
+                total += array.length;
+            }
+        }
+        return total;
+    }
+
+    /// {@return whether a sentinel is registered whose collection moves the arrays of bursts; for tests}
+    boolean watchingCollectionsForTests() {
+        return burstWatched;
+    }
+
+    /// Moves the arrays of bursts to the overflow on the caller's thread, as the collection of a sentinel does; for
+    /// tests of a pool made untrimmed, which registers no sentinel.
+    void collectedForTests() {
+        moveBursts();
+    }
+
     /// The free arrays past the reserve, of each size, and the bytes they hold, of each size and in all.
     private static final class Overflow {
         final ConcurrentLinkedQueue<byte[]>[] free;
@@ -830,11 +983,12 @@ public final class HeapPool {
         return pooledBytes.get() + overflowBytesForTests();
     }
 
-    /// {@return the free arrays of `length` bytes, a pooled size, as they stand: the reserve's, then the overflow's;
-    /// for tests}
+    /// {@return the free arrays of `length` bytes, a pooled size, as they stand: the reserve's, those bursts gave it,
+    /// then the overflow's; for tests}
     List<byte[]> freeForTests(int length) {
         var size = Integer.numberOfTrailingZeros(length) - MIN_SHIFT;
         var arrays = new ArrayList<>(free[size]);
+        arrays.addAll(burstFree[size]);
         var set = overflow.get();
         if (set != null) {
             arrays.addAll(set.free[size]);

@@ -24,7 +24,8 @@ import java.util.function.ToLongFunction;
 /// commit [ends][#finish()]. An array of over 1 MiB, which a doubling array of a batch of a thousand messages was, the
 /// pool does not recycle and the collector gives regions of its own. From its move to a rope until it leaves it, at
 /// the end of the commit or at [#clear()], the batch [holds][HeapPool#hold()] the pool's overflow, where the chunks of
-/// the frames of the commits before it wait, so a collection while it fills keeps them for its rope; a batch dropped
+/// the frames of the commits before it wait once a collection moved them out of the reserve
+/// ([HeapPool#releaseBurst(byte\[\])]), so a collection while it fills keeps them for its rope; a batch dropped
 /// without either holds nothing once it is unreachable.
 ///
 /// A value of half a [chunk][#CHUNK_BYTES] or more never enters that array: it takes an array of its own at the put,
@@ -582,9 +583,9 @@ public final class ArrayWriteBatch implements WriteBatch {
     /// Lets go of the rope, if the batch has one: every chunk returns to the pool but those that are their values' home,
     /// which the versions may slice and no one writes again.
     ///
-    /// The chunks go to the pool's overflow alone ([HeapPool#releaseBurst(byte\[\])]), which the rope holds until
-    /// they are all back: the next large batch or frame body takes them from there, and once no work holds the
-    /// overflow the first collection frees them, where the pool's reserve would keep them after the batch.
+    /// The chunks go back as a burst's ([HeapPool#releaseBurst(byte\[\])]): the next large batch or frame body takes
+    /// them again, from the reserve within its bounds and past them from the overflow the rope holds until they are all
+    /// back, and once such batches stop coming the pool's next collections free them.
     private void leaveRope() {
         if (chunks == null) {
             return;

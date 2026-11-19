@@ -1349,7 +1349,7 @@ final class PageFile implements AutoCloseable {
                 // next window seals into these arrays again, and the first collection after the checkpoint frees them
                 for (var sealed : sealedUnits) {
                     if (sealed != null) {
-                        pool.releaseBurst(sealed);
+                        pool.releaseHeld(sealed);
                     }
                 }
             }
