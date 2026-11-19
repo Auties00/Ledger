@@ -9,6 +9,7 @@ import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /// The writes an open replays into one paged key space from the frames before the log's last budget, in arrays with no
 /// object per entry: each key once, with its newest value or its removal, in the order of the keys and by the hash of
@@ -52,8 +53,9 @@ import java.util.concurrent.atomic.AtomicLong;
 /// homes), until the queue of values that may leave the heap moves them as it moves the values of versions ([#spill]):
 /// a value of at least [SpillQueue#LOG_VALUE_MIN] bytes to the log, a shorter one to a chunk of the run's own. Once no
 /// entry is on a home any more, the run lets go of it. The order of the keys of a view is made at the first scan, count
-/// or checkpoint that needs it, not by the commit, from the order of an older view that has one and the entries after
-/// it.
+/// or checkpoint that needs it, not by the commit, from the longest order any view of the run made ([Storage]): the
+/// entries after that order's are sorted and merged into it, or, for a view older than it, its entries are picked out
+/// of it, so an ingest that scans after every append sorts each entry once whether or not older views are still read.
 ///
 /// The arrays of a run are shared by its views and are only ever added to: a commit that appends writes past the
 /// entries of every view, the hash table only gains slots (a table grown or rebuilt is a new array, published before
@@ -624,8 +626,8 @@ final class PackedRun {
         return order != null;
     }
 
-    /// {@return the entries the orders of the run's views sorted in all, for tests: a view that makes its order from an
-    /// older view's sorts only the entries after that view's}
+    /// {@return the entries the orders of the run's views sorted in all, for tests: a view sorts only the entries after
+    /// those of the longest order a view of the run made, and none if its own are all in that order}
     long sortedForTests() {
         return storage.sorted.get();
     }
@@ -864,18 +866,46 @@ final class PackedRun {
         }
     }
 
-    // The entries of the view sorted by key: those of the newest older view that has its order, merged with the ones
-    // after them sorted here, or all of them sorted here
+    // The entries of the view sorted by key, from the longest order a view of the run made (Storage.lastOrder): the
+    // entries of this view picked out of it in its order if it is longer, else its entries merged with those after them
+    // sorted here; all of them sorted here if no view made one. Offered to the storage as the longest order after
     private int[] sortedOrder() {
-        int[] made = null;
-        for (var older = previous; older != null; older = older.previous) {
-            made = older.order;
-            if (made != null) {
+        var storage = this.storage;
+        var made = storage.lastOrder.get();
+        int[] result;
+        if (made != null && made.length >= size) {
+            result = pickOrder(made, size);
+        } else {
+            result = mergeOrder(storage, made);
+        }
+        for (var longest = made; longest == null || longest.length < result.length; longest = storage.lastOrder.get()) {
+            if (storage.lastOrder.compareAndSet(longest, result)) {
                 break;
             }
         }
+        return result;
+    }
+
+    // The entries below `size` of `order`, an order of the keys of the first order.length entries, in its order: the
+    // entries of a view at or before the one that made `order`, sorted without comparing a key
+    private static int[] pickOrder(int[] order, int size) {
+        if (order.length == size) {
+            return order;
+        }
+        var picked = new int[size];
+        var out = 0;
+        for (var entry : order) {
+            if (entry < size) {
+                picked[out++] = entry;
+            }
+        }
+        return picked;
+    }
+
+    // The entries of the view sorted by key: those of `made`, an order of the keys of the first made.length entries or
+    // null for none, merged with the ones after them sorted here
+    private int[] mergeOrder(Storage storage, int[] made) {
         var from = made == null ? 0 : made.length;
-        var storage = this.storage;
         var keys = storage.keys;
         var keyEnds = storage.keyEnds;
         var sorted = KeySort.sort(keys, keyEnds, from, size);
@@ -1647,6 +1677,9 @@ final class PackedRun {
         int homeCount;
         // Lets the spills of the run's commits take turns
         final Object spillLock = new Object();
+        // The longest order of the keys a view of the run made, of the first lastOrder.length entries, which no commit
+        // changes, as every view's order is made after its commit published it; replaced only by a longer one
+        final AtomicReference<int[]> lastOrder = new AtomicReference<>();
         // The entries the orders of the views sorted, for tests
         final AtomicLong sorted = new AtomicLong();
     }
