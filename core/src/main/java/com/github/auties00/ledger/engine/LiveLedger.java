@@ -416,12 +416,15 @@ public final class LiveLedger implements Ledger {
     /// The puts and removals before the log's last budget of a paged key space go, for the keys memory holds no chain
     /// of, to a [PackedRun] of the key space rather than to chains: a value in the log, or in a chunk if shorter, and the
     /// key, in arrays with no object per write, where a logged value costs less than a chain's version and [LogValue].
-    /// [#endReplay(ReplayValues)] publishes the runs. A key space's first range removal publishes its run before it
-    /// counts what it removes, and the key space's later writes go to chains, so every range removal stamped after
-    /// the run's writes is newer than all of them. A write that goes to a chain while the run of its key space is still
-    /// being built, of the log's last budget, of a value in the file of large values or refused by the run, takes what
-    /// the run holds of its key as the tree's state of it ([#replayHint(KeyspaceState, MemorySegment, ReplayValues)]),
-    /// as the trees the open found lack the run's writes.
+    /// [#endReplay(ReplayValues)] publishes the runs. A run's arrays, once full, grow to the entries the log's frames
+    /// up to its last budget are expected to give it at the rate the frames replayed so far gave them
+    /// ([ReplayValues#reserve(PackedRun.Builder, long)]), so a long log copies them a few times rather than at every
+    /// doubling. A key space's first range removal publishes its run before it counts what it removes, and the key
+    /// space's later writes go to chains, so every range removal stamped after the run's writes is newer than all of
+    /// them. A write that goes to a chain while the run of its key space is still being built, of the log's last
+    /// budget, of a value in the file of large values or refused by the run, takes what the run holds of its key as
+    /// the tree's state of it ([#replayHint(KeyspaceState, MemorySegment, ReplayValues)]), as the trees the open found
+    /// lack the run's writes.
     ///
     /// @param values the chunks and the state of this open's replay
     /// @param segment the use of the segment that holds the frame, or `null` to move no value
@@ -429,6 +432,7 @@ public final class LiveLedger implements Ledger {
     boolean replay(long sequence, byte[] body, int start, int length, ReplayValues values, LogSegmentView segment,
                    long frameOffset, long logFrom) {
         var view = values.frame(body);
+        values.reached(logFrom);
         var queue = segment == null ? null : spills;
         // Whether the values go to the log at once rather than to chunks the queue lists
         var moves = queue != null && !queue.keepsReplayed(logFrom);
@@ -546,6 +550,7 @@ public final class LiveLedger implements Ledger {
                     } else {
                         run.put(key, stamp, null, 0, 0);
                     }
+                    values.reserve(run, queue.replayBudget());
                     runWrites[0]++;
                     return;
                 }
@@ -584,6 +589,7 @@ public final class LiveLedger implements Ledger {
                         var run = moves ? runFor(state, key, values, null, 0) : null;
                         if (run != null) {
                             run.delete(key, applier.nextStamp());
+                            values.reserve(run, queue.replayBudget());
                             runWrites[0]++;
                             return;
                         }
