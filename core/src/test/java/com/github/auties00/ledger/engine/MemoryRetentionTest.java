@@ -511,8 +511,9 @@ class MemoryRetentionTest {
             expected = own + shared;
             assertEquals(expected, ledger.size(MESSAGES));
             assertEquals(writers, ledger.size(SESSIONS));
-            // The pipeline still lets go of a large commit once quiet
-            assertTrue(collected(commitWrites(ledger, 0xFD, 2_000)), "the pipeline kept a commit of 2,000 writes");
+            // The pipeline still lets go of a large commit once quiet: on its committing thread, or at the next tick if
+            // a role was held then, as by a pass of maintenance the writers left behind
+            assertTrue(collected(commitWrites(ledger, 0xFD, 2_000), checkpointer::tick), "the pipeline kept a commit of 2,000 writes");
             expected += 2_000;
             assertEquals(expected, ledger.size(MESSAGES));
         }
@@ -591,7 +592,14 @@ class MemoryRetentionTest {
 
     /// {@return whether the collector took what `reference` refers to, within a few collections}
     private static boolean collected(WeakReference<?> reference) throws InterruptedException {
+        return collected(reference, () -> {
+        });
+    }
+
+    /// {@return whether the collector took what `reference` refers to, within a few collections, each after `before`}
+    private static boolean collected(WeakReference<?> reference, Runnable before) throws InterruptedException {
         for (var attempt = 0; attempt < 20 && reference.get() != null; attempt++) {
+            before.run();
             System.gc();
             Thread.sleep(10);
         }
