@@ -263,26 +263,63 @@ class LogOutputSizeTest {
             assertTrue(medium > 100_000 && medium < 110_000, "a medium group made an output of " + medium + " bytes");
             assertEquals(allocations + 1, log.outputAllocationsForTests());
             assertNull(log.spareOutputForTests(), "an output smaller than the largest was given back");
-            // And the next large group grows it once, to the largest size, which it gives back
+            // And the next large group grows it once, to the largest size, which the loss of the spare keeps
             commitBatch(ledger, model, "c", 300, 4_000);
             assertEquals(allocations + 2, log.outputAllocationsForTests(), "a large group grew its output more than once");
-            assertEquals(LogWriter.ALIGNMENT, log.outputLength());
-            var replaced = log.spareOutputForTests();
-            assertNotNull(replaced);
-            assertNotSame(spare, replaced);
-            assertEquals(LogWriter.OUTPUT, replaced.length);
-            // Groups of every size after the spare was used again, their padding over the bytes of earlier groups
+            assertEquals(LogWriter.OUTPUT, log.outputLength(), "the largest output was given back right after the collector took the spare");
+            // Groups of every size while it is kept, their padding over the bytes of earlier groups
             for (var i = 0; i < 8; i++) {
                 commit(ledger, model, "after" + i, 300 + 700 * i);
                 commitBatch(ledger, model, "d" + i + "-", 270 + 10 * i, 4_000);
             }
-            assertEquals(allocations + 2, log.outputAllocationsForTests(), "a group allocated an output while the spare was reachable");
+            assertEquals(LogWriter.OUTPUT, log.outputLength());
+            assertEquals(allocations + 2, log.outputAllocationsForTests(), "a group allocated an output while the largest was kept");
             assertTrue(log.mostGroupGrowthsForTests() <= 1, "the output grew " + log.mostGroupGrowthsForTests() + " times for one group");
             survivesPowerLossLarge(disk, encrypted, model);
         }
         try (var reopened = openLarge(disk.getPath("/store"), encrypted, null)) {
             assertEquals(model, contents(reopened));
         }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @CsvSource({"true", "false"})
+    @DisplayName("keeps the largest output between groups for 256 groups once the collector took the spare, then gives it back, and twice as long after the next loss")
+    void holdsAfterLoss(boolean encrypted) throws Exception {
+        var disk = CrashFileSystem.create();
+        var model = new TreeMap<String, String>();
+        try (var ledger = openLarge(disk.getPath("/store"), encrypted, null)) {
+            var log = log(ledger);
+            log.keepSpareForTests = true;
+            commit(ledger, model, "first", 500);
+            commitBatch(ledger, model, "a", 300, 4_000);
+            assertEquals(LogWriter.ALIGNMENT, log.outputLength());
+            assertEquals(0, log.holdGroupsForTests());
+            var allocations = log.outputAllocationsForTests();
+            // The collector takes the spare between two large groups: the second allocates one and keeps it
+            log.dropSpareOutputForTests();
+            commitBatch(ledger, model, "b", 300, 4_000);
+            assertEquals(allocations + 1, log.outputAllocationsForTests());
+            assertEquals(LogWriter.OUTPUT, log.outputLength(), "the largest output was given back right after the collector took the spare");
+            assertEquals(255, log.holdGroupsForTests());
+            for (var i = 0; i < 255; i++) {
+                commit(ledger, model, "s" + i, 500);
+                assertEquals(LogWriter.OUTPUT, log.outputLength(), "the largest output was given back after " + (i + 1) + " groups");
+            }
+            assertEquals(0, log.holdGroupsForTests());
+            commit(ledger, model, "last", 500);
+            assertEquals(LogWriter.ALIGNMENT, log.outputLength(), "the largest output was kept once the hold ran out");
+            var spare = log.spareOutputForTests();
+            assertNotNull(spare);
+            assertEquals(LogWriter.OUTPUT, spare.length);
+            // A second loss keeps it twice as long
+            log.dropSpareOutputForTests();
+            commitBatch(ledger, model, "c", 300, 4_000);
+            assertEquals(allocations + 2, log.outputAllocationsForTests());
+            assertEquals(LogWriter.OUTPUT, log.outputLength());
+            assertEquals(511, log.holdGroupsForTests());
+        }
+        survivesPowerLossLarge(disk, encrypted, model);
     }
 
     @ParameterizedTest(name = "encrypted: {0}")
