@@ -418,6 +418,58 @@ class PageCacheTest {
     }
 
     @Test
+    @DisplayName("grows a table of at most 4,096 slots at three quarters of its slots, and a larger one at half")
+    void denseGrowth() {
+        var cache = PageCache.isolated(1L << 30);
+        IdleTicker.unwatch(cache);
+        var units = new ArrayList<byte[]>();
+        var capacity = PageCache.MIN_CAPACITY;
+        for (var i = 0; i < 3 * PageCache.DENSE_CAPACITY; i++) {
+            var unit = shortUnit(page(i));
+            units.add(unit);
+            cache.put(page(i), unit, true);
+            var entries = i + 1;
+            var limit = capacity <= PageCache.DENSE_CAPACITY ? capacity - capacity / 4 : capacity / 2;
+            if (entries > limit) {
+                capacity *= 2;
+            }
+            assertEquals(capacity, cache.capacityForTests(), "the slots for " + entries + " entries");
+        }
+        // 4,096 slots hold 3,072 entries, and the larger tables half of theirs: 12,288 entries take 32,768
+        assertEquals(8 * PageCache.DENSE_CAPACITY, capacity);
+        for (var i = 0; i < units.size(); i++) {
+            assertTrue(units.get(i) == cache.peek(page(i)), "unit " + i);
+        }
+    }
+
+    @Test
+    @DisplayName("rebuilds a small table whose entries churn just under three quarters of its slots once every few puts, not at each")
+    void denseChurn() {
+        var capacity = 32;
+        // One entry fewer than the three quarters a table of 32 slots grows past, with the one a put adds
+        var entries = capacity - capacity / 4 - 1;
+        var cache = PageCache.isolated((long) entries * PageFormat.SIZE);
+        IdleTicker.unwatch(cache);
+        var puts = 100_000;
+        var rebuilds = 0;
+        var table = cache.tableForTests();
+        for (var i = 0; i < puts; i++) {
+            cache.put(page(i), unit(page(i)), i % 3 == 0);
+            if (i >= capacity) {
+                assertEquals(capacity, cache.capacityForTests(), "the slots after " + i + " puts");
+                if (cache.tableForTests() != table) {
+                    rebuilds++;
+                }
+            }
+            table = cache.tableForTests();
+            assertTrue(cache.clockLengthForTests() + cache.tombstonesForTests() <= capacity - capacity / 8, "the table holds " + cache.tombstonesForTests() + " departed slots");
+        }
+        assertEquals(entries, cache.clockLengthForTests());
+        // A rebuild leaves an eighth of the slots to fill with departed entries, one a put at most, before the next
+        assertTrue(rebuilds <= puts / (capacity / 8), rebuilds + " rebuilds in " + puts + " puts");
+    }
+
+    @Test
     @DisplayName("shrinks at a tick a table that few of its slots use, keeping what it holds")
     void shrink() {
         var cache = PageCache.isolated(64L << 20);
