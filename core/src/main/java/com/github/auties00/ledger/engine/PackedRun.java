@@ -8,6 +8,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -63,7 +64,7 @@ import java.util.concurrent.atomic.AtomicReference;
 /// ([FramedHome]) in its stead. The first read of a value on such a home reads the value frame back, authenticated by
 /// its own tag, into an array of its own that becomes the home again, so the read costs one positioned read of the
 /// frame and an open of it, and later reads of the home cost nothing more; the checkpoint that takes the run reads
-/// every such home back first ([#readBackHomes()]).
+/// every such home back first, on a few threads of its own ([#readBackHomes()]).
 ///
 /// The arrays of a run are shared by its views and are only ever added to: a commit that appends writes past the
 /// entries of every view, the hash table only gains slots (a table grown or rebuilt is a new array, published before
@@ -646,6 +647,20 @@ final class PackedRun {
         return count;
     }
 
+    /// {@return the bytes of the value frames of the homes a bulk commit's run let go of, read back or not, for tests}
+    long framedBytesForTests() {
+        var framed = storage.framed;
+        var bytes = 0L;
+        for (var chunk = 0; framed != null && chunk < framed.length; chunk++) {
+            for (var i = 0; framed[chunk] != null && i < HOME_CHUNK; i++) {
+                if (framed[chunk][i] != null) {
+                    bytes += framed[chunk][i].length();
+                }
+            }
+        }
+        return bytes;
+    }
+
     /// {@return the homes of a bulk commit's run the run still holds, for tests}
     int homesForTests() {
         var homes = storage.homes;
@@ -757,7 +772,7 @@ final class PackedRun {
         }
         var index = homeIndex(value);
         var place = framedHome(storage, index);
-        return place == null ? null : readBack(index, place);
+        return place == null ? null : readBack(index, place, null);
     }
 
     // The value frame home `index` of the run of `storage` was let go of for, or null for a home it kept or let go of
@@ -776,12 +791,14 @@ final class PackedRun {
     /// Read into an array of its own, which becomes the home with a compare-and-set, so threads that read it back at
     /// once all use the one that won.
     ///
+    /// @param buffer an array of [LogSegmentView#frameBuffer(int)] the sealed frame is read into, or `null` to have one
+    ///               lent for the read
     /// @throws IllegalStateException if the frame is in a log segment a checkpoint retired, which only a reader of a
     ///                               later tree than the run's can find
-    private MemorySegment readBack(int index, FramedHome place) {
+    private MemorySegment readBack(int index, FramedHome place, byte[] buffer) {
         MemorySegment read;
         try {
-            read = place.segment().readValueFrame(place.frameOffset(), place.length(), place.sequence());
+            read = place.segment().readValueFrame(place.frameOffset(), place.length(), place.sequence(), buffer);
         } catch (LogSegmentView.Retired _) {
             throw new IllegalStateException("A value in a retired log segment is newer than the tree of its reader");
         }
@@ -791,43 +808,67 @@ final class PackedRun {
     }
 
     /// Reads back every home of the run, up to those of the commit that made this view, that the run let go of for its
-    /// value frame and has not read back yet, each on a virtual thread of its own, and waits for them: for a checkpoint
-    /// about to take every entry of the run, which would otherwise read them one after the other as its merge reaches
-    /// each home's first entry. A home whose read fails stays as it was, for the read of an entry on it to fail as it
-    /// would have.
+    /// value frame and has not read back yet, on as many virtual threads as the machine has processors, and waits for
+    /// them: for a checkpoint about to take every entry of the run, which would otherwise read them one after the other
+    /// as its merge reaches each home's first entry. A home whose read fails stays as it was, for the read of an entry
+    /// on it to fail as it would have.
+    ///
+    /// Each thread reads the sealed frames of its homes into one array of its own, as long as the longest frame, so the
+    /// read-back allocates the homes it restores and an array per thread besides.
     void readBackHomes() {
         var storage = this.storage;
         if (storage.framed == null) {
             return;
         }
         var homes = storage.homes;
-        var readers = new ArrayList<Thread>();
+        var pending = new int[endHome];
+        var places = new FramedHome[endHome];
+        var count = 0;
+        var longest = 0;
         for (var home = 0; home < endHome; home++) {
             if (HOMES.getAcquire(homes[home >>> HOME_CHUNK_BITS], home & HOME_MASK) != null) {
                 continue;
             }
             var place = framedHome(storage, home);
             if (place != null) {
-                var index = home;
+                pending[count] = home;
+                places[count++] = place;
+                longest = Math.max(longest, place.length());
+            }
+        }
+        if (count == 0) {
+            return;
+        }
+        var next = new AtomicInteger();
+        var total = count;
+        var segment = places[0].segment();
+        var bytes = longest;
+        Runnable reader = () -> {
+            var buffer = segment.frameBuffer(bytes);
+            int at;
+            while ((at = next.getAndIncrement()) < total) {
                 try {
-                    readers.add(Thread.ofVirtual().name("ledger-home-read").start(() -> {
-                        try {
-                            readBack(index, place);
-                        } catch (RuntimeException _) {
-                            // Left to the read of an entry on the home, which fails as it would have
-                        }
-                    }));
-                } catch (RuntimeException | OutOfMemoryError _) {
-                    // Without a thread, the merge reads the home at its first entry
-                    break;
+                    readBack(pending[at], places[at], buffer);
+                } catch (RuntimeException _) {
+                    // Left to the read of an entry on the home, which fails as it would have
                 }
+            }
+        };
+        var readers = new ArrayList<Thread>();
+        var threads = Math.min(total, Runtime.getRuntime().availableProcessors());
+        for (var thread = 0; thread < threads; thread++) {
+            try {
+                readers.add(Thread.ofVirtual().name("ledger-home-read").start(reader));
+            } catch (RuntimeException | OutOfMemoryError _) {
+                // The homes the threads started do not read are read by the merge at their first entry
+                break;
             }
         }
         var interrupted = false;
-        for (var reader : readers) {
+        for (var thread : readers) {
             while (true) {
                 try {
-                    reader.join();
+                    thread.join();
                     break;
                 } catch (InterruptedException _) {
                     interrupted = true;

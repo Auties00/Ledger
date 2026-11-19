@@ -5,8 +5,8 @@ import com.github.auties00.ledger.LedgerIoException;
 
 import javax.crypto.spec.SecretKeySpec;
 import java.io.EOFException;
-import java.lang.foreign.MemorySegment;
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.ClosedChannelException;
@@ -36,7 +36,8 @@ import java.util.zip.CRC32C;
 /// for the burst of reads ([HeapPool#acquireCollectable(int)]), and opened into a second one by the JDK's AES-GCM,
 /// which runs its intrinsics over the whole message and authenticates it before the value is copied out. Neither
 /// array outlives the read; at rest the pool reaches them only weakly. A value frame a bulk commit's run reads a home
-/// back from ([#readValueFrame(long, int, long)]) is opened the same way into an array of its own, which the run keeps.
+/// back from ([#readValueFrame(long, int, long, byte\[\])]) is opened the same way into an array of its own, which the
+/// run keeps, its sealed bytes read into an array the pool lends or one the caller keeps for a series of such reads.
 final class LogSegmentView {
     /// The most bytes one read of the channel takes, the size of the temporary direct buffer the JDK keeps per thread.
     static final int SLICE = 1 << 20;
@@ -242,6 +243,25 @@ final class LogSegmentView {
         }
     }
 
+    /// {@return an array that holds the sealed value frame of `length` bytes of body, or of fewer, that
+    /// [#readValueFrame(long, int, long, byte\[\])] reads, for a caller that reads a series of value frames, or `null`
+    /// without encryption, where a read keeps the array it reads the frame into}
+    byte[] frameBuffer(int length) {
+        return key == null ? null : new byte[LogWriter.FRAME_HEADER + length + LogWriter.TAG_BYTES];
+    }
+
+    /// {@return the body of the value frame at `frameOffset` of the segment, of `length` bytes, a frame of the split
+    /// commit at `sequence`, read and authenticated into an array of its own, read-only}
+    ///
+    /// The sealed frame is read into an array the pool lends for the read.
+    ///
+    /// @throws Retired if a checkpoint retired the segment, or retires it as the frame is read
+    /// @throws LedgerIoException if the segment cannot be read
+    /// @throws LedgerCorruptedException if the frame fails authentication, or is not that value frame
+    MemorySegment readValueFrame(long frameOffset, int length, long sequence) {
+        return readValueFrame(frameOffset, length, sequence, null);
+    }
+
     /// {@return the body of the value frame at `frameOffset` of the segment, of `length` bytes, a frame of the split
     /// commit at `sequence`, read and authenticated into an array of its own, read-only}
     ///
@@ -249,10 +269,13 @@ final class LogSegmentView {
     /// authenticates it; without encryption its CRC-32C checks it. Its header must name a value frame of `sequence`
     /// holding `length` bytes.
     ///
+    /// @param buffer with encryption, an array of [#frameBuffer(int)] for `length` or more that the sealed frame is
+    ///               read into, which the caller keeps, or `null` to have the pool lend one for this read; unused
+    ///               without encryption
     /// @throws Retired if a checkpoint retired the segment, or retires it as the frame is read
     /// @throws LedgerIoException if the segment cannot be read
     /// @throws LedgerCorruptedException if the frame fails authentication, or is not that value frame
-    MemorySegment readValueFrame(long frameOffset, int length, long sequence) {
+    MemorySegment readValueFrame(long frameOffset, int length, long sequence, byte[] buffer) {
         if (retired) {
             throw Retired.INSTANCE;
         }
@@ -271,7 +294,7 @@ final class LogSegmentView {
             return MemorySegment.ofArray(sealed).asSlice(LogWriter.FRAME_HEADER, length).asReadOnly();
         }
         var pool = spills.pool();
-        var sealed = pool.acquireCollectable(sealedLength);
+        var sealed = buffer != null ? buffer : pool.acquireCollectable(sealedLength);
         var crypto = spills.takeCrypto();
         try {
             readFully(ByteBuffer.wrap(sealed), 0, sealedLength, frameOffset);
@@ -283,7 +306,9 @@ final class LogSegmentView {
             return MemorySegment.ofArray(plain).asReadOnly();
         } finally {
             spills.giveBack(crypto);
-            pool.releaseCollectable(sealed);
+            if (buffer == null) {
+                pool.releaseCollectable(sealed);
+            }
         }
     }
 
