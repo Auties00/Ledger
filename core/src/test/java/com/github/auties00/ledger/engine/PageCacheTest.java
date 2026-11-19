@@ -544,12 +544,29 @@ class PageCacheTest {
     @Nested
     @DisplayName("while it screens what reads miss")
     class Screening {
-        /// {@return a cache the test alone ticks, which screens what its reads miss}
+        /// {@return a cache the test alone ticks, which screens what its reads miss and keeps its table of refused units
+        /// through collections, so a recall of a unit the test holds finds it whatever the collector does}
         private static PageCache screening(long limit) {
+            var cache = weakScreening(limit);
+            cache.pinRefusalsForTests();
+            return cache;
+        }
+
+        /// {@return a cache the test alone ticks, which screens what its reads miss and reaches its table of refused
+        /// units only weakly, as a store's does}
+        private static PageCache weakScreening(long limit) {
             var cache = PageCache.isolated(limit);
             IdleTicker.unwatch(cache);
             cache.screen(true);
             return cache;
+        }
+
+        /// Collects until the collector took the table of the refused units of `cache`.
+        private static void collectRefusals(PageCache cache) {
+            for (var attempt = 0; attempt < 20 && cache.refusalSlotsForTests() != 0; attempt++) {
+                System.gc();
+            }
+            assertEquals(0, cache.refusalSlotsForTests(), "the collector left the table of refused units");
         }
 
         @Test
@@ -967,6 +984,81 @@ class PageCacheTest {
                 cache.putScreened(page(i), shortUnit(page(i)), PageCache.POINT);
             }
             assertEquals(PageCache.MAX_REFUSALS, cache.refusalSlotsForTests(), "the table grew past its most slots");
+        }
+
+        @Test
+        @DisplayName("reaches its table of refused units only weakly, so a collection takes it though the units stay reachable, and rebuilds it at the next refusal with as many slots, or half as many down to the fewest if it took fewer refusals than an eighth of them")
+        void refusalTableWeak() {
+            var cache = weakScreening(LIMIT);
+            var held = new ArrayList<byte[]>();
+            // Pinned while the test reads what it built, so a collection meanwhile does not change it
+            cache.pinRefusalsForTests();
+            for (var i = 0; i < 1_000; i++) {
+                var unit = shortUnit(page(i));
+                held.add(unit);
+                cache.refuse(PageCache.dataKey(page(i).page(), page(i).slot()), page(i), unit);
+            }
+            var slots = cache.refusalSlotsForTests();
+            var taken = cache.refusalsForTests();
+            assertTrue(slots >= 1_024, "the table holds " + slots + " slots for 1,000 refusals");
+            cache.unpinRefusalsForTests();
+            collectRefusals(cache);
+            assertNull(cache.recall(page(0), PageCache.POINT), "a unit still reachable whose table the collector took");
+            var expected = taken < slots / 8 ? Math.max(PageCache.MIN_REFUSALS, slots / 2) : slots;
+            var fewest = 0;
+            for (var next = 2_000; ; next++) {
+                cache.pinRefusalsForTests();
+                cache.refuse(PageCache.dataKey(page(next).page(), page(next).slot()), page(next), shortUnit(page(next)));
+                assertEquals(expected, cache.refusalSlotsForTests(), "the table built after a collection, at refusal " + next);
+                assertEquals(1, cache.refusalsForTests());
+                cache.unpinRefusalsForTests();
+                // Twice at the fewest: a table of the fewest slots is rebuilt at as many
+                if (expected == PageCache.MIN_REFUSALS && ++fewest == 2) {
+                    break;
+                }
+                collectRefusals(cache);
+                // A table that took one refusal is rebuilt at half its slots, down to the fewest
+                expected = Math.max(PageCache.MIN_REFUSALS, expected / 2);
+            }
+            java.lang.ref.Reference.reachabilityFence(held);
+            cache.close();
+            assertEquals(0, cache.refusalSlotsForTests(), "the table of a closed cache");
+            cache.refuse(PageCache.dataKey(page(0).page(), page(0).slot()), page(0), shortUnit(page(0)));
+            assertEquals(0, cache.refusalSlotsForTests(), "a table built after the close");
+        }
+
+        @Test
+        @DisplayName("builds one table of refused units however many first refusals race to build it, and counts each refusal in it")
+        void refusalsRace() throws InterruptedException {
+            var cache = screening(LIMIT);
+            // Fewer than a quarter of the first table's slots, so no refusal grows it
+            var threads = PageCache.MIN_REFUSALS / 8;
+            for (var round = 0; round < 50; round++) {
+                cache.clearForTests();
+                var start = new CountDownLatch(1);
+                var done = new CountDownLatch(threads);
+                var held = new ArrayList<byte[]>();
+                for (var thread = 0; thread < threads; thread++) {
+                    var ref = page(round * threads + thread);
+                    var unit = shortUnit(ref);
+                    held.add(unit);
+                    Thread.ofPlatform().start(() -> {
+                        try {
+                            start.await();
+                            cache.refuse(PageCache.dataKey(ref.page(), ref.slot()), ref, unit);
+                        } catch (InterruptedException exception) {
+                            Thread.currentThread().interrupt();
+                        } finally {
+                            done.countDown();
+                        }
+                    });
+                }
+                start.countDown();
+                assertTrue(done.await(30, TimeUnit.SECONDS));
+                assertEquals(PageCache.MIN_REFUSALS, cache.refusalSlotsForTests(), "round " + round);
+                assertEquals(threads, cache.refusalsForTests(), "the refusals the table counted in round " + round);
+                java.lang.ref.Reference.reachabilityFence(held);
+            }
         }
 
         @Test

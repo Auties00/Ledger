@@ -59,6 +59,8 @@ class ScreenedReadsTest {
         Tree(Path directory) throws Exception {
             this.cache = PageCache.isolated(64 * MIB);
             IdleTicker.unwatch(cache);
+            // The tests recall units they hold, which a collection would otherwise take the table of refused units from
+            cache.pinRefusalsForTests();
             this.pages = PageFile.open(directory, new PageCipher(new SecretKeySpec(KEY, "AES")), cache, new HeapPool(1 << 20));
             // Whatever a read of the test's disk takes
             pages.forceWarmReadsForTests(true);
