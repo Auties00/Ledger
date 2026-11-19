@@ -23,7 +23,9 @@ import java.util.concurrent.atomic.AtomicLong;
 /// time. It keeps the free arrays past the reserve, up to the bytes the stores ask it for, in an overflow it reaches
 /// only weakly, unless work that takes many arrays at once [holds][#hold()] it: a large batch's rope, the body of a
 /// large commit's frame, a checkpoint. While any such work holds it, a collection, young or full, keeps it; once none
-/// does, the first collection frees it. A large commit gives back tens of megabytes of chunks as its frame is sealed,
+/// does, the first collection frees it. Such work gives its arrays back to the overflow alone
+/// ([#releaseBurst(byte\[\])]), where it finds them again for as long as it holds it, so the reserve never keeps
+/// the arrays of a burst that ended. A large commit gives back tens of megabytes of chunks as its frame is sealed,
 /// which a pool that held every free array strongly kept for as long as the store went on taking an array of their
 /// size, and after the last store closed; the next large batch holds what is left of them from its first chunk, so
 /// large commits that follow one another reuse them, unless a collection ran between the two.
@@ -363,6 +365,38 @@ public final class HeapPool {
         if (pooledBySize[size].addAndGet(-length) + length > perSize) {
             return;
         }
+        releaseToOverflow(size, array, perSize, max);
+    }
+
+    /// Returns `array`, one of the many a burst of work gives back, to the overflow alone, never to the reserve, unless
+    /// it is not one of the pooled sizes or the pool is full.
+    ///
+    /// The reserve keeps the arrays that work which takes and gives back one array at a time needs again; a burst
+    /// takes back the arrays it gave from the overflow it holds, and once it ends the first collection frees them,
+    /// where the reserve would keep up to [#RESERVE_PER_SIZE] of each size it used for as long as the store stays open.
+    /// The caller holds the overflow ([#hold()]) from before its first array goes back until after its last has, so
+    /// a collection during the burst keeps them; an array given back while nothing holds the overflow is left to the
+    /// next collection.
+    ///
+    /// @param array an array [#acquire] returned, which the caller no longer uses
+    void releaseBurst(byte[] array) {
+        var length = array.length;
+        if (Integer.bitCount(length) != 1 || length < 1 << MIN_SHIFT || length > 1 << MAX_SHIFT) {
+            return;
+        }
+        var size = Integer.numberOfTrailingZeros(length) - MIN_SHIFT;
+        var max = maxPooledBytes;
+        var perSize = max / 2;
+        if (pooledBySize[size].get() + length > perSize) {
+            return;
+        }
+        releaseToOverflow(size, array, perSize, max);
+    }
+
+    /// Puts `array`, of the size `size`, in the overflow, unless the size would then hold more than `perSize` bytes,
+    /// the reserve's and the overflow's together, or the pool more than `max`.
+    private void releaseToOverflow(int size, byte[] array, long perSize, long max) {
+        var length = array.length;
         var set = overflow();
         if (set.bytes[size].addAndGet(length) + pooledBySize[size].get() > perSize) {
             set.bytes[size].addAndGet(-length);
@@ -696,6 +730,11 @@ public final class HeapPool {
     /// {@return the bytes of the reserve's free arrays; for tests}
     long reservedBytesForTests() {
         return pooledBytes.get();
+    }
+
+    /// {@return the bytes of the reserve's free arrays of `length` bytes, a pooled size; for tests}
+    long reservedBytesForTests(int length) {
+        return pooledBySize[Integer.numberOfTrailingZeros(length) - MIN_SHIFT].get();
     }
 
     /// The free arrays past the reserve, of each size, and the bytes they hold, of each size and in all.

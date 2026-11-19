@@ -1345,9 +1345,11 @@ final class PageFile implements AutoCloseable {
                     writeRun(run, runStart);
                 }
             } finally {
+                // To the overflow alone: the checkpoint this writer belongs to holds it from its cut to its end, so the
+                // next window seals into these arrays again, and the first collection after the checkpoint frees them
                 for (var sealed : sealedUnits) {
                     if (sealed != null) {
-                        pool.release(sealed);
+                        pool.releaseBurst(sealed);
                     }
                 }
             }
