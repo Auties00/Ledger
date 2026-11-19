@@ -289,6 +289,8 @@ class CachedUnitsTest {
         IdleTicker.unwatch(cache);
         try {
             cache.screen(true);
+            // The test holds the units it recalls, which a collection would otherwise take the table of refused units from
+            cache.pinRefusalsForTests();
             var parent = new PageRef(10, 1, 7, 1);
             var parentUnit = unit(PageFormat.BRANCH, 1, parent);
             cache.putScreened(parent, parentUnit, PageCache.POINT);
