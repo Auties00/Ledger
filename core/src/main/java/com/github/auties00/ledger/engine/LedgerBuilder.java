@@ -308,9 +308,11 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                         }
 
                         @Override
-                        public boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment,
-                                              long frameOffset, long logFrom) {
-                            return ledger.replay(sequence, body, start, length, values, segment, frameOffset, logFrom);
+                        public boolean commit(long sequence, byte[] body, int start, int length,
+                                              FrameBody.ValueFrames section, LogSegmentView segment, long frameOffset,
+                                              long logFrom) {
+                            return ledger.replay(sequence, body, start, length, section, values, segment, frameOffset,
+                                    logFrom);
                         }
 
                         @Override

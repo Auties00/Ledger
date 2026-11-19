@@ -79,7 +79,7 @@ import java.util.zip.CRC32C;
 /// grows where the heap grew before. Once it retires, a reader that finds such a value reads it from its own tree.
 ///
 /// Nothing of this is durable: a recovery replays the commits as ever, and moves the values it replays the same way
-/// ([LiveLedger#replay(long, byte\[\], int, int, ReplayValues, LogSegmentView, long, long)]).
+/// ([LiveLedger#replay(long, byte\[\], int, int, FrameBody.ValueFrames, ReplayValues, LogSegmentView, long, long)]).
 final class SpillQueue {
     /// The shortest value that moves to the log rather than to an array of its own, or of a [PackedRun] to a chunk of
     /// the run's: a [LogValue] takes 40 bytes, an array of the value 16 more than the value, 8-aligned, so from 96 bytes
@@ -686,12 +686,13 @@ final class SpillQueue {
         private boolean ownOnly;
         // Set by the log writer as it seals the frame: the segment use, the frame's offset, where the commit's body
         // starts in the frame's body, the bytes of the frame's body, 0 if unknown, and whether the group was written
-        // through
+        // through; for a split commit, those of its head, and where its value frames lie
         private LogSegmentView segment;
         private long frameOffset;
         private int commitStart;
         private int frameBody;
         private boolean through;
+        private ValueFramePlaces valueFrames;
 
         private Record(long sequence, int capacity) {
             this.sequence = sequence;
@@ -700,6 +701,9 @@ final class SpillQueue {
         }
 
         /// Lists `version`, whose value of `length` bytes starts at `offset` of the commit's body.
+        ///
+        /// @param offset where the value starts in the commit's body; or, for a value a split body left to its section,
+        ///               `-1` minus where it starts in the section, which a value frame holds
         void add(Version version, int offset, int length) {
             if (count == versions.length) {
                 versions = Arrays.copyOf(versions, count * 2);
@@ -721,6 +725,9 @@ final class SpillQueue {
 
         /// Lists `entry` of the run `values` names, whose value of `length` bytes starts at `offset` of the commit's
         /// body, the write `op` of the commit's batch, on an array other values share.
+        ///
+        /// @param offset where the value starts in the commit's body, or for a value a split body left to its section,
+        ///               `-1` minus where it starts in the section, as [#add(Version, int, int)] takes it
         ///
         /// A value shorter than [#LOG_VALUE_MIN] counts in the verdict at its length, the bytes it takes packed in a
         /// chunk of the run's own ([PackedRun#spill]), where a version's would take an array of its own.
@@ -763,6 +770,52 @@ final class SpillQueue {
             this.commitStart = commitStart;
             this.frameBody = frameBody;
             this.through = through;
+        }
+
+        /// Records how the split body of the commit groups its section into value frames, before the record is queued:
+        /// value frame `i` holds the `lengths[i]` bytes of the section from `starts[i]`.
+        void valueFrames(int[] starts, int[] lengths) {
+            this.valueFrames = new ValueFramePlaces(starts, lengths);
+        }
+
+        /// Records where the value frames of the split commit lie, after [#locate] located its head: value frame `i`
+        /// at `offsets[i]` of the same segment use.
+        void locateValueFrames(long[] offsets) {
+            valueFrames.offsets = offsets;
+        }
+
+        /// {@return the offset of the frame that holds the value listed at `offset` ([#add(Version, int, int)])}
+        long frameOf(int offset) {
+            if (offset >= 0) {
+                return frameOffset;
+            }
+            var frame = valueFrames == null ? -1 : valueFrames.find(-1 - offset);
+            return frame < 0 ? frameOffset : valueFrames.offsets[frame];
+        }
+
+        /// {@return where the value listed at `offset` ([#add(Version, int, int)]) starts in the body of its frame}
+        int indexOf(int offset) {
+            if (offset >= 0) {
+                return commitStart + offset;
+            }
+            var start = -1 - offset;
+            var frame = valueFrames == null ? -1 : valueFrames.find(start);
+            return frame < 0 ? 0 : start - valueFrames.starts[frame];
+        }
+
+        /// {@return the bytes of the body of the frame that holds the value listed at `offset`
+        /// ([#add(Version, int, int)]), 0 if unknown}
+        int bodyOf(int offset) {
+            if (offset >= 0) {
+                return frameBody;
+            }
+            var frame = valueFrames == null ? -1 : valueFrames.find(-1 - offset);
+            return frame < 0 ? 0 : valueFrames.lengths[frame];
+        }
+
+        /// {@return the segment use that holds the commit's frames, or `null` if the store moves no value}
+        LogSegmentView segment() {
+            return segment;
         }
 
         /// Decides which values move, before the record is queued: all of them if moving those on shared arrays frees
@@ -821,8 +874,10 @@ final class SpillQueue {
                     if (ownOnly && version.ownArray() == null) {
                         continue;
                     }
-                    var framed = segment != null && framesAlone(segment, frameBody, version.valueLength()) ? frameBody : 0;
-                    if (version.spill(crypto, segment, frameOffset, commitStart + offsets[i], framed, null)) {
+                    var offset = offsets[i];
+                    var body = bodyOf(offset);
+                    var framed = segment != null && framesAlone(segment, body, version.valueLength()) ? body : 0;
+                    if (version.spill(crypto, segment, frameOf(offset), indexOf(offset), framed, null)) {
                         if (version.valueLength() >= LOG_VALUE_MIN) {
                             logged++;
                         } else {
@@ -832,7 +887,7 @@ final class SpillQueue {
                 }
                 // On arrays other values share, so they stay when only the values on arrays of their own move
                 for (var i = 0; runs != null && !ownOnly && i < runs.length; i++) {
-                    var moved = runs[i].spill(crypto, segment, frameOffset, commitStart, frameBody, sequence);
+                    var moved = runs[i].spill(crypto, this);
                     logged += moved[0];
                     copied += moved[1];
                 }
@@ -848,6 +903,39 @@ final class SpillQueue {
             offsets = null;
             count = 0;
             runs = null;
+        }
+    }
+
+    /// Where the value frames of a split commit lie, and the value frame the last lookup found, from which the next one
+    /// goes on: the values of a record are listed in the order of the writes, and so lie in the order of the section.
+    private static final class ValueFramePlaces {
+        private final int[] starts;
+        private final int[] lengths;
+        // Where each value frame starts in its segment, once the log located them; read after the commit is durable
+        private long[] offsets;
+        private int cursor;
+
+        ValueFramePlaces(int[] starts, int[] lengths) {
+            this.starts = starts;
+            this.lengths = lengths;
+        }
+
+        /// {@return the value frame that holds the byte at `start` of the section, the last one for a start past the
+        /// section, or -1 if there is none}
+        int find(int start) {
+            var count = starts.length;
+            if (count == 0) {
+                return -1;
+            }
+            var frame = cursor;
+            if (start < starts[frame]) {
+                frame = 0;
+            }
+            while (frame + 1 < count && starts[frame + 1] <= start) {
+                frame++;
+            }
+            cursor = frame;
+            return frame;
         }
     }
 
@@ -889,14 +977,14 @@ final class SpillQueue {
             this.run = run;
         }
 
-        /// {@return the values moved to the log and to a chunk, in this order: the run's [PackedRun#spill]}
-        private int[] spill(Crypto crypto, LogSegmentView segment, long frameOffset, int commitStart, int frameBody,
-                            long sequence) {
+        /// {@return the values moved to the log and to a chunk, in this order: the run's [PackedRun#spill], the frames
+        /// of the commit located by `record`}
+        private int[] spill(Crypto crypto, Record record) {
             var target = run;
             if (target == null || count == 0) {
                 return new int[2];
             }
-            return target.spill(crypto, segment, frameOffset, commitStart, frameBody, sequence, entries, offsets, ops, count);
+            return target.spill(crypto, record, entries, offsets, ops, count);
         }
     }
 

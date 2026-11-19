@@ -123,6 +123,14 @@ import java.util.zip.CRC32C;
 /// group or a segment, so a group starts, ends and rolls over at the frames it would one frame per commit; a group
 /// torn by a crash drops its runs whole, commits of a group never acknowledged durable.
 ///
+/// The body of a split commit ([FrameBody#split()]) never joins a run, whatever its length: its own part is sealed as
+/// a frame of type [FrameBody#COMMIT_SPLIT], and each of its value frames right after it as a frame of type
+/// [FrameBody#VALUES] carrying the same sequence, a reference of a batch's chunk going to the cipher as it is. The
+/// writer takes the head and its value frames as one unit, as it takes any other frame: they never straddle a group or
+/// a segment, and the bytes the unit seals into, every header and tag counted, decide its rollover and whether its
+/// group is written through. Recovery replays such a commit only once every value frame of it authenticated, so a
+/// crash between them drops it whole, as it drops a torn frame.
+///
 /// Once a frame is sealed into the output, which is all a retried write or a rewrite after an interrupt sends again,
 /// its body is never read: the writer gives the body's pooled chunks back then ([FrameBody#release()]). A stopped
 /// writer leaves the bodies it still queues to the collector, their holds on the pool's overflow let go
@@ -141,8 +149,12 @@ final class LogWriter {
     /// build that reads only earlier versions refuses it by its version and not at the first such frame; from 4 its
     /// commits may name units of the file of large values of format [PageFormat#CLOSE_TAG], which a build that reads
     /// only the first format would fail to authenticate, and would take for a crash's torn tail, dropping the durable
-    /// commits of the last group, rather than refuse.
-    static final int SEGMENT_VERSION = 4;
+    /// commits of the last group, rather than refuse; from 5 it may hold frames of types [FrameBody#COMMIT_SPLIT] and
+    /// [FrameBody#VALUES].
+    static final int SEGMENT_VERSION = 5;
+    /// The oldest version whose segments may hold frames of types [FrameBody#COMMIT_SPLIT] and [FrameBody#VALUES]:
+    /// recovery refuses one in an older segment, which no writer of this store put there.
+    static final int SPLIT_SEGMENT_VERSION = 5;
     /// The oldest version recovery reads, whose frame types the current version all has.
     static final int OLDEST_SEGMENT_VERSION = 2;
     static final int TAG_BYTES = 16;
@@ -422,6 +434,10 @@ final class LogWriter {
     private LogSegmentView view;
     // Whether the group being sealed is written through to stable storage; owned by the flush task
     private boolean sealingThrough;
+    // The bytes of the body being gathered that are still to seal, and those gathered at the end of the output and not
+    // encrypted yet; owned by the flush task
+    private int gatherLeft;
+    private int gathered;
     private final AtomicBoolean scheduled;
     // Held by the one flush that writes groups, on the pool or on the thread of a commit waiting for its group
     private final AtomicBoolean running;
@@ -869,6 +885,27 @@ final class LogWriter {
         }
     }
 
+    /// Records, for the split commit of `body`, if it lists values that may leave the heap, where its frames lie: its
+    /// head at `frameOffset` of the current segment, sealed with `overhead` bytes past its body, and each value frame
+    /// right after the one before it.
+    ///
+    /// Before the group's write, so before the durable sequence that publishes the location covers it.
+    private void locateSplit(FrameBody body, long frameOffset, int overhead) {
+        var record = body.spill();
+        if (record == null) {
+            return;
+        }
+        var head = body.headBytes();
+        var offsets = new long[body.valueFrames()];
+        var offset = frameOffset + FRAME_HEADER + head + overhead;
+        for (var frame = 0; frame < offsets.length; frame++) {
+            offsets[frame] = offset;
+            offset += FRAME_HEADER + body.valueFrameBytes(frame) + overhead;
+        }
+        record.locate(view, frameOffset, 0, head, sealingThrough);
+        record.locateValueFrames(offsets);
+    }
+
     /// Waits until the first `frames` frames queued since the writer opened are durable.
     ///
     /// @throws LedgerIoException if the writer stops first
@@ -980,11 +1017,12 @@ final class LogWriter {
     }
 
     /// {@return a bound on the bytes `frames` seal into, each counted as a frame of its own, more than the run that may
-    /// hold it takes; or -1 if it is more than [#ONE_WRITE]}
+    /// hold it takes, and a split commit as its head and value frames; or -1 if it is more than [#ONE_WRITE]}
     private long sealedBytes(List<Queued> frames) {
         var bytes = 0L;
+        var overhead = sealOverhead();
         for (var frame : frames) {
-            bytes += FRAME_HEADER + frame.body().size() + (keys.encrypted() ? TAG_BYTES : Integer.BYTES);
+            bytes += frame.body().sealedBytes(overhead);
             if (bytes > ONE_WRITE) {
                 return -1;
             }
@@ -1211,10 +1249,11 @@ final class LogWriter {
         groupGrowths = 0;
         for (var index = 0; index < count; ) {
             var frame = group.get(index);
-            var bodyLength = frame.body().size();
-            var sealedLength = bodyLength + sealOverhead();
-            // The test of the frame alone: a run takes the commits after its first only while it fits in the segment
-            if (position + used + FRAME_HEADER + sealedLength > segmentSize && position + used > SEGMENT_HEADER) {
+            var body = frame.body();
+            var bodyLength = body.size();
+            // The test of the frame alone, or of a split commit's head and value frames: a run takes the commits after
+            // its first only while it fits in the segment
+            if (position + used + body.sealedBytes(sealOverhead()) > segmentSize && position + used > SEGMENT_HEADER) {
                 drain();
                 if (unitForce != null) {
                     await(unitForce);
@@ -1227,9 +1266,13 @@ final class LogWriter {
                 start = position;
                 groupStart = true;
             }
-            if (bodyLength > RUN_MAX_BODY) {
-                seal(frame, sealedLength, groupStart);
-                frame.body().release();
+            if (body.split()) {
+                sealSplit(frame, groupStart);
+                body.release();
+                index++;
+            } else if (bodyLength > RUN_MAX_BODY) {
+                seal(frame, bodyLength + sealOverhead(), groupStart);
+                body.release();
                 index++;
             } else {
                 var end = runEnd(group, index);
@@ -1332,6 +1375,7 @@ final class LogWriter {
         if (frame.type() != FrameBody.COMMIT) {
             return first + 1;
         }
+        assert !frame.body().split() : "a split commit's frame in a run";
         var limit = Math.min(RUN_BYTES, segmentSize - position - used - FRAME_HEADER - sealOverhead());
         var entries = (long) FrameBody.runEntryBytes(frame.body().size());
         var sequence = frame.sequence();
@@ -1360,6 +1404,7 @@ final class LogWriter {
     /// it copy the whole array first.
     private void sealRun(List<Queued> group, int first, int end, boolean groupStart) throws IOException {
         var frame = group.get(first);
+        assert !frame.body().split() : "a split commit sealed as a run";
         var single = end - first == 1;
         var plainLength = 0;
         if (single) {
@@ -1440,6 +1485,42 @@ final class LogWriter {
             sealPieces(body, at, frameOffset);
             return;
         }
+        sealOwn(body, at, frameOffset);
+    }
+
+    /// Seals the split commit of `frame` into the output, writing the output out whenever it fills: its own part as a
+    /// frame of type [FrameBody#COMMIT_SPLIT] as [#seal] seals a body of its own bytes, then each value frame right
+    /// after it, of type [FrameBody#VALUES] and the same sequence, as [#sealPieces] seals the references it holds.
+    ///
+    /// Only the head may start the group: no other frame comes between it and its value frames.
+    private void sealSplit(Queued frame, boolean groupStart) throws IOException {
+        var body = frame.body();
+        var overhead = sealOverhead();
+        room(FRAME_HEADER);
+        var at = used;
+        var frameOffset = position + used;
+        writeHeader(at, body.headBytes() + overhead, frame.sequence(), FrameBody.COMMIT_SPLIT, groupStart);
+        used += FRAME_HEADER;
+        locateSplit(body, frameOffset, overhead);
+        sealOwn(body, at, frameOffset);
+        for (var valueFrame = 0; valueFrame < body.valueFrames(); valueFrame++) {
+            var length = body.valueFrameBytes(valueFrame);
+            room(FRAME_HEADER);
+            at = used;
+            var valueOffset = position + used;
+            writeHeader(at, length + overhead, frame.sequence(), FrameBody.VALUES, false);
+            used += FRAME_HEADER;
+            startGather(at, valueOffset, length);
+            for (var reference = body.valueFrameFirst(valueFrame); reference < body.valueFrameEnd(valueFrame); reference++) {
+                gather(body.referenceArray(reference), body.referenceOffset(reference), body.referenceLength(reference));
+            }
+            endGather();
+        }
+    }
+
+    /// Seals the own bytes of `body`, its one array or its chunks, into the output after the frame's header at `at`, at
+    /// `frameOffset` of the segment.
+    private void sealOwn(FrameBody body, int at, long frameOffset) throws IOException {
         var chunks = body.chunkCount();
         if (cipher != null) {
             try {
@@ -1484,7 +1565,35 @@ final class LogWriter {
     }
 
     /// Seals `body`, which refers to values, into the output after the frame's header at `at`, at `frameOffset` of
-    /// the segment.
+    /// the segment, its pieces gathered as [#gather] does.
+    private void sealPieces(FrameBody body, int at, long frameOffset) throws IOException {
+        startGather(at, frameOffset, body.size());
+        for (var piece = 0; piece < body.pieces(); piece++) {
+            gather(body.pieceArray(piece), body.pieceOffset(piece), body.pieceLength(piece));
+        }
+        endGather();
+    }
+
+    /// Starts sealing a body of `length` bytes given piece by piece ([#gather]) into the output, after the frame's
+    /// header at `at`, at `frameOffset` of the segment.
+    private void startGather(int at, long frameOffset, int length) throws IOException {
+        gatherLeft = length;
+        gathered = 0;
+        if (cipher == null) {
+            crc.reset();
+            crc.update(output, at, FRAME_HEADER);
+            return;
+        }
+        try {
+            cipher.init(Cipher.ENCRYPT_MODE, segmentKey, new GCMParameterSpec(TAG_BYTES * 8, nonce(frameOffset)));
+            // The cipher keeps the additional data, so the header may leave the output before the body is sealed
+            cipher.updateAAD(output, at, FRAME_HEADER);
+        } catch (GeneralSecurityException exception) {
+            throw new IOException("A log frame could not be sealed", exception);
+        }
+    }
+
+    /// Seals the `left` bytes at `offset` of `array` as the next piece of the body [#startGather] started.
     ///
     /// Without encryption each piece is copied into the output and the CRC read from there. With it, a piece of at
     /// least [#DIRECT_PIECE] bytes goes to the cipher as it is and shorter ones are gathered in the output and
@@ -1492,76 +1601,73 @@ final class LogWriter {
     /// gather that ends before a direct piece taking the first bytes of that piece to end on a block, so the cipher
     /// never holds part of a block back between two calls, nor writes past the bytes it was given, which in place
     /// would overwrite bytes it has not read.
-    private void sealPieces(FrameBody body, int at, long frameOffset) throws IOException {
+    private void gather(byte[] array, int offset, int left) throws IOException {
         if (cipher == null) {
-            crc.reset();
-            crc.update(output, at, FRAME_HEADER);
-            for (var piece = 0; piece < body.pieces(); piece++) {
-                var array = body.pieceArray(piece);
-                var offset = body.pieceOffset(piece);
-                for (var left = body.pieceLength(piece); left > 0; ) {
-                    var slice = Math.min(SLICE, left);
-                    room(slice);
-                    System.arraycopy(array, offset, output, used, slice);
-                    crc.update(output, used, slice);
-                    used += slice;
-                    offset += slice;
-                    left -= slice;
-                }
+            gatherLeft -= left;
+            while (left > 0) {
+                var slice = Math.min(SLICE, left);
+                room(slice);
+                System.arraycopy(array, offset, output, used, slice);
+                crc.update(output, used, slice);
+                used += slice;
+                offset += slice;
+                left -= slice;
             }
+            return;
+        }
+        try {
+            if (gathered != 0 && left >= DIRECT_PIECE) {
+                // To the end of a block, which SLICE is a multiple of, so the room made for the gather holds it
+                var taken = -gathered & (BLOCK - 1);
+                System.arraycopy(array, offset, output, used + gathered, taken);
+                gathered += taken;
+                offset += taken;
+                left -= taken;
+                gatherLeft -= taken;
+                used += cipher.update(output, used, gathered, output, used);
+                gathered = 0;
+            }
+            while (left > 0) {
+                int taken;
+                if (gathered == 0 && left >= DIRECT_PIECE) {
+                    taken = Math.min(Sealing.slice(SLICE), left);
+                    if (taken != gatherLeft) {
+                        taken &= -BLOCK;
+                    }
+                    room(taken + TAG_BYTES);
+                    used += cipher.update(array, offset, taken, output, used);
+                } else {
+                    if (gathered == 0) {
+                        room(Math.min(SLICE, gatherLeft) + TAG_BYTES);
+                    }
+                    taken = Math.min(SLICE - gathered, left);
+                    System.arraycopy(array, offset, output, used + gathered, taken);
+                    gathered += taken;
+                    if (gathered == SLICE || taken == gatherLeft) {
+                        used += cipher.update(output, used, gathered, output, used);
+                        gathered = 0;
+                    }
+                }
+                offset += taken;
+                left -= taken;
+                gatherLeft -= taken;
+            }
+        } catch (GeneralSecurityException exception) {
+            throw new IOException("A log frame could not be sealed", exception);
+        }
+    }
+
+    /// Ends the body [#startGather] started, once [#gather] took all its bytes: writes its tag, or its checksum
+    /// without encryption.
+    private void endGather() throws IOException {
+        assert gatherLeft == 0 && gathered == 0 : "a body sealed short of its length";
+        if (cipher == null) {
             room(Integer.BYTES);
             ByteBuffer.wrap(output, used, Integer.BYTES).putInt((int) crc.getValue());
             used += Integer.BYTES;
             return;
         }
         try {
-            cipher.init(Cipher.ENCRYPT_MODE, segmentKey, new GCMParameterSpec(TAG_BYTES * 8, nonce(frameOffset)));
-            // The cipher keeps the additional data, so the header may leave the output before the body is sealed
-            cipher.updateAAD(output, at, FRAME_HEADER);
-            var remaining = body.size();
-            // The bytes gathered at the end of the output and not encrypted yet; room for them was made at the first
-            var gathered = 0;
-            for (var piece = 0; piece < body.pieces(); piece++) {
-                var array = body.pieceArray(piece);
-                var offset = body.pieceOffset(piece);
-                var left = body.pieceLength(piece);
-                if (gathered != 0 && left >= DIRECT_PIECE) {
-                    // To the end of a block, which SLICE is a multiple of, so the room made for the gather holds it
-                    var taken = -gathered & (BLOCK - 1);
-                    System.arraycopy(array, offset, output, used + gathered, taken);
-                    gathered += taken;
-                    offset += taken;
-                    left -= taken;
-                    remaining -= taken;
-                    used += cipher.update(output, used, gathered, output, used);
-                    gathered = 0;
-                }
-                while (left > 0) {
-                    int taken;
-                    if (gathered == 0 && left >= DIRECT_PIECE) {
-                        taken = Math.min(Sealing.slice(SLICE), left);
-                        if (taken != remaining) {
-                            taken &= -BLOCK;
-                        }
-                        room(taken + TAG_BYTES);
-                        used += cipher.update(array, offset, taken, output, used);
-                    } else {
-                        if (gathered == 0) {
-                            room(Math.min(SLICE, remaining) + TAG_BYTES);
-                        }
-                        taken = Math.min(SLICE - gathered, left);
-                        System.arraycopy(array, offset, output, used + gathered, taken);
-                        gathered += taken;
-                        if (gathered == SLICE || taken == remaining) {
-                            used += cipher.update(output, used, gathered, output, used);
-                            gathered = 0;
-                        }
-                    }
-                    offset += taken;
-                    left -= taken;
-                    remaining -= taken;
-                }
-            }
             room(2 * TAG_BYTES);
             used += cipher.doFinal(output, used);
         } catch (GeneralSecurityException exception) {

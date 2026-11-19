@@ -6,6 +6,7 @@ import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
+import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.Transaction;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.testkit.ChangeInterceptor;
@@ -17,6 +18,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
@@ -79,9 +81,15 @@ class FrameReferencesTest {
         return MemorySegment.ofArray(text.getBytes(StandardCharsets.UTF_8)).asReadOnly();
     }
 
-    /// {@return the arrays `body` refers to, by identity}
+    /// {@return the arrays `body` refers to, by identity: those of its pieces, or of a split body's section}
     private static Set<byte[]> referenced(FrameBody body) {
         var arrays = Collections.<byte[]>newSetFromMap(new IdentityHashMap<>());
+        if (body.split()) {
+            for (var reference = 0; reference < body.references(); reference++) {
+                arrays.add(body.referenceArray(reference));
+            }
+            return arrays;
+        }
         for (var piece = 1; piece < body.pieces(); piece += 2) {
             arrays.add(body.pieceArray(piece));
         }
@@ -743,5 +751,564 @@ class FrameReferencesTest {
             }));
             assertEquals(2, ledger.size(MESSAGES));
         }
+    }
+
+    /// A write of a commit body as recovery reads it: its key space, key, and value or `null`, with the value frame
+    /// that holds the value (-1 for the body itself) and where the value lies in that frame's body.
+    private record Read(int keyspace, byte[] key, byte[] value, int frame, long at) {
+    }
+
+    /// The frames of a split commit as the log writer seals them, before sealing: its head, the own part, and the body of
+    /// each of its value frames.
+    private record SplitFrames(byte[] head, byte[][] values) {
+        /// {@return the value frames as recovery hands them over}
+        FrameBody.ValueFrames valueFrames() {
+            var frames = new FrameBody.ValueFrames(values.length);
+            for (var i = 0; i < values.length; i++) {
+                frames.add(values[i], values[i].length, 1_000L * (i + 1));
+            }
+            return frames;
+        }
+    }
+
+    /// {@return the frames the log writer seals for the ended split body `body`: its own bytes, and each value frame's
+    /// references gathered}
+    private static SplitFrames frames(FrameBody body) {
+        var head = new byte[body.headBytes()];
+        var at = 0;
+        for (var chunk = 0; chunk < body.chunkCount(); chunk++) {
+            System.arraycopy(body.chunk(chunk), 0, head, at, body.chunkLength(chunk));
+            at += body.chunkLength(chunk);
+        }
+        assertEquals(head.length, at);
+        var values = new byte[body.valueFrames()][];
+        for (var frame = 0; frame < values.length; frame++) {
+            values[frame] = new byte[body.valueFrameBytes(frame)];
+            var offset = 0;
+            for (var reference = body.valueFrameFirst(frame); reference < body.valueFrameEnd(frame); reference++) {
+                var length = body.referenceLength(reference);
+                System.arraycopy(body.referenceArray(reference), body.referenceOffset(reference), values[frame], offset, length);
+                offset += length;
+            }
+            assertEquals(values[frame].length, offset);
+        }
+        return new SplitFrames(head, values);
+    }
+
+    /// {@return the puts and removals of the commit body `bytes`, read as recovery reads them, with the value frames
+    /// `values` of a split body, or `null`}
+    private static List<Read> read(byte[] bytes, FrameBody.ValueFrames values) {
+        var reads = new ArrayList<Read>();
+        var view = MemorySegment.ofArray(bytes).asReadOnly();
+        FrameBody.readCommit(bytes, view, 0, bytes.length, values, new FrameBody.Visitor() {
+            @Override
+            public void put(int keyspace, int keyAt, int keyLength, int valueAt, int valueLength) {
+                reads.add(new Read(keyspace, Arrays.copyOfRange(bytes, keyAt, keyAt + keyLength),
+                        Arrays.copyOfRange(bytes, valueAt, valueAt + valueLength), -1, valueAt));
+            }
+
+            @Override
+            public void putSection(int keyspace, int keyAt, int keyLength, int frame, int valueAt, int valueLength) {
+                var body = values.body(frame);
+                assertTrue(valueAt + valueLength <= values.length(frame));
+                reads.add(new Read(keyspace, Arrays.copyOfRange(bytes, keyAt, keyAt + keyLength),
+                        Arrays.copyOfRange(body, valueAt, valueAt + valueLength), frame, valueAt));
+            }
+
+            @Override
+            public void delete(int keyspace, int keyAt, int keyLength) {
+                reads.add(new Read(keyspace, Arrays.copyOfRange(bytes, keyAt, keyAt + keyLength), null, -1, -1));
+            }
+
+            @Override
+            public void deleteRange(int keyspace, MemorySegment from, MemorySegment to) {
+                throw new AssertionError("no range removal was written");
+            }
+
+            @Override
+            public void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
+                throw new AssertionError("no unit was written");
+            }
+        });
+        return reads;
+    }
+
+    /// {@return the length of the writes a split body's head starts with}
+    private static int writesLength(byte[] bytes) {
+        return (bytes[0] & 0xFF) | (bytes[1] & 0xFF) << 8 | (bytes[2] & 0xFF) << 16 | (bytes[3] & 0xFF) << 24;
+    }
+
+    @Test
+    @DisplayName("a split body takes the paged values of a rope batch as a reference per run of a chunk, as value frames that never split a reference, and reads back every write from them")
+    void splitBody() {
+        var random = new Random(41);
+        var pool = new HeapPool(1L << 28, false);
+        var batch = new ArrayWriteBatch(this, pool, BY_NAME);
+        var values = new ArrayList<byte[]>();
+        for (var i = 0; i < 400; i++) {
+            // One value on an array of its own in the middle of the rope's values, and a resident one
+            var value = pattern(random, i == 200 ? 200_000 : 1_000 + random.nextInt(400));
+            batch.put(i == 300 ? SESSIONS : MESSAGES, "message" + i, value);
+            values.add(value);
+        }
+        batch.prepare(false, null, Map.of());
+        assertTrue(batch.valuesInOrder());
+        assertTrue(batch.chunksForTests() > 1, "the batch is no rope");
+        var body = FrameBody.forCommit(batch, null, pool);
+        assertTrue(body.split());
+        assertEquals(FrameBody.COMMIT_SPLIT, body.commitType());
+        assertEquals(FrameBody.sectionBytes(batch, null), values.stream().mapToLong(value -> value.length).sum() - values.get(300).length);
+        // Where each run of the section would break: a new array, or a value that does not follow the last on it
+        var runs = 0;
+        byte[] last = null;
+        var end = 0;
+        var section = 0L;
+        for (var i = 0; i < batch.size(); i++) {
+            var key = batch.key(i);
+            var length = (int) batch.valueBytes(i);
+            if (batch.keyspace(i).residency() == Keyspace.Residency.RESIDENT) {
+                body.put(1, key, batch.value(i));
+                continue;
+            }
+            var own = batch.ownValue(i);
+            var array = own != null ? own : batch.homeArray(i);
+            var offset = own != null ? 0 : batch.homeOffset(i);
+            if (array != last || offset != end) {
+                runs++;
+            }
+            last = array;
+            end = offset + length;
+            body.putSection(0, key, array, offset, length);
+            assertEquals(-1 - section, body.sectionOffset(length));
+            section += length;
+        }
+        body.finishSplit();
+        assertEquals(runs, body.references());
+        // The own value breaks the run of its chunk, and the rope's last chunk is a copy
+        assertTrue(runs <= batch.chunksForTests() + 2, runs + " references for " + batch.chunksForTests() + " chunks");
+        assertEquals(section + body.headBytes(), body.size());
+        // Each reference of 64 KiB or more is a value frame of its own, shorter ones share one of at most a chunk
+        var frameBytes = 0L;
+        for (var frame = 0; frame < body.valueFrames(); frame++) {
+            var first = body.valueFrameFirst(frame);
+            var references = body.valueFrameEnd(frame) - first;
+            assertTrue(references >= 1, "an empty value frame");
+            var bytes = 0;
+            for (var reference = first; reference < body.valueFrameEnd(frame); reference++) {
+                bytes += body.referenceLength(reference);
+                if (body.referenceLength(reference) >= FrameBody.VALUES_ALONE) {
+                    assertEquals(1, references, "a long reference shares value frame " + frame);
+                }
+            }
+            assertEquals(bytes, body.valueFrameBytes(frame));
+            assertTrue(references == 1 || bytes <= FrameBody.CHUNK_BYTES, "value frame " + frame + " of " + bytes + " bytes");
+            frameBytes += bytes;
+        }
+        assertEquals(section, frameBytes);
+        assertEquals(body.headBytes() + section + (1 + body.valueFrames()) * (LogWriter.FRAME_HEADER + 16L),
+                body.sealedBytes(16));
+        var expected = frames(body);
+        var writes = writesLength(expected.head());
+        assertArrayEquals(FrameBody.splitTable(expected.head(), 0, expected.head().length),
+                Arrays.stream(expected.values()).mapToInt(frame -> frame.length).toArray());
+        var reads = read(expected.head(), expected.valueFrames());
+        assertEquals(values.size(), reads.size());
+        var frame = 0;
+        var next = 0L;
+        for (var i = 0; i < reads.size(); i++) {
+            var read = reads.get(i);
+            assertArrayEquals(values.get(i), read.value(), "write " + i);
+            assertArrayEquals(("message" + i).getBytes(StandardCharsets.UTF_8), read.key());
+            if (i == 300) {
+                assertEquals(-1, read.frame(), "the resident value is in the head");
+                assertTrue(read.at() < writes, "the resident value is among the writes");
+                continue;
+            }
+            // The values of the section, back to back, each in the value frame that holds it
+            if (next == expected.values()[frame].length) {
+                frame++;
+                next = 0;
+            }
+            assertEquals(frame, read.frame(), "the value frame of write " + i);
+            assertEquals(next, read.at(), "where write " + i + " lies");
+            next += read.value().length;
+        }
+        assertEquals(expected.values().length - 1, frame);
+        // The batch starts again on chunks of the pool, which never are the section's
+        batch.finish();
+        for (var i = 0; i < 400; i++) {
+            batch.put(MESSAGES, "again" + i, new byte[1_200]);
+        }
+        var again = frames(body);
+        assertArrayEquals(expected.head(), again.head());
+        for (var i = 0; i < expected.values().length; i++) {
+            assertArrayEquals(expected.values()[i], again.values()[i], "value frame " + i);
+        }
+        body.release();
+        assertEquals(0, body.references(), "a released body keeps the arrays it referred to");
+    }
+
+    @Test
+    @DisplayName("a released split body made without a pool lets go of its section's arrays too")
+    void releasedSplitWithoutPool() {
+        var body = FrameBody.forSplit(16, null);
+        body.putSection(0, utf8("a"), new byte[100_000], 0, 100_000);
+        body.finishSplit();
+        assertEquals(1, body.references());
+        body.release();
+        assertEquals(0, body.references());
+        assertTrue(body.split());
+    }
+
+    @Test
+    @DisplayName("a section extends its last reference only by a value that follows it on the same array, and gathers short references into a value frame")
+    void sectionRuns() {
+        var first = new byte[100];
+        var second = new byte[100];
+        new Random(5).nextBytes(first);
+        new Random(6).nextBytes(second);
+        var body = FrameBody.forSplit(16, null);
+        body.putSection(0, utf8("a"), first, 0, 10);
+        // An inline put between two values of the section is in the head, which breaks no run
+        body.put(1, utf8("inline"), utf8("held"));
+        body.putSection(0, utf8("b"), first, 10, 5);
+        assertEquals(1, body.references());
+        // A gap
+        body.putSection(0, utf8("c"), first, 20, 5);
+        assertEquals(2, body.references());
+        // Another array at the offset the last reference ends at
+        body.putSection(0, utf8("d"), second, 25, 5);
+        assertEquals(3, body.references());
+        body.putSection(0, utf8("e"), second, 30, 0);
+        body.putSection(0, utf8("f"), second, 30, 7);
+        assertEquals(3, body.references());
+        // An array before the last one, at the end of its reference
+        body.putSection(0, utf8("g"), first, 25, 3);
+        assertEquals(4, body.references());
+        body.finishSplit();
+        // Four short references, one value frame
+        assertEquals(1, body.valueFrames());
+        assertEquals(10 + 5 + 5 + 5 + 7 + 3, body.valueFrameBytes(0));
+        var frames = frames(body);
+        var reads = read(frames.head(), frames.valueFrames());
+        assertEquals(List.of("a", "inline", "b", "c", "d", "e", "f", "g"),
+                reads.stream().map(read -> new String(read.key(), StandardCharsets.UTF_8)).toList());
+        assertArrayEquals(Arrays.copyOfRange(first, 0, 10), reads.get(0).value());
+        assertArrayEquals("held".getBytes(StandardCharsets.UTF_8), reads.get(1).value());
+        assertArrayEquals(Arrays.copyOfRange(first, 10, 15), reads.get(2).value());
+        assertArrayEquals(Arrays.copyOfRange(first, 20, 25), reads.get(3).value());
+        assertArrayEquals(Arrays.copyOfRange(second, 25, 30), reads.get(4).value());
+        assertArrayEquals(new byte[0], reads.get(5).value());
+        assertArrayEquals(Arrays.copyOfRange(second, 30, 37), reads.get(6).value());
+        assertArrayEquals(Arrays.copyOfRange(first, 25, 28), reads.get(7).value());
+        // The writes, then a table of one value frame
+        assertTrue(writesLength(frames.head()) < frames.head().length);
+    }
+
+    @Test
+    @DisplayName("value frames: a reference of 64 KiB or more alone, short ones gathered up to a chunk, never splitting one")
+    void valueFrameGrouping() {
+        var arrays = new ArrayList<byte[]>();
+        var body = FrameBody.forSplit(16, null);
+        // Lengths of the references in order, each on an array of its own
+        int[] lengths = {1_000, 2_000, FrameBody.VALUES_ALONE, 500, FrameBody.CHUNK_BYTES - 600, 700, 300,
+                FrameBody.VALUES_ALONE - 1, FrameBody.VALUES_ALONE - 1, FrameBody.VALUES_ALONE - 1, FrameBody.VALUES_ALONE - 1,
+                FrameBody.VALUES_ALONE - 1, 3 << 20};
+        for (var i = 0; i < lengths.length; i++) {
+            var array = new byte[lengths[i]];
+            Arrays.fill(array, (byte) i);
+            arrays.add(array);
+            body.putSection(0, utf8("k" + i), array, 0, lengths[i]);
+        }
+        body.finishSplit();
+        assertEquals(lengths.length, body.references());
+        var frames = new ArrayList<List<Integer>>();
+        for (var frame = 0; frame < body.valueFrames(); frame++) {
+            var references = new ArrayList<Integer>();
+            for (var reference = body.valueFrameFirst(frame); reference < body.valueFrameEnd(frame); reference++) {
+                references.add(reference);
+            }
+            frames.add(references);
+        }
+        // 1,000 and 2,000 gather; 64 KiB alone; 500 alone as a long one follows it; then 700 and 300 gather with three
+        // references just short of 64 KiB, the fourth passing a chunk, which starts the next; the 3 MiB one alone
+        assertEquals(List.of(List.of(0, 1), List.of(2), List.of(3), List.of(4), List.of(5, 6, 7, 8, 9), List.of(10, 11),
+                List.of(12)), frames);
+        var split = frames(body);
+        var reads = read(split.head(), split.valueFrames());
+        for (var i = 0; i < lengths.length; i++) {
+            assertArrayEquals(arrays.get(i), reads.get(i).value(), "write " + i);
+        }
+    }
+
+    @Test
+    @DisplayName("a split body whose section stays empty is its head alone, with a table of no value frame, and an empty value left to it reads as a put of the head")
+    void emptySection() {
+        var body = FrameBody.forSplit(16, new HeapPool(1L << 24, false));
+        body.put(1, utf8("session"), utf8("resident"));
+        body.delete(0, utf8("removed"));
+        body.putSection(0, utf8("empty"), new byte[10], 4, 0);
+        body.finishSplit();
+        assertEquals(0, body.references());
+        assertEquals(0, body.valueFrames());
+        var frames = frames(body);
+        assertEquals(0, frames.values().length);
+        assertEquals(0, FrameBody.splitTable(frames.head(), 0, frames.head().length).length);
+        var reads = read(frames.head(), frames.valueFrames());
+        assertEquals(3, reads.size());
+        assertArrayEquals("resident".getBytes(StandardCharsets.UTF_8), reads.get(0).value());
+        assertEquals(null, reads.get(1).value());
+        // Recovery passes it on as a put whose value lies in no value frame, which a replay could not index
+        assertArrayEquals("empty".getBytes(StandardCharsets.UTF_8), reads.get(2).key());
+        assertArrayEquals(new byte[0], reads.get(2).value());
+        assertEquals(-1, reads.get(2).frame());
+    }
+
+    /// {@return the frames of a split body of three puts that leave their values to the section, one long enough for a
+    /// value frame of its own, and one inline}
+    private static SplitFrames splitFrames() {
+        var body = FrameBody.forSplit(16, null);
+        var values = new byte[64];
+        new Random(9).nextBytes(values);
+        var alone = new byte[FrameBody.VALUES_ALONE];
+        new Random(10).nextBytes(alone);
+        body.putSection(0, utf8("a"), values, 0, 30);
+        body.put(1, utf8("b"), utf8("inline"));
+        body.putSection(0, utf8("c"), values, 30, 34);
+        body.putSection(0, utf8("d"), alone, 0, alone.length);
+        body.finishSplit();
+        assertEquals(2, body.valueFrames());
+        return frames(body);
+    }
+
+    static Stream<Arguments> malformedSplits() {
+        var valid = splitFrames();
+        var head = valid.head();
+        var writes = writesLength(head);
+        var values = valid.values();
+        return Stream.of(
+                Arguments.of("a writes length below its own four bytes", withWritesLength(head, 3), values),
+                Arguments.of("a writes length past the head", withWritesLength(head, head.length + 1), values),
+                Arguments.of("a negative writes length", withWritesLength(head, -1), values),
+                Arguments.of("a head shorter than its writes length", Arrays.copyOf(head, 3), values),
+                Arguments.of("writes that end inside a write", withWritesLength(head, writes - 1), values),
+                Arguments.of("a table a byte late", withWritesLength(head, writes + 1), values),
+                Arguments.of("bytes after the table", Arrays.copyOf(head, head.length + 1), values),
+                Arguments.of("a value frame fewer than the table", head, Arrays.copyOf(values, 1)),
+                Arguments.of("a value frame more than the table", head, new byte[][]{values[0], values[1], new byte[4]}),
+                Arguments.of("a value frame shorter than the table", head, new byte[][]{Arrays.copyOf(values[0], values[0].length - 1), values[1]}),
+                Arguments.of("a value that spans two value frames", withTable(head, writes, values[0].length - 1, values[1].length + 1),
+                        new byte[][]{Arrays.copyOf(values[0], values[0].length - 1),
+                                concat(Arrays.copyOfRange(values[0], values[0].length - 1, values[0].length), values[1])}),
+                Arguments.of("values that end before the last value frame", withTable(head, writes, values[0].length, values[1].length + 1),
+                        new byte[][]{values[0], Arrays.copyOf(values[1], values[1].length + 1)}));
+    }
+
+    private static byte[] withWritesLength(byte[] bytes, int writes) {
+        var copy = bytes.clone();
+        copy[0] = (byte) writes;
+        copy[1] = (byte) (writes >>> 8);
+        copy[2] = (byte) (writes >>> 16);
+        copy[3] = (byte) (writes >>> 24);
+        return copy;
+    }
+
+    /// {@return `head` with its table replaced by one of value frames of `lengths`}
+    private static byte[] withTable(byte[] head, int writes, int... lengths) {
+        var table = new java.io.ByteArrayOutputStream();
+        table.writeBytes(Arrays.copyOf(head, writes));
+        writeVarInt(table, lengths.length);
+        for (var length : lengths) {
+            writeVarInt(table, length);
+        }
+        return table.toByteArray();
+    }
+
+    private static void writeVarInt(java.io.ByteArrayOutputStream out, long value) {
+        while ((value & ~0x7FL) != 0) {
+            out.write((int) ((value & 0x7F) | 0x80));
+            value >>>= 7;
+        }
+        out.write((int) value);
+    }
+
+    private static byte[] concat(byte[] first, byte[] second) {
+        var bytes = Arrays.copyOf(first, first.length + second.length);
+        System.arraycopy(second, 0, bytes, first.length, second.length);
+        return bytes;
+    }
+
+    /// {@return value frames of the bodies `values`, as recovery hands them over}
+    private static FrameBody.ValueFrames valueFrames(byte[][] values) {
+        return new SplitFrames(null, values).valueFrames();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("malformedSplits")
+    @DisplayName("recovery refuses a malformed split commit")
+    void malformedSplit(String ignored, byte[] head, byte[][] values) {
+        assertThrows(LedgerCorruptedException.class, () -> read(head, valueFrames(values)));
+    }
+
+    @Test
+    @DisplayName("the valid frames of a malformed split's cases read back, so each case fails on its damage alone")
+    void validSplit() {
+        var valid = splitFrames();
+        assertEquals(4, read(valid.head(), valid.valueFrames()).size());
+    }
+
+    @Test
+    @DisplayName("recovery refuses a section put in a body that is not split")
+    void sectionOutsideSplit() {
+        var valid = splitFrames();
+        var writes = writesLength(valid.head());
+        // The writes of the head, read as the body of a frame of type COMMIT
+        var bytes = Arrays.copyOfRange(valid.head(), 4, writes);
+        assertThrows(LedgerCorruptedException.class, () -> read(bytes, null));
+        assertThrows(LedgerCorruptedException.class, () -> FrameBody.readCommitKinds(bytes, 0, bytes.length, false,
+                new FrameBody.KindVisitor() {
+                    @Override
+                    public void put(int keyspace) {
+                    }
+
+                    @Override
+                    public void remove(int keyspace) {
+                    }
+
+                    @Override
+                    public void putExternal(int keyspace, long length, PageRef ref) {
+                    }
+                }));
+        // And a split head read as a body that is not
+        assertThrows(LedgerCorruptedException.class, () -> read(valid.head(), null));
+    }
+
+    static Stream<Arguments> splitStores() {
+        return Stream.of(Arguments.of(true, 1L << 20), Arguments.of(false, 1L << 20), Arguments.of(true, 64L << 10),
+                Arguments.of(false, 64L << 10));
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}, large values from {1}")
+    @MethodSource("splitStores")
+    @DisplayName("queues a split frame for a rope batch, which keeps its values while the batch starts again at once on pooled chunks, and recovers them")
+    void splitFrames(boolean encrypted, long largeValues) throws Exception {
+        withSlab(false, pool -> {
+            var random = new Random(largeValues + (encrypted ? 1 : 0));
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, byte[]>();
+            CrashFileSystem survivor;
+            try (var ledger = open(disk.getPath("/store"), encrypted, largeValues)) {
+                ledger.awaitDurable();
+                // A unit first, whose epoch frame is then durable: a commit with a unit waits for it
+                var unit = pattern(random, 100_000);
+                ledger.commit(ledger.newBatch().put(MESSAGES, "unit", unit)).awaitDurable();
+                model.put(id(MESSAGES, "unit"), unit);
+                var reached = new CountDownLatch(1);
+                var open = stallLog(disk, reached);
+                var queue = ((LiveLedger) ledger).logForTests();
+                Commit last = null;
+                try {
+                    ledger.commit(ledger.newBatch().put(MESSAGES, "first", new byte[300]));
+                    model.put(id(MESSAGES, "first"), new byte[300]);
+                    assertTrue(reached.await(2, TimeUnit.MINUTES));
+                    var batch = ledger.newBatch();
+                    for (var round = 0; round < 4; round++) {
+                        for (var i = 0; i < 300; i++) {
+                            var key = "r" + round + ":" + i;
+                            // A value of 200 KiB on an array of its own, below the default large values; values of
+                            // 64 to 128 KiB on the rope, which the smaller large values send to units
+                            var length = i == 150 ? 200 << 10 : i % 97 == 5 ? 70_000 + random.nextInt(50_000) : 1_000 + random.nextInt(1_000);
+                            var value = pattern(random, length);
+                            batch.put(MESSAGES, key, value);
+                            model.put(id(MESSAGES, key), value);
+                        }
+                        var session = "s" + round;
+                        var state = pattern(random, 3_000);
+                        batch.put(SESSIONS, session, state);
+                        model.put(id(SESSIONS, session), state);
+                        // The same batch starts again right after, on chunks of the pool, while the frame waits
+                        last = ledger.commit(batch);
+                        var frame = queue.queuedForTests().getLast();
+                        assertTrue(frame.split(), "the frame of round " + round + " is not split");
+                        assertTrue(frame.references() < 40, frame.references() + " references");
+                        assertTrue(frame.valueFrames() > 0 && frame.valueFrames() <= frame.references(), frame.valueFrames() + " value frames");
+                        assertTrue(frame.headBytes() < 64 << 10, "the frame copies its values");
+                    }
+                    pool.assertNoneFree(ledger);
+                    verify(ledger, model);
+                } finally {
+                    open.countDown();
+                }
+                last.awaitDurable();
+                verify(ledger, model);
+                survivor = disk.afterPowerLoss(new Random(7));
+            }
+            try (var ledger = open(survivor.getPath("/store"), encrypted, largeValues)) {
+                verify(ledger, model);
+                ledger.checkpoint();
+                verify(ledger, model);
+            }
+        });
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a split commit's group seals into exactly the bytes its body says its head and value frames take, as the writer counts them for its rollover and its write through")
+    void splitSealedBytes(boolean encrypted) throws Exception {
+        var disk = CrashFileSystem.create();
+        try (var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(disk.getPath("/store"))
+                .encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
+                .keyspace(MESSAGES).keyspace(SESSIONS).keyspace(NOTES))
+                .segmentSize(64L << 20)
+                .build()) {
+            ledger.commit(ledger.newBatch().put(MESSAGES, "warm", new byte[10])).awaitDurable();
+            var log = ledger.logForTests();
+            var reached = new CountDownLatch(1);
+            var open = stallLog(disk, reached);
+            Commit last;
+            List<FrameBody> bodies;
+            try {
+                // A commit whose group's write holds the writer, so the next frame waits in the queue
+                ledger.commit(ledger.newBatch().put(MESSAGES, "first", new byte[300]));
+                assertTrue(reached.await(2, TimeUnit.MINUTES));
+                var random = new Random(3);
+                var batch = ledger.newBatch();
+                for (var i = 0; i < 2_000; i++) {
+                    // Values of the rope, a few long enough for a value frame of their own, and resident ones between
+                    var length = i % 333 == 7 ? 90_000 : 200 + random.nextInt(800);
+                    batch.put(i % 50 == 0 ? SESSIONS : MESSAGES, "k" + i, pattern(random, length));
+                }
+                last = ledger.commit(batch);
+                bodies = log.queuedForTests();
+            } finally {
+                open.countDown();
+            }
+            assertEquals(1, bodies.size());
+            var split = bodies.getFirst();
+            assertTrue(split.split());
+            assertTrue(split.valueFrames() > 2, split.valueFrames() + " value frames");
+            var overhead = encrypted ? LogWriter.TAG_BYTES : Integer.BYTES;
+            var sealed = split.sealedBytes(overhead);
+            last.awaitDurable();
+            // The split commit's group, the last, holds its frames alone
+            assertEquals(sealed, log.groupEnd() - log.groupStart(), "the bytes the group sealed into");
+        }
+    }
+
+    @Test
+    @DisplayName("a split body whose own part passes the largest body of a run starts on a chunk of the pool and gives it back on release; a smaller one, or one without a pool, takes an array of its own")
+    void splitOwnPartOnChunk() {
+        var pool = new HeapPool(1L << 26, false);
+        var large = FrameBody.forSplit(LogWriter.RUN_MAX_BODY + 1, pool);
+        assertEquals(FrameBody.CHUNK_BYTES, large.chunk(0).length);
+        assertTrue(large.holdsPoolForTests());
+        large.finishSplit();
+        large.handOff();
+        large.release();
+        assertFalse(large.holdsPoolForTests());
+        var small = FrameBody.forSplit(LogWriter.RUN_MAX_BODY - 8, pool);
+        assertTrue(small.chunk(0).length < FrameBody.CHUNK_BYTES);
+        var unpooled = FrameBody.forSplit(LogWriter.RUN_MAX_BODY + 1, null);
+        assertTrue(unpooled.chunk(0).length < FrameBody.CHUNK_BYTES || unpooled.chunk(0).length == LogWriter.RUN_MAX_BODY + 1 + Integer.BYTES);
     }
 }

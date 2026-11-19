@@ -41,6 +41,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class RecoveryBufferTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.utf8());
+    // The values of the large batch, which its frame holds itself: a paged key space's would leave to value frames of
+    // their own
+    private static final Keyspace<String, String> LARGE = Keyspace.resident("large", KeyCodec.utf8(), ValueCodec.utf8());
     private static final int BUFFER = LogWriter.OUTPUT;
     private static final long LARGE_SEGMENT = 8L << 20;
     private static final long SMALL_SEGMENT = 256L << 10;
@@ -57,7 +60,7 @@ class RecoveryBufferTest {
 
     private static Ledger open(Path directory, boolean encrypted, long segmentSize) {
         return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
-                .keyspace(MESSAGES).checkpointEvery(1L << 40))
+                .keyspace(MESSAGES).keyspace(LARGE).checkpointEvery(1L << 40))
                 .checkpointHeap(1L << 40)
                 .segmentSize(segmentSize)
                 .build();
@@ -66,6 +69,10 @@ class RecoveryBufferTest {
     private static TreeMap<String, String> contents(Ledger ledger) {
         var entries = new TreeMap<String, String>();
         ledger.forEach(MESSAGES, KeyRange.all(), (key, value) -> {
+            entries.put(key, value);
+            return true;
+        });
+        ledger.forEach(LARGE, KeyRange.all(), (key, value) -> {
             entries.put(key, value);
             return true;
         });
@@ -93,7 +100,7 @@ class RecoveryBufferTest {
         }
 
         /// Commits about `bytes` of values of a few KiB each, durably one at a time so each is a frame of its own, and
-        /// in the middle one batch of about 1.6 MiB, a frame longer than the buffer.
+        /// in the middle one batch of about 1.6 MiB of resident values, a frame longer than the buffer.
         void commit(Ledger ledger, Random random, String prefix, long bytes) throws InterruptedException {
             var written = 0L;
             var large = false;
@@ -105,7 +112,7 @@ class RecoveryBufferTest {
                     for (var i = 0; i < 16; i++) {
                         var key = prefix + "-large-" + i;
                         var value = text(random, 100_000);
-                        batch.put(MESSAGES, key, value);
+                        batch.put(LARGE, key, value);
                         next.put(key, value);
                     }
                     written += 1_600_000;
@@ -138,7 +145,7 @@ class RecoveryBufferTest {
         }
 
         boolean holdsCommits() {
-            return type == FrameBody.COMMIT || type == FrameBody.COMMITS;
+            return type == FrameBody.COMMIT || type == FrameBody.COMMITS || type == FrameBody.COMMIT_SPLIT;
         }
     }
 

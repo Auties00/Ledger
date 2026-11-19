@@ -323,7 +323,7 @@ class LogRunTest {
                 }
 
                 @Override
-                public boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset,
+                public boolean commit(long sequence, byte[] body, int start, int length, FrameBody.ValueFrames section, LogSegmentView segment, long frameOffset,
                                       long logFrom) {
                     told.put(sequence, new long[]{segment.number(), frameOffset, logFrom});
                     return true;
@@ -358,7 +358,7 @@ class LogRunTest {
                 }
 
                 @Override
-                public boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset,
+                public boolean commit(long sequence, byte[] body, int start, int length, FrameBody.ValueFrames section, LogSegmentView segment, long frameOffset,
                                       long logFrom) {
                     if (sequence == missing) {
                         return false;
@@ -1346,7 +1346,7 @@ class LogRunTest {
                 }
 
                 @Override
-                public boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment,
+                public boolean commit(long sequence, byte[] body, int start, int length, FrameBody.ValueFrames section, LogSegmentView segment,
                                       long frameOffset, long logFrom) {
                     var written = log.bodies.get((int) sequence - 1);
                     told.add("commit " + sequence + " " + Arrays.equals(body, start, start + length, written, 0, written.length));
