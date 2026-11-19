@@ -824,11 +824,11 @@ final class SpillQueue {
         /// Lists `entry` of the run `values` names, whose value of `length` bytes starts at `offset` of the commit's
         /// body, the write `op` of the commit's batch, on an array other values share.
         ///
-        /// @param offset where the value starts in the commit's body, or for a value a split body left to its section,
-        ///               `-1` minus where it starts in the section, as [#add(Version, int, int)] takes it
-        ///
         /// A value shorter than [#LOG_VALUE_MIN] counts in the verdict at its length, the bytes it takes packed in a
         /// chunk of the run's own ([PackedRun#spill]), where a version's would take an array of its own.
+        ///
+        /// @param offset where the value starts in the commit's body, or for a value a split body left to its section,
+        ///               `-1` minus where it starts in the section, as [#add(Version, int, int)] takes it
         void addRun(RunValues values, int entry, int op, int offset, int length) {
             if (runs == null) {
                 runs = new RunValues[]{values};
