@@ -1370,10 +1370,24 @@ class WriteThroughTest {
         // Room for a group of the most one write takes, and a megabyte of filler, after a spare's first group
         private static final long SEGMENT = 4 << 20;
         private static final int WRITES = 256;
+        // The key space of the batches, resident, so their frames hold their values: a paged key space's would leave
+        // them to value frames, whose number moves with the lengths of the values
+        private static final Keyspace<String, String> ROWS = Keyspace.resident("rows", KeyCodec.utf8(), ValueCodec.utf8());
 
         private static Ledger open(Path directory, boolean encrypted, WriteThrough.Mode mode) {
-            var builder = Ledger.builder().directory(directory).encryption(encrypted ? Encryption.key(KEY) : Encryption.none()).keyspace(NAMES);
+            var builder = Ledger.builder().directory(directory).encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
+                    .keyspace(NAMES).keyspace(ROWS);
             return ((LedgerBuilder) builder).segmentSize(SEGMENT).writeThrough(mode).build();
+        }
+
+        /// {@return what `ledger` holds, of both key spaces}
+        private static Map<String, String> contents(Ledger ledger) {
+            var entries = new TreeMap<>(WriteThroughTest.contents(ledger));
+            ledger.forEach(ROWS, KeyRange.all(), (key, value) -> {
+                entries.put(key, value);
+                return true;
+            });
+            return entries;
         }
 
         /// Commits `writes` values of `length` bytes, the last `extra` bytes longer, under the keys `prefix000`
@@ -1383,7 +1397,7 @@ class WriteThroughTest {
             for (var i = 0; i < writes; i++) {
                 var key = prefix + "%03d".formatted(i);
                 var value = "v".repeat(i == writes - 1 ? length + extra : length);
-                batch.put(NAMES, key, value);
+                batch.put(ROWS, key, value);
                 model.put(key, value);
             }
             ledger.commit(batch).awaitDurable();

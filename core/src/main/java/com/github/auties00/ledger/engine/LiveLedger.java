@@ -431,13 +431,25 @@ public final class LiveLedger implements Ledger {
     /// the tree's state of it ([#replayHint(KeyspaceState, MemorySegment, ReplayValues)]), as the trees the open found
     /// lack the run's writes.
     ///
+    /// A split commit's body is its head's, and `section` its value frames, which hold the values its puts left to the
+    /// section: each such value is replayed as the others, from the value frame that holds it, which takes the place of
+    /// `body` and `frameOffset` for it.
+    ///
+    /// @param section the value frames of a split commit, those of a frame of type [FrameBody#COMMIT_SPLIT], or `null`
     /// @param values the chunks and the state of this open's replay
     /// @param segment the use of the segment that holds the frame, or `null` to move no value
     /// @return whether it replayed the commit
-    boolean replay(long sequence, byte[] body, int start, int length, ReplayValues values, LogSegmentView segment,
-                   long frameOffset, long logFrom) {
+    boolean replay(long sequence, byte[] body, int start, int length, FrameBody.ValueFrames section, ReplayValues values,
+                   LogSegmentView segment, long frameOffset, long logFrom) {
         var view = values.frame(body);
         values.reached(logFrom);
+        // Where each value frame's bytes start in the section, and the bytes of the section
+        var sectionStarts = section == null ? null : new int[section.count()];
+        var sectionBytes = 0L;
+        for (var frame = 0; section != null && frame < section.count(); frame++) {
+            sectionStarts[frame] = (int) sectionBytes;
+            sectionBytes += section.length(frame);
+        }
         var queue = segment == null ? null : spills;
         // Whether the values go to the log at once rather than to chunks the queue lists
         var moves = queue != null && !queue.keepsReplayed(logFrom);
@@ -453,7 +465,7 @@ public final class LiveLedger implements Ledger {
         // a key space whose writes go to its run, nearly all of a long log's, but all of one that replays to chains
         var chained = new int[1];
         // The kinds and key spaces of the writes alone, with no slice of a key or a value
-        FrameBody.readCommitKinds(body, start, length, new FrameBody.KindVisitor() {
+        FrameBody.readCommitKinds(body, start, length, section != null, new FrameBody.KindVisitor() {
             @Override
             public void put(int keyspace) {
                 loadForReplay(keyspace);
@@ -522,7 +534,7 @@ public final class LiveLedger implements Ledger {
         var record = new SpillQueue.Record[1];
         // Whether the segment recorded the commit, before its first value moves there
         var noted = new boolean[1];
-        FrameBody.readCommit(body, view, start, length, new FrameBody.Visitor() {
+        FrameBody.readCommit(body, view, start, length, section, new FrameBody.Visitor() {
             @Override
             public void putExternal(int keyspace, MemorySegment key, long length, PageRef ref) {
                 var unit = units.get(next[0]++);
@@ -541,6 +553,21 @@ public final class LiveLedger implements Ledger {
 
             @Override
             public void put(int keyspace, int keyAt, int keyLength, int valueAt, int bytes) {
+                put(keyspace, keyAt, keyLength, body, view, frameOffset, -1, valueAt, bytes);
+            }
+
+            @Override
+            public void putSection(int keyspace, int keyAt, int keyLength, int frame, int valueAt, int bytes) {
+                put(keyspace, keyAt, keyLength, section.body(frame), section.view(frame), section.offset(frame),
+                        sectionStarts[frame], valueAt, bytes);
+            }
+
+            /// Replays a put whose key is the `keyLength` bytes at `keyAt` of the commit's body and whose value is the
+            /// `bytes` bytes at `valueAt` of `frameArray`, the opened body of the frame at `valueFrame` of the segment,
+            /// `frameView` a read-only segment of all of it: the commit's own, or a value frame of its section, whose
+            /// bytes start at `sectionStart` of the section, -1 for the commit's own.
+            private void put(int keyspace, int keyAt, int keyLength, byte[] frameArray, MemorySegment frameView,
+                             long valueFrame, int sectionStart, int valueAt, int bytes) {
                 var state = byId.get(keyspace);
                 if (state == null) {
                     return;
@@ -548,14 +575,16 @@ public final class LiveLedger implements Ledger {
                 if (replayHint(state) != TreeSearch.BLIND) {
                     if (state.resident && state.keyspace.values() == BuiltinCodecs.BYTES_VALUE) {
                         var hash = Segments.hash(body, keyAt, keyLength);
-                        if (!applier.putReplayedBytes(state, body, keyAt, keyLength, hash, valueAt, bytes)) {
+                        // A value of the section lies in another body than its key, which the in-place path needs
+                        if (frameArray != body
+                                || !applier.putReplayedBytes(state, body, keyAt, keyLength, hash, valueAt, bytes)) {
                             var key = view.asSlice(keyAt, keyLength);
-                            applier.put(state, applier.claim(state, key, hash), key, view.asSlice(valueAt, bytes), null,
-                                    false, null, null, 0, null, TreeSearch.UNKNOWN, null);
+                            applier.put(state, applier.claim(state, key, hash), key, frameView.asSlice(valueAt, bytes),
+                                    null, false, null, null, 0, null, TreeSearch.UNKNOWN, null);
                         }
                         return;
                     }
-                    var value = view.asSlice(valueAt, bytes);
+                    var value = frameView.asSlice(valueAt, bytes);
                     applier.put(state, view.asSlice(keyAt, keyLength), value,
                             state.resident ? residentValue(state, null, value) : null);
                     return;
@@ -572,11 +601,11 @@ public final class LiveLedger implements Ledger {
                             noted[0] = true;
                         }
                         var crypto = values.crypto(queue);
-                        queue.tagReplayedInto(crypto, stamp, body, valueAt, bytes);
-                        run.putLogged(body, keyAt, keyLength, hash, stamp, segment, frameOffset, valueAt,
+                        queue.tagReplayedInto(crypto, stamp, frameArray, valueAt, bytes);
+                        run.putLogged(body, keyAt, keyLength, hash, stamp, segment, valueFrame, valueAt,
                                 crypto.tagHigh(), crypto.tagLow(), bytes);
                     } else if (ReplayValues.shared(bytes)) {
-                        var at = values.copy(body, valueAt, bytes);
+                        var at = values.copy(frameArray, valueAt, bytes);
                         run.put(body, keyAt, keyLength, hash, stamp, values.view(), at, bytes);
                     } else {
                         run.put(body, keyAt, keyLength, hash, stamp, null, 0, 0);
@@ -586,17 +615,17 @@ public final class LiveLedger implements Ledger {
                     return;
                 }
                 var key = view.asSlice(keyAt, keyLength);
-                var value = view.asSlice(valueAt, bytes);
+                var value = frameView.asSlice(valueAt, bytes);
                 if (moves && bytes >= SpillQueue.LOG_VALUE_MIN) {
-                    // On the body for as long as it takes to tag it there: a slice of the body's view, at valueAt
-                    applier.put(state, applier.claim(state, key, hash), key, value, null, false, view, null, valueAt,
+                    // On the frame's body for as long as it takes to tag it there: a slice of its view, at valueAt
+                    applier.put(state, applier.claim(state, key, hash), key, value, null, false, frameView, null, valueAt,
                             null, replayHint(state, key, values), null);
                     if (!noted[0]) {
                         queue.noteReplayed(sequence, segment);
                         noted[0] = true;
                     }
-                    if (!queue.moveReplayed(values.crypto(queue), applier.lastVersion(), segment, frameOffset, valueAt,
-                            body)) {
+                    if (!queue.moveReplayed(values.crypto(queue), applier.lastVersion(), segment, valueFrame, valueAt,
+                            frameArray)) {
                         // The version stays on the body, which no later frame may then be opened into
                         values.keepFrame();
                     }
@@ -609,8 +638,9 @@ public final class LiveLedger implements Ledger {
                     if (record[0] == null) {
                         record[0] = queue.record(sequence, listed[0]);
                     }
-                    // Where the value starts in the frame's body
-                    record[0].add(applier.lastVersion(), valueAt, bytes);
+                    // Where the value starts in the frame's body, or in the section
+                    record[0].add(applier.lastVersion(), sectionStart < 0 ? valueAt : -1 - (sectionStart + valueAt),
+                            bytes);
                 }
             }
 
@@ -656,12 +686,24 @@ public final class LiveLedger implements Ledger {
         if (listing != null) {
             // The values lie at their addresses in the frame's body, so the commit's body starts at 0 of it
             listing.locate(segment, frameOffset, 0, 0, false);
+            if (section != null) {
+                var offsets = new long[section.count()];
+                var lengths = new int[section.count()];
+                for (var frame = 0; frame < offsets.length; frame++) {
+                    offsets[frame] = section.offset(frame);
+                    lengths[frame] = section.length(frame);
+                }
+                listing.valueFrames(sectionStarts, lengths);
+                listing.locateValueFrames(offsets);
+            }
             // The log's last budget, which the queue holds without moving any
             queue.add(listing);
         }
-        replayedBytes += 13 + length + unitBytes[0];
+        // The section counts as the writer counted it, as part of the commit's body
+        var bodyBytes = length + sectionBytes;
+        replayedBytes += 13 + bodyBytes + unitBytes[0];
         // As the writes would have held on chains, so the first checkpoint comes when it would have
-        replayedHeap += LogWriter.heapOf(length, unitBytes[1], applier.touched.size() + runWrites[0], false);
+        replayedHeap += LogWriter.heapOf(bodyBytes, unitBytes[1], applier.touched.size() + runWrites[0], false);
         return true;
     }
 
@@ -1087,6 +1129,7 @@ public final class LiveLedger implements Ledger {
                 for (var i = 0; i < size; i++) {
                     applyAlone(writes, i, applier, hints, units);
                 }
+                applier.finishFrame();
             } catch (RuntimeException | Error throwable) {
                 // A resident value whose decoder throws, or a tree that cannot be read, stops the batch
                 applier.rollback();
@@ -1638,6 +1681,7 @@ public final class LiveLedger implements Ledger {
             for (var i = 0; i < size; i++) {
                 applyWrite(pending, applier, i);
             }
+            applier.finishFrame();
         } catch (Throwable failure) {
             applier.rollback();
             pending.failure = failure;
@@ -3540,12 +3584,17 @@ public final class LiveLedger implements Ledger {
                 addDelta(state, 1);
             }
             if (frame != null) {
+                var sectioned = false;
                 if (external != null) {
                     frame.putExternal(state.id, key, length, external);
                     unitBytes += length;
                     if (state.resident) {
                         unitHeap += length;
                     }
+                } else if (kept != null && !state.resident && frame.split()) {
+                    // Left on the array the version keeps, which no one writes or pools: a value frame refers to it
+                    frame.putSection(state.id, key, kept, keptAt, length);
+                    sectioned = true;
                 } else if (kept != null && length >= frame.referable()) {
                     frame.put(state.id, key, kept, keptAt, length);
                 } else {
@@ -3556,16 +3605,47 @@ public final class LiveLedger implements Ledger {
                 if (spillRoom != 0 && spillRoom != REPLAYED && external == null && !state.resident && (own != null
                         ? length >= SpillQueue.LOG_VALUE_MIN
                         : spillRoom > 0 && source != null && state.overwrites.spills())) {
-                    listSpill(version, length);
+                    listSpill(version, length, sectioned);
                 }
             }
         }
 
-        /// Lists `version`, whose value of `length` bytes the commit's frame now ends with, among the values that may
-        /// leave the heap for the log.
-        private void listSpill(Version version, int length) {
-            // A put ends with its value, whether the frame copies it or refers to it
-            spillRecord().add(version, frame.size() - length, length);
+        /// Lists `version`, whose value of `length` bytes the last put of the commit's frame holds, among the values
+        /// that may leave the heap for the log.
+        ///
+        /// @param sectioned whether the put left the value to the section of a split frame, whose value frames hold it
+        private void listSpill(Version version, int length, boolean sectioned) {
+            spillRecord().add(version, valueOffset(length, sectioned), length);
+        }
+
+        /// {@return where the value of `length` bytes the last put of the commit's frame holds starts, as a
+        /// [SpillQueue.Record] lists it: in the frame's body, or `-1` minus where it starts in the section of a split
+        /// frame if `sectioned`}
+        private int valueOffset(int length, boolean sectioned) {
+            // A put ends with its value, whether the frame copies it or refers to it, or ends the section so far
+            return sectioned ? frame.sectionOffset(length) : frame.valueOffset(length);
+        }
+
+        /// Ends the commit's frame once its last write is in, if it is split ([FrameBody#finishSplit()]); not for a
+        /// commit taken back.
+        void finishFrame() {
+            if (frame == null || !frame.split()) {
+                return;
+            }
+            frame.finishSplit();
+            var record = frame.spill();
+            if (record != null) {
+                // The bytes of the section each value frame holds, from where
+                var starts = new int[frame.valueFrames()];
+                var lengths = new int[starts.length];
+                var start = 0;
+                for (var valueFrame = 0; valueFrame < starts.length; valueFrame++) {
+                    starts[valueFrame] = start;
+                    lengths[valueFrame] = frame.valueFrameBytes(valueFrame);
+                    start += lengths[valueFrame];
+                }
+                record.valueFrames(starts, lengths);
+            }
         }
 
         /// {@return the record of the values of the commit that may leave the heap for the log, made at the first}
@@ -3672,7 +3752,12 @@ public final class LiveLedger implements Ledger {
             addDelta(state, 1);
             if (frame != null) {
                 var kept = writes.homeArray(index);
-                if (kept != null && length >= frame.referable()) {
+                var sectioned = false;
+                if (kept != null && frame.split()) {
+                    // Left on the home the run keeps, which no one writes or pools: a value frame refers to it
+                    frame.putSection(state.id, key, kept, offset, length);
+                    sectioned = true;
+                } else if (kept != null && length >= frame.referable()) {
                     frame.put(state.id, key, kept, offset, length);
                 } else {
                     frame.put(state.id, key, value);
@@ -3681,8 +3766,8 @@ public final class LiveLedger implements Ledger {
                     if (bulk.listed == null) {
                         bulk.listed = new SpillQueue.RunValues(bulk.planned);
                     }
-                    // A put ends with its value, whether the frame copies it or refers to it
-                    spillRecord().addRun(bulk.listed, entry, (int) (stamp & Reads.MAX_OPS), frame.size() - length, length);
+                    spillRecord().addRun(bulk.listed, entry, (int) (stamp & Reads.MAX_OPS), valueOffset(length, sectioned),
+                            length);
                 }
             }
             return true;
@@ -3884,7 +3969,7 @@ public final class LiveLedger implements Ledger {
             // Queued before it is visible, so the log holds every commit a reader can see, in order
             if (frame != null) {
                 try {
-                    log.append(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size() + runWrites(),
+                    log.append(frame.commitType(), sequence, frame, unitBytes, unitHeap, touched.size() + runWrites(),
                             sharesChunk);
                     logged = true;
                 } catch (RuntimeException exception) {
@@ -3899,7 +3984,7 @@ public final class LiveLedger implements Ledger {
         /// Adds the commit's frame, if it is journaled, to `batch`.
         void queueFrame(LogWriter.Batch batch) {
             if (frame != null) {
-                batch.add(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size() + runWrites(),
+                batch.add(frame.commitType(), sequence, frame, unitBytes, unitHeap, touched.size() + runWrites(),
                         sharesChunk);
             }
         }

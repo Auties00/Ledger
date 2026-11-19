@@ -47,6 +47,15 @@ import java.util.zip.CRC32C;
 /// later group it is a commit no one was told of. The commits of its run before it are replayed, those after it are
 /// not. A run whose frame authenticates but whose entries are malformed is damage, not a tear, and is refused.
 ///
+/// A split commit ([FrameBody#COMMIT_SPLIT]) is replayed only once each of the value frames its table announces
+/// ([FrameBody#VALUES]) follows it and authenticates: the writer writes them right after it in the same group, so one
+/// cut short, failing authentication, or missing where the padding of a group starts ends the segment as a torn frame
+/// does, and the commit, never acknowledged, is not replayed in part; with a later group after it, the commit was
+/// acknowledged and the log is refused. A value frame that authenticates but is not the one the table announces, of
+/// another type, sequence or length, and a value frame that follows no split commit, are damage and refused. Neither
+/// type is read from a segment older than [LogWriter#SPLIT_SEGMENT_VERSION]. The value frames of a split commit the
+/// checkpoint holds are read past as its head is.
+///
 /// Segments are read through one buffer, a part at a time, which passes from each segment to the next. A frame is
 /// authenticated where the buffer holds it, and opened out of it into an array of the recovery's [FrameReadAhead.Spares]:
 /// replay copies no sealed bytes, and a frame longer than the buffer is read into an array of its own, which no later
@@ -59,12 +68,13 @@ import java.util.zip.CRC32C;
 /// frames of similar lengths opens into a few arrays, as many as the frames open at once.
 ///
 /// A recovery that moves values off the heap bounds the log that follows each frame before it replays
-/// ([Sink#commit(long, byte\[\], int, int, LogSegmentView, long, long)]): it reads the header and the first frame
-/// header of every segment, and the chain of frame headers of the last segment that holds frames
-/// ([#framesEnd(Path, boolean, CRC32C, SegmentReader.Buffer, byte\[\])]), through a window of a page and a header in
-/// the replay's buffer, filled at each header the window does not hold. That segment is read twice, once by this pass
-/// and once by the replay: where its frames are shorter than a page, as the groups of a group-committed log are, the
-/// pass reads all of it a window at a time, up to a whole segment; where they are longer, a window for each frame.
+/// ([Sink#commit(long, byte\[\], int, int, FrameBody.ValueFrames, LogSegmentView, long, long)]): it reads the
+/// header and the first frame header of every segment, and the chain of frame headers of the last segment that holds
+/// frames ([#framesEnd(Path, boolean, CRC32C, SegmentReader.Buffer, byte\[\])]), through a window of a page and a
+/// header in the replay's buffer, filled at each header the window does not hold. That segment is read twice, once by
+/// this pass and once by the replay: where its frames are shorter than a page, as the groups of a group-committed log
+/// are, the pass reads all of it a window at a time, up to a whole segment; where they are longer, a window for each
+/// frame.
 final class LogRecovery {
     /// The bytes of the buffer: below half a G1 region of 2 MiB, as [LogWriter#OUTPUT] is, so not humongous.
     private static final int BUFFER = LogWriter.OUTPUT;
@@ -91,12 +101,17 @@ final class LogRecovery {
         /// [#releasesFrame()] then says otherwise, recovery opens a later frame into it once the frame replayed, so
         /// nothing that outlives the frame may refer to it.
         ///
+        /// A split commit's frame is followed by its value frames, which recovery opened into arrays of its own as it
+        /// opens any frame, and passes as `section`, each to be read as its body is.
+        ///
+        /// @param section the value frames of a split commit, whose own part `body` then holds, or `null` for any
+        ///                other commit
         /// @param segment the use, or `null` if the recovery moves no value off the heap
         /// @param logFrom the bytes of log from the start of the frame to the end of the log, at most: the frames a
         ///                recovery that moves values off the heap still replays lie there, and 0 without one
         /// @return whether it replayed the commit; it changed nothing if not
-        boolean commit(long sequence, byte[] body, int start, int length, LogSegmentView segment, long frameOffset,
-                       long logFrom);
+        boolean commit(long sequence, byte[] body, int start, int length, FrameBody.ValueFrames section,
+                       LogSegmentView segment, long frameOffset, long logFrom);
 
         void epoch(int epoch);
 
@@ -212,12 +227,19 @@ final class LogRecovery {
                 var view = spills == null ? null : spills.segment(number, path, segmentKey);
                 var segmentEnd = Math.max(ends[index], position);
                 var afterPadding = false;
+                // The split commit whose value frames are being read, or null
+                Split split = null;
                 while (reader.read(position, frame, 0, LogWriter.FRAME_HEADER, peek)) {
                     if (position % LogWriter.ALIGNMENT != 0) {
                         // The padding after a group, which only a group's first frame follows; a frame never starts
                         // with a zero byte, and the padding can be shorter than a frame header
                         var boundary = Math.min((position + LogWriter.ALIGNMENT - 1) / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT, reader.size());
                         if (reader.isZero(position, boundary - position)) {
+                            if (split != null) {
+                                // A group ends between a split commit and one of its value frames: a torn group
+                                checkNoLaterGroup(reader, position, last, tag, crc, path);
+                                break;
+                            }
                             position = boundary;
                             afterPadding = true;
                             continue;
@@ -258,6 +280,53 @@ final class LogRecovery {
                     var body = opened.body();
                     var bodyLength = opened.length();
                     lastWritten = path;
+                    if ((type == FrameBody.COMMIT_SPLIT || type == FrameBody.VALUES) && version < LogWriter.SPLIT_SEGMENT_VERSION) {
+                        throw new LedgerCorruptedException(path + " holds a split commit in a segment of version " + version
+                                + ", whose segments hold none", null);
+                    }
+                    if (split != null || type == FrameBody.VALUES) {
+                        if (split == null) {
+                            throw new LedgerCorruptedException(path + " holds a value frame at offset " + position
+                                    + " that follows no split commit", null);
+                        }
+                        split.add(frame, sequence, type, body, bodyLength, position, path, spares);
+                        position = end;
+                    } else if (type == FrameBody.COMMIT_SPLIT) {
+                        var table = FrameBody.splitTable(body, 0, bodyLength);
+                        var skipped = sequence <= checkpoint;
+                        if (!skipped && sequence != last + 1) {
+                            throw new LedgerCorruptedException(path + " holds commit " + sequence + " after commit " + last, null);
+                        }
+                        split = new Split(sequence, body, bodyLength, position, table, skipped,
+                                spills == null ? 0 : segmentEnd - position + after[index]);
+                        if (skipped) {
+                            // Held by the checkpoint's trees, as its value frames are
+                            spares.giveBody(body);
+                        }
+                        position = end;
+                    }
+                    if (split != null || type == FrameBody.VALUES) {
+                        if (!split.complete()) {
+                            continue;
+                        }
+                        var ended = split;
+                        split = null;
+                        if (ended.skipped) {
+                            continue;
+                        }
+                        var replayed = sink.commit(ended.sequence, ended.head, 0, ended.headLength, ended.values, view,
+                                ended.offset, ended.logFrom);
+                        var released = sink.releasesFrame();
+                        if (!replayed) {
+                            checkNoLaterGroup(reader, ended.offset, last, tag, crc, path);
+                            break;
+                        }
+                        last = ended.sequence;
+                        if (released) {
+                            ended.giveBack(spares);
+                        }
+                        continue;
+                    }
                     var replayed = true;
                     switch (type) {
                         case FrameBody.COMMIT -> {
@@ -265,7 +334,7 @@ final class LogRecovery {
                                 if (sequence != last + 1) {
                                     throw new LedgerCorruptedException(path + " holds commit " + sequence + " after commit " + last, null);
                                 }
-                                replayed = sink.commit(sequence, body, 0, bodyLength, view, position,
+                                replayed = sink.commit(sequence, body, 0, bodyLength, null, view, position,
                                         spills == null ? 0 : segmentEnd - position + after[index]);
                                 if (replayed) {
                                     last = sequence;
@@ -285,7 +354,7 @@ final class LogRecovery {
                                     throw new LedgerCorruptedException(path + " holds commit " + next + " after commit " + last, null);
                                 }
                                 var length = commits.next();
-                                replayed = sink.commit(next, body, commits.start(), length, view, position,
+                                replayed = sink.commit(next, body, commits.start(), length, null, view, position,
                                         spills == null ? 0 : segmentEnd - position + after[index]);
                                 if (replayed) {
                                     last = next;
@@ -320,6 +389,70 @@ final class LogRecovery {
             }
         }
         return new Result(last, lastSegment, empty, lastWritten);
+    }
+
+    /// A split commit whose value frames recovery reads: its head, opened, and the value frames read so far.
+    private static final class Split {
+        private final long sequence;
+        private final byte[] head;
+        private final int headLength;
+        private final long offset;
+        private final int[] table;
+        private final boolean skipped;
+        private final long logFrom;
+        // The value frames opened, or null for a commit the checkpoint holds, whose value frames are read past
+        private final FrameBody.ValueFrames values;
+        // The value frames read
+        private int read;
+
+        /// Starts the split commit at `sequence` whose head, the first `headLength` bytes of `head`, is the frame at
+        /// `offset` of its segment and announces the value frames of `table`.
+        ///
+        /// @param skipped whether the checkpoint holds the commit, whose value frames are then read past
+        /// @param logFrom the bytes of log from the head to the end of the log, at most, as [Sink#commit] takes them
+        Split(long sequence, byte[] head, int headLength, long offset, int[] table, boolean skipped, long logFrom) {
+            this.sequence = sequence;
+            this.head = head;
+            this.headLength = headLength;
+            this.offset = offset;
+            this.table = table;
+            this.skipped = skipped;
+            this.logFrom = logFrom;
+            this.values = skipped ? null : new FrameBody.ValueFrames(table.length);
+        }
+
+        /// Takes the opened value frame at `position` of `path`, whose header is `header`, as the next of the commit;
+        /// for a skipped commit, gives its body back to `spares` at once.
+        ///
+        /// @throws LedgerCorruptedException if the frame, which authenticated, is not the value frame the table
+        ///         announces next: of another type, sequence or length, or the first of a group
+        void add(byte[] header, long frameSequence, byte type, byte[] body, int length, long position, Path path,
+                 FrameReadAhead.Spares spares) {
+            if (type != FrameBody.VALUES || frameSequence != sequence || (header[17] & LogWriter.GROUP_START) != 0
+                    || length != table[read]) {
+                throw new LedgerCorruptedException(path + " holds a frame at offset " + position + " where value frame "
+                        + read + " of split commit " + sequence + " belongs", null);
+            }
+            read++;
+            if (skipped) {
+                spares.giveBody(body);
+            } else {
+                values.add(body, length, position);
+            }
+        }
+
+        /// {@return whether every value frame of the commit was read}
+        boolean complete() {
+            return read == table.length;
+        }
+
+        /// Gives the arrays of the head and of the value frames back to `spares`, once nothing refers to them.
+        void giveBack(FrameReadAhead.Spares spares) {
+            spares.giveBody(head);
+            for (var frame = 0; frame < values.count(); frame++) {
+                spares.giveBody(values.body(frame));
+            }
+        }
     }
 
     private static Cipher cipher(StoreKeys keys) {

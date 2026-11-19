@@ -12,7 +12,7 @@ import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -39,17 +39,20 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
-/// Stores whose commits have frame bodies on chunks of the process's pool, which the log hands back as it seals them
-/// while committers take the same chunks for the ropes their batches and values live on: the values read before and
-/// after a checkpoint and after a power loss, commits taken back, and a log that stops with such frames queued.
+/// Stores whose large commits have frames of each [shape][Frames]: bodies on chunks of the process's pool, which the
+/// log hands back as it seals them while committers take the same chunks for the ropes their batches and values live
+/// on, and split bodies, whose sections refer to the value chunks of the ropes the versions keep until the log seals
+/// them. The tests check the values read before and after a checkpoint and after a power loss, commits taken back, and
+/// a log that stops with such frames queued.
 ///
 /// The force of the log is held while committers queue frames behind it, so the frames the flush then seals give their
-/// chunks back while the next batches take them; with assertions on, a released chunk is overwritten with a pattern
-/// first, which a frame or a value still reading it would show.
+/// chunks back, or are sealed from the ropes, while the next batches take chunks; with assertions on, a released chunk
+/// is overwritten with a pattern first, which a frame or a value still reading it would show.
 class FramePoolStressTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> NAMES = Keyspace.paged("names", KeyCodec.utf8(), ValueCodec.utf8());
     private static final Keyspace<String, String> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
+    private static final Keyspace<String, String> NOTES = Keyspace.resident("notes", KeyCodec.utf8(), ValueCodec.utf8());
     // A resident key space whose decoder refuses a value starting with 0x7F, which takes its batch back as it applies
     private static final Keyspace<String, String> STRICT = Keyspace.resident("strict", KeyCodec.utf8(), ValueCodec.of(
             value -> value.getBytes(StandardCharsets.UTF_8).length,
@@ -62,12 +65,32 @@ class FramePoolStressTest {
             }));
     private static final int THREADS = 6;
     private static final int LARGE_COMMITS = 8;
-    // Writes of a large commit, whose body of about 330 KiB spans two chunks and whose batch is on a rope
+    // Writes of a large commit, about 330 KiB, whose batch is on a rope: to NOTES, a body that spans two chunks; to
+    // NAMES, a split body of about 3 KiB that refers to the rope's value chunks
     private static final int LARGE_WRITES = 130;
+
+    /// The shape of the frames of the tests' large commits, by the key space they write to.
+    enum Frames {
+        /// Paged values, which a split body leaves to its section on the arrays the versions keep.
+        SPLIT(NAMES),
+        /// Resident values, which a body that refers to none copies into chunks of the pool.
+        CHUNKED(NOTES);
+
+        final Keyspace<String, String> space;
+
+        Frames(Keyspace<String, String> space) {
+            this.space = space;
+        }
+
+        /// {@return whether `body`, queued and not sealed yet, is the frame of a large commit of this shape}
+        boolean shapes(FrameBody body) {
+            return this == SPLIT ? body.split() : !body.split() && body.holdsPoolForTests();
+        }
+    }
 
     private static Ledger open(Path directory, Encryption encryption) {
         return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(encryption).keyspace(NAMES).keyspace(CHATS)
-                .keyspace(STRICT).commitWindow(Duration.ZERO))
+                .keyspace(NOTES).keyspace(STRICT).commitWindow(Duration.ZERO))
                 .segmentSize(1L << 20)
                 .build();
     }
@@ -97,10 +120,10 @@ class FramePoolStressTest {
         }
     }
 
-    /// Checks that `ledger` holds `expected` in [#NAMES] and each committer's last chat.
-    private static void assertHolds(Ledger ledger, Map<String, String> expected, Map<String, String> chats) {
+    /// Checks that `ledger` holds `expected` in `space` and each committer's last chat.
+    private static void assertHolds(Ledger ledger, Keyspace<String, String> space, Map<String, String> expected, Map<String, String> chats) {
         var names = new TreeMap<String, String>();
-        ledger.forEach(NAMES, KeyRange.all(), (key, value) -> {
+        ledger.forEach(space, KeyRange.all(), (key, value) -> {
             names.put(key, value);
             return true;
         });
@@ -115,10 +138,11 @@ class FramePoolStressTest {
         }
     }
 
-    @ParameterizedTest(name = "encrypted: {0}")
-    @ValueSource(booleans = {true, false})
-    @DisplayName("keeps every value while frames queued behind a held force give their chunks back to the next batches")
-    void queuedFrames(boolean encrypted) throws Exception {
+    @ParameterizedTest(name = "{0} frames, encrypted: {1}")
+    @CsvSource({"SPLIT, true", "SPLIT, false", "CHUNKED, true", "CHUNKED, false"})
+    @DisplayName("keeps every value while large frames queued behind a held force are sealed and the next batches take chunks")
+    void queuedFrames(Frames frames, boolean encrypted) throws Exception {
+        var space = frames.space;
         var encryption = encrypted ? Encryption.key(KEY) : Encryption.none();
         var disk = CrashFileSystem.create();
         var blocked = new AtomicBoolean();
@@ -139,10 +163,10 @@ class FramePoolStressTest {
         var failures = new ConcurrentLinkedQueue<Throwable>();
         var ledger = open(disk.getPath("/store"), encryption);
         try {
-            ledger.commit(ledger.newBatch().put(NAMES, "warm", "x")).awaitDurable();
+            ledger.commit(ledger.newBatch().put(space, "warm", "x")).awaitDurable();
             expected.put("warm", "x");
             blocked.set(true);
-            ledger.commit(ledger.newBatch().put(NAMES, "first", "blocked"));
+            ledger.commit(ledger.newBatch().put(space, "first", "blocked"));
             expected.put("first", "blocked");
             assertTrue(forcing.await(10, TimeUnit.SECONDS), "the first group never reached its force");
             // Two phases: frames queue behind the held force, then the flush seals them while the committers go on
@@ -164,7 +188,7 @@ class FramePoolStressTest {
                             var values = new String[LARGE_WRITES];
                             for (var write = 0; write < LARGE_WRITES; write++) {
                                 values[write] = value(thread, commit, write);
-                                batch.put(NAMES, key(thread, first + write), values[write]);
+                                batch.put(space, key(thread, first + write), values[write]);
                             }
                             batch.put(CHATS, "chat" + thread, "commit " + commit);
                             ledger.commit(batch);
@@ -173,15 +197,15 @@ class FramePoolStressTest {
                             }
                             chats.put("chat" + thread, "commit " + commit);
                             // A small commit beside, whose frame a run takes
-                            ledger.commit(ledger.newBatch().put(NAMES, "small" + thread, "v" + commit));
+                            ledger.commit(ledger.newBatch().put(space, "small" + thread, "v" + commit));
                             expected.put("small" + thread, "v" + commit);
                             // The values just written, and some of an earlier commit, on the arrays they live on
                             var random = new Random(thread * 31L + commit);
                             for (var check = 0; check < 20; check++) {
                                 var write = random.nextInt(LARGE_WRITES);
-                                assertEquals(values[write], ledger.get(NAMES, key(thread, first + write)).orElseThrow());
+                                assertEquals(values[write], ledger.get(space, key(thread, first + write)).orElseThrow());
                                 var older = random.nextInt(first + LARGE_WRITES);
-                                assertEquals(expected.get(key(thread, older)), ledger.get(NAMES, key(thread, older)).orElseThrow());
+                                assertEquals(expected.get(key(thread, older)), ledger.get(space, key(thread, older)).orElseThrow());
                             }
                         }
                     } catch (Throwable throwable) {
@@ -191,6 +215,8 @@ class FramePoolStressTest {
                 }));
             }
             assertTrue(queued.await(1, TimeUnit.MINUTES), "the committers never queued their first frames");
+            assertTrue(((LiveLedger) ledger).logForTests().queuedForTests().stream().anyMatch(frames::shapes),
+                    "no frame queued behind the held force is " + frames);
             blocked.set(false);
             released.countDown();
             go.countDown();
@@ -206,15 +232,15 @@ class FramePoolStressTest {
             }
             ledger.awaitDurable();
             assertNoChunkFreeTwice();
-            assertHolds(ledger, expected, chats);
+            assertHolds(ledger, space, expected, chats);
             ledger.checkpoint();
-            assertHolds(ledger, expected, chats);
+            assertHolds(ledger, space, expected, chats);
             // Written after the last checkpoint, so recovery replays them from the log
             for (var t = 0; t < THREADS; t++) {
                 var batch = ledger.newBatch();
                 for (var write = 0; write < LARGE_WRITES; write++) {
                     var value = value(t, 100, write);
-                    batch.put(NAMES, key(t, write), value);
+                    batch.put(space, key(t, write), value);
                     expected.put(key(t, write), value);
                 }
                 ledger.commit(batch);
@@ -227,14 +253,15 @@ class FramePoolStressTest {
         }
         var survivor = disk.afterPowerLoss(new Random(encrypted ? 3 : 4));
         try (var reopened = open(survivor.getPath("/store"), encryption)) {
-            assertHolds(reopened, expected, chats);
+            assertHolds(reopened, space, expected, chats);
         }
     }
 
-    @ParameterizedTest(name = "encrypted: {0}")
-    @ValueSource(booleans = {true, false})
-    @DisplayName("a commit taken back gives its frame's chunks back once, and the store goes on")
-    void takenBack(boolean encrypted) throws Exception {
+    @ParameterizedTest(name = "{0} frames, encrypted: {1}")
+    @CsvSource({"SPLIT, true", "SPLIT, false", "CHUNKED, true", "CHUNKED, false"})
+    @DisplayName("a commit taken back gives the chunks its frame holds back once, and the store goes on")
+    void takenBack(Frames frames, boolean encrypted) throws Exception {
+        var space = frames.space;
         var encryption = encrypted ? Encryption.key(KEY) : Encryption.none();
         var disk = CrashFileSystem.create();
         try (var ledger = open(disk.getPath("/store"), encryption)) {
@@ -244,15 +271,15 @@ class FramePoolStressTest {
                 // A transaction of about 1.5 MiB of frame that throws
                 assertThrows(IllegalStateException.class, () -> ledger.update(transaction -> {
                     for (var write = 0; write < 600; write++) {
-                        transaction.put(NAMES, key(9, write), value(9, commit, write));
+                        transaction.put(space, key(9, write), value(9, commit, write));
                     }
                     throw new IllegalStateException("abort");
                 }));
                 assertNoChunkFreeTwice();
                 // A batch that runs alone, for its range removal, and whose last write's decoder throws
-                var batch = ledger.newBatch().deleteRange(NAMES, KeyRange.between("a", "b"));
+                var batch = ledger.newBatch().deleteRange(space, KeyRange.between("a", "b"));
                 for (var write = 0; write < 300; write++) {
-                    batch.put(NAMES, key(8, write), value(8, commit, write));
+                    batch.put(space, key(8, write), value(8, commit, write));
                 }
                 batch.putEncoded(STRICT, MemorySegment.ofArray("k".getBytes(StandardCharsets.UTF_8)), MemorySegment.ofArray(new byte[]{0x7F}));
                 assertThrows(IllegalArgumentException.class, () -> ledger.commit(batch));
@@ -260,44 +287,44 @@ class FramePoolStressTest {
                 // A transaction and a batch of the same size that commit
                 ledger.update(transaction -> {
                     for (var write = 0; write < 300; write++) {
-                        transaction.put(NAMES, key(7, write), value(7, commit, write));
+                        transaction.put(space, key(7, write), value(7, commit, write));
                     }
                 });
                 var committed = ledger.newBatch();
                 for (var write = 0; write < 300; write++) {
-                    committed.put(NAMES, key(6, write), value(6, commit, write));
+                    committed.put(space, key(6, write), value(6, commit, write));
                     expected.put(key(6, write), value(6, commit, write));
                     expected.put(key(7, write), value(7, commit, write));
                 }
                 ledger.commit(committed).awaitDurable();
                 assertNoChunkFreeTwice();
             }
-            assertEquals(List.of(), ledger.range(NAMES, KeyRange.between(key(8, 0), key(9, 9_999)), 10));
-            assertHolds(ledger, expected, Map.of());
+            assertEquals(List.of(), ledger.range(space, KeyRange.between(key(8, 0), key(9, 9_999)), 10));
+            assertHolds(ledger, space, expected, Map.of());
         }
         try (var reopened = open(disk.afterPowerLoss(new Random(5)).getPath("/store"), encryption)) {
             assertEquals(0, reopened.size(STRICT));
         }
     }
 
-    @ParameterizedTest(name = "encrypted: {0}")
-    @ValueSource(booleans = {true, false})
-    @DisplayName("recovers a state between the last durable commit and the last visible one when the log stops with frames on chunks queued")
-    void stoppedWithQueuedFrames(boolean encrypted) throws Exception {
+    @ParameterizedTest(name = "{0} frames, encrypted: {1}")
+    @CsvSource({"SPLIT, true", "SPLIT, false", "CHUNKED, true", "CHUNKED, false"})
+    @DisplayName("recovers a state between the last durable commit and the last visible one when the log stops with large frames queued")
+    void stoppedWithQueuedFrames(Frames frames, boolean encrypted) throws Exception {
         var encryption = encrypted ? Encryption.key(KEY) : Encryption.none();
         var dry = CrashFileSystem.create();
-        new Workload(encryption).run(dry.getPath("/store"));
+        new Workload(encryption, frames.space).run(dry.getPath("/store"));
         var forces = dry.forces();
         for (var force = 0; force <= forces; force += Math.max(1, forces / 12)) {
             var disk = CrashFileSystem.create();
             disk.stopAtForce(force);
-            var workload = new Workload(encryption);
+            var workload = new Workload(encryption, frames.space);
             workload.run(disk.getPath("/store"));
             assertNoChunkFreeTwice();
             var survivor = force % 2 == 0 ? disk.afterPowerLoss(new Random(force)) : disk.afterProcessCrash();
             try (var ledger = open(survivor.getPath("/store"), encryption)) {
                 var recovered = new TreeMap<String, String>();
-                ledger.forEach(NAMES, KeyRange.all(), (key, value) -> {
+                ledger.forEach(frames.space, KeyRange.all(), (key, value) -> {
                     recovered.put(key, value);
                     return true;
                 });
@@ -309,7 +336,7 @@ class FramePoolStressTest {
                     fail("At force " + force + ", the store recovered a state no commit from " + workload.durable + " to "
                             + workload.visible + " left, of " + recovered.size() + " keys");
                 }
-                ledger.commit(ledger.newBatch().put(NAMES, "after", "recovery")).awaitDurable();
+                ledger.commit(ledger.newBatch().put(frames.space, "after", "recovery")).awaitDurable();
             }
         }
     }
@@ -320,7 +347,7 @@ class FramePoolStressTest {
         var disk = CrashFileSystem.create();
         try (var pool = IoPool.create(1)) {
             var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(disk.getPath("/store"))
-                    .encryption(Encryption.key(KEY)).keyspace(NAMES).commitWindow(Duration.ZERO).ioPool(pool))
+                    .encryption(Encryption.key(KEY)).keyspace(NAMES).keyspace(CHATS).commitWindow(Duration.ZERO).ioPool(pool))
                     .segmentSize(1L << 20)
                     .build();
             try {
@@ -398,8 +425,9 @@ class FramePoolStressTest {
             this.thread = new Thread(() -> {
                 try {
                     var batch = ledger.newBatch();
+                    // Resident values, which the frame copies: a paged key space's would leave its own bytes below a chunk
                     for (var write = 0; write < LARGE_WRITES; write++) {
-                        batch.put(NAMES, key(committer, write), value(committer, 0, write));
+                        batch.put(CHATS, key(committer, write), value(committer, 0, write));
                     }
                     ledger.commit(batch);
                 } catch (Throwable throwable) {
@@ -432,16 +460,19 @@ class FramePoolStressTest {
         }
     }
 
-    /// Commits of frames on chunks that do not wait for durability, a commit window apart so they queue, then one that
-    /// waits; and the state of [#NAMES] after each commit.
+    /// Large commits to a key space that do not wait for durability, a commit window apart so they queue, then one that
+    /// waits; and the state of the key space after each commit.
     private static final class Workload {
         private final Encryption encryption;
+        // The key space of the commits, which gives their frames their shape
+        private final Keyspace<String, String> space;
         final List<TreeMap<String, String>> history;
         int visible;
         int durable;
 
-        Workload(Encryption encryption) {
+        Workload(Encryption encryption, Keyspace<String, String> space) {
             this.encryption = encryption;
+            this.space = space;
             this.history = new ArrayList<>();
             history.add(new TreeMap<>());
         }
@@ -451,7 +482,7 @@ class FramePoolStressTest {
             Ledger ledger = null;
             try {
                 ledger = ((LedgerBuilder) Ledger.builder().directory(directory).encryption(encryption).keyspace(NAMES)
-                        .keyspace(CHATS).keyspace(STRICT).commitWindow(Duration.ofMillis(2)))
+                        .keyspace(CHATS).keyspace(NOTES).keyspace(STRICT).commitWindow(Duration.ofMillis(2)))
                         .segmentSize(1L << 20)
                         .build();
                 var state = new TreeMap<String, String>();
@@ -461,7 +492,7 @@ class FramePoolStressTest {
                         for (var write = 0; write < LARGE_WRITES; write++) {
                             var key = key(round, commit * 40 + write);
                             var value = value(round, commit, write);
-                            batch.put(NAMES, key, value);
+                            batch.put(space, key, value);
                             state.put(key, value);
                         }
                         var pending = ledger.commit(batch);
