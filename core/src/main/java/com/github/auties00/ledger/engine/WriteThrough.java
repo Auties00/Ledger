@@ -235,12 +235,14 @@ final class WriteThrough {
     /// [LogWriter#ALIGNMENT]}
     ///
     /// It follows the size of the log's output, which grows while groups need more and goes back once they no longer
-    /// do, so it is replaced only when that size changes.
+    /// do: it is replaced when it is smaller than the output, or more than twice its size, so an output that moves
+    /// between two close sizes does not replace it, and the native memory of a replaced one, which only the collector
+    /// gives back, does not pile up.
     ///
     /// @throws IOException if native memory has no room for it, as under a limit of direct memory
     private MemorySegment copy(byte[] bytes, int length, int capacity) throws IOException {
         var size = (long) (capacity + LogWriter.ALIGNMENT - 1) / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT;
-        if (buffer == null || buffer.byteSize() != size) {
+        if (buffer == null || buffer.byteSize() < size || buffer.byteSize() > 2 * size) {
             try {
                 // Given back to the collector with the view, once a later size replaces both
                 var allocator = allocatorForTests;
