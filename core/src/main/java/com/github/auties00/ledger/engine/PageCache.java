@@ -8,7 +8,6 @@ import java.lang.ref.WeakReference;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /// The opened units of the store's files, by file and first page, within a limit of bytes it shares with the caches of
@@ -97,6 +96,15 @@ import java.util.concurrent.atomic.AtomicLong;
 /// kept 4 KB for one leaf the cache did not even take. Writes, the lookups of a commit, the reads of a checkpoint and
 /// of a resident key space, the root of a tree, and the units of a scan past its first leaves and values cache as they
 /// would unscreened.
+///
+/// The table of the refused units is itself reached only weakly ([Refusals]): it holds nothing a collection keeps, so
+/// the collection that takes the arrays takes the table and the references in its slots with them, and a store that
+/// stopped reading keeps none of its up to 64 KiB. The next refusal builds a table of as many slots as the one the
+/// collector took, or of half as many, down to [#MIN_REFUSALS], if that one took fewer refusals than an eighth of its
+/// slots, so a store that refuses thousands of units between two collections allocates one table a collection rather
+/// than growing one again from the smallest. A collection that takes the table also forgets the refused units
+/// something else still held strongly at that moment, a scan's units in use, which then cost one read from the file
+/// each.
 final class PageCache implements IdleTicker.Watched {
     /// The file of the trees, `ledger.data`.
     static final int DATA = 0;
@@ -153,14 +161,14 @@ final class PageCache implements IdleTicker.Watched {
     private static final VarHandle TAGS = MethodHandles.arrayElementVarHandle(int[].class);
     private static final VarHandle META = MethodHandles.arrayElementVarHandle(long[].class);
     private static final VarHandle UNITS = MethodHandles.arrayElementVarHandle(byte[][].class);
-    /// The slots of the table of the refused units at its first refusal, 1 KiB of references, so a store that reads
-    /// little keeps little.
+    /// The slots of the table of the refused units at the first refusal, 1 KiB of references, so a store that reads
+    /// little keeps little; also the fewest a table rebuilt after a collection has.
     static final int MIN_REFUSALS = 256;
     /// The most slots of the table of the refused units: it doubles while it took more refusals since it was built than
     /// a quarter of its slots, so it keeps about four slots a unit up to this many, in pairs, and a second read
     /// thousands of refusals after the first seldom finds both slots of its pair taken by newer units. 64 KiB of
-    /// references, and as many references as slots at most, as the slot of a unit the collector took is emptied at the
-    /// next refusal.
+    /// references, which the next collection takes with the units, and as many references as slots at most, as the
+    /// slot of a unit the collector took is emptied at the next refusal.
     static final int MAX_REFUSALS = 16_384;
     private static final VarHandle REFUSED = MethodHandles.arrayElementVarHandle(Refused[].class);
 
@@ -177,13 +185,16 @@ final class PageCache implements IdleTicker.Watched {
     private final Doorkeeper doorkeeper;
     // Whether the cache screens what reads miss, which the data file turns on
     private volatile boolean screening;
-    // The arrays of the units the cache refused lately, held weakly, by a hash of their key and nonce; null until the
-    // first refusal and after the close
-    private volatile Refused[] refused;
-    // The refusals since the table of the refused units was built
-    private final AtomicInteger refusals;
+    // The table of the units the cache refused lately, reached weakly, with the refusals it took; null until the first
+    // refusal, after the close and after a clear of the tests. Replaced only under the lock
+    private volatile Refusals refused;
     // The refused units whose arrays the collector took, whose slots the next refusal empties
     private final ReferenceQueue<byte[]> collected;
+    // Whether every table of the refused units the cache builds stays strongly reachable, for tests that recall a unit
+    // after a refusal whatever the collector does in between; guarded by the lock
+    private boolean pinsRefusalsForTests;
+    // The table of the refused units a test pinned; guarded by the lock
+    private Refused[] pinnedRefusalsForTests;
 
     private PageCache(Budget budget) {
         this.lock = new Object();
@@ -191,7 +202,6 @@ final class PageCache implements IdleTicker.Watched {
         this.bytes = new AtomicLong();
         this.budget = budget;
         this.doorkeeper = new Doorkeeper();
-        this.refusals = new AtomicInteger();
         this.collected = new ReferenceQueue<>();
     }
 
@@ -455,7 +465,7 @@ final class PageCache implements IdleTicker.Watched {
     /// @param key a key of [#key(int, int)] or [#dataKey(int, int)]
     /// @param screen the read's screening: [#UNSCREENED], [#POINT] or [#SCAN]
     byte[] recall(long key, PageRef ref, int screen) {
-        var refused = this.refused;
+        var refused = refusedTable();
         if (refused == null) {
             return null;
         }
@@ -527,7 +537,7 @@ final class PageCache implements IdleTicker.Watched {
     ///
     /// @param key a key of [#key(int, int)] or [#dataKey(int, int)]
     byte[] recallWeak(long key, PageRef ref) {
-        var refused = this.refused;
+        var refused = refusedTable();
         if (refused == null) {
             return null;
         }
@@ -579,41 +589,81 @@ final class PageCache implements IdleTicker.Watched {
     ///
     /// @param reads the reads the doorkeeper counted, 1, 2 or 3, or 0 if unknown
     private void refuse(long key, PageRef ref, byte[] unit, int reads) {
-        var refused = this.refused;
+        var refusals = this.refused;
+        var refused = refusals == null ? null : refusals.get();
         if (refused == null) {
             refused = refusals();
             if (refused == null) {
                 return;
             }
+            refusals = this.refused;
         }
-        forgetCollected();
+        forgetCollected(refused);
         // A unit refused again, a scan's second read once the collector took the first read's array, takes its own
-        // slot back and does not count: the table holds it once
+        // slot back and does not count: the table holds it once. A table a racing grow or clear replaced counts
+        // nothing, as its refusals no longer size anything
         if (place(refused, new Refused(unit, key, ref, reads, collected))
-                && refusals.incrementAndGet() > refused.length / 4 && refused.length < MAX_REFUSALS) {
+                && refusals != null
+                && refusals.took(refused) > refused.length / 4
+                && refused.length < MAX_REFUSALS) {
             grow(refused);
         }
     }
 
-    /// {@return the slots of the refused units, allocated at the first refusal, or `null` once the cache closed}
+    /// {@return the table of the refused units, or `null` before the first refusal, once the collector took it and
+    /// after the close}
+    ///
+    /// A caller reads it once per operation and uses that array throughout, which keeps it reachable meanwhile.
+    private Refused[] refusedTable() {
+        var refusals = this.refused;
+        return refusals == null ? null : refusals.get();
+    }
+
+    /// {@return the table of the refused units, built at the first refusal and again at the first after the collector
+    /// took the last one, or `null` once the cache closed}
+    ///
+    /// A table built after a collection has the slots of the one the collector took, or half as many, down to
+    /// [#MIN_REFUSALS], if that one took fewer refusals than an eighth of its slots: the store refuses fewer units
+    /// between two collections than the table was sized for.
     private Refused[] refusals() {
         synchronized (lock) {
-            if (refused == null && !closed) {
-                refused = new Refused[MIN_REFUSALS];
-                refusals.set(0);
+            var refusals = this.refused;
+            var table = refusals == null ? null : refusals.get();
+            if (table == null && !closed) {
+                var slots = MIN_REFUSALS;
+                if (refusals != null) {
+                    slots = refusals.slots;
+                    if (refusals.taken() < slots / 8) {
+                        slots = Math.max(MIN_REFUSALS, slots / 2);
+                    }
+                }
+                table = new Refused[slots];
+                publish(table, 0);
             }
-            return refused;
+            return table;
         }
     }
 
-    /// Empties the slots of the refused units whose arrays the collector took, so the table never keeps more
-    /// references than the units it can still give back and those the last collection took.
-    private void forgetCollected() {
+    /// Makes `table`, which took `taken` refusals, the table of the refused units, holding the lock.
+    private void publish(Refused[] table, int taken) {
+        this.refused = new Refusals(table, taken);
+        if (pinsRefusalsForTests) {
+            pinnedRefusalsForTests = table;
+        }
+    }
+
+    /// Empties the slots of `refused`, the table of the refused units or `null` once the collector took it, whose
+    /// arrays the collector took, so the table never keeps more references than the units it can still give back and
+    /// those the last collection took.
+    ///
+    /// It drains the queue even with no table, so the queue keeps none of the references it holds reachable. A unit
+    /// placed in a table that a grow replaced since is emptied only from a slot that holds that very reference, so it
+    /// never empties the slot of another unit.
+    private void forgetCollected(Refused[] refused) {
         Object gone;
         while ((gone = collected.poll()) != null) {
-            var refused = this.refused;
             if (refused == null) {
-                return;
+                continue;
             }
             var held = (Refused) gone;
             var slot = refusal(held.key, held.nonceHigh, refused.length);
@@ -627,7 +677,8 @@ final class PageCache implements IdleTicker.Watched {
     /// collector has not taken; a refusal that races it may be lost, which costs that unit one more read.
     private void grow(Refused[] from) {
         synchronized (lock) {
-            if (refused != from) {
+            var refusals = this.refused;
+            if (refusals == null || !refusals.refersTo(from)) {
                 return;
             }
             var to = new Refused[from.length * 2];
@@ -642,8 +693,7 @@ final class PageCache implements IdleTicker.Watched {
                     }
                 }
             }
-            refused = to;
-            refusals.set(held);
+            publish(to, held);
         }
     }
 
@@ -701,6 +751,49 @@ final class PageCache implements IdleTicker.Watched {
         /// {@return whether it names the unit `other` names}
         boolean names(Refused other) {
             return key == other.key && nonceHigh == other.nonceHigh && identity == other.identity;
+        }
+    }
+
+    /// The table of the units the cache refused, reached weakly, and the refusals it took since it was built.
+    ///
+    /// Each slot of the table reaches its unit's array weakly, so once a collection took the arrays nothing in the
+    /// table is worth keeping, and the table goes with them: the cache keeps no table a collection emptied, nor the
+    /// cleared references in its slots, which the collector then never finds. This object stays with the cache until a
+    /// new table replaces it, to size that table.
+    private static final class Refusals extends WeakReference<Refused[]> {
+        private static final VarHandle TAKEN;
+
+        static {
+            try {
+                TAKEN = MethodHandles.lookup().findVarHandle(Refusals.class, "taken", int.class);
+            } catch (ReflectiveOperationException exception) {
+                throw new ExceptionInInitializerError(exception);
+            }
+        }
+
+        // The slots of the table, known once the collector took it
+        private final int slots;
+        // The refusals the table took: the units it kept from the table it replaced, and each refusal since of a unit
+        // it did not hold
+        private volatile int taken;
+
+        Refusals(Refused[] table, int taken) {
+            super(table);
+            this.slots = table.length;
+            this.taken = taken;
+        }
+
+        /// Counts a refusal `table` took.
+        ///
+        /// @return the refusals it took with this one, or 0 if `table` is not the one this object reaches, as a grow or
+        ///         a clear replaced it
+        int took(Refused[] table) {
+            return refersTo(table) ? (int) TAKEN.getAndAdd(this, 1) + 1 : 0;
+        }
+
+        /// {@return the refusals the table took}
+        int taken() {
+            return taken;
         }
     }
 
@@ -898,6 +991,7 @@ final class PageCache implements IdleTicker.Watched {
         synchronized (lock) {
             closed = true;
             refused = null;
+            pinnedRefusalsForTests = null;
             dropAll();
         }
         doorkeeper.close();
@@ -1006,20 +1100,22 @@ final class PageCache implements IdleTicker.Watched {
         return doorkeeper;
     }
 
-    /// {@return the slots of the table of the refused units, 0 before the first refusal; for tests that bound it}
+    /// {@return the slots of the table of the refused units, 0 before the first refusal and once the collector took it;
+    /// for tests that bound it}
     int refusalSlotsForTests() {
-        var refused = this.refused;
+        var refused = refusedTable();
         return refused == null ? 0 : refused.length;
     }
 
-    /// {@return the refusals since the table of the refused units was built; for tests that count them}
+    /// {@return the refusals the table of the refused units took since it was built; for tests that count them}
     int refusalsForTests() {
-        return refusals.get();
+        var refusals = this.refused;
+        return refusals == null ? 0 : refusals.taken();
     }
 
     /// {@return the slots of the table of the refused units that hold one; for tests that bound it}
     int refusedForTests() {
-        var refused = this.refused;
+        var refused = refusedTable();
         var held = 0;
         if (refused != null) {
             for (var slot = 0; slot < refused.length; slot++) {
@@ -1049,22 +1145,50 @@ final class PageCache implements IdleTicker.Watched {
         }
     }
 
-    /// Forgets the units the cache refused, as a collection that took their arrays would, and keeps its entries and
-    /// what its doorkeeper counted, so tests read those units from the file.
+    /// Forgets the units the cache refused, as a collection that took their arrays would: the table goes, and the next
+    /// refusal builds one sized as after a collection. It keeps the entries and what the doorkeeper counted, so tests
+    /// read those units from the file.
     void forgetRefusedForTests() {
         synchronized (lock) {
-            refused = null;
-            refusals.set(0);
+            var refusals = this.refused;
+            if (refusals != null) {
+                refusals.clear();
+            }
+            pinnedRefusalsForTests = null;
         }
     }
 
-    /// Drops every entry and forgets the units it refused, so tests read units from the file.
+    /// Drops every entry and forgets the units it refused, so tests read units from the file; the next refusal builds a
+    /// table of [#MIN_REFUSALS] slots.
     void clearForTests() {
         synchronized (lock) {
             refused = null;
-            refusals.set(0);
+            pinnedRefusalsForTests = null;
             dropAll();
         }
+    }
+
+    /// Keeps the table of the refused units the cache has, and every one it builds from now on, strongly reachable
+    /// while it is the cache's table, so tests that recall a unit they hold after its refusal find it whatever the
+    /// collector does in between.
+    void pinRefusalsForTests() {
+        synchronized (lock) {
+            pinsRefusalsForTests = true;
+            pinnedRefusalsForTests = refusedTable();
+        }
+    }
+
+    /// Lets the collector take the table of the refused units again, as it does unless [#pinRefusalsForTests()] ran.
+    void unpinRefusalsForTests() {
+        synchronized (lock) {
+            pinsRefusalsForTests = false;
+            pinnedRefusalsForTests = null;
+        }
+    }
+
+    /// {@return the object the cache reads its slots from, which a rebuild replaces; for tests that count rebuilds}
+    Object tableForTests() {
+        return table;
     }
 
     /// Runs `action` holding the lock of the cache, so tests can make whatever changes the cache wait for it.
