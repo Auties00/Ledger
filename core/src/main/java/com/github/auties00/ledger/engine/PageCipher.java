@@ -51,8 +51,8 @@ class PageCipher {
     /// `plain` may end anywhere from the end of its content to the end of the unit: the bytes it lacks before the tag
     /// seal as zeros, so the unit is the one the whole pages, zero past the content, make.
     ///
-    /// @throws IllegalArgumentException if `plain` ends before its content or past the unit, or the content does not
-    ///                                  fit in the unit
+    /// @throws IllegalArgumentException if `plain` ends before its content or past the unit, the content does not fit
+    ///                                  in the unit, or its header is of format [PageFormat#CLOSE_TAG]
     void seal(byte[] plain, int pages, byte[] out, int offset) {
         var length = pages * PageFormat.SIZE;
         var tag = length - PageFormat.TAG;
@@ -61,6 +61,7 @@ class PageCipher {
             throw new IllegalArgumentException("A unit of " + pages + " pages cannot hold " + content + " bytes of content in "
                     + plain.length + " bytes");
         }
+        checkTagAtEnd(plain);
         // The bytes of plain sealed as they are; zeros follow up to the tag
         var filled = Math.min(plain.length, tag);
         System.arraycopy(plain, 0, out, offset, PageFormat.HEADER);
@@ -93,8 +94,8 @@ class PageCipher {
     /// encrypts each slice over itself, which AES-GCM does without a copy when the output starts where the input does.
     /// The bytes of `unit` past the unit are left as they are.
     ///
-    /// @throws IllegalArgumentException if `unit` is shorter than the unit, or the content its header names does not
-    ///                                  fit in the unit
+    /// @throws IllegalArgumentException if `unit` is shorter than the unit, the content its header names does not fit
+    ///                                  in the unit, or its header is of format [PageFormat#CLOSE_TAG]
     void seal(byte[] unit, int pages) {
         var length = pages * PageFormat.SIZE;
         var tag = length - PageFormat.TAG;
@@ -103,6 +104,7 @@ class PageCipher {
             throw new IllegalArgumentException("A unit of " + pages + " pages cannot hold " + content + " bytes of content in "
                     + unit.length + " bytes");
         }
+        checkTagAtEnd(unit);
         if (key == null) {
             var crc = new CRC32C();
             crc.update(unit, 0, tag);
@@ -140,14 +142,18 @@ class PageCipher {
     /// Seals the unit of `pages` pages whose header is `header` and whose content is the `contentLength` bytes of
     /// `content` at `contentOffset`, passing it to `out` a part at a time through `buffer`.
     ///
-    /// The unit is the one [#seal(byte\[\], int, byte\[\], int)] makes of the same header and content, but neither is
-    /// whole in memory: a value of megabytes is sealed through a buffer of its own size. The cipher reads each whole
-    /// slice of the content where it is; only the last part of the content and the padding after it are copied.
-    /// The first slice of a content of [#FIRST_SLICE] bytes or more is that long, the others [#SLICE] bytes, or shorter
-    /// in the first [#UNIT_COLD_BYTES] while the process seals its first megabytes ([Sealing#slice(int)]).
+    /// A header of the first format makes the unit [#seal(byte\[\], int, byte\[\], int)] makes of the same header and
+    /// content, but neither is whole in memory: a value of megabytes is sealed through a buffer of its own size. A
+    /// header of format [PageFormat#CLOSE_TAG] makes a unit whose content is sealed alone, the tag right after it, and
+    /// zeros, which are not sealed, up to the end of the unit. The cipher reads each whole slice of the content where
+    /// it is; only the last part of the content and the padding after it are copied. The first slice of a content of
+    /// [#FIRST_SLICE] bytes or more is that long, the others [#SLICE] bytes, or shorter in the first [#UNIT_COLD_BYTES]
+    /// while the process seals its first megabytes ([Sealing#slice(int)]).
     ///
     /// @param header the unit's header, filled in, of [PageFormat#HEADER] bytes
     /// @param buffer the buffer the sealed bytes pass through, of at least 64 KiB
+    /// @throws IllegalArgumentException if the content does not fit in the unit, or the header is of format
+    ///                                  [PageFormat#CLOSE_TAG] in a store without encryption
     /// @throws IOException if `out` fails
     void seal(byte[] header, byte[] content, int contentOffset, int contentLength, int pages, byte[] buffer, Output out) throws IOException {
         var tag = pages * PageFormat.SIZE - PageFormat.TAG;
@@ -155,9 +161,14 @@ class PageCipher {
         if (padding < 0) {
             throw new IllegalArgumentException("A unit of " + pages + " pages holds at most " + PageFormat.capacity(pages) + " bytes");
         }
+        var closeTag = header[PageFormat.FORMAT] == PageFormat.CLOSE_TAG;
+        if (closeTag && key == null) {
+            throw new IllegalArgumentException("A unit of format " + PageFormat.CLOSE_TAG + " needs a store that encrypts");
+        }
         System.arraycopy(header, 0, buffer, 0, PageFormat.HEADER);
         var used = PageFormat.HEADER;
-        var total = contentLength + padding;
+        // The padding of a unit whose tag follows its content goes out after the tag, as zeros
+        var total = closeTag ? contentLength : contentLength + padding;
         if (key == null) {
             var crc = new CRC32C();
             crc.update(header, 0, PageFormat.HEADER);
@@ -223,6 +234,18 @@ class PageCipher {
                 used = 0;
             }
             used += cipher.doFinal(buffer, used);
+            if (closeTag) {
+                for (var left = padding; left > 0; ) {
+                    if (used == buffer.length) {
+                        out.write(buffer, used);
+                        used = 0;
+                    }
+                    var count = (int) Math.min(buffer.length - used, left);
+                    Arrays.fill(buffer, used, used + count, (byte) 0);
+                    used += count;
+                    left -= count;
+                }
+            }
             out.write(buffer, used);
         } catch (GeneralSecurityException exception) {
             throw new IllegalStateException("A unit could not be sealed", exception);
@@ -233,9 +256,15 @@ class PageCipher {
 
     /// Opens the unit of `pages` pages sealed in `sealed` at `offset` into `plain`, header included.
     ///
+    /// A unit of format [PageFormat#CLOSE_TAG], whose tag is not at the end of the unit, fails: it opens through
+    /// [#openContent(byte\[\], int, int, byte\[\], int)].
+    ///
     /// @param plain the array the plaintext goes to, of at least the unit's bytes before its tag
     /// @return whether it authenticates
     boolean open(byte[] sealed, int offset, int pages, byte[] plain) {
+        if (sealed[offset + PageFormat.FORMAT] == PageFormat.CLOSE_TAG) {
+            return false;
+        }
         var length = pages * PageFormat.SIZE;
         var tag = length - PageFormat.TAG;
         System.arraycopy(sealed, offset, plain, 0, PageFormat.HEADER);
@@ -251,6 +280,38 @@ class PageCipher {
             cipher.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, sealed, offset + PageFormat.NONCE, 12));
             cipher.updateAAD(sealed, offset, PageFormat.HEADER);
             cipher.doFinal(sealed, offset + PageFormat.HEADER, length - PageFormat.HEADER, plain, PageFormat.HEADER);
+            return true;
+        } catch (AEADBadTagException _) {
+            return false;
+        } catch (GeneralSecurityException exception) {
+            throw new IllegalStateException("A unit could not be opened", exception);
+        } finally {
+            ciphers.offer(cipher);
+        }
+    }
+
+    /// Opens the `content` bytes of content of the unit of format [PageFormat#CLOSE_TAG] sealed in `sealed` at `offset`
+    /// into `plain` at `plainOffset`.
+    ///
+    /// The tag follows the content, so the open takes the header, which is the additional data, the content and the
+    /// tag, and nothing past them. `plain` is never `sealed`: out of place, the open runs the AES-GCM intrinsic that
+    /// decrypts and authenticates in one pass.
+    ///
+    /// @param content the bytes of content the header names
+    /// @return whether it authenticates; never for a unit of another format, or in a store without encryption
+    /// @throws IllegalArgumentException if `plain` is `sealed`
+    boolean openContent(byte[] sealed, int offset, int content, byte[] plain, int plainOffset) {
+        if (plain == sealed) {
+            throw new IllegalArgumentException("A unit opens out of place");
+        }
+        if (key == null || sealed[offset + PageFormat.FORMAT] != PageFormat.CLOSE_TAG) {
+            return false;
+        }
+        var cipher = take();
+        try {
+            cipher.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, sealed, offset + PageFormat.NONCE, 12));
+            cipher.updateAAD(sealed, offset, PageFormat.HEADER);
+            cipher.doFinal(sealed, offset + PageFormat.HEADER, content + PageFormat.TAG, plain, plainOffset);
             return true;
         } catch (AEADBadTagException _) {
             return false;
@@ -310,6 +371,13 @@ class PageCipher {
         crc.update(content, 0, contentLength);
         crc.update(rest, PageFormat.HEADER, padding);
         return Bytes.i32(rest, PageFormat.HEADER + padding) == (int) crc.getValue();
+    }
+
+    // Throws if the header at the start of `unit` is of format CLOSE_TAG, whose layout only the streamed seal makes
+    private static void checkTagAtEnd(byte[] unit) {
+        if (unit[PageFormat.FORMAT] == PageFormat.CLOSE_TAG) {
+            throw new IllegalArgumentException("A unit of format " + PageFormat.CLOSE_TAG + " is sealed a part at a time");
+        }
     }
 
     private Cipher take() {

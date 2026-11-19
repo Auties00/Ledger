@@ -137,8 +137,11 @@ final class LogWriter {
     static final byte GROUP_START = 1;
     static final long SEGMENT_MAGIC = 0x4C475345474D4E54L;
     /// The version of the segments a writer starts: from 3 a segment may hold frames of type [FrameBody#COMMITS], so a
-    /// build that reads only earlier versions refuses it by its version and not at the first such frame.
-    static final int SEGMENT_VERSION = 3;
+    /// build that reads only earlier versions refuses it by its version and not at the first such frame; from 4 its
+    /// commits may name units of the file of large values of format [PageFormat#CLOSE_TAG], which a build that reads
+    /// only the first format would fail to authenticate, and would take for a crash's torn tail, dropping the durable
+    /// commits of the last group, rather than refuse.
+    static final int SEGMENT_VERSION = 4;
     /// The oldest version recovery reads, whose frame types the current version all has.
     static final int OLDEST_SEGMENT_VERSION = 2;
     static final int TAG_BYTES = 16;

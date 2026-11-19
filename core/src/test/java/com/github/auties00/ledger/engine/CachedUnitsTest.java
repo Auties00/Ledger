@@ -190,10 +190,21 @@ class CachedUnitsTest {
             assertEquals(largeRef.pages() * PageFormat.SIZE, largeUnit.length);
             assertEquals(PageFormat.HEADER + small.length + largeUnit.length, cache.size());
             assertArrayEquals(large, Arrays.copyOfRange(largeUnit, PageFormat.HEADER, PageFormat.HEADER + large.length));
+            // A store that encrypts writes the tag after the content, which its readers open alone: the whole pages
+            // hold zeros past it as the first format's plaintext does
+            var format = encrypted ? PageFormat.CLOSE_TAG : PageFormat.VERSION;
+            assertEquals(format, smallUnit[PageFormat.FORMAT]);
+            assertEquals(format, largeUnit[PageFormat.FORMAT]);
+            assertArrayEquals(new byte[largeUnit.length - PageFormat.HEADER - large.length],
+                    Arrays.copyOfRange(largeUnit, PageFormat.HEADER + large.length, largeUnit.length));
             // What the replay of the log reads
             var replayed = blobs.readUnit(smallRef);
             assertEquals(smallRef.pages() * PageFormat.SIZE, replayed.length);
             assertArrayEquals(small, Arrays.copyOfRange(replayed, PageFormat.HEADER, PageFormat.HEADER + small.length));
+            assertArrayEquals(new byte[replayed.length - PageFormat.HEADER - small.length],
+                    Arrays.copyOfRange(replayed, PageFormat.HEADER + small.length, replayed.length));
+            var copied = blobs.copyValue(largeRef, large.length, PageCache.UNSCREENED);
+            assertArrayEquals(large, copied);
         } finally {
             cache.close();
         }
