@@ -3727,6 +3727,8 @@ public final class LiveLedger implements Ledger {
             bulkRuns = null;
             for (var bulk : runs) {
                 if (bulk.builder.isEmpty()) {
+                    // Takes back the chunk of keys an append made for its keys
+                    bulk.builder.rollback();
                     continue;
                 }
                 var run = bulk.builder.buildCommitted(pages);
