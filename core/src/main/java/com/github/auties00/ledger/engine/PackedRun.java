@@ -174,7 +174,7 @@ final class PackedRun {
         this.pages = pages;
         this.previous = previous;
         this.lock = new Object();
-        this.order = committed ? null : sortedOrder();
+        this.order = committed ? null : mergeSorted(storage.keys, storage.keyEnds, size);
     }
 
     /// {@return the stamp of the oldest write the run holds}
@@ -924,6 +924,41 @@ final class PackedRun {
             }
         }
         return merged;
+    }
+
+    // The entries of a replay's run sorted by key, which the open makes once, at its peak of heap: a bottom-up merge
+    // sort of their indexes, which moves no key and takes 4 bytes of scratch per entry where KeySort takes 20, and
+    // leaves KeySort to the bulk commits' runs, whose orders it merges view by view
+    private static int[] mergeSorted(byte[][] keys, int[] keyEnds, int size) {
+        var sorted = new int[size];
+        for (var i = 0; i < size; i++) {
+            sorted[i] = i;
+        }
+        if (size < 2) {
+            return sorted;
+        }
+        var scratch = new int[size];
+        var from = sorted;
+        var to = scratch;
+        for (var width = 1; width < size; width *= 2) {
+            for (var low = 0; low < size; low += 2 * width) {
+                var middle = Math.min(low + width, size);
+                var high = Math.min(low + 2 * width, size);
+                var left = low;
+                var right = middle;
+                for (var out = low; out < high; out++) {
+                    if (left < middle && (right >= high || compareEntries(keys, keyEnds, from[left], from[right]) <= 0)) {
+                        to[out] = from[left++];
+                    } else {
+                        to[out] = from[right++];
+                    }
+                }
+            }
+            var swap = from;
+            from = to;
+            to = swap;
+        }
+        return from;
     }
 
     // The order of the keys of entries `left` and `right`

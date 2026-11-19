@@ -3792,9 +3792,10 @@ public final class LiveLedger implements Ledger {
                     log.append(FrameBody.COMMIT, sequence, frame, unitBytes, unitHeap, touched.size() + runWrites(),
                             sharesChunk);
                     logged = true;
-                } catch (RuntimeException exception) {
+                } catch (RuntimeException | Error throwable) {
+                    // A run the commit appended to must not keep its entries, or no later commit could append
                     rollback();
-                    throw exception;
+                    throw throwable;
                 }
             }
             publishRuns();
