@@ -279,7 +279,11 @@ class BatchOwnValuesTest {
                 assertInstanceOf(byte[].class, resident.sourceForTests());
                 assertEquals(text.length(), resident.sourceBytesForTests());
                 assertEquals(text, ledger.get(NAMES, new byte[]{1}).orElseThrow());
-                assertInstanceOf(byte[].class, head(ledger, TEXTS, new byte[]{2}).sourceForTests());
+                // Encoded once, onto an array of its own of half a chunk or more, which leaves the heap for the log once
+                // its commit is durable, on the spill queue's thread, which may have moved it already
+                var paged = head(ledger, TEXTS, new byte[]{2});
+                var source = paged.sourceForTests();
+                assertTrue(source instanceof byte[] || source instanceof LogValue, "the value is on " + source);
                 assertEquals(text, ledger.get(TEXTS, new byte[]{2}).orElseThrow());
             }
         }
