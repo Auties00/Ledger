@@ -5,6 +5,7 @@ import com.github.auties00.ledger.LedgerIoException;
 
 import javax.crypto.spec.SecretKeySpec;
 import java.io.EOFException;
+import java.lang.foreign.MemorySegment;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
@@ -12,6 +13,7 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.zip.CRC32C;
 
 /// One use of a log segment, the writing of one open or the frames one recovery replayed, as the values that left the
 /// heap for it are read back from ([LogValue]).
@@ -33,7 +35,8 @@ import java.nio.file.StandardOpenOption;
 /// A [framed][LogValue#framed()] value is read with its whole frame into an array of the process's [HeapPool], taken
 /// for the burst of reads ([HeapPool#acquireCollectable(int)]), and opened into a second one by the JDK's AES-GCM,
 /// which runs its intrinsics over the whole message and authenticates it before the value is copied out. Neither
-/// array outlives the read; at rest the pool reaches them only weakly.
+/// array outlives the read; at rest the pool reaches them only weakly. A value frame a bulk commit's run reads a home
+/// back from ([#readValueFrame(long, int, long)]) is opened the same way into an array of its own, which the run keeps.
 final class LogSegmentView {
     /// The most bytes one read of the channel takes, the size of the temporary direct buffer the JDK keeps per thread.
     static final int SLICE = 1 << 20;
@@ -237,6 +240,72 @@ final class LogSegmentView {
                 pool.releaseCollectable(plain);
             }
         }
+    }
+
+    /// {@return the body of the value frame at `frameOffset` of the segment, of `length` bytes, a frame of the split
+    /// commit at `sequence`, read and authenticated into an array of its own, read-only}
+    ///
+    /// The frame's tag, which binds its header, so its type, sequence and length, and its place in the segment use,
+    /// authenticates it; without encryption its CRC-32C checks it. Its header must name a value frame of `sequence`
+    /// holding `length` bytes.
+    ///
+    /// @throws Retired if a checkpoint retired the segment, or retires it as the frame is read
+    /// @throws LedgerIoException if the segment cannot be read
+    /// @throws LedgerCorruptedException if the frame fails authentication, or is not that value frame
+    MemorySegment readValueFrame(long frameOffset, int length, long sequence) {
+        if (retired) {
+            throw Retired.INSTANCE;
+        }
+        var overhead = key == null ? Integer.BYTES : LogWriter.TAG_BYTES;
+        var sealedLength = LogWriter.FRAME_HEADER + length + overhead;
+        if (key == null) {
+            // The body is used where it lies, past the header, so it is read into an array of its own
+            var sealed = new byte[sealedLength];
+            readFully(ByteBuffer.wrap(sealed), 0, sealedLength, frameOffset);
+            var crc = new CRC32C();
+            crc.update(sealed, 0, LogWriter.FRAME_HEADER + length);
+            if (ByteBuffer.wrap(sealed).getInt(LogWriter.FRAME_HEADER + length) != (int) crc.getValue()) {
+                throw damaged("does not match its checksum");
+            }
+            checkValueFrame(sealed, length, sequence, overhead);
+            return MemorySegment.ofArray(sealed).asSlice(LogWriter.FRAME_HEADER, length).asReadOnly();
+        }
+        var pool = spills.pool();
+        var sealed = pool.acquireCollectable(sealedLength);
+        var crypto = spills.takeCrypto();
+        try {
+            readFully(ByteBuffer.wrap(sealed), 0, sealedLength, frameOffset);
+            var plain = new byte[length];
+            if (!crypto.openFrame(key, frameOffset, sealed, length, plain)) {
+                throw damaged("does not authenticate");
+            }
+            checkValueFrame(sealed, length, sequence, overhead);
+            return MemorySegment.ofArray(plain).asReadOnly();
+        } finally {
+            spills.giveBack(crypto);
+            pool.releaseCollectable(sealed);
+        }
+    }
+
+    /// Checks that the frame header at the start of `sealed`, which its tag or checksum covered, names a value frame of
+    /// `sequence` whose body holds `length` bytes, sealed with `overhead` bytes past it.
+    ///
+    /// @throws LedgerCorruptedException if it does not
+    private void checkValueFrame(byte[] sealed, int length, long sequence, int overhead) {
+        var header = ByteBuffer.wrap(sealed);
+        if (header.getInt(0) != LogWriter.MAGIC || sealed[16] != FrameBody.VALUES || header.getLong(8) != sequence
+                || header.getInt(4) != length + overhead) {
+            throw damaged("is not the value frame of commit " + sequence + " the store wrote there");
+        }
+    }
+
+    /// {@return the failure of a read of a value frame that `what` says, or [Retired] if the segment retired
+    /// meanwhile, as a preparation that reused the file would make the read fail}
+    private RuntimeException damaged(String what) {
+        if (retired) {
+            return Retired.INSTANCE;
+        }
+        return new LedgerCorruptedException("A value frame of the log segment " + path + " " + what, null);
     }
 
     /// Reads `length` bytes at `position` of the file into `buffer` from `offset`, whatever the buffer's position and

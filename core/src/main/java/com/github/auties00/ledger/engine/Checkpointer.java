@@ -671,6 +671,11 @@ final class Checkpointer implements IdleTicker.Watched {
                 run = null;
             }
             var runEntries = run == null ? 0 : run.size();
+            if (run != null) {
+                // The homes a bulk commit's run let go of for its value frames, read back at once rather than one at a
+                // time as the merge reaches them
+                run.readBackHomes();
+            }
             var ops = new ArrayList<TreeUpdate.Op>(chains.length + runEntries);
             var removals = keyspace.removals();
             // The next entry of the run in the order of the keys, or -1 past the last, compared with the chains in the
