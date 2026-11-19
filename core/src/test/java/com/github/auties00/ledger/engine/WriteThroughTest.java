@@ -1424,7 +1424,6 @@ class WriteThroughTest {
             var spare = log.spareOutputForTests();
             assertNotNull(spare, "the group was not written from the largest output");
             assertEquals(LogWriter.OUTPUT, spare.length);
-            log.dropSpareOutputForTests();
         }
 
         private static void survivesPowerLoss(CrashFileSystem disk, boolean encrypted, Map<String, String> model) {
