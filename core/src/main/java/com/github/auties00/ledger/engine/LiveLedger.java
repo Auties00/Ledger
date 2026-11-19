@@ -49,7 +49,8 @@ import java.util.function.LongSupplier;
 /// a commit whole or not at all. Transactions and batches with a range removal run alone instead: they hold both roles
 /// once every commit given a sequence has published. So does a bulk commit: a batch of at least [#BULK_RUN_WRITES]
 /// puts to a paged key space whose latest tree holds none of its entries, which keeps its puts of new keys in a
-/// [PackedRun] rather than on chains. A batch's range removal counts the entries it removes after the
+/// [PackedRun] rather than on chains, appending them to the run of the bulk commits before it until a checkpoint's cut
+/// closes that run. A batch's range removal counts the entries it removes after the
 /// commit, on a thread of its own, against a read registered at the commit before ([PendingRanges]).
 ///
 /// After publishing, the publisher prunes the versions no reader can need any more, applies the range removals every
@@ -1124,7 +1125,8 @@ public final class LiveLedger implements Ledger {
                     if (applier.putToRun(bulk, state, key, hash, value, writes, index, unit)) {
                         return;
                     }
-                    // The run's entry, newer than the trees and unpublished, is the key's state before this write
+                    // The run's entry, newer than the trees, is the key's state before this write: one of the commit,
+                    // unpublished, or of a commit before it that the run's newest view holds
                     if (bulk.builder.find(key, hash) >= 0) {
                         inTree = TreeSearch.FOUND;
                     }
@@ -1154,10 +1156,10 @@ public final class LiveLedger implements Ledger {
     /// with the puts and the bytes of their keys of each, or `null` if there is none}
     ///
     /// A key space qualifies with at least [#BULK_RUN_WRITES] puts in the batch and no range removal of it, in a store
-    /// with a data file and a log, if no run is in memory for it, the latest tree holds none of its entries and no range
-    /// removal is stamped after that tree: a reader of a run applies the range removals since its tree to the run's
-    /// entries, which only removals newer than the run may do. The batch counts its puts in one pass, which only a batch
-    /// of that many writes makes.
+    /// with a data file and a log, if no run is in memory for it or the run is a bulk commit's that still takes appends,
+    /// the latest tree holds none of its entries and no range removal is stamped after that tree: a reader of a run
+    /// applies the range removals since its tree to the run's entries, which only removals newer than the run may do.
+    /// The batch counts its puts in one pass, which only a batch of that many writes makes.
     private BulkPlan bulkPlan(ArrayWriteBatch writes) {
         var size = writes.size();
         if (pages == null || log == null || size < BULK_RUN_WRITES) {
@@ -1242,13 +1244,20 @@ public final class LiveLedger implements Ledger {
     }
 
     /// {@return whether a bulk commit may keep its puts of new keys of `state` in a run, `trees` being the latest
-    /// trees: a paged key space with no run in memory, none of whose entries `trees` holds, with no range removal
-    /// stamped after them}
+    /// trees: a paged key space with no run in memory, or the run of bulk commits no checkpoint's cut closed, which
+    /// the commit appends to, none of whose entries `trees` holds, with no range removal stamped after them}
     ///
     /// No chain of a key the trees lack is then dropped before a newer tree holds its key: a key of the key space with
-    /// no chain, once every commit before the bulk commit has published, is one no tree and no commit holds.
+    /// no chain and no entry in the run, once every commit before the bulk commit has published, is one no tree and no
+    /// commit holds. A run that takes appends was made after the cut of every tree published since, which closes
+    /// the runs it finds, so none of those trees holds part of it, and no range removal is newer than any of its
+    /// entries: one stamped after the tree refuses the append.
     private boolean bulkEligible(KeyspaceState state, TreeVersion trees) {
-        if (state.resident || state.run != null || trees != null && trees.root(state.id) != null) {
+        if (state.resident || trees != null && trees.root(state.id) != null) {
+            return false;
+        }
+        var run = state.run;
+        if (run != null && !(run.committed() && run.appendable())) {
             return false;
         }
         var treeBound = trees == null ? -1 : Reads.boundOf(trees.sequence);
@@ -1277,18 +1286,21 @@ public final class LiveLedger implements Ledger {
         }
     }
 
-    /// The run a bulk commit builds of its puts of new keys of one key space.
+    /// The run a bulk commit builds of its puts of new keys of one key space, or appends them to.
     private static final class BulkRun {
         private final KeyspaceState state;
         private final PackedRun.Builder builder;
-        // The puts of the batch to the key space, the most the run takes
+        // The puts of the batch to the key space, the most the commit adds to the run
         private final int planned;
         // The entries the commit's record of values that may leave the heap lists, made at the first, or null
         private SpillQueue.RunValues listed;
 
-        private BulkRun(KeyspaceState state, int planned, long keyBytes) {
+        /// Creates the run of the puts of new keys of `state`, appended to `after`, the key space's run, or a new run if
+        /// `null`.
+        private BulkRun(KeyspaceState state, int planned, long keyBytes, PackedRun after) {
             this.state = state;
-            this.builder = new PackedRun.Builder(planned, keyBytes);
+            this.builder = after == null ? PackedRun.Builder.forCommit(planned, keyBytes)
+                    : PackedRun.Builder.appending(after, planned, keyBytes);
             this.planned = planned;
         }
     }
@@ -2314,6 +2326,12 @@ public final class LiveLedger implements Ledger {
             for (var state : states.values()) {
                 var number = state.dirtyNumber();
                 cuts.add(new KeyspaceCut(state, state.cutDirty(), state.removals, state.known(sequence), number));
+                // Every view of a run is then at or below the cut, which the checkpoint takes whole: later bulk
+                // commits keep their writes on chains until it is released
+                var run = state.run;
+                if (run != null) {
+                    run.closeToAppends();
+                }
                 if (state.overwrites != null) {
                     state.overwrites.cut(bound);
                 }
@@ -2438,6 +2456,7 @@ public final class LiveLedger implements Ledger {
                     var active = scan.active();
                     state.blind.fold(active[active.length - 1]);
                     if (state.run != null) {
+                        state.dropRunViews(Reads.boundOf(active[active.length - 1]));
                         state.releaseRun(Reads.boundOf(floor(scan.oldest())));
                     }
                 } finally {
@@ -2521,9 +2540,14 @@ public final class LiveLedger implements Ledger {
         if (found == null || chain != null && chain.head != null) {
             return false;
         }
-        // The run the open replayed, or a bulk commit made, is part of the tree of `point` for its readers; the key's
-        // chain, of a put after a bulk commit or a replay, holds its hash already
-        var run = Reads.runOf(state, point);
+        // The run the open replayed, or bulk commits made, is part of the tree of `point` for its readers; the key's
+        // chain, of a put after a bulk commit or a replay, holds its hash already. The answer serves the write as it
+        // applies, after every view published since `point`, so the lookup reads the newest view: a run only gains
+        // entries until a newer tree, which the answer is not used with, holds it
+        var run = state.run;
+        if (run != null && run.maxStamp() <= point.treeBound()) {
+            run = null;
+        }
         var entry = run == null ? -1 : run.find(key, chain != null ? chain.hash : Segments.hash(key));
         if (entry >= 0) {
             found[index] = run.removes(entry) ? TreeSearch.ABSENT : TreeSearch.FOUND;
@@ -2816,6 +2840,7 @@ public final class LiveLedger implements Ledger {
             state.counts.dropBelow(oldest);
             state.blind.fold(oldest);
             state.ranges.fold(oldest);
+            state.dropRunViews(Reads.boundOf(oldest));
             state.releaseRun(cutBound);
         }
         sweep(bounds, cutBound, SWEEP_BUDGET);
@@ -3580,7 +3605,8 @@ public final class LiveLedger implements Ledger {
         }
 
         /// Starts a run of the puts of new keys of each key space of `plan` that still qualifies
-        /// ([#bulkEligible(KeyspaceState, TreeVersion)]), now that the commit holds both roles.
+        /// ([#bulkEligible(KeyspaceState, TreeVersion)]), now that the commit holds both roles: a new run, or an append
+        /// to the key space's run.
         void startRuns(BulkPlan plan) {
             var trees = tree;
             var started = 0;
@@ -3588,7 +3614,7 @@ public final class LiveLedger implements Ledger {
             for (var i = 0; i < runs.length; i++) {
                 var state = plan.states()[i];
                 if (bulkEligible(state, trees)) {
-                    runs[started++] = new BulkRun(state, plan.puts()[i], plan.keyBytes()[i]);
+                    runs[started++] = new BulkRun(state, plan.puts()[i], plan.keyBytes()[i], state.run);
                 }
             }
             bulkRuns = started == 0 ? null : Arrays.copyOf(runs, started);
@@ -3607,8 +3633,8 @@ public final class LiveLedger implements Ledger {
             return puts;
         }
 
-        /// {@return the puts the commit's runs took, which the log's estimate of the commit's heap counts as writes; 0
-        /// once the commit published them}
+        /// {@return the puts the commit's runs took, those of the commits it appends to left out, which the log's
+        /// estimate of the commit's heap counts as writes; 0 once the commit published them}
         private int runWrites() {
             var runs = bulkRuns;
             var writes = 0;
@@ -3635,7 +3661,8 @@ public final class LiveLedger implements Ledger {
         }
 
         /// Applies the put of write `index` of `writes`, of `key` and `value`, to the run `bulk`, if memory holds no chain
-        /// of the key nor the run an entry of it, and the value lies on a home of the batch the run can name.
+        /// of the key nor the run an entry of it, of this commit or of one it appends to, and the value lies on a home of
+        /// the batch the run can name.
         ///
         /// The commit runs alone, so a key memory holds no chain of is one no tree holds and no commit before wrote: the
         /// put adds an entry, which it counts. The frame records the put as any other, and the commit's record of values
@@ -3688,8 +3715,10 @@ public final class LiveLedger implements Ledger {
             return true;
         }
 
-        /// Builds the runs of the commit's puts of new keys and makes each part of its key space, before the commit's
-        /// sequence is visible: a reader below it does not read the run ([Reads#runOf(KeyspaceState, ReadPoint)]).
+        /// Builds the runs of the commit's puts of new keys, or the new views of the runs it appended to, and makes each
+        /// part of its key space, before the commit's sequence is visible: a reader below it does not read the run, or
+        /// reads the view before ([Reads#runOf(KeyspaceState, ReadPoint)]). A commit that added nothing to a run leaves
+        /// it as it was.
         private void publishRuns() {
             var runs = bulkRuns;
             if (runs == null) {
@@ -3976,7 +4005,14 @@ public final class LiveLedger implements Ledger {
         void rollback() {
             assert !logged : "a commit whose frame the log queued is taken back";
             discardFrame();
-            // Never published: no reader saw the runs, and the deltas that counted their puts go with the commit
+            // Never published: no reader saw the runs' entries, and the deltas that counted their puts go with the
+            // commit; a run the commit appended to is left as its newest view holds it
+            var runs = bulkRuns;
+            if (runs != null) {
+                for (var bulk : runs) {
+                    bulk.builder.rollback();
+                }
+            }
             bulkRuns = null;
             for (var write : touched) {
                 var chain = write.chain();

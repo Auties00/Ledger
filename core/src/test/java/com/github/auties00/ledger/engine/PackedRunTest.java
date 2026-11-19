@@ -1183,7 +1183,7 @@ class PackedRunTest {
     }
 
     @Test
-    @DisplayName("a builder asked for room grows its arrays of the entries to it when they are next full and those of the logged values to their share, doubles after, never shrinks an array, and builds a run trimmed to its entries")
+    @DisplayName("a builder asked for room grows the ends of its keys to it when they are next full, keeps the places of its logged values in whole chunks that take no room in advance, doubles after, never shrinks an array, and builds a run trimmed to its entries")
     void builderReserves() {
         var chunk = MemorySegment.ofArray(new byte[64]).asReadOnly();
         var builder = new PackedRun.Builder();
@@ -1192,16 +1192,15 @@ class PackedRunTest {
             putReserved(builder, id, stamp++, 0, chunk);
         }
         assertEquals(4_096, builder.capacity());
-        assertArrayEquals(new int[]{4_096, 4_096, 4_096, 4_096, 4_096}, builder.loggedLengthsForTests());
+        // Three quarters of the entries are logged, in a first chunk grown to a whole one and a second made whole
+        assertArrayEquals(new int[]{2_048, 2_048}, builder.loggedLengthsForTests());
         builder.reserve(10_000);
         // Overwrites take no room, so the arrays wait for the next new key
         putReserved(builder, 5, stamp++, 1, chunk);
         assertEquals(4_096, builder.capacity());
         putReserved(builder, 4_096, stamp++, 0, chunk);
         assertEquals(10_000, builder.capacity());
-        // Three quarters of the entries were logged, and a sixteenth more
-        var share = 10_000 * 3_072 / 4_096 + 10_000 / 16;
-        assertArrayEquals(new int[]{share, share, share, share, share}, builder.loggedLengthsForTests());
+        assertArrayEquals(new int[]{2_048, 2_048}, builder.loggedLengthsForTests(), "the logged values took room in advance");
         for (var id = 4_097; id < 10_001; id++) {
             putReserved(builder, id, stamp++, 0, chunk);
         }
@@ -1251,11 +1250,11 @@ class PackedRunTest {
             put(builder, key, stamp++, chunk, 0, 8);
             putLogged(builder, key, stamp++, 0, -id, 0, 0);
         }
-        assertArrayEquals(new int[]{8_192, 8_192, 8_192, 8_192, 8_192}, builder.loggedLengthsForTests());
+        assertArrayEquals(new int[]{2_048, 2_048, 2_048, 2_048}, builder.loggedLengthsForTests());
         builder.reserve(6_000);
         put(builder, key(0, 4_096), stamp, chunk, 0, 8);
         assertEquals(6_000, builder.capacity());
-        assertArrayEquals(new int[]{8_192, 8_192, 8_192, 8_192, 8_192}, builder.loggedLengthsForTests());
+        assertArrayEquals(new int[]{2_048, 2_048, 2_048, 2_048}, builder.loggedLengthsForTests());
         var run = builder.build(null, null);
         var lengths = run.arrayLengthsForTests();
         assertEquals(4_097, lengths[0]);
