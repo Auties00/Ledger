@@ -67,6 +67,8 @@ import java.util.function.LongFunction;
 /// preparing a segment may ask which way is left beside it, so the round trip of asking the device holds no commit up.
 final class WriteThrough {
     private static final String OS = System.getProperty("os.name", "");
+    /// The writes in a row taking at most half of the buffer after which it goes back to the size they took.
+    private static final int SHRINK_AFTER = 256;
 
     /// How a store writes the groups that one write holds.
     enum Mode {
@@ -126,6 +128,9 @@ final class WriteThrough {
     // The buffer a group is copied into before it is written, aligned to LogWriter.ALIGNMENT, and a view of it
     private MemorySegment buffer;
     private ByteBuffer bufferView;
+    // The writes in a row, up to SHRINK_AFTER, that took at most half of the buffer, and the most bytes one of them took
+    private int smallWrites;
+    private long smallPeak;
     // The handles opened, for tests; written by the flush that holds the log writer
     private volatile int opens;
     /// Allocates the buffer in place of the arena, by its size; for tests that refuse it.
@@ -205,6 +210,12 @@ final class WriteThrough {
         }
     }
 
+    /// {@return the bytes of the buffer groups are copied into, or 0 before the first, for tests}
+    long bufferSizeForTests() {
+        var current = buffer;
+        return current == null ? 0 : current.byteSize();
+    }
+
     /// {@return the handles opened so far, for tests}
     int opensForTests() {
         return opens;
@@ -231,30 +242,58 @@ final class WriteThrough {
         }
     }
 
-    /// {@return the buffer holding the first `length` bytes of `bytes`, at least `capacity` bytes long and aligned to
+    /// {@return the buffer holding the first `length` bytes of `bytes`, a multiple of [LogWriter#ALIGNMENT], aligned to
     /// [LogWriter#ALIGNMENT]}
     ///
-    /// It follows the size of the log's output, which grows while groups need more and goes back once they no longer
-    /// do: it is replaced when it is smaller than the output, or more than twice its size, so an output that moves
-    /// between two close sizes does not replace it, and the native memory of a replaced one, which only the collector
-    /// gives back, does not pile up.
+    /// It follows the groups written through rather than the log's output, which a writer gives back at every empty
+    /// queue and takes back for any group larger than its smallest size: it grows when a group needs more, by a quarter
+    /// at least, so groups of slowly growing sizes replace it a bounded number of times, and goes back to the size they
+    /// took after [#SHRINK_AFTER] groups in a row that took at most half of it. Groups of sizes that alternate, or a
+    /// large one now and then among small ones, so keep one buffer, and the native memory of replaced ones, which only
+    /// the collector gives back, does not pile up. A smaller buffer native memory has no room for leaves the larger one
+    /// in place.
     ///
-    /// @throws IOException if native memory has no room for it, as under a limit of direct memory
-    private MemorySegment copy(byte[] bytes, int length, int capacity) throws IOException {
-        var size = (long) (capacity + LogWriter.ALIGNMENT - 1) / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT;
-        if (buffer == null || buffer.byteSize() < size || buffer.byteSize() > 2 * size) {
-            try {
-                // Given back to the collector with the view, once a later size replaces both
-                var allocator = allocatorForTests;
-                var replaced = allocator != null ? allocator.apply(size) : Arena.ofAuto().allocate(size, LogWriter.ALIGNMENT);
-                bufferView = replaced.asByteBuffer();
-                buffer = replaced;
-            } catch (OutOfMemoryError exception) {
-                throw new IOException("The buffer of a write through could not be allocated", exception);
+    /// @throws IOException if native memory has no room for a buffer that holds the group, as under a limit of direct
+    ///                     memory
+    private MemorySegment copy(byte[] bytes, int length) throws IOException {
+        var size = buffer == null ? 0 : buffer.byteSize();
+        if (length > size) {
+            var grown = Math.max(length, size + (size >> 2));
+            replace(Math.min(Math.max(length, LogWriter.OUTPUT), (grown + LogWriter.ALIGNMENT - 1) / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT));
+            smallWrites = 0;
+            smallPeak = 0;
+        } else if (2L * length <= size) {
+            smallPeak = Math.max(smallPeak, length);
+            if (++smallWrites >= SHRINK_AFTER) {
+                var shrunk = Math.max(LogWriter.ALIGNMENT, smallPeak);
+                smallWrites = 0;
+                smallPeak = 0;
+                try {
+                    replace(shrunk);
+                } catch (IOException _) {
+                    // The larger buffer still holds the group
+                }
             }
+        } else {
+            smallWrites = 0;
+            smallPeak = 0;
         }
         MemorySegment.copy(bytes, 0, buffer, ValueLayout.JAVA_BYTE, 0, length);
         return buffer;
+    }
+
+    /// Replaces the buffer with one of `size` bytes, the old one given back to the collector with its view.
+    ///
+    /// @throws IOException if native memory has no room for it
+    private void replace(long size) throws IOException {
+        try {
+            var allocator = allocatorForTests;
+            var replaced = allocator != null ? allocator.apply(size) : Arena.ofAuto().allocate(size, LogWriter.ALIGNMENT);
+            bufferView = replaced.asByteBuffer();
+            buffer = replaced;
+        } catch (OutOfMemoryError exception) {
+            throw new IOException("The buffer of a write through could not be allocated", exception);
+        }
     }
 
     /// A segment opened to write through.
@@ -262,12 +301,11 @@ final class WriteThrough {
         /// Writes the first `length` bytes of `bytes` at `position`, a multiple of [LogWriter#ALIGNMENT] as `length`
         /// is, all of them, durable once it returns.
         ///
-        /// @param capacity the size of `bytes`, which the copy the write takes them from follows
         /// @throws java.nio.channels.ClosedByInterruptException if an interrupt closed the handle meanwhile, which
         ///         left some, all or none of the bytes written; only a channel's write is interruptible
         /// @throws IOException if the write failed, which may have left some of the bytes written, or if the buffer the
         ///                     bytes are copied into could not be allocated
-        void write(byte[] bytes, int length, int capacity, long position) throws IOException;
+        void write(byte[] bytes, int length, long position) throws IOException;
 
         /// {@return whether the handle is open; an interrupt of a write closes a channel}
         boolean isOpen();
@@ -289,8 +327,8 @@ final class WriteThrough {
         }
 
         @Override
-        public void write(byte[] bytes, int length, int capacity, long position) throws IOException {
-            owner.copy(bytes, length, capacity);
+        public void write(byte[] bytes, int length, long position) throws IOException {
+            owner.copy(bytes, length);
             // The aligned copy, which a channel opened with DIRECT would otherwise make on each write
             var source = owner.bufferView.clear().limit(length);
             var at = position;
@@ -384,8 +422,8 @@ final class WriteThrough {
         }
 
         @Override
-        public void write(byte[] bytes, int length, int capacity, long position) throws IOException {
-            var source = owner.copy(bytes, length, capacity);
+        public void write(byte[] bytes, int length, long position) throws IOException {
+            var source = owner.copy(bytes, length);
             var done = 0;
             while (done < length) {
                 var at = position + done;
