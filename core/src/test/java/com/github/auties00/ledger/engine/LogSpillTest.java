@@ -2573,6 +2573,31 @@ class LogSpillTest {
         }
     }
 
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a checkpoint's read-back of the homes a run let go of allocates the homes and one frame's array per reading thread, not an array per home")
+    void framedHomesReadBackAllocatesTheHomes(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = openSized(directory, encrypted, 1 << 20, Duration.ZERO, 64L << 20)) {
+            writeBulk(ledger, expected, 0, 50_000).awaitDurable();
+            var run = bulkRun(ledger);
+            var homes = run.framedHomesForTests();
+            assertTrue(homes > 30, homes + " homes let go of");
+            assertEquals(0, run.homesForTests());
+            var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
+            var before = threads.getTotalThreadAllocatedBytes();
+            run.readBackHomes();
+            var allocated = threads.getTotalThreadAllocatedBytes() - before;
+            assertEquals(homes, run.homesForTests(), "homes read back");
+            // Each reading thread's array holds the longest frame, 256 KiB of body at most; 1 MiB covers the threads,
+            // the ciphers and the other threads of the store
+            var bound = run.framedBytesForTests() + (long) Runtime.getRuntime().availableProcessors() * ((256 << 10) + 64) + (1 << 20);
+            assertTrue(allocated < bound, "the read-back of " + homes + " homes of " + run.framedBytesForTests()
+                    + " bytes allocated " + allocated + " bytes, over " + bound);
+            verifyLarge(ledger, expected);
+        }
+    }
+
     @Test
     @DisplayName("a bulk commit of 4 MB of short values, under the homes a run lets go of, keeps them, and its record leaves the queue")
     void smallBulkKeepsHomes(@TempDir Path directory) throws Exception {
