@@ -2044,21 +2044,38 @@ final class LogWriter {
         return false;
     }
 
-    /// Waits until the commit at `sequence` is durable.
+    /// Waits until the commit at `sequence` is durable, then lets the runs of the bulk commits up to it go of the homes
+    /// their value frames hold, unless that happened already ([#dropHomes(long)]).
     ///
     /// @throws InterruptedException if interrupted while waiting
     /// @throws LedgerIoException if the writer stopped before it was
     void awaitDurable(long sequence) throws InterruptedException {
         await(sequence, -1);
+        dropHomes(sequence);
     }
 
-    /// Waits until the commit at `sequence` is durable or `timeout` elapses.
+    /// Waits until the commit at `sequence` is durable or `timeout` elapses, then, if it is durable, does what
+    /// [#awaitDurable(long)] does after its wait.
     ///
     /// @return whether it is durable
     /// @throws InterruptedException if interrupted while waiting
     /// @throws LedgerIoException if the writer stopped before it was
     boolean awaitDurable(long sequence, Duration timeout) throws InterruptedException {
-        return await(sequence, Math.max(0, timeout.toNanos()));
+        if (!await(sequence, Math.max(0, timeout.toNanos()))) {
+            return false;
+        }
+        dropHomes(sequence);
+        return true;
+    }
+
+    /// Lets the runs of the bulk commits up to `sequence`, which is durable, go of their homes for their value frames,
+    /// unless the thread that moves values did already ([SpillQueue#dropHomes(long)]): a commit whose wait returns has
+    /// let go of them, whichever thread did.
+    private void dropHomes(long sequence) {
+        var queue = spills;
+        if (queue != null) {
+            queue.dropHomes(sequence);
+        }
     }
 
     /// Parks the caller until the commit at `sequence` is durable, or `timeout` nanoseconds pass if it is not negative.

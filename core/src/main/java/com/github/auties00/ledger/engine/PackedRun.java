@@ -57,12 +57,21 @@ import java.util.concurrent.atomic.AtomicReference;
 /// entries after that order's are sorted and merged into it, or, for a view older than it, its entries are picked out
 /// of it, so an ingest that scans after every append sorts each entry once whether or not older views are still read.
 ///
+/// A bulk commit whose frame was split ([FrameBody#split()]) and whose values do not pay to move one by one may have
+/// the run let go of its homes instead, once the frame is durable ([#dropHomes]): a home whose values a value frame of
+/// the commit holds at the offsets they have on the home, from its start, takes that frame's place in the log
+/// ([FramedHome]) in its stead. The first read of a value on such a home reads the value frame back, authenticated by
+/// its own tag, into an array of its own that becomes the home again, so the read costs one positioned read of the
+/// frame and an open of it, and later reads of the home cost nothing more; the checkpoint that takes the run reads
+/// every such home back first ([#readBackHomes()]).
+///
 /// The arrays of a run are shared by its views and are only ever added to: a commit that appends writes past the
 /// entries of every view, the hash table only gains slots (a table grown or rebuilt is a new array, published before
 /// any entry it adds), and the words, homes and places in the log the spill writes lie in chunks that never move, so
 /// the spill of an earlier commit's values runs beside a later commit's append. A view is immutable but for the place
 /// of the values of a bulk commit's run, which the spill switches with one release store of the entry's word after it
-/// published where the value went, so readers use it without synchronization: every read of a word is an acquire.
+/// published where the value went, and its homes, which a drop or a read back sets with a release store, so readers use
+/// it without synchronization: every read of a word or of a home is an acquire.
 /// [#correction()], the tree lookups it caches and the order of the keys made late take a lock of the view's own.
 final class PackedRun {
     /// The entries a run holds at most: the low bits of a slot of the hash table hold an entry's index plus one.
@@ -117,6 +126,7 @@ final class PackedRun {
     private static final int HOME_INDEX_SHIFT = 41;
     private static final VarHandle WORDS = MethodHandles.arrayElementVarHandle(long[].class);
     private static final VarHandle HOMES = MethodHandles.arrayElementVarHandle(MemorySegment[].class);
+    private static final VarHandle FRAMED = MethodHandles.arrayElementVarHandle(FramedHome[].class);
     // A value's place in the log: the index of its segment in the table above the bits of where its frame starts
     private static final int FRAME_BITS = 48;
     private static final long FRAME_MASK = (1L << FRAME_BITS) - 1;
@@ -161,9 +171,18 @@ final class PackedRun {
     private volatile int[] order;
     // Per entry, whether `base` holds its key, as TreeSearch.FOUND or ABSENT, or UNKNOWN; made at the first need
     private volatile byte[] inBase;
+    // The homes of the commit that made the view, from `firstHome`, included, to `endHome`, excluded, of the run's
+    private final int firstHome;
+    private final int endHome;
+    // Per home of the commit that made the view, if its frame was split, where the home's start lies in the section,
+    // plus one, as its values place it: 0 if no value said, -1 if two said otherwise; and where its last value ends on
+    // it. Null for any other view
+    private final int[] homeSections;
+    private final int[] homeEnds;
 
     private PackedRun(Storage storage, int size, long minStamp, long fromStamp, long maxStamp, boolean committed,
-                      TreeRoot base, PageFile pages, PackedRun previous) {
+                      TreeRoot base, PageFile pages, PackedRun previous, int firstHome, int endHome, int[] homeSections,
+                      int[] homeEnds) {
         this.storage = storage;
         this.size = size;
         this.minStamp = minStamp;
@@ -175,6 +194,10 @@ final class PackedRun {
         this.previous = previous;
         this.lock = new Object();
         this.order = committed ? null : mergeSorted(storage.keys, storage.keyEnds, size);
+        this.firstHome = firstHome;
+        this.endHome = endHome;
+        this.homeSections = homeSections;
+        this.homeEnds = homeEnds;
     }
 
     /// {@return the stamp of the oldest write the run holds}
@@ -364,7 +387,7 @@ final class PackedRun {
                 return MemorySegment.ofArray(readLogged(value)).asReadOnly();
             }
             if ((value & HOME) != 0) {
-                var home = home(value);
+                var home = homeOrFrame(value);
                 if (home == null) {
                     // Every value on it moved before the run let go of it: the word says where this one went
                     value = word(entry);
@@ -393,7 +416,7 @@ final class PackedRun {
             long offset;
             int length;
             if ((value & HOME) != 0) {
-                source = home(value);
+                source = homeOrFrame(value);
                 if (source == null) {
                     value = word(entry);
                     continue;
@@ -428,7 +451,7 @@ final class PackedRun {
                         (int) ((value >>> 32) & LOGGED_LENGTH_MASK));
             }
             if ((value & HOME) != 0) {
-                var home = home(value);
+                var home = homeOrFrame(value);
                 if (home == null) {
                     value = word(entry);
                     continue;
@@ -609,6 +632,20 @@ final class PackedRun {
         return onHome(word(entry));
     }
 
+    /// {@return the homes of a bulk commit's run it let go of for their value frames, read back or not, for tests}
+    int framedHomesForTests() {
+        var framed = storage.framed;
+        var count = 0;
+        for (var chunk = 0; framed != null && chunk < framed.length; chunk++) {
+            for (var i = 0; framed[chunk] != null && i < HOME_CHUNK; i++) {
+                if (framed[chunk][i] != null) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
     /// {@return the homes of a bulk commit's run the run still holds, for tests}
     int homesForTests() {
         var homes = storage.homes;
@@ -709,6 +746,175 @@ final class PackedRun {
     private MemorySegment home(long value) {
         var index = homeIndex(value);
         return (MemorySegment) HOMES.getAcquire(storage.homes[index >>> HOME_CHUNK_BITS], index & HOME_MASK);
+    }
+
+    // The home the word `value` of a value on a home names, read back from its value frame if the run let go of it for
+    // that frame; null once every value on it moved
+    private MemorySegment homeOrFrame(long value) {
+        var home = home(value);
+        if (home != null) {
+            return home;
+        }
+        var index = homeIndex(value);
+        var place = framedHome(storage, index);
+        return place == null ? null : readBack(index, place);
+    }
+
+    // The value frame home `index` of the run of `storage` was let go of for, or null for a home it kept or let go of
+    // once every value on it moved; read after the home was found null, which the drop stored after the place
+    private static FramedHome framedHome(Storage storage, int index) {
+        var framed = storage.framed;
+        var chunk = index >>> HOME_CHUNK_BITS;
+        if (framed == null || chunk >= framed.length || framed[chunk] == null) {
+            return null;
+        }
+        return (FramedHome) FRAMED.getAcquire(framed[chunk], index & HOME_MASK);
+    }
+
+    /// {@return home `index`, read back from the value frame `place` names, which the run let go of it for}
+    ///
+    /// Read into an array of its own, which becomes the home with a compare-and-set, so threads that read it back at
+    /// once all use the one that won.
+    ///
+    /// @throws IllegalStateException if the frame is in a log segment a checkpoint retired, which only a reader of a
+    ///                               later tree than the run's can find
+    private MemorySegment readBack(int index, FramedHome place) {
+        MemorySegment read;
+        try {
+            read = place.segment().readValueFrame(place.frameOffset(), place.length(), place.sequence());
+        } catch (LogSegmentView.Retired _) {
+            throw new IllegalStateException("A value in a retired log segment is newer than the tree of its reader");
+        }
+        var chunk = storage.homes[index >>> HOME_CHUNK_BITS];
+        var witness = (MemorySegment) HOMES.compareAndExchange(chunk, index & HOME_MASK, (MemorySegment) null, read);
+        return witness == null ? read : witness;
+    }
+
+    /// Reads back every home of the run, up to those of the commit that made this view, that the run let go of for its
+    /// value frame and has not read back yet, each on a virtual thread of its own, and waits for them: for a checkpoint
+    /// about to take every entry of the run, which would otherwise read them one after the other as its merge reaches
+    /// each home's first entry. A home whose read fails stays as it was, for the read of an entry on it to fail as it
+    /// would have.
+    void readBackHomes() {
+        var storage = this.storage;
+        if (storage.framed == null) {
+            return;
+        }
+        var homes = storage.homes;
+        var readers = new ArrayList<Thread>();
+        for (var home = 0; home < endHome; home++) {
+            if (HOMES.getAcquire(homes[home >>> HOME_CHUNK_BITS], home & HOME_MASK) != null) {
+                continue;
+            }
+            var place = framedHome(storage, home);
+            if (place != null) {
+                var index = home;
+                try {
+                    readers.add(Thread.ofVirtual().name("ledger-home-read").start(() -> {
+                        try {
+                            readBack(index, place);
+                        } catch (RuntimeException _) {
+                            // Left to the read of an entry on the home, which fails as it would have
+                        }
+                    }));
+                } catch (RuntimeException | OutOfMemoryError _) {
+                    // Without a thread, the merge reads the home at its first entry
+                    break;
+                }
+            }
+        }
+        var interrupted = false;
+        for (var reader : readers) {
+            while (true) {
+                try {
+                    reader.join();
+                    break;
+                } catch (InterruptedException _) {
+                    interrupted = true;
+                }
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /// {@return per home of the commit that made this view of a bulk commit's run, the index of the value frame of
+    /// `starts` and `lengths` that holds it, or -1: the frame starts in the section where the home's start lies there,
+    /// its values lie in the section at their offsets on the home, and the frame holds them up to the end of the last;
+    /// `null` for a view whose commit's frame was not split}
+    ///
+    /// The run may let go of such a home for its frame, which holds the bytes of every value on it where the home does.
+    ///
+    /// @param starts where each value frame's bytes start in the section, in order
+    /// @param lengths the bytes of each value frame
+    int[] framedHomes(int[] starts, int[] lengths) {
+        if (homeSections == null) {
+            return null;
+        }
+        var frames = new int[endHome - firstHome];
+        for (var home = 0; home < frames.length; home++) {
+            frames[home] = -1;
+            var start = homeSections[home] - 1;
+            if (start < 0) {
+                continue;
+            }
+            var frame = Arrays.binarySearch(starts, start);
+            if (frame >= 0 && homeEnds[home] <= lengths[frame]) {
+                frames[home] = frame;
+            }
+        }
+        return frames;
+    }
+
+    /// Lets go of each home of the commit that made this view that `frames` names a value frame of ([#framedHomes]),
+    /// for the place of that frame in the log: value frame `f` at `offsets[f]` of `segment`, holding `lengths[f]`
+    /// bytes, of the commit at `sequence`. A home of fewer than `minLength` bytes in its frame stays. Called once per
+    /// commit, once the frames are durable, by drops that take turns, the only writers of the places.
+    ///
+    /// Each place is published before its home is let go of, the home with a release store, so a reader that loads a
+    /// home as `null` finds its place and reads it back. The homes of the run's other commits are no business of it.
+    ///
+    /// @return the bytes of the value frames of the homes let go of
+    long dropHomes(int[] frames, LogSegmentView segment, long[] offsets, int[] lengths, long sequence, int minLength) {
+        var storage = this.storage;
+        var homes = storage.homes;
+        var bytes = 0L;
+        for (var i = 0; i < frames.length; i++) {
+            var frame = frames[i];
+            var home = firstHome + i;
+            var homeChunk = homes[home >>> HOME_CHUNK_BITS];
+            if (frame < 0 || lengths[frame] < minLength || HOMES.getAcquire(homeChunk, home & HOME_MASK) == null) {
+                continue;
+            }
+            var chunk = home >>> HOME_CHUNK_BITS;
+            var framed = storage.framed;
+            if (framed == null || chunk >= framed.length || framed[chunk] == null) {
+                // A copy with the chunk added, published whole: a reader that loaded the chunks before finds no place
+                // of a home this drop lets go of, which it loads only after the home's release store below
+                framed = framed == null ? new FramedHome[homes.length][]
+                        : Arrays.copyOf(framed, Math.max(framed.length, homes.length));
+                if (framed[chunk] == null) {
+                    framed[chunk] = new FramedHome[HOME_CHUNK];
+                }
+                storage.framed = framed;
+            }
+            var place = new FramedHome(segment, offsets[frame], lengths[frame], sequence);
+            FRAMED.setRelease(framed[chunk], home & HOME_MASK, place);
+            HOMES.setRelease(homeChunk, home & HOME_MASK, (MemorySegment) null);
+            bytes += lengths[frame];
+        }
+        return bytes;
+    }
+
+    /// The value frame a bulk commit's run let go of a home for: the frame at `frameOffset` of `segment`, of the commit
+    /// at `sequence`, whose body of `length` bytes holds the home's bytes from its start.
+    ///
+    /// @param segment the segment use that wrote the frame
+    /// @param frameOffset where the frame starts in its segment
+    /// @param length the bytes of the frame's body
+    /// @param sequence the sequence the frame carries, its commit's
+    record FramedHome(LogSegmentView segment, long frameOffset, int length, long sequence) {
     }
 
     // The stamp of logged value `index` of `places`, which its tag binds
@@ -1222,6 +1428,10 @@ final class PackedRun {
         private int priorKeyEnds;
         private int priorWordChunks;
         private int priorSlots;
+        // Per home of the builder, from firstHome, as the view keeps them, once a value placed in the section of a
+        // split frame said; null before
+        private int[] homeSections;
+        private int[] homeEnds;
 
         /// Creates the builder of the run of an open's replay.
         Builder() {
@@ -1532,6 +1742,36 @@ final class PackedRun {
             return index;
         }
 
+        /// Records that the value of the last [#putHome], of `length` bytes at `offset` of its home, starts at `start`
+        /// of the section of the commit's split frame ([FrameBody#putSection]), so the run knows which homes a value
+        /// frame holds whole ([PackedRun#framedHomes]).
+        void placeInSection(int offset, int length, int start) {
+            if (length == 0) {
+                return;
+            }
+            var index = storage.homeCount - 1 - firstHome;
+            if (homeSections == null) {
+                homeSections = new int[Math.max(16, index + 1)];
+                homeEnds = new int[homeSections.length];
+            } else if (index >= homeSections.length) {
+                var grown = Math.max(index + 1, 2 * homeSections.length);
+                homeSections = Arrays.copyOf(homeSections, grown);
+                homeEnds = Arrays.copyOf(homeEnds, grown);
+            }
+            // Where the home's start lies in the section, as this value places it: before the section, the home holds
+            // other bytes before its first value there
+            var base = start - offset;
+            var known = homeSections[index];
+            if (known != -1) {
+                if (base < 0 || known != 0 && known != base + 1) {
+                    homeSections[index] = -1;
+                } else {
+                    homeSections[index] = base + 1;
+                }
+            }
+            homeEnds[index] = Math.max(homeEnds[index], offset + length);
+        }
+
         /// Records a removal of the key that is the `keyLength` bytes at `keyFrom` of `keyArray`, whose hash is `hash`
         /// ([Segments#hash(byte\[\], int, int)]), stamped `stamp`.
         void delete(byte[] keyArray, int keyFrom, int keyLength, int hash, long stamp) {
@@ -1737,6 +1977,8 @@ final class PackedRun {
                 counts[index >>> HOME_CHUNK_BITS][index & HOME_MASK] = 0;
             }
             storage.homeCount = firstHome;
+            homeSections = null;
+            homeEnds = null;
             if (storage.keys.length != firstChunk) {
                 storage.keys = Arrays.copyOf(storage.keys, firstChunk);
             }
@@ -1828,7 +2070,7 @@ final class PackedRun {
                     segments.toArray(LogSegmentView[]::new));
             this.logs = null;
             chunks.clear();
-            return new PackedRun(storage, size, minStamp, minStamp, maxStamp, false, base, pages, null);
+            return new PackedRun(storage, size, minStamp, minStamp, maxStamp, false, base, pages, null, 0, 0, null, null);
         }
 
         /// {@return the view of the run holding the puts of new keys a bulk commit recorded and counted, none of which
@@ -1841,13 +2083,19 @@ final class PackedRun {
             var storage = this.storage;
             finishKeys();
             giveBackRoom();
+            var endHome = storage.homeCount;
+            var sections = homeSections == null ? null : Arrays.copyOf(homeSections, endHome - firstHome);
+            var ends = homeEnds == null ? null : Arrays.copyOf(homeEnds, endHome - firstHome);
+            homeSections = null;
+            homeEnds = null;
             if (after == null) {
                 storage.places = NO_PLACES;
                 storage.appendable = true;
-                return new PackedRun(storage, storage.entries, minStamp, minStamp, maxStamp, true, null, pages, null);
+                return new PackedRun(storage, storage.entries, minStamp, minStamp, maxStamp, true, null, pages, null,
+                        firstHome, endHome, sections, ends);
             }
             return new PackedRun(storage, storage.entries, after.minStamp, minStamp, Math.max(after.maxStamp, maxStamp),
-                    true, null, pages, after);
+                    true, null, pages, after, firstHome, endHome, sections, ends);
         }
     }
 
@@ -1877,6 +2125,11 @@ final class PackedRun {
         // Per home, the entries whose value is still on it; written by the commit that adds the home and then by the
         // spill alone
         volatile int[][] homeEntries;
+        // Per home, the value frame that holds it once the run let go of it for that frame ([FramedHome]), in chunks of
+        // HOME_CHUNK by the index a word holds, each place written with a release store before its home is let go of;
+        // null until the first drop, and a chunk null while no home of it was let go of. Written by the drops alone,
+        // which take turns
+        volatile FramedHome[][] framed;
         // Open addressing on the hash of the keys, at most three quarters full; replaced by a larger table, or one
         // without the entries of a commit taken back, never changed but to add a slot
         volatile int[] slots;

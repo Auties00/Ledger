@@ -3783,6 +3783,7 @@ public final class LiveLedger implements Ledger {
                 if (kept != null && frame.split()) {
                     // Left on the home the run keeps, which no one writes or pools: a value frame refers to it
                     frame.putSection(state.id, key, kept, offset, length);
+                    builder.placeInSection(offset, length, -1 - frame.sectionOffset(length));
                     sectioned = true;
                 } else if (kept != null && length >= frame.referable()) {
                     frame.put(state.id, key, kept, offset, length);
