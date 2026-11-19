@@ -302,6 +302,9 @@ class CheckpointSaturationTest {
             try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
                 TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.POINT);
                 TreeSearch.leaf(tree.pages, tree.root, key(5_000), PageCache.POINT);
+                // The second read from the file, as a recall of the first read's array would cache the leaf only at
+                // the third
+                tree.cache.forgetRefusedForTests();
                 TreeSearch.leaf(tree.pages, tree.root, key(5_000), PageCache.POINT);
                 assertNull(tree.cache.peek(tree.path(key(100)).getLast()), "the leaf read once");
                 assertTrue(tree.cache.referencedForTests(tree.path(key(5_000)).getLast()), "the leaf read twice");
@@ -374,6 +377,7 @@ class CheckpointSaturationTest {
                 var leaf = tree.path(key(100)).getLast();
                 TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.POINT);
                 assertNull(tree.cache.peek(leaf), "the leaf of key 100 at its first read after checkpoints no read followed");
+                tree.cache.forgetRefusedForTests();
                 TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.POINT);
                 assertTrue(tree.cache.referencedForTests(leaf), "the leaf of key 100 at its second read");
                 assertArrayEquals(new byte[170], tree.read(key(100)));
@@ -401,6 +405,7 @@ class CheckpointSaturationTest {
                     assertTrue(tree.cache.seen(control), "the first read of the control after checkpoint " + round);
                 }
                 assertEquals(0, tree.cache.doorkeeperForTests().rotationsForTests(), "doorkeeper rotations");
+                tree.cache.forgetRefusedForTests();
                 TreeSearch.leaf(tree.pages, tree.root, key(19_990), PageCache.POINT);
                 assertTrue(tree.cache.referencedForTests(control), "the leaf of the control at its second read");
             }
@@ -560,11 +565,14 @@ class CheckpointSaturationTest {
                 assertNull(tree.cache.peek(pointed), "the replacement of the leaf a point read read once");
                 TreeSearch.leaf(tree.pages, tree.root, key(100), PageCache.POINT);
                 assertTrue(tree.cache.referencedForTests(scanned), "the replacement of the leaf a scan read once, at a point read's first read");
+                // Reads from the file, as recalls of the array a read refused would cache the leaf a read later
                 for (var read = 1; read <= 2; read++) {
+                    tree.cache.forgetRefusedForTests();
                     TreeSearch.leaf(tree.pages, tree.root, key(5_000), PageCache.SCAN);
                     assertNull(tree.cache.peek(pointed), "the replacement of the leaf a point read read once, at a scan's read " + read);
                     assertEquals(read + 1, tree.pages.reads(pointed), "the reads of the replacement after a scan's read " + read);
                 }
+                tree.cache.forgetRefusedForTests();
                 TreeSearch.leaf(tree.pages, tree.root, key(5_000), PageCache.SCAN);
                 assertTrue(tree.cache.referencedForTests(pointed), "the replacement of the leaf a point read read once, at a scan's third read");
                 assertArrayEquals(new byte[151], tree.read(key(100)));

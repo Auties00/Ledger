@@ -263,7 +263,8 @@ final class PageFile implements AutoCloseable {
     /// its page share, is refused with it, so their reads take it back ([PageCache#recallWeak(long, PageRef)]) without
     /// reading it while the collector has not taken it. A read that caches what it reads as read first takes back a
     /// unit, or the leaf of a delta record, the cache [refused][#recalled(PageRef, byte, int)] lately, reading nothing;
-    /// the doorkeeper counts that recall as the read, and a recall that finds nothing as none.
+    /// that recall counts as the read, and caches the unit a read later than a read from the file would, and a recall
+    /// that finds nothing counts as none.
     ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     /// @param cached whether to keep the unit in the cache
@@ -825,7 +826,8 @@ final class PageFile implements AutoCloseable {
     }
 
     /// {@return the unit `ref` names if the cache [refused][PageCache#recall(long, PageRef, int)] it lately and still
-    /// reaches it, which it then holds unless it does not admit a scan's read of it yet, or `null`}
+    /// reaches it, which it then holds unless the read's screening needs more reads of it, a read more than a read
+    /// from the file needs, or `null`}
     ///
     /// A recalled unit of another kind reads as a miss, so the read from the file that follows fails as it would
     /// without it.

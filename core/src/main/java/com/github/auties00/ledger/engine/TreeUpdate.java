@@ -47,8 +47,10 @@ import java.util.concurrent.atomic.AtomicReference;
 /// the page cache's doorkeeper, with the most reads of any it replaces ([PageFile#expect(PageRef, int)]): a point
 /// reader that reads it once caches it, as it would have cached the node it replaces at that read, and a scan that
 /// reads each version once caches it at its first read once it read the two versions before it; one rewritten before
-/// any read is not expected in turn. A branch of level 1 the writer cached as written would count as read at a reader's
-/// first read, past the doorkeeper that screens it as it screens the leaves under it.
+/// any read is not expected in turn. The reads it counts are those a read from the file needs: the reads that
+/// [recall][PageCache#recall(long, PageRef, int)] a unit the cache refused record no more of them. A branch of level 1
+/// the writer cached as written would count as read at a reader's first read, past the doorkeeper that screens it as it
+/// screens the leaves under it.
 final class TreeUpdate {
     /// The writes below a branch from which its children's subtrees are updated on every processor.
     private static final int PARALLEL_OPS = 4_096;
