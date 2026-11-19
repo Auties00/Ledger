@@ -377,6 +377,7 @@ class BulkCommitRunTest {
                 }
             }
             assertTrue(logged > 0 && chunked > 0);
+            assertEquals(1, run.framePairsForTests(), "the values of the commit's one frame took more than one place");
             assertTrue(ledger.spills().loggedValuesForTests() >= logged);
             verify(ledger, expected);
             // Overwrites over values in the log, then a checkpoint that reads them back
@@ -865,6 +866,93 @@ class BulkCommitRunTest {
             verifyKeys(ledger, expected);
         }
         CheckpointTest.verifyPages(directory, encrypted);
+    }
+
+    @Test
+    @DisplayName("a spill of a bulk commit's run that moves no value to the log, its long values left on their home with no segment to take them, adds no place in the log and moves the short ones to a chunk")
+    void spillWithNoLoggedValue() {
+        var count = 40;
+        var home = new byte[count * 200];
+        for (var i = 0; i < home.length; i++) {
+            home[i] = (byte) (i * 7);
+        }
+        var view = MemorySegment.ofArray(home).asReadOnly();
+        var builder = new PackedRun.Builder(count, count * 4L);
+        var entries = new int[count];
+        var offsets = new int[count];
+        var ops = new int[count];
+        for (var message = 0; message < count; message++) {
+            var key = MemorySegment.ofArray(key(message));
+            // Every other value too long for a chunk, which only a segment would take
+            var length = message % 2 == 0 ? 40 : SpillQueue.LOG_VALUE_MIN + 50;
+            entries[message] = builder.putHome(key, Segments.hash(key), Reads.stamp(7, message), view, message * 200, length);
+            offsets[message] = message * 200;
+            ops[message] = message;
+        }
+        var run = builder.buildCommitted(null);
+        assertEquals(0, run.framePairsForTests());
+        var moved = run.spill(null, null, 0, 0, 0, 7, entries, offsets, ops, count);
+        assertArrayEquals(new int[]{0, count / 2}, moved);
+        assertEquals(0, run.framePairsForTests(), "a spill with no value for the log added a place");
+        for (var message = 0; message < count; message++) {
+            var length = message % 2 == 0 ? 40 : SpillQueue.LOG_VALUE_MIN + 50;
+            assertEquals(message % 2 != 0, run.onHomeForTests(entries[message]), "message " + message);
+            assertArrayEquals(Arrays.copyOfRange(home, message * 200, message * 200 + length), run.valueBytes(entries[message]));
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("readers racing the spill of a bulk commit's run, through the store and a snapshot taken before it, read every value as written while the run publishes the place of the commit's frame")
+    void readsRacingSpill(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, encrypted, 1L << 30)) {
+            ledger.state(MESSAGES).overwrites.forceSpillsForTests();
+            var batch = ledger.newBatch();
+            puts(batch, expected, 0, BULK, 0, LONG_LENGTHS);
+            ledger.commit(batch).awaitDurable();
+            var run = ledger.state(MESSAGES).run;
+            assertNotNull(run);
+            var failure = new AtomicReference<Throwable>();
+            var stop = new AtomicBoolean();
+            var started = new CountDownLatch(4);
+            try (var snapshot = ledger.snapshot()) {
+                var readers = new ArrayList<Thread>();
+                for (var reader = 0; reader < 4; reader++) {
+                    var seed = reader;
+                    var view = reader % 2 == 0 ? (View) ledger : snapshot;
+                    readers.add(Thread.ofPlatform().start(() -> {
+                        var random = new Random(seed);
+                        started.countDown();
+                        try {
+                            while (!stop.get()) {
+                                var message = random.nextInt(BULK);
+                                var value = view.get(MESSAGES, key(message)).orElseThrow();
+                                if (!Arrays.equals(expected.messages.get(message), value)) {
+                                    throw new AssertionError("message " + message + " read wrong");
+                                }
+                            }
+                        } catch (Throwable throwable) {
+                            failure.compareAndSet(null, throwable);
+                        }
+                    }));
+                }
+                started.await();
+                ledger.spills().drainAllForTests(ledger.log()::durableSequence);
+                ledger.spills().awaitIdleForTests();
+                // Reads of the values the spill moved, through the places it published
+                Thread.sleep(50);
+                stop.set(true);
+                for (var reader : readers) {
+                    reader.join();
+                }
+                assertNull(failure.get(), () -> "a reader failed: " + failure.get());
+                assertEquals(0, run.homesForTests(), "the run kept a home every value left");
+                assertEquals(1, run.framePairsForTests());
+                verify(snapshot, expected);
+            }
+            verify(ledger, expected);
+        }
     }
 
     private static void spillNow(LiveLedger ledger) throws InterruptedException {

@@ -33,9 +33,10 @@ import java.util.Arrays;
 /// Per entry it keeps the key's bytes and their end, a word of the value's place and kind, a slot of the hash table and an
 /// index of the key order; the keys lie in chunks of [#KEY_CHUNK] bytes, a value shorter than
 /// [SpillQueue#LOG_VALUE_MIN] in the replay's chunks ([ReplayValues]), and a longer one stays in the log, where the run
-/// keeps its place, its tag and its stamp, which the tag binds, as a [LogValue] would. A message that took a chain, a version, a [LogValue], an entry of
-/// the hash index, of the dirty and blind lists, and a node of the ordered map once scanned, about 300 bytes over its key
-/// and value, takes about 50 here.
+/// keeps its tag and its stamp, which the tag binds, and its place as a [LogValue] would, though once per frame of the
+/// commits it replayed rather than once per value when its values outnumber those frames twice ([Places]). A message
+/// that took a chain, a version, a [LogValue], an entry of the hash index, of the dirty and blind lists, and a node of
+/// the ordered map once scanned, about 300 bytes over its key and value, takes about 50 here.
 ///
 /// A bulk commit makes a run too ([#committed()]): the puts of new keys of a paged key space whose latest tree holds
 /// none of its entries, at least [LiveLedger#BULK_RUN_WRITES] of them in one batch, which the commit counts as it
@@ -169,11 +170,28 @@ final class PackedRun {
         this.values = trim(builder.values, size);
         builder.values = null;
         var logged = builder.logged;
+        // A place per value when the values are fewer than twice the frames they lie in, so a run of commits of one
+        // logged value each costs no more than a place per value; the frames' table otherwise
+        var logPlaces = builder.logPlaces;
+        if (logPlaces == null && logged > 0 && 2L * builder.commits >= logged) {
+            logPlaces = builder.placesPerValue();
+        }
+        long[] commitSequences = null;
+        long[] commitPlaces = null;
+        if (logPlaces != null) {
+            logPlaces = trim(logPlaces, logged);
+        } else {
+            commitSequences = trim(builder.commitSequences, builder.commits);
+            commitPlaces = trim(builder.commitPlaces, builder.commits);
+        }
         this.places = new Places(builder.chunks.toArray(MemorySegment[]::new), trim(builder.logStamps, logged),
-                trim(builder.logPlaces, logged), trim(builder.logBodies, logged), trim(builder.tagHighs, logged),
-                trim(builder.tagLows, logged), builder.segments.toArray(LogSegmentView[]::new));
+                logPlaces, commitSequences, commitPlaces, builder.lastSequence, trim(builder.logBodies, logged),
+                trim(builder.tagHighs, logged), trim(builder.tagLows, logged),
+                builder.segments.toArray(LogSegmentView[]::new));
         builder.logStamps = null;
         builder.logPlaces = null;
+        builder.commitSequences = null;
+        builder.commitPlaces = null;
         builder.logBodies = null;
         builder.tagHighs = null;
         builder.tagLows = null;
@@ -524,6 +542,13 @@ final class PackedRun {
         return ((value >>> LENGTH_SHIFT) & LENGTH_MASK) == 0 ? null : places.chunks()[chunkOf(value)];
     }
 
+    /// {@return the pairs of the frames' table that places the run's logged values, for tests, or -1 if the run keeps
+    /// a place per value}
+    int framePairsForTests() {
+        var places = this.places;
+        return places.logPlaces() != null ? -1 : places.commitSequences().length;
+    }
+
     /// {@return whether the value of `entry` is on a home of a bulk commit's run, for tests}
     boolean onHomeForTests(int entry) {
         return onHome(word(entry));
@@ -593,7 +618,7 @@ final class PackedRun {
 
     // The place in the log of logged value `index` of `places`, made for the read
     private static LogValue logged(Places places, int index) {
-        var place = places.logPlaces()[index];
+        var place = places.place(index);
         return new LogValue(places.segments()[(int) (place >>> FRAME_BITS)], place & FRAME_MASK, places.logBodies()[index],
                 places.tagHighs()[index], places.tagLows()[index]);
     }
@@ -684,9 +709,34 @@ final class PackedRun {
                 segments[segmentIndex] = segment;
             }
         }
-        var after = new Places(chunks, Arrays.copyOf(before.logStamps(), total), Arrays.copyOf(before.logPlaces(), total),
-                Arrays.copyOf(before.logBodies(), total), Arrays.copyOf(before.tagHighs(), total),
-                Arrays.copyOf(before.tagLows(), total), segments);
+        // The place of the commit's frame, which every value it moves to the log shares, goes in before the places are
+        // published, unlike the arrays per value: a read of any older value searches the whole frames' table
+        var logPlaces = before.logPlaces();
+        var commitSequences = before.commitSequences();
+        var commitPlaces = before.commitPlaces();
+        var lastSequence = before.lastSequence();
+        if (logged > 0) {
+            var place = (long) segmentIndex << FRAME_BITS | frameOffset;
+            if (logPlaces == null && !before.holds(sequence, place)) {
+                logPlaces = before.placesPerValue();
+            }
+            if (logPlaces != null) {
+                logPlaces = Arrays.copyOf(logPlaces, total);
+                Arrays.fill(logPlaces, firstLogged, total, place);
+            } else if (sequence > lastSequence) {
+                var commits = commitSequences.length;
+                if (commits == 0 || commitPlaces[commits - 1] != place) {
+                    commitSequences = Arrays.copyOf(commitSequences, commits + 1);
+                    commitPlaces = Arrays.copyOf(commitPlaces, commits + 1);
+                    commitSequences[commits] = sequence;
+                    commitPlaces[commits] = place;
+                }
+            }
+            lastSequence = Math.max(lastSequence, sequence);
+        }
+        var after = new Places(chunks, Arrays.copyOf(before.logStamps(), total), logPlaces, commitSequences,
+                commitPlaces, lastSequence, Arrays.copyOf(before.logBodies(), total),
+                Arrays.copyOf(before.tagHighs(), total), Arrays.copyOf(before.tagLows(), total), segments);
         // Published before the first word that refers to what it adds; written below only at indexes no word refers to
         // yet, each before the release store of the word that does
         places = after;
@@ -714,9 +764,10 @@ final class PackedRun {
                 var place = SpillQueue.framesAlone(segment, frameBody, length)
                         ? LogValue.framed(segment, frameOffset, bodyIndex, frameBody)
                         : crypto.logValue(segment, frameOffset, bodyIndex, stamp, home, offset, length);
+                // The place published above is the frame's: no value of a commit lies in another frame
+                assert place.segment() == segment && place.frameOffset() == frameOffset;
                 var index = nextLogged++;
                 after.logStamps()[index] = stamp;
-                after.logPlaces()[index] = (long) segmentIndex << FRAME_BITS | place.frameOffset();
                 after.logBodies()[index] = place.bodyIndex();
                 after.tagHighs()[index] = place.tagHigh();
                 after.tagLows()[index] = place.tagLow();
@@ -804,7 +855,15 @@ final class PackedRun {
         private int size;
         private final ArrayList<MemorySegment> chunks;
         private long[] logStamps;
+        // The place of each logged value, or null while the frames' table below holds them: once a value arrives that
+        // the table cannot place, the builder keeps a place per value from then on
         private long[] logPlaces;
+        // The frames' table: the first sequence of each run of commits whose logged values share a frame, ascending, and
+        // that frame's place, in `commits` pairs; the newest sequence of a logged value so far, or -1
+        private long[] commitSequences;
+        private long[] commitPlaces;
+        private int commits;
+        private long lastSequence;
         private int[] logBodies;
         private long[] tagHighs;
         private int[] tagLows;
@@ -833,7 +892,9 @@ final class PackedRun {
             this.values = new long[capacity];
             this.chunks = new ArrayList<>();
             this.logStamps = new long[0];
-            this.logPlaces = new long[0];
+            this.commitSequences = new long[0];
+            this.commitPlaces = new long[0];
+            this.lastSequence = -1;
             this.logBodies = new int[0];
             this.tagHighs = new long[0];
             this.tagLows = new int[0];
@@ -904,8 +965,26 @@ final class PackedRun {
         }
 
         /// Records a put of `key`, stamped `stamp`, of the `length` bytes `logged` holds in the log.
+        ///
+        /// The replay records the commits in the order of their sequences, each of whose values lies in its one frame,
+        /// so the values of one frame take one pair of the frames' table; a value out of that order, or of a sequence
+        /// whose frame the table places elsewhere, makes the builder keep a place per value.
         void putLogged(MemorySegment key, long stamp, LogValue logged, int length) {
             var entry = entry(key, stamp);
+            var segment = segments.isEmpty() ? -1 : segments.size() - 1;
+            if (segment < 0 || segments.get(segment) != logged.segment()) {
+                segments.add(logged.segment());
+                segment++;
+            }
+            var place = (long) segment << FRAME_BITS | logged.frameOffset();
+            // Decided before an index is taken or a stamp replaced, so a switch to a place per value places every value
+            // recorded so far by the stamps the table placed it by
+            if (logPlaces == null && !holds(stamp >>> Reads.OP_BITS, place)) {
+                logPlaces = placesPerValue();
+                commitSequences = null;
+                commitPlaces = null;
+                commits = 0;
+            }
             var previous = values[entry];
             int index;
             if (previous >= 0 && (previous & LOGGED) != 0) {
@@ -916,23 +995,54 @@ final class PackedRun {
                 if (index == logStamps.length) {
                     var capacity = Math.max(FIRST_ENTRIES, 2 * index);
                     logStamps = Arrays.copyOf(logStamps, capacity);
-                    logPlaces = Arrays.copyOf(logPlaces, capacity);
+                    if (logPlaces != null) {
+                        logPlaces = Arrays.copyOf(logPlaces, capacity);
+                    }
                     logBodies = Arrays.copyOf(logBodies, capacity);
                     tagHighs = Arrays.copyOf(tagHighs, capacity);
                     tagLows = Arrays.copyOf(tagLows, capacity);
                 }
             }
-            var segment = segments.isEmpty() ? -1 : segments.size() - 1;
-            if (segment < 0 || segments.get(segment) != logged.segment()) {
-                segments.add(logged.segment());
-                segment++;
-            }
             logStamps[index] = stamp;
-            logPlaces[index] = (long) segment << FRAME_BITS | logged.frameOffset();
+            if (logPlaces != null) {
+                logPlaces[index] = place;
+            }
             logBodies[index] = logged.bodyIndex();
             tagHighs[index] = logged.tagHigh();
             tagLows[index] = logged.tagLow();
             values[entry] = LOGGED | (long) length << 32 | (index & 0xFFFF_FFFFL);
+        }
+
+        // Whether the frames' table places a logged value of commit `sequence` at `place`, adding a pair when the
+        // sequence is the newest so far and its frame is not the last pair's; false if the table places it elsewhere
+        private boolean holds(long sequence, long place) {
+            if (sequence > lastSequence) {
+                if (commits == 0 || commitPlaces[commits - 1] != place) {
+                    if (commits == commitSequences.length) {
+                        var capacity = Math.max(8, 2 * commits);
+                        commitSequences = Arrays.copyOf(commitSequences, capacity);
+                        commitPlaces = Arrays.copyOf(commitPlaces, capacity);
+                    }
+                    commitSequences[commits] = sequence;
+                    commitPlaces[commits++] = place;
+                }
+                lastSequence = sequence;
+                return true;
+            }
+            if (sequence == lastSequence) {
+                return commitPlaces[commits - 1] == place;
+            }
+            var pair = pairOf(commitSequences, commits, sequence);
+            return pair >= 0 && commitPlaces[pair] == place;
+        }
+
+        // The place of every logged value recorded so far, by the frames' table, in an array as long as the stamps'
+        private long[] placesPerValue() {
+            var places = new long[logStamps.length];
+            for (var i = 0; i < logged; i++) {
+                places[i] = placeOf(commitSequences, commitPlaces, commits, logStamps[i] >>> Reads.OP_BITS);
+            }
+            return places;
         }
 
         /// {@return the entries the builder holds}
@@ -1212,16 +1322,85 @@ final class PackedRun {
         }
     }
 
+    // The pair of the frames' table, of `count` pairs whose first sequences ascend in `sequences`, that places the
+    // logged values of commit `sequence`: the last whose first sequence is at most it, or -1 if none is
+    private static int pairOf(long[] sequences, int count, long sequence) {
+        var low = 0;
+        var high = count - 1;
+        while (low <= high) {
+            var middle = (low + high) >>> 1;
+            if (sequences[middle] <= sequence) {
+                low = middle + 1;
+            } else {
+                high = middle - 1;
+            }
+        }
+        return high;
+    }
+
+    // The place of a logged value of commit `sequence` by the frames' table of `count` pairs
+    private static long placeOf(long[] sequences, long[] places, int count, long sequence) {
+        // Every value of a bulk commit's run, and of a replay of one frame, lies in one frame
+        if (count == 1 && sequences[0] <= sequence) {
+            return places[0];
+        }
+        var pair = pairOf(sequences, count, sequence);
+        if (pair < 0) {
+            throw new IllegalStateException("No frame of the run holds the values of commit " + sequence);
+        }
+        return places[pair];
+    }
+
     /// Where the values of a run that are not on a home lie.
     ///
+    /// Every logged value of one commit lies in the one frame of that commit, and the commits a run's values come from
+    /// reach it in the order of their sequences, which their stamps hold, so the run keeps the place of their frames once
+    /// per run of commits that share a frame: a pair of the sequence of the first and of the frame's place, which
+    /// places every value of a commit from that sequence up to the next pair's. It keeps a place per value instead when
+    /// that takes less memory, its values being fewer than twice the pairs, as when each commit logged one, or when a
+    /// value came out of that order. A change that lets the values of one commit span several frames breaks the table:
+    /// such commits need a place per value, or a pair per piece of the commit.
+    ///
     /// @param chunks the read-only views of the chunks the short values lie in
-    /// @param logStamps per logged value, the stamp of its write, which its tag binds
-    /// @param logPlaces per logged value, the index of its segment in `segments` over where its frame starts
+    /// @param logStamps per logged value, the stamp of its write, which its tag binds and whose sequence names its commit
+    /// @param logPlaces per logged value, the index of its segment in `segments` over where its frame starts; `null` when
+    ///                  the frames' table places the values
+    /// @param commitSequences the first sequence of each pair of the frames' table, ascending; `null` with `logPlaces`
+    /// @param commitPlaces the place of each pair's frame, as `logPlaces` holds one; `null` with `logPlaces`
+    /// @param lastSequence the newest sequence of a logged value the frames' table places, or -1
     /// @param logBodies per logged value, where it lies in its frame's body
     /// @param tagHighs per logged value, the first part of its tag ([LogValue])
     /// @param tagLows per logged value, the second part of its tag
     /// @param segments the segment uses the logged values are in
-    private record Places(MemorySegment[] chunks, long[] logStamps, long[] logPlaces, int[] logBodies, long[] tagHighs,
-                          int[] tagLows, LogSegmentView[] segments) {
+    private record Places(MemorySegment[] chunks, long[] logStamps, long[] logPlaces, long[] commitSequences,
+                          long[] commitPlaces, long lastSequence, int[] logBodies, long[] tagHighs, int[] tagLows,
+                          LogSegmentView[] segments) {
+        /// {@return the place of logged value `index`: the index of its segment in `segments` over where its frame
+        /// starts}
+        long place(int index) {
+            if (logPlaces != null) {
+                return logPlaces[index];
+            }
+            return placeOf(commitSequences, commitPlaces, commitSequences.length, logStamps[index] >>> Reads.OP_BITS);
+        }
+
+        /// {@return whether the frames' table places the logged values of commit `sequence` at `place`, or would once a
+        /// pair of them is added: the sequence is newer than every one it places, or it places it there}
+        boolean holds(long sequence, long place) {
+            if (sequence > lastSequence) {
+                return true;
+            }
+            var pair = pairOf(commitSequences, commitSequences.length, sequence);
+            return pair >= 0 && commitPlaces[pair] == place;
+        }
+
+        /// {@return the place of every logged value, by the frames' table, in an array of their count}
+        long[] placesPerValue() {
+            var places = new long[logStamps.length];
+            for (var i = 0; i < places.length; i++) {
+                places[i] = place(i);
+            }
+            return places;
+        }
     }
 }

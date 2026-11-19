@@ -39,6 +39,7 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -628,7 +629,174 @@ class PackedRunTest {
             assertTrue(run.removes(run.find(MemorySegment.ofArray(key(1, 78)))));
             assertEquals(-1, run.find(MemorySegment.ofArray(key(9, 9))));
             assertEquals(-1, run.find(key(9, 9)));
+            // Commits of tens of messages each: the run places their logged values once per frame
+            assertTrue(run.framePairsForTests() > 0, "the run keeps a place per value of commits of many values");
         }
+    }
+
+    /// Records in `builder` a put of `key`, write `op` of commit `sequence`, of a value of 200 bytes in the frame at
+    /// `frameOffset` of `segment`, and in `model` its place.
+    private static void putLogged(PackedRun.Builder builder, TreeMap<ByteBuffer, LogValue> model, String key,
+                                  LogSegmentView segment, long frameOffset, long sequence, int op) {
+        // A body index and a tag of each write's own, so a value placed by another write's place differs
+        var logged = new LogValue(segment, frameOffset, op * 1_000 + (int) sequence, sequence, op);
+        builder.putLogged(MemorySegment.ofArray(key.getBytes()), Reads.stamp(sequence, op), logged, 200);
+        model.put(ByteBuffer.wrap(key.getBytes()), logged);
+    }
+
+    /// Checks that `run` places every logged value of `model` where its write put it, and finds a chunk for the
+    /// others, mapped to `null`.
+    private static void checkPlaces(PackedRun run, TreeMap<ByteBuffer, LogValue> model) {
+        for (var entry : model.entrySet()) {
+            var name = new String(entry.getKey().array());
+            var found = run.find(MemorySegment.ofArray(entry.getKey().array()));
+            assertTrue(found >= 0, () -> "no entry of " + name);
+            var source = run.sourceForTests(found);
+            if (entry.getValue() == null) {
+                assertInstanceOf(MemorySegment.class, source, name);
+            } else {
+                assertEquals(entry.getValue(), source, () -> "the place of " + name);
+            }
+        }
+    }
+
+    private static LogSegmentView segment(long number) {
+        return new LogSegmentView(number, Path.of("segment-" + number), null, null);
+    }
+
+    @Test
+    @DisplayName("a run places the logged values of commits that share frames, overwritten across commits, twice in one commit, after a short value and in two segments, by one pair per frame")
+    void framesTable() {
+        var first = segment(1);
+        var second = segment(2);
+        var chunk = MemorySegment.ofArray(new byte[64]);
+        var builder = new PackedRun.Builder();
+        var model = new TreeMap<ByteBuffer, LogValue>();
+        for (long sequence = 1; sequence <= 40; sequence++) {
+            // Three commits per frame, the first seven frames in one segment and the rest in the next
+            var frame = (sequence - 1) / 3;
+            var segment = frame < 7 ? first : second;
+            var frameOffset = 4_096 * frame;
+            var op = 0;
+            for (var i = 0; i < 4; i++) {
+                putLogged(builder, model, "new-" + sequence + "-" + i, segment, frameOffset, sequence, op++);
+            }
+            if (sequence > 1) {
+                putLogged(builder, model, "new-" + (sequence - 1) + "-0", segment, frameOffset, sequence, op++);
+            }
+            putLogged(builder, model, "twice-" + sequence, segment, frameOffset, sequence, op++);
+            putLogged(builder, model, "twice-" + sequence, segment, frameOffset, sequence, op++);
+            var key = "short-then-logged".getBytes();
+            if (sequence % 3 == 0) {
+                builder.put(MemorySegment.ofArray(key), Reads.stamp(sequence, op++), chunk, 0, 40);
+                model.put(ByteBuffer.wrap(key), null);
+            } else {
+                putLogged(builder, model, "short-then-logged", segment, frameOffset, sequence, op++);
+            }
+            putLogged(builder, model, "often-" + sequence % 5, segment, frameOffset, sequence, op);
+        }
+        var run = builder.build(null, null);
+        assertEquals(14, run.framePairsForTests(), "a pair per frame");
+        checkPlaces(run, model);
+    }
+
+    @Test
+    @DisplayName("a run of commits of one logged value each keeps a place per value when each commit has a frame of its own, and a pair per frame when commits share frames")
+    void oneValuePerCommit() {
+        var segment = segment(1);
+        var own = new PackedRun.Builder();
+        var ownModel = new TreeMap<ByteBuffer, LogValue>();
+        for (long sequence = 1; sequence <= 50; sequence++) {
+            putLogged(own, ownModel, "own-" + sequence, segment, 512 * sequence, sequence, 0);
+        }
+        var ownRun = own.build(null, null);
+        assertEquals(-1, ownRun.framePairsForTests(), "a pair per value costs more than a place per value");
+        checkPlaces(ownRun, ownModel);
+        var shared = new PackedRun.Builder();
+        var sharedModel = new TreeMap<ByteBuffer, LogValue>();
+        for (long sequence = 1; sequence <= 60; sequence++) {
+            putLogged(shared, sharedModel, "shared-" + sequence, segment, 4_096 * ((sequence - 1) / 6), sequence, 0);
+        }
+        var sharedRun = shared.build(null, null);
+        assertEquals(10, sharedRun.framePairsForTests());
+        checkPlaces(sharedRun, sharedModel);
+    }
+
+    @ParameterizedTest(name = "case {0}")
+    @ValueSource(ints = {0, 1, 2})
+    @DisplayName("a value of an older commit in that commit's frame keeps the frames' table, and one in another frame, of an older commit or of the newest, makes the run keep a place per value")
+    void valuesOutOfOrder(int outOfOrder) {
+        var segment = segment(1);
+        var builder = new PackedRun.Builder();
+        var model = new TreeMap<ByteBuffer, LogValue>();
+        for (long sequence = 1; sequence <= 10; sequence++) {
+            for (var op = 0; op < 5; op++) {
+                putLogged(builder, model, "k-" + sequence + "-" + op, segment, 4_096 * sequence, sequence, op);
+            }
+        }
+        switch (outOfOrder) {
+            // Commit 4 again, in its own frame
+            case 0 -> putLogged(builder, model, "k-2-0", segment, 4_096 * 4, 4, 7);
+            // Commit 4 again, in the frame of commit 6
+            case 1 -> putLogged(builder, model, "k-2-0", segment, 4_096 * 6, 4, 7);
+            // The newest commit, in a frame after its own
+            default -> putLogged(builder, model, "k-9-1", segment, 4_096 * 11, 10, 7);
+        }
+        for (long sequence = 11; sequence <= 12; sequence++) {
+            for (var op = 0; op < 5; op++) {
+                putLogged(builder, model, "k-" + sequence + "-" + op, segment, 4_096 * (sequence + 1), sequence, op);
+            }
+        }
+        var run = builder.build(null, null);
+        assertEquals(outOfOrder == 0 ? 12 : -1, run.framePairsForTests());
+        checkPlaces(run, model);
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}, commits awaited one by one: {1}")
+    @MethodSource("singleCommits")
+    @DisplayName("a replay of commits of one logged message each, each in a frame of its own or several in a frame, reads every value back authenticated, before and after the checkpoint that takes the run")
+    void replayedSingleValueCommits(boolean encrypted, boolean awaited, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var commits = 300;
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            for (var id = 0; id < commits; id++) {
+                var value = new byte[200];
+                Arrays.fill(value, (byte) id);
+                value[0] = (byte) (id >>> 8);
+                var commit = ledger.commit(ledger.newBatch().put(MESSAGES, key(id & 3, id), value));
+                expected.put(key(id & 3, id), value);
+                if (awaited || id % 50 == 49) {
+                    commit.awaitDurable();
+                }
+            }
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            var run = ledger.state(MESSAGES).run;
+            assertNotNull(run);
+            if (awaited) {
+                assertEquals(-1, run.framePairsForTests(), "commits of a frame each kept a pair per value");
+            } else {
+                // Groups of up to 50 commits, sealed as runs of commits in shared frames
+                var pairs = run.framePairsForTests();
+                assertTrue(pairs > 0 && pairs < commits / 2, "the run kept " + pairs + " pairs for " + commits + " values");
+            }
+            for (var id = 0; id < commits; id++) {
+                var entry = run.find(MemorySegment.ofArray(key(id & 3, id)));
+                assertInstanceOf(LogValue.class, run.sourceForTests(entry));
+                assertArrayEquals(expected.messages.get(ByteBuffer.wrap(key(id & 3, id))), run.valueBytes(entry));
+            }
+            verify(ledger, expected);
+            ledger.checkpoint();
+            assertNull(ledger.state(MESSAGES).run);
+            verify(ledger, expected);
+        }
+        CheckpointTest.verifyPages(directory, encrypted);
+    }
+
+    private static Stream<Arguments> singleCommits() {
+        return Stream.of(Arguments.of(true, true), Arguments.of(true, false), Arguments.of(false, true),
+                Arguments.of(false, false));
     }
 
     /// {@return a key of chat `chat` of `length` bytes, from 5 to [KeyCodec#MAX_LENGTH], unique by its first five}
