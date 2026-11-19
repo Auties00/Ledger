@@ -388,62 +388,45 @@ class ReplayResidentInPlaceTest {
         }
     }
 
-    @ParameterizedTest(name = "{0}, loaded at open: {1}")
-    @CsvSource({"sessions, true", "sessions, false", "coded, true", "coded, false"})
+    @ParameterizedTest(name = "{0}, loaded at open: {1}, longer: {2}")
+    @CsvSource({"sessions, true, false", "sessions, false, false", "sessions, true, true", "sessions, false, true",
+            "coded, true, false", "coded, false, false"})
     @DisplayName("the first replayed put of a loaded key of byte arrays with the loaded value's length writes the loader's array, and one of a key space with a codec of its own never does")
-    void loaderArraysReused(String name, boolean atOpen, @TempDir Path directory) throws Exception {
+    void loaderArraysReused(String name, boolean atOpen, boolean longer, @TempDir Path directory) throws Exception {
         var keyspace = name.equals("sessions") ? SESSIONS : CODED;
-        // Each of KEYS loaded values overwritten once, with values of their length or one byte longer
-        var same = directory.resolve("same");
-        var longer = directory.resolve("longer");
-        var models = new ArrayList<TreeMap<String, byte[]>>();
-        for (var store : List.of(same, longer)) {
-            var random = new Random(12);
-            var model = new TreeMap<String, byte[]>();
-            try (var ledger = open(store, true, Long.MAX_VALUE, atOpen)) {
-                var batch = ledger.newBatch();
-                for (var i = 0; i < KEYS; i++) {
-                    var value = value(random, LENGTH);
-                    batch.put(keyspace, loadedKey(i), value);
-                    model.put(loadedKey(i), value);
-                }
-                ledger.commit(batch).awaitDurable();
-                ledger.checkpoint();
-                for (var i = 0; i < KEYS; i++) {
-                    var value = value(random, store == same ? LENGTH : LENGTH + 1);
-                    ledger.commit(ledger.newBatch().put(keyspace, loadedKey(i), value)).awaitDurable();
-                    model.put(loadedKey(i), value);
-                }
-                ((LiveLedger) ledger).closeWithoutCheckpoint();
+        var random = new Random(12);
+        var model = new TreeMap<String, byte[]>();
+        try (var ledger = open(directory, true, Long.MAX_VALUE, atOpen)) {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < KEYS; i++) {
+                var value = value(random, LENGTH);
+                batch.put(keyspace, loadedKey(i), value);
             }
-            models.add(model);
-        }
-        var threads = (com.sun.management.ThreadMXBean) java.lang.management.ManagementFactory.getThreadMXBean();
-        var allocated = new long[2];
-        for (var round = 0; round < 2; round++) {
-            for (var i = 0; i < 2; i++) {
-                var store = i == 0 ? same : longer;
-                var before = threads.getTotalThreadAllocatedBytes();
-                var ledger = open(store, true, Long.MAX_VALUE, atOpen);
-                // The second round, once both opens loaded their classes
-                allocated[i] = threads.getTotalThreadAllocatedBytes() - before;
-                try (ledger) {
-                    check(ledger, keyspace, models.get(i));
-                    ((LiveLedger) ledger).closeWithoutCheckpoint();
-                }
+            ledger.commit(batch).awaitDurable();
+            ledger.checkpoint();
+            // Each loaded value overwritten once, with a value of its length or one byte longer
+            for (var i = 0; i < KEYS; i++) {
+                var value = value(random, longer ? LENGTH + 1 : LENGTH);
+                ledger.commit(ledger.newBatch().put(keyspace, loadedKey(i), value)).awaitDurable();
+                model.put(loadedKey(i), value);
             }
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
         }
-        // The arrays the replay allocates for the longer values, and for the others only if it does not reuse
-        var saved = allocated[1] - allocated[0];
-        if (keyspace == SESSIONS) {
-            assertTrue(saved > KEYS * LENGTH * 3L / 4, "the replay reused " + saved + " bytes");
-        } else {
-            assertTrue(Math.abs(saved) < KEYS * LENGTH / 4L, "the replay reused " + saved + " bytes");
+        try (var ledger = open(directory, true, Long.MAX_VALUE, atOpen)) {
+            // Each key is replayed once, so every array a replayed put wrote is one the loader made
+            var inPlace = ((LiveLedger) ledger).replayedInPlaceForTests();
+            assertEquals(keyspace == SESSIONS && !longer ? KEYS : 0, inPlace);
+            check(ledger, keyspace, model);
+            ledger.checkpoint();
+            check(ledger, keyspace, model);
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, true, Long.MAX_VALUE, !atOpen)) {
+            check(ledger, keyspace, model);
         }
     }
 
-    // The loaded keys of loaderArraysReused and the length of their values: the arrays a replay reuses take a megabyte,
-    // far above what the opens allocate otherwise apart
+    // The loaded keys of loaderArraysReused and the length of their values
     private static final int KEYS = 40;
     private static final int LENGTH = 32 << 10;
 

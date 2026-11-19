@@ -177,6 +177,8 @@ public final class LiveLedger implements Ledger {
     // endReplay: a replayed put of a resident key space of byte arrays then overwrites in place the array of the version
     // it replaces ([Applier#replayedArray(Version, int)])
     private boolean replayingOpen;
+    // The replayed puts of the open that wrote their value into the array of the version they replace, for tests
+    private int replayedInPlace;
     // Whether a prune left a chain that a later one may shorten, so the sweep has work; guarded by the publishing role
     private boolean sweepPending;
     // Whether the sweep's current pass over the store found such a chain
@@ -767,6 +769,12 @@ public final class LiveLedger implements Ledger {
     /// estimates it}
     long replayedHeap() {
         return replayedHeap;
+    }
+
+    /// {@return the replayed puts of the open that wrote their value into the array of the version they replaced
+    /// ([Applier#replayedArray(Version, int)]); for tests}
+    int replayedInPlaceForTests() {
+        return replayedInPlace;
     }
 
     /// Gives an id to every key space the store does not know yet.
@@ -3216,7 +3224,11 @@ public final class LiveLedger implements Ledger {
                 return null;
             }
             var own = head.ownArray();
-            return own != null && own.length == length && head.decoded == own ? own : null;
+            if (own == null || own.length != length || head.decoded != own) {
+                return null;
+            }
+            replayedInPlace++;
+            return own;
         }
 
         /// {@return the version the last write of the commit added}
