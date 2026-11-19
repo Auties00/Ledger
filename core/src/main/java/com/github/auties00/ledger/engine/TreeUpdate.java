@@ -110,17 +110,23 @@ final class TreeUpdate {
     ///
     /// It keeps a chain of the key, or the run's entry of a key only a run holds, and the version rather than segments
     /// of the key and the value, which it makes when it writes the key: a checkpoint holds one state per key it takes,
-    /// through the whole update.
+    /// through the whole update. The state of a put only a run holds keeps the run and the entry alone
+    /// ([#ofRun(PackedRun, int)]): the update reads the entry's value where the run keeps it when it writes the leaf,
+    /// and a value in the log only then, into the leaf, so it holds no version and no place in the log for it.
     ///
     /// @param keyed a chain of the key, whose bytes the state compares and writes, or `null` for the entry `entry` of
     ///              `run`, whose key the state compares in the run and writes from it
-    /// @param version its version as of the checkpoint, or `null` if the key has none
+    /// @param version its version as of the checkpoint, or `null` if the key has none; [#RUN_VALUE] for the run's put
+    ///                of the key, which [#version()] makes at the call
     /// @param blind the chain of the key, if a blind write the checkpoint takes needs to know whether the tree held
     ///              the key ([BlindWrites]), which the update records on it; or `null`
     /// @param run the [PackedRun] whose entry `entry` is the key's, which the update tells whether the tree held the
     ///            key ([PackedRun#settles()]); or `null`
     /// @param entry the key's entry in `run`, or -1
     record Op(Chain keyed, Version version, Chain blind, PackedRun run, int entry) {
+        /// What the state of a put only a run holds keeps in place of a version: the put of the run's entry.
+        static final Version RUN_VALUE = new Version(Long.MIN_VALUE, (MemorySegment) null, null, null);
+
         /// Makes the state of the key of `keyed` with `version`, as [Op] does, for a key no run holds.
         Op(Chain keyed, Version version, Chain blind) {
             this(keyed, version, blind, null, -1);
@@ -138,6 +144,25 @@ final class TreeUpdate {
             this(new Chain(key, 0), value == null ? null : new Version(0, value, null, null), null);
         }
 
+        /// {@return the state of the key of entry `entry` of `run`, which puts it: the put of the run's entry, kept as
+        /// the run and the entry}
+        static Op ofRun(PackedRun run, int entry) {
+            return new Op(null, RUN_VALUE, null, run, entry);
+        }
+
+        /// {@return its version as of the checkpoint, or `null` if the key has none: for the put of a run's entry, a
+        /// version of the entry's value made at the call ([PackedRun#version(int)])}
+        @Override
+        public Version version() {
+            return version == RUN_VALUE ? run.version(entry) : version;
+        }
+
+        /// {@return whether the state is the put of a run's entry, kept as the run and the entry
+        /// ([#ofRun(PackedRun, int)])}
+        boolean runValue() {
+            return version == RUN_VALUE;
+        }
+
         /// {@return the order of the key and `other`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
         int compareKey(MemorySegment other) {
             return keyed != null ? keyed.compareKey(other) : run.compareKey(entry, other);
@@ -150,12 +175,15 @@ final class TreeUpdate {
 
         /// {@return the value, or `null` if the key has none}
         MemorySegment value() {
+            if (version == RUN_VALUE) {
+                return run.value(entry);
+            }
             return version == null ? null : version.value();
         }
 
         /// {@return whether the key has no value}
         boolean removes() {
-            return version == null || version.removes();
+            return version == null || version != RUN_VALUE && version.removes();
         }
 
         /// {@return whether the value is in a log segment a checkpoint retired, which only a published checkpoint's
@@ -164,20 +192,28 @@ final class TreeUpdate {
         /// Such a version is at or below the cut of that checkpoint, so it is the key's state here only when a commit
         /// that replaced it rolled back, leaving the key to write as it was.
         boolean inTree() {
+            if (version == RUN_VALUE) {
+                return run.inRetiredSegment(entry);
+            }
             return version != null && version.inRetiredSegment();
         }
 
         /// {@return the unit of [BlobFile] a commit wrote the value to, which the tree takes, or `null`}
+        ///
+        /// No run holds such a value: a bulk commit and the replay put a value in that file on a chain.
         PageRef external() {
-            return version == null ? null : version.external();
+            return version == null || version == RUN_VALUE ? null : version.external();
         }
 
         /// Records on the chain of a blind write, and for the run that holds the key, whether the tree held the key.
+        ///
+        /// A bulk commit's run counted its puts as it applied them ([PackedRun#committed()]), so nothing is recorded
+        /// for it.
         void settle(boolean inTree) {
             if (blind != null) {
                 blind.settle(inTree);
             }
-            if (run != null && entry >= 0) {
+            if (run != null && entry >= 0 && !run.committed()) {
                 PackedRun.settle(run.settles(), entry, inTree);
             }
         }
@@ -974,6 +1010,9 @@ final class TreeUpdate {
 
     private LeafEntry entry(Op op) throws IOException {
         var key = op.key(keys);
+        if (op.runValue()) {
+            return runEntry(key, op.run(), op.entry());
+        }
         var version = op.version();
         var external = op.external();
         if (external == null && version.logged()) {
@@ -996,15 +1035,36 @@ final class TreeUpdate {
             // Copied into the leaf with an array copy, without a view of it
             return new LeafEntry(key, array, null, array.length);
         }
-        var value = op.value();
+        return valueEntry(key, version.value());
+    }
+
+    /// {@return the entry of `key` whose value is that of entry `entry` of `run`, which puts it, read where the run
+    /// keeps it, without a version: a value in the log, read from the log when the leaf is written
+    /// ([PackedRun.LoggedEntry]), or into a unit of its own if too long for a leaf}
+    private LeafEntry runEntry(MemorySegment key, PackedRun run, int entry) throws IOException {
+        var logged = run.loggedLength(entry);
+        if (logged >= 0) {
+            if (LeafEntry.fitsInline(key.byteSize(), logged)) {
+                return new LeafEntry(key, new PackedRun.LoggedEntry(run, entry), null, logged);
+            }
+            var unitPages = PageFormat.pagesFor(logged);
+            var ref = writer.writeLoggedValue(allocate(unitPages), unitPages, run.version(entry));
+            return new LeafEntry(key, null, ref, logged);
+        }
+        return valueEntry(key, run.value(entry));
+    }
+
+    /// {@return the entry of `key` with `value`, inline, or in a unit of its own the update writes if too long for a
+    /// leaf}
+    private LeafEntry valueEntry(MemorySegment key, MemorySegment value) throws IOException {
         var length = value.byteSize();
         if (LeafEntry.fitsInline(key.byteSize(), length)) {
             return new LeafEntry(key, value, null, (int) length);
         }
         var unitPages = PageFormat.pagesFor(length);
         var page = allocate(unitPages);
-        // The writer builds the unit from the version's value in the array it seals it into: nothing reads it before
-        // the checkpoint is published, and a read after goes through the file
+        // The writer builds the unit from the value in the array it seals it into: nothing reads it before the
+        // checkpoint is published, and a read after goes through the file
         var ref = writer.writeValue(page, unitPages, value);
         return new LeafEntry(key, null, ref, (int) length);
     }

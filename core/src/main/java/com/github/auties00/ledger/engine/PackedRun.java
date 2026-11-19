@@ -406,6 +406,39 @@ final class PackedRun {
         }
     }
 
+    /// {@return the bytes of the value of `entry` if it is in the log, or -1 if it is elsewhere or the entry removes its
+    /// key}
+    ///
+    /// The place of a value in the log never changes, so a value this finds in the log stays there.
+    int loggedLength(int entry) {
+        var value = word(entry);
+        return value >= 0 && (value & LOGGED) != 0 ? (int) ((value >>> 32) & LOGGED_LENGTH_MASK) : -1;
+    }
+
+    /// Reads the value of `entry`, which is in the log ([#loggedLength(int)]), into `target` from `offset`, as
+    /// [Version#readLogged(byte\[\], int)] reads a version's.
+    ///
+    /// @throws LogSegmentView.Retired if a checkpoint retired the value's segment
+    /// @throws com.github.auties00.ledger.LedgerIoException if the log cannot be read
+    /// @throws com.github.auties00.ledger.LedgerCorruptedException if the log changed
+    void readLogged(int entry, byte[] target, int offset) {
+        var value = word(entry);
+        var index = (int) value;
+        var places = this.places;
+        logged(places, index).readInto(places.logStamps()[index], (int) ((value >>> 32) & LOGGED_LENGTH_MASK), target, offset);
+    }
+
+    /// {@return whether the value of `entry` is in a log segment a checkpoint retired, as
+    /// [Version#inRetiredSegment()] tells of a version's; `false` for a value elsewhere or a removal}
+    boolean inRetiredSegment(int entry) {
+        var value = word(entry);
+        if (value < 0 || (value & LOGGED) == 0) {
+            return false;
+        }
+        var places = this.places;
+        return places.segments()[(int) (places.logPlaces()[(int) value] >>> FRAME_BITS)].retired();
+    }
+
     /// {@return the position in the key order of the first entry whose key is at or after `key`, or [#size()] if none
     /// is; 0 for `null`}
     int lowerPosition(MemorySegment key) {
@@ -479,10 +512,16 @@ final class PackedRun {
 
     /// {@return the change the entries of the run from `from`, included, to `to`, excluded, either `null` for no bound,
     /// make to the count of the tree the store opened from in that range}
+    ///
+    /// A bulk commit's run puts keys no tree it is read over holds, so each of its entries in the range adds one, which
+    /// takes no lookup and records nothing.
     long correction(MemorySegment from, MemorySegment to) {
         var first = lowerPosition(from);
         var last = to == null ? size : lowerPosition(to);
-        return first >= last ? 0 : countBetween(first, last);
+        if (first >= last) {
+            return 0;
+        }
+        return committed ? last - first : countBetween(first, last);
     }
 
     // The change the entries at positions first to last, excluded, of the key order make to the count of `base`
@@ -1209,6 +1248,19 @@ final class PackedRun {
             if (tree != null) {
                 tree.release();
             }
+        }
+    }
+
+    /// The inline value of a leaf a checkpoint writes that is the value of an entry of a run in the log, which
+    /// [TreeNodes#writeEntry(byte\[\], int, TreeNodes.LeafEntry)] reads from the log straight into the leaf it writes,
+    /// as it reads a logged version's: the checkpoint holds neither a version nor a place in the log for it until then.
+    ///
+    /// @param run the run
+    /// @param entry the entry, whose value is in the log ([#loggedLength(int)])
+    record LoggedEntry(PackedRun run, int entry) {
+        /// Reads the value into `target` from `offset`, as [PackedRun#readLogged(int, byte\[\], int)] does.
+        void readInto(byte[] target, int offset) {
+            run.readLogged(entry, target, offset);
         }
     }
 

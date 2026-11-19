@@ -765,27 +765,26 @@ final class Checkpointer implements IdleTicker.Watched {
         return roots;
     }
 
-    /// {@return the state of the key of `entry` of `run` as of the cut: the run's value, or none if the entry removes
-    /// the key or a range removal since the trees `treeBound` holds, and within `bound`, covers it, every such removal
-    /// being newer than the run's writes}
+    /// {@return the state of the key of `entry` of `run` as of the cut: the run's put ([TreeUpdate.Op#ofRun(PackedRun, int)]),
+    /// or none if the entry removes the key or a range removal since the trees `treeBound` holds, and within `bound`,
+    /// covers it, every such removal being newer than the run's writes}
     private static TreeUpdate.Op runOp(PackedRun run, int entry, RangeRemoval[] removals, long treeBound, long bound) {
-        var version = run.version(entry);
-        if (version != null) {
-            // A view of the key only for a removal that may cover it
-            MemorySegment key = null;
-            for (var removal : removals) {
-                if (removal.stamp() > treeBound && removal.stamp() <= bound) {
-                    if (key == null) {
-                        key = run.key(entry);
-                    }
-                    if (removal.covers(key)) {
-                        version = null;
-                        break;
-                    }
+        if (run.removes(entry)) {
+            return new TreeUpdate.Op(run, entry, null);
+        }
+        // A view of the key only for a removal that may cover it
+        MemorySegment key = null;
+        for (var removal : removals) {
+            if (removal.stamp() > treeBound && removal.stamp() <= bound) {
+                if (key == null) {
+                    key = run.key(entry);
+                }
+                if (removal.covers(key)) {
+                    return new TreeUpdate.Op(run, entry, null);
                 }
             }
         }
-        return new TreeUpdate.Op(run, entry, version);
+        return TreeUpdate.Op.ofRun(run, entry);
     }
 
     private PageRef writeCatalog(LiveLedger.Cut cut, TreeRoot[] roots, PageFile.Writer writer, TreeUpdate update) throws IOException {
