@@ -75,11 +75,12 @@ import java.util.Arrays;
 /// that the log reads once: the body of a large batch, which refers to no value, and that of a transaction, whose
 /// values of a few kilobytes it refers to. The log hands the chunks back once it sealed the frame ([#release()]); a
 /// body the log never took goes back with [#discard()]. From its first chunk until then the body
-/// [holds][HeapPool#hold()] the pool's overflow, where the chunks of the frames sealed before it wait, so a collection
-/// while it fills keeps them for it; a body a stopped log leaves to the collector lets go of it ([#abandon()]). A
-/// chunked body that refers to no value is read through [#chunkCount()], [#chunk(int)] and [#chunkLength(int)], one
-/// that refers to values through its pieces, which then never span two chunks; [#array()] serves only a body of one
-/// array. No pooled chunk is ever an array a body refers to: those are arrays the pool never hands out.
+/// [holds][HeapPool#hold()] the pool's overflow, where the chunks of the frames sealed before it wait once a
+/// collection moved them out of the reserve ([HeapPool#releaseBurst(byte\[\])]), so a collection while it fills keeps
+/// them for it; a body a stopped log leaves to the collector lets go of it ([#abandon()]). A chunked body that refers
+/// to no value is read through [#chunkCount()], [#chunk(int)] and [#chunkLength(int)], one that refers to values
+/// through its pieces, which then never span two chunks; [#array()] serves only a body of one array. No pooled chunk
+/// is ever an array a body refers to: those are arrays the pool never hands out.
 ///
 /// A write checks once that the array it writes has room for its longest encoding, and takes a path that checks each
 /// field only when it may not: that path, which grows the array or goes on in the next chunk, runs at a chunk boundary
@@ -464,10 +465,10 @@ final class FrameBody {
     /// them reachable; a body made without a pool keeps its array and its references, but for a split body's, which it
     /// lets go of all the same. A second call does nothing.
     ///
-    /// The chunks of a body of more than one go to the pool's overflow alone ([HeapPool#releaseBurst(byte\[\])]),
-    /// which the body holds until they are all back: the next large body takes them from there, and once no work
-    /// holds the overflow the first collection frees them, where the pool's reserve would keep a large commit's
-    /// chunks after it. A body of one array gives it back to the reserve, for the small commits that follow.
+    /// The chunks of a body of more than one go back as a burst's ([HeapPool#releaseBurst(byte\[\])]): the next
+    /// large body takes them again, from the reserve within its bounds and past them from the overflow this body holds
+    /// until they are all back, and once large bodies stop coming the pool's next collections free them. A body of
+    /// one array gives it back to the reserve, for the small commits that follow.
     void release() {
         if (split()) {
             // The arrays of the section, which a bulk commit's run may let go of once the value frames are durable
