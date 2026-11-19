@@ -18,13 +18,13 @@ import java.util.HashMap;
 /// cache with room evicts nothing to take them, and keeps a key space small enough to fit for the next scan.
 ///
 /// A cursor of a paged key space's reads screens the leaves and blobs it admits as a scan, and the branches of level 1
-/// it reads while it admits: the cache takes one only at its fourth read
+/// it reads while it admits: the cache takes one only at its fourth read from the file
 /// ([PageCache#putScreened(long, PageRef, byte\[\], int)] with [PageCache#SCAN]), as most of the pages of a chat a
 /// client opens are read once, and most of those read two or three times are not read again. A unit the cache refused
 /// lately and still reaches weakly is [recalled][PageFile#recalled(PageRef, byte, int)] before the cursor reads
-/// anything ahead or from the file: its second and third reads read nothing and leave the array where it was, and its
-/// fourth caches that array. The cursor keeps the branches on its path, so it never reads a branch the cache refused
-/// twice in one scan.
+/// anything ahead or from the file: its second, third and fourth reads read nothing and leave the array where it was,
+/// and its fifth caches that array, a read later than a read from the file would, as a recall costs next to nothing.
+/// The cursor keeps the branches on its path, so it never reads a branch the cache refused twice in one scan.
 ///
 /// A cursor made to gather reads ahead while the reads of the file are [cold][PageFile#coldReads()]. When it needs a
 /// leaf that neither the cache nor its own reads ahead hold, it reads that leaf together with the next siblings under
