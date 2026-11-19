@@ -299,16 +299,15 @@ final class SpillQueue {
         return true;
     }
 
-    /// {@return the place in the log of a value a recovery replays into a [PackedRun]: the `length` bytes at `bodyIndex`
-    /// of `frame`, the opened body of the frame at `frameOffset` of `segment`, which holds it durably, of the write
-    /// stamped `stamp`, tagged where they lie}
+    /// Tags a value a recovery replays into a [PackedRun], the `length` bytes at `bodyIndex` of `frame`, the opened
+    /// body of a frame the log holds durably, of the write stamped `stamp`, where they lie, and counts it among the
+    /// values in the log. The tag is left in `crypto` ([Crypto#tagHigh()], [Crypto#tagLow()]), which the run records
+    /// with the value's place, so no [LogValue] is made per value.
     ///
     /// @param crypto the caller's, until it gives it back ([#takeCrypto()])
-    LogValue tagReplayed(Crypto crypto, LogSegmentView segment, long frameOffset, int bodyIndex, long stamp, byte[] frame,
-                         int length) {
-        var logged = crypto.logValue(segment, frameOffset, bodyIndex, stamp, frame, bodyIndex, length);
+    void tagReplayedInto(Crypto crypto, long stamp, byte[] frame, int bodyIndex, int length) {
+        crypto.tagOnly(frame, bodyIndex, length, stamp);
         loggedValues.incrementAndGet();
-        return logged;
     }
 
     /// Queues `record`, of a published commit after every one queued, and starts moving values if the queue is over
@@ -1024,6 +1023,32 @@ final class SpillQueue {
             }
             tag(value, offset, length, stamp);
             return new LogValue(segment, frameOffset, bodyIndex, first, (int) second);
+        }
+
+        /// Tags the `length` bytes at `offset` of `value`, the value of the version stamped `stamp`, as
+        /// [#logValue(LogSegmentView, long, int, long, byte\[\], int, int)] tags them, leaving the tag in [#tagHigh()]
+        /// and [#tagLow()] until the next tag.
+        void tagOnly(byte[] value, int offset, int length, long stamp) {
+            if (keys == null) {
+                crc.reset();
+                crc.update(value, offset, length);
+                first = 0;
+                second = (int) crc.getValue();
+                return;
+            }
+            tag(value, offset, length, stamp);
+        }
+
+        /// {@return the high part of the last tag [#tagOnly(byte\[\], int, int, long)] made, as [LogValue#tagHigh()]
+        /// keeps it}
+        long tagHigh() {
+            return first;
+        }
+
+        /// {@return the low part of the last tag [#tagOnly(byte\[\], int, int, long)] made, as [LogValue#tagLow()]
+        /// keeps it}
+        int tagLow() {
+            return (int) second;
         }
 
         /// Decrypts the `length` bytes after the first `skip` of `sealed` into `target` from `offset`: the bytes from the

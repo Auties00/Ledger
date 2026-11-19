@@ -173,10 +173,10 @@ public final class LiveLedger implements Ledger {
     // The log bytes, and the heap by the log's estimate, of the commits the open replayed, which the trees lack
     private long replayedBytes;
     private long replayedHeap;
-    // The stamp of the first write the open replays, from its first replayed commit, before the store attaches its log,
-    // until endReplay, and Long.MAX_VALUE otherwise: a replayed put of a resident key space of byte arrays overwrites in
-    // place the array of a version stamped from it ([Applier#replayedArray(Version, int)])
-    private long replayedFrom = Long.MAX_VALUE;
+    // Whether the open is replaying its log, from its first replayed commit, before the store attaches its log, until
+    // endReplay: a replayed put of a resident key space of byte arrays then overwrites in place the array of the version
+    // it replaces ([Applier#replayedArray(Version, int)])
+    private boolean replayingOpen;
     // Whether a prune left a chain that a later one may shorten, so the sweep has work; guarded by the publishing role
     private boolean sweepPending;
     // Whether the sweep's current pass over the store found such a chain
@@ -440,26 +440,39 @@ public final class LiveLedger implements Ledger {
         var missing = new boolean[1];
         // The puts the queue lists, for the room of the commit's record
         var listed = new int[1];
+        // The writes that may go to chains, which size the applier's list of the keys the commit touched: not those of
+        // a key space whose writes go to its run, nearly all of a long log's
+        var chained = new int[1];
         // The kinds and key spaces of the writes alone, with no slice of a key or a value
         FrameBody.readCommitKinds(body, start, length, new FrameBody.KindVisitor() {
             @Override
             public void put(int keyspace) {
                 loadForReplay(keyspace);
-                if (queue != null && !moves) {
-                    var state = byId.get(keyspace);
-                    if (state != null && replayHint(state) == TreeSearch.BLIND) {
-                        listed[0]++;
-                    }
+                var state = byId.get(keyspace);
+                if (state == null) {
+                    return;
+                }
+                var blind = replayHint(state) == TreeSearch.BLIND;
+                if (!blind || !moves) {
+                    chained[0]++;
+                }
+                if (blind && queue != null && !moves) {
+                    listed[0]++;
                 }
             }
 
             @Override
             public void remove(int keyspace) {
                 loadForReplay(keyspace);
+                var state = byId.get(keyspace);
+                if (state != null && (!moves || replayHint(state) != TreeSearch.BLIND)) {
+                    chained[0]++;
+                }
             }
 
             @Override
             public void putExternal(int keyspace, long length, PageRef ref) {
+                chained[0]++;
                 loadForReplay(keyspace);
                 if (blobs == null || missing[0]) {
                     missing[0] = true;
@@ -490,10 +503,10 @@ public final class LiveLedger implements Ledger {
         var next = new int[1];
         // Only for the open's replay, before the store attaches its log and starts the threads that read, checkpoint
         // or tick: a commit replayed into an open store overwrites no array
-        if (replayedFrom == Long.MAX_VALUE && log == null && checkpointer == null) {
-            replayedFrom = Reads.stamp(sequence, 0);
+        if (!replayingOpen && log == null && checkpointer == null) {
+            replayingOpen = true;
         }
-        var applier = new Applier(sequence, null, 4, false, false, 0, true);
+        var applier = new Applier(sequence, null, chained[0], false, false, 0, true);
         // The writes that went to runs rather than to chains
         var runWrites = new int[1];
         // Made at the first put the queue lists, so a commit with none allocates no record
@@ -518,48 +531,62 @@ public final class LiveLedger implements Ledger {
             }
 
             @Override
-            public void put(int keyspace, MemorySegment key, MemorySegment value) {
+            public void put(int keyspace, int keyAt, int keyLength, int valueAt, int bytes) {
                 var state = byId.get(keyspace);
                 if (state == null) {
                     return;
                 }
                 if (replayHint(state) != TreeSearch.BLIND) {
-                    applier.put(state, key, value, state.resident ? residentValue(state, null, value) : null);
+                    if (state.resident && state.keyspace.values() == BuiltinCodecs.BYTES_VALUE) {
+                        var hash = Segments.hash(body, keyAt, keyLength);
+                        if (!applier.putReplayedBytes(state, body, keyAt, keyLength, hash, valueAt, bytes)) {
+                            var key = view.asSlice(keyAt, keyLength);
+                            applier.put(state, applier.claim(state, key, hash), key, view.asSlice(valueAt, bytes), null,
+                                    false, null, null, 0, null, TreeSearch.UNKNOWN, null);
+                        }
+                        return;
+                    }
+                    var value = view.asSlice(valueAt, bytes);
+                    applier.put(state, view.asSlice(keyAt, keyLength), value,
+                            state.resident ? residentValue(state, null, value) : null);
                     return;
                 }
-                var bytes = Math.toIntExact(value.byteSize());
-                var run = moves ? runFor(state, key, values, bytes >= SpillQueue.LOG_VALUE_MIN ? segment : null, bytes) : null;
+                // Hashed once for both the lookup of its chain and the run's table
+                var hash = moves ? Segments.hash(body, keyAt, keyLength) : 0;
+                var run = moves ? runFor(state, body, keyAt, keyLength, hash, values,
+                        bytes >= SpillQueue.LOG_VALUE_MIN ? segment : null, bytes) : null;
                 if (run != null) {
                     var stamp = applier.nextStamp();
                     if (bytes >= SpillQueue.LOG_VALUE_MIN) {
-                        // Where the value starts in the body: the address of a slice of the body's view
-                        var at = Math.toIntExact(value.address());
                         if (!noted[0]) {
                             queue.noteReplayed(sequence, segment);
                             noted[0] = true;
                         }
-                        var logged = queue.tagReplayed(values.crypto(queue), segment, frameOffset, at, stamp, body, bytes);
-                        run.putLogged(key, stamp, logged, bytes);
+                        var crypto = values.crypto(queue);
+                        queue.tagReplayedInto(crypto, stamp, body, valueAt, bytes);
+                        run.putLogged(body, keyAt, keyLength, hash, stamp, segment, frameOffset, valueAt,
+                                crypto.tagHigh(), crypto.tagLow(), bytes);
                     } else if (ReplayValues.shared(bytes)) {
-                        var at = values.copy(value, 0, bytes);
-                        run.put(key, stamp, values.view(), at, bytes);
+                        var at = values.copy(body, valueAt, bytes);
+                        run.put(body, keyAt, keyLength, hash, stamp, values.view(), at, bytes);
                     } else {
-                        run.put(key, stamp, null, 0, 0);
+                        run.put(body, keyAt, keyLength, hash, stamp, null, 0, 0);
                     }
                     runWrites[0]++;
                     return;
                 }
+                var key = view.asSlice(keyAt, keyLength);
+                var value = view.asSlice(valueAt, bytes);
                 if (moves && bytes >= SpillQueue.LOG_VALUE_MIN) {
-                    // On the body for as long as it takes to tag it there: a slice of the body's view, whose address
-                    // is where it starts in the body
-                    var at = Math.toIntExact(value.address());
-                    applier.put(state, applier.claim(state, key), key, value, null, false, view, null, at, null,
-                            replayHint(state, key, values), null);
+                    // On the body for as long as it takes to tag it there: a slice of the body's view, at valueAt
+                    applier.put(state, applier.claim(state, key, hash), key, value, null, false, view, null, valueAt,
+                            null, replayHint(state, key, values), null);
                     if (!noted[0]) {
                         queue.noteReplayed(sequence, segment);
                         noted[0] = true;
                     }
-                    if (!queue.moveReplayed(values.crypto(queue), applier.lastVersion(), segment, frameOffset, at, body)) {
+                    if (!queue.moveReplayed(values.crypto(queue), applier.lastVersion(), segment, frameOffset, valueAt,
+                            body)) {
                         // The version stays on the body, which no later frame may then be opened into
                         values.keepFrame();
                     }
@@ -570,28 +597,31 @@ public final class LiveLedger implements Ledger {
                     if (record[0] == null) {
                         record[0] = queue.record(sequence, listed[0]);
                     }
-                    // Where the value starts in the frame's body, its address in the body's view
-                    record[0].add(applier.lastVersion(), Math.toIntExact(value.address()), bytes);
+                    // Where the value starts in the frame's body
+                    record[0].add(applier.lastVersion(), valueAt, bytes);
                 }
             }
 
             @Override
-            public void delete(int keyspace, MemorySegment key) {
+            public void delete(int keyspace, int keyAt, int keyLength) {
                 var state = byId.get(keyspace);
                 if (state != null) {
                     var hint = replayHint(state);
                     if (hint == TreeSearch.BLIND) {
-                        var run = moves ? runFor(state, key, values, null, 0) : null;
+                        var hash = moves ? Segments.hash(body, keyAt, keyLength) : 0;
+                        var run = moves ? runFor(state, body, keyAt, keyLength, hash, values, null, 0) : null;
                         if (run != null) {
-                            run.delete(key, applier.nextStamp());
+                            run.delete(body, keyAt, keyLength, hash, applier.nextStamp());
                             runWrites[0]++;
                             return;
                         }
                         // On the key's chain, opened as a commit of the pipeline opens it: the other path checks first
                         // that the key exists, which a blind hint answers no for any key memory holds no version of
-                        applier.delete(state, applier.claim(state, key), key, replayHint(state, key, values));
+                        var key = view.asSlice(keyAt, keyLength);
+                        applier.delete(state, moves ? applier.claim(state, key, hash) : applier.claim(state, key), key,
+                                replayHint(state, key, values));
                     } else {
-                        applier.delete(state, key);
+                        applier.delete(state, view.asSlice(keyAt, keyLength));
                     }
                 }
             }
@@ -631,10 +661,11 @@ public final class LiveLedger implements Ledger {
         }
         values.end(spills);
         // No write overwrites a version's array from now on
-        replayedFrom = Long.MAX_VALUE;
+        replayingOpen = false;
     }
 
-    /// {@return the builder of the run of `state` that takes a replayed write of `key`, or `null` if the write goes to a
+    /// {@return the builder of the run of `state` that takes a replayed write of the key that is the `keyLength` bytes at
+    /// `keyAt` of `body`, whose hash is `hash` ([Segments#hash(byte\[\], int, int)]), or `null` if the write goes to a
     /// chain: the key space replays to chains from its first range removal, memory holds a chain of the key, or the
     /// builder is full}
     ///
@@ -644,10 +675,11 @@ public final class LiveLedger implements Ledger {
     ///
     /// @param segment the log segment of the value the write moves there, or `null` for a write of none
     /// @param length the bytes of the value the write puts, 0 for a removal
-    private static PackedRun.Builder runFor(KeyspaceState state, MemorySegment key, ReplayValues values,
-                                            LogSegmentView segment, int length) {
+    private static PackedRun.Builder runFor(KeyspaceState state, byte[] body, int keyAt, int keyLength, int hash,
+                                            ReplayValues values, LogSegmentView segment, int length) {
         var run = values.run(state);
-        return run != null && run.takes(key, segment, length) && state.chain(key) == null ? run : null;
+        return run != null && run.takes(keyLength, segment, length) && state.chain(body, keyAt, keyLength, hash) == null
+                ? run : null;
     }
 
     /// Publishes the run `builder` of `state` holds, the open's writes of the key space kept in arrays, over the tree the
@@ -3153,22 +3185,34 @@ public final class LiveLedger implements Ledger {
         }
 
         /// {@return the array of `head`, the version a put of a value of `length` bytes this replayed commit applies
-        /// to a resident key space of byte arrays replaces, if the put may overwrite it in place: `head` was made by
-        /// the open's replay, on an array of its own of that length, and no unit of the file of large values holds it;
-        /// or `null`}
+        /// to a resident key space of byte arrays replaces, if the put may overwrite it in place: the commit is one of
+        /// the open's replay, `head` keeps the value on an array of its own of that length, which is the value it
+        /// decodes to, and no unit of the file of large values holds it; or `null`}
         ///
-        /// The open's replay makes such an array for each put it replays and keeps it only on the version, so a key
-        /// overwritten with values of one length takes one array for the whole replay rather than one per put. The new
-        /// version and the one it replaces then share the array, which holds the new value, until a prune drops the
-        /// older: an exception to [Version#ownArray()]'s rule that a version's array is never written, which holds
-        /// only because nothing reads the older one's value meanwhile. No reader, snapshot, checkpoint or ticker exists
-        /// until the open returns, and every write after the replay applies with no such overwrite; the resident loader
-        /// reads only the trees' pages, and its versions, stamped by the checkpoint, come before the replay's; the spill
-        /// queue lists only versions of paged key spaces; and what the replay itself reads of a replaced version (its
-        /// existence for the counts, its stamp for the prunes, range removals and sweeps, its unit for the file of large
-        /// values) is never its value's bytes. Nothing pools or deduplicates versions' arrays by identity.
+        /// Such an array is one the open made: the resident loader's, for a version of the trees the store opened from,
+        /// or the replay's, for a put it replayed before. Either keeps it only on that version, so a key overwritten with
+        /// values of one length takes one array for the whole open rather than one per put, and the trees' array is
+        /// written rather than dropped. The new version and the one it replaces then share the array, which holds the
+        /// new value, until a prune drops the older: an exception to [Version#ownArray()]'s rule that a version's array
+        /// is never written, which holds only because nothing reads the older one's value meanwhile:
+        /// - the loader of a resident key space installs all of it before the key space's first replayed write, on the
+        ///   opening thread ([ResidentLoader#loadNow()], from the replay's first pass over each commit), and no loader
+        ///   thread starts before the open returns, so no loader is running while the replay writes;
+        /// - the loader gives each version of a key space of byte arrays an array of its own, a copy decoded from the
+        ///   page, which only that version holds;
+        /// - no reader, snapshot, checkpoint or ticker exists until the open returns, every checkpoint after it cuts at
+        ///   or after the last replayed commit, so it writes the newest version of the key, and a version the loader
+        ///   made is in the trees already, so no checkpoint writes it again;
+        /// - every write after the replay applies with no such overwrite, and a commit replayed into an open store makes
+        ///   none;
+        /// - the spill queue lists only versions of paged key spaces, and what the replay itself reads of a replaced
+        ///   version (its existence for the counts, its stamp for the prunes, range removals and sweeps, its unit for
+        ///   the file of large values) is never its value's bytes.
+        ///
+        /// Nothing pools or deduplicates versions' arrays by identity. A key space with a codec of its own decodes to
+        /// an object other than the array, so its arrays are never written.
         private byte[] replayedArray(Version head, int length) {
-            if (head == null || head.stamp < replayedFrom || head.external() != null) {
+            if (head == null || !replayingOpen || head.external() != null) {
                 return null;
             }
             var own = head.ownArray();
@@ -3303,12 +3347,61 @@ public final class LiveLedger implements Ledger {
         ///
         /// The claim keeps a prune that runs beside it, of a commit published before, from dropping the chain.
         Chain claim(KeyspaceState state, MemorySegment key) {
+            return claim(state, key, Segments.hash(key));
+        }
+
+        /// {@return the chain of `key`, whose hash is `hash` ([Segments#hash(MemorySegment)]), claimed as
+        /// [#claim(KeyspaceState, MemorySegment)] claims it}
+        Chain claim(KeyspaceState state, MemorySegment key, int hash) {
             while (true) {
-                var chain = state.open(key);
+                var chain = state.open(key, hash);
                 if (chain.claimAlone(sequence)) {
                     return chain;
                 }
             }
+        }
+
+        /// Applies a replayed put to `state`, a resident key space of byte arrays, of the value that is the `length`
+        /// bytes at `valueAt` of `body`, under the key that is the `keyLength` bytes at `keyAt`, whose hash is `hash`
+        /// ([Segments#hash(byte\[\], int, int)]), with no slice of either, when the version memory holds of the key
+        /// alone says whether the key existed: the key space has no range removal, and its chain is reachable, has a
+        /// version older than the put and takes the claim. It then applies the put as
+        /// [#put(KeyspaceState, MemorySegment, MemorySegment, Object)] would, the value on an array of its own or, in
+        /// the open's replay, in the array of the version it replaces ([#replayedArray(Version, int)]).
+        ///
+        /// @return whether it applied the put; if not, nothing changed, and the caller applies it with slices
+        boolean putReplayedBytes(KeyspaceState state, byte[] body, int keyAt, int keyLength, int hash, int valueAt,
+                                 int length) {
+            // Every case that falls back is decided before the put takes a stamp
+            if (state.removals.length != 0 || op > Reads.MAX_OPS) {
+                return false;
+            }
+            var chain = state.chain(body, keyAt, keyLength, hash);
+            if (chain == null) {
+                return false;
+            }
+            var head = chain.head;
+            // A head older than the put is the version a reader at the put's bound resolves to, with no range removal
+            if (head == null || head.stamp >= Reads.stamp(sequence, op) || !chain.reachable()
+                    || !chain.claimAlone(sequence)) {
+                return false;
+            }
+            var stamp = nextStamp();
+            var existed = head.removes() ? TreeSearch.ABSENT : TreeSearch.FOUND;
+            var copy = replayedArray(head, length);
+            if (copy != null) {
+                System.arraycopy(body, valueAt, copy, 0, length);
+            } else {
+                copy = Arrays.copyOfRange(body, valueAt, valueAt + length);
+            }
+            var version = Version.ofOwn(stamp, copy, copy, head, null);
+            chain.attach(version);
+            touched.add(new Touched(state, chain, version, false));
+            replace(head);
+            if (existed == TreeSearch.ABSENT) {
+                addDelta(state, 1);
+            }
+            return true;
         }
 
         /// Applies a put of `key`, whose chain is `chain`, in the order and without the race the caller ensures.

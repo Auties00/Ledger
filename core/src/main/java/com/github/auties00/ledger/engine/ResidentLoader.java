@@ -401,7 +401,9 @@ final class ResidentLoader {
                 var value = TreeSearch.value(pages, leaf, offset, false);
                 var decoded = values.decode(value);
                 // A version on an array of its own, not on the leaf, which would stay reachable while one of its
-                // entries does; the decoded array is the encoding, of which the version keeps one copy
+                // entries does; the decoded array is the encoding, of which the version keeps one copy. The array must
+                // be a fresh one that no other version, page or cache holds: the open's replay writes a later value of
+                // the key into it in place (LiveLedger.Applier#replayedArray)
                 var version = decoded instanceof byte[] bytes && values == BuiltinCodecs.BYTES_VALUE
                         ? new Version(stamp, bytes, decoded, null)
                         : new Version(stamp, Segments.toBytes(value), decoded, null);

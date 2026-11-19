@@ -70,7 +70,23 @@ final class ReplayValues {
         return at;
     }
 
-    /// {@return the read-only view of the chunk the last [#copy(MemorySegment, long, int)] copied into}
+    /// Copies the `length` bytes at `offset` of `array` as [#copy(MemorySegment, long, int)] copies those of a segment.
+    ///
+    /// @return where the copy starts in [#view()]
+    int copy(byte[] array, int offset, int length) {
+        if (chunk == null || fill > CHUNK_BYTES - length) {
+            chunk = new byte[CHUNK_BYTES];
+            view = MemorySegment.ofArray(chunk).asReadOnly();
+            fill = 0;
+        }
+        var at = fill;
+        System.arraycopy(array, offset, chunk, at, length);
+        fill = at + length;
+        return at;
+    }
+
+    /// {@return the read-only view of the chunk the last [#copy(MemorySegment, long, int)] or
+    /// [#copy(byte\[\], int, int)] copied into}
     MemorySegment view() {
         return view;
     }

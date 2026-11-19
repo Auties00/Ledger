@@ -712,6 +712,8 @@ class PackedRunTest {
         var stamp = new long[1];
         // Where the keys end and how many started a chunk early, as the builder places them
         var placed = new int[2];
+        // Each key reaches the builder at an offset of a larger array, as a replayed key lies in its frame body
+        var offsets = new Random(seed ^ 0x0FF5E7L);
         Consumer<byte[]> write = key -> {
             var wrapped = ByteBuffer.wrap(key);
             if (!model.containsKey(wrapped)) {
@@ -722,19 +724,23 @@ class PackedRunTest {
                 }
                 placed[0] = start + key.length;
             }
-            var segment = MemorySegment.ofArray(key);
-            assertTrue(builder.takes(segment, null, 100));
+            assertTrue(builder.takes(MemorySegment.ofArray(key), null, 100));
+            var from = offsets.nextInt(16);
+            var body = new byte[from + key.length + offsets.nextInt(16)];
+            offsets.nextBytes(body);
+            System.arraycopy(key, 0, body, from, key.length);
+            var hash = Segments.hash(body, from, key.length);
             var kind = random.nextInt(8);
             if (kind == 0) {
-                builder.delete(segment, stamp[0]++);
+                builder.delete(body, from, key.length, hash, stamp[0]++);
                 model.put(wrapped, null);
             } else if (kind == 1) {
-                builder.put(segment, stamp[0]++, null, 0, 0);
+                builder.put(body, from, key.length, hash, stamp[0]++, null, 0, 0);
                 model.put(wrapped, new byte[0]);
             } else {
                 var length = 1 + random.nextInt(100);
                 var offset = random.nextInt(valueBytes.length - length);
-                builder.put(segment, stamp[0]++, valueChunk, offset, length);
+                builder.put(body, from, key.length, hash, stamp[0]++, valueChunk, offset, length);
                 model.put(wrapped, Arrays.copyOfRange(valueBytes, offset, offset + length));
             }
         };
@@ -858,6 +864,71 @@ class PackedRunTest {
             if (!model.containsKey(ByteBuffer.wrap(absent))) {
                 assertEquals(-1, builder.find(MemorySegment.ofArray(absent)));
             }
+        }
+    }
+
+    @ParameterizedTest(name = "seed {0}")
+    @ValueSource(ints = {1, 2, 3})
+    @DisplayName("a builder given keys at unaligned offsets of larger arrays hashes and places each as a bulk commit's builder places it given as a segment, and finds a key it holds rather than adding it again")
+    void keysFromArraysAsSegments(int seed) {
+        var random = new Random(seed);
+        var fromArrays = new PackedRun.Builder();
+        var fromSegments = new PackedRun.Builder();
+        var keys = new ArrayList<byte[]>();
+        // The newest write of each key: whether it removes it
+        var removed = new TreeMap<ByteBuffer, Boolean>(Expected::compare);
+        var stamp = 0L;
+        while (fromArrays.size() < 30_000) {
+            byte[] key;
+            if (!keys.isEmpty() && random.nextInt(6) == 0) {
+                key = keys.get(random.nextInt(keys.size()));
+            } else {
+                // Short keys repeat by chance too, long ones cross the ends of the key chunks
+                key = new byte[random.nextInt(8) == 0 ? 1 + random.nextInt(KeyCodec.MAX_LENGTH) : 1 + random.nextInt(40)];
+                random.nextBytes(key);
+            }
+            var from = random.nextInt(24);
+            var body = new byte[from + key.length + random.nextInt(9)];
+            random.nextBytes(body);
+            System.arraycopy(key, 0, body, from, key.length);
+            var hash = Segments.hash(body, from, key.length);
+            var segment = MemorySegment.ofArray(key.clone()).asReadOnly();
+            assertEquals(Segments.hash(segment), hash);
+            assertTrue(fromArrays.takes(key.length, null, 0));
+            var held = fromArrays.find(segment);
+            var size = fromArrays.size();
+            var removes = random.nextInt(4) == 0;
+            if (removes) {
+                fromArrays.delete(body, from, key.length, hash, stamp);
+            } else {
+                fromArrays.put(body, from, key.length, hash, stamp, null, 0, 0);
+            }
+            stamp++;
+            removed.put(ByteBuffer.wrap(key), removes);
+            var entry = fromArrays.find(segment, hash);
+            assertEquals(removes, fromArrays.removes(entry));
+            if (held >= 0) {
+                assertEquals(held, entry);
+                assertEquals(size, fromArrays.size());
+                continue;
+            }
+            keys.add(key);
+            assertEquals(size, entry);
+            assertEquals(entry, fromSegments.putHome(segment, Segments.hash(segment), stamp, null, 0, 0));
+        }
+        var arrays = fromArrays.build(null, null);
+        var segments = fromSegments.build(null, null);
+        assertEquals(segments.size(), arrays.size());
+        assertArrayEquals(segments.keyChunkLengthsForTests(), arrays.keyChunkLengthsForTests());
+        for (var entry = 0; entry < arrays.size(); entry++) {
+            assertEquals(0, Segments.compare(segments.key(entry), arrays.key(entry)));
+        }
+        for (var i = 0; i < keys.size(); i++) {
+            var key = keys.get(i);
+            assertEquals(i, arrays.find(MemorySegment.ofArray(key)));
+            assertEquals(i, arrays.find(key));
+            assertEquals(i, segments.find(MemorySegment.ofArray(key)));
+            assertEquals(removed.get(ByteBuffer.wrap(key)), arrays.removes(i));
         }
     }
 
