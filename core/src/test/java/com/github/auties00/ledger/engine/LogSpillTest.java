@@ -1,5 +1,6 @@
 package com.github.auties00.ledger.engine;
 
+import com.github.auties00.ledger.Commit;
 import com.github.auties00.ledger.Encryption;
 import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
@@ -8,8 +9,10 @@ import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.View;
+import com.github.auties00.ledger.testkit.ChangeInterceptor;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -34,6 +37,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -2474,6 +2480,433 @@ class LogSpillTest {
         }
         try (var ledger = openSized(directory, encrypted, 0, Duration.ZERO, 16L << 20)) {
             verify(ledger, expected);
+        }
+    }
+
+    /// Commits a bulk batch of `count` messages from `first` of 100 to 300 bytes, as an app-state snapshot's: short
+    /// values whose move one by one would not pay, but some long enough that the commit lists them, about 200 bytes
+    /// each, so a split frame's value frames hold the homes of the run the commit keeps them in; records them in
+    /// `expected`.
+    ///
+    /// @return the commit, not waited for
+    private static Commit writeBulk(Ledger ledger, TreeMap<Integer, byte[]> expected, int first, int count) {
+        var batch = ledger.newBatch();
+        for (var message = first; message < first + count; message++) {
+            var value = large(message, 100 + message % 201);
+            batch.put(MESSAGES, key(message), value);
+            expected.put(message, value);
+        }
+        return ledger.commit(batch);
+    }
+
+    /// {@return the run of the bulk commit of `MESSAGES`}
+    private static PackedRun bulkRun(LiveLedger ledger) {
+        var run = ledger.state(MESSAGES).run;
+        assertNotNull(run, "the bulk commit made no run");
+        assertTrue(run.committed());
+        return run;
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a bulk commit of 10 MB of short values lets go of every home of its run once durable, before its wait returns, and reads each back from its value frame at the first read, before and after a checkpoint and a reopen")
+    void framedHomes(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = openSized(directory, encrypted, 1 << 20, Duration.ZERO, 64L << 20)) {
+            writeBulk(ledger, expected, 0, 50_000).awaitDurable();
+            var run = bulkRun(ledger);
+            var homes = run.framedHomesForTests();
+            assertTrue(homes > 30, homes + " homes let go of");
+            assertEquals(0, run.homesForTests(), "homes the run still holds once its commit's wait returned");
+            assertTrue(ledger.spills().droppedHomesForTests() >= SpillQueue.FRAMED_HOMES_MIN);
+            assertEquals(0, ledger.spills().eagerSequencesForTests().length, "a record of the dropped homes still queued");
+            // The first read of a value reads its home back, and the home stays
+            assertArrayEquals(expected.get(7), ledger.get(MESSAGES, key(7)).orElseThrow());
+            assertEquals(1, run.homesForTests());
+            verifyLarge(ledger, expected);
+            assertEquals(homes, run.homesForTests(), "every home read back");
+            ledger.checkpoint();
+            verifyLarge(ledger, expected);
+            // A second bulk commit, over a tree that holds the first: its puts go to chains, whose versions keep their
+            // arrays as they did
+            var more = ledger.newBatch();
+            for (var message = 50_000; message < 50_100; message++) {
+                var value = large(message, 300);
+                more.put(MESSAGES, key(message), value);
+                expected.put(message, value);
+            }
+            ledger.commit(more).awaitDurable();
+            verifyLarge(ledger, expected);
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = openSized(directory, encrypted, 1 << 20, Duration.ZERO, 64L << 20)) {
+            verifyLarge(ledger, expected);
+            ledger.checkpoint();
+            verifyLarge(ledger, expected);
+        }
+    }
+
+    @Test
+    @DisplayName("a bulk commit's checkpoint reads back every home its run let go of before it merges the run, and the close's checkpoint does too")
+    void framedHomesCheckpoint(@TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = openSized(directory, true, 1 << 20, Duration.ZERO, 64L << 20)) {
+            writeBulk(ledger, expected, 0, 50_000).awaitDurable();
+            var run = bulkRun(ledger);
+            assertEquals(0, run.homesForTests());
+            ledger.checkpoint();
+            assertEquals(run.framedHomesForTests(), run.homesForTests(), "homes the checkpoint read back");
+            verifyLarge(ledger, expected);
+        }
+        // The close's checkpoint, of a store whose tree is empty before the bulk commit, as a bulk commit needs
+        var second = directory.resolve("second");
+        var written = new TreeMap<Integer, byte[]>();
+        try (var ledger = openSized(second, true, 1 << 20, Duration.ZERO, 64L << 20)) {
+            writeBulk(ledger, written, 100_000, 50_000).awaitDurable();
+            assertEquals(0, bulkRun(ledger).homesForTests());
+        }
+        try (var ledger = openSized(second, true, 1 << 20, Duration.ZERO, 64L << 20)) {
+            verifyLarge(ledger, written);
+        }
+        try (var ledger = openSized(directory, true, 1 << 20, Duration.ZERO, 64L << 20)) {
+            verifyLarge(ledger, expected);
+        }
+    }
+
+    @Test
+    @DisplayName("a bulk commit of 4 MB of short values, under the homes a run lets go of, keeps them, and its record leaves the queue")
+    void smallBulkKeepsHomes(@TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = openSized(directory, true, 1 << 20, Duration.ZERO, 64L << 20)) {
+            writeBulk(ledger, expected, 0, 20_000).awaitDurable();
+            var run = bulkRun(ledger);
+            assertEquals(0, run.framedHomesForTests());
+            assertTrue(run.homesForTests() > 10);
+            assertEquals(0, ledger.spills().eagerSequencesForTests().length);
+            verifyLarge(ledger, expected);
+        }
+    }
+
+    @Test
+    @DisplayName("a bulk commit no one waits for lets go of its homes on the thread that moves values")
+    void framedHomesUnwaited(@TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = openSized(directory, true, 1 << 20, Duration.ZERO, 64L << 20)) {
+            var commit = writeBulk(ledger, expected, 0, 50_000);
+            var run = bulkRun(ledger);
+            // Durable once the log's flush is done; the thread that moves values then lets go of the homes
+            while (ledger.log().durableSequence() < commit.sequence()) {
+                Thread.sleep(1);
+            }
+            var spills = ledger.spills();
+            for (var waited = 0; run.framedHomesForTests() == 0; waited++) {
+                assertTrue(waited < 10_000, "the homes never left");
+                spills.awaitIdleForTests();
+                Thread.sleep(1);
+            }
+            spills.awaitIdleForTests();
+            assertEquals(0, spills.eagerSequencesForTests().length);
+            verifyLarge(ledger, expected);
+        }
+    }
+
+    @Test
+    @DisplayName("the homes a run let go of leave the heap: nothing but the run held them")
+    void framedHomesUnreachable() throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        var disk = CrashFileSystem.create();
+        try (var ledger = openSized(disk.getPath("/store"), true, 1 << 20, Duration.ZERO, 64L << 20)) {
+            ledger.commit(ledger.newBatch().put(CHATS, "warm", "x")).awaitDurable();
+            var reached = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            disk.intercept((path, kind) -> {
+                if (kind == ChangeInterceptor.ChangeKind.WRITE && path.toString().endsWith(".log")) {
+                    reached.countDown();
+                    try {
+                        assertTrue(release.await(2, TimeUnit.MINUTES));
+                    } catch (InterruptedException exception) {
+                        throw new java.io.IOException(exception);
+                    }
+                }
+            });
+            Commit commit;
+            List<WeakReference<Object>> weak;
+            try {
+                // A first commit whose group's write holds the writer, so the bulk commit's frames wait in the queue
+                ledger.commit(ledger.newBatch().put(CHATS, "first", "x"));
+                assertTrue(reached.await(2, TimeUnit.MINUTES));
+                commit = writeBulk(ledger, expected, 0, 50_000);
+                weak = homesOf(bulkRun(ledger));
+                assertTrue(weak.size() > 30);
+            } finally {
+                // Every later write passes the interceptor at once
+                release.countDown();
+            }
+            commit.awaitDurable();
+            for (var round = 0; round < 50 && weak.stream().anyMatch(reference -> reference.get() != null); round++) {
+                System.gc();
+                Thread.sleep(20);
+            }
+            assertTrue(weak.stream().allMatch(reference -> reference.get() == null), "a home let go of is still reachable");
+            verifyLarge(ledger, expected);
+        }
+    }
+
+    /// {@return a weak reference to each home `run` holds}
+    private static List<WeakReference<Object>> homesOf(PackedRun run) {
+        var homes = new ArrayList<WeakReference<Object>>();
+        for (var entry = 0; entry < run.size(); entry++) {
+            var home = run.sourceForTests(entry);
+            if (home != null && homes.stream().noneMatch(reference -> reference.get() == home)) {
+                homes.add(new WeakReference<>(home));
+            }
+        }
+        return homes;
+    }
+
+    @RepeatedTest(5)
+    @DisplayName("readers of a run's homes let go of read every value at once, each home read back by one of them, while a checkpoint merges the run")
+    void framedHomesConcurrentReads(@TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = openSized(directory, true, 1 << 20, Duration.ZERO, 64L << 20)) {
+            writeBulk(ledger, expected, 0, 50_000).awaitDurable();
+            var run = bulkRun(ledger);
+            var homes = run.framedHomesForTests();
+            assertEquals(0, run.homesForTests());
+            var start = new CountDownLatch(1);
+            var failures = new ConcurrentLinkedQueue<Throwable>();
+            var readers = new ArrayList<Thread>();
+            for (var reader = 0; reader < 8; reader++) {
+                var seed = reader;
+                readers.add(Thread.ofPlatform().start(() -> {
+                    try {
+                        start.await();
+                        var random = new Random(seed);
+                        for (var i = 0; i < 5_000; i++) {
+                            var message = random.nextInt(50_000);
+                            assertArrayEquals(expected.get(message), ledger.get(MESSAGES, key(message)).orElseThrow(), "message " + message);
+                        }
+                    } catch (Throwable failure) {
+                        failures.add(failure);
+                    }
+                }));
+            }
+            var checkpoint = Thread.ofPlatform().start(() -> {
+                try {
+                    start.await();
+                    ledger.checkpoint();
+                } catch (Throwable failure) {
+                    failures.add(failure);
+                }
+            });
+            start.countDown();
+            for (var reader : readers) {
+                reader.join();
+            }
+            checkpoint.join();
+            assertTrue(failures.isEmpty(), () -> failures.peek().toString());
+            assertEquals(homes, run.homesForTests());
+            verifyLarge(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "checkpoint before the wait: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a snapshot from before a checkpoint that takes a bulk commit's run reads every value of the run, the homes let go of included, while the checkpoint keeps the segment of their value frames, which retires once the snapshot closes")
+    void framedHomesSegmentKeptForSnapshot(boolean early, @TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = openSized(directory, true, 1 << 20, Duration.ZERO, 16L << 20)) {
+            var log = ledger.log();
+            var commit = writeBulk(ledger, expected, 0, 50_000);
+            var run = bulkRun(ledger);
+            var older = log.currentSegment();
+            var snapshot = ledger.snapshot();
+            var seen = new TreeMap<>(expected);
+            if (early) {
+                // A checkpoint whose publication may come before or after the run lets go of its homes
+                ledger.checkpoint();
+            }
+            commit.awaitDurable();
+            // Resident values, which never move, until the log rolls to a newer segment
+            for (var filler = 0; log.currentSegment() == older; filler++) {
+                ledger.commit(ledger.newBatch().put(CHATS, "f" + filler, "x".repeat(100_000))).awaitDurable();
+            }
+            ledger.checkpoint();
+            var spills = ledger.spills();
+            if (run.framedHomesForTests() > 0) {
+                assertTrue(Arrays.stream(spills.segmentsForTests()).anyMatch(number -> number == older),
+                        "the checkpoint retired the segment of the value frames a snapshot reads");
+            }
+            verifyLarge(snapshot, seen);
+            snapshot.close();
+            ledger.checkpointer().tick();
+            assertTrue(Arrays.stream(spills.segmentsForTests()).noneMatch(number -> number == older));
+            verifyLarge(ledger, expected);
+        }
+        try (var ledger = openSized(directory, true, 1 << 20, Duration.ZERO, 16L << 20)) {
+            verifyLarge(ledger, expected);
+        }
+    }
+
+    @Test
+    @DisplayName("a read of a home let go of whose value frame is damaged reports the damage, and the home stays let go of")
+    void framedHomeDamaged(@TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = openSized(directory, true, 1 << 20, Duration.ZERO, 64L << 20)) {
+            writeBulk(ledger, expected, 0, 50_000).awaitDurable();
+            var run = bulkRun(ledger);
+            assertTrue(run.framedHomesForTests() > 0);
+            var name = LogWriter.segmentName(ledger.log().currentSegment());
+            Path path;
+            try (var files = Files.walk(directory)) {
+                path = files.filter(file -> file.getFileName().toString().equals(name)).findFirst().orElseThrow();
+            }
+            // A byte of every value frame's body: the frames sit past the head, about 256 KiB each
+            try (var channel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                var size = channel.size();
+                var one = ByteBuffer.allocate(1);
+                for (var at = (long) LogWriter.SEGMENT_HEADER + 4_096; at < size; at += 8_192) {
+                    one.clear();
+                    channel.read(one, at);
+                    one.flip();
+                    var flipped = (byte) (one.get(0) ^ 0x40);
+                    channel.write(ByteBuffer.wrap(new byte[]{flipped}), at);
+                }
+            }
+            assertThrows(LedgerCorruptedException.class, () -> ledger.get(MESSAGES, key(7)));
+            assertEquals(0, run.homesForTests());
+            ledger.closeWithoutCheckpoint();
+        }
+    }
+
+    static IntStream framedSeeds() {
+        return IntStream.range(0, 12);
+    }
+
+    @ParameterizedTest(name = "seed {0}")
+    @MethodSource("framedSeeds")
+    @DisplayName("a store whose bulk commit's run let go of its homes recovers that commit and a state between its last durable commit and its last visible one, whether a crash or a loss of power stops it as it reads the homes back, writes after them, checkpoints them or closes")
+    void framedHomesRecoverAfterCrash(int seed) throws Exception {
+        var encrypted = seed % 2 == 0;
+        var dry = CrashFileSystem.create();
+        var counted = new FramedWorkload(seed, encrypted);
+        counted.run(dry.getPath("/store"));
+        assertTrue(counted.dropped, "the bulk commit's run let go of no home");
+        var disk = CrashFileSystem.create();
+        var random = new Random(seed * 7919L + 5);
+        // Past the bulk commit, durable before the workload goes on
+        disk.stopAfter(counted.bulkChanges + random.nextLong(dry.changes() - counted.bulkChanges + 1));
+        var workload = new FramedWorkload(seed, encrypted);
+        workload.run(disk.getPath("/store"));
+        var survivor = seed % 3 == 0 ? disk.afterProcessCrash() : disk.afterPowerLoss(new Random(random.nextLong()));
+        try (var ledger = open(survivor.getPath("/store"), encrypted, 0)) {
+            var read = new TreeMap<Integer, byte[]>();
+            ledger.forEach(MESSAGES, KeyRange.all(), (key, value) -> {
+                read.put(ByteBuffer.wrap(key).getInt(), value);
+                return true;
+            });
+            if (workload.bulkChanges == 0) {
+                // This run took more changes to make the bulk commit durable than the dry run, and stopped before it was
+                assertTrue(read.isEmpty() || read.size() == workload.bulk.size(), read.size() + " messages");
+                return;
+            }
+            for (var entry : workload.bulk.entrySet()) {
+                assertArrayEquals(entry.getValue(), read.remove(entry.getKey()), "bulk message " + entry.getKey());
+            }
+            var matched = false;
+            for (var commit = workload.durable; commit <= workload.visible && !matched; commit++) {
+                matched = sameMessages(read, workload.history.get(commit));
+            }
+            assertTrue(matched, "the store recovered a state no commit from " + workload.durable + " to " + workload.visible + " left");
+            for (var message = 100_000; message < 150_000; message += 97) {
+                assertArrayEquals(workload.bulk.get(message), ledger.get(MESSAGES, key(message)).orElseThrow(), "bulk message " + message);
+            }
+        }
+    }
+
+    /// {@return whether `read` holds exactly the messages of `expected`}
+    private static boolean sameMessages(TreeMap<Integer, byte[]> read, TreeMap<Integer, byte[]> expected) {
+        if (!read.keySet().equals(expected.keySet())) {
+            return false;
+        }
+        for (var entry : expected.entrySet()) {
+            if (!Arrays.equals(entry.getValue(), read.get(entry.getKey()))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// A workload drawn from a seed whose first commit is a durable bulk commit of 50,000 short messages, whose run lets
+    /// go of its homes, followed by reads of them, small batches of other keys, some durable, checkpoints and a close;
+    /// and the small batches' state after each commit, the last it made visible and the last it knows durable.
+    private static final class FramedWorkload {
+        private final Random random;
+        private final boolean encrypted;
+        final TreeMap<Integer, byte[]> bulk = new TreeMap<>();
+        final List<TreeMap<Integer, byte[]>> history = new ArrayList<>(List.of(new TreeMap<>()));
+        int visible;
+        int durable;
+        // The file system's changes once the bulk commit is durable, and whether its run let go of its homes
+        long bulkChanges;
+        boolean dropped;
+
+        FramedWorkload(int seed, boolean encrypted) {
+            this.random = new Random(seed);
+            this.encrypted = encrypted;
+        }
+
+        void run(Path directory) {
+            LiveLedger ledger = null;
+            try {
+                ledger = open(directory, encrypted, 0);
+                writeBulk(ledger, bulk, 100_000, 50_000).awaitDurable();
+                dropped = ledger.state(MESSAGES).run.framedHomesForTests() > 0;
+                bulkChanges = changes(directory);
+                for (var step = 0; step < 20; step++) {
+                    var choice = random.nextInt(10);
+                    if (choice == 0) {
+                        ledger.checkpoint();
+                        durable = visible;
+                    } else if (choice == 1) {
+                        for (var i = 0; i < 200; i++) {
+                            var message = 100_000 + random.nextInt(50_000);
+                            assertArrayEquals(bulk.get(message), ledger.get(MESSAGES, key(message)).orElseThrow());
+                        }
+                    } else {
+                        var next = new TreeMap<>(history.getLast());
+                        var batch = ledger.newBatch();
+                        for (var i = 0; i < 1 + random.nextInt(20); i++) {
+                            var message = random.nextInt(500);
+                            var value = large(message + step * 1_000, 100 + random.nextInt(2_000));
+                            batch.put(MESSAGES, key(message), value);
+                            next.put(message, value);
+                        }
+                        var commit = ledger.commit(batch);
+                        history.add(next);
+                        visible++;
+                        if (random.nextBoolean()) {
+                            commit.awaitDurable();
+                            durable = visible;
+                        }
+                    }
+                }
+                ledger.close();
+                durable = visible;
+            } catch (Exception | AssertionError failure) {
+                if (ledger != null) {
+                    try {
+                        ledger.close();
+                    } catch (RuntimeException _) {
+                        // The file system stopped: closing only lets go of the threads
+                    }
+                }
+            }
+        }
+
+        /// {@return the changes the file system of `directory` made so far}
+        private static long changes(Path directory) {
+            return ((CrashFileSystem) directory.getFileSystem()).changes();
         }
     }
 }

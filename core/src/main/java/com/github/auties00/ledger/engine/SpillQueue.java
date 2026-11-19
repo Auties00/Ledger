@@ -55,8 +55,8 @@ import java.util.zip.CRC32C;
 ///   own, of a transaction, or of one with a unit of [BlobFile]. A value a recovery copied to an array of its own
 ///   moves, to the log only;
 /// - of a commit whose values on shared arrays would take, once moved, more than half the bytes they take now
-///   ([Record#settle()]), a value shorter than [#PAYING_VALUE_MIN] counted at the array of its own it would take, or
-///   at its length if a bulk commit's run packs it in a chunk of its own: a value shorter than [#LOG_VALUE_MIN] goes
+///   ([Record#settle(long)]), a value shorter than [#PAYING_VALUE_MIN] counted at the array of its own it would take,
+///   or at its length if a bulk commit's run packs it in a chunk of its own: a value shorter than [#LOG_VALUE_MIN] goes
 ///   to such an array or chunk, which frees the array it shared only once every other value on it left too, and one
 ///   of 96 to 255 bytes goes to the log, saving less than 216 bytes of heap for a read back of its own by the next
 ///   checkpoint. So a commit of mostly short values, like an app-state snapshot of 100 to
@@ -67,6 +67,15 @@ import java.util.zip.CRC32C;
 ///
 /// The puts a bulk commit keeps in a run of its own ([PackedRun]) list in its record as the run's entries rather than as
 /// versions, and move as a version's value would, each by one switch of the entry's word ([RunValues]).
+///
+/// A bulk commit whose values on shared arrays stay, as moving them one by one would not pay, but whose frame was split
+/// may still free them if they are many ([Record#settle(long)]): its run lets go of each home a value frame holds whole
+/// ([PackedRun#dropHomes]), and reads it back from that frame at its first read, so a commit as large as an app-state
+/// snapshot leaves the heap with one store per home, no tag and no copy, at the cost of one positioned read of a home
+/// the first time a value on it is read. Such a record waits outside the budget, as the records whose values all leave
+/// once durable do, and its run lets go of the homes as soon as the frames are durable: on the thread of a commit that
+/// waits for its durability, before the wait returns ([#dropHomes(long)]), or on the thread that moves values. Its
+/// segment is noted as those of moved values are, so it stays while a reader may read the run.
 ///
 /// A recovery moves a value it replays that the log holds before its last budget of bytes at once, on its own thread,
 /// tagged where it lies in the frame body it came in
@@ -88,12 +97,12 @@ final class SpillQueue {
     /// third or less from 96 bytes; each for a positioned read back by the checkpoint that writes it. Below, the log
     /// saves too little heap to pay for the read.
     static final int LOG_VALUE_MIN = 96;
-    /// The shortest value that [Record#settle()] counts at the 40 bytes of its [LogValue]; a shorter one counts at the
-    /// array of its own it would take below [#LOG_VALUE_MIN], whether it goes to the log or not. A value of 96 to 255
-    /// bytes so moves to the log beside longer values whose move pays, as the arrays they share leave the heap only once
-    /// every value on them moved, but never makes a record's move pay alone: it saves less than 216 bytes for a read back
-    /// of its own, and a commit of thousands of them would leave its frame on the heap until the thread had tagged and
-    /// placed the last one.
+    /// The shortest value that [Record#settle(long)] counts at the 40 bytes of its [LogValue]; a shorter one counts at
+    /// the array of its own it would take below [#LOG_VALUE_MIN], whether it goes to the log or not. A value of 96 to
+    /// 255 bytes so moves to the log beside longer values whose move pays, as the arrays they share leave the heap only
+    /// once every value on them moved, but never makes a record's move pay alone: it saves less than 216 bytes for a
+    /// read back of its own, and a commit of thousands of them would leave its frame on the heap until the thread had
+    /// tagged and placed the last one.
     static final int PAYING_VALUE_MIN = 256;
     /// The bytes a [LogValue] takes on the heap.
     private static final int LOG_VALUE_BYTES = 40;
@@ -108,6 +117,11 @@ final class SpillQueue {
     /// The shortest value a read authenticates by the tag of its frame rather than by a tag of its own: below it, the
     /// set-up of an AES-GCM message per read costs more than the polynomials of the value.
     static final int FRAMED_VALUE_MIN = 16 << 10;
+    /// The fewest bytes of homes a bulk commit's run lets go of for its value frames ([Record#settle(long)]), unless
+    /// twice the budget is more: a commit several budgets large, as an app-state snapshot of 100,000 entries is, whose
+    /// first reads after it then read whole homes back, where a smaller one, such as a snapshot of 20,000 entries and
+    /// the patches read right after it, keeps its values where reads of a recent commit find them.
+    static final long FRAMED_HOMES_MIN = 8L << 20;
     /// The prime 2^61 - 1, the modulus of the polynomials of the tags.
     private static final long PRIME = (1L << 61) - 1;
     /// The bytes of a word of a tagged value: 7, so a word is below [#PRIME].
@@ -135,6 +149,9 @@ final class SpillQueue {
     // The sequence of the first record of eager, Long.MAX_VALUE when it is empty, which the log's durability path
     // reads without the lock; written holding the lock
     private volatile long eagerHead = Long.MAX_VALUE;
+    // The sequence of the first record of eager whose run still holds homes it lets go of once durable, Long.MAX_VALUE
+    // if none does, which a wait for durability reads without the lock; written holding the lock
+    private volatile long homesHead = Long.MAX_VALUE;
     // The segments values moved to, ordered by number, which no checkpoint has retired; guarded by the lock
     private final ArrayList<LogSegmentView> segments;
     // The bytes of values the records of the queue the budget counts list; written holding the lock
@@ -161,6 +178,8 @@ final class SpillQueue {
     private long drainedRoom;
     // The records whose values on shared arrays stay, as their move would not pay, for tests
     private final AtomicLong unpaidRecords = new AtomicLong();
+    // The bytes of homes the runs of bulk commits let go of for their value frames, for tests
+    private final AtomicLong droppedHomes = new AtomicLong();
 
     /// Creates the queue of a store.
     ///
@@ -321,10 +340,10 @@ final class SpillQueue {
         if (record.count == 0 && record.runs == null) {
             return;
         }
-        var settled = record.settle();
+        var settled = record.settle(Math.max(FRAMED_HOMES_MIN, 2 * budget));
         if (settled != Record.ALL) {
             unpaidRecords.incrementAndGet();
-            if (settled == Record.NONE) {
+            if (settled == Record.NONE && record.homes != Record.HOMES_HELD) {
                 record.release();
                 return;
             }
@@ -339,6 +358,9 @@ final class SpillQueue {
                     eagerHead = record.sequence;
                 }
                 eager.addLast(record);
+                if (record.homes == Record.HOMES_HELD && homesHead == Long.MAX_VALUE) {
+                    homesHead = record.sequence;
+                }
             } else {
                 records.addLast(record);
                 held = held + record.bytes;
@@ -450,6 +472,10 @@ final class SpillQueue {
                         eager.pollFirst();
                         var next = eager.peekFirst();
                         eagerHead = next == null ? Long.MAX_VALUE : next.sequence;
+                        if (record.homes == Record.HOMES_HELD) {
+                            dropLocked(record);
+                            homesHead = firstHomes();
+                        }
                     } else if (counted != null) {
                         record = counted;
                         records.pollFirst();
@@ -469,6 +495,65 @@ final class SpillQueue {
         } finally {
             giveBack(crypto);
         }
+    }
+
+    /// Lets the runs of the queued records up to `sequence`, which is durable, go of the homes they let go of once
+    /// durable ([Record#settle(long)]), on the caller's thread, unless the thread that moves values did already; a
+    /// record with no other value to move leaves the queue. Called as a wait for the durability of `sequence` returns,
+    /// so the commit's homes are gone by then whichever thread let go of them: each record's drop runs whole under the
+    /// queue's lock. Takes no lock when no such record is queued.
+    void dropHomes(long sequence) {
+        if (homesHead > sequence) {
+            return;
+        }
+        synchronized (lock) {
+            for (var iterator = eager.iterator(); iterator.hasNext(); ) {
+                var record = iterator.next();
+                if (record.sequence > sequence) {
+                    break;
+                }
+                if (record.homes != Record.HOMES_HELD) {
+                    continue;
+                }
+                dropLocked(record);
+                if (record.homesOnly()) {
+                    iterator.remove();
+                    record.release();
+                    drainedRecords.incrementAndGet();
+                }
+            }
+            var first = eager.peekFirst();
+            eagerHead = first == null ? Long.MAX_VALUE : first.sequence;
+            homesHead = firstHomes();
+        }
+    }
+
+    /// Lets the run of `record`, whose frames are durable, go of the homes it lets go of, and notes its segment, which
+    /// then stays while a reader may read the run; holding the lock.
+    private void dropLocked(Record record) {
+        record.homes = Record.HOMES_DROPPED;
+        if (record.segment == null) {
+            return;
+        }
+        // Before the first home leaves, as a moved value's commit is noted before it moves
+        note(record.segment, record.sequence);
+        droppedHomes.addAndGet(record.dropHomes());
+    }
+
+    /// {@return the sequence of the first record of eager whose run still holds homes it lets go of once durable, or
+    /// Long.MAX_VALUE}; holding the lock
+    private long firstHomes() {
+        for (var record : eager) {
+            if (record.homes == Record.HOMES_HELD) {
+                return record.sequence;
+            }
+        }
+        return Long.MAX_VALUE;
+    }
+
+    /// {@return the bytes of homes the runs of bulk commits let go of for their value frames so far; for tests}
+    long droppedHomesForTests() {
+        return droppedHomes.get();
     }
 
     /// Moves the values of every record whose commit `durableSequence` gives durable, whatever the budget, on the
@@ -491,9 +576,11 @@ final class SpillQueue {
             if ((record = eager.peekFirst()) != null && record.sequence <= cut) {
                 do {
                     eager.pollFirst();
+                    // A run whose homes the checkpoint holds keeps them: a later drop finds the record gone
                     record.release();
                 } while ((record = eager.peekFirst()) != null && record.sequence <= cut);
                 eagerHead = record == null ? Long.MAX_VALUE : record.sequence;
+                homesHead = firstHomes();
             }
             for (var segment : segments) {
                 if (segment.number() >= logStart) {
@@ -565,6 +652,7 @@ final class SpillQueue {
             }
             eager.clear();
             eagerHead = Long.MAX_VALUE;
+            homesHead = Long.MAX_VALUE;
         }
         retireAll();
     }
@@ -611,7 +699,7 @@ final class SpillQueue {
     }
 
     /// {@return the records whose values on shared arrays stay where they are, as moving them would not pay
-    /// ([Record#settle()]), whether or not the record's values on arrays of their own move; for tests}
+    /// ([Record#settle(long)]), whether or not the record's values on arrays of their own move; for tests}
     long unpaidRecordsForTests() {
         return unpaidRecords.get();
     }
@@ -664,12 +752,19 @@ final class SpillQueue {
         private int count;
         // The entries of the runs of the commit's bulk puts it lists, a run's at a time, or null before the first
         private RunValues[] runs;
-        /// The verdict of [#settle()] that every value of the record may move.
+        /// The verdict of [#settle(long)] that every value of the record may move.
         static final int ALL = 0;
-        /// The verdict of [#settle()] that only the record's values on arrays of their own may move.
+        /// The verdict of [#settle(long)] that only the record's values on arrays of their own may move.
         static final int OWN = 1;
-        /// The verdict of [#settle()] that no value of the record moves.
+        /// The verdict of [#settle(long)] that no value of the record moves.
         static final int NONE = 2;
+        /// The state of a record whose run keeps every home, as any record but those below.
+        static final byte HOMES_KEPT = 0;
+        /// The state of a record whose run lets go of its homes for its value frames once they are durable, until it
+        /// does.
+        static final byte HOMES_HELD = 1;
+        /// The state of a record whose run let go of its homes, or would have but for a written through group.
+        static final byte HOMES_DROPPED = 2;
 
         // The bytes of the values the record moves, whether one is at least LOG_VALUE_MIN, and the bytes of the
         // shortest
@@ -682,8 +777,11 @@ final class SpillQueue {
         private long sharedMoved;
         private long ownBytes;
         private int ownShortest = Integer.MAX_VALUE;
-        // Whether only the values on arrays of their own move ([#settle()])
+        // Whether only the values on arrays of their own move ([#settle(long)])
         private boolean ownOnly;
+        // Whether the record's runs let go of their homes for its value frames: HOMES_KEPT, HOMES_HELD or
+        // HOMES_DROPPED; written holding the queue's lock once the record is queued
+        private byte homes;
         // Set by the log writer as it seals the frame: the segment use, the frame's offset, where the commit's body
         // starts in the frame's body, the bytes of the frame's body, 0 if unknown, and whether the group was written
         // through; for a split commit, those of its head, and where its value frames lie
@@ -830,26 +928,75 @@ final class SpillQueue {
         /// for what its move costs, and leaves the heap it holds where it was. A value of at least [#LOG_VALUE_MIN] bytes
         /// on an array of its own frees that array whatever its record's other values do.
         ///
+        /// A record whose values on shared arrays stay may still free them if it lists the entries of a run of a split
+        /// commit and value frames hold whole homes of at least `homesMin` bytes of the run ([PackedRun#framedHomes]):
+        /// the run lets go of those homes once the frames are durable, a record outside the budget until then
+        /// ([#eager()]), whatever its verdict.
+        ///
         /// @return [#ALL], [#OWN] or [#NONE]
-        int settle() {
+        int settle(long homesMin) {
             if (sharedMoved <= sharedBytes / 2) {
                 return ALL;
             }
-            if (ownBytes == 0) {
-                return NONE;
+            if (runs != null && valueFrames != null && holdsHomes(homesMin)) {
+                homes = HOMES_HELD;
             }
             ownOnly = true;
+            if (ownBytes == 0) {
+                bytes = 0;
+                return NONE;
+            }
             bytes = ownBytes;
             shortest = ownShortest;
             return OWN;
         }
 
-        /// {@return whether, once [settled][#settle()], every value the record moves is on an array of its own and at
-        /// least [#THROUGH_VALUE_MIN] bytes, so it leaves the heap once durable outside the budget}
+        /// {@return whether the value frames of the commit hold whole homes of its runs of at least `homesMin` bytes in
+        /// all}, which each run then names, home by home
+        private boolean holdsHomes(long homesMin) {
+            var held = 0L;
+            for (var values : runs) {
+                var run = values.run;
+                var frames = run == null ? null : run.framedHomes(valueFrames.starts, valueFrames.lengths);
+                values.homeFrames = frames;
+                for (var home = 0; frames != null && home < frames.length; home++) {
+                    if (frames[home] >= 0) {
+                        held += valueFrames.lengths[frames[home]];
+                    }
+                }
+            }
+            return held >= homesMin;
+        }
+
+        /// {@return whether, once [settled][#settle(long)], every value the record moves is on an array of its own and
+        /// at least [#THROUGH_VALUE_MIN] bytes, or its runs let go of their homes, so it leaves the queue once durable
+        /// outside the budget}
         ///
         /// Such a record moves to the log even of a group written through ([#logs()]).
         boolean eager() {
-            return ownBytes > 0 && bytes == ownBytes && ownShortest >= THROUGH_VALUE_MIN;
+            return homes == HOMES_HELD || ownBytes > 0 && bytes == ownBytes && ownShortest >= THROUGH_VALUE_MIN;
+        }
+
+        /// {@return whether the record moves nothing once its runs let go of their homes}
+        private boolean homesOnly() {
+            return ownOnly && ownBytes == 0;
+        }
+
+        /// Lets each run of the record go of the homes its value frames hold whole, the frames being durable: of a
+        /// group written through, only those of at least [#THROUGH_VALUE_MIN] bytes, as a read back of a shorter one
+        /// would go to the device; holding the queue's lock.
+        ///
+        /// @return the bytes of the homes let go of
+        private long dropHomes() {
+            var places = valueFrames;
+            var dropped = 0L;
+            for (var values : runs) {
+                if (values.run != null && values.homeFrames != null) {
+                    dropped += values.run.dropHomes(values.homeFrames, segment, places.offsets, places.lengths,
+                            sequence, through ? THROUGH_VALUE_MIN : 0);
+                }
+            }
+            return dropped;
         }
 
         /// {@return the sequence of the commit}
@@ -952,6 +1099,9 @@ final class SpillQueue {
         private int[] offsets;
         private int[] ops;
         private int count;
+        // Per home the commit added to the run, the value frame that holds it whole or -1, for a record whose run lets
+        // go of its homes ([Record#settle(long)]); null otherwise
+        private int[] homeFrames;
 
         /// Creates the list of the entries of a run, with room for `capacity` of them.
         RunValues(int capacity) {
