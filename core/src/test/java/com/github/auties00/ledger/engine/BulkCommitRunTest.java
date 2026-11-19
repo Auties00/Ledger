@@ -1037,6 +1037,48 @@ class BulkCommitRunTest {
         }
     }
 
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a bulk commit whose puts mostly go to chains leaves the run's arrays and hash table the room its new keys take, not the room of every put")
+    void appendRoomOfNewKeys(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            var batch = ledger.newBatch();
+            puts(batch, expected, 0, BULK, 0, LENGTHS);
+            ledger.commit(batch).awaitDurable();
+            var run = ledger.state(MESSAGES).run;
+            var lengths = run.arrayLengthsForTests();
+            var slots = run.slotsForTests();
+            assertEquals(BULK, lengths[0]);
+            // Overwrites of the run's keys alone: the append takes nothing and leaves the run as it was
+            batch = ledger.newBatch();
+            puts(batch, expected, 0, BULK, 1, LENGTHS);
+            ledger.commit(batch).awaitDurable();
+            assertSame(run, ledger.state(MESSAGES).run);
+            assertArrayEquals(lengths, run.arrayLengthsForTests());
+            assertEquals(slots, run.slotsForTests());
+            verify(ledger, expected);
+            // Overwrites and 100 new keys: room for those, as an append of 100 keys makes it
+            batch = ledger.newBatch();
+            puts(batch, expected, 0, BULK, 2, LENGTHS);
+            puts(batch, expected, BULK, 100, 0, LENGTHS);
+            ledger.commit(batch).awaitDurable();
+            var appended = ledger.state(MESSAGES).run;
+            assertTrue(appended.sharesArraysForTests(run));
+            assertEquals(BULK + 100, appended.size());
+            var grown = appended.arrayLengthsForTests();
+            assertEquals(Math.max(BULK + 100, lengths[0] + (lengths[0] >> 1)), grown[0], "the ends of the keys");
+            assertEquals(lengths[1], grown[1], "the words");
+            assertTrue(4L * (BULK + 100) <= 3L * slots, "the test's run needs a larger table");
+            assertEquals(slots, appended.slotsForTests(), "the hash table");
+            verify(ledger, expected);
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            verify(ledger, expected);
+        }
+    }
+
     @Test
     @DisplayName("a bulk commit taken back as it appends leaves the run as its newest view holds it, with no entry, home or slot of its own, and the next append takes its indexes")
     void rollbackMidAppend(@TempDir Path directory) throws Exception {
@@ -1060,6 +1102,8 @@ class BulkCommitRunTest {
             puts(batch, expected, 0, BULK, 0, LENGTHS);
             ledger.commit(batch).awaitDurable();
             var run = ledger.state(MESSAGES).run;
+            var lengths = run.arrayLengthsForTests();
+            var slots = run.slotsForTests();
             try (var before = ledger.snapshot()) {
                 var taken = ledger.newBatch();
                 // New keys, enough to grow the hash table, then a decoded value that throws after the run took them
@@ -1069,6 +1113,8 @@ class BulkCommitRunTest {
                 assertThrows(IllegalArgumentException.class, () -> ledger.commit(taken));
                 assertSame(run, ledger.state(MESSAGES).run, "a commit taken back published a view");
                 assertEquals(BULK, run.size());
+                assertArrayEquals(lengths, run.arrayLengthsForTests(), "the room of a commit taken back was kept");
+                assertEquals(slots, run.slotsForTests(), "the hash table of a commit taken back was kept");
                 for (var message = BULK; message < 5 * BULK; message += 97) {
                     assertTrue(ledger.get(MESSAGES, key(message)).isEmpty(), "message " + message + " of a commit taken back");
                 }

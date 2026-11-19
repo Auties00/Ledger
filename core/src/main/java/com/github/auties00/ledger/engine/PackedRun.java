@@ -647,6 +647,11 @@ final class PackedRun {
         return lengths;
     }
 
+    /// {@return the slots of the run's hash table, for tests}
+    int slotsForTests() {
+        return storage.slots.length;
+    }
+
     /// {@return the entries the arrays of the run have room for, for tests: `keyEnds`, the words of all chunks, then
     /// the places in the log of all chunks of the logged values}
     int[] arrayLengthsForTests() {
@@ -1208,6 +1213,11 @@ final class PackedRun {
         private MemorySegment lastHome;
         // The entries the replay's `keyEnds` grows to room for when it is next full, or 0 to double it
         private int reserved;
+        // The lengths of the ends of the keys, the chunks of the words and the hash table before a bulk commit's builder
+        // made room for its puts, which it gives back as far as its entries do not take it
+        private int priorKeyEnds;
+        private int priorWordChunks;
+        private int priorSlots;
 
         /// Creates the builder of the run of an open's replay.
         Builder() {
@@ -1262,11 +1272,14 @@ final class PackedRun {
             if (view.size != firstEntry) {
                 throw new IllegalStateException("A run's newest view holds " + view.size + " of its " + firstEntry + " entries");
             }
+            this.priorKeyEnds = storage.keyEnds.length;
+            this.priorWordChunks = storage.words.length;
+            this.priorSlots = storage.slots.length;
             // Room for the planned entries, made before any is added, so no array a reader may load moves after
             var needed = (int) Math.min(MAX_ENTRIES, (long) firstEntry + Math.max(1, planned));
             var keyEnds = storage.keyEnds;
             if (needed > keyEnds.length) {
-                storage.keyEnds = Arrays.copyOf(keyEnds, (int) Math.min(MAX_ENTRIES, Math.max(needed, keyEnds.length + (keyEnds.length >> 1))));
+                storage.keyEnds = Arrays.copyOf(keyEnds, keyEndsFor(needed, keyEnds.length));
             }
             addWordChunks(needed);
             // The commit's keys start a chunk of their own, made here rather than at the first key, so a put takes no
@@ -1296,6 +1309,12 @@ final class PackedRun {
         /// publishes its own ([#buildCommitted(PageFile)]) or takes its writes back ([#rollback()]).
         static Builder appending(PackedRun view, int planned, long keyBytes) {
             return new Builder(view, planned, keyBytes);
+        }
+
+        // The length the ends of the keys of `length` grow to for `entries` entries, more than it holds: a half more at
+        // least, so appends of slowly growing runs copy them a bounded number of times
+        private static int keyEndsFor(int entries, int length) {
+            return (int) Math.min(MAX_ENTRIES, Math.max(entries, length + (length >> 1)));
         }
 
         // The least power of two `entries` fill at most three quarters of
@@ -1718,11 +1737,39 @@ final class PackedRun {
                 storage.keys = Arrays.copyOf(storage.keys, firstChunk);
             }
             storage.keyBytes = firstKeyBytes;
-            if (storage.entries != firstEntry) {
-                storage.entries = firstEntry;
+            var added = storage.entries != firstEntry;
+            storage.entries = firstEntry;
+            if (!giveBackRoom() && added) {
                 rehash(storage.slots.length);
             }
             lastHome = null;
+        }
+
+        /// Gives back the room a bulk commit's builder made for puts its run did not take, those of keys a chain or the
+        /// run already held, and keeps what the entries it holds now take: the lengths the run's arrays would have had
+        /// had the commit planned exactly those entries. A reader of an earlier view keeps reading the arrays it loaded,
+        /// and every array put in their place holds every entry, published before the view that adds any.
+        ///
+        /// @return whether it published a new hash table, which holds every entry of the run
+        private boolean giveBackRoom() {
+            var storage = this.storage;
+            var entries = storage.entries;
+            var keyEnds = storage.keyEnds;
+            var keyEndsLength = entries > priorKeyEnds ? keyEndsFor(entries, priorKeyEnds) : priorKeyEnds;
+            if (keyEnds.length > keyEndsLength) {
+                storage.keyEnds = Arrays.copyOf(keyEnds, keyEndsLength);
+            }
+            var words = storage.words;
+            var wordChunks = Math.max(priorWordChunks, (entries + WORD_MASK) >>> WORD_CHUNK_BITS);
+            if (words.length > wordChunks) {
+                storage.words = Arrays.copyOf(words, wordChunks);
+            }
+            var slots = 4L * entries > 3L * priorSlots ? tableFor(entries) : priorSlots;
+            if (storage.slots.length > slots) {
+                rehash(slots);
+                return true;
+            }
+            return false;
         }
 
         // Trims the last chunk of the builder's keys to the bytes its keys take, and makes the read-only views of the
@@ -1789,6 +1836,7 @@ final class PackedRun {
         PackedRun buildCommitted(PageFile pages) {
             var storage = this.storage;
             finishKeys();
+            giveBackRoom();
             if (after == null) {
                 storage.places = NO_PLACES;
                 storage.appendable = true;
