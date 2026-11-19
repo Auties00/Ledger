@@ -879,6 +879,9 @@ class BulkCommitRunTest {
         var snapshots = new ArrayList<Snapshot>();
         var commits = 8;
         try (var ledger = open(directory, true, budget)) {
+            if (budget == 0) {
+                ledger.state(MESSAGES).overwrites.forceSpillsForTests();
+            }
             PackedRun first = null;
             for (var commit = 0; commit < commits; commit++) {
                 var batch = ledger.newBatch();
@@ -904,6 +907,17 @@ class BulkCommitRunTest {
                 seen.add(expected.copy());
                 verify(ledger, expected);
                 assertEquals(run.size(), run.sortedForTests(), "a view sorted entries a view before it had ordered");
+                if (budget == 0 && commit % 2 == 0) {
+                    // The values of this commit and the one before leave their homes here, those of the next commit
+                    // beside the append after it
+                    spillNow(ledger);
+                    assertEquals(0, run.homesForTests(), "a spill beside the appends left a value on its home");
+                    verify(ledger, expected);
+                }
+            }
+            if (budget == 0) {
+                spillNow(ledger);
+                assertEquals(0, ledger.state(MESSAGES).run.homesForTests(), "a spill beside the appends left a value on its home");
             }
             for (var i = 0; i < commits; i++) {
                 verify(snapshots.get(i), seen.get(i));
@@ -1248,6 +1262,8 @@ class BulkCommitRunTest {
                     failure.compareAndSet(null, throwable);
                 }
             });
+            var appended = 0;
+            PackedRun before = null;
             for (var bulk = 0; bulk < 6; bulk++) {
                 var batch = ledger.newBatch();
                 var writes = new ArrayList<Object[]>();
@@ -1258,6 +1274,15 @@ class BulkCommitRunTest {
                     writes.add(new Object[]{message, value});
                 }
                 commits.put(ledger.commit(batch).sequence(), writes);
+                var run = ledger.state(MESSAGES).run;
+                if (before != null && run != null && run != before && run.sharesArraysForTests(before) && run.size() > before.size()) {
+                    appended++;
+                }
+                before = run;
+            }
+            if (round == 0) {
+                // No checkpoint runs beside them, so the bulk commits after the first append to its run
+                assertTrue(appended > 0, "no bulk commit appended to the run while the readers and writers ran");
             }
             Thread.sleep(50);
             stop.set(true);
