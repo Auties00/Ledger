@@ -1487,13 +1487,13 @@ class WriteThroughTest {
                 commit(ledger, model, "s");
                 assertEquals(through + 1, log.writtenThrough(), "the small group was not written through");
                 assertEquals(allocated, sizes.size(), "the buffer was replaced for a small group");
-                // Medium groups written through once the collector took the spare output: the output grows to their
-                // bound, and the buffer, if smaller, grows once
+                // Medium groups written through once the collector took the spare output: the output grows to the power
+                // of two at or above their bound, and the buffer, if smaller, grows once
                 log.dropSpareOutputForTests();
                 commitBatch(ledger, model, "m", 32, 4_000, 0);
                 assertEquals(through + 2, log.writtenThrough(), "the medium group was not written through");
                 var medium = log.outputLength();
-                assertTrue(medium > 128_000 && medium < 140_000, "a medium group made an output of " + medium + " bytes");
+                assertEquals(128 << 10, medium, "a medium group made an output of " + medium + " bytes");
                 assertTrue(sizes.size() <= allocated + 1, "buffers allocated: " + sizes);
                 var afterMedium = sizes.size();
                 assertTrue(way.bufferSizeForTests() >= 128_000, "a buffer of " + way.bufferSizeForTests() + " bytes");

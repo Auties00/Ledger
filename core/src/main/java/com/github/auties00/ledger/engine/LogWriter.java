@@ -1785,16 +1785,15 @@ final class LogWriter {
     ///
     /// A group takes back the spare output while it is reachable, whatever it asks for: it allocates nothing, and the
     /// output is given back again once the queue is empty. Otherwise it grows the output in one step to the power of two
-    /// at or above the group's bound, or above a quarter more than the output if that is more, or to that size itself
-    /// past half of [#OUTPUT], so groups of slowly growing sizes replace it a bounded number of times; one that asks for more than its bound, which
-    /// the bound rules out, doubles it, so it never grows by the bytes of a slice at a time. An output of the bound's
-    /// own size, 266 KB for a group of one value of 256 KiB, stays between the groups of a store that commits such
-    /// values one after another, beside the chunks of their bodies, and is small enough that every young collection
-    /// with room in its survivor space copies them again until they are old enough to promote: on the CI runners
-    /// those copies took G1's share of the CPU past its target, and it grew the heap to 750 MB, where the 512 KiB of
-    /// the power of two, the size doubling reached, makes the collector promote them together at once. A spare the collector took keeps the largest output from being given back for the next
-    /// [#HOLD_GROUPS] groups or more, counted once the output grows to [#OUTPUT] again, which a group that needs less
-    /// never does.
+    /// at or above the larger of the group's bound and a quarter more than the output, or, once that size passes half
+    /// of [#OUTPUT], to that size rounded up to [#ALIGNMENT], so groups of slowly growing sizes replace it a bounded
+    /// number of times; one that asks for more than its bound, which the bound rules out, doubles it, so it never grows
+    /// by the bytes of a slice at a time. The power of two keeps the sizes doubling reached, so a store that commits
+    /// values of 256 KiB one after another keeps an output of 512 KiB between its groups: an output of the group's
+    /// exact bound, 266 KB, let the output and the chunks of the bodies fit the survivor space of a small young
+    /// generation, which then copied them at every young collection until they were old enough to promote. A spare the
+    /// collector took keeps the largest output from being given back for the next [#HOLD_GROUPS] groups or more,
+    /// counted once the output grows to [#OUTPUT] again, which a group that needs less never does.
     private void grow(int need) {
         if (++groupGrowths > mostGroupGrowths) {
             mostGroupGrowths = groupGrowths;
