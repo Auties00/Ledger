@@ -1265,8 +1265,11 @@ class FrameReferencesTest {
             var log = ledger.logForTests();
             var reached = new CountDownLatch(1);
             var open = stallLog(disk, reached);
+            var overhead = encrypted ? LogWriter.TAG_BYTES : Integer.BYTES;
             Commit last;
             List<FrameBody> bodies;
+            int valueFrames;
+            long sealed;
             try {
                 // A commit whose group's write holds the writer, so the next frame waits in the queue
                 ledger.commit(ledger.newBatch().put(MESSAGES, "first", new byte[300]));
@@ -1280,15 +1283,16 @@ class FrameReferencesTest {
                 }
                 last = ledger.commit(batch);
                 bodies = log.queuedForTests();
+                assertEquals(1, bodies.size());
+                // Read while the writer waits: once it seals the frame, the release lets go of the body's section
+                var split = bodies.getFirst();
+                assertTrue(split.split());
+                valueFrames = split.valueFrames();
+                sealed = split.sealedBytes(overhead);
             } finally {
                 open.countDown();
             }
-            assertEquals(1, bodies.size());
-            var split = bodies.getFirst();
-            assertTrue(split.split());
-            assertTrue(split.valueFrames() > 2, split.valueFrames() + " value frames");
-            var overhead = encrypted ? LogWriter.TAG_BYTES : Integer.BYTES;
-            var sealed = split.sealedBytes(overhead);
+            assertTrue(valueFrames > 2, valueFrames + " value frames");
             last.awaitDurable();
             // The split commit's group, the last, holds its frames alone
             assertEquals(sealed, log.groupEnd() - log.groupStart(), "the bytes the group sealed into");
