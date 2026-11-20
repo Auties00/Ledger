@@ -1784,12 +1784,16 @@ final class LogWriter {
     /// for `need` bytes.
     ///
     /// A group takes back the spare output while it is reachable, whatever it asks for: it allocates nothing, and the
-    /// output is given back again once the queue is empty. Otherwise it grows the output to the group's bound in one
-    /// step, or by a quarter if that is more, so groups of slowly growing sizes replace it a bounded number of times;
-    /// one that asks for more than its bound, which the bound rules out, doubles it, so it never grows by the bytes of a
-    /// slice at a time. A spare the collector took keeps the largest output from being given back for the next
-    /// [#HOLD_GROUPS] groups or more, counted once the output grows to [#OUTPUT] again, which a group that needs less
-    /// never does.
+    /// output is given back again once the queue is empty. Otherwise it grows the output in one step to the power of two
+    /// at or above the larger of the group's bound and a quarter more than the output, or, once that size passes half
+    /// of [#OUTPUT], to that size rounded up to [#ALIGNMENT], so groups of slowly growing sizes replace it a bounded
+    /// number of times; one that asks for more than its bound, which the bound rules out, doubles it, so it never grows
+    /// by the bytes of a slice at a time. The power of two keeps the sizes doubling reached, so a store that commits
+    /// values of 256 KiB one after another keeps an output of 512 KiB between its groups: an output of the group's
+    /// exact bound, 266 KB, let the output and the chunks of the bodies fit the survivor space of a small young
+    /// generation, which then copied them at every young collection until they were old enough to promote. A spare the
+    /// collector took keeps the largest output from being given back for the next [#HOLD_GROUPS] groups or more,
+    /// counted once the output grows to [#OUTPUT] again, which a group that needs less never does.
     private void grow(int need) {
         if (++groupGrowths > mostGroupGrowths) {
             mostGroupGrowths = groupGrowths;
@@ -1807,7 +1811,8 @@ final class LogWriter {
         }
         var length = output.length;
         var size = need <= groupNeed ? Math.max(groupNeed, length + (length >> 2)) : Math.max(2L * length, need);
-        output = Arrays.copyOf(output, (int) Math.min(OUTPUT, (size + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT));
+        var bound = size > OUTPUT / 2 ? (size + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT : Long.highestOneBit(size - 1) << 1;
+        output = Arrays.copyOf(output, (int) Math.min(OUTPUT, bound));
         outputAllocations++;
         if (spareLost && output.length == OUTPUT) {
             spareLost = false;

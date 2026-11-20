@@ -128,7 +128,7 @@ class LogOutputSizeTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @CsvSource({"true", "false"})
-    @DisplayName("grows once, to the bound of a group of one value of 256 KiB, and keeps that size for the next ones")
+    @DisplayName("grows once, to the power of two above the bound of a group of one value of 256 KiB, and keeps that size for the next ones")
     void boundedByGroup(boolean encrypted) throws Exception {
         var disk = CrashFileSystem.create();
         var model = new TreeMap<String, String>();
@@ -138,9 +138,7 @@ class LogOutputSizeTest {
             var allocations = log.outputAllocationsForTests();
             commit(ledger, model, "large0", 256 << 10);
             var length = log.outputLength();
-            assertTrue(length >= 256 << 10 && length <= (256 << 10) + 2 * LogWriter.ALIGNMENT,
-                    "the output holds " + length + " bytes after a group of 256 KiB, where doubling made 512 KiB");
-            assertEquals(0, length % LogWriter.ALIGNMENT);
+            assertEquals(512 << 10, length, "the output holds " + length + " bytes after a group of 256 KiB");
             assertEquals(allocations + 1, log.outputAllocationsForTests(), "the output grew more than once for one group");
             for (var i = 1; i < 6; i++) {
                 commit(ledger, model, "large" + i, 256 << 10);
@@ -292,7 +290,7 @@ class LogOutputSizeTest {
             assertNull(log.spareOutputForTests());
             commitBatch(ledger, model, "n", 25, 4_000);
             var medium = log.outputLength();
-            assertTrue(medium > 100_000 && medium < 110_000, "a medium group made an output of " + medium + " bytes");
+            assertEquals(128 << 10, medium, "a medium group made an output of " + medium + " bytes");
             assertEquals(allocations + 1, log.outputAllocationsForTests());
             assertNull(log.spareOutputForTests(), "an output smaller than the largest was given back");
             // And the next large group grows it once, to the largest size, which the loss of the spare keeps
