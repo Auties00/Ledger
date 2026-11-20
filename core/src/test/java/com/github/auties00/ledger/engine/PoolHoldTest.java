@@ -90,7 +90,7 @@ class PoolHoldTest {
     }
 
     @Test
-    @DisplayName("the next body on chunks takes the chunks of the frame sealed before it, through collections while it fills, and once bodies stop the collection after the move of the reserve's chunks frees them all")
+    @DisplayName("a body of more chunks than the reserve has room for gives them to the overflow alone, where the next body takes them through collections while it fills, and once bodies stop the first collection frees them all")
     void bodyKeepsChunks() {
         var pool = new HeapPool(64L << 20, false);
         var first = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
@@ -101,11 +101,12 @@ class PoolHoldTest {
         // The log seals the first frame while the next commit fills its body
         first.handOff();
         first.release();
-        assertEquals(HeapPool.RESERVE_PER_SIZE, pool.burstBytesForTests(), "the chunks of a body of many in the reserve");
-        assertEquals(12L * CHUNK - HeapPool.RESERVE_PER_SIZE, pool.overflowBytesForTests(), "the chunks past the reserve");
+        assertEquals(0, pool.burstBytesForTests(), "the chunks of a body of many in the reserve");
+        assertEquals(0, pool.reservedBytesForTests(CHUNK), "the chunks of a body of many in the reserve");
+        assertEquals(12L * CHUNK, pool.overflowBytesForTests(), "the chunks of a body of many in the overflow");
         System.gc();
         System.gc();
-        assertEquals(12L * CHUNK - HeapPool.RESERVE_PER_SIZE, pool.overflowBytesForTests(), "a collection freed the chunks while a body held them");
+        assertEquals(12L * CHUNK, pool.overflowBytesForTests(), "a collection freed the chunks while a body held them");
         fillTo(next, 12 * CHUNK - 4_000);
         // The first chunk of the next body is a new one, taken before the first released its own
         var taken = chunks(next);
@@ -117,12 +118,8 @@ class PoolHoldTest {
         taken.clear();
         collectOverflow(pool);
         assertEquals(0, pool.overflowBytesForTests(), "a collection with no body open left the overflow");
-        assertEquals(HeapPool.RESERVE_PER_SIZE, pool.burstBytesForTests(), "the chunks of the last body in the reserve");
-        // The collection after the last body moves the reserve's chunks; the one after it frees them
-        pool.collectedForTests();
-        assertEquals(0, pool.reservedBytesForTests(), "the chunks of the bodies the reserve kept past the move");
-        collectOverflow(pool);
-        assertEquals(0, pool.overflowBytesForTests(), "a collection after the move left the chunks");
+        assertEquals(0, pool.burstBytesForTests(), "the chunks of the last body in the reserve");
+        assertEquals(0, pool.reservedBytesForTests(CHUNK), "the chunks of the bodies in the reserve");
     }
 
     @Test
@@ -174,6 +171,40 @@ class PoolHoldTest {
         pool.collectedForTests();
         assertEquals(reserved, pool.reservedBytesForTests(CHUNK), "the rope's chunks in the reserve past a collection");
         assertEquals(overflow + (long) chunks * CHUNK, pool.overflowBytesForTests(), "the rope's chunks in the overflow");
+    }
+
+    @Test
+    @DisplayName("a body or a rope of more chunks than the reserve has room for gives them to the overflow alone, and one of as many as it has room for to the reserve")
+    void longBurstsSkipReserve() {
+        assertEquals(4, HeapPool.BURST_KEPT_CHUNKS);
+        var pool = new HeapPool(64L << 20, false);
+        pool.holdOverflowForTests(true);
+        var body = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
+        fillTo(body, 5 * CHUNK - 4_000);
+        assertEquals(5, body.chunkCount());
+        var arrays = chunks(body);
+        body.handOff();
+        body.release();
+        assertEquals(0, pool.reservedBytesForTests(CHUNK), "the chunks of a body of five in the reserve");
+        assertEquals(5L * CHUNK, pool.overflowBytesForTests(), "the chunks of a body of five in the overflow");
+        assertEquals(arrays, pool.freeForTests(CHUNK), "the chunks of the body, in the overflow");
+        var batch = new ArrayWriteBatch(new Object(), pool, Map.of(MESSAGES.name(), MESSAGES));
+        var key = new byte[8];
+        for (var i = 0; batch.chunksForTests() < 5; i++) {
+            ByteBuffer.wrap(key).putInt(0, i);
+            batch.put(MESSAGES, key.clone(), new byte[10_000]);
+        }
+        assertEquals(5, batch.chunksForTests());
+        batch.clear();
+        assertEquals(0, pool.reservedBytesForTests(CHUNK), "the chunks of a rope of five in the reserve");
+        assertEquals(5L * CHUNK, pool.overflowBytesForTests(), "the chunks of a rope of five in the overflow");
+        var four = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
+        fillTo(four, 4 * CHUNK - 4_000);
+        assertEquals(4, four.chunkCount());
+        four.handOff();
+        four.release();
+        assertEquals(4L * CHUNK, pool.burstBytesForTests(), "the chunks of a body of four in the reserve, as a burst's");
+        assertEquals(1L * CHUNK, pool.overflowBytesForTests(), "the overflow after a body of four took four of its chunks");
     }
 
     @Test

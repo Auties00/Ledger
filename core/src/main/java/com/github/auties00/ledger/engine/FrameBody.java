@@ -75,15 +75,16 @@ import java.util.Arrays;
 /// that the log reads once: the body of a large batch, which refers to no value, and that of a transaction, whose
 /// values of a few kilobytes it refers to. The log hands the chunks back once it sealed the frame ([#release()]); a
 /// body the log never took goes back with [#discard()]. From its first chunk until then the body
-/// [holds][HeapPool#hold()] the pool's overflow, where the chunks of the frames sealed before it wait once a
-/// collection moved them out of the reserve ([HeapPool#releaseBurst(byte\[\])]), so a collection while it fills keeps
-/// them for it; a body a stopped log leaves to the collector lets go of it ([#abandon()]). A chunked body that refers
-/// to no value is read through [#chunkCount()], [#chunk(int)] and [#chunkLength(int)], one that refers to values
-/// through its pieces, which then never span two chunks; [#array()] serves only a body of one array. A split body is
-/// read in two parts: its own bytes, the head, through its chunks as a body that refers to no value is, and its
-/// section frame by frame, each value frame through the references from [#valueFrameFirst(int)] to
-/// [#valueFrameEnd(int)] ([#referenceArray(int)], [#referenceOffset(int)], [#referenceLength(int)]), never through its
-/// pieces. No pooled chunk is ever an array a body refers to: those are arrays the pool never hands out.
+/// [holds][HeapPool#hold()] the pool's overflow, where the chunks of the frames sealed before it wait, from their
+/// release for a long frame and once a collection moved them out of the reserve for the others
+/// ([HeapPool#releaseBurst(byte\[\])]), so a collection while it fills keeps them for it; a body a stopped log leaves
+/// to the collector lets go of it ([#abandon()]). A chunked body that refers to no value is read through
+/// [#chunkCount()], [#chunk(int)] and [#chunkLength(int)], one that refers to values through its pieces, which then
+/// never span two chunks; [#array()] serves only a body of one array. A split body is read in two parts: its own bytes,
+/// the head, through its chunks as a body that refers to no value is, and its section frame by frame, each value frame
+/// through the references from [#valueFrameFirst(int)] to [#valueFrameEnd(int)] ([#referenceArray(int)],
+/// [#referenceOffset(int)], [#referenceLength(int)]), never through its pieces. No pooled chunk is ever an array a body
+/// refers to: those are arrays the pool never hands out.
 ///
 /// A write checks once that the array it writes has room for its longest encoding, and takes a path that checks each
 /// field only when it may not: that path, which grows the array or goes on in the next chunk, runs at a chunk boundary
@@ -468,10 +469,12 @@ final class FrameBody {
     /// them reachable; a body made without a pool keeps its array and its references, but for a split body's, which it
     /// lets go of all the same. A second call does nothing.
     ///
-    /// The chunks of a body of more than one go back as a burst's ([HeapPool#releaseBurst(byte\[\])]): the next
-    /// large body takes them again, from the reserve within its bounds and past them from the overflow this body holds
-    /// until they are all back, and once large bodies stop coming the pool's next collections free them. A body of
-    /// one array gives it back to the reserve, for the small commits that follow.
+    /// The chunks of a body of more than one and at most [HeapPool#BURST_KEPT_CHUNKS] go back as a burst's
+    /// ([HeapPool#releaseBurst(byte\[\])]): the next large body takes them again, from the reserve within its bounds
+    /// and past them from the overflow this body holds until they are all back, and once large bodies stop coming the
+    /// pool's next collections free them. Those of a longer body, which the reserve has room for only a few of, go to
+    /// the overflow alone ([HeapPool#releaseHeld(byte\[\])]), where the next large body takes them again unless a
+    /// collection came first. A body of one array gives it back to the reserve, for the small commits that follow.
     void release() {
         if (split()) {
             // The arrays of the section, which a bulk commit's run may let go of once the value frames are durable
@@ -485,9 +488,12 @@ final class FrameBody {
         referred = References.none(referred.referable);
         if (pooled.chunks != null) {
             var burst = pooled.chunkCount > 1;
+            var held = pooled.chunkCount > HeapPool.BURST_KEPT_CHUNKS;
             for (var i = 0; i < pooled.chunkCount; i++) {
                 assert poison(pooled.chunks[i]);
-                if (burst) {
+                if (held) {
+                    pooled.pool.releaseHeld(pooled.chunks[i]);
+                } else if (burst) {
                     pooled.pool.releaseBurst(pooled.chunks[i]);
                 } else {
                     pooled.pool.release(pooled.chunks[i]);
