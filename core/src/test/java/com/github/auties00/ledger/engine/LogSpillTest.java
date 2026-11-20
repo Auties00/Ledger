@@ -50,6 +50,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -2536,6 +2537,43 @@ class LogSpillTest {
                 expected.put(message, value);
             }
             ledger.commit(more).awaitDurable();
+            verifyLarge(ledger, expected);
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = openSized(directory, encrypted, 1 << 20, Duration.ZERO, 64L << 20)) {
+            verifyLarge(ledger, expected);
+            ledger.checkpoint();
+            verifyLarge(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a bulk commit that appends to the run of an earlier one lets go of its own homes once durable, by their indexes in the arrays the views share, the earlier commit's homes staying as its drop left them, and every value of both reads back, before and after a checkpoint and a reopen")
+    void framedHomesAppended(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new TreeMap<Integer, byte[]>();
+        try (var ledger = openSized(directory, encrypted, 1 << 20, Duration.ZERO, 64L << 20)) {
+            writeBulk(ledger, expected, 0, 50_000).awaitDurable();
+            var first = bulkRun(ledger);
+            var firstHomes = first.framedHomesForTests();
+            assertTrue(firstHomes > 30, firstHomes + " homes let go of");
+            // One read of the first commit's homes back, which the second commit's drop leaves as it is
+            assertArrayEquals(expected.get(7), ledger.get(MESSAGES, key(7)).orElseThrow());
+            assertEquals(1, first.homesForTests());
+            writeBulk(ledger, expected, 50_000, 50_000).awaitDurable();
+            var second = bulkRun(ledger);
+            assertNotSame(first, second);
+            assertTrue(second.sharesArraysForTests(first), "the second bulk commit did not append to the run");
+            assertEquals(100_000, second.size(), "the appending commit's view does not hold both commits' entries");
+            var homes = second.framedHomesForTests();
+            assertTrue(homes > firstHomes + 30, homes + " homes let go of after the append, " + firstHomes + " before");
+            assertEquals(1, second.homesForTests(), "homes the run still holds once the appending commit's wait returned");
+            assertEquals(0, ledger.spills().eagerSequencesForTests().length, "a record of the dropped homes still queued");
+            assertArrayEquals(expected.get(60_007), ledger.get(MESSAGES, key(60_007)).orElseThrow());
+            assertEquals(2, second.homesForTests());
+            verifyLarge(ledger, expected);
+            assertEquals(homes, second.homesForTests(), "every home read back");
+            ledger.checkpoint();
             verifyLarge(ledger, expected);
             ledger.closeWithoutCheckpoint();
         }

@@ -154,6 +154,38 @@ class LogOutputSizeTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @CsvSource({"true", "false"})
+    @DisplayName("bounds a group of one split commit by its head and every value frame, a header and a tag each, so the output grows once to hold it")
+    void boundedBySplit(boolean encrypted) throws Exception {
+        var disk = CrashFileSystem.create();
+        var model = new TreeMap<String, String>();
+        try (var ledger = openLarge(disk.getPath("/store"), encrypted, null)) {
+            var log = log(ledger);
+            commit(ledger, model, "first", 500);
+            // Sixteen values of a fifth to a quarter of a rope chunk, four to a chunk: a head and four value frames,
+            // whose headers and tags count 176 bytes or more past the bodies, the commits 160 bytes apart, so one of
+            // them seals into a few bytes past a block of the bound's rounding whatever the header's bytes
+            for (var step = 0; step < 26; step++) {
+                var length = 56_000 + 10 * step;
+                var batch = ledger.newBatch();
+                for (var i = 0; i < 16; i++) {
+                    var key = "s" + step + "-" + "%02d".formatted(i);
+                    var value = "s".repeat(length);
+                    batch.put(NAMES, key, value);
+                    model.put(key, value);
+                }
+                ledger.commit(batch).awaitDurable();
+                var peak = log.groupPeakForTests();
+                assertTrue(peak - 16L * length >= 5L * LogWriter.FRAME_HEADER, "the commit was not split: " + peak);
+                assertTrue(peak <= log.groupNeedForTests(),
+                        "a split commit asked for " + peak + " bytes past its bound of " + log.groupNeedForTests());
+            }
+            assertTrue(log.mostGroupGrowthsForTests() <= 1, "the output grew " + log.mostGroupGrowthsForTests() + " times for one group");
+        }
+        survivesPowerLossLarge(disk, encrypted, model);
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @CsvSource({"true", "false"})
     @DisplayName("grows at most once for a group of many small commits sealed as runs, whatever the groups the flush takes")
     void boundedByRuns(boolean encrypted) throws Exception {
         var disk = CrashFileSystem.create();

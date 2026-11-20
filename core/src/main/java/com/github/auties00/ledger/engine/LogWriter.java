@@ -1328,11 +1328,11 @@ final class LogWriter {
     /// joins them, the room the cipher's last call asks for past the last one and the padding to the next block}
     ///
     /// The commits are joined into runs as a segment with room for them all would join them, each entry counted as an
-    /// entry of a run even when its run holds it alone, which takes up to three bytes less. A segment that fills ends a
-    /// run sooner, but the rollover writes out the output first, and the runs either side of it hold no more than the
-    /// ones counted. Every call of [#room(int)] but the cipher's last asks for no more than the frame being sealed holds,
-    /// and that one for at most a tag past it. The bound is a multiple of [#ALIGNMENT], so groups of one size keep one
-    /// output of that size.
+    /// entry of a run even when its run holds it alone, which takes up to three bytes less, and a split commit counts as
+    /// its head and value frames, a header and a tag each. A segment that fills ends a run sooner, but the rollover
+    /// writes out the output first, and the runs either side of it hold no more than the ones counted. Every call of
+    /// [#room(int)] but the cipher's last asks for no more than the frame being sealed holds, and that one for at most a
+    /// tag past it. The bound is a multiple of [#ALIGNMENT], so groups of one size keep one output of that size.
     private int groupBound(List<Queued> group) {
         var frame = (long) FRAME_HEADER + sealOverhead();
         var bytes = 2L * TAG_BYTES;
@@ -1353,7 +1353,8 @@ final class LogWriter {
                 sequence = queued.sequence();
             } else {
                 entries = -1;
-                bytes += frame + length;
+                // A split commit as its head and each of its value frames, a header and a tag each
+                bytes += queued.body().sealedBytes(sealOverhead());
             }
             if (bytes >= OUTPUT) {
                 return OUTPUT;
@@ -2212,6 +2213,11 @@ final class LogWriter {
     /// {@return the most bytes the last group written asked the output for, for tests: read after it is durable}
     int groupPeakForTests() {
         return groupPeak;
+    }
+
+    /// {@return the bound of the last group written ([#groupBound(List)]), for tests: read after it is durable}
+    int groupNeedForTests() {
+        return groupNeed;
     }
 
     /// {@return the groups left for which the largest output is kept between groups, for tests: read after a group
