@@ -356,6 +356,41 @@ class LogOutputSizeTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @CsvSource({"true", "false"})
+    @DisplayName("counts a loss of the spare only once a group grows the output to the largest again, and keeps it for 256 groups again after a loss that comes long after the last hold ran out")
+    void holdDecays(boolean encrypted) throws Exception {
+        var disk = CrashFileSystem.create();
+        var model = new TreeMap<String, String>();
+        try (var ledger = openLarge(disk.getPath("/store"), encrypted, null)) {
+            var log = log(ledger);
+            log.keepSpareForTests = true;
+            commit(ledger, model, "first", 500);
+            commitBatch(ledger, model, "a", 300, 4_000);
+            assertEquals(LogWriter.ALIGNMENT, log.outputLength());
+            // The collector takes the spare, then a group that needs a few kilobytes more than the smallest output
+            log.dropSpareOutputForTests();
+            commit(ledger, model, "medium", 6_000);
+            assertEquals(0, log.holdGroupsForTests(), "a group that never grew the output to the largest counted a loss");
+            assertEquals(256, log.nextHoldForTests());
+            // The next large group allocates the megabyte, which counts the loss
+            commitBatch(ledger, model, "b", 300, 4_000);
+            assertEquals(255, log.holdGroupsForTests());
+            assertEquals(512, log.nextHoldForTests());
+            for (var i = 0; i < 255 + 300; i++) {
+                commit(ledger, model, "s" + i, 500);
+            }
+            assertEquals(0, log.holdGroupsForTests());
+            // A loss 300 groups after the hold ran out, as the next bulk load of a store that loads now and then
+            log.dropSpareOutputForTests();
+            commitBatch(ledger, model, "c", 300, 4_000);
+            assertEquals(LogWriter.OUTPUT, log.outputLength());
+            assertEquals(255, log.holdGroupsForTests(), "a loss long after the last hold kept the output longer");
+            assertEquals(512, log.nextHoldForTests(), "the hold of the next loss did not come back down");
+        }
+        survivesPowerLossLarge(disk, encrypted, model);
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @CsvSource({"true", "false"})
     @DisplayName("keeps the largest output for a medium group queued while a large one was written, allocating none, and gives it back after")
     void keptWhileQueued(boolean encrypted) throws Exception {
         var disk = CrashFileSystem.create();

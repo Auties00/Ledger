@@ -194,9 +194,10 @@ final class LogWriter {
     /// The small groups in a row after which a larger buffer goes back to the size they needed.
     private static final int SHRINK_AFTER = 256;
     /// The groups for which a writer that found its spare output taken by the collector keeps the largest output
-    /// between groups instead of giving it back, doubled by every later loss up to [#MAX_HOLD_GROUPS]: a store whose
-    /// collections fall between its groups, as one written to without pause does, would otherwise allocate a megabyte
-    /// for most of its large groups.
+    /// between groups instead of giving it back, doubled by every loss that comes within as many groups of the end of
+    /// the hold before it, up to [#MAX_HOLD_GROUPS]: a store whose collections fall between its groups, as one written
+    /// to without pause does, would otherwise allocate a megabyte for most of its large groups. A loss that comes
+    /// later, as the next bulk load of a store that loads now and then does, keeps it for this many groups again.
     private static final int HOLD_GROUPS = 256;
     /// The most groups one loss of the spare output keeps the largest output for, so a store loses at most one spare
     /// every so many groups.
@@ -340,8 +341,14 @@ final class LogWriter {
     private WeakReference<byte[]> spareOutput;
     // The groups left for which the largest output is kept between groups, set when the collector took the spare
     private int holdGroups;
-    // The groups the next loss of the spare keeps the largest output for, from HOLD_GROUPS up to MAX_HOLD_GROUPS
+    // The groups the next loss of the spare keeps the largest output for, from HOLD_GROUPS up to MAX_HOLD_GROUPS, if
+    // it comes within HOLD_GROUPS groups of the end of the last hold
     private int nextHold = HOLD_GROUPS;
+    // The groups written since the last hold ran out, up to Integer.MAX_VALUE
+    private int groupsSinceHold = Integer.MAX_VALUE;
+    // Whether a group found the spare output taken by the collector and no group has grown the output to OUTPUT since:
+    // the loss counts once the output grows that far, the megabyte it then allocates
+    private boolean spareLost;
     // The spare output held strongly too, for tests that check which array a group takes back
     private byte[] keptSpareForTests;
     // Whether a spare output given back is held strongly too, for tests
@@ -1113,8 +1120,13 @@ final class LogWriter {
                 // spare between two groups not long ago
                 if (holdGroups > 0) {
                     holdGroups--;
-                } else if (idle && output.length == OUTPUT) {
-                    giveBackOutput();
+                } else {
+                    if (groupsSinceHold < Integer.MAX_VALUE) {
+                        groupsSinceHold++;
+                    }
+                    if (idle && output.length == OUTPUT) {
+                        giveBackOutput();
+                    }
                 }
                 publish(sequence, frames, roomy);
                 if (!leading && poolWanted()) {
@@ -1776,7 +1788,8 @@ final class LogWriter {
     /// step, or by a quarter if that is more, so groups of slowly growing sizes replace it a bounded number of times;
     /// one that asks for more than its bound, which the bound rules out, doubles it, so it never grows by the bytes of a
     /// slice at a time. A spare the collector took keeps the largest output from being given back for the next
-    /// [#HOLD_GROUPS] groups or more.
+    /// [#HOLD_GROUPS] groups or more, counted once the output grows to [#OUTPUT] again, which a group that needs less
+    /// never does.
     private void grow(int need) {
         if (++groupGrowths > mostGroupGrowths) {
             mostGroupGrowths = groupGrowths;
@@ -1790,13 +1803,21 @@ final class LogWriter {
         }
         if (kept != null) {
             spareOutput = null;
-            holdGroups = nextHold;
-            nextHold = Math.min(MAX_HOLD_GROUPS, 2 * nextHold);
+            spareLost = true;
         }
         var length = output.length;
         var size = need <= groupNeed ? Math.max(groupNeed, length + (length >> 2)) : Math.max(2L * length, need);
         output = Arrays.copyOf(output, (int) Math.min(OUTPUT, (size + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT));
         outputAllocations++;
+        if (spareLost && output.length == OUTPUT) {
+            spareLost = false;
+            if (groupsSinceHold > HOLD_GROUPS) {
+                nextHold = HOLD_GROUPS;
+            }
+            holdGroups = nextHold;
+            nextHold = Math.min(MAX_HOLD_GROUPS, 2 * nextHold);
+            groupsSinceHold = 0;
+        }
     }
 
     /// Gives back the output of [#OUTPUT] bytes once the group last written from it is durable and the queue is empty:
@@ -1805,7 +1826,8 @@ final class LogWriter {
     ///
     /// A store that writes large groups now and then, as a bulk load does, so holds a megabyte strongly only while
     /// groups keep coming, and one whose groups keep coming neither gives the output back nor allocates another; one
-    /// whose collections took a spare between two groups keeps the largest output for [#HOLD_GROUPS] groups or more. The
+    /// whose collections took a spare between two groups keeps the largest output for [#HOLD_GROUPS] groups or more,
+    /// and for [#HOLD_GROUPS] again once its losses stop following one another. The
     /// output of a smaller group stays until [#SHRINK_AFTER] small groups take it back.
     private void giveBackOutput() {
         assert used == 0 && output.length == OUTPUT : "an output given back holds bytes or is not the largest";
@@ -1816,6 +1838,7 @@ final class LogWriter {
 
     /// Keeps `spare`, an output of [#OUTPUT] bytes no group writes from any more, weakly, for the next group that grows.
     private void keepSpare(byte[] spare) {
+        spareLost = false;
         var kept = spareOutput;
         if (kept == null || kept.get() != spare) {
             spareOutput = new WeakReference<>(spare);
@@ -2224,6 +2247,12 @@ final class LogWriter {
     /// returned}
     int holdGroupsForTests() {
         return holdGroups;
+    }
+
+    /// {@return the groups the next loss of the spare output keeps the largest output for, if it comes within
+    /// [#HOLD_GROUPS] groups of the end of the last hold, for tests: read after a group returned}
+    int nextHoldForTests() {
+        return nextHold;
     }
 
     /// {@return the times the output grew while the last group was written, for tests: read after it is durable}
