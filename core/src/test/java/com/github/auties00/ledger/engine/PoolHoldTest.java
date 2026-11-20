@@ -93,7 +93,6 @@ class PoolHoldTest {
     @DisplayName("the next body on chunks takes the chunks of the frame sealed before it, through collections while it fills, and once bodies stop the collection after the move of the reserve's chunks frees them all")
     void bodyKeepsChunks() {
         var pool = new HeapPool(64L << 20, false);
-        pool.keepBurstsForTests();
         var first = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
         fillTo(first, 12 * CHUNK - 4_000);
         var arrays = chunks(first);
@@ -131,7 +130,6 @@ class PoolHoldTest {
     void bodyChunksAsBurst() {
         var pool = new HeapPool(64L << 20, false);
         pool.holdOverflowForTests(true);
-        pool.keepBurstsForTests();
         var single = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
         fillTo(single, CHUNK / 2);
         assertEquals(1, single.chunkCount());
@@ -159,7 +157,6 @@ class PoolHoldTest {
     void ropeAsBurst() {
         var pool = new HeapPool(64L << 20, false);
         pool.holdOverflowForTests(true);
-        pool.keepBurstsForTests();
         var batch = new ArrayWriteBatch(new Object(), pool, Map.of(MESSAGES.name(), MESSAGES));
         var key = new byte[8];
         for (var i = 0; batch.chunksForTests() < 4; i++) {
@@ -177,33 +174,6 @@ class PoolHoldTest {
         pool.collectedForTests();
         assertEquals(reserved, pool.reservedBytesForTests(CHUNK), "the rope's chunks in the reserve past a collection");
         assertEquals(overflow + (long) chunks * CHUNK, pool.overflowBytesForTests(), "the rope's chunks in the overflow");
-    }
-
-    @Test
-    @DisplayName("a lone body of many chunks and a lone batch's rope give their chunks to the overflow alone, which two collections right after them free")
-    void loneBodyAndRope() {
-        var pool = new HeapPool(64L << 20, false);
-        var body = new FrameBody(CHUNK, FrameBody.NOT_REFERABLE, pool);
-        fillTo(body, 4 * CHUNK - 4_000);
-        var probes = new ArrayList<WeakReference<byte[]>>();
-        chunks(body).forEach(chunk -> probes.add(new WeakReference<>(chunk)));
-        body.handOff();
-        body.release();
-        assertEquals(0, pool.burstBytesForTests(), "the chunks of a lone body in the reserve");
-        assertEquals(4L * CHUNK, pool.overflowBytesForTests(), "the chunks of a lone body in the overflow");
-        // A rope an instant later, before any collection, goes where the body went
-        var batch = new ArrayWriteBatch(new Object(), pool, Map.of(MESSAGES.name(), MESSAGES));
-        var key = new byte[8];
-        for (var i = 0; batch.chunksForTests() < 4; i++) {
-            ByteBuffer.wrap(key).putInt(0, i);
-            batch.put(MESSAGES, key.clone(), new byte[10_000]);
-        }
-        batch.clear();
-        assertEquals(0, pool.burstBytesForTests(), "the chunks of a lone rope in the reserve");
-        System.gc();
-        System.gc();
-        assertEquals(0, probes.stream().filter(probe -> !probe.refersTo(null)).count(), "collections right after a lone body left its chunks");
-        assertEquals(0, pool.overflowBytesForTests(), "collections right after a lone rope left its chunks");
     }
 
     @Test

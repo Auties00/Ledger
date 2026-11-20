@@ -75,8 +75,8 @@ import java.util.Arrays;
 /// that the log reads once: the body of a large batch, which refers to no value, and that of a transaction, whose
 /// values of a few kilobytes it refers to. The log hands the chunks back once it sealed the frame ([#release()]); a
 /// body the log never took goes back with [#discard()]. From its first chunk until then the body
-/// [holds][HeapPool#hold()] the pool's overflow, where the chunks of the frames sealed before it wait unless a run of
-/// such frames keeps them in the reserve ([HeapPool#keepsBurst()]), so a collection while it fills keeps
+/// [holds][HeapPool#hold()] the pool's overflow, where the chunks of the frames sealed before it wait once a
+/// collection moved them out of the reserve ([HeapPool#releaseBurst(byte\[\])]), so a collection while it fills keeps
 /// them for it; a body a stopped log leaves to the collector lets go of it ([#abandon()]). A chunked body that refers
 /// to no value is read through [#chunkCount()], [#chunk(int)] and [#chunkLength(int)], one that refers to values
 /// through its pieces, which then never span two chunks; [#array()] serves only a body of one array. A split body is
@@ -468,11 +468,10 @@ final class FrameBody {
     /// them reachable; a body made without a pool keeps its array and its references, but for a split body's, which it
     /// lets go of all the same. A second call does nothing.
     ///
-    /// The chunks of a body of more than one go back as a burst's ([HeapPool#keepsBurst()]): the next large body
-    /// takes them again, from the overflow this body holds until they are all back, or from the reserve within its
-    /// bounds while large bodies come in a run that collections fall between, and once large bodies stop coming the
-    /// pool's next collections free them. A body of one array gives it back to the reserve, for the small commits that
-    /// follow.
+    /// The chunks of a body of more than one go back as a burst's ([HeapPool#releaseBurst(byte\[\])]): the next
+    /// large body takes them again, from the reserve within its bounds and past them from the overflow this body holds
+    /// until they are all back, and once large bodies stop coming the pool's next collections free them. A body of
+    /// one array gives it back to the reserve, for the small commits that follow.
     void release() {
         if (split()) {
             // The arrays of the section, which a bulk commit's run may let go of once the value frames are durable
@@ -486,11 +485,10 @@ final class FrameBody {
         referred = References.none(referred.referable);
         if (pooled.chunks != null) {
             var burst = pooled.chunkCount > 1;
-            var kept = burst && pooled.pool.keepsBurst();
             for (var i = 0; i < pooled.chunkCount; i++) {
                 assert poison(pooled.chunks[i]);
                 if (burst) {
-                    pooled.pool.releaseBurst(pooled.chunks[i], kept);
+                    pooled.pool.releaseBurst(pooled.chunks[i]);
                 } else {
                     pooled.pool.release(pooled.chunks[i]);
                 }
