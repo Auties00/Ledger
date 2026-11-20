@@ -79,8 +79,11 @@ import java.util.Arrays;
 /// such frames keeps them in the reserve ([HeapPool#keepsBurst()]), so a collection while it fills keeps
 /// them for it; a body a stopped log leaves to the collector lets go of it ([#abandon()]). A chunked body that refers
 /// to no value is read through [#chunkCount()], [#chunk(int)] and [#chunkLength(int)], one that refers to values
-/// through its pieces, which then never span two chunks; [#array()] serves only a body of one array. No pooled chunk
-/// is ever an array a body refers to: those are arrays the pool never hands out.
+/// through its pieces, which then never span two chunks; [#array()] serves only a body of one array. A split body is
+/// read in two parts: its own bytes, the head, through its chunks as a body that refers to no value is, and its
+/// section frame by frame, each value frame through the references from [#valueFrameFirst(int)] to
+/// [#valueFrameEnd(int)] ([#referenceArray(int)], [#referenceOffset(int)], [#referenceLength(int)]), never through its
+/// pieces. No pooled chunk is ever an array a body refers to: those are arrays the pool never hands out.
 ///
 /// A write checks once that the array it writes has room for its longest encoding, and takes a path that checks each
 /// field only when it may not: that path, which grows the array or goes on in the next chunk, runs at a chunk boundary
@@ -1481,11 +1484,6 @@ final class FrameBody {
         /// {@return the value frames added}
         int count() {
             return count;
-        }
-
-        /// {@return whether every value frame of the room was added}
-        boolean full() {
-            return count == bodies.length;
         }
 
         /// {@return the array of the body of value frame `frame`}

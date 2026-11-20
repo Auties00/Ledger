@@ -910,14 +910,14 @@ final class PackedRun {
 
     /// Lets go of each home of the commit that made this view that `frames` names a value frame of ([#framedHomes]),
     /// for the place of that frame in the log: value frame `f` at `offsets[f]` of `segment`, holding `lengths[f]`
-    /// bytes, of the commit at `sequence`. A home of fewer than `minLength` bytes in its frame stays. Called once per
-    /// commit, once the frames are durable, by drops that take turns, the only writers of the places.
+    /// bytes, of the commit at `sequence`. Called once per commit, once the frames are durable, by drops that take
+    /// turns, the only writers of the places.
     ///
     /// Each place is published before its home is let go of, the home with a release store, so a reader that loads a
     /// home as `null` finds its place and reads it back. The homes of the run's other commits are no business of it.
     ///
     /// @return the bytes of the value frames of the homes let go of
-    long dropHomes(int[] frames, LogSegmentView segment, long[] offsets, int[] lengths, long sequence, int minLength) {
+    long dropHomes(int[] frames, LogSegmentView segment, long[] offsets, int[] lengths, long sequence) {
         var storage = this.storage;
         var homes = storage.homes;
         var bytes = 0L;
@@ -925,7 +925,7 @@ final class PackedRun {
             var frame = frames[i];
             var home = firstHome + i;
             var homeChunk = homes[home >>> HOME_CHUNK_BITS];
-            if (frame < 0 || lengths[frame] < minLength || HOMES.getAcquire(homeChunk, home & HOME_MASK) == null) {
+            if (frame < 0 || HOMES.getAcquire(homeChunk, home & HOME_MASK) == null) {
                 continue;
             }
             var chunk = home >>> HOME_CHUNK_BITS;
