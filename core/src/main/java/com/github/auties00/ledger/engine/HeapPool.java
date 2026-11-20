@@ -35,11 +35,15 @@ import java.util.concurrent.atomic.AtomicLong;
 /// go on, the chunks grow old after a few collections and stay; an overflow that a collection between two commits
 /// cleared would make the next commit allocate them again, and each young collection during a commit copy them,
 /// which, at the rate of a client storing large values one by one, doubles the pauses and makes G1 grow the heap to
-/// keep its time down. Each collection after such chunks came back moves them to the overflow, where the next commit
-/// takes them again; once commits stop coming, the collection after that frees them, so the reserve keeps no chunk of
-/// commits that stopped. A checkpoint, which holds the overflow from its cut to its end and comes once per many
-/// commits, gives the arrays it seals pages into to the overflow alone ([#releaseHeld(byte\[\])]), where its next
-/// window takes them again.
+/// keep its time down. The first collection after such chunks came back moves them to the overflow, where the next
+/// commit takes them again; once commits stop coming, the collection after that frees them. The move runs in the
+/// action of a [Cleaner] after that first collection, so a collection right after it may find the chunks still in the
+/// reserve, up to [#RESERVE_PER_SIZE] of their size. A body or a rope of more chunks than the reserve has room for,
+/// [#BURST_KEPT_CHUNKS], such as that of an app-state snapshot's bulk commit, gives them to the overflow alone
+/// ([#releaseHeld(byte\[\])]), as the reserve would keep only a few of them: the next such commit, which holds the
+/// overflow from its first chunk, takes them again, and the first collection after the last frees them all. A
+/// checkpoint, which holds the overflow from its cut to its end and comes once per many commits, gives the arrays it
+/// seals pages into to the overflow alone as well, where its next window takes them again.
 ///
 /// The free arrays of a size none was taken of for a tick of the [IdleTicker], between one and two of its periods, go
 /// to the collector, the reserve's and the overflow's alike, so neither a store idle after a checkpoint, in a process
@@ -74,6 +78,10 @@ public final class HeapPool {
     /// The most bytes of free arrays of one size the pool holds strongly, 1 MiB: 256 of the smallest arrays, which
     /// reads and small commits take, four chunks of a rope, one of the longest arrays.
     static final long RESERVE_PER_SIZE = 1L << 20;
+    /// The most chunks of a large commit's body or a bulk batch's rope that go back as a burst's
+    /// ([#releaseBurst(byte\[\])]), the four the reserve has room for; the chunks of a longer one go to the overflow
+    /// alone ([#releaseHeld(byte\[\])]).
+    static final int BURST_KEPT_CHUNKS = (int) (RESERVE_PER_SIZE / FrameBody.CHUNK_BYTES);
     /// The most bytes of free arrays the pool holds strongly, 4 MiB: more than the growth arrays of eight writers'
     /// batches, about 2 MiB, take at once.
     static final long RESERVE = 4L << 20;
@@ -380,15 +388,18 @@ public final class HeapPool {
         releaseTo(array, free);
     }
 
-    /// Returns `array`, one of the chunks a large commit's body or a bulk batch's rope gives back, to the pool, unless
-    /// it is not one of the pooled sizes or the pool is full.
+    /// Returns `array`, one of the chunks a large commit's body or a bulk batch's rope of at most
+    /// [#BURST_KEPT_CHUNKS] chunks gives back, to the pool, unless it is not one of the pooled sizes or the pool is
+    /// full.
     ///
     /// It goes where [#release(byte\[\])] would put it, within the same bounds, but the reserve keeps it apart from
     /// the arrays work takes and gives back one at a time, and the first collection after it moves it to the overflow,
     /// which the next collection frees unless work holds it or took it back. So commits that follow one another take
     /// the chunks of the one before them from the reserve, or, after a collection, from the overflow, and give them
     /// back to the reserve, which holds them through the next collection: the chunks grow old and stay. Once such
-    /// commits stop, the reserve keeps none past the next collection, and the one after it frees them.
+    /// commits stop, the first collection moves the reserve's chunks and the one after the move frees them. The move
+    /// runs in the action of a [Cleaner] after that first collection, so a collection right after it may find them
+    /// still in the reserve, up to [#RESERVE_PER_SIZE] of their size; only one sentinel is registered per move.
     ///
     /// @param array an array [#acquire] returned, which the caller no longer uses
     void releaseBurst(byte[] array) {
@@ -481,11 +492,12 @@ public final class HeapPool {
         }
     }
 
-    /// Returns `array`, one of the arrays a checkpoint seals pages into, to the overflow alone, never to the reserve,
-    /// unless it is not one of the pooled sizes or the pool is full.
+    /// Returns `array`, one of the arrays a checkpoint seals pages into or one of the chunks of a body or a rope of
+    /// more than [#BURST_KEPT_CHUNKS], to the overflow alone, never to the reserve, unless it is not one of the pooled
+    /// sizes or the pool is full.
     ///
     /// The caller holds the overflow ([#hold()]) from before its first array goes back until after its last has, so
-    /// a collection during its work keeps them and its next window takes them again; once it ends, the first
+    /// a collection during its work keeps them and its next window or commit takes them again; once it ends, the first
     /// collection frees them, where the reserve would keep up to [#RESERVE_PER_SIZE] of each size it used. An array
     /// given back while nothing holds the overflow is left to the next collection.
     ///
