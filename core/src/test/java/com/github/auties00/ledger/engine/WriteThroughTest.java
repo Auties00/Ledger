@@ -1495,5 +1495,65 @@ class WriteThroughTest {
                 assertEquals(model, contents(reopened));
             }
         }
+
+        /// Commits sixteen paged values of `length` bytes, the last `extra` bytes longer, under the keys `prefix00`
+        /// onwards, in one batch, durably, and records them in `model`: four of them fill each of four chunks of the
+        /// batch's rope, so the commit's frame is split into its head and four value frames, one per chunk, whatever
+        /// the lengths of a fifth of a chunk to a quarter.
+        private static void commitSplit(Ledger ledger, Map<String, String> model, String prefix, int length, int extra) throws InterruptedException {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < 16; i++) {
+                var key = prefix + "%02d".formatted(i);
+                var value = "s".repeat(i == 15 ? length + extra : length);
+                batch.put(NAMES, key, value);
+                model.put(key, value);
+            }
+            ledger.commit(batch).awaitDurable();
+        }
+
+        @ParameterizedTest(name = "encrypted: {0}")
+        @CsvSource({"true", "false"})
+        @DisplayName("counts every frame of a split commit, its head and its value frames, against the most one write takes: writes through a split commit that seals into exactly that, forces one a byte larger, and both survive a loss of power")
+        void splitBoundary(boolean encrypted) throws Exception {
+            var disk = CrashFileSystem.create();
+            var model = new TreeMap<String, String>();
+            try (var ledger = open(disk.getPath("/store"), encrypted, WriteThrough.Mode.DSYNC)) {
+                var log = log(ledger);
+                var fills = 0;
+                while (log.currentSegment() < 4) {
+                    commitBatch(ledger, model, "f" + fills++ + "-", 64, 4_000, 0);
+                }
+                ledger.checkpoint();
+
+                commitSplit(ledger, model, "c", 60_000, 0);
+                var fixed = lastGroup(log) - 16L * 60_000;
+                // The head and four value frames, each with a header
+                assertTrue(fixed >= 5L * LogWriter.FRAME_HEADER, "the commit was not split: " + fixed);
+                var length = (int) ((LogWriter.ONE_WRITE - fixed) / 16);
+                var extra = (int) ((LogWriter.ONE_WRITE - fixed) % 16);
+                assertTrue(4L * length + extra + 1 <= FrameBody.CHUNK_BYTES, "four values do not fit a rope chunk");
+
+                reachRoom(ledger, model, "p");
+                var through = log.writtenThrough();
+                var forces = log.forces();
+                commitSplit(ledger, model, "a", length, extra);
+                assertEquals(LogWriter.ONE_WRITE, lastGroup(log));
+                assertEquals(through + 1, log.writtenThrough(), "the split commit of the most one write takes was not written through");
+                assertEquals(forces + 1, log.forces());
+                survivesPowerLoss(disk, encrypted, model);
+
+                reachRoom(ledger, model, "q");
+                through = log.writtenThrough();
+                forces = log.forces();
+                commitSplit(ledger, model, "b", length, extra + 1);
+                assertEquals(LogWriter.ONE_WRITE + 1, lastGroup(log));
+                assertEquals(through, log.writtenThrough(), "a split commit past the most one write takes was written through");
+                assertEquals(forces + 1, log.forces(), "a split commit past the most one write takes was not forced once");
+                survivesPowerLoss(disk, encrypted, model);
+            }
+            try (var reopened = open(disk.getPath("/store"), encrypted, WriteThrough.Mode.OFF)) {
+                assertEquals(model, contents(reopened));
+            }
+        }
     }
 }
