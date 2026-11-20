@@ -1463,7 +1463,8 @@ class WriteThroughTest {
                 }
                 return Arena.ofAuto().allocate(size, LogWriter.ALIGNMENT);
             };
-            var builder = Ledger.builder().directory(disk.getPath("/store")).encryption(encrypted ? Encryption.key(KEY) : Encryption.none()).keyspace(NAMES);
+            var builder = Ledger.builder().directory(disk.getPath("/store")).encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
+                    .keyspace(NAMES).keyspace(ROWS);
             try (var ledger = ((LedgerBuilder) builder).segmentSize(SEGMENT).writeThrough(way).build()) {
                 var log = log(ledger);
                 var fills = 0;
