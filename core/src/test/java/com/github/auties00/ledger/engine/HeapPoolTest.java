@@ -153,34 +153,17 @@ class HeapPoolTest {
         return arrays;
     }
 
-    /// Gives `count` new arrays of `length` bytes back to `pool` as a large commit's body or a bulk batch's rope does,
-    /// asking the pool once where they go.
+    /// Gives `count` new arrays of `length` bytes back to `pool` as a large commit's body or a bulk batch's rope does.
     ///
     /// @return the arrays, by identity
     private static List<byte[]> releaseNewBurst(HeapPool pool, int count, int length) {
         var arrays = new ArrayList<byte[]>();
-        var kept = pool.keepsBurst();
         for (var i = 0; i < count; i++) {
             var array = new byte[length];
             arrays.add(array);
-            pool.releaseBurst(array, kept);
+            pool.releaseBurst(array);
         }
         return arrays;
-    }
-
-    /// {@return weak references to `arrays`, which the caller then lets go of}
-    private static List<WeakReference<byte[]>> probes(List<byte[]> arrays) {
-        var probes = new ArrayList<WeakReference<byte[]>>();
-        for (var array : arrays) {
-            probes.add(new WeakReference<>(array));
-        }
-        arrays.clear();
-        return probes;
-    }
-
-    /// {@return how many of `probes` still reach their array}
-    private static long alive(List<WeakReference<byte[]>> probes) {
-        return probes.stream().filter(probe -> !probe.refersTo(null)).count();
     }
 
     /// Gives `count` new arrays of `length` bytes back to `pool` as a checkpoint, which holds its overflow, does.
@@ -283,7 +266,6 @@ class HeapPoolTest {
     @DisplayName("keeps a large commit's chunks in the reserve, apart and within its bounds, past them in the overflow, and hands out the reserve's other arrays first")
     void keepsBurst() {
         var pool = new HeapPool(64L << 20, false);
-        pool.keepBurstsForTests();
         var hold = pool.hold();
         var reserved = releaseNew(pool, 2, CHUNK);
         // The reserve of a size is four chunks, the two others among them
@@ -297,9 +279,7 @@ class HeapPoolTest {
         for (var array : reserved) {
             assertSame(array, pool.acquire(CHUNK), "an array of the reserve");
         }
-        // The first acquire after the collections moved the commit's chunks of the reserve behind those past it
-        assertEquals(0, pool.burstBytesForTests(), "the chunks of the commit in the reserve past a collection and an acquire");
-        for (var i : List.of(2, 3, 4, 5, 0, 1)) {
+        for (var i = 0; i < 6; i++) {
             assertSame(burst.get(i), pool.acquire(CHUNK), "chunk " + i + " of the commit");
         }
         Reference.reachabilityFence(hold);
@@ -309,7 +289,6 @@ class HeapPoolTest {
     @DisplayName("moves the reserve's chunks of large commits to the overflow at a collection, where the next commit takes them again, and the collection after frees them if none does, keeping the reserve's other arrays")
     void movesBurst() {
         var pool = new HeapPool(64L << 20, false);
-        pool.keepBurstsForTests();
         var reserved = releaseNew(pool, 2, CHUNK);
         var burst = releaseNewBurst(pool, 2, CHUNK);
         pool.collectedForTests();
@@ -327,10 +306,7 @@ class HeapPoolTest {
             taken.add(array);
         }
         reserved.forEach(pool::release);
-        // No collection ran since the burst before, so this one goes where that one went
-        var kept = pool.keepsBurst();
-        assertTrue(kept, "a burst of a run gave its chunks to the overflow alone");
-        taken.forEach(array -> pool.releaseBurst(array, kept));
+        taken.forEach(pool::releaseBurst);
         taken.clear();
         Reference.reachabilityFence(hold);
         hold = null;
@@ -357,10 +333,8 @@ class HeapPoolTest {
     void collectionMovesBurst() {
         // Trimmed, so collections run the move; the ticker trims it only every 30 s, past the test
         var pool = new HeapPool(64L << 20);
-        pool.keepBurstsForTests();
         var burst = releaseNewBurst(pool, 2, CHUNK);
-        assertEquals(2L * CHUNK, pool.burstBytesForTests(), "the chunks of a commit of a run in the reserve");
-        assertTrue(pool.burstsReservedForTests());
+        assertTrue(pool.watchingCollectionsForTests(), "no collection watched after a commit's chunks came back");
         var probe = new WeakReference<>(burst.getLast());
         burst.clear();
         for (var i = 0; i < 500 && (pool.burstBytesForTests() != 0 || probe.get() != null); i++) {
@@ -369,72 +343,7 @@ class HeapPoolTest {
         }
         assertEquals(0, pool.burstBytesForTests(), "the reserve kept the chunks of the commit past the collections");
         assertNull(probe.get(), "the collections left a chunk of the commit");
-        assertFalse(pool.burstsReservedForTests(), "a move to make with no chunk in the reserve");
-    }
-
-    @Test
-    @DisplayName("a lone large commit or bulk batch gives its chunks to the overflow alone, so two collections right after it, with nothing in between, free them all")
-    void loneBurstFreed() {
-        // Trimmed, as the process's pool is
-        var pool = new HeapPool(64L << 20);
-        var probes = probes(releaseNewBurst(pool, 4, CHUNK));
-        assertEquals(0, pool.burstBytesForTests(), "the chunks of a lone burst in the reserve");
-        assertEquals(4L * CHUNK, pool.overflowBytesForTests(), "the chunks of a lone burst in the overflow");
-        System.gc();
-        System.gc();
-        assertEquals(0, alive(probes), "the collections right after a lone burst left its chunks");
-        assertEquals(0, pool.reservedBytesForTests());
-    }
-
-    @Test
-    @DisplayName("a burst after a collection freed the chunks of the one before starts a run that keeps them in the reserve, a burst before any collection goes where the one before went, and one two collections after the last ends the run")
-    void runOfBursts() {
-        var pool = new HeapPool(64L << 20, false);
-        // A burst and a second one an instant later, as a commit's body and its batch's rope, the overflow held between
-        var hold = pool.hold();
-        var lone = probes(releaseNewBurst(pool, 2, CHUNK));
-        releaseNewBurst(pool, 1, CHUNK);
-        assertEquals(0, pool.burstBytesForTests(), "a burst before any collection kept chunks the one before did not");
-        assertEquals(3L * CHUNK, pool.overflowBytesForTests());
-        Reference.reachabilityFence(hold);
-        hold = null;
-        System.gc();
-        assertEquals(0, alive(lone), "a collection with nothing held left the chunks of a lone burst");
-        // The next burst finds the chunks of the one before lost to that collection
-        var run = probes(releaseNewBurst(pool, 2, CHUNK));
-        assertEquals(2L * CHUNK, pool.burstBytesForTests(), "the chunks of a burst after a lost one not in the reserve");
-        System.gc();
-        System.gc();
-        assertEquals(2, alive(run), "collections freed the reserve's chunks of a run before their move");
-        // A collection ran since, but its move has not: the run goes on
-        releaseNewBurst(pool, 1, CHUNK);
-        assertEquals(3L * CHUNK, pool.burstBytesForTests(), "the chunks of the next burst of a run");
-        // The move of the collection after the latest burst, then a collection after it, ends the run
-        pool.collectedForTests();
-        assertEquals(0, pool.burstBytesForTests());
-        System.gc();
-        assertEquals(0, alive(run), "a collection after the move left the chunks of the run");
-        assertEquals(0, pool.overflowBytesForTests());
-        releaseNewBurst(pool, 2, CHUNK);
-        assertEquals(0, pool.burstBytesForTests(), "a burst two collections after the last of a run kept its chunks");
-        assertEquals(2L * CHUNK, pool.overflowBytesForTests());
-    }
-
-    @Test
-    @DisplayName("the first array the pool hands out after a collection that followed the latest burst moves the reserve's chunks to the overflow")
-    void acquireMovesBurst() {
-        var pool = new HeapPool(64L << 20, false);
-        pool.keepBurstsForTests();
-        var hold = pool.hold();
-        releaseNewBurst(pool, 2, CHUNK);
-        pool.release(pool.acquire(4_096));
-        assertEquals(2L * CHUNK, pool.burstBytesForTests(), "an acquire with no collection since the burst moved its chunks");
-        System.gc();
-        pool.release(pool.acquire(4_096));
-        assertEquals(0, pool.burstBytesForTests(), "an acquire after a collection left the chunks in the reserve");
-        assertEquals(2L * CHUNK, pool.overflowBytesForTests(), "the moved chunks in the overflow the next commit holds");
-        assertFalse(pool.burstsReservedForTests());
-        Reference.reachabilityFence(hold);
+        assertFalse(pool.watchingCollectionsForTests(), "a collection still watched with no chunk in the reserve");
     }
 
     @Test
@@ -661,7 +570,7 @@ class HeapPoolTest {
                             if (hold != null && kind == 0) {
                                 pool.releaseHeld(array);
                             } else if (kind == 1) {
-                                pool.releaseBurst(array, random.nextInt(4) == 0 ? pool.keepsBurst() : random.nextBoolean());
+                                pool.releaseBurst(array);
                             } else {
                                 pool.release(array);
                             }
