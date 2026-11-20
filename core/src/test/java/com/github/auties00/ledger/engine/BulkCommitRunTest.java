@@ -5,6 +5,7 @@ import com.github.auties00.ledger.KeyCodec;
 import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
+import com.github.auties00.ledger.Snapshot;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.View;
 import com.github.auties00.ledger.WriteBatch;
@@ -256,7 +257,7 @@ class BulkCommitRunTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
-    @DisplayName("a bulk commit's run is not made where a tree holds the key space, a range removal is newer than the tree, the batch removes a range of it, or another run is in memory")
+    @DisplayName("a bulk commit's run is not made where a tree holds the key space, a range removal is newer than the tree, or the batch removes a range of it, and a later bulk commit appends to the run in memory")
     void ineligibleKeyspaces(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
@@ -303,7 +304,9 @@ class BulkCommitRunTest {
                 otherExpected.texts.put("t" + i, "text " + i);
             }
             ledger.commit(batch).awaitDurable();
-            assertTrue(ledger.state(TEXTS).run == run, "a second run beside the first");
+            var appended = ledger.state(TEXTS).run;
+            assertTrue(appended.sharesArraysForTests(run), "a second run beside the first");
+            assertEquals(2 * BULK, appended.size(), "the second bulk commit did not append to the run");
             verify(ledger, otherExpected);
             ledger.checkpoint();
             verify(ledger, otherExpected);
@@ -865,6 +868,491 @@ class BulkCommitRunTest {
             verifyKeys(ledger, expected);
         }
         CheckpointTest.verifyPages(directory, encrypted);
+    }
+
+    @ParameterizedTest(name = "spill budget: {0}")
+    @ValueSource(longs = {Long.MAX_VALUE, 0})
+    @DisplayName("later bulk commits append to the run of the first, each publishing a view that a snapshot opened between them reads as of its sequence, each view's order made from the one before, and the views no reader needs let go")
+    void appendsAcrossCommits(long budget, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var seen = new ArrayList<Expected>();
+        var snapshots = new ArrayList<Snapshot>();
+        var commits = 8;
+        try (var ledger = open(directory, true, budget)) {
+            if (budget == 0) {
+                ledger.state(MESSAGES).overwrites.forceSpillsForTests();
+            }
+            PackedRun first = null;
+            for (var commit = 0; commit < commits; commit++) {
+                var batch = ledger.newBatch();
+                // Keys after every earlier commit's and between them, so each view's order interleaves the commits
+                for (var i = 0; i < BULK; i++) {
+                    var message = i * commits + commit;
+                    var value = value(message, commit, LENGTHS);
+                    batch.put(MESSAGES, key(message), value);
+                    expected.messages.put(message, value);
+                }
+                ledger.commit(batch).awaitDurable();
+                var run = ledger.state(MESSAGES).run;
+                assertNotNull(run, "a bulk commit made no run");
+                if (first == null) {
+                    first = run;
+                } else {
+                    assertTrue(run.sharesArraysForTests(first), "a bulk commit made a run beside the first");
+                    assertNotNull(run.previous(), "a view of an append lost the one before while a snapshot read it");
+                }
+                assertEquals((commit + 1) * BULK, run.size());
+                assertEquals(0, ledger.state(MESSAGES).chains(), "a put of a new key took a chain");
+                snapshots.add(ledger.snapshot());
+                seen.add(expected.copy());
+                verify(ledger, expected);
+                assertEquals(run.size(), run.sortedForTests(), "a view sorted entries a view before it had ordered");
+                if (budget == 0 && commit % 2 == 0) {
+                    // The values of this commit and the one before leave their homes here, those of the next commit
+                    // beside the append after it
+                    spillNow(ledger);
+                    assertEquals(0, run.homesForTests(), "a spill beside the appends left a value on its home");
+                    verify(ledger, expected);
+                }
+            }
+            if (budget == 0) {
+                spillNow(ledger);
+                assertEquals(0, ledger.state(MESSAGES).run.homesForTests(), "a spill beside the appends left a value on its home");
+            }
+            for (var i = 0; i < commits; i++) {
+                verify(snapshots.get(i), seen.get(i));
+            }
+            var run = ledger.state(MESSAGES).run;
+            assertEquals(run.size(), run.sortedForTests(), "a snapshot's read sorted its view again");
+            for (var snapshot : snapshots) {
+                snapshot.close();
+            }
+            // A commit that runs alone maintains the store: no reader reads a view before the newest any more
+            ledger.commit(ledger.newBatch().deleteRange(TEXTS, KeyRange.all())).awaitDurable();
+            assertSame(run, ledger.state(MESSAGES).run);
+            assertNull(run.previous(), "the views no reader reads stayed linked");
+            verify(ledger, expected);
+            ledger.checkpoint();
+            assertNull(ledger.state(MESSAGES).run, "the run outlived the checkpoint that took it");
+            verify(ledger, expected);
+        }
+        try (var ledger = open(directory, true, budget)) {
+            verify(ledger, expected);
+        }
+        CheckpointTest.verifyPages(directory, true);
+    }
+
+    @Test
+    @DisplayName("a scan after each append, with no reader held across commits so every view before the newest is let go, sorts each entry of the run once, and a snapshot of an older view picks its order out of a newer view's")
+    void scansBetweenAppends(@TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        var commits = 8;
+        Snapshot early = null;
+        Expected earlySeen = null;
+        try (var ledger = open(directory, true, Long.MAX_VALUE)) {
+            for (var commit = 0; commit < commits; commit++) {
+                var batch = ledger.newBatch();
+                for (var i = 0; i < BULK; i++) {
+                    var message = i * commits + commit;
+                    var value = value(message, commit, LENGTHS);
+                    batch.put(MESSAGES, key(message), value);
+                    expected.messages.put(message, value);
+                }
+                ledger.commit(batch).awaitDurable();
+                var run = ledger.state(MESSAGES).run;
+                assertEquals((commit + 1) * BULK, run.size());
+                if (commit == 2) {
+                    assertNull(run.previous(), "a view no reader reads stayed linked");
+                    // Read only after a later view made its order, which holds this view's entries
+                    early = ledger.snapshot();
+                    earlySeen = expected.copy();
+                    continue;
+                }
+                if (commit < 2) {
+                    assertNull(run.previous(), "a view no reader reads stayed linked");
+                }
+                try (var snapshot = ledger.snapshot()) {
+                    verify(snapshot, expected);
+                }
+                assertEquals(run.size(), run.sortedForTests(), "a scan sorted entries an older view had ordered");
+            }
+            var run = ledger.state(MESSAGES).run;
+            var sorted = run.sortedForTests();
+            verify(early, earlySeen);
+            assertEquals(sorted, run.sortedForTests(), "an older view sorted entries a newer view had ordered");
+            early.close();
+            verify(ledger, expected);
+            ledger.checkpoint();
+            assertNull(ledger.state(MESSAGES).run, "the run outlived the checkpoint that took it");
+            verify(ledger, expected);
+        }
+        try (var ledger = open(directory, true, Long.MAX_VALUE)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a later bulk commit puts keys of the run's views on chains over their entries, removes them, and appends its new keys, counted exactly through a crash, a checkpoint and a reopen")
+    void laterBulkOverRunKeys(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            var batch = ledger.newBatch();
+            puts(batch, expected, 0, BULK, 0, LENGTHS);
+            ledger.commit(batch).awaitDurable();
+            var first = ledger.state(MESSAGES).run;
+            batch = ledger.newBatch();
+            puts(batch, expected, BULK, BULK, 0, LENGTHS);
+            for (var message = 0; message < 300; message++) {
+                if (message % 3 == 0) {
+                    batch.delete(MESSAGES, key(message));
+                    expected.messages.remove(message);
+                } else {
+                    var value = value(message, 5, LENGTHS);
+                    batch.put(MESSAGES, key(message), value);
+                    expected.messages.put(message, value);
+                }
+            }
+            // A new key put, removed and put again in the batch, and one put then removed
+            batch.put(MESSAGES, key(3 * BULK), new byte[]{1});
+            batch.delete(MESSAGES, key(3 * BULK));
+            batch.put(MESSAGES, key(3 * BULK), new byte[]{2});
+            expected.messages.put(3 * BULK, new byte[]{2});
+            batch.put(MESSAGES, key(3 * BULK + 1), new byte[]{1});
+            batch.delete(MESSAGES, key(3 * BULK + 1));
+            ledger.commit(batch).awaitDurable();
+            var run = ledger.state(MESSAGES).run;
+            assertTrue(run.sharesArraysForTests(first));
+            assertEquals(2 * BULK + 2, run.size());
+            verify(ledger, expected);
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a bulk commit whose puts mostly go to chains leaves the run's arrays and hash table the room its new keys take, not the room of every put")
+    void appendRoomOfNewKeys(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            var batch = ledger.newBatch();
+            puts(batch, expected, 0, BULK, 0, LENGTHS);
+            ledger.commit(batch).awaitDurable();
+            var run = ledger.state(MESSAGES).run;
+            var lengths = run.arrayLengthsForTests();
+            var slots = run.slotsForTests();
+            assertEquals(BULK, lengths[0]);
+            // Overwrites of the run's keys alone: the append takes nothing and leaves the run as it was
+            batch = ledger.newBatch();
+            puts(batch, expected, 0, BULK, 1, LENGTHS);
+            ledger.commit(batch).awaitDurable();
+            assertSame(run, ledger.state(MESSAGES).run);
+            assertArrayEquals(lengths, run.arrayLengthsForTests());
+            assertEquals(slots, run.slotsForTests());
+            verify(ledger, expected);
+            // Overwrites and 100 new keys: room for those, as an append of 100 keys makes it
+            batch = ledger.newBatch();
+            puts(batch, expected, 0, BULK, 2, LENGTHS);
+            puts(batch, expected, BULK, 100, 0, LENGTHS);
+            ledger.commit(batch).awaitDurable();
+            var appended = ledger.state(MESSAGES).run;
+            assertTrue(appended.sharesArraysForTests(run));
+            assertEquals(BULK + 100, appended.size());
+            var grown = appended.arrayLengthsForTests();
+            assertEquals(Math.max(BULK + 100, lengths[0] + (lengths[0] >> 1)), grown[0], "the ends of the keys");
+            assertEquals(lengths[1], grown[1], "the words");
+            assertTrue(4L * (BULK + 100) <= 3L * slots, "the test's run needs a larger table");
+            assertEquals(slots, appended.slotsForTests(), "the hash table");
+            verify(ledger, expected);
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @Test
+    @DisplayName("a bulk commit taken back as it appends leaves the run as its newest view holds it, with no entry, home or slot of its own, and the next append takes its indexes")
+    void rollbackMidAppend(@TempDir Path directory) throws Exception {
+        ValueCodec<String> refusing = ValueCodec.of(value -> value.getBytes(StandardCharsets.UTF_8).length,
+                (value, target) -> MemorySegment.copy(MemorySegment.ofArray(value.getBytes(StandardCharsets.UTF_8)), 0,
+                        target, 0, target.byteSize()),
+                source -> {
+                    var text = new String(source.toArray(ValueLayout.JAVA_BYTE), StandardCharsets.UTF_8);
+                    if (text.equals("fail")) {
+                        throw new IllegalArgumentException("refused");
+                    }
+                    return text;
+                });
+        var failing = Keyspace.resident("failing", KeyCodec.utf8(), refusing);
+        try (var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(directory)
+                .encryption(Encryption.key(KEY)).keyspace(MESSAGES).keyspace(TEXTS).keyspace(CHATS).keyspace(failing))
+                .writeThrough(WriteThrough.Mode.OFF)
+                .build()) {
+            var expected = new Expected();
+            var batch = ledger.newBatch();
+            puts(batch, expected, 0, BULK, 0, LENGTHS);
+            ledger.commit(batch).awaitDurable();
+            var run = ledger.state(MESSAGES).run;
+            var lengths = run.arrayLengthsForTests();
+            var slots = run.slotsForTests();
+            try (var before = ledger.snapshot()) {
+                var taken = ledger.newBatch();
+                // New keys, enough to grow the hash table, then a decoded value that throws after the run took them
+                puts(taken, new Expected(), BULK, 4 * BULK, 9, LENGTHS);
+                taken.putEncoded(failing, MemorySegment.ofArray("k".getBytes(StandardCharsets.UTF_8)),
+                        MemorySegment.ofArray("fail".getBytes(StandardCharsets.UTF_8)));
+                assertThrows(IllegalArgumentException.class, () -> ledger.commit(taken));
+                assertSame(run, ledger.state(MESSAGES).run, "a commit taken back published a view");
+                assertEquals(BULK, run.size());
+                assertArrayEquals(lengths, run.arrayLengthsForTests(), "the room of a commit taken back was kept");
+                assertEquals(slots, run.slotsForTests(), "the hash table of a commit taken back was kept");
+                for (var message = BULK; message < 5 * BULK; message += 97) {
+                    assertTrue(ledger.get(MESSAGES, key(message)).isEmpty(), "message " + message + " of a commit taken back");
+                }
+                verify(ledger, expected);
+                // Half the keys of the commit taken back, and others
+                var next = ledger.newBatch();
+                puts(next, expected, 3 * BULK, 2 * BULK, 1, LENGTHS);
+                ledger.commit(next).awaitDurable();
+                var appended = ledger.state(MESSAGES).run;
+                assertTrue(appended.sharesArraysForTests(run));
+                assertSame(run, appended.previous());
+                assertEquals(3 * BULK, appended.size());
+                for (var message = BULK; message < 3 * BULK; message += 97) {
+                    assertTrue(ledger.get(MESSAGES, key(message)).isEmpty(), "message " + message + " of a commit taken back");
+                }
+                verify(ledger, expected);
+                assertEquals(BULK, before.size(MESSAGES));
+                assertTrue(before.get(MESSAGES, key(3 * BULK)).isEmpty());
+            }
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a checkpoint's cut closes the run to appends: bulk commits during and after it go to chains, counted exactly, and the checkpoint takes the run whole")
+    void cutClosesRun(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            var batch = ledger.newBatch();
+            puts(batch, expected, 0, BULK, 0, LENGTHS);
+            ledger.commit(batch).awaitDurable();
+            var batch2 = ledger.newBatch();
+            puts(batch2, expected, BULK, BULK, 0, LENGTHS);
+            ledger.commit(batch2).awaitDurable();
+            var run = ledger.state(MESSAGES).run;
+            assertEquals(2 * BULK, run.size());
+            var ran = new AtomicBoolean();
+            ledger.checkpointer().hookCutForTests(() -> {
+                if (ran.compareAndSet(false, true)) {
+                    assertFalse(run.appendable(), "the cut left the run open to appends");
+                    var during = ledger.newBatch();
+                    puts(during, expected, 2 * BULK, BULK, 0, LENGTHS);
+                    // Keys of the closed run too, on chains over its entries
+                    for (var message = 0; message < 100; message++) {
+                        var value = value(message, 3, LENGTHS);
+                        during.put(MESSAGES, key(message), value);
+                        expected.messages.put(message, value);
+                    }
+                    ledger.commit(during);
+                    assertSame(run, ledger.state(MESSAGES).run, "a bulk commit appended to a closed run");
+                    assertTrue(ledger.state(MESSAGES).chains() >= BULK, "the bulk commit after the cut kept no chains");
+                }
+            });
+            ledger.checkpoint();
+            assertTrue(ran.get());
+            ledger.checkpointer().hookCutForTests(null);
+            assertNull(ledger.state(MESSAGES).run, "the checkpoint left the run it took");
+            verify(ledger, expected);
+            // The tree now holds the key space: chains again
+            batch = ledger.newBatch();
+            puts(batch, expected, 3 * BULK, BULK, 0, LENGTHS);
+            ledger.commit(batch).awaitDurable();
+            assertNull(ledger.state(MESSAGES).run);
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a run started after the cut of a checkpoint still running takes appends until that checkpoint publishes a tree of the key space, then bulk commits go to chains, and the next checkpoint merges the run into that tree")
+    void runAfterRunningCut(boolean encrypted, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            var small = ledger.newBatch();
+            puts(small, expected, 10 * BULK, 20, 0, LENGTHS);
+            ledger.commit(small).awaitDurable();
+            var ran = new AtomicBoolean();
+            ledger.checkpointer().hookCutForTests(() -> {
+                if (ran.compareAndSet(false, true)) {
+                    for (var commit = 0; commit < 2; commit++) {
+                        var batch = ledger.newBatch();
+                        puts(batch, expected, commit * BULK, BULK, 0, LENGTHS);
+                        ledger.commit(batch);
+                    }
+                    var run = ledger.state(MESSAGES).run;
+                    assertNotNull(run);
+                    assertEquals(2 * BULK, run.size(), "a bulk commit after the cut did not append to the run started after it");
+                    assertTrue(run.appendable());
+                }
+            });
+            ledger.checkpoint();
+            assertTrue(ran.get());
+            ledger.checkpointer().hookCutForTests(null);
+            var run = ledger.state(MESSAGES).run;
+            assertNotNull(run, "a checkpoint below the run released it");
+            verify(ledger, expected);
+            var batch = ledger.newBatch();
+            puts(batch, expected, 2 * BULK, BULK, 0, LENGTHS);
+            for (var message = 0; message < 50; message++) {
+                batch.delete(MESSAGES, key(message * 7));
+                expected.messages.remove(message * 7);
+            }
+            ledger.commit(batch).awaitDurable();
+            assertSame(run, ledger.state(MESSAGES).run, "a bulk commit appended over a tree of the key space");
+            verify(ledger, expected);
+            ledger.checkpoint();
+            assertNull(ledger.state(MESSAGES).run);
+            verify(ledger, expected);
+        }
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "round {0}")
+    @ValueSource(ints = {0, 1, 2})
+    @DisplayName("bulk commits appending beside pipelined commits, checkpoints and readers keep every snapshot's count, scan and point reads in agreement and the counts exact")
+    void racingAppends(int round, @TempDir Path directory) throws Exception {
+        var commits = new ConcurrentHashMap<Long, List<Object[]>>();
+        try (var ledger = open(directory, true, round == 2 ? 0 : Long.MAX_VALUE)) {
+            var stop = new AtomicBoolean();
+            var failure = new AtomicReference<Throwable>();
+            var threads = new ArrayList<Thread>();
+            for (var t = 0; t < 2; t++) {
+                var seed = round * 10 + t;
+                threads.add(Thread.ofPlatform().start(() -> {
+                    var random = new Random(seed);
+                    try {
+                        while (!stop.get()) {
+                            var batch = ledger.newBatch();
+                            var writes = new ArrayList<Object[]>();
+                            for (var i = 0; i < 1 + random.nextInt(4); i++) {
+                                var message = random.nextInt(6 * BULK);
+                                if (random.nextInt(3) == 0) {
+                                    batch.delete(MESSAGES, key(message));
+                                    writes.add(new Object[]{message, null});
+                                } else {
+                                    var value = value(message, 100 + random.nextInt(50), LENGTHS);
+                                    batch.put(MESSAGES, key(message), value);
+                                    writes.add(new Object[]{message, value});
+                                }
+                            }
+                            commits.put(ledger.commit(batch).sequence(), writes);
+                        }
+                    } catch (Throwable throwable) {
+                        failure.compareAndSet(null, throwable);
+                    }
+                }));
+            }
+            // Snapshots whose count, scan and point reads must agree, whichever view of the run they read
+            threads.add(Thread.ofPlatform().start(() -> {
+                try {
+                    while (!stop.get()) {
+                        try (var snapshot = ledger.snapshot()) {
+                            var size = snapshot.size(MESSAGES);
+                            var scanned = new ArrayList<byte[]>();
+                            snapshot.forEach(MESSAGES, KeyRange.all(), (key, _) -> {
+                                scanned.add(key);
+                                return true;
+                            });
+                            assertEquals(size, scanned.size(), "a snapshot's count and scan disagree");
+                            for (var i = 0; i < scanned.size(); i += 101) {
+                                assertTrue(snapshot.get(MESSAGES, scanned.get(i)).isPresent(), "a scanned key reads absent");
+                            }
+                            var low = key(BULK);
+                            var high = key(3 * BULK);
+                            var counted = snapshot.range(MESSAGES, KeyRange.between(low, high), Integer.MAX_VALUE).size();
+                            var between = scanned.stream().filter(key -> Arrays.compareUnsigned(key, low) >= 0
+                                    && Arrays.compareUnsigned(key, high) < 0).count();
+                            assertEquals(between, counted, "a snapshot's range and scan disagree");
+                        }
+                    }
+                } catch (Throwable throwable) {
+                    failure.compareAndSet(null, throwable);
+                }
+            }));
+            var checkpoints = Thread.ofPlatform().start(() -> {
+                try {
+                    while (round > 0 && !stop.get()) {
+                        ledger.checkpoint();
+                        Thread.sleep(5);
+                    }
+                } catch (Throwable throwable) {
+                    failure.compareAndSet(null, throwable);
+                }
+            });
+            var appended = 0;
+            PackedRun before = null;
+            for (var bulk = 0; bulk < 6; bulk++) {
+                var batch = ledger.newBatch();
+                var writes = new ArrayList<Object[]>();
+                // Half the keys of the bulk commit before, half new
+                for (var message = bulk * BULK / 2; message < bulk * BULK / 2 + BULK; message++) {
+                    var value = value(message, bulk, LENGTHS);
+                    batch.put(MESSAGES, key(message), value);
+                    writes.add(new Object[]{message, value});
+                }
+                commits.put(ledger.commit(batch).sequence(), writes);
+                var run = ledger.state(MESSAGES).run;
+                if (before != null && run != null && run != before && run.sharesArraysForTests(before) && run.size() > before.size()) {
+                    appended++;
+                }
+                before = run;
+            }
+            if (round == 0) {
+                // No checkpoint runs beside them, so the bulk commits after the first append to its run
+                assertTrue(appended > 0, "no bulk commit appended to the run while the readers and writers ran");
+            }
+            Thread.sleep(50);
+            stop.set(true);
+            for (var thread : threads) {
+                thread.join();
+            }
+            checkpoints.join();
+            if (failure.get() != null) {
+                throw new AssertionError(failure.get());
+            }
+            var expected = new Expected();
+            for (var sequence : commits.keySet().stream().sorted().toList()) {
+                for (var write : commits.get(sequence)) {
+                    if (write[1] == null) {
+                        expected.messages.remove((Integer) write[0]);
+                    } else {
+                        expected.messages.put((Integer) write[0], (byte[]) write[1]);
+                    }
+                }
+            }
+            verify(ledger, expected);
+            ledger.checkpoint();
+            verify(ledger, expected);
+        }
     }
 
     private static void spillNow(LiveLedger ledger) throws InterruptedException {

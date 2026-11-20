@@ -6,6 +6,7 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.FileChannel;
@@ -180,6 +181,14 @@ final class LogWriter {
     private static final int SMALL_GROUP = 8 << 10;
     /// The small groups in a row after which a larger buffer goes back to the size they needed.
     private static final int SHRINK_AFTER = 256;
+    /// The groups for which a writer that found its spare output taken by the collector keeps the largest output
+    /// between groups instead of giving it back, doubled by every later loss up to [#MAX_HOLD_GROUPS]: a store whose
+    /// collections fall between its groups, as one written to without pause does, would otherwise allocate a megabyte
+    /// for most of its large groups.
+    private static final int HOLD_GROUPS = 256;
+    /// The most groups one loss of the spare output keeps the largest output for, so a store loses at most one spare
+    /// every so many groups.
+    private static final int MAX_HOLD_GROUPS = 1 << 16;
     /// The bytes of a frame body sealed in one call, a multiple of the AES block.
     private static final int SLICE = 64 << 10;
     /// The shortest piece of a frame body that refers to values which [#seal] hands to the cipher as it is; shorter
@@ -262,7 +271,7 @@ final class LogWriter {
     private boolean interruptedWrite;
     // Whether the flush running is a commit's, for its own group, which one drain writes whole
     private boolean leading;
-    // Where the last drain wrote, and how many bytes, which the output still holds until the next group is sealed
+    // Where the last drain wrote, and how many bytes, which the output holds until its group is durable
     private long lastDrainStart;
     private int lastDrainLength;
     private long segmentNumber;
@@ -309,6 +318,22 @@ final class LogWriter {
     // The buffer frames are sealed into and written from, a slice at a time whatever their size; it grows up to OUTPUT
     // while a group needs more, so a group that fits is written with one call
     private byte[] output;
+    // The output of MIN_OUTPUT bytes the writer starts with, which an output of OUTPUT bytes is given back to once the
+    // queue is empty, so giving it back allocates nothing
+    private final byte[] smallOutput;
+    // The output of OUTPUT bytes given back the last time a group left the queue empty, or a run of small groups took
+    // back, reached weakly, so the next group that grows the output takes it back unless the collector took it first.
+    // Its bytes are never written again: only a commit's own group rewrites its last drain, during its own force,
+    // before the output is given back
+    private WeakReference<byte[]> spareOutput;
+    // The groups left for which the largest output is kept between groups, set when the collector took the spare
+    private int holdGroups;
+    // The groups the next loss of the spare keeps the largest output for, from HOLD_GROUPS up to MAX_HOLD_GROUPS
+    private int nextHold = HOLD_GROUPS;
+    // The spare output held strongly too, for tests that check which array a group takes back
+    private byte[] keptSpareForTests;
+    // Whether a spare output given back is held strongly too, for tests
+    volatile boolean keepSpareForTests;
     // The buffer over the whole of output that drains write it through, made again only when output is replaced, so a
     // drain allocates nothing whatever the compiler inlines
     private ByteBuffer outputBuffer;
@@ -320,6 +345,14 @@ final class LogWriter {
     private int smallPeak;
     // The most bytes the group being written asked the output for so far
     private int groupPeak;
+    // The most bytes the group being written may ask the output for, at most OUTPUT: what its frames seal into, joined
+    // into runs, the room the cipher's last call asks for past them and the padding to a block
+    private int groupNeed;
+    // The times the output grew for the group being written, and the most it grew for one group, for tests
+    private int groupGrowths;
+    private volatile int mostGroupGrowths;
+    // The arrays the output grew into, for tests; written by the flush task only
+    private volatile long outputAllocations;
     // How long the write and force of a group took, or its write through, a moving average in nanoseconds of the groups
     // after the first, each at most four times the average before it, or 0 before the second group
     private long forceNanos;
@@ -442,7 +475,8 @@ final class LogWriter {
             throw new IllegalStateException("AES-GCM is unavailable", exception);
         }
         this.crc = new CRC32C();
-        this.output = new byte[MIN_OUTPUT];
+        this.smallOutput = new byte[MIN_OUTPUT];
+        this.output = smallOutput;
         this.flushing = new ArrayList<>();
         this.queueLock = new ReentrantLock();
         this.queueDrained = queueLock.newCondition();
@@ -1026,13 +1060,23 @@ final class LogWriter {
                 group.clear();
                 flushing = group;
                 boolean roomy;
+                boolean idle;
                 queueLock.lock();
                 try {
                     pendingBytes -= bodies;
                     roomy = pendingBytes < QUEUE_LIMIT / 2;
+                    idle = queue.isEmpty();
                     queueDrained.signalAll();
                 } finally {
                     queueLock.unlock();
+                }
+                // The group is durable and no other is queued: a store whose groups keep coming keeps the largest
+                // output from one to the next, and one that stops holds it only weakly, unless the collector took a
+                // spare between two groups not long ago
+                if (holdGroups > 0) {
+                    holdGroups--;
+                } else if (idle && output.length == OUTPUT) {
+                    giveBackOutput();
                 }
                 publish(sequence, frames, roomy);
                 if (!leading && poolWanted()) {
@@ -1137,7 +1181,11 @@ final class LogWriter {
             // The size every group of the run fitted in, so the next ones of the same sizes do not grow it again
             var size = Math.max(MIN_OUTPUT, Integer.highestOneBit(smallPeak - 1) << 1);
             if (output.length > size) {
-                output = new byte[size];
+                if (output.length == OUTPUT) {
+                    keepSpare(output);
+                }
+                output = size == MIN_OUTPUT ? smallOutput : new byte[size];
+                outputBuffer = null;
             }
             smallGroups = 0;
             smallPeak = 0;
@@ -1159,6 +1207,8 @@ final class LogWriter {
             bodies += frame.body().size();
         }
         var count = group.size();
+        groupNeed = groupBound(group);
+        groupGrowths = 0;
         for (var index = 0; index < count; ) {
             var frame = group.get(index);
             var bodyLength = frame.body().size();
@@ -1229,6 +1279,44 @@ final class LogWriter {
             fillNext();
         }
         return bodies;
+    }
+
+    /// {@return the most bytes `group` asks the output for, at most [#OUTPUT]: its frames sealed as [#runEnd(List, int)]
+    /// joins them, the room the cipher's last call asks for past the last one and the padding to the next block}
+    ///
+    /// The commits are joined into runs as a segment with room for them all would join them, each entry counted as an
+    /// entry of a run even when its run holds it alone, which takes up to three bytes less. A segment that fills ends a
+    /// run sooner, but the rollover writes out the output first, and the runs either side of it hold no more than the
+    /// ones counted. Every call of [#room(int)] but the cipher's last asks for no more than the frame being sealed holds,
+    /// and that one for at most a tag past it. The bound is a multiple of [#ALIGNMENT], so groups of one size keep one
+    /// output of that size.
+    private int groupBound(List<Queued> group) {
+        var frame = (long) FRAME_HEADER + sealOverhead();
+        var bytes = 2L * TAG_BYTES;
+        // The bytes of the entries of the run the last commit joined, or -1 if the last frame is not in a run
+        var entries = -1L;
+        var sequence = 0L;
+        for (var queued : group) {
+            var length = queued.body().size();
+            if (queued.type() == FrameBody.COMMIT && length <= RUN_MAX_BODY) {
+                var entry = FrameBody.runEntryBytes(length);
+                if (entries >= 0 && queued.sequence() == sequence + 1 && entries + entry <= RUN_BYTES) {
+                    entries += entry;
+                    bytes += entry;
+                } else {
+                    entries = entry;
+                    bytes += frame + entry;
+                }
+                sequence = queued.sequence();
+            } else {
+                entries = -1;
+                bytes += frame + length;
+            }
+            if (bytes >= OUTPUT) {
+                return OUTPUT;
+            }
+        }
+        return (int) Math.min(OUTPUT, (bytes + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT);
     }
 
     /// {@return the bytes sealing adds to a frame body: the GCM tag, or the CRC-32C without encryption}
@@ -1554,20 +1642,79 @@ final class LogWriter {
     }
 
     /// Makes room for `bytes` more in the output: grows it while it is smaller than [#OUTPUT], else writes it out.
+    ///
+    /// No byte past `used` is live when it is called: the bytes a frame gathers past `used` before it seals them in
+    /// place fit in the room the first of them asked for, so a growth keeps the first `used` bytes only.
     private void room(int bytes) throws IOException {
-        if (used + bytes > groupPeak) {
-            groupPeak = used + bytes;
+        var need = used + bytes;
+        if (need > groupPeak) {
+            groupPeak = need;
         }
-        if (used + bytes > output.length) {
+        if (need > output.length) {
             if (output.length < OUTPUT) {
-                var grown = Math.min(OUTPUT, Math.max(2 * output.length, used + bytes));
-                // The bytes not written yet stay where they are
-                output = Arrays.copyOf(output, grown);
-                if (used + bytes <= grown) {
+                grow(need);
+                if (need <= output.length) {
                     return;
                 }
             }
             drain();
+        }
+    }
+
+    /// Replaces the output with a larger one that holds its first `used` bytes where they are, for a group that asks it
+    /// for `need` bytes.
+    ///
+    /// A group takes back the spare output while it is reachable, whatever it asks for: it allocates nothing, and the
+    /// output is given back again once the queue is empty. Otherwise it grows the output to the group's bound in one
+    /// step, or by a quarter if that is more, so groups of slowly growing sizes replace it a bounded number of times;
+    /// one that asks for more than its bound, which the bound rules out, doubles it, so it never grows by the bytes of a
+    /// slice at a time. A spare the collector took keeps the largest output from being given back for the next
+    /// [#HOLD_GROUPS] groups or more.
+    private void grow(int need) {
+        if (++groupGrowths > mostGroupGrowths) {
+            mostGroupGrowths = groupGrowths;
+        }
+        var kept = spareOutput;
+        var spare = kept == null ? null : kept.get();
+        if (spare != null) {
+            System.arraycopy(output, 0, spare, 0, used);
+            output = spare;
+            return;
+        }
+        if (kept != null) {
+            spareOutput = null;
+            holdGroups = nextHold;
+            nextHold = Math.min(MAX_HOLD_GROUPS, 2 * nextHold);
+        }
+        var length = output.length;
+        var size = need <= groupNeed ? Math.max(groupNeed, length + (length >> 2)) : Math.max(2L * length, need);
+        output = Arrays.copyOf(output, (int) Math.min(OUTPUT, (size + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT));
+        outputAllocations++;
+    }
+
+    /// Gives back the output of [#OUTPUT] bytes once the group last written from it is durable and the queue is empty:
+    /// the next group starts from the smallest output, and takes the spare back if it grows while the collector has not
+    /// taken it.
+    ///
+    /// A store that writes large groups now and then, as a bulk load does, so holds a megabyte strongly only while
+    /// groups keep coming, and one whose groups keep coming neither gives the output back nor allocates another; one
+    /// whose collections took a spare between two groups keeps the largest output for [#HOLD_GROUPS] groups or more. The
+    /// output of a smaller group stays until [#SHRINK_AFTER] small groups take it back.
+    private void giveBackOutput() {
+        assert used == 0 && output.length == OUTPUT : "an output given back holds bytes or is not the largest";
+        keepSpare(output);
+        output = smallOutput;
+        outputBuffer = null;
+    }
+
+    /// Keeps `spare`, an output of [#OUTPUT] bytes no group writes from any more, weakly, for the next group that grows.
+    private void keepSpare(byte[] spare) {
+        var kept = spareOutput;
+        if (kept == null || kept.get() != spare) {
+            spareOutput = new WeakReference<>(spare);
+        }
+        if (keepSpareForTests) {
+            keptSpareForTests = spare;
         }
     }
 
@@ -1614,7 +1761,7 @@ final class LogWriter {
         lastDrainLength = used;
         while (throughFile != null) {
             try {
-                throughFile.write(output, used, output.length, start);
+                throughFile.write(output, used, start);
                 position = start + used;
                 used = 0;
                 forcedPosition = position;
@@ -1932,6 +2079,48 @@ final class LogWriter {
     /// {@return the bytes of the output, for tests: read after a group returned, its size once that group was written}
     int outputLength() {
         return output.length;
+    }
+
+    /// {@return the arrays the output grew into since the writer opened, for tests}
+    long outputAllocationsForTests() {
+        return outputAllocations;
+    }
+
+    /// {@return the most bytes the last group written asked the output for, for tests: read after it is durable}
+    int groupPeakForTests() {
+        return groupPeak;
+    }
+
+    /// {@return the groups left for which the largest output is kept between groups, for tests: read after a group
+    /// returned}
+    int holdGroupsForTests() {
+        return holdGroups;
+    }
+
+    /// {@return the times the output grew while the last group was written, for tests: read after it is durable}
+    int groupGrowthsForTests() {
+        return groupGrowths;
+    }
+
+    /// {@return the most times the output grew while one group was written, for tests}
+    int mostGroupGrowthsForTests() {
+        return mostGroupGrowths;
+    }
+
+    /// {@return the output given back once the queue was empty, or `null` if there is none or the collector took it, for
+    /// tests: read after a group returned}
+    byte[] spareOutputForTests() {
+        var spare = spareOutput;
+        return spare == null ? null : spare.get();
+    }
+
+    /// Lets go of the output given back, as a collection would, for tests: called between groups.
+    void dropSpareOutputForTests() {
+        var spare = spareOutput;
+        if (spare != null) {
+            spare.clear();
+        }
+        keptSpareForTests = null;
     }
 
     /// {@return the way later segments are opened to write through, or `null` if their groups are forced, for tests}

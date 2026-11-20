@@ -36,8 +36,9 @@ final class ReplayValues {
     /// rather than to twice its entries ([#reserve(PackedRun.Builder, long)]).
     static final int RESERVE_AT = 4096;
     /// The entries up to which a reservation may give a builder more than twice its entries, at most sixteen times:
-    /// the arrays of 262,144 entries take 11.5 MB at most (12 bytes per entry, 32 more per value in the log), so an
-    /// estimate too high costs that much at most past what doubling would have taken.
+    /// the ends of the keys of 262,144 entries, the only array of a builder that grows by copies past its first chunks,
+    /// take 1 MB (4 bytes per entry), so an estimate too high costs that much at most past what doubling would have
+    /// taken.
     static final int RESERVE_ENTRIES = 1 << 18;
 
     // The chunk values are copied into, its read-only view, and the bytes of it they took; null before the first one
@@ -76,7 +77,7 @@ final class ReplayValues {
     /// and at most sixteen times the entries up to [#RESERVE_ENTRIES] entries and twice them past that, so an estimate
     /// too high (a log whose later frames overwrite the keys of its first ones) takes little more than doubling would.
     /// Nothing for a run that is not full, nor while the replay is still in the frame of the run's first write, whose
-    /// writes give no rate: the arrays then double.
+    /// writes give no rate: the ends of the keys then double.
     void reserve(PackedRun.Builder run, long budget) {
         var size = run.size();
         if (size < RESERVE_AT || size < run.capacity()) {

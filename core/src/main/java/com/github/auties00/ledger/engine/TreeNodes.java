@@ -477,6 +477,8 @@ final class TreeNodes {
             Bytes.u16(unit, position + 1, entry.length());
             if (entry.held() instanceof Version logged) {
                 logged.readLogged(unit, position + 3);
+            } else if (entry.held() instanceof PackedRun.LoggedEntry logged) {
+                logged.readInto(unit, position + 3);
             } else if (entry.held() instanceof byte[] array) {
                 System.arraycopy(array, 0, unit, position + 3, entry.length());
             } else {
@@ -600,13 +602,14 @@ final class TreeNodes {
     /// An inline value is held as a read-only segment; as the array that is the value, for a version that keeps its
     /// value on an array of its own, which [#writeEntry(byte\[\], int, LeafEntry)] copies with an array copy and no view
     /// of it; or, for the value of a version that left the heap for the log ([SpillQueue]), as that version, whose value
-    /// [#writeEntry(byte\[\], int, LeafEntry)] reads from the log straight into the unit it writes. A checkpoint then
-    /// copies such a value once, into its leaf or delta record, with nothing of its own in between.
+    /// [#writeEntry(byte\[\], int, LeafEntry)] reads from the log straight into the unit it writes, or as the entry of a
+    /// [PackedRun] whose value is in the log ([PackedRun.LoggedEntry]), read the same way. A checkpoint then copies such
+    /// a value once, into its leaf or delta record, with nothing of its own in between.
     ///
     /// @param key the key
-    /// @param held the inline value: a read-only segment, an array no one writes that is the value whole, or a
-    ///             [Version] whose value is in the log ([Version#logged()]); or `null` if the value is in a blob or a
-    ///             unit, or the entry is a removal
+    /// @param held the inline value: a read-only segment, an array no one writes that is the value whole, a [Version]
+    ///             whose value is in the log ([Version#logged()]), or a [PackedRun.LoggedEntry]; or `null` if the value
+    ///             is in a blob or a unit, or the entry is a removal
     /// @param blob the blob or unit of the value, or `null` if it is inline, or the entry is a removal
     /// @param length the bytes of the value, or -1 for a removal
     /// @param external whether `blob` is a unit of [BlobFile] rather than a blob of the data file
@@ -648,7 +651,8 @@ final class TreeNodes {
             if (blob != null || other.blob != null) {
                 return blob != null && blob.equals(other.blob);
             }
-            if (held instanceof Version || other.held instanceof Version) {
+            if (held instanceof Version || other.held instanceof Version || held instanceof PackedRun.LoggedEntry
+                    || other.held instanceof PackedRun.LoggedEntry) {
                 // Not read back to compare: a value in the log is that of a write since the last checkpoint, which
                 // a delta record then holds even if it wrote the bytes the base holds
                 return held == other.held;
