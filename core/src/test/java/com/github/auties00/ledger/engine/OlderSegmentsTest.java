@@ -13,7 +13,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
-import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -30,7 +29,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.zip.CRC32C;
 import java.util.zip.ZipInputStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -38,20 +39,33 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
-/// Stores whose log a build of segment version 3 wrote and left uncheckpointed, with a large value of each key space
-/// in a unit of the first format and an empty prepared segment of version 3 after the last written one, open with the
-/// current build: recovery replays the older segments, writes its own commits to a segment of the current version
-/// rather than into the prepared one, and the store survives a loss of power at sampled forces of its later writes.
+/// Stores whose log a build of an older segment version wrote and left uncheckpointed, with a large value of each key
+/// space in a unit and an empty prepared segment of that version after the last written one, open with the current
+/// build: recovery replays the older segments, writes its own commits, split ones among them, to a segment of the
+/// current version rather than into the prepared one, and the store survives a loss of power at sampled forces of its
+/// later writes.
 ///
-/// The fixtures `segments-v3-encrypted.zip` and `segments-v3-plain.zip` hold such stores, written by the commits of
-/// [#writeFixture(Writer)] through a build of segment version 3, opened with [#open(Path, boolean)]'s options and
-/// segments of 64 KiB, its process halted once the last commit was durable.
+/// The fixtures `segments-v<version>-encrypted.zip` and `segments-v<version>-plain.zip` hold such stores, written by
+/// the commits of [#writeFixture(Writer)] through a build of that segment version, opened with
+/// [#open(Path, boolean)]'s options and segments of 64 KiB, its process halted once the last commit was durable: the
+/// version 3 ones by f33bbc5, whose units of large values are of the first format and whose third segment is the
+/// prepared one, the version 4 ones by e0538fc, whose units of an encrypted store are of format
+/// [PageFormat#CLOSE_TAG] and whose fourth segment is the prepared one.
 class OlderSegmentsTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.bytes());
     private static final Keyspace<String, byte[]> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.bytes());
-    private static final int OLDER_VERSION = 3;
-    private static final long PREPARED_SEGMENT = 3;
+    /// The writes of a split commit: values of 300 to 500 bytes, about 1.2 MB of them, which take several value frames.
+    private static final int SPLIT_WRITES = 3_000;
+
+    /// {@return the prepared, empty segment of the fixture of segment version `version`}
+    private static long preparedSegment(int version) {
+        return switch (version) {
+            case 3 -> 3;
+            case 4 -> 4;
+            default -> throw new IllegalArgumentException("no fixture of segment version " + version);
+        };
+    }
 
     private static LiveLedger open(Path directory, boolean encrypted) {
         return (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(directory)
@@ -170,9 +184,10 @@ class OlderSegmentsTest {
         return contents;
     }
 
-    // Unpacks the fixture into `directory`, forcing every file and directory so a loss of power keeps all of it
-    private static void unpack(boolean encrypted, Path directory) throws IOException {
-        var name = encrypted ? "segments-v3-encrypted.zip" : "segments-v3-plain.zip";
+    // Unpacks the fixture of segment version `version` into `directory`, forcing every file and directory so a loss of
+    // power keeps all of it
+    private static void unpack(int version, boolean encrypted, Path directory) throws IOException {
+        var name = "segments-v%d-%s.zip".formatted(version, encrypted ? "encrypted" : "plain");
         var directories = new LinkedHashSet<Path>();
         Files.createDirectories(directory);
         directories.add(directory);
@@ -227,14 +242,44 @@ class OlderSegmentsTest {
         }
     }
 
-    @ParameterizedTest(name = "encrypted {0}")
-    @ValueSource(booleans = {true, false})
-    @DisplayName("replays an uncheckpointed log of the older version, writes its own commits to a segment of the current version past the older prepared one, and keeps them through a crash, a checkpoint and reopens")
-    void opensOlderLog(boolean encrypted, @TempDir Path directory) throws Exception {
-        unpack(encrypted, directory);
+    /// {@return the split frames of the segment at `segment` whose headers are whole}
+    ///
+    /// The header of a frame is never encrypted, so this reads the segments of an encrypted store too.
+    private static int splitFrames(Path segment) throws IOException {
+        var bytes = Files.readAllBytes(segment);
+        var buffer = ByteBuffer.wrap(bytes);
+        var crc = new CRC32C();
+        var splits = 0;
+        for (var at = LogWriter.SEGMENT_HEADER; at + LogWriter.FRAME_HEADER <= bytes.length; at++) {
+            if (buffer.getInt(at) != LogWriter.MAGIC || bytes[at + 16] != FrameBody.COMMIT_SPLIT) {
+                continue;
+            }
+            crc.reset();
+            crc.update(bytes, at, LogWriter.FRAME_HEADER - Integer.BYTES);
+            if ((int) crc.getValue() == buffer.getInt(at + LogWriter.FRAME_HEADER - Integer.BYTES)) {
+                splits++;
+            }
+        }
+        return splits;
+    }
+
+    /// Gives `put` the [#SPLIT_WRITES] values of a split commit of generation `generation`, every `step`th of them.
+    private static void putSplit(BiConsumer<String, byte[]> put, int generation, int step) {
+        for (var i = 0; i < SPLIT_WRITES; i += step) {
+            var key = "s-%05d".formatted(i);
+            put.accept(key, value(key, generation, 300 + (i + generation * 50) % 200));
+        }
+    }
+
+    @ParameterizedTest(name = "version {0}, encrypted {1}")
+    @CsvSource({"3,true", "3,false", "4,true", "4,false"})
+    @DisplayName("replays an uncheckpointed log of an older version, writes its own commits, a split one among them, to a segment of the current version past the older prepared one, and keeps them through a crash, a checkpoint and reopens")
+    void opensOlderLog(int version, boolean encrypted, @TempDir Path directory) throws Exception {
+        unpack(version, encrypted, directory);
         var log = directory.resolve("log");
-        var prepared = log.resolve("%016x.log".formatted(PREPARED_SEGMENT));
-        assertEquals(OLDER_VERSION, segmentVersion(prepared));
+        var preparedSegment = preparedSegment(version);
+        var prepared = log.resolve("%016x.log".formatted(preparedSegment));
+        assertEquals(version, segmentVersion(prepared));
         assertFalse(framesWritten(prepared), "the fixture's last segment is prepared and empty");
         var expected = fixtureState();
         try (var ledger = open(directory, encrypted)) {
@@ -243,23 +288,32 @@ class OlderSegmentsTest {
             batch.put(MESSAGES, "m-large", value("m-large", 1, 30_000));
             batch.put(MESSAGES, "m-0002", value("m-0002", 1, 200));
             ledger.commit(batch).awaitDurable();
+            var split = ledger.newBatch();
+            putSplit((key, value) -> {
+                split.put(MESSAGES, key, value);
+                expected.get(MESSAGES.name()).put(key, HexFormat.of().formatHex(value));
+            }, 0, 1);
+            ledger.commit(split).awaitDurable();
             expected.get(MESSAGES.name()).put("m-large", HexFormat.of().formatHex(value("m-large", 1, 30_000)));
             expected.get(MESSAGES.name()).put("m-0002", HexFormat.of().formatHex(value("m-0002", 1, 200)));
             ledger.closeWithoutCheckpoint();
         }
         var later = 0;
+        var splits = 0;
         try (var segments = Files.list(log)) {
             for (var segment : segments.filter(path -> path.getFileName().toString().endsWith(".log")).toList()) {
                 var number = Long.parseLong(segment.getFileName().toString().substring(0, 16), 16);
-                if (number > PREPARED_SEGMENT) {
+                if (number > preparedSegment) {
                     assertEquals(LogWriter.SEGMENT_VERSION, segmentVersion(segment), segment.toString());
+                    splits += splitFrames(segment);
                     later++;
                 } else {
-                    assertEquals(OLDER_VERSION, segmentVersion(segment), segment.toString());
+                    assertEquals(version, segmentVersion(segment), segment.toString());
                 }
             }
         }
         assertTrue(later > 0, "no segment of the current version");
+        assertTrue(splits > 0, "no split frame after the older log");
         if (Files.exists(prepared)) {
             assertFalse(framesWritten(prepared), "a commit written into the older prepared segment");
         }
@@ -308,6 +362,12 @@ class OlderSegmentsTest {
                 });
                 last.awaitDurable();
                 durable = visible;
+                // Two split commits, the second rewriting half of the first's values
+                write(ledger, writer -> putSplit((key, value) -> writer.put(MESSAGES, key, value), 0, 1));
+                write(ledger, writer -> {
+                    putSplit((key, value) -> writer.put(MESSAGES, key, value), 1, 2);
+                    writer.put(CHATS, "c-02", value("c-02", 100, 64));
+                });
                 ledger.checkpoint();
                 write(ledger, writer -> writer.put(CHATS, "c-large", value("c-large", 1, 18_000)));
                 write(ledger, writer -> {
@@ -369,12 +429,12 @@ class OlderSegmentsTest {
         }
     }
 
-    @ParameterizedTest(name = "encrypted {0}, part {1}")
-    @CsvSource({"true,0", "true,1", "false,0"})
-    @DisplayName("recovers a state between the last durable and the last visible commit at sampled forces of the writes that follow an older log, and keeps it through a checkpoint and a reopen")
-    void powerLossAfterOlderLog(boolean encrypted, int part) throws Exception {
+    @ParameterizedTest(name = "version {0}, encrypted {1}, part {2}")
+    @CsvSource({"3,true,0", "3,true,1", "3,false,0", "4,true,0", "4,true,1", "4,false,0"})
+    @DisplayName("recovers a state between the last durable and the last visible commit at sampled forces of the writes that follow an older log, split commits among them, and keeps it through a checkpoint and a reopen")
+    void powerLossAfterOlderLog(int version, boolean encrypted, int part) throws Exception {
         var dry = CrashFileSystem.create();
-        unpack(encrypted, dry.getPath("/store"));
+        unpack(version, encrypted, dry.getPath("/store"));
         var unpacked = dry.forces();
         var dryRun = new Continuation(encrypted);
         dryRun.run(dry.getPath("/store"));
@@ -388,7 +448,7 @@ class OlderSegmentsTest {
         points.add(forces);
         for (var force : points) {
             var disk = CrashFileSystem.create();
-            unpack(encrypted, disk.getPath("/store"));
+            unpack(version, encrypted, disk.getPath("/store"));
             disk.stopAtForce(force);
             var continuation = new Continuation(encrypted);
             continuation.run(disk.getPath("/store"));
