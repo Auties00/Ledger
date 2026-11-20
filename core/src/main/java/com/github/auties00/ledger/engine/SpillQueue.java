@@ -763,7 +763,7 @@ final class SpillQueue {
         /// The state of a record whose run lets go of its homes for its value frames once they are durable, until it
         /// does.
         static final byte HOMES_HELD = 1;
-        /// The state of a record whose run let go of its homes, or would have but for a written through group.
+        /// The state of a record whose run let go of its homes.
         static final byte HOMES_DROPPED = 2;
 
         // The bytes of the values the record moves, whether one is at least LOG_VALUE_MIN, and the bytes of the
@@ -982,18 +982,22 @@ final class SpillQueue {
             return ownOnly && ownBytes == 0;
         }
 
-        /// Lets each run of the record go of the homes its value frames hold whole, the frames being durable: of a
-        /// group written through, only those of at least [#THROUGH_VALUE_MIN] bytes, as a read back of a shorter one
-        /// would go to the device; holding the queue's lock.
+        /// Lets each run of the record go of the homes its value frames hold whole, the frames being durable, holding
+        /// the queue's lock.
+        ///
+        /// The group of such a record is never written through, so a read back finds the frames in the system's cache:
+        /// its value frames hold whole homes of at least [#FRAMED_HOMES_MIN] bytes ([#settle(long)]), and a group
+        /// is written through only if its frames seal into one write of less than a megabyte
+        /// ([LogWriter#ONE_WRITE]).
         ///
         /// @return the bytes of the homes let go of
         private long dropHomes() {
+            assert !through : "a group of homes let go of written through";
             var places = valueFrames;
             var dropped = 0L;
             for (var values : runs) {
                 if (values.run != null && values.homeFrames != null) {
-                    dropped += values.run.dropHomes(values.homeFrames, segment, places.offsets, places.lengths,
-                            sequence, through ? THROUGH_VALUE_MIN : 0);
+                    dropped += values.run.dropHomes(values.homeFrames, segment, places.offsets, places.lengths, sequence);
                 }
             }
             return dropped;

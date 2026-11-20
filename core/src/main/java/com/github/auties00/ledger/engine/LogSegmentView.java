@@ -253,18 +253,6 @@ final class LogSegmentView {
     /// {@return the body of the value frame at `frameOffset` of the segment, of `length` bytes, a frame of the split
     /// commit at `sequence`, read and authenticated into an array of its own, read-only}
     ///
-    /// The sealed frame is read into an array the pool lends for the read.
-    ///
-    /// @throws Retired if a checkpoint retired the segment, or retires it as the frame is read
-    /// @throws LedgerIoException if the segment cannot be read
-    /// @throws LedgerCorruptedException if the frame fails authentication, or is not that value frame
-    MemorySegment readValueFrame(long frameOffset, int length, long sequence) {
-        return readValueFrame(frameOffset, length, sequence, null);
-    }
-
-    /// {@return the body of the value frame at `frameOffset` of the segment, of `length` bytes, a frame of the split
-    /// commit at `sequence`, read and authenticated into an array of its own, read-only}
-    ///
     /// The frame's tag, which binds its header, so its type, sequence and length, and its place in the segment use,
     /// authenticates it; without encryption its CRC-32C checks it. Its header must name a value frame of `sequence`
     /// holding `length` bytes.
