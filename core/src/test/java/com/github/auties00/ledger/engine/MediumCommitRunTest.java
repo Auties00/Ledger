@@ -31,6 +31,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -693,6 +694,9 @@ class MediumCommitRunTest {
             commits.put(0L, populated.entrySet().stream().map(entry -> new Object[]{entry.getKey(), entry.getValue()}).toList());
             var stop = new AtomicBoolean();
             var failure = new AtomicReference<Throwable>();
+            // Held for reading by each step of the other threads, and for writing by the commits that must find the
+            // store idle
+            var quiet = new ReentrantReadWriteLock(true);
             var threads = new ArrayList<Thread>();
             threads.add(Thread.ofPlatform().start(() -> {
                 var random = new Random(round);
@@ -711,7 +715,12 @@ class MediumCommitRunTest {
                                 writes.add(new Object[]{message, value});
                             }
                         }
-                        commits.put(ledger.commit(batch).sequence(), writes);
+                        quiet.readLock().lock();
+                        try {
+                            commits.put(ledger.commit(batch).sequence(), writes);
+                        } finally {
+                            quiet.readLock().unlock();
+                        }
                         Thread.sleep(0, 200_000);
                     }
                 } catch (Throwable throwable) {
@@ -723,6 +732,7 @@ class MediumCommitRunTest {
                 try {
                     var iteration = 0;
                     while (!stop.get()) {
+                        quiet.readLock().lock();
                         try (var snapshot = ledger.snapshot()) {
                             var size = snapshot.size(MESSAGES);
                             if (++iteration % 25 == 0) {
@@ -730,6 +740,8 @@ class MediumCommitRunTest {
                                 assertEquals(size, scanned, "a snapshot's count and scan disagree");
                             }
                             assertEquals(size, snapshot.size(MESSAGES), "a snapshot counted twice differently");
+                        } finally {
+                            quiet.readLock().unlock();
                         }
                     }
                 } catch (Throwable throwable) {
@@ -739,7 +751,12 @@ class MediumCommitRunTest {
             var checkpoints = Thread.ofPlatform().start(() -> {
                 try {
                     while (round > 0 && !stop.get()) {
-                        ledger.checkpoint();
+                        quiet.readLock().lock();
+                        try {
+                            ledger.checkpoint();
+                        } finally {
+                            quiet.readLock().unlock();
+                        }
                         Thread.sleep(3);
                     }
                 } catch (Throwable throwable) {
@@ -747,24 +764,40 @@ class MediumCommitRunTest {
                 }
             });
             var random = new Random(round + 100);
-            var runs = 0;
+            var quietRuns = 0;
             for (var commit = 0; commit < 150; commit++) {
-                var batch = ledger.newBatch();
-                var writes = new ArrayList<Object[]>();
-                for (var i = 0; i < 100; i++) {
-                    var message = random.nextInt(4) == 0 ? random.nextInt(POPULATED) : POPULATED + commit * 100 + i;
-                    var value = value(message, commit);
-                    batch.put(MESSAGES, key(message), value);
-                    writes.add(new Object[]{message, value});
+                // Now and then with the other threads held between their steps and a checkpoint published, so the
+                // commit finds the store idle and no cut waiting for its trees whatever the timing of the machine
+                var still = commit % 30 == 29;
+                if (still) {
+                    quiet.writeLock().lock();
                 }
-                for (var i = 0; i < 5; i++) {
-                    var message = random.nextInt(POPULATED + commit * 100);
-                    batch.delete(MESSAGES, key(message));
-                    writes.add(new Object[]{message, null});
-                }
-                commits.put(ledger.commit(batch).sequence(), writes);
-                if (ledger.state(MESSAGES).run != null) {
-                    runs++;
+                try {
+                    if (still) {
+                        ledger.checkpoint();
+                    }
+                    var batch = ledger.newBatch();
+                    var writes = new ArrayList<Object[]>();
+                    for (var i = 0; i < 100; i++) {
+                        var message = random.nextInt(4) == 0 ? random.nextInt(POPULATED) : POPULATED + commit * 100 + i;
+                        var value = value(message, commit);
+                        batch.put(MESSAGES, key(message), value);
+                        writes.add(new Object[]{message, value});
+                    }
+                    for (var i = 0; i < 5; i++) {
+                        var message = random.nextInt(POPULATED + commit * 100);
+                        batch.delete(MESSAGES, key(message));
+                        writes.add(new Object[]{message, null});
+                    }
+                    commits.put(ledger.commit(batch).sequence(), writes);
+                    var run = ledger.state(MESSAGES).run;
+                    if (still && run != null && run.appended() && !run.counted() && run.appendable()) {
+                        quietRuns++;
+                    }
+                } finally {
+                    if (still) {
+                        quiet.writeLock().unlock();
+                    }
                 }
             }
             stop.set(true);
@@ -775,7 +808,7 @@ class MediumCommitRunTest {
             if (failure.get() != null) {
                 throw new AssertionError(failure.get());
             }
-            assertTrue(runs > 0, "no medium commit made a run");
+            assertTrue(quietRuns > 0, "no medium commit that found the store idle made an uncounted run");
             var expected = new TreeMap<Integer, byte[]>();
             for (var sequence : commits.keySet().stream().sorted().toList()) {
                 for (var write : commits.get(sequence)) {
