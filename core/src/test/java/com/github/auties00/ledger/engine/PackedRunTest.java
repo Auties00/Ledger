@@ -33,6 +33,7 @@ import java.util.Random;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.IntUnaryOperator;
 import java.util.stream.IntStream;
@@ -1598,5 +1599,248 @@ class PackedRunTest {
             }
         }
         return durable;
+    }
+
+    /// {@return a key of the tests of a bulk commit's hash table, `id` after a fixed prefix}
+    private static byte[] tableKey(int id) {
+        return ByteBuffer.allocate(8).putInt(0x7AB1E000).putInt(id).array();
+    }
+
+    /// {@return the keys `first` to `first + count`, excluded}
+    private static List<byte[]> tableKeys(int first, int count) {
+        var keys = new ArrayList<byte[]>(count);
+        for (var id = first; id < first + count; id++) {
+            keys.add(tableKey(id));
+        }
+        return keys;
+    }
+
+    /// Puts `keys`, which the run holds no entry of, into `builder` as a bulk commit puts empty values.
+    private static void putEmpty(PackedRun.Builder builder, List<byte[]> keys) {
+        var stamp = 0L;
+        for (var key : keys) {
+            var segment = MemorySegment.ofArray(key);
+            assertTrue(builder.fits(segment, null, 0, 0));
+            builder.putHome(segment, Segments.hash(segment), stamp++, null, 0, 0);
+        }
+    }
+
+    /// Checks that `run` finds each key of `present` through both of its finds, and none of `absent`.
+    private static void assertFinds(PackedRun run, List<byte[]> present, List<byte[]> absent) {
+        for (var key : present) {
+            var entry = run.find(key);
+            assertTrue(entry >= 0 && entry < run.size(), () -> "lost " + HexFormat.of().formatHex(key));
+            assertEquals(entry, run.find(MemorySegment.ofArray(key)));
+            assertArrayEquals(key, run.key(entry).toArray(ValueLayout.JAVA_BYTE));
+        }
+        for (var key : absent) {
+            assertEquals(-1, run.find(key), () -> "found " + HexFormat.of().formatHex(key));
+            assertEquals(-1, run.find(MemorySegment.ofArray(key)));
+        }
+    }
+
+    /// {@return whether `value` is a power of two}
+    private static boolean powerOfTwo(int value) {
+        return value > 0 && (value & (value - 1)) == 0;
+    }
+
+    @ParameterizedTest(name = "{0} entries")
+    @ValueSource(ints = {1, 2, 3, 5, 7, 9, 13, 100, 2_548, 666_667})
+    @DisplayName("a bulk commit's new run takes a hash table two thirds full of its entries, of any length, and finds every key through both finds and no other")
+    void commitTableTwoThirds(int entries) {
+        var builder = PackedRun.Builder.forCommit(entries, 8L * entries);
+        var keys = tableKeys(0, entries);
+        putEmpty(builder, keys);
+        var run = builder.buildCommitted(null);
+        assertEquals(Math.max(2, entries + (entries + 1) / 2), run.slotsForTests());
+        assertFinds(run, keys, tableKeys(entries, Math.min(entries, 1_000) + 10));
+    }
+
+    @ParameterizedTest(name = "{0} entries")
+    @ValueSource(ints = {2, 3, 6, 7, 10, 11, 666_667})
+    @DisplayName("keys whose probes start at the last slot of a table of odd length wrap to its first slots, and a find of a key of no entry that starts there wraps to an empty slot")
+    void probesWrap(int entries) {
+        var slots = entries + (entries + 1) / 2;
+        assertEquals(1, slots & 1, "the table's length is even");
+        // Keys whose probe starts at the last slot, up to half the entries and at least two, then keys of no entry
+        // whose probe starts there too
+        var wanted = Math.min(Math.max(2, entries / 2 + 1), 64);
+        var last = new ArrayList<byte[]>();
+        var absent = new ArrayList<byte[]>();
+        var probe = ByteBuffer.wrap(tableKey(0));
+        for (var id = 0; last.size() < wanted || absent.size() < 8; id++) {
+            var key = probe.putInt(4, id).array();
+            if (PackedRun.home(Segments.hash(key), slots) == slots - 1) {
+                if (last.size() < wanted) {
+                    last.add(key.clone());
+                } else {
+                    absent.add(key.clone());
+                }
+            }
+        }
+        var keys = new ArrayList<>(last.subList(0, Math.min(entries, wanted)));
+        for (var id = -1; keys.size() < entries; id--) {
+            keys.add(tableKey(id));
+        }
+        var builder = PackedRun.Builder.forCommit(entries, 8L * entries);
+        putEmpty(builder, keys);
+        var run = builder.buildCommitted(null);
+        assertEquals(slots, run.slotsForTests());
+        assertFinds(run, keys, absent);
+    }
+
+    @Test
+    @DisplayName("the probe of a table of any length starts in it, and spreads hashes over it evenly")
+    void homeInTable() {
+        var random = new Random(7);
+        for (var length : new int[]{2, 3, 5, 11, 1_500, 150_000, 1_000_001, 1 << 20, PackedRun.MAX_ENTRIES + PackedRun.MAX_ENTRIES / 2}) {
+            for (var i = 0; i < 10_000; i++) {
+                var home = PackedRun.home(random.nextInt(), length);
+                assertTrue(home >= 0 && home < length, "home " + home + " of " + length);
+            }
+            assertEquals(0, PackedRun.home(0, length));
+            assertEquals(length - 1, PackedRun.home(-1, length));
+        }
+        // 300,000 random hashes over 30 equal parts of a table of 3,000 slots: each part within 10% of the mean
+        var parts = new int[30];
+        for (var i = 0; i < 300_000; i++) {
+            parts[PackedRun.home(random.nextInt(), 3_000) / 100]++;
+        }
+        for (var part : parts) {
+            assertTrue(Math.abs(part - 10_000) < 1_000, "part of " + part);
+        }
+    }
+
+    @Test
+    @DisplayName("a new run whose commit took fewer entries than it planned keeps its table while they fill half of it, and takes one two thirds full of them below")
+    void newRunGivesBackTable() {
+        // 1,000 planned puts: 1,500 slots, kept down to 750 entries
+        var kept = PackedRun.Builder.forCommit(1_000, 8_000);
+        var keys = tableKeys(0, 750);
+        putEmpty(kept, keys);
+        var run = kept.buildCommitted(null);
+        assertEquals(1_500, run.slotsForTests());
+        assertFinds(run, keys, tableKeys(750, 300));
+        var shrunk = PackedRun.Builder.forCommit(1_000, 8_000);
+        keys = tableKeys(0, 749);
+        putEmpty(shrunk, keys);
+        run = shrunk.buildCommitted(null);
+        assertEquals(749 + 375, run.slotsForTests());
+        assertFinds(run, keys, tableKeys(749, 300));
+    }
+
+    @Test
+    @DisplayName("an append to a run of a table two thirds full keeps the table while the entries fill at most three quarters of it, and makes a power of two past that, where older views and the newest find their own keys")
+    void appendsToCommitTable() {
+        var builder = PackedRun.Builder.forCommit(1_000, 8_000);
+        var first = tableKeys(0, 1_000);
+        putEmpty(builder, first);
+        var run = builder.buildCommitted(null);
+        assertEquals(1_500, run.slotsForTests());
+        // 125 more fill three quarters of the table exactly
+        var appending = PackedRun.Builder.appending(run, 125, 1_000);
+        var second = tableKeys(1_000, 125);
+        putEmpty(appending, second);
+        var appended = appending.buildCommitted(null);
+        assertEquals(1_500, appended.slotsForTests(), "an append within three quarters made a table");
+        var both = new ArrayList<>(first);
+        both.addAll(second);
+        assertFinds(run, first, second);
+        assertFinds(appended, both, tableKeys(1_125, 100));
+        // One more key is past three quarters: a power of two
+        appending = PackedRun.Builder.appending(appended, 1, 8);
+        var third = tableKeys(1_125, 1);
+        putEmpty(appending, third);
+        var grown = appending.buildCommitted(null);
+        assertEquals(2_048, grown.slotsForTests());
+        var all = new ArrayList<>(both);
+        all.addAll(third);
+        assertFinds(run, first, tableKeys(1_000, 126));
+        assertFinds(appended, both, third);
+        assertFinds(grown, all, tableKeys(1_126, 100));
+    }
+
+    @Test
+    @DisplayName("readers of the first view of a run of a table two thirds full find its keys and none of the later commits' while appends grow the table past three quarters")
+    void readersAcrossAppendRehash() throws Exception {
+        var builder = PackedRun.Builder.forCommit(3_000, 24_000);
+        var first = tableKeys(0, 3_000);
+        putEmpty(builder, first);
+        var run = builder.buildCommitted(null);
+        assertEquals(4_500, run.slotsForTests());
+        // Appends of 375 keys: the first fills three quarters of the table, the second makes a power of two
+        var later = tableKeys(3_000, 18_750);
+        var stop = new AtomicBoolean();
+        var failure = new AtomicReference<Throwable>();
+        var readers = new ArrayList<Thread>();
+        for (var r = 0; r < 2; r++) {
+            var seed = r;
+            readers.add(Thread.ofPlatform().start(() -> {
+                var random = new Random(seed);
+                try {
+                    while (!stop.get()) {
+                        var key = first.get(random.nextInt(first.size()));
+                        var entry = run.find(key);
+                        if (entry < 0 || entry >= run.size() || run.find(MemorySegment.ofArray(key)) != entry) {
+                            throw new AssertionError("the first view lost " + HexFormat.of().formatHex(key));
+                        }
+                        var absent = later.get(random.nextInt(later.size()));
+                        if (run.find(absent) != -1 || run.find(MemorySegment.ofArray(absent)) != -1) {
+                            throw new AssertionError("the first view found a later key");
+                        }
+                    }
+                } catch (Throwable throwable) {
+                    failure.set(throwable);
+                }
+            }));
+        }
+        var newest = run;
+        var held = new ArrayList<>(first);
+        var tables = new ArrayList<Integer>();
+        for (var from = 0; from < later.size(); from += 375) {
+            var keys = later.subList(from, from + 375);
+            var appending = PackedRun.Builder.appending(newest, keys.size(), 8L * keys.size());
+            putEmpty(appending, keys);
+            newest = appending.buildCommitted(null);
+            held.addAll(keys);
+            tables.add(newest.slotsForTests());
+        }
+        stop.set(true);
+        for (var reader : readers) {
+            reader.join();
+        }
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+        assertEquals(4_500, tables.getFirst(), "an append within three quarters made a table");
+        assertTrue(powerOfTwo(tables.get(1)) && powerOfTwo(tables.getLast()), "the table past three quarters is not a power of two");
+        assertFinds(run, first, later.subList(0, 200));
+        assertFinds(newest, held, tableKeys(21_750, 200));
+    }
+
+    @Test
+    @DisplayName("a commit taken back as it appends to a run of a table two thirds full gives back the table of exactly its earlier length, which finds every key of the newest view, and the next append takes it")
+    void rollbackRestoresCommitTable() {
+        var builder = PackedRun.Builder.forCommit(1_000, 8_000);
+        var first = tableKeys(0, 1_000);
+        putEmpty(builder, first);
+        var run = builder.buildCommitted(null);
+        assertEquals(1_500, run.slotsForTests());
+        var taken = PackedRun.Builder.appending(run, 4_000, 32_000);
+        var takenKeys = tableKeys(1_000, 4_000);
+        putEmpty(taken, takenKeys);
+        assertTrue(powerOfTwo(run.slotsForTests()), "the append made no larger table");
+        taken.rollback();
+        assertEquals(1_500, run.slotsForTests(), "the rollback kept the larger table");
+        assertFinds(run, first, takenKeys);
+        var next = PackedRun.Builder.appending(run, 100, 800);
+        var nextKeys = tableKeys(5_000, 100);
+        putEmpty(next, nextKeys);
+        var appended = next.buildCommitted(null);
+        assertEquals(1_500, appended.slotsForTests());
+        var both = new ArrayList<>(first);
+        both.addAll(nextKeys);
+        assertFinds(appended, both, takenKeys);
+        assertFinds(run, first, nextKeys);
     }
 }

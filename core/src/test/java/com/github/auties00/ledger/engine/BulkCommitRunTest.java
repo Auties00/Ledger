@@ -1151,6 +1151,83 @@ class BulkCommitRunTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
+    @DisplayName("a bulk commit of 100,000 puts of new keys keeps them in a run whose hash table is two thirds full, under the 1 MiB of a humongous array, finds every key and no other, and an open replays them into a power of two")
+    void largeCommitTable(boolean encrypted, @TempDir Path directory) throws Exception {
+        var count = 100_000;
+        var value = new byte[]{1, 2, 3, 4, 5, 6, 7, 8};
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            var batch = ledger.newBatch();
+            for (var message = 0; message < count; message++) {
+                batch.put(MESSAGES, key(message), value);
+            }
+            ledger.commit(batch).awaitDurable();
+            var run = ledger.state(MESSAGES).run;
+            assertNotNull(run);
+            assertTrue(run.committed());
+            assertEquals(count, run.size());
+            assertEquals(150_000, run.slotsForTests());
+            assertTrue(4L * run.slotsForTests() + 16 < 1 << 20, "the hash table is a humongous array");
+            for (var message = 0; message < count; message++) {
+                var key = key(message);
+                var entry = run.find(key);
+                assertTrue(entry >= 0, "message " + message);
+                assertEquals(entry, run.find(MemorySegment.ofArray(key)));
+                assertArrayEquals(value, ledger.get(MESSAGES, key).orElseThrow());
+            }
+            for (var message = count; message < count + 10_000; message++) {
+                assertEquals(-1, run.find(key(message)));
+                assertEquals(-1, run.find(MemorySegment.ofArray(key(message))));
+                assertTrue(ledger.get(MESSAGES, key(message)).isEmpty());
+            }
+            assertEquals(count, ledger.size(MESSAGES));
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, 0)) {
+            var run = ledger.state(MESSAGES).run;
+            assertNotNull(run);
+            assertFalse(run.committed());
+            var slots = run.slotsForTests();
+            assertEquals(0, slots & (slots - 1), "the replay's table of " + slots + " slots is not a power of two");
+            for (var message = 0; message < count + 1_000; message++) {
+                assertEquals(message < count, ledger.get(MESSAGES, key(message)).isPresent(), "message " + message);
+            }
+            assertEquals(count, ledger.size(MESSAGES));
+        }
+    }
+
+    @ParameterizedTest(name = "{0} puts of earlier keys of the batch")
+    @ValueSource(ints = {10, 2_000})
+    @DisplayName("a first bulk commit whose puts partly go to chains keeps the run's hash table it made for every put while its new keys fill half of it, and takes one two thirds full of them below")
+    void newRunTableOfNewKeys(int repeats, @TempDir Path directory) throws Exception {
+        var expected = new Expected();
+        try (var ledger = open(directory, true, Long.MAX_VALUE)) {
+            var batch = ledger.newBatch();
+            puts(batch, expected, 0, BULK, 0, LENGTHS);
+            // Later puts of keys the batch put: the run holds the first, so these go to chains
+            for (var i = 0; i < repeats; i++) {
+                var message = i % BULK;
+                var value = value(message, 1, LENGTHS);
+                batch.put(MESSAGES, key(message), value);
+                expected.messages.put(message, value);
+            }
+            ledger.commit(batch).awaitDurable();
+            var run = ledger.state(MESSAGES).run;
+            assertNotNull(run);
+            assertEquals(BULK, run.size());
+            var planned = BULK + repeats;
+            var made = planned + (planned + 1) / 2;
+            var slots = 2L * BULK < made ? BULK + (BULK + 1) / 2 : made;
+            assertEquals(slots, run.slotsForTests());
+            verify(ledger, expected);
+            ledger.closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, true, 0)) {
+            verify(ledger, expected);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
     @DisplayName("a checkpoint's cut closes the run to appends: bulk commits during and after it go to chains, counted exactly, and the checkpoint takes the run whole")
     void cutClosesRun(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();

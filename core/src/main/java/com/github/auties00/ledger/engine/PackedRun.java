@@ -306,9 +306,9 @@ final class PackedRun {
         var keyEnds = layout == null ? storage.keyEnds : null;
         var keys = storage.keys;
         var size = this.size;
-        var mask = slots.length - 1;
+        var table = slots.length;
         var tag = hash & TAG_MASK;
-        for (var i = hash & mask; ; i = (i + 1) & mask) {
+        for (var i = home(hash, table); ; i = next(i, table)) {
             var slot = slots[i];
             if (slot == 0) {
                 return -1;
@@ -336,9 +336,9 @@ final class PackedRun {
         var keyEnds = layout == null ? storage.keyEnds : null;
         var keys = storage.keys;
         var size = this.size;
-        var mask = slots.length - 1;
+        var table = slots.length;
         var tag = hash & TAG_MASK;
-        for (var i = hash & mask; ; i = (i + 1) & mask) {
+        for (var i = home(hash, table); ; i = next(i, table)) {
             var slot = slots[i];
             if (slot == 0) {
                 return -1;
@@ -809,6 +809,18 @@ final class PackedRun {
             var chunk = chunk(entry);
             return chunk << KEY_CHUNK_BITS | (entry - chunk * perChunk) * length;
         }
+    }
+
+    /// {@return the slot a key whose hash is `hash` starts probing at in a hash table of `length` slots, of any length:
+    /// the hash's low 24 bits, which the tag of a slot leaves out, scaled to the table by a multiply rather than a
+    /// division}
+    static int home(int hash, int length) {
+        return (int) (((Integer.rotateLeft(hash, 8) & 0xFFFF_FFFFL) * length) >>> 32);
+    }
+
+    // The slot a probe of a hash table of `length` slots reads after `slot`: the next, or the first after the last
+    private static int next(int slot, int length) {
+        return ++slot == length ? 0 : slot;
     }
 
     private static int chunkOf(long value) {
@@ -1567,11 +1579,12 @@ final class PackedRun {
 
         /// Creates the builder of the run of an open's replay.
         Builder() {
-            this(FIRST_ENTRIES, FIRST_ENTRIES * 32L, false);
+            this(FIRST_ENTRIES, FIRST_ENTRIES * 32L, false, tableFor(FIRST_ENTRIES));
         }
 
-        // A builder of a new run with room for `entries` entries of `keyBytes` bytes of keys in all
-        private Builder(int entries, long keyBytes, boolean committed) {
+        // A builder of a new run with room for `entries` entries of `keyBytes` bytes of keys in all, whose hash table
+        // starts with `slots` slots
+        private Builder(int entries, long keyBytes, boolean committed, int slots) {
             var capacity = Math.max(1, entries);
             this.storage = new Storage();
             this.after = null;
@@ -1597,7 +1610,7 @@ final class PackedRun {
                 this.logs = new long[0][];
                 this.segments = new ArrayList<>();
             }
-            storage.slots = new int[tableFor(capacity)];
+            storage.slots = new int[slots];
             this.minStamp = Long.MAX_VALUE;
             this.maxStamp = -1;
         }
@@ -1656,7 +1669,7 @@ final class PackedRun {
         /// of `keyBytes` bytes of keys in all, which it takes without growing an array: a bulk commit knows both before
         /// it applies}
         static Builder forCommit(int entries, long keyBytes) {
-            return new Builder(entries, keyBytes, true);
+            return new Builder(entries, keyBytes, true, commitTable(Math.max(1, entries)));
         }
 
         /// {@return the builder of a bulk commit that appends its puts of new keys to the run whose newest view is
@@ -1675,7 +1688,15 @@ final class PackedRun {
             return (int) Math.min(MAX_ENTRIES, Math.max(entries, length + (length >> 1)));
         }
 
-        // The least power of two `entries` fill at most three quarters of
+        // The slots of the hash table of a bulk commit's new run of `entries` entries, two thirds full: the commit
+        // knows its entries before it applies, and a power of two would leave the table between three eighths and
+        // three quarters full
+        private static int commitTable(long entries) {
+            return (int) Math.max(2, entries + (entries + 1) / 2);
+        }
+
+        // The least power of two `entries` fill at most three quarters of: the table of the replay's run, of a commit
+        // that appends past three quarters and of a table that doubles, whose entries keep coming
         private static int tableFor(long entries) {
             var table = 2;
             while (4L * entries > 3L * table) {
@@ -1939,9 +1960,9 @@ final class PackedRun {
             var layout = storage.layout;
             var keyEnds = layout == null ? storage.keyEnds : null;
             var keys = storage.keys;
-            var mask = slots.length - 1;
+            var table = slots.length;
             var tag = hash & TAG_MASK;
-            for (var i = hash & mask; ; i = (i + 1) & mask) {
+            for (var i = home(hash, table); ; i = next(i, table)) {
                 var slot = slots[i];
                 if (slot == 0) {
                     return i;
@@ -1963,9 +1984,9 @@ final class PackedRun {
             var layout = storage.layout;
             var keyEnds = layout == null ? storage.keyEnds : null;
             var keys = storage.keys;
-            var mask = slots.length - 1;
+            var table = slots.length;
             var tag = hash & TAG_MASK;
-            for (var i = hash & mask; ; i = (i + 1) & mask) {
+            for (var i = home(hash, table); ; i = next(i, table)) {
                 var slot = slots[i];
                 if (slot == 0) {
                     return i;
@@ -2135,15 +2156,14 @@ final class PackedRun {
             var keyEnds = layout == null ? storage.keyEnds : null;
             var keys = storage.keys;
             var grown = new int[length];
-            var mask = length - 1;
             var entries = storage.entries;
             for (var entry = 0; entry < entries; entry++) {
                 var start = keyStart(layout, keyEnds, entry);
                 var hash = Segments.hash(keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK,
                         keyEnd(layout, keyEnds, start, entry) - start);
-                var i = hash & mask;
+                var i = home(hash, length);
                 while (grown[i] != 0) {
-                    i = (i + 1) & mask;
+                    i = next(i, length);
                 }
                 grown[i] = (hash & TAG_MASK) | (entry + 1);
             }
@@ -2184,8 +2204,9 @@ final class PackedRun {
 
         /// Gives back the room a bulk commit's builder made for puts its run did not take, those of keys a chain or the
         /// run already held, and keeps what the entries it holds now take: the lengths the run's arrays would have had
-        /// had the commit planned exactly those entries. A reader of an earlier view keeps reading the arrays it loaded,
-        /// and every array put in their place holds every entry, published before the view that adds any.
+        /// had the commit planned exactly those entries, but for a new run's hash table, which is made again only if
+        /// the entries leave it under half full. A reader of an earlier view keeps reading the arrays it loaded, and
+        /// every array put in their place holds every entry, published before the view that adds any.
         ///
         /// @return whether it published a new hash table, which holds every entry of the run
         private boolean giveBackRoom() {
@@ -2201,7 +2222,14 @@ final class PackedRun {
             if (words.length > wordChunks) {
                 storage.words = Arrays.copyOf(words, wordChunks);
             }
-            var slots = 4L * entries > 3L * priorSlots ? tableFor(entries) : priorSlots;
+            int slots;
+            if (after == null) {
+                // A new run's table, made two thirds full for every put of the commit, is made again only once the
+                // entries leave it under half full: a rehash hashes every key again before the commit publishes
+                slots = 2L * entries < storage.slots.length ? commitTable(entries) : storage.slots.length;
+            } else {
+                slots = 4L * entries > 3L * priorSlots ? tableFor(entries) : priorSlots;
+            }
             if (storage.slots.length > slots) {
                 rehash(slots);
                 return true;
@@ -2325,8 +2353,9 @@ final class PackedRun {
         // null until the first drop, and a chunk null while no home of it was let go of. Written by the drops alone,
         // which take turns
         volatile FramedHome[][] framed;
-        // Open addressing on the hash of the keys, at most three quarters full; replaced by a larger table, or one
-        // without the entries of a commit taken back, never changed but to add a slot
+        // Open addressing on the hash of the keys, of any length and at most three quarters full: two thirds of a bulk
+        // commit's new run, a power of two for a replay's run and once a commit appends past three quarters; replaced
+        // by a larger table, or one without the entries of a commit taken back, never changed but to add a slot
         volatile int[] slots;
         // Whether a later bulk commit may append to the run: set by the first, cleared by a checkpoint's cut
         volatile boolean appendable;
