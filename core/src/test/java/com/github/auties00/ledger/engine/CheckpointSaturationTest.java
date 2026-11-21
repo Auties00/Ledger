@@ -21,6 +21,7 @@ import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -638,7 +639,7 @@ class CheckpointSaturationTest {
         }
 
         @Test
-        @DisplayName("gives none of the plaintext of the leaves it leaves out to the pool")
+        @DisplayName("gives none of the plaintext of the leaves it leaves out to the pool, nor its window, and takes no array of it")
         void noPooledPlaintext(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, 64 * MIB).filled(KEYS)) {
                 var writer = tree.unsaturated();
@@ -663,8 +664,7 @@ class CheckpointSaturationTest {
                     }
                 }
                 assertTrue(plaintext.size() > 100, plaintext.size() + " leaves");
-                var released = new AtomicInteger();
-                var leaked = new AtomicInteger();
+                var released = Collections.newSetFromMap(new IdentityHashMap<byte[], Boolean>());
                 tree.pool.watchForTests(new HeapPool.Watcher() {
                     @Override
                     public void acquired(byte[] array) {
@@ -672,16 +672,19 @@ class CheckpointSaturationTest {
 
                     @Override
                     public void released(byte[] array) {
-                        released.incrementAndGet();
-                        if (plaintext.contains(array)) {
-                            leaked.incrementAndGet();
+                        synchronized (released) {
+                            released.add(array);
                         }
                     }
                 });
+                var acquires = tree.pool.acquiresForTests();
                 writer.flush();
                 tree.pool.watchForTests(null);
-                assertTrue(released.get() > 0, "the flush gave its sealed arrays back");
-                assertEquals(0, leaked.get(), "plaintext leaves went to the pool");
+                var window = writer.windowForTests();
+                assertNotNull(window, "the flush sealed into no window");
+                assertEquals(acquires, tree.pool.acquiresForTests(), "the flush took arrays of the pool");
+                assertFalse(released.contains(window), "the window went to the pool");
+                assertTrue(Collections.disjoint(released, plaintext), "plaintext leaves went to the pool");
                 for (var leaf : leaves) {
                     assertNull(tree.cache.peek(leaf), "the leaf " + leaf);
                 }
@@ -884,21 +887,18 @@ class CheckpointSaturationTest {
             try (var ledger = options(path).build()) {
                 var live = (LiveLedger) ledger;
                 write(ledger, 0, 0, keys);
-                var writes = new AtomicInteger();
+                var file = path.resolve(PageFile.FILE);
+                var before = Files.size(file);
                 var failed = new AtomicBoolean();
-                disk.intercept((file, kind) -> {
-                    if (!file.endsWith(PageFile.FILE)) {
-                        return;
-                    }
-                    if (kind == ChangeKind.WRITE) {
-                        writes.incrementAndGet();
-                    } else if (kind == ChangeKind.FORCE && failed.compareAndSet(false, true)) {
+                disk.intercept((written, kind) -> {
+                    if (written.endsWith(PageFile.FILE) && kind == ChangeKind.FORCE && failed.compareAndSet(false, true)) {
                         throw new IOException("The device failed");
                     }
                 });
                 assertThrows(LedgerIoException.class, ledger::checkpoint);
-                // Each flush writes a window of 1 MiB at a time at least: more than 8 writes took two flushes
-                assertTrue(writes.get() > 8, "the checkpoint wrote " + writes.get() + " times");
+                // A flush starts once the queued units reach the limit, and the last flush writes the rest: units past
+                // the limit took two flushes
+                assertTrue(Files.size(file) - before > PageFile.STAGED_LIMIT, "the checkpoint wrote " + (Files.size(file) - before) + " bytes");
                 disk.intercept((_, _) -> {
                 });
                 if (clear) {

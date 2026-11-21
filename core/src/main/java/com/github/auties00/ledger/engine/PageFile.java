@@ -35,9 +35,12 @@ final class PageFile implements AutoCloseable {
     static final int READ_CHANNELS = 8;
     /// The most pages [#readAll(List, byte, int)] and [#prefetch(PageRef\[\], int, int\[\])] read with one call.
     static final int RUN_PAGES = 64;
-    private static final int STAGED_LIMIT = 8 << 20;
-    // The staged bytes a flush seals before it writes them, which bounds the sealed arrays it holds at once
-    private static final long SEAL_WINDOW = 1 << 20;
+    /// The bytes of queued units from which a writer flushes them.
+    static final int STAGED_LIMIT = 8 << 20;
+    /// The most bytes of units a flush seals side by side in its writer's window before it writes them: a multiple of
+    /// the page size short of a megabyte, so the window, header included, takes less than half of a G1 region of 2 MiB
+    /// and is not allocated as a humongous object there, as the log's output is not ([LogWriter#OUTPUT]).
+    static final int WINDOW_BYTES = (1 << 20) - (64 << 10);
     // The bytes a checkpoint writes from which it forces them beside its work, as the device takes them, instead of
     // all at once before its superblock: forced at the end, the writes of a checkpoint that rewrites hundreds of
     // megabytes kept the device idle while it built them, then made it wait seconds for them
@@ -983,26 +986,32 @@ final class PageFile implements AutoCloseable {
         return true;
     }
 
-    /// Fills the header of `unit`.
+    /// Fills the header of `unit`, at its start.
     ///
     /// A leaf or a branch whose writer gave it a search index ([NodeIndex]) keeps its format and index byte; every
     /// other unit is of format [PageFormat#VERSION].
     static void header(byte[] unit, byte kind, int level, int page, int pages, int length, long nonceHigh, int nonceLow) {
-        var indexed = (kind == PageFormat.LEAF || kind == PageFormat.BRANCH) && unit[PageFormat.FORMAT] == PageFormat.INDEXED;
-        unit[PageFormat.KIND] = kind;
+        header(unit, 0, kind, level, page, pages, length, nonceHigh, nonceLow);
+    }
+
+    /// Fills the [PageFormat#HEADER] bytes of the header of the unit at `offset` of `unit`, as
+    /// [#header(byte\[\], byte, int, int, int, int, long, int)] fills one at the start of its array.
+    static void header(byte[] unit, int offset, byte kind, int level, int page, int pages, int length, long nonceHigh, int nonceLow) {
+        var indexed = (kind == PageFormat.LEAF || kind == PageFormat.BRANCH) && unit[offset + PageFormat.FORMAT] == PageFormat.INDEXED;
+        unit[offset + PageFormat.KIND] = kind;
         if (!indexed) {
-            unit[PageFormat.FORMAT] = PageFormat.VERSION;
-            unit[PageFormat.INDEX] = 0;
+            unit[offset + PageFormat.FORMAT] = PageFormat.VERSION;
+            unit[offset + PageFormat.INDEX] = 0;
         }
-        unit[PageFormat.LEVEL] = (byte) level;
-        unit[3] = 0;
-        Bytes.i32(unit, PageFormat.PAGES, pages);
-        Bytes.i32(unit, PageFormat.PAGE, page);
-        Bytes.i32(unit, PageFormat.LENGTH, length);
-        Bytes.i64(unit, PageFormat.NONCE, nonceHigh);
-        Bytes.i32(unit, PageFormat.NONCE + 8, nonceLow);
-        unit[PageFormat.INDEX + 1] = 0;
-        Bytes.u16(unit, PageFormat.INDEX + 2, 0);
+        unit[offset + PageFormat.LEVEL] = (byte) level;
+        unit[offset + 3] = 0;
+        Bytes.i32(unit, offset + PageFormat.PAGES, pages);
+        Bytes.i32(unit, offset + PageFormat.PAGE, page);
+        Bytes.i32(unit, offset + PageFormat.LENGTH, length);
+        Bytes.i64(unit, offset + PageFormat.NONCE, nonceHigh);
+        Bytes.i32(unit, offset + PageFormat.NONCE + 8, nonceLow);
+        unit[offset + PageFormat.INDEX + 1] = 0;
+        Bytes.u16(unit, offset + PageFormat.INDEX + 2, 0);
     }
 
     /// Forces every unit written so far, and the length of the file.
@@ -1085,6 +1094,13 @@ final class PageFile implements AutoCloseable {
     /// Each unit gets the next nonce of the checkpoint: the checkpoint's random first 8 bytes and a counter. A queued
     /// unit is read back through [#staged(PageRef)], since the file does not hold it yet.
     ///
+    /// A flush seals the units of up to [#WINDOW_BYTES] at a time side by side, in the order of their pages, into one
+    /// array the writer keeps until its checkpoint's last flush ([#finish()]), its window, and writes each run of
+    /// consecutive pages from it with one call. The checkpoint takes none of the pool's arrays for its units but for
+    /// one longer than the window, so it holds none of the arrays the commits give back to the pool while it runs:
+    /// holding the pool's overflow to keep arrays for its seals would keep every array the commits give back past the
+    /// reserve meanwhile too, through every collection until the checkpoint ends.
+    ///
     /// It is safe for concurrent use, as the tasks of a checkpoint that rewrites its trees in parallel use it; a flush
     /// seals its units on every processor.
     final class Writer {
@@ -1110,6 +1126,12 @@ final class PageFile implements AutoCloseable {
         private final BooleanSupplier saturation;
         // Set once saturation held: the log only grows past the cut while the checkpoint runs
         private volatile boolean saturated;
+        // The array the units of a window are sealed into side by side and written from, or null before the first
+        // flush and after the last; guarded by the lock. A checkpoint of a few units, as an idle store's or a close's
+        // often is, takes one only as long as they are, so it allocates no megabyte for them
+        private byte[] window;
+        // The windows this writer allocated, for tests
+        private int windowsAllocated;
 
         private Writer(long nonceHigh, BooleanSupplier lagging, BooleanSupplier saturation) {
             this.lock = new Object();
@@ -1269,7 +1291,7 @@ final class PageFile implements AutoCloseable {
                 return entry.unit();
             }
             var unit = new byte[PageFormat.HEADER + entry.contentLength()];
-            fillValue(entry, unit);
+            fillValue(entry, unit, 0);
             return unit;
         }
 
@@ -1298,17 +1320,44 @@ final class PageFile implements AutoCloseable {
             }
         }
 
+        /// Seals and writes every queued unit, as the last flush of the checkpoint, and lets go of the window: the
+        /// writer stays reachable through the checkpoint's update until the checkpoint is published.
+        void finish() throws IOException {
+            synchronized (lock) {
+                try {
+                    flushQueued();
+                } finally {
+                    window = null;
+                }
+            }
+        }
+
         private void flushQueued() throws IOException {
             var entries = new ArrayList<>(staged.values());
-            // A window at a time: sealing all the staged units before writing any left the pool holding a whole flush
-            // of sealed arrays, 8 MiB, from one checkpoint to the next
+            // A window at a time, each ending before the unit that would take it past WINDOW_BYTES; a unit longer than
+            // that is a window of its own
+            var ends = new int[entries.size()];
+            var windows = 0;
+            var widest = 0L;
             for (var from = 0; from < entries.size(); ) {
                 var to = from;
                 var bytes = 0L;
-                while (to < entries.size() && (to == from || bytes + (long) entries.get(to).ref().pages() * PageFormat.SIZE <= SEAL_WINDOW)) {
+                while (to < entries.size() && (to == from || bytes + (long) entries.get(to).ref().pages() * PageFormat.SIZE <= WINDOW_BYTES)) {
                     bytes += (long) entries.get(to).ref().pages() * PageFormat.SIZE;
                     to++;
                 }
+                if (bytes <= WINDOW_BYTES) {
+                    widest = Math.max(widest, bytes);
+                }
+                ends[windows++] = to;
+                from = to;
+            }
+            if (widest > 0) {
+                // A flush of more than one window is one of many: it takes the whole window at once
+                ensureWindow(windows > 1 ? WINDOW_BYTES : (int) widest);
+            }
+            for (int i = 0, from = 0; i < windows; i++) {
+                var to = ends[i];
                 flushWindow(entries.subList(from, to));
                 from = to;
             }
@@ -1318,84 +1367,102 @@ final class PageFile implements AutoCloseable {
             forceBeside();
         }
 
-        /// Seals and writes the staged units of `entries`, in the order of their pages.
-        private void flushWindow(List<Staged> entries) throws IOException {
-            var run = new ArrayList<ByteBuffer>();
-            var sealedUnits = new byte[entries.size()][];
-            var runStart = -1L;
-            var runEnd = -1L;
-            try {
-                seal(entries, sealedUnits);
-                for (var index = 0; index < entries.size(); index++) {
-                    var entry = entries.get(index);
-                    var length = entry.ref().pages() * PageFormat.SIZE;
-                    var sealed = sealedUnits[index];
-                    var start = PageFormat.offset(entry.ref().page());
-                    if (start != runEnd && !run.isEmpty()) {
-                        writeRun(run, runStart);
-                        run.clear();
-                    }
-                    if (run.isEmpty()) {
-                        runStart = start;
-                    }
-                    run.add(ByteBuffer.wrap(sealed, 0, length));
-                    runEnd = start + length;
-                }
-                if (!run.isEmpty()) {
-                    writeRun(run, runStart);
-                }
-            } finally {
-                // To the overflow alone: the checkpoint this writer belongs to holds it from its cut to its end, so the
-                // next window seals into these arrays again, and the first collection after the checkpoint frees them
-                for (var sealed : sealedUnits) {
-                    if (sealed != null) {
-                        pool.releaseHeld(sealed);
-                    }
-                }
+        /// Makes the window at least `bytes` long: the first one as long as that, a longer one [#WINDOW_BYTES] long,
+        /// so a writer allocates at most two.
+        private void ensureWindow(int bytes) {
+            if (window != null && window.length >= bytes) {
+                return;
             }
+            window = new byte[window == null ? bytes : WINDOW_BYTES];
+            windowsAllocated++;
         }
 
-        /// Seals the staged units of `entries` into arrays of the pool, in `sealedUnits` by index, on every processor
-        /// from [#PARALLEL_SEALS] units; `sealedUnits` holds those it sealed if it throws.
+        /// Seals and writes the staged units of `entries`, in the order of their pages: into the window side by side,
+        /// or, for a single unit longer than the window, into an array of the pool.
+        private void flushWindow(List<Staged> entries) throws IOException {
+            var first = entries.getFirst();
+            var firstLength = first.ref().pages() * PageFormat.SIZE;
+            if (entries.size() == 1 && firstLength > WINDOW_BYTES) {
+                flushLong(first, firstLength);
+                return;
+            }
+            var array = window;
+            var offsets = new int[entries.size()];
+            var end = 0;
+            for (var index = 0; index < entries.size(); index++) {
+                offsets[index] = end;
+                end += entries.get(index).ref().pages() * PageFormat.SIZE;
+            }
+            seal(entries, array, offsets);
+            // The units lie in the window in the order of their pages, so a run of consecutive pages is one range of it
+            var runFrom = 0;
+            var runStart = PageFormat.offset(first.ref().page());
+            var runEnd = runStart;
+            for (var index = 0; index < entries.size(); index++) {
+                var start = PageFormat.offset(entries.get(index).ref().page());
+                if (start != runEnd) {
+                    writeRun(array, runFrom, offsets[index] - runFrom, runStart);
+                    runFrom = offsets[index];
+                    runStart = start;
+                }
+                runEnd = start + (long) entries.get(index).ref().pages() * PageFormat.SIZE;
+            }
+            writeRun(array, runFrom, end - runFrom, runStart);
+        }
+
+        /// Seals and writes the unit of `entry`, of `length` bytes, longer than the window, through an array of the
+        /// pool.
+        private void flushLong(Staged entry, int length) throws IOException {
+            var sealed = pool.acquire(length);
+            sealInto(entry, sealed, 0);
+            writeRun(sealed, 0, length, PageFormat.offset(entry.ref().page()));
+            // Only once sealed and written: an array a seal or a write failed on may hold the plaintext of a value,
+            // which the pool would lend to any store of the process
+            pool.release(sealed);
+        }
+
+        /// Seals the staged units of `entries` into `window`, each at its offset in `offsets`, on every processor from
+        /// [#PARALLEL_SEALS] units.
         ///
         /// The caller holds the lock and waits for the seals, so they run on virtual threads and never in the common
         /// pool, where the tasks of a parallel update wait for this same lock: a split of a seal forked to the deque of a
         /// worker parked on a join, after the caller last looked there or above a task only a free worker can take from
-        /// its base, would never run, and the checkpoint with it.
+        /// its base, would never run, and the checkpoint with it. Each seal writes only its unit's range of the window.
         ///
         /// It waits for the units and not for the threads ([ClaimedIndexes]): an application's virtual threads may hold
         /// every carrier for as long as they compute.
-        private void seal(List<Staged> entries, byte[][] sealedUnits) {
+        private void seal(List<Staged> entries, byte[] window, int[] offsets) {
             var helpers = entries.size() < PARALLEL_SEALS ? 0 : Runtime.getRuntime().availableProcessors() - 1;
-            ClaimedIndexes.run("ledger-seal", entries.size(), helpers, i -> {
-                var entry = entries.get(i);
-                var pages = entry.ref().pages();
-                var sealed = pool.acquire(pages * PageFormat.SIZE);
-                sealedUnits[i] = sealed;
-                if (entry.unit() != null) {
-                    cipher.seal(entry.unit(), pages, sealed, 0);
-                    return;
-                }
-                // The array of the pool comes back with the bytes of its last use: the padding is zeroed up to the tag
-                var end = fillValue(entry, sealed);
-                Arrays.fill(sealed, end, pages * PageFormat.SIZE - PageFormat.TAG, (byte) 0);
-                cipher.seal(sealed, pages);
-            });
+            ClaimedIndexes.run("ledger-seal", entries.size(), helpers, i -> sealInto(entries.get(i), window, offsets[i]));
         }
 
-        /// Writes the header and the content of the value unit `entry` into `unit` from its start.
+        /// Seals the unit of `entry` into `array` at `offset`: a node unit from its plaintext, a value unit built there
+        /// from its value and sealed over itself.
+        private void sealInto(Staged entry, byte[] array, int offset) {
+            var pages = entry.ref().pages();
+            if (entry.unit() != null) {
+                cipher.seal(entry.unit(), pages, array, offset);
+                return;
+            }
+            // The array holds the bytes of the units it held before: the padding is zeroed up to the tag
+            var end = fillValue(entry, array, offset);
+            Arrays.fill(array, end, offset + pages * PageFormat.SIZE - PageFormat.TAG, (byte) 0);
+            cipher.seal(array, offset, pages);
+        }
+
+        /// Writes the header and the content of the value unit `entry` into `array` from `offset`.
         ///
-        /// @return the end of the content in `unit`
-        private int fillValue(Staged entry, byte[] unit) {
+        /// @return the end of the content in `array`
+        private int fillValue(Staged entry, byte[] array, int offset) {
             var ref = entry.ref();
             var length = entry.contentLength();
-            header(unit, PageFormat.VALUE, 0, ref.page(), ref.pages(), length, ref.nonceHigh(), ref.nonceLow());
+            header(array, offset, PageFormat.VALUE, 0, ref.page(), ref.pages(), length, ref.nonceHigh(), ref.nonceLow());
             if (entry.value() != null) {
-                MemorySegment.copy(entry.value(), ValueLayout.JAVA_BYTE, 0, unit, PageFormat.HEADER, length);
+                MemorySegment.copy(entry.value(), ValueLayout.JAVA_BYTE, 0, array, offset + PageFormat.HEADER, length);
             } else {
-                entry.logged().readLogged(unit, PageFormat.HEADER);
+                entry.logged().readLogged(array, offset + PageFormat.HEADER);
             }
-            return PageFormat.HEADER + length;
+            return offset + PageFormat.HEADER + length;
         }
 
         /// Starts forcing what the checkpoint wrote so far, beside its work, once it wrote [#FORCE_EVERY] bytes since
@@ -1455,15 +1522,12 @@ final class PageFile implements AutoCloseable {
             }
         }
 
-        private void writeRun(ArrayList<ByteBuffer> run, long position) throws IOException {
-            var buffers = run.toArray(ByteBuffer[]::new);
-            var remaining = 0L;
-            for (var buffer : buffers) {
-                remaining += buffer.remaining();
-            }
+        /// Writes the `length` bytes of `array` from `offset` at `position` of the file.
+        private void writeRun(byte[] array, int offset, int length, long position) throws IOException {
+            var buffer = ByteBuffer.wrap(array, offset, length);
             writer.position(position);
-            while (remaining > 0) {
-                remaining -= writer.write(buffers);
+            while (buffer.hasRemaining()) {
+                writer.write(buffer);
             }
         }
 
@@ -1487,6 +1551,21 @@ final class PageFile implements AutoCloseable {
                 }
                 staged.clear();
                 stagedBytes = 0;
+                window = null;
+            }
+        }
+
+        /// {@return the windows this writer allocated, for tests}
+        int windowsAllocatedForTests() {
+            synchronized (lock) {
+                return windowsAllocated;
+            }
+        }
+
+        /// {@return the window, or `null` if there is none, for tests}
+        byte[] windowForTests() {
+            synchronized (lock) {
+                return window;
             }
         }
     }

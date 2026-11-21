@@ -5,7 +5,6 @@ import com.github.auties00.ledger.LedgerIoException;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
-import java.lang.ref.Reference;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -46,9 +45,10 @@ import java.util.concurrent.locks.ReentrantLock;
 /// of them: each checkpoint and each tick of the [IdleTicker] drops those released since the last on a virtual thread
 /// ([#dropReleased()]). The clock would otherwise keep them, unread, until it evicted them or two ticks passed.
 ///
-/// A checkpoint [holds][HeapPool#hold()] the overflow of the store's pool from its cut until it ends, so the arrays it
-/// reads and seals its pages into, which its flushes give back many at once, stay in the pool while it runs, through
-/// collections; once it ends, the first collection frees those past the pool's reserve.
+/// A checkpoint seals its units into one array of its own, its writer's window ([PageFile.Writer]), and reads the units
+/// it replaces into arrays of the pool's reserve, one at a time on each thread that reads; it holds none of the pool's
+/// overflow, so the arrays the commits give back past the reserve while it runs are freed by the next collection, as
+/// they are while none runs.
 ///
 /// A checkpoint that fails before its superblock gives its pages back, and the next one retries. One that fails while
 /// it writes its superblock leaves it unknown whether that superblock is durable, so the pages it wrote stay in use and
@@ -435,7 +435,6 @@ final class Checkpointer implements IdleTicker.Watched {
     /// @param closing whether the store is closing, so no commit follows and every log segment becomes obsolete
     /// @throws LedgerIoException if the checkpoint cannot be written; the store goes on, and the next one retries
     void run(boolean closing) {
-        Object poolHold = null;
         lock.lock();
         try {
             if (closed && !closing) {
@@ -463,7 +462,6 @@ final class Checkpointer implements IdleTicker.Watched {
                 hook.run();
             }
             cutBytes = cut.logBytes();
-            poolHold = pages.pool().hold();
             // Lagging once a second interval of log waits behind the cut: the commits will wait for this checkpoint
             BooleanSupplier lagging = () -> log.appendedBytes() - cutBytes > every;
             // No checkpoint follows the one of a close, whose cache closes with the store
@@ -506,7 +504,7 @@ final class Checkpointer implements IdleTicker.Watched {
                     blobFreeList = writeBlobFreeList(writer, update, blobRuns);
                 }
                 freeList = writeFreeList(writer, update, freed);
-                writer.flush();
+                writer.finish();
                 writer.awaitForce();
                 if (blobs != null) {
                     // The units the trees take were written by commits the log may not have forced yet
@@ -564,8 +562,6 @@ final class Checkpointer implements IdleTicker.Watched {
                 // The checkpoint is durable; trailing free pages wait for the next one
             }
         } finally {
-            // Every flush of the checkpoint gave its sealed arrays back before it returned
-            Reference.reachabilityFence(poolHold);
             lock.unlock();
         }
     }

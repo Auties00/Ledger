@@ -195,6 +195,73 @@ class PageCipherTest {
         assertFalse(new PageCipher(null).openContent(unit, 0, 10, new byte[10], 0));
     }
 
+    static Stream<Arguments> unitsAtOffsets() {
+        var slice = 64 << 10;
+        var lengths = new int[]{0, 1, 4_000, PageFormat.capacity(1), PageFormat.capacity(1) + 1, slice + 13, 2 * slice + 13};
+        // At the start, at pages of a window, at an offset of no block, and at the very end of the array
+        var offsets = new int[]{0, PageFormat.SIZE, 5 * PageFormat.SIZE, 100, -1};
+        return Arrays.stream(lengths).boxed().flatMap(length -> Arrays.stream(offsets).boxed()
+                .flatMap(offset -> Stream.of(true, false).map(encrypted -> Arguments.of(length, offset, encrypted))));
+    }
+
+    @ParameterizedTest(name = "{0} bytes at {1}, encrypted: {2}")
+    @MethodSource("unitsAtOffsets")
+    @DisplayName("a unit sealed at an offset of a shared array, in place or from its plaintext, is the unit sealed alone, opens there, and leaves the bytes around it")
+    void sealsAtAnOffset(int length, int at, boolean encrypted) {
+        var pages = PageFormat.pagesFor(length);
+        var unitLength = pages * PageFormat.SIZE;
+        var tag = unitLength - PageFormat.TAG;
+        var content = new byte[length];
+        new Random(length * 31L + at).nextBytes(content);
+        var plain = new byte[PageFormat.HEADER + length];
+        // A nonce of its own for each case: a cipher object refuses to seal twice under one nonce
+        PageFile.header(plain, PageFormat.VALUE, 0, 9, pages, length, 41L + at, length + 3);
+        System.arraycopy(content, 0, plain, PageFormat.HEADER, length);
+        var alone = new byte[unitLength];
+        new PageCipher(encrypted ? KEY : null).seal(plain, pages, alone, 0);
+
+        // A window holding other units before and after this one, unless it ends the array
+        var offset = at == -1 ? 3 * PageFormat.SIZE : at;
+        var arrayLength = at == -1 ? offset + unitLength : offset + unitLength + 2 * PageFormat.SIZE;
+        var dirt = new byte[arrayLength];
+        new Random(at).nextBytes(dirt);
+
+        var inPlace = dirt.clone();
+        PageFile.header(inPlace, offset, PageFormat.VALUE, 0, 9, pages, length, 41L + at, length + 3);
+        System.arraycopy(content, 0, inPlace, offset + PageFormat.HEADER, length);
+        Arrays.fill(inPlace, offset + PageFormat.HEADER + length, offset + tag, (byte) 0);
+        new PageCipher(encrypted ? KEY : null).seal(inPlace, offset, pages);
+        var outOfPlace = dirt.clone();
+        new PageCipher(encrypted ? KEY : null).seal(plain, pages, outOfPlace, offset);
+
+        var cipher = new PageCipher(encrypted ? KEY : null);
+        for (var sealed : List.of(inPlace, outOfPlace)) {
+            assertArrayEquals(alone, Arrays.copyOfRange(sealed, offset, offset + unitLength));
+            assertArrayEquals(Arrays.copyOf(dirt, offset), Arrays.copyOf(sealed, offset), "the bytes before the unit");
+            assertArrayEquals(Arrays.copyOfRange(dirt, offset + unitLength, arrayLength),
+                    Arrays.copyOfRange(sealed, offset + unitLength, arrayLength), "the bytes after the unit");
+            var opened = new byte[unitLength];
+            assertTrue(cipher.open(sealed, offset, pages, opened));
+            assertArrayEquals(plain, Arrays.copyOf(opened, plain.length));
+            var tampered = sealed.clone();
+            tampered[offset + PageFormat.HEADER + length / 2] ^= 1;
+            assertFalse(cipher.open(tampered, offset, pages, opened));
+        }
+    }
+
+    @Test
+    @DisplayName("a unit sealed in place must lie whole in its array, past a nonnegative offset")
+    void sealsInPlaceWithinTheArray() {
+        var unit = new byte[2 * PageFormat.SIZE];
+        PageFile.header(unit, PageFormat.SIZE, PageFormat.VALUE, 0, 9, 1, 10, 41L, 3);
+        var cipher = new PageCipher(KEY);
+        assertThrows(IllegalArgumentException.class, () -> cipher.seal(unit, PageFormat.SIZE + 1, 1));
+        assertThrows(IllegalArgumentException.class, () -> cipher.seal(unit, -1, 1));
+        assertThrows(IllegalArgumentException.class, () -> cipher.seal(unit, PageFormat.SIZE, 2));
+        unit[PageFormat.SIZE + PageFormat.FORMAT] = PageFormat.CLOSE_TAG;
+        assertThrows(IllegalArgumentException.class, () -> cipher.seal(unit, PageFormat.SIZE, 1));
+    }
+
     private static void assertSealsTheSameUnit(int length, boolean encrypted, int bufferLength) throws IOException {
         var cipher = new PageCipher(encrypted ? KEY : null);
         var pages = PageFormat.pagesFor(length);
