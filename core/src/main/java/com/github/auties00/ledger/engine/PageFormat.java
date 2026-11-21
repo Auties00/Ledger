@@ -26,8 +26,9 @@ package com.github.auties00.ledger.engine;
 /// search index between the offsets of its entries and the entries ([NodeIndex]). A reader finds the entries of either
 /// through their offsets, so the first format's readers read both, and a store holds nodes of both formats.
 ///
-/// A unit of the file of large values ([BlobFile]) in a store that encrypts is of format [#CLOSE_TAG], whose tag
-/// follows its content, so a reader opens the content alone, straight into an array of its length:
+/// A unit of the file of large values ([BlobFile]) in a store that encrypts whose content fits in one record,
+/// [#FIRST_RECORD_CONTENT] bytes, is of format [#CLOSE_TAG], whose tag follows its content, so a reader opens the
+/// content alone, straight into an array of its length:
 ///
 /// ```text
 ///  0  header, as above, of format 3
@@ -36,11 +37,31 @@ package com.github.auties00.ledger.engine;
 ///     zeros up to the end of the unit, which no tag covers and no reader reads
 /// ```
 ///
-/// The format byte is in the header, the tag's additional data, so a unit read under the other format fails
+/// A longer one is of format [#RECORDS]: its content is sealed as records of [#RECORD] bytes, each its piece of the
+/// content and a tag of its own, so a reader opens it a record at a time, each straight into its place in an array of
+/// the content's length, and never holds the whole sealed unit:
+///
+/// ```text
+///       0  header, as above, of format 4
+///      32  record 0: the first FIRST_RECORD_CONTENT bytes of content, encrypted, then its AES-GCM tag, 16 bytes
+///  524288  record 1: the next RECORD_CONTENT bytes of content, or the rest, encrypted, then its tag
+/// i * 512 KiB  record i, likewise; the last one holds the rest of the content
+///          zeros up to the end of the unit, which no tag covers and no reader reads
+/// ```
+///
+/// Every record but the last is whole, and each after the first starts on a page, at `i * RECORD`. Record `i` is
+/// sealed under the unit's nonce with `i` in the top 16 bits of its first 8 bytes, record 0 under the unit's nonce
+/// itself, and its additional data is the unit's header. The first 8 bytes of the nonce of every unit of the file are
+/// below 2^48 ([BlobFile#write(byte\[\], int, int)] refuses to seal more units in one open), and a content of at most
+/// [Integer#MAX_VALUE] bytes takes at most 4,097 records, so no two records of the file share a nonce. The header names
+/// the content's length, from which a reader counts the records, so a record read in another unit, at another index,
+/// or in a unit cut short of its last records fails authentication.
+///
+/// The format byte is in the header, the tags' additional data, so a unit read under another format fails
 /// authentication. A store without encryption writes every unit of large values in the first format, and one that
-/// encrypts keeps the units of the first format an earlier build wrote, so the readers of the file read both. A build
-/// that reads only the first refuses the segments of a log this build wrote by their version
-/// ([LogWriter#SEGMENT_VERSION]), so it never replays a commit whose unit it would take for a torn one.
+/// encrypts keeps the units of the first format and of format [#CLOSE_TAG] earlier builds wrote, so the readers of the
+/// file read all three. A build that reads only the earlier formats refuses the segments of a log this build wrote by
+/// their version ([LogWriter#SEGMENT_VERSION]), so it never replays a commit whose unit it would take for a torn one.
 ///
 /// The header is the additional data of the GCM tag, so a unit read at another position, or under another kind,
 /// fails authentication. The nonce of each unit is new (see [Checkpointer]), and whatever refers to a unit (a parent
@@ -60,6 +81,20 @@ final class PageFormat {
     /// The format of a unit of the file of large values in a store that encrypts whose tag follows its content: the
     /// content is sealed alone, and the bytes after the tag, up to the end of the unit, are zero and not authenticated.
     static final byte CLOSE_TAG = 3;
+    /// The format of a unit of the file of large values in a store that encrypts whose content is sealed as records of
+    /// [#RECORD] bytes, each with its own tag: the bytes after the last record, up to the end of the unit, are zero and
+    /// not authenticated.
+    static final byte RECORDS = 4;
+    /// The sealed bytes of a whole record of a unit of format [#RECORDS], its content and its tag, the first record's
+    /// with the unit's header: 512 KiB, an array of [HeapPool] below its longest, which G1 gives no region of its own
+    /// at regions of 2 MiB or more, and one call of a channel and one message of AES-GCM, which the cipher's intrinsic
+    /// takes whole.
+    static final int RECORD = 512 << 10;
+    /// The bytes of content of a whole record of a unit of format [#RECORDS] after the first.
+    static final int RECORD_CONTENT = RECORD - TAG;
+    /// The bytes of content of the first record of a unit of format [#RECORDS], which follows the unit's header, so
+    /// the header, the record and its tag take [#RECORD] bytes and every later record starts on a page.
+    static final int FIRST_RECORD_CONTENT = RECORD - HEADER - TAG;
 
     static final byte SUPERBLOCK = 1;
     static final byte LEAF = 2;
@@ -98,14 +133,50 @@ final class PageFormat {
     private PageFormat() {
     }
 
-    /// {@return the bytes of content a unit of `pages` pages holds}
+    /// {@return the bytes of content a unit of `pages` pages holds, in any format but [#RECORDS]}
     static int capacity(int pages) {
         return pages * SIZE - HEADER - TAG;
     }
 
-    /// {@return whether a unit of `pages` pages holds `content` bytes of content}
+    /// {@return whether a unit of `pages` pages holds `content` bytes of content, in any format but [#RECORDS]}
     static boolean fits(int pages, int content) {
         return content >= 0 && content <= capacity(pages);
+    }
+
+    /// {@return whether a unit of `pages` pages of format `format` holds `content` bytes of content}
+    static boolean fits(byte format, int pages, int content) {
+        return content >= 0 && sealedLength(format, content) <= (long) pages * SIZE;
+    }
+
+    /// {@return the bytes from the start of a unit of format `format` holding `content` bytes to the end of its last
+    /// tag: its header, its content and its tags}
+    static long sealedLength(byte format, long content) {
+        var tags = format == RECORDS ? records(content) : 1;
+        return HEADER + content + (long) tags * TAG;
+    }
+
+    /// {@return the records of a unit of format [#RECORDS] holding `content` bytes: one for at most
+    /// [#FIRST_RECORD_CONTENT] bytes, and one more for each [#RECORD_CONTENT] bytes, or part of them, past those}
+    static int records(long content) {
+        return content <= FIRST_RECORD_CONTENT ? 1
+                : 1 + Math.toIntExact(Math.ceilDiv(content - FIRST_RECORD_CONTENT, (long) RECORD_CONTENT));
+    }
+
+    /// {@return the offset in the content of the first byte of record `record` of a unit of format [#RECORDS]}
+    static int recordContent(int record) {
+        return record == 0 ? 0 : record * RECORD_CONTENT - HEADER;
+    }
+
+    /// {@return the bytes of content record `record` of a unit of format [#RECORDS] with `content` bytes of content
+    /// holds}
+    static int recordLength(int record, int content) {
+        return Math.min(content - recordContent(record), record == 0 ? FIRST_RECORD_CONTENT : RECORD_CONTENT);
+    }
+
+    /// {@return the offset in a unit of format [#RECORDS] of the sealed bytes of record `record`: right after the
+    /// header for the first, `record * RECORD` for the others}
+    static long recordPosition(int record) {
+        return record == 0 ? HEADER : (long) record * RECORD;
     }
 
     /// {@return the bytes the page cache keeps of a unit of `pages` pages with `content` bytes of content, which
@@ -120,9 +191,14 @@ final class PageFormat {
         return pages <= TRIMMED_PAGES && length - kept >= TRIM_LEAST ? kept : length;
     }
 
-    /// {@return the pages of a unit holding `content` bytes}
+    /// {@return the pages of a unit holding `content` bytes, in any format but [#RECORDS]}
     static int pagesFor(long content) {
         return Math.toIntExact((content + HEADER + TAG + SIZE - 1) / SIZE);
+    }
+
+    /// {@return the pages of a unit of format `format` holding `content` bytes}
+    static int pagesFor(byte format, long content) {
+        return Math.toIntExact(Math.ceilDiv(sealedLength(format, content), (long) SIZE));
     }
 
     /// {@return the byte offset of page `page` in the file}

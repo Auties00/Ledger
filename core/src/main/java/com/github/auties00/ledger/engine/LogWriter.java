@@ -150,8 +150,9 @@ final class LogWriter {
     /// commits may name units of the file of large values of format [PageFormat#CLOSE_TAG], which a build that reads
     /// only the first format would fail to authenticate, and would take for a crash's torn tail, dropping the durable
     /// commits of the last group, rather than refuse; from 5 it may hold frames of types [FrameBody#COMMIT_SPLIT] and
-    /// [FrameBody#VALUES].
-    static final int SEGMENT_VERSION = 5;
+    /// [FrameBody#VALUES]; from 6 its commits may name units of format [PageFormat#RECORDS], which a build that reads
+    /// only the earlier formats would likewise take for a torn tail.
+    static final int SEGMENT_VERSION = 6;
     /// The oldest version whose segments may hold frames of types [FrameBody#COMMIT_SPLIT] and [FrameBody#VALUES]:
     /// recovery refuses one in an older segment, which no writer of this store put there.
     static final int SPLIT_SEGMENT_VERSION = 5;
