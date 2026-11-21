@@ -166,7 +166,7 @@ class HeapPoolTest {
         return arrays;
     }
 
-    /// Gives `count` new arrays of `length` bytes back to `pool` as a checkpoint, which holds its overflow, does.
+    /// Gives `count` new arrays of `length` bytes back to `pool` as a long body or rope, which holds its overflow, does.
     ///
     /// @return the arrays, by identity
     private static List<byte[]> releaseNewHeld(HeapPool pool, int count, int length) {
@@ -209,7 +209,7 @@ class HeapPoolTest {
     }
 
     @Test
-    @DisplayName("gives a checkpoint's arrays to the overflow alone, within half the maximum for a size with its reserve and the maximum in all, and leaves the reserve as it is")
+    @DisplayName("gives the chunks of a long body or rope to the overflow alone, within half the maximum for a size with its reserve and the maximum in all, and leaves the reserve as it is")
     void releasesHeld() {
         var pool = new HeapPool(6L << 20, false);
         var hold = pool.hold();
@@ -217,7 +217,7 @@ class HeapPoolTest {
         assertEquals(2L * CHUNK, pool.reservedBytesForTests());
         // Half the maximum for a size is 12 chunks, the reserve's 2 among them
         var burst = releaseNewHeld(pool, 12, CHUNK);
-        assertEquals(2L * CHUNK, pool.reservedBytesForTests(), "the reserve after a checkpoint");
+        assertEquals(2L * CHUNK, pool.reservedBytesForTests(), "the reserve after a long body");
         assertEquals(10L * CHUNK, pool.overflowBytesForTests());
         // A size with an empty reserve keeps it empty
         releaseNewHeld(pool, 4, HeapPool.MAX_POOLED);
@@ -227,18 +227,18 @@ class HeapPoolTest {
         releaseNewHeld(pool, 1, 64 << 10);
         assertEquals(0, pool.reservedBytesForTests(64 << 10));
         assertEquals(10L * CHUNK + (3L << 20), pool.overflowBytesForTests(), "an array past the maximum in all");
-        // The reserve's arrays first, then those of the checkpoint the overflow kept
+        // The reserve's arrays first, then those of the body the overflow kept
         for (var array : reserved) {
             assertSame(array, pool.acquire(CHUNK), "an array of the reserve");
         }
         for (var i = 0; i < 10; i++) {
-            assertSame(burst.get(i), pool.acquire(CHUNK), "array " + i + " of the checkpoint");
+            assertSame(burst.get(i), pool.acquire(CHUNK), "array " + i + " of the body");
         }
         Reference.reachabilityFence(hold);
     }
 
     @Test
-    @DisplayName("keeps a checkpoint's arrays through collections while the overflow is held, frees them at the first collection that finds no hold, and keeps the reserve")
+    @DisplayName("keeps the chunks of a long body or rope through collections while the overflow is held, frees them at the first collection that finds no hold, and keeps the reserve")
     void collectsHeld() {
         var pool = new HeapPool(64L << 20, false);
         var reserved = releaseNew(pool, 2, CHUNK);
@@ -246,7 +246,7 @@ class HeapPoolTest {
         var burst = releaseNewHeld(pool, 6, CHUNK);
         System.gc();
         System.gc();
-        assertEquals(6L * CHUNK, pool.overflowBytesForTests(), "a collection freed a checkpoint's arrays while the overflow was held");
+        assertEquals(6L * CHUNK, pool.overflowBytesForTests(), "a collection freed the chunks of a body while the overflow was held");
         var probe = new WeakReference<>(burst.getLast());
         burst.clear();
         Reference.reachabilityFence(hold);
@@ -254,7 +254,7 @@ class HeapPoolTest {
         for (var i = 0; i < 50 && probe.get() != null; i++) {
             System.gc();
         }
-        assertNull(probe.get(), "a collection with no hold left an array of the checkpoint");
+        assertNull(probe.get(), "a collection with no hold left a chunk of the body");
         assertEquals(0, pool.overflowBytesForTests());
         assertEquals(2L * CHUNK, pool.reservedBytesForTests());
         for (var array : reserved) {
@@ -564,8 +564,8 @@ class HeapPoolTest {
                                 failures.add("an array written while out");
                             }
                             out.remove(array);
-                            // A checkpoint gives its arrays back to the overflow it holds; a large commit gives its
-                            // chunks back as a burst
+                            // A long body or rope gives its chunks back to the overflow it holds; a short one gives
+                            // them back as a burst
                             var kind = random.nextInt(3);
                             if (hold != null && kind == 0) {
                                 pool.releaseHeld(array);

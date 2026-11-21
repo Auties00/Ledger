@@ -21,14 +21,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The work that holds the overflow of a pool while it runs, so collections in the middle of it keep the arrays it
-/// takes again: the body of a frame on chunks, a batch on a rope, a checkpoint; and the overflow a store's large
-/// commit leaves, which the first collection after it frees. The tests that look for collections run `System.gc()`, a
+/// takes again: the body of a frame on chunks, a batch on a rope; a checkpoint, which holds none; and the overflow a
+/// store's large commit leaves, which the first collection after it frees. The tests that look for collections run `System.gc()`, a
 /// full one.
 class PoolHoldTest {
     private static final byte[] KEY = new byte[32];
@@ -208,14 +209,22 @@ class PoolHoldTest {
     }
 
     @Test
-    @DisplayName("a checkpoint gives the arrays it seals into to the overflow it holds: the reserve of no size grows by them, and the next window takes them again through collections")
-    void checkpointSkipsReserve() throws Exception {
+    @DisplayName("a checkpoint seals its value units into its own window through collections: it takes none of the pool's arrays for them, gives none back, and the reserve of no size grows")
+    void checkpointSealsIntoItsWindow() throws Exception {
         var disk = CrashFileSystem.create();
         var pool = HeapPool.process();
         var armed = new AtomicBoolean();
         var collections = new AtomicInteger();
-        var reused = new AtomicInteger();
+        var pooled = new AtomicInteger();
+        // The array of the pool a value unit of 74 pages would take
         var unit = 512 << 10;
+        disk.intercept((path, kind) -> {
+            // A collection between two windows, as the checkpoint's own allocations start young ones
+            if (armed.get() && kind == ChangeInterceptor.ChangeKind.WRITE && path.endsWith(PageFile.FILE) && collections.get() < 3) {
+                collections.incrementAndGet();
+                System.gc();
+            }
+        });
         try (var ledger = options(disk.getPath("/store")).build()) {
             var key = new byte[8];
             // Pages of a few KiB
@@ -227,27 +236,29 @@ class PoolHoldTest {
                 }
                 ledger.commit(batch).awaitDurable();
             }
-            // Value units of 74 pages, sealed into arrays of 512 KiB, three to a window
+            // Value units of 74 pages, three to a window
+            var values = new ArrayList<byte[]>();
             var batch = ledger.newBatch();
             for (var i = 0; i < 9; i++) {
                 ByteBuffer.wrap(key).putInt(0, 100_000 + i);
-                batch.put(MESSAGES, key.clone(), new byte[300_000]);
+                var value = new byte[300_000];
+                value[i * 1_000] = (byte) (i + 1);
+                values.add(value);
+                batch.put(MESSAGES, key.clone(), value);
             }
             ledger.commit(batch).awaitDurable();
             pool.watchForTests(new HeapPool.Watcher() {
                 @Override
                 public void acquired(byte[] array) {
                     if (armed.get() && array.length == unit) {
-                        reused.incrementAndGet();
+                        pooled.incrementAndGet();
                     }
                 }
 
                 @Override
                 public void released(byte[] array) {
-                    // A collection between two windows, as the checkpoint's own allocations start young ones
-                    if (armed.get() && array.length == unit && collections.get() < 3) {
-                        collections.incrementAndGet();
-                        System.gc();
+                    if (armed.get() && array.length == unit) {
+                        pooled.incrementAndGet();
                     }
                 }
             });
@@ -262,11 +273,16 @@ class PoolHoldTest {
                 armed.set(false);
                 pool.watchForTests(null);
             }
-            assertTrue(collections.get() > 0, "the checkpoint sealed no value unit");
-            assertTrue(reused.get() >= 6, "the arrays of value units the later windows took again: " + reused.get());
+            assertTrue(collections.get() > 0, "the checkpoint wrote no page");
+            assertEquals(0, pooled.get(), "the arrays of value units the checkpoint took from the pool or gave it");
             for (var length = 4_096; length <= HeapPool.MAX_POOLED; length <<= 1) {
                 var after = pool.reservedBytesForTests(length);
                 assertTrue(after <= before[length / 4_096], "the reserve of " + length + " bytes grew from " + before[length / 4_096] + " to " + after);
+            }
+            ((LiveLedger) ledger).clearPageCacheForTests();
+            for (var i = 0; i < 9; i++) {
+                ByteBuffer.wrap(key).putInt(0, 100_000 + i);
+                assertArrayEquals(values.get(i), ledger.get(MESSAGES, key).orElseThrow(), "value " + i);
             }
         }
     }
@@ -334,23 +350,25 @@ class PoolHoldTest {
     }
 
     @Test
-    @DisplayName("a checkpoint holds the overflow of the store's pool while it writes its pages, and lets go of it once it ends")
-    void checkpointHolds() throws Exception {
+    @DisplayName("a checkpoint holds none of the overflow of the store's pool while it writes its pages: chunks given back past the reserve meanwhile go at the next collection")
+    void checkpointHoldsNothing() throws Exception {
         var disk = CrashFileSystem.create();
         var directory = disk.getPath("/store");
+        var pool = HeapPool.process();
         var armed = new AtomicBoolean();
         var probes = new AtomicInteger();
-        var held = new AtomicInteger();
+        var kept = new AtomicInteger();
         disk.intercept((path, kind) -> {
-            // The first writes of the checkpoint: a collection at each of them takes a while
+            // The first writes of the checkpoint, which stalls in each while collections run
             if (armed.get() && kind == ChangeInterceptor.ChangeKind.WRITE && path.endsWith(PageFile.FILE) && probes.get() < 3) {
                 probes.incrementAndGet();
-                // Reached from here only through the probe
-                var probe = new WeakReference<>(HeapPool.process().hold());
-                System.gc();
-                System.gc();
-                if (probe.get() != null) {
-                    held.incrementAndGet();
+                // The chunks of commits made while the checkpoint runs: more than the reserve has room for
+                for (var i = 0; i < 12; i++) {
+                    pool.release(new byte[CHUNK]);
+                }
+                collectOverflow(pool);
+                if (pool.overflowBytesForTests() != 0) {
+                    kept.incrementAndGet();
                 }
             }
         });
@@ -368,13 +386,8 @@ class PoolHoldTest {
             ledger.checkpoint();
             armed.set(false);
             assertTrue(probes.get() > 0, "the checkpoint wrote no page");
-            assertEquals(probes.get(), held.get(), "the writes of the checkpoint the overflow was free at");
-            var after = new WeakReference<>(HeapPool.process().hold());
-            for (var i = 0; i < 100 && after.get() != null; i++) {
-                System.gc();
-                LockSupport.parkNanos(10_000_000);
-            }
-            assertNull(after.get(), "the overflow held once the checkpoint ended");
+            assertEquals(0, kept.get(), "the writes of the checkpoint a collection left the overflow at");
+            assertTrue(pool.reservedBytesForTests() <= HeapPool.RESERVE, "the reserve during the checkpoint");
         }
     }
 

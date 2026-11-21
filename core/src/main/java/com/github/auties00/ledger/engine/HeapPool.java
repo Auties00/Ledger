@@ -23,11 +23,11 @@ import java.util.concurrent.atomic.AtomicLong;
 /// enough for the arrays the commits, reads and writes of large values of a few stores take and give back one at a
 /// time. It keeps the free arrays past the reserve, up to the bytes the stores ask it for, in an overflow it reaches
 /// only weakly, unless work that takes many arrays at once [holds][#hold()] it: a large batch's rope, the body of a
-/// large commit's frame, a checkpoint. While any such work holds it, a collection, young or full, keeps it; once none
-/// does, the first collection frees it. A large commit gives back tens of megabytes of chunks as its frame is sealed,
-/// which a pool that held every free array strongly kept for as long as the store went on taking an array of their
-/// size, and after the last store closed; the next large batch holds what is left of them from its first chunk, so
-/// large commits that follow one another reuse them, unless a collection ran between the two.
+/// large commit's frame. While any such work holds it, a collection, young or full, keeps it; once none does, the
+/// first collection frees it. A large commit gives back tens of megabytes of chunks as its frame is sealed, which a
+/// pool that held every free array strongly kept for as long as the store went on taking an array of their size, and
+/// after the last store closed; the next large batch holds what is left of them from its first chunk, so large commits
+/// that follow one another reuse them, unless a collection ran between the two.
 ///
 /// The chunks a large commit's body or a bulk batch's rope gives back go to the reserve within its bounds, as other
 /// arrays do, but kept apart ([#releaseBurst(byte\[\])]): such commits come one after another while a client stores
@@ -41,9 +41,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /// reserve, up to [#RESERVE_PER_SIZE] of their size. A body or a rope of more chunks than the reserve has room for,
 /// [#BURST_KEPT_CHUNKS], such as that of an app-state snapshot's bulk commit, gives them to the overflow alone
 /// ([#releaseHeld(byte\[\])]), as the reserve would keep only a few of them: the next such commit, which holds the
-/// overflow from its first chunk, takes them again, and the first collection after the last frees them all. A
-/// checkpoint, which holds the overflow from its cut to its end and comes once per many commits, gives the arrays it
-/// seals pages into to the overflow alone as well, where its next window takes them again.
+/// overflow from its first chunk, takes them again, and the first collection after the last frees them all.
 ///
 /// The free arrays of a size none was taken of for a tick of the [IdleTicker], between one and two of its periods, go
 /// to the collector, the reserve's and the overflow's alike, so neither a store idle after a checkpoint, in a process
@@ -117,8 +115,8 @@ public final class HeapPool {
     // overflow's together
     private volatile long maxPooledBytes;
     // The bytes of the reserve's free arrays of each size. A size, its reserve and its overflow together, may not
-    // hold more than half of maxPooledBytes: a checkpoint's flush releases its many small arrays at once, and would
-    // otherwise leave no room for the large ones
+    // hold more than half of maxPooledBytes: a long body or rope releases its many chunks at once, and would otherwise
+    // leave no room for the other sizes
     private final AtomicLong[] pooledBySize;
     // The free arrays past the reserve, which only this reference and the holds of work reach; replaced, holding the
     // overflow's lock, once the collector cleared it. Its counts are its own, so a cleared one needs no fix-up
@@ -498,12 +496,11 @@ public final class HeapPool {
         }
     }
 
-    /// Returns `array`, one of the arrays a checkpoint seals pages into or one of the chunks of a body or a rope of
-    /// more than [#BURST_KEPT_CHUNKS], to the overflow alone, never to the reserve, unless it is not one of the pooled
-    /// sizes or the pool is full.
+    /// Returns `array`, one of the chunks of a body or a rope of more than [#BURST_KEPT_CHUNKS], to the overflow
+    /// alone, never to the reserve, unless it is not one of the pooled sizes or the pool is full.
     ///
     /// The caller holds the overflow ([#hold()]) from before its first array goes back until after its last has, so
-    /// a collection during its work keeps them and its next window or commit takes them again; once it ends, the first
+    /// a collection during its work keeps them and its next commit takes them again; once it ends, the first
     /// collection frees them, where the reserve would keep up to [#RESERVE_PER_SIZE] of each size it used. An array
     /// given back while nothing holds the overflow is left to the next collection.
     ///
