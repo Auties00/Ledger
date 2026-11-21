@@ -73,6 +73,10 @@ import java.util.concurrent.atomic.AtomicLong;
 /// that gives a view of the value, which the caller may keep, still opens the unit into an array of its own. Only an
 /// array that never left its reader comes back: one the page cache, a version, a view or a caller received never does,
 /// as a reader may still read it.
+///
+/// The window a checkpoint seals its units into ([PageFile.Writer]), which is no pooled size, comes back apart
+/// ([#releaseWindow(byte\[\])]), at most [#WINDOW_SPARES] of them, reached only weakly: the next checkpoint of any store
+/// of the process takes it again, unless a collection ran between the two.
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
@@ -93,6 +97,9 @@ public final class HeapPool {
     /// cache takes; a miss the cache refuses keeps one. Each more would keep the regions of a unit committed while a
     /// marking is pending.
     static final int LARGE_SPARES = 2;
+    /// The most windows of checkpoints' writers the pool keeps ([#releaseWindow(byte\[\])]): one for each of two
+    /// checkpoints that run at once, in stores of the process that close or tick together.
+    static final int WINDOW_SPARES = 2;
     // Moves the chunks of bursts a pool's reserve keeps to its overflow once a collection took the sentinel it
     // registered
     private static final Cleaner COLLECTIONS = Cleaner.create(Thread.ofVirtual().name("ledger-pool-collections").factory());
@@ -160,6 +167,10 @@ public final class HeapPool {
     // The large acquires so far, and the count the trimmer saw last, as for the other arrays
     private int largeAcquires;
     private int largeAcquiresSeen;
+    // Guards windowSpares
+    private final Object windowLock;
+    // The windows the writers of checkpoints gave back, reached only weakly; or null slots
+    private final WeakReference<byte[]>[] windowSpares;
 
     // The pool the stores of the process share, made with the first; guarded by the class
     private static HeapPool process;
@@ -242,6 +253,8 @@ public final class HeapPool {
         this.collectableOut = new AtomicInteger();
         this.largeLock = new Object();
         this.largeSpares = new WeakReference[LARGE_SPARES];
+        this.windowLock = new Object();
+        this.windowSpares = new WeakReference[WINDOW_SPARES];
         this.trimmer = trimmed ? this::trimIfIdle : null;
         if (trimmed) {
             IdleTicker.watch(trimmer);
@@ -496,8 +509,9 @@ public final class HeapPool {
         }
     }
 
-    /// Returns `array`, one of the chunks of a body or a rope of more than [#BURST_KEPT_CHUNKS], to the overflow
-    /// alone, never to the reserve, unless it is not one of the pooled sizes or the pool is full.
+    /// Returns `array`, one of the chunks of a body or a rope of more than [#BURST_KEPT_CHUNKS] or the array of a
+    /// checkpoint's unit longer than its window, to the overflow alone, never to the reserve, unless it is not one of
+    /// the pooled sizes or the pool is full.
     ///
     /// The caller holds the overflow ([#hold()]) from before its first array goes back until after its last has, so
     /// a collection during its work keeps them and its next commit takes them again; once it ends, the first
@@ -648,6 +662,71 @@ public final class HeapPool {
                 largeNext = (largeNext + 1) % largeSpares.length;
             }
             largeSpares[slot] = new WeakReference<>(array);
+        }
+    }
+
+    /// {@return the shortest window a checkpoint's writer gave back ([#releaseWindow(byte\[\])]) that holds at least
+    /// `capacity` bytes, or `null` if the pool keeps none}
+    ///
+    /// The window of a checkpoint is the one array it seals its units into, which it holds from its first flush to its
+    /// last: the checkpoints of the stores of a process, the closes of many stores one after another or the ticks of
+    /// idle ones, take the window of the one before them again, as they took the arrays of their seals from the pool
+    /// before they had a window.
+    byte[] acquireWindow(int capacity) {
+        synchronized (windowLock) {
+            var best = -1;
+            byte[] taken = null;
+            for (var slot = 0; slot < windowSpares.length; slot++) {
+                var spare = windowSpares[slot];
+                var array = spare == null ? null : spare.get();
+                if (array != null && array.length >= capacity && (taken == null || array.length < taken.length)) {
+                    best = slot;
+                    taken = array;
+                }
+            }
+            if (taken != null) {
+                windowSpares[best] = null;
+            }
+            return taken;
+        }
+    }
+
+    /// Keeps `array`, a checkpoint's window, for the window of the next checkpoint of any store of the process,
+    /// reached only weakly, so the first collection after it frees it, as it frees the overflow: in a free slot, or in
+    /// place of the shortest spare if that one is shorter.
+    ///
+    /// @param array a window whose every flush sealed and wrote its units: one a seal or a write failed on may hold
+    ///              the plaintext of a value, which the window of another store's checkpoint would keep
+    void releaseWindow(byte[] array) {
+        synchronized (windowLock) {
+            var slot = 0;
+            var shortest = Integer.MAX_VALUE;
+            for (var i = 0; i < windowSpares.length && shortest > 0; i++) {
+                var spare = windowSpares[i];
+                var kept = spare == null ? null : spare.get();
+                var length = kept == null ? 0 : kept.length;
+                if (length < shortest) {
+                    shortest = length;
+                    slot = i;
+                }
+            }
+            if (shortest < array.length) {
+                windowSpares[slot] = new WeakReference<>(array);
+            }
+        }
+    }
+
+    /// {@return the bytes of the windows the pool keeps; for tests}
+    long windowSpareBytesForTests() {
+        synchronized (windowLock) {
+            var bytes = 0L;
+            for (var spare : windowSpares) {
+                var array = spare == null ? null : spare.get();
+                if (array != null) {
+                    bytes += array.length;
+                }
+            }
+            return bytes;
         }
     }
 

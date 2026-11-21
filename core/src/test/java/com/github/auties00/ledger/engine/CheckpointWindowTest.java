@@ -33,14 +33,16 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The window a checkpoint's writer seals its units into side by side: each unit on the file is the one sealed in an
-/// array of its own, whatever the window held before; the window is sized to the flush and allocated at most twice per
-/// writer, never goes to the pool and is let go of by the last flush and a discard; a unit longer than the window seals
-/// into an array of the pool, which goes back only once the unit is written; and a store whose checkpoints write every
-/// kind of unit, in windows with gaps between their pages, reads every value back from the file.
+/// array of its own, whatever the window held before; the window is sized to the flush and taken at most twice per
+/// writer, from the pool's spare windows when one is long enough; it goes back to them after the last flush, never
+/// after a failed one or a discard, and never to the pool's arrays; a unit longer than the window seals into an array
+/// of the pool, which goes back to the overflow only once the unit is written; and a store whose checkpoints write
+/// every kind of unit, in windows with gaps between their pages, reads every value back from the file.
 class CheckpointWindowTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<byte[], byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.bytes(), ValueCodec.bytes());
@@ -173,7 +175,7 @@ class CheckpointWindowTest {
             var window = writer.windowForTests();
             assertNotNull(window);
             assertEquals(PageFile.WINDOW_BYTES, window.length);
-            assertEquals(1, writer.windowsAllocatedForTests(), "the windows the writer allocated");
+            assertEquals(1, writer.windowsTakenForTests(), "the windows the writer allocated");
             assertEquals(acquires + 1, pages.pool.acquiresForTests(), "the arrays of the pool the flush took: the long unit's");
             assertEquals(1, pages.released.size(), "the arrays the flush gave back: the long unit's");
             assertFalse(pages.released.contains(window), "the window went to the pool");
@@ -190,7 +192,10 @@ class CheckpointWindowTest {
             }
             writer.finish();
             assertNull(writer.windowForTests(), "the window after the last flush");
-            assertEquals(1, writer.windowsAllocatedForTests());
+            assertEquals(1, writer.windowsTakenForTests());
+            assertFalse(pages.released.contains(window), "the window went to the pool's arrays");
+            assertEquals(window.length, pages.pool.windowSpareBytesForTests(), "the window the pool keeps for the next checkpoint");
+            assertSame(window, pages.pool.acquireWindow(PageFormat.SIZE), "the window the next checkpoint takes");
             assertSealedAlone(pages.path, more, encrypted);
         }
     }
@@ -207,7 +212,8 @@ class CheckpointWindowTest {
                 queueNode(writer, expected, random, page++, 100);
             }
             writer.flush();
-            assertEquals(3 * PageFormat.SIZE, writer.windowForTests().length, "the window of a flush of 3 units");
+            var first = writer.windowForTests();
+            assertEquals(4 * PageFormat.SIZE, first.length, "the window of a flush of 3 units, the power of two of their bytes");
             for (var i = 0; i < 5; i++) {
                 queueNode(writer, expected, random, page++, 100);
             }
@@ -217,18 +223,52 @@ class CheckpointWindowTest {
                 queueNode(writer, expected, random, page++, 100);
             }
             writer.flush();
-            assertEquals(2, writer.windowsAllocatedForTests());
+            assertEquals(2, writer.windowsTakenForTests());
             assertTrue(pages.released.isEmpty(), "arrays went to the pool");
+            var full = writer.windowForTests();
+            assertEquals(first.length, pages.pool.windowSpareBytesForTests(), "the spare windows while the writer grew");
             writer.finish();
             assertNull(writer.windowForTests());
+            assertEquals(first.length + full.length, pages.pool.windowSpareBytesForTests(), "the spare windows after the last flush");
             assertSealedAlone(pages.path, expected, true);
 
+            // The next checkpoint takes the shortest spare that holds its flush
             var failed = pages.writer(2L);
             queueNode(failed, new TreeMap<>(), random, page++, 100);
             failed.flush();
-            assertNotNull(failed.windowForTests());
+            assertSame(first, failed.windowForTests(), "the window of the next checkpoint's flush of one unit");
             failed.discard();
             assertNull(failed.windowForTests(), "the window after a discard");
+            assertEquals(full.length, pages.pool.windowSpareBytesForTests(), "the spare windows after a discard");
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a window a flush failed to write never goes back to the pool's spare windows")
+    void failedWindow(boolean encrypted) throws IOException {
+        var disk = CrashFileSystem.create();
+        try (var pages = new Pages(disk.getPath("/failed"), encrypted)) {
+            var random = new Random(4);
+            var page = PageFormat.FIRST_UNIT_PAGE;
+            var writer = pages.writer(9L);
+            for (var i = 0; i < 3; i++) {
+                page += queueValue(writer, new TreeMap<>(), random, page, 2_000);
+            }
+            writer.flush();
+            assertNotNull(writer.windowForTests());
+            for (var i = 0; i < 3; i++) {
+                page += queueValue(writer, new TreeMap<>(), random, page, 2_000);
+            }
+            disk.intercept((path, kind) -> {
+                if (kind == ChangeKind.WRITE && path.endsWith(PageFile.FILE)) {
+                    throw new IOException("The device failed");
+                }
+            });
+            assertThrows(IOException.class, writer::finish);
+            assertNull(writer.windowForTests(), "the window after a failed flush");
+            assertEquals(0, pages.pool.windowSpareBytesForTests(), "the spare windows after a failed flush");
+            assertTrue(pages.released.isEmpty(), "an array holding the plaintext of a value went to the pool");
         }
     }
 
@@ -242,9 +282,10 @@ class CheckpointWindowTest {
             var expected = new TreeMap<Integer, byte[]>();
             queueValue(writer, expected, new Random(1), PageFormat.FIRST_UNIT_PAGE, LONGER_THAN_WINDOW);
             writer.finish();
-            assertEquals(0, writer.windowsAllocatedForTests(), "a window for a unit longer than it");
+            assertEquals(0, writer.windowsTakenForTests(), "a window for a unit longer than it");
             assertEquals(1, pages.released.size(), "the arrays the unit gave back");
             assertTrue(pages.released.iterator().next().length >= PageFormat.pagesFor(LONGER_THAN_WINDOW) * PageFormat.SIZE);
+            assertEquals(0, pages.pool.reservedBytesForTests(), "the bytes the unit's array keeps in the reserve");
             assertSealedAlone(pages.path, expected, encrypted);
         }
 
