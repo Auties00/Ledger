@@ -180,6 +180,14 @@ public final class LiveLedger implements Ledger {
     private boolean replayingOpen;
     // The replayed puts of the open that wrote their value into the array of the version they replace, for tests
     private int replayedInPlace;
+    // The stamp of the open's first replayed write, or Long.MAX_VALUE outside the open's replay: a version stamped at or
+    // after it was made by a replayed commit, which listed its chain for the next checkpoint. The resident loader's
+    // versions are below it, as the loader stamps them as the checkpoint they come from and the replay skips every
+    // commit at or below the checkpoint
+    private long replayFloor = Long.MAX_VALUE;
+    // The replayed puts of the open that gave the head of their chain their value and stamp, making no version
+    // (Applier.putReplayedBytes); the heap the log's estimate gives them counts toward the first checkpoint
+    private long restamped;
     // The rooms the open's replay asked its runs' builders for ([ReplayValues#reserve(PackedRun.Builder, long)]), for
     // tests
     private int replayReservations;
@@ -527,7 +535,9 @@ public final class LiveLedger implements Ledger {
         // or tick: a commit replayed into an open store overwrites no array
         if (!replayingOpen && log == null && checkpointer == null) {
             replayingOpen = true;
+            replayFloor = Reads.stamp(sequence, 0);
         }
+        var restampedBefore = restamped;
         var applier = new Applier(sequence, null, chained[0], false, false, 0, true);
         // The writes that went to runs rather than to chains
         var runWrites = new int[1];
@@ -703,8 +713,10 @@ public final class LiveLedger implements Ledger {
         // The section counts as the writer counted it, as part of the commit's body
         var bodyBytes = length + sectionBytes;
         replayedBytes += 13 + bodyBytes + unitBytes[0];
-        // As the writes would have held on chains, so the first checkpoint comes when it would have
-        replayedHeap += LogWriter.heapOf(bodyBytes, unitBytes[1], applier.touched.size() + runWrites[0], false);
+        // As the writes would have held on chains, so the first checkpoint comes when it would have: a put that restamped
+        // its chain's head counts as one that made a version
+        replayedHeap += LogWriter.heapOf(bodyBytes, unitBytes[1],
+                applier.touched.size() + runWrites[0] + Math.toIntExact(restamped - restampedBefore), false);
         return true;
     }
 
@@ -717,8 +729,9 @@ public final class LiveLedger implements Ledger {
         }
         values.end(spills);
         replayReservations += values.reservations();
-        // No write overwrites a version's array from now on
+        // No write overwrites a version's array, or restamps a version, from now on
         replayingOpen = false;
+        replayFloor = Long.MAX_VALUE;
     }
 
     /// {@return the builder of the run of `state` that takes a replayed write of the key that is the `keyLength` bytes at
@@ -831,6 +844,12 @@ public final class LiveLedger implements Ledger {
     /// ([Applier#replayedArray(Version, int)]); for tests}
     int replayedInPlaceForTests() {
         return replayedInPlace;
+    }
+
+    /// {@return the replayed puts of the open that gave the head of their key's chain their value and stamp, making no
+    /// version ([Applier#putReplayedBytes(KeyspaceState, byte\[\], int, int, int, int, int)]); for tests}
+    long restampedForTests() {
+        return restamped;
     }
 
     /// {@return the rooms the open's replay asked its runs' builders for ([ReplayValues#reserve(PackedRun.Builder,
@@ -3290,7 +3309,10 @@ public final class LiveLedger implements Ledger {
         /// values of one length takes one array for the whole open rather than one per put, and the trees' array is
         /// written rather than dropped. The new version and the one it replaces then share the array, which holds the
         /// new value, until a prune drops the older: an exception to [Version#ownArray()]'s rule that a version's array
-        /// is never written, which holds only because nothing reads the older one's value meanwhile:
+        /// is never written, which holds only because nothing reads the older one's value meanwhile. When `head` is a
+        /// version the replay made, which links to no older one, the put makes no version: `head` takes the value and
+        /// the put's stamp ([Version#restampReplayed(long)]), and stays listed for the next checkpoint by the commit
+        /// that made it, as no checkpoint cuts while the open replays. In either case:
         /// - the loader of a resident key space installs all of it before the key space's first replayed write, on the
         ///   opening thread ([ResidentLoader#loadNow()], from the replay's first pass over each commit), and no loader
         ///   thread starts before the open returns, so no loader is running while the replay writes;
@@ -3469,6 +3491,14 @@ public final class LiveLedger implements Ledger {
         /// [#put(KeyspaceState, MemorySegment, MemorySegment, Object)] would, the value on an array of its own or, in
         /// the open's replay, in the array of the version it replaces ([#replayedArray(Version, int)]).
         ///
+        /// In the open's replay, a put over a version an earlier replayed commit made, which links to no older version,
+        /// makes no version, adds no key the commit touched and replaces nothing: the version takes the value in its
+        /// array and the put's stamp ([Version#restampReplayed(long)]). Such a version is no removal, so the key
+        /// existed; its chain is listed for the next checkpoint since the commit that made the version, and no
+        /// checkpoint cuts until the open returns; no reader exists that could need its earlier value or stamp; and the
+        /// key space has no range removal the restamp could move the version past. A version the resident loader made
+        /// is never restamped, as its chain is not listed: its stamp is the checkpoint's, below every replayed one.
+        ///
         /// @return whether it applied the put; if not, nothing changed, and the caller applies it with slices
         boolean putReplayedBytes(KeyspaceState state, byte[] body, int keyAt, int keyLength, int hash, int valueAt,
                                  int length) {
@@ -3489,6 +3519,14 @@ public final class LiveLedger implements Ledger {
             var stamp = nextStamp();
             var existed = head.removes() ? TreeSearch.ABSENT : TreeSearch.FOUND;
             var copy = replayedArray(head, length);
+            if (copy != null && head.stamp >= replayFloor && head.older == null) {
+                assert replayingOpen && stamp > head.stamp && !head.removes() && head.external() == null
+                        && state.removals.length == 0 : "a replayed put restamps a version it may not";
+                System.arraycopy(body, valueAt, copy, 0, length);
+                head.restampReplayed(stamp);
+                restamped++;
+                return true;
+            }
             if (copy != null) {
                 System.arraycopy(body, valueAt, copy, 0, length);
             } else {

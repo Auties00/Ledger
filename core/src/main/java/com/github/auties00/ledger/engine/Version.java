@@ -10,8 +10,14 @@ import java.lang.invoke.VarHandle;
 /// stamp is at or below its bound. Only the writer creates versions and cuts chains, through [#link(Version)].
 ///
 /// A version reaches readers through the release store that makes it the head of its chain, which publishes the
-/// plain store of [#older] the constructor makes; a volatile store there would wait, on most processors, for every
-/// store before it to reach the cache.
+/// plain stores of [#stamp] and [#older] the constructor makes; a volatile store there would wait, on most processors,
+/// for every store before it to reach the cache.
+///
+/// The open's replay may give a head that one of its replayed commits made, and that replaced no version a reader
+/// could need, the value and the stamp of a later replayed put of its key ([#restampReplayed(long)]). That write comes
+/// after the release store that published the head, so the store does not publish it: the threads that read the store
+/// afterwards are ordered after it by their start, or by the hand-off of the opened [com.github.auties00.ledger.Ledger],
+/// as none exists while the open replays.
 ///
 /// A version whose value a unit of [BlobFile] also holds is an [External], which keeps what the file needs: 16 bytes
 /// every other buffered write would carry for nothing. One of a paged key space keeps no copy of the value at all: its
@@ -41,7 +47,9 @@ sealed class Version permits Version.External {
     static final Version HIDDEN = new Version(Long.MIN_VALUE, (MemorySegment) null, null, null);
 
     /// The commit sequence in the high bits and the position of the write in its batch in the low bits.
-    final long stamp;
+    ///
+    /// Changed only by [#restampReplayed(long)], while the open replays its log, before any reader exists.
+    long stamp;
     // The read-only segment the encoded value is part of, the array of its batch; or the array that is the value, which
     // a resident version keeps, as does a paged one its batch gave an array of its own or whose value left the batch's
     // array, and whose segment and session, 72 bytes, a read of its encoding makes; or the BlobFile whose unit, which
@@ -105,6 +113,16 @@ sealed class Version permits Version.External {
     static Version of(long stamp, MemorySegment source, int offset, int length, Object decoded, Version older, PageRef external) {
         return external == null ? new Version(stamp, source, offset, length, decoded, older)
                 : new External(stamp, source, offset, length, decoded, older, external);
+    }
+
+    /// Makes this version, the head of its chain, the version of a later replayed put of its key, stamped `stamp`,
+    /// whose value the caller wrote into its array, of the same length: only while the open replays its log, before
+    /// any reader exists, for a head an earlier replayed commit made and that links to no older version, so no reader
+    /// could need the value and the stamp it had ([LiveLedger.Applier]).
+    void restampReplayed(long stamp) {
+        assert stamp > this.stamp : "a replayed put restamps a version with an earlier stamp";
+        assert older == null && !removes() : "a restamped version replaced none and removes nothing";
+        this.stamp = stamp;
     }
 
     /// {@return the encoded value, read-only, or `null` if this version removes the key}
@@ -189,7 +207,9 @@ sealed class Version permits Version.External {
     /// write the value of a replayed put of a resident key space of byte arrays into the array of the version that the
     /// put replaces, one the open's resident loader or its replay made, when it has the value's length
     /// ([LiveLedger.Applier]): the two versions then share the array, which holds the newer value, while nothing can
-    /// read the older. Nothing may rely on a version owning its array alone, by identity, for a version the open made.
+    /// read the older. When the version it would replace is one the replay made and links to no older version, no new
+    /// version is made at all: that one takes the value in its array and the put's stamp ([#restampReplayed(long)]).
+    /// Nothing may rely on a version owning its array alone, by identity, for a version the open made.
     byte[] ownArray() {
         return SOURCE.getAcquire(this) instanceof byte[] array ? array : null;
     }

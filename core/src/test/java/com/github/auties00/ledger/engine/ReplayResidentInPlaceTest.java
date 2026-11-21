@@ -7,6 +7,7 @@ import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.LedgerCorruptedException;
 import com.github.auties00.ledger.ValueCodec;
+import com.github.auties00.ledger.View;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -44,7 +45,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// with the loaded value's length writes the loader's array; an array a read returned after the open is never written
 /// again; a store whose replay fails part way reads the data file's values at the next open; and the overwrite leaves
 /// alone the versions a unit of the file of large values holds and the arrays of a key space with a codec of its own.
-/// Range removals among the replayed writes, and removals of loaded keys put again, keep the counts.
+/// Range removals among the replayed writes, and removals of loaded keys put again, keep the counts. A replayed put over
+/// a version an earlier replayed commit made, with no older version, restamps that version rather than making one,
+/// exactly as often as the tests count, and the store reads the same values, scans and counts after the open, a
+/// checkpoint and a reopen, with the first checkpoint due at the same heap as without the restamps.
 class ReplayResidentInPlaceTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, byte[]> SESSIONS = Keyspace.resident("sessions", KeyCodec.utf8(), ValueCodec.bytes());
@@ -79,7 +83,7 @@ class ReplayResidentInPlaceTest {
     }
 
     /// Checks that `ledger` holds exactly `model` in `keyspace`.
-    private static void check(Ledger ledger, Keyspace<String, byte[]> keyspace, TreeMap<String, byte[]> model) {
+    private static void check(View ledger, Keyspace<String, byte[]> keyspace, TreeMap<String, byte[]> model) {
         for (var entry : model.entrySet()) {
             assertArrayEquals(entry.getValue(), ledger.get(keyspace, entry.getKey()).orElse(null), entry.getKey());
         }
@@ -576,5 +580,180 @@ class ReplayResidentInPlaceTest {
         try (var ledger = open(directory, true)) {
             check(ledger, model);
         }
+    }
+
+    /// {@return the puts of the open of `ledger` that restamped the head of their chain}
+    private static long restamped(Ledger ledger) {
+        return ((LiveLedger) ledger).restampedForTests();
+    }
+
+    /// Opens `directory`, checks `model` in [#SESSIONS] with a snapshot taken at once and with the store, and closes it
+    /// without a checkpoint.
+    ///
+    /// @return the puts the open restamped
+    private static long reopenAndCheck(Path directory, boolean encrypted, boolean atOpen, TreeMap<String, byte[]> model) {
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, atOpen)) {
+            try (var snapshot = ledger.snapshot()) {
+                check(snapshot, SESSIONS, model);
+            }
+            check(ledger, model);
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+            return restamped(ledger);
+        }
+    }
+
+    /// Checks `model` after a checkpoint of the store at `directory`, and after a reopen whose log the checkpoint
+    /// retired, so the data file alone holds the values the restamped versions had.
+    private static void checkpointAndCheck(Path directory, boolean encrypted, boolean atOpen,
+                                           TreeMap<String, byte[]> model) {
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, atOpen)) {
+            ledger.checkpoint();
+            check(ledger, model);
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+        }
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, !atOpen)) {
+            assertEquals(0, restamped(ledger), "a reopen after the checkpoint replays nothing");
+            check(ledger, model);
+        }
+    }
+
+    @ParameterizedTest(name = "loaded at open: {0}, encrypted: {1}")
+    @CsvSource({"true, true", "false, true", "true, false", "false, false"})
+    @DisplayName("a loaded key and a new key overwritten in separate commits with one length restamp every put after their first replayed one")
+    void restampsOverwrites(boolean atOpen, boolean encrypted, @TempDir Path directory) throws Exception {
+        var random = new Random(atOpen ? 13 : 14);
+        var model = new TreeMap<String, byte[]>();
+        var commits = 25;
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, atOpen)) {
+            var batch = ledger.newBatch();
+            for (var i = 0; i < 100; i++) {
+                var value = value(random, 300);
+                batch.put(SESSIONS, loadedKey(i), value);
+                model.put(loadedKey(i), value);
+            }
+            ledger.commit(batch).awaitDurable();
+            ledger.checkpoint();
+            for (var commit = 0; commit < commits; commit++) {
+                var loaded = value(random, 300);
+                var fresh = value(random, 700);
+                ledger.commit(ledger.newBatch().put(SESSIONS, loadedKey(7), loaded)).awaitDurable();
+                ledger.commit(ledger.newBatch().put(SESSIONS, "fresh", fresh)).awaitDurable();
+                model.put(loadedKey(7), loaded);
+                model.put("fresh", fresh);
+            }
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+        }
+        // The first replayed put of each key makes a version, over the loader's or over none; each later one restamps
+        // it, as the commit that made it pruned the version it replaced
+        assertEquals(2L * (commits - 1), reopenAndCheck(directory, encrypted, atOpen, model));
+        // The same log replayed again by an open that loads the other way
+        assertEquals(2L * (commits - 1), reopenAndCheck(directory, encrypted, !atOpen, model));
+        checkpointAndCheck(directory, encrypted, atOpen, model);
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("put, delete, put and put of one key restamps only the last put and keeps the count")
+    void restampAfterDelete(boolean encrypted, @TempDir Path directory) throws Exception {
+        var random = new Random(15);
+        var model = new TreeMap<String, byte[]>();
+        try (var ledger = open(directory, encrypted)) {
+            var other = value(random, 64);
+            ledger.commit(ledger.newBatch().put(SESSIONS, "other", other)).awaitDurable();
+            model.put("other", other);
+            ledger.commit(ledger.newBatch().put(SESSIONS, "s", value(random, 400))).awaitDurable();
+            ledger.commit(ledger.newBatch().delete(SESSIONS, "s")).awaitDurable();
+            ledger.commit(ledger.newBatch().put(SESSIONS, "s", value(random, 400))).awaitDurable();
+            var last = value(random, 400);
+            ledger.commit(ledger.newBatch().put(SESSIONS, "s", last)).awaitDurable();
+            model.put("s", last);
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+        }
+        assertEquals(1, reopenAndCheck(directory, encrypted, false, model));
+        checkpointAndCheck(directory, encrypted, false, model);
+    }
+
+    @ParameterizedTest(name = "loaded at open: {0}, encrypted: {1}")
+    @CsvSource({"true, true", "false, true", "true, false", "false, false"})
+    @DisplayName("a replayed range removal removes the keys restamped before it, and no put of its key space restamps after it")
+    void rangeRemovalAfterRestamps(boolean atOpen, boolean encrypted, @TempDir Path directory) throws Exception {
+        var random = new Random(16);
+        var model = new TreeMap<String, byte[]>();
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE, atOpen)) {
+            var batch = ledger.newBatch();
+            for (var key : new String[]{"a0", "b0", "c0"}) {
+                var value = value(random, 200);
+                batch.put(SESSIONS, key, value);
+                model.put(key, value);
+            }
+            ledger.commit(batch).awaitDurable();
+            ledger.checkpoint();
+            // Two restamps of a1 and one of b1
+            for (var key : new String[]{"a1", "a1", "a1", "b1", "b1"}) {
+                var value = value(random, 200);
+                ledger.commit(ledger.newBatch().put(SESSIONS, key, value)).awaitDurable();
+                model.put(key, value);
+            }
+            ledger.commit(ledger.newBatch().deleteRange(SESSIONS, KeyRange.between("a", "b"))).awaitDurable();
+            model.keySet().removeIf(key -> key.startsWith("a"));
+            // Overwrites of one length outside the removal and inside it, none of which restamps
+            for (var key : new String[]{"b1", "b1", "b1", "a2", "a2", "a2", "c0", "c0"}) {
+                var value = value(random, 200);
+                ledger.commit(ledger.newBatch().put(SESSIONS, key, value)).awaitDurable();
+                model.put(key, value);
+            }
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+        }
+        assertEquals(3, reopenAndCheck(directory, encrypted, atOpen, model));
+        checkpointAndCheck(directory, encrypted, atOpen, model);
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("two puts of a new key in one commit and a third in a later one restamp the first put's version twice")
+    void restampWithinCommit(boolean encrypted, @TempDir Path directory) throws Exception {
+        var random = new Random(17);
+        var model = new TreeMap<String, byte[]>();
+        try (var ledger = open(directory, encrypted)) {
+            ledger.commit(ledger.newBatch().put(SESSIONS, "n", value(random, 90)).put(SESSIONS, "n", value(random, 90)))
+                    .awaitDurable();
+            var last = value(random, 90);
+            ledger.commit(ledger.newBatch().put(SESSIONS, "n", last)).awaitDurable();
+            model.put("n", last);
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+        }
+        assertEquals(2, reopenAndCheck(directory, encrypted, false, model));
+        checkpointAndCheck(directory, encrypted, false, model);
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a store whose replay restamps estimates the same replayed heap as one whose key space never does")
+    void replayedHeapUnchanged(boolean encrypted, @TempDir Path base) throws Exception {
+        var heaps = new long[2];
+        var restamps = new long[2];
+        var keyspaces = List.of(SESSIONS, CODED);
+        for (var i = 0; i < 2; i++) {
+            var directory = base.resolve("store" + i);
+            var keyspace = keyspaces.get(i);
+            var random = new Random(18);
+            try (var ledger = open(directory, encrypted)) {
+                for (var commit = 0; commit < 60; commit++) {
+                    var batch = ledger.newBatch();
+                    for (var write = 0; write < 3; write++) {
+                        batch.put(keyspace, "s" + random.nextInt(6), value(random, 250));
+                    }
+                    ledger.commit(batch).awaitDurable();
+                }
+                ((LiveLedger) ledger).closeWithoutCheckpoint();
+            }
+            try (var ledger = open(directory, encrypted)) {
+                heaps[i] = ((LiveLedger) ledger).replayedHeap();
+                restamps[i] = restamped(ledger);
+            }
+        }
+        assertTrue(restamps[0] > 100, "restamps " + restamps[0]);
+        assertEquals(0, restamps[1]);
+        assertEquals(heaps[1], heaps[0]);
     }
 }
