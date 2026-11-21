@@ -69,6 +69,8 @@ final class Checkpointer implements IdleTicker.Watched {
     /// [IdleTicker] without a commit checkpoints them: below it, a store that writes now and then would checkpoint
     /// after almost every write.
     static final long IDLE_BACKLOG = 1L << 20;
+    // The runs a checkpoint merges into a key space that holds none its trees lack
+    private static final PackedRun[] NO_RUNS = new PackedRun[0];
     // The checkpointers of the open stores of the process, whose writes the trees lack share one heap budget: a budget
     // of half the heap for each store let a process of several busy stores buffer more than the heap
     private static final Set<Checkpointer> OPEN = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
@@ -656,6 +658,13 @@ final class Checkpointer implements IdleTicker.Watched {
     /// counted it. Its cut closed the run to appends ([PackedRun#closeToAppends()]), so that view is at or below the
     /// cut.
     ///
+    /// The runs are those the cut recorded ([LiveLedger.KeyspaceCut#run()] and [LiveLedger.KeyspaceCut#older()]), not
+    /// the key space's at the build: the bulk commits after the cut may start a run beside the one it closed. Each run
+    /// is merged whose writes the trees lack and whose first is at or below the cut, so the checkpoint takes the run
+    /// the cut closed, which a reader of the trees before may still keep in memory beside a younger one, and both of a
+    /// key space whose earlier checkpoint failed after a younger run started: their keys are disjoint, and each entry
+    /// carries its own run into the update.
+    ///
     /// @param adopted receives the units of the file of large values the trees take
     private TreeRoot[] build(LiveLedger.Cut cut, TreeUpdate update, Set<PageRef> adopted) throws IOException {
         var roots = cut.base() == null ? new TreeRoot[cut.maxId() + 1] : cut.base().roots(cut.maxId() + 1);
@@ -667,47 +676,43 @@ final class Checkpointer implements IdleTicker.Watched {
             var chains = keyspace.dirty().toArray(Chain[]::new);
             ChainSort.sort(chains);
             // The run the open replayed, if the trees the checkpoint updates are those the store opened from, or the
-            // newest view of the bulk commits' run its cut closed, if they are older than the run
-            var run = state.run;
-            if (run != null && (run.maxStamp() <= treeBound || run.minStamp() > bound)) {
-                run = null;
-            }
-            if (run != null && run.maxStamp() > bound) {
-                throw new IllegalStateException("A run of " + state.keyspace.name() + " holds writes on both sides of the cut");
-            }
-            var runEntries = run == null ? 0 : run.size();
-            if (run != null) {
+            // newest views of the bulk commits' runs the trees lack, the older first
+            var runs = merged(state, keyspace.older(), keyspace.run(), treeBound, bound);
+            var runEntries = 0;
+            for (var run : runs) {
+                runEntries += run.size();
                 // The homes a bulk commit's run let go of for its value frames, read back at once rather than one at a
                 // time as the merge reaches them
                 run.readBackHomes();
             }
             var ops = new ArrayList<TreeUpdate.Op>(chains.length + runEntries);
             var removals = keyspace.removals();
-            // The next entry of the run in the order of the keys, or -1 past the last, compared with the chains in the
-            // run's arrays: the states of the run's keys hold the run, not a chain and a view of each key
-            var position = 0;
-            var next = runEntries == 0 ? -1 : run.entryAt(0);
+            // The next entry of the runs in the order of the keys, compared with the chains in the run's arrays: the
+            // states of the runs' keys hold the runs, not a chain and a view of each key
+            var next = new RunEntries(runs);
             Chain previous = null;
             for (var chain : chains) {
                 if (previous != null && Chain.sameKey(previous, chain)) {
                     continue;
                 }
                 previous = chain;
-                // The run's entries of the keys before the chain's go first; one of the chain's key goes with the chain
+                // The runs' entries of the keys before the chain's go first; one of the chain's key goes with the chain
+                PackedRun run = null;
                 var entry = -1;
-                while (next >= 0) {
-                    var order = run.compareChain(chain, next);
+                while (next.run != null) {
+                    var order = next.run.compareChain(chain, next.entry);
                     if (order < 0) {
                         break;
                     }
-                    var taken = next;
-                    position++;
-                    next = position < runEntries ? run.entryAt(position) : -1;
+                    var taken = next.run;
+                    var takenEntry = next.entry;
+                    next.advance();
                     if (order == 0) {
-                        entry = taken;
+                        run = taken;
+                        entry = takenEntry;
                         break;
                     }
-                    ops.add(runOp(run, taken, removals, treeBound, bound));
+                    ops.add(runOp(taken, takenEntry, removals, treeBound, bound));
                 }
                 // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
                 // otherwise another one, or none
@@ -737,10 +742,9 @@ final class Checkpointer implements IdleTicker.Watched {
                     }
                 }
             }
-            while (next >= 0) {
-                ops.add(runOp(run, next, removals, treeBound, bound));
-                position++;
-                next = position < runEntries ? run.entryAt(position) : -1;
+            while (next.run != null) {
+                ops.add(runOp(next.run, next.entry, removals, treeBound, bound));
+                next.advance();
             }
             var ranges = new ArrayList<TreeUpdate.Range>();
             for (var removal : keyspace.removals()) {
@@ -753,13 +757,14 @@ final class Checkpointer implements IdleTicker.Watched {
             var pendingRanges = state.ranges.correction(cut.sequence());
             var base = roots[state.id];
             var root = update.apply(base, ops, TreeUpdate.merge(ranges));
-            // The update settled the blind writes up to the cut but those of keys it skipped, looked up here, in the run
-            // first: its writes are older than the blind ones of its keys
-            var merged = run;
+            // The update settled the blind writes up to the cut but those of keys it skipped, looked up here, in the runs
+            // first: their writes are older than the blind ones of their keys, and a key is in one of them at most
             var blind = state.blind.correction(cut.sequence(), key -> {
-                var entry = merged == null ? -1 : merged.find(key);
-                if (entry >= 0) {
-                    return !merged.removes(entry);
+                for (var run : runs) {
+                    var entry = run.find(key);
+                    if (entry >= 0) {
+                        return !run.removes(entry);
+                    }
                 }
                 return base != null && TreeSearch.contains(pages, base, key);
             });
@@ -795,6 +800,86 @@ final class Checkpointer implements IdleTicker.Watched {
             }
         }
         return TreeUpdate.Op.ofRun(run, entry);
+    }
+
+    /// {@return the runs of `state` a checkpoint whose trees have bound `treeBound` and whose cut has bound `bound`
+    /// merges, the older first: of `older` and `run`, as the cut recorded them, each whose writes the trees lack and
+    /// whose first write is at or below the cut}
+    ///
+    /// A run a checkpoint merges holds no write above its cut, as the cut closed it, or the one before it did.
+    ///
+    /// @throws IllegalStateException if a run holds writes on both sides of the cut
+    private static PackedRun[] merged(KeyspaceState state, PackedRun older, PackedRun run, long treeBound, long bound) {
+        var taken = takes(state, older, treeBound, bound);
+        if (takes(state, run, treeBound, bound)) {
+            return taken ? new PackedRun[]{older, run} : new PackedRun[]{run};
+        }
+        return taken ? new PackedRun[]{older} : NO_RUNS;
+    }
+
+    // Whether a checkpoint merges `run`, as merged(...) gives
+    private static boolean takes(KeyspaceState state, PackedRun run, long treeBound, long bound) {
+        if (run == null || run.maxStamp() <= treeBound || run.minStamp() > bound) {
+            return false;
+        }
+        if (run.maxStamp() > bound) {
+            throw new IllegalStateException("A run of " + state.keyspace.name() + " holds writes on both sides of the cut");
+        }
+        return true;
+    }
+
+    /// The entries of the runs a checkpoint merges into one key space's tree, one at a time, in the order of their keys:
+    /// those of one run, or of two runs that share no key, merged.
+    private static final class RunEntries {
+        private final PackedRun[] runs;
+        // The position of the next entry of each run in its key order
+        private final int[] positions;
+        /// The run of the current entry, or `null` past the last entry of every run.
+        PackedRun run;
+        /// The current entry of [#run].
+        int entry;
+
+        RunEntries(PackedRun[] runs) {
+            this.runs = runs;
+            this.positions = new int[runs.length];
+            advance();
+        }
+
+        /// Moves to the next entry in the order of the keys.
+        void advance() {
+            if (runs.length == 1) {
+                var only = runs[0];
+                var position = positions[0];
+                if (position < only.size()) {
+                    run = only;
+                    entry = only.entryAt(position);
+                    positions[0] = position + 1;
+                } else {
+                    run = null;
+                }
+                return;
+            }
+            PackedRun lowest = null;
+            var lowestEntry = -1;
+            var lowestIndex = -1;
+            for (var i = 0; i < runs.length; i++) {
+                var candidate = runs[i];
+                if (positions[i] >= candidate.size()) {
+                    continue;
+                }
+                var candidateEntry = candidate.entryAt(positions[i]);
+                if (lowest == null || candidate.compareKey(candidateEntry, lowest.key(lowestEntry)) < 0) {
+                    lowest = candidate;
+                    lowestEntry = candidateEntry;
+                    lowestIndex = i;
+                }
+            }
+            if (lowest != null) {
+                positions[lowestIndex]++;
+            }
+            run = lowest;
+            entry = lowestEntry;
+        }
     }
 
     private PageRef writeCatalog(LiveLedger.Cut cut, TreeRoot[] roots, PageFile.Writer writer, TreeUpdate update) throws IOException {

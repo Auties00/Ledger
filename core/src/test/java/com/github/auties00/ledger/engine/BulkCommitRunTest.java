@@ -36,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -47,18 +48,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// and crash sees as the chains they replaced showed them. The expected state of every test is kept beside the store and
 /// checked through every read path.
 class BulkCommitRunTest {
-    private static final byte[] KEY = new byte[32];
-    private static final Keyspace<byte[], byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.bytes(), ValueCodec.bytes());
-    private static final Keyspace<String, String> TEXTS = Keyspace.paged("texts", KeyCodec.utf8(), ValueCodec.utf8());
-    private static final Keyspace<String, String> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
-    private static final int BULK = LiveLedger.BULK_RUN_WRITES + 500;
+    static final byte[] KEY = new byte[32];
+    static final Keyspace<byte[], byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.bytes(), ValueCodec.bytes());
+    static final Keyspace<String, String> TEXTS = Keyspace.paged("texts", KeyCodec.utf8(), ValueCodec.utf8());
+    static final Keyspace<String, String> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
+    static final int BULK = LiveLedger.BULK_RUN_WRITES + 500;
     // Empty, short, at the log's threshold, between it and the verdict's paying length, and above
-    private static final int[] LENGTHS = {0, 40, SpillQueue.LOG_VALUE_MIN, 200, 700, 1_500};
+    static final int[] LENGTHS = {0, 40, SpillQueue.LOG_VALUE_MIN, 200, 700, 1_500};
     // Values that move to the log once their record drains: mostly long, so the record's verdict lets all move
     private static final int[] LONG_LENGTHS = {40, SpillQueue.LOG_VALUE_MIN, 700, 1_500, 3_000};
     private static final int LARGE_VALUES = 64 << 10;
 
-    private static LiveLedger open(Path directory, boolean encrypted, long budget) {
+    static LiveLedger open(Path directory, boolean encrypted, long budget) {
         var ledger = (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(directory)
                 .encryption(encrypted ? Encryption.key(KEY) : Encryption.none())
                 .keyspace(MESSAGES).keyspace(TEXTS).keyspace(CHATS).commitWindow(Duration.ZERO)
@@ -71,11 +72,11 @@ class BulkCommitRunTest {
         return ledger;
     }
 
-    private static byte[] key(int message) {
+    static byte[] key(int message) {
         return ByteBuffer.allocate(Integer.BYTES).putInt(message).array();
     }
 
-    private static byte[] value(int message, int generation, int[] lengths) {
+    static byte[] value(int message, int generation, int[] lengths) {
         var length = lengths[Math.floorMod(message * 7 + generation, lengths.length)];
         var value = new byte[length];
         for (var i = 0; i < length; i++) {
@@ -85,7 +86,7 @@ class BulkCommitRunTest {
     }
 
     /// What a store should hold.
-    private static final class Expected {
+    static final class Expected {
         final TreeMap<Integer, byte[]> messages = new TreeMap<>();
         final TreeMap<String, String> texts = new TreeMap<>();
 
@@ -98,7 +99,7 @@ class BulkCommitRunTest {
     }
 
     /// Adds to `batch` puts of messages `first` to `first + count`, excluded, and records them in `expected`.
-    private static void puts(WriteBatch batch, Expected expected, int first, int count, int generation, int[] lengths) {
+    static void puts(WriteBatch batch, Expected expected, int first, int count, int generation, int[] lengths) {
         for (var message = first; message < first + count; message++) {
             var value = value(message, generation, lengths);
             batch.put(MESSAGES, key(message), value);
@@ -107,7 +108,7 @@ class BulkCommitRunTest {
     }
 
     /// Checks every way a view reads `expected`: point reads, encoded reads, scans both ways, ranges and counts.
-    private static void verify(View view, Expected expected) {
+    static void verify(View view, Expected expected) {
         for (var entry : expected.messages.entrySet()) {
             assertArrayEquals(entry.getValue(), view.get(MESSAGES, key(entry.getKey())).orElseThrow(),
                     () -> "message " + entry.getKey());
@@ -1141,7 +1142,7 @@ class BulkCommitRunTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
-    @DisplayName("a checkpoint's cut closes the run to appends: bulk commits during and after it go to chains, counted exactly, and the checkpoint takes the run whole")
+    @DisplayName("a checkpoint's cut closes the run to appends: bulk commits during it start a run beside it, keys of the closed run going to chains, bulk commits after it go to chains, all counted exactly, and the checkpoint takes the closed run whole")
     void cutClosesRun(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
@@ -1166,22 +1167,31 @@ class BulkCommitRunTest {
                         expected.messages.put(message, value);
                     }
                     ledger.commit(during);
-                    assertSame(run, ledger.state(MESSAGES).run, "a bulk commit appended to a closed run");
-                    assertTrue(ledger.state(MESSAGES).chains() >= BULK, "the bulk commit after the cut kept no chains");
+                    var beside = ledger.state(MESSAGES).run;
+                    assertNotSame(run, beside, "a bulk commit after the cut appended to the closed run");
+                    assertSame(run, beside.older(), "the run started after the cut is not beside the closed one");
+                    assertEquals(BULK, beside.size(), "keys of the closed run went to the run beside it");
+                    assertEquals(2 * BULK, run.size(), "the bulk commit after the cut appended to the closed run");
+                    assertTrue(ledger.state(MESSAGES).chains() < BULK, "the bulk commit after the cut kept its new keys on chains");
+                    // Read by the latest readers, whose trees hold neither run
+                    verify(ledger, expected);
                 }
             });
             ledger.checkpoint();
             assertTrue(ran.get());
             ledger.checkpointer().hookCutForTests(null);
-            assertNull(ledger.state(MESSAGES).run, "the checkpoint left the run it took");
+            var beside = ledger.state(MESSAGES).run;
+            assertNotNull(beside, "the checkpoint took the run started after its cut");
+            assertNull(beside.older(), "the checkpoint left the run it took");
             verify(ledger, expected);
             // The tree now holds the key space: chains again
             batch = ledger.newBatch();
             puts(batch, expected, 3 * BULK, BULK, 0, LENGTHS);
             ledger.commit(batch).awaitDurable();
-            assertNull(ledger.state(MESSAGES).run);
+            assertSame(beside, ledger.state(MESSAGES).run, "a bulk commit appended over a tree of the key space");
             verify(ledger, expected);
             ledger.checkpoint();
+            assertNull(ledger.state(MESSAGES).run, "the checkpoint left the run it took");
             verify(ledger, expected);
         }
         try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {

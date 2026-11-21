@@ -48,10 +48,12 @@ import java.util.function.LongSupplier;
 /// link cleared asks the map for the next chain.
 ///
 /// A paged key space of a store that crashed may also hold the writes its open replayed as a [PackedRun], which the
-/// readers of the tree the store opened from read as part of it ([Reads#runOf(KeyspaceState, ReadPoint)]), until every
+/// readers of the tree the store opened from read as part of it ([Reads#runOf(PackedRun, ReadPoint)]), until every
 /// reader reads a later tree, which holds them. So may one the bulk commits wrote while its latest tree held none of its
 /// entries: the readers at or after a commit read the view of the run that commit published as part of their trees,
-/// until every reader reads a tree that holds the run.
+/// until every reader reads a tree that holds the run. Once a checkpoint's cut closed that run, the bulk commits may
+/// start a second run beside it ([PackedRun#older()]), which shares none of its keys, while the latest tree still
+/// holds none of the key space's entries: a reader whose tree lacks both reads both.
 ///
 /// Readers use it concurrently with the commits. Commits create chains before they are given a sequence; everything
 /// else changes only under it.
@@ -98,10 +100,15 @@ final class KeyspaceState {
     // The writes whose effect on the count the trees settle
     final BlindWrites blind;
     /// The writes the open replayed into the key space as a run, which the readers of the tree the store opened from
-    /// read as part of it, or the newest view of the run of the bulk commits, which the readers at or after each commit
-    /// read as part of their trees ([PackedRun#at(long)]); or `null`: none was replayed and no bulk commit made one, or
-    /// every reader reads a tree that holds it. Published by the open's replay, before any reader exists, or by each
-    /// bulk commit, holding both roles before its sequence is visible, and cleared holding the publishing role.
+    /// read as part of it, or the newest view of the newest run of the bulk commits, which the readers at or after each
+    /// commit read as part of their trees ([PackedRun#at(long)]); or `null`: none was replayed and no bulk commit made
+    /// one, or every reader reads a tree that holds it. Published by the open's replay, before any reader exists, or by
+    /// each bulk commit, holding both roles before its sequence is visible, and cleared holding the publishing role.
+    ///
+    /// The bulk commits' run a cut closed, while a younger run takes the bulk commits after the cut, is the younger
+    /// one's [PackedRun#older()] rather than a field of its own: a reader loads this field once and finds both runs as
+    /// one consistent pair, the older being set before the younger is published and cleared only once every reader's
+    /// tree holds it.
     volatile PackedRun run;
     // The change the run makes to the count, against the tree the store opened from: 0 without one, UNCOUNTED until
     // known. Kept once the run is gone, as the counts of the commits leave the run's writes out
@@ -203,15 +210,16 @@ final class KeyspaceState {
     }
 
     /// {@return the stamp of the value in memory that a write of `key`, whose hash is `hash` ([Segments#hash(MemorySegment)])
-    /// and whose newest version in memory is `head`, replaces: that of `head`, or with no version that of the run's
-    /// entry of the key, the run's newest ([PackedRun#maxStamp()]), which no tree holds while it is above the bound of
-    /// the last checkpoint; [ValueSlab.Overwrites#NOTHING] if the write replaces no value in memory}
+    /// and whose newest version in memory is `head`, replaces: that of `head`, or with no version that of the entry of
+    /// the key in the run that holds one, that run's newest ([PackedRun#maxStamp()]), which no tree holds while it is
+    /// above the bound of the last checkpoint; [ValueSlab.Overwrites#NOTHING] if the write replaces no value in memory}
     ///
-    /// A writer passes the hash its chain of the key keeps, so the lookup in the run hashes nothing. A writer reads the
-    /// run's newest view, and no tree holds part of a run (a checkpoint takes a replay's whole, and a bulk commits' run
-    /// whole once its cut closed it), so the run's newest stamp tells for each of its entries whether a tree holds it.
-    /// The range removals since the run are not applied to its entry: a writer that found the key absent counts its
-    /// write as replacing nothing instead of calling this.
+    /// A writer passes the hash its chain of the key keeps, so the lookup in a run hashes nothing. A writer reads the
+    /// newest view of each run, and no tree holds part of a run (a checkpoint takes a replay's whole, and a bulk
+    /// commits' run whole once its cut closed it), so the newest stamp of the run that holds the key tells whether a
+    /// tree holds its entry: the run beside the newest ([PackedRun#older()]) may be held by a tree that lacks the
+    /// newest, so each run answers with its own stamp. The range removals since a run are not applied to its entry: a
+    /// writer that found the key absent counts its write as replacing nothing instead of calling this.
     long replacedStamp(Version head, MemorySegment key, int hash) {
         if (head != null) {
             return ValueSlab.Overwrites.stampOf(head);
@@ -221,6 +229,11 @@ final class KeyspaceState {
             return ValueSlab.Overwrites.NOTHING;
         }
         var entry = held.find(key, hash);
+        if (entry < 0) {
+            // The runs share no key
+            held = held.older();
+            entry = held == null ? -1 : held.find(key, hash);
+        }
         return entry < 0 || held.removes(entry) ? ValueSlab.Overwrites.NOTHING : held.maxStamp();
     }
 
@@ -1046,20 +1059,33 @@ final class KeyspaceState {
     /// commit that publishes it, part of the tree of every reader at or after the commit; called by the commit, holding
     /// both roles, before its sequence is visible.
     ///
-    /// The run makes no correction to the count, so what [#replayCorrection()] keeps of a replay's run stays as it is.
+    /// The first view of a run started beside the one a cut closed takes that run's place here, which it carries as its
+    /// [PackedRun#older()], so every reader still finds it. The run makes no correction to the count, so what
+    /// [#replayCorrection()] keeps of a replay's run stays as it is.
+    ///
+    /// @throws IllegalStateException if `run` was started beside a run the key space no longer holds
     void publishBulkRun(PackedRun run) {
         if (!run.committed()) {
             throw new IllegalArgumentException("A run a replay made is no bulk commit's");
         }
+        var older = run.older();
+        var current = this.run;
+        if (older != null && current != older && (current == null || current.older() != older)) {
+            throw new IllegalStateException("A run beside one the key space no longer holds");
+        }
         this.run = run;
     }
 
-    /// Lets go of the views of the run older than the one every reader reads at least, `oldestBound` being the bound
+    /// Lets go of the views of the runs older than the one every reader reads at least, `oldestBound` being the bound
     /// of the oldest sequence a reader reads at ([PackedRun#dropBelow(long)]); holding the publishing role.
     void dropRunViews(long oldestBound) {
         var current = run;
         if (current != null) {
             current.dropBelow(oldestBound);
+            var older = current.older();
+            if (older != null) {
+                older.dropBelow(oldestBound);
+            }
         }
     }
 
@@ -1078,12 +1104,24 @@ final class KeyspaceState {
         return correction;
     }
 
-    /// Releases the run of the writes the open replayed, once every reader's tree is at or above `cutBound`, the bound of
-    /// the checkpoint every reader's tree holds, and that tree holds the run; holding the publishing role.
+    /// Releases the run of the writes the open replayed, or a run of the bulk commits, once every reader's tree is at
+    /// or above `cutBound`, the bound of the checkpoint every reader's tree holds, and that tree holds the run; holding
+    /// the publishing role.
+    ///
+    /// The run beside the newest ([PackedRun#older()]) holds older writes, so it goes first, and the newest stays while
+    /// a reader's tree lacks it; once every reader's tree holds the newest, both go.
     void releaseRun(long cutBound) {
         var current = run;
-        if (current != null && cutBound >= current.maxStamp() && (current.committed() || replayed != UNCOUNTED)) {
+        if (current == null) {
+            return;
+        }
+        if (cutBound >= current.maxStamp() && (current.committed() || replayed != UNCOUNTED)) {
             run = null;
+            return;
+        }
+        var older = current.older();
+        if (older != null && cutBound >= older.maxStamp()) {
+            current.releaseOlder();
         }
     }
 

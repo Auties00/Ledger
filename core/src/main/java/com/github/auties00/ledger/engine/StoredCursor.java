@@ -3,8 +3,9 @@ package com.github.auties00.ledger.engine;
 import java.lang.foreign.MemorySegment;
 
 /// A scan's walk over the entries a read finds below memory, in the scan's range and order: those of its tree
-/// ([TreeCursor]), or those of the tree the store opened from with the writes the open replayed over them
-/// ([PackedRun.Cursor]).
+/// ([TreeCursor]), or those of a walk below with the entries of a run over them ([PackedRun.Cursor]): the tree the
+/// store opened from with the writes the open replayed, or a tree with the runs of the bulk commits it lacks, one
+/// cursor per run.
 sealed interface StoredCursor permits TreeCursor, PackedRun.Cursor {
     /// Moves to the next entry in the cursor's order.
     ///

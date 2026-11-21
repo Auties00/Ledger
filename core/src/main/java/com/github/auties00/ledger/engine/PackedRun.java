@@ -50,7 +50,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /// finds, a slot of the hash table naming an entry past the view's last being skipped, so it reads as of its sequence.
 /// The run is part of the tree of every reader at or after its first commit ([#minStamp()]) and of none before, until
 /// a checkpoint at or after its last commit takes it, which is one cut after the run was closed: no checkpoint takes
-/// part of a run. Its values lie where the batches put them, on the arrays the commits' versions would have sliced (its
+/// part of a run. While the latest tree still holds none of the key space's entries, the bulk commits after the cut
+/// start a second run beside the closed one ([#older()]), with none of its keys, so the commits that run while a
+/// checkpoint builds keep their puts in arrays too. Its values lie where the batches put them, on the arrays the commits' versions would have sliced (its
 /// homes), until the queue of values that may leave the heap moves them as it moves the values of versions ([#spill]):
 /// a value of at least [SpillQueue#LOG_VALUE_MIN] bytes to the log, a shorter one to a chunk of the run's own. Once no
 /// entry is on a home any more, the run lets go of it. The order of the keys of a view is made at the first scan, count
@@ -260,11 +262,30 @@ final class PackedRun {
         return storage.appendable;
     }
 
-    /// Closes the run to later bulk commits, which then keep their writes on chains until a checkpoint takes the run:
-    /// called by the cut of a checkpoint, holding the store's publishing role, which a bulk commit holds from before
-    /// it applies to after it publishes, so the checkpoint takes the newest view whole or none of the run.
+    /// Closes the run to later bulk commits, which then start a run beside it ([#older()]) or keep their writes on
+    /// chains, until a checkpoint takes the run: called by the cut of a checkpoint, holding the store's publishing role,
+    /// which a bulk commit holds from before it applies to after it publishes, so the checkpoint takes the newest view
+    /// whole or none of the run.
     void closeToAppends() {
         storage.appendable = false;
+    }
+
+    /// {@return the bulk commits' run a checkpoint's cut closed before the first commit of this one, which the readers
+    /// whose trees lack it read beside this run, or `null`: this run started with none beside it, or every reader's
+    /// tree holds that one}
+    ///
+    /// The two runs hold no key in common, as a bulk commit that finds a key in the older run puts it on a chain, and
+    /// every write of the older run is older than every write of this one. The older run is set before this run's first
+    /// view is published, so a reader that loads a view of this run finds it, and it is cleared only once every reader's
+    /// tree holds it ([#releaseOlder()]): a reader that finds it cleared reads a tree that holds it. Every view of this
+    /// run shares it.
+    PackedRun older() {
+        return storage.older;
+    }
+
+    /// Lets go of [#older()], which every reader's tree now holds; called holding the store's publishing role.
+    void releaseOlder() {
+        storage.older = null;
     }
 
     /// Lets go of the views older than the newest of this view and the ones before it whose commit is at or below
@@ -1556,6 +1577,20 @@ final class PackedRun {
             return new Builder(entries, keyBytes, true);
         }
 
+        /// {@return the builder of the run a bulk commit makes of its puts of new keys beside `older`, the newest view
+        /// of the key space's run a checkpoint's cut closed, as [#forCommit(int, long)] gives, whose views read `older`
+        /// as [PackedRun#older()]}
+        ///
+        /// The caller puts no key `older` holds in the new run.
+        static Builder beside(PackedRun older, int entries, long keyBytes) {
+            if (!older.committed || older.appendable()) {
+                throw new IllegalArgumentException("A run beside one no cut closed");
+            }
+            var builder = new Builder(entries, keyBytes, true);
+            builder.storage.older = older;
+            return builder;
+        }
+
         /// {@return the builder of a bulk commit that appends its puts of new keys to the run whose newest view is
         /// `view`, a bulk commit's run still [appendable][PackedRun#appendable()], with room for `planned` more entries
         /// of `keyBytes` bytes of keys in all}
@@ -2176,6 +2211,10 @@ final class PackedRun {
         volatile int[] slots;
         // Whether a later bulk commit may append to the run: set by the first, cleared by a checkpoint's cut
         volatile boolean appendable;
+        // The run a cut closed before this one's first commit, which readers whose trees lack it read beside this one;
+        // set before the first view is published, cleared holding the store's publishing role once every reader's tree
+        // holds it
+        volatile PackedRun older;
         // The entries, where the last key ends, and the homes, as the last commit to append left them
         int entries;
         int keyBytes;
@@ -2191,7 +2230,8 @@ final class PackedRun {
 
     /// A scan's walk over the entries of the tree the store opened from with the run over them: a key of the run takes
     /// the run's entry and shadows the tree's, a removal of the run hides the tree's entry, and the others are the
-    /// tree's.
+    /// tree's. The walk below it may be another run's over the tree, the older run a bulk commits' run was started
+    /// beside ([#older()]), whose keys it does not share.
     ///
     /// The scan applies the range removals since that tree to every entry it returns, those of the run included, as
     /// each removal it applies is newer than every entry of the run.
@@ -2203,7 +2243,7 @@ final class PackedRun {
         private final PackedRun run;
         // The run's entries in the order of their keys
         private final int[] order;
-        private final TreeCursor tree;
+        private final StoredCursor tree;
         private final boolean descending;
         // The positions of the key order in the range: from `first`, included, to `last`, excluded
         private final int first;
@@ -2221,7 +2261,7 @@ final class PackedRun {
 
         /// Creates the walk over the view's entries from `from`, included, to `to`, excluded, either `null` for no
         /// bound, merged over `tree`, a cursor of the same range and order, or none if `null`.
-        Cursor(PackedRun run, TreeCursor tree, MemorySegment from, MemorySegment to, boolean descending) {
+        Cursor(PackedRun run, StoredCursor tree, MemorySegment from, MemorySegment to, boolean descending) {
             this.run = run;
             this.order = run.order();
             this.tree = tree;

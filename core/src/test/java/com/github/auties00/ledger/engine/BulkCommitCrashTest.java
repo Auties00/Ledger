@@ -25,8 +25,9 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 /// Power loss at sampled forces of a workload past [LiveLedger#BULK_RUN_WRITES]: bulk commits appending to one run,
 /// their values moved to the log by the spill, beside large values, small overwrites and removals of the run's keys,
-/// a checkpoint and a reopen. The store recovers a state between its last durable and its last visible commit, keeps
-/// it through a checkpoint, and opens to it again.
+/// a checkpoint and a reopen, and in a second workload bulk commits during that checkpoint, which start a run beside the
+/// one its cut closed ([PackedRun#older()]). The store recovers a state between its last durable and its last visible
+/// commit, keeps it through a checkpoint, and opens to it again.
 class BulkCommitCrashTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.utf8());
@@ -56,14 +57,19 @@ class BulkCommitCrashTest {
 
     private static final class Workload {
         final boolean encrypted;
+        // Whether bulk commits run at the cut of the checkpoint of step 4
+        final boolean beside;
+        // The bulk commits that started or appended to a run beside a closed one
+        int besides;
         final List<Map<String, TreeMap<String, String>>> history = new ArrayList<>();
         final Map<String, TreeMap<String, String>> state = new TreeMap<>();
         int visible;
         int durable;
         int appended;
 
-        Workload(boolean encrypted) {
+        Workload(boolean encrypted, boolean beside) {
             this.encrypted = encrypted;
+            this.beside = beside;
             state.put(MESSAGES.name(), new TreeMap<>());
             state.put(CHATS.name(), new TreeMap<>());
             history.add(copy(state));
@@ -118,7 +124,16 @@ class BulkCommitCrashTest {
                     ledger.spills().drain(ledger.log()::durableSequence);
                     ledger.spills().awaitIdleForTests();
                     if (step == 4) {
-                        ledger.checkpoint();
+                        if (beside) {
+                            hookBulkCommits(ledger);
+                        }
+                        try {
+                            ledger.checkpoint();
+                        } finally {
+                            ledger.checkpointer().hookCutForTests(null);
+                        }
+                        // The commits at the cut are not the checkpoint's
+                        ledger.awaitDurable();
                         durable = visible;
                     } else if (step == 6) {
                         ledger.close();
@@ -138,6 +153,34 @@ class BulkCommitCrashTest {
                     }
                 }
             }
+        }
+
+        /// Makes the next checkpoint of `ledger` run two bulk commits at its cut, of new keys and of keys of the run
+        /// the cut closed, which go to chains; a commit the crash stops ends the hook, and the checkpoint then fails
+        /// on its own.
+        private void hookBulkCommits(LiveLedger ledger) {
+            ledger.checkpointer().hookCutForTests(() -> {
+                try {
+                    for (var commit = 0; commit < 2; commit++) {
+                        var batch = ledger.newBatch();
+                        var next = copy(state);
+                        for (var i = 0; i < BULK; i++) {
+                            var key = i % 10 == 0 ? "b04-%05d".formatted(i) : "y%02d-%05d".formatted(commit, i);
+                            var value = value(key, 50 + commit, LENGTHS[(i + commit) % LENGTHS.length]);
+                            batch.put(MESSAGES, key, value);
+                            next.get(MESSAGES.name()).put(key, value);
+                        }
+                        ledger.commit(batch);
+                        commit(next);
+                        var run = ledger.state(MESSAGES).run;
+                        if (run != null && run.older() != null) {
+                            besides++;
+                        }
+                    }
+                } catch (RuntimeException _) {
+                    // Stopped by the crash
+                }
+            });
         }
 
         private void commit(Map<String, TreeMap<String, String>> next) {
@@ -171,10 +214,22 @@ class BulkCommitCrashTest {
     @CsvSource({"true,0", "true,1", "false,0"})
     @DisplayName("recovers a state between the last durable and the last visible commit at sampled forces of a workload of appending bulk commits, spills and large values")
     void sampledForces(boolean encrypted, int part) throws Exception {
+        sampled(encrypted, part, false);
+    }
+
+    @ParameterizedTest(name = "encrypted {0}, part {1}")
+    @CsvSource({"true,0", "false,1"})
+    @DisplayName("recovers a state between the last durable and the last visible commit at sampled forces of a workload whose bulk commits during a checkpoint start a run beside the one its cut closed")
+    void sampledForcesBeside(boolean encrypted, int part) throws Exception {
+        sampled(encrypted, part, true);
+    }
+
+    private static void sampled(boolean encrypted, int part, boolean beside) throws Exception {
         var dry = CrashFileSystem.create();
-        var dryRun = new Workload(encrypted);
+        var dryRun = new Workload(encrypted, beside);
         dryRun.run(dry.getPath("/store"));
         assertTrue(dryRun.appended > 0, "no bulk commit appended");
+        assertTrue(!beside || dryRun.besides > 0, "no bulk commit started a run beside the closed one");
         var forces = dry.forces();
         var random = new Random(forces * 31 + part);
         var points = new ArrayList<Long>();
@@ -185,7 +240,7 @@ class BulkCommitCrashTest {
         for (var force : points) {
             var disk = CrashFileSystem.create();
             disk.stopAtForce(force);
-            var workload = new Workload(encrypted);
+            var workload = new Workload(encrypted, beside);
             workload.run(disk.getPath("/store"));
             var survivor = disk.afterPowerLoss(new Random(random.nextLong()));
             Map<String, TreeMap<String, String>> recovered;
