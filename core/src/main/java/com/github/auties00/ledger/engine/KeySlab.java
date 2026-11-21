@@ -6,7 +6,8 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
-/// The copies of the keys a key space's chains hold, packed into small shared arrays.
+/// The copies of the keys a key space's chains hold, or of the first keys of the leaves a checkpoint writes from a run,
+/// packed into small shared arrays.
 ///
 /// A key of at most [Chain#INLINE] bytes goes into the words of its chain instead, which a comparison reads without a
 /// load that waits for the chain's own. A holder that keeps such a key as a segment for as long as the slab's other
@@ -14,6 +15,10 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 /// chain enters it, and the update of a tree, with a slab of its own, for the entries it writes. A copy only a short
 /// lookup needs is made elsewhere ([Chain#key()]), since a copy here stays reachable while another copy in its chunk
 /// does: the copies of a key space's scans and removals would stay with its map's keys.
+///
+/// The update of a tree that writes a key space's first leaves from a run alone knows each leaf by a copy here of its
+/// first key ([#copy(MemorySegment)]), which the branch above takes once every leaf is written: a view of the leaf's own
+/// plaintext would keep the whole unit reachable, a page for a key of a few dozen bytes, until then.
 ///
 /// A key copied into an array of its own costs the array's header and, for the read-only view of it, a segment and a
 /// memory session of the segment's own: about a hundred bytes for a 16-byte key, on every key a commit writes. A copy
@@ -94,6 +99,26 @@ final class KeySlab {
             var start = (int) USED.getVolatile(chunk);
             if (start + length <= chunk.array.length && USED.compareAndSet(chunk, start, start + length)) {
                 chain.copyKey(chunk.array, start);
+                return chunk.view.asSlice(start, length);
+            }
+            stripe = retry(stripe, chunk, start, length);
+        }
+    }
+
+    /// {@return a read-only copy of `key`, which keeps nothing `key` is part of reachable}
+    ///
+    /// The copy is a span of a chunk; a key longer than a chunk takes gets an array of its own.
+    MemorySegment copy(MemorySegment key) {
+        var length = (int) key.byteSize();
+        if (length > LARGEST) {
+            return Segments.copy(key);
+        }
+        var stripe = contended ? stripe() : 0;
+        while (true) {
+            var chunk = room(stripe);
+            var start = (int) USED.getVolatile(chunk);
+            if (start + length <= chunk.array.length && USED.compareAndSet(chunk, start, start + length)) {
+                MemorySegment.copy(key, ValueLayout.JAVA_BYTE, 0, chunk.array, start, length);
                 return chunk.view.asSlice(start, length);
             }
             stripe = retry(stripe, chunk, start, length);
