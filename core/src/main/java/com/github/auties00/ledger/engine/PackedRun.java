@@ -365,6 +365,33 @@ final class PackedRun {
         return (long) WORDS.getAcquire(storage.words[entry >>> WORD_CHUNK_BITS], entry & WORD_MASK);
     }
 
+    /// {@return the bytes of the key of `entry`, without a view of it}
+    int keyLength(int entry) {
+        var storage = this.storage;
+        var layout = storage.layout;
+        if (layout != null) {
+            return layout.length();
+        }
+        var keyEnds = storage.keyEnds;
+        return keyEnds[entry] - keyStart(keyEnds, entry);
+    }
+
+    /// {@return the bytes of the value of `entry`, which puts its key, read off its word alone: the same wherever a
+    /// spill moves the value, as a spill keeps its length}
+    ///
+    /// Called only for an entry that puts its key: the word of a removal holds no length.
+    int valueLength(int entry) {
+        var value = word(entry);
+        // Tested first: a logged value's length may reach the bit of a value on a home
+        if ((value & LOGGED) != 0) {
+            return (int) ((value >>> 32) & LOGGED_LENGTH_MASK);
+        }
+        if ((value & HOME) != 0) {
+            return homeLength(value);
+        }
+        return (int) ((value >>> LENGTH_SHIFT) & LENGTH_MASK);
+    }
+
     /// {@return the key of `entry`, a read-only slice of the run's keys}
     MemorySegment key(int entry) {
         var storage = this.storage;

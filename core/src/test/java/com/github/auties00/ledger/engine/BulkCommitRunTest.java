@@ -210,6 +210,90 @@ class BulkCommitRunTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
+    @DisplayName("the checkpoint of a key space with no tree whose writes are a run alone, a bulk commit's or a replay's, writes its tree straight from the run, and merges states as before once a chain or a range removal since the tree joins the run, counting exactly either way")
+    void runTrees(boolean encrypted, @TempDir Path directory) throws Exception {
+        // Inline values, values at the log's threshold, and values that leaf entries hold in units of their own
+        int[] lengths = {0, 40, SpillQueue.LOG_VALUE_MIN, 700, 1_500, 3_000, 9_000};
+        var alone = new Expected();
+        try (var ledger = open(directory.resolve("alone"), encrypted, Long.MAX_VALUE)) {
+            var batch = ledger.newBatch();
+            puts(batch, alone, 0, BULK, 0, lengths);
+            ledger.commit(batch).awaitDurable();
+            assertTrue(ledger.state(MESSAGES).run.committed());
+            // Keys of one length: the run keeps no ends of its keys, and the first pass reads their length off its layout
+            assertEquals(Integer.BYTES, ledger.state(MESSAGES).run.keyLengthForTests());
+            var streamed = ledger.checkpointer().streamedForTests();
+            ledger.checkpoint();
+            assertEquals(streamed + 1, ledger.checkpointer().streamedForTests(), "the run's tree was not written from the run");
+            assertNull(ledger.state(MESSAGES).run, "the run outlived the checkpoint that took it");
+            verify(ledger, alone);
+        }
+        try (var ledger = open(directory.resolve("alone"), encrypted, Long.MAX_VALUE)) {
+            verify(ledger, alone);
+        }
+        CheckpointTest.verifyPages(directory.resolve("alone"), encrypted);
+        // A chain beside the run, and a range removal since the tree, take the merge
+        var chained = new Expected();
+        try (var ledger = open(directory.resolve("chained"), encrypted, Long.MAX_VALUE)) {
+            var batch = ledger.newBatch();
+            puts(batch, chained, 0, BULK, 0, lengths);
+            ledger.commit(batch).awaitDurable();
+            ledger.commit(ledger.newBatch().put(MESSAGES, key(BULK + 7), new byte[]{7})).awaitDurable();
+            chained.messages.put(BULK + 7, new byte[]{7});
+            assertEquals(1, ledger.state(MESSAGES).chains());
+            var streamed = ledger.checkpointer().streamedForTests();
+            ledger.checkpoint();
+            assertEquals(streamed, ledger.checkpointer().streamedForTests(), "a run with a chain beside it was written alone");
+            verify(ledger, chained);
+        }
+        var ranged = new Expected();
+        try (var ledger = open(directory.resolve("ranged"), encrypted, Long.MAX_VALUE)) {
+            var batch = ledger.newBatch();
+            puts(batch, ranged, 0, BULK, 0, lengths);
+            ledger.commit(batch).awaitDurable();
+            ledger.commit(ledger.newBatch().deleteRange(MESSAGES, KeyRange.between(key(100), key(400)))).awaitDurable();
+            ranged.messages.subMap(100, 400).clear();
+            var streamed = ledger.checkpointer().streamedForTests();
+            ledger.checkpoint();
+            assertEquals(streamed, ledger.checkpointer().streamedForTests(), "a run under a range removal was written alone");
+            verify(ledger, ranged);
+        }
+        // A replay's run, of puts and removals, of short values in chunks and longer ones left in the log, over no tree
+        var replayed = new Expected();
+        try (var ledger = open(directory.resolve("replayed"), encrypted, Long.MAX_VALUE)) {
+            for (var round = 0; round < 60; round++) {
+                var batch = ledger.newBatch();
+                puts(batch, replayed, round * 40, 40, round, lengths);
+                for (var message = round * 40 - 37; message > 0 && message < round * 40; message += 13) {
+                    batch.delete(MESSAGES, key(message));
+                    replayed.messages.remove(message);
+                }
+                ledger.commit(batch).awaitDurable();
+            }
+            ledger.closeWithoutCheckpoint();
+        }
+        // No budget kept on the heap, which would send the log's last writes to chains
+        try (var ledger = open(directory.resolve("replayed"), encrypted, 0)) {
+            var run = ledger.state(MESSAGES).run;
+            assertNotNull(run, "the replay made no run");
+            assertFalse(run.committed());
+            assertEquals(Integer.BYTES, run.keyLengthForTests(), "the replay's run keeps the ends of keys of one length");
+            assertEquals(0, ledger.state(MESSAGES).chains(), "a replayed write took a chain");
+            verify(ledger, replayed);
+            var streamed = ledger.checkpointer().streamedForTests();
+            ledger.checkpoint();
+            assertEquals(streamed + 1, ledger.checkpointer().streamedForTests(), "the replay's tree was not written from its run");
+            verify(ledger, replayed);
+        }
+        try (var ledger = open(directory.resolve("replayed"), encrypted, Long.MAX_VALUE)) {
+            assertNull(ledger.state(MESSAGES).run, "a clean open replayed writes");
+            verify(ledger, replayed);
+        }
+        CheckpointTest.verifyPages(directory.resolve("replayed"), encrypted);
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
     @DisplayName("a key the bulk commit writes again, removes, or gives a value the run cannot hold goes to a chain over the run's entry, counted exactly")
     void repeatedKeysInBulk(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();

@@ -7,13 +7,18 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.io.TempDir;
 
 import javax.crypto.spec.SecretKeySpec;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -23,17 +28,21 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The copy-on-write tree on its own, against a sorted map: random rounds of writes and range removals, with every
-/// freed page reused at once.
+/// freed page reused at once; and the first tree of a key space written straight from a run, against the tree the
+/// states of the run's entries write.
 class TreeUpdateTest {
     private static final java.util.Comparator<byte[]> UNSIGNED = Arrays::compareUnsigned;
 
@@ -236,6 +245,407 @@ class TreeUpdateTest {
                 // A close would wait for workers a failure of the timeout left stuck
                 workers.shutdownNow();
             }
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a tree written from a replay's run alone, of values in chunks and in the log, inline, at the inline bound and in units of many pages, empty values, removals and keys longer than a slab's chunk takes, is the tree the states of the run's entries write, unit for unit, past the bytes a writer queues before it flushes, and records the same settles")
+    void runTreeLayout(boolean encrypted, @TempDir Path directory) throws Exception {
+        var random = new Random(encrypted ? 53 : 59);
+        var writes = runWrites(random, 30_000, false);
+        var queued = 0L;
+        for (var write : writes) {
+            if (write.kind() != RunKind.REMOVED && !TreeNodes.LeafEntry.fitsInline(write.key().length, write.value().length)) {
+                queued += (long) PageFormat.pagesFor(write.value().length) * PageFormat.SIZE;
+            }
+        }
+        // More than the 8 MiB a writer queues before it flushes, in value units alone
+        assertTrue(queued > 8 << 20, "the value units take " + queued + " bytes");
+        try (var log = new Log(directory.resolve("1.log"))) {
+            var streamedRun = replayRun(writes, log);
+            var mergedRun = replayRun(writes, log);
+            log.write();
+            var streamed = layOut(directory.resolve("streamed"), encrypted, streamedRun, true, null);
+            var merged = layOut(directory.resolve("merged"), encrypted, mergedRun, false, null);
+            assertLaidAlike(merged, streamed);
+            assertArrayEquals(mergedRun.settles(), streamedRun.settles(), "the settles differ");
+            for (var position = 0; position < streamedRun.size(); position++) {
+                assertEquals(TreeSearch.ABSENT, streamedRun.settles()[streamedRun.entryAt(position)], "an entry is not settled");
+            }
+            assertEquals(mergedRun.correction(), streamedRun.correction());
+            verifyLaid(directory.resolve("streamed"), encrypted, streamed, writes, random);
+        }
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("a tree written from a bulk commit's run alone, of values on its homes, is the tree the states of the run's entries write, unit for unit, and records no settle")
+    void committedRunTreeLayout(boolean encrypted, @TempDir Path directory) throws Exception {
+        var random = new Random(encrypted ? 61 : 67);
+        var writes = runWrites(random, 30_000, true);
+        try (var log = new Log(directory.resolve("1.log"))) {
+            var streamedRun = committedRun(writes, log, null);
+            var mergedRun = committedRun(writes, log, null);
+            var streamed = layOut(directory.resolve("streamed"), encrypted, streamedRun, true, null);
+            var merged = layOut(directory.resolve("merged"), encrypted, mergedRun, false, null);
+            assertLaidAlike(merged, streamed);
+            for (var position = 0; position < streamedRun.size(); position++) {
+                assertEquals(TreeSearch.UNKNOWN, streamedRun.settles()[streamedRun.entryAt(position)], "a counted run was settled");
+            }
+            verifyLaid(directory.resolve("streamed"), encrypted, streamed, writes, random);
+        }
+    }
+
+    @Test
+    @DisplayName("values a spill moves off the homes of a bulk commit's run to the log and to chunks between the two passes of its tree are written where the states of the run's entries put them, and read back")
+    void spillBetweenRunPasses(@TempDir Path directory) throws Exception {
+        var random = new Random(71);
+        var writes = runWrites(random, 20_000, true);
+        try (var log = new Log(directory.resolve("1.log"))) {
+            var homes = new ArrayList<HomeValues>();
+            var streamedRun = committedRun(writes, log, homes);
+            var mergedRun = committedRun(writes, log, null);
+            log.write();
+            var moved = new int[2];
+            Consumer<int[]> spill = _ -> {
+                var sequence = 1L;
+                for (var home : homes) {
+                    var record = log.queue.record(sequence++, home.entries().size());
+                    record.locate(log.view, log.places.get(home.array()), 0, 0, false);
+                    var count = 0;
+                    var entries = new int[home.entries().size()];
+                    var offsets = new int[entries.length];
+                    var ops = new int[entries.length];
+                    // Every other value, so leaves hold values on homes, in chunks and in the log side by side
+                    for (var i = 0; i < entries.length; i += 2) {
+                        entries[count] = home.entries().get(i);
+                        offsets[count] = home.offsets().get(i);
+                        ops[count] = i;
+                        count++;
+                    }
+                    var crypto = log.queue.takeCrypto();
+                    try {
+                        var spilled = streamedRun.spill(crypto, record, entries, offsets, ops, count);
+                        moved[0] += spilled[0];
+                        moved[1] += spilled[1];
+                    } finally {
+                        log.queue.giveBack(crypto);
+                    }
+                }
+            };
+            var streamed = layOut(directory.resolve("streamed"), true, streamedRun, true, spill);
+            assertTrue(moved[0] > 0, "no value moved to the log");
+            assertTrue(moved[1] > 0, "no value moved to a chunk");
+            var merged = layOut(directory.resolve("merged"), true, mergedRun, false, null);
+            assertLaidAlike(merged, streamed);
+            verifyLaid(directory.resolve("streamed"), true, streamed, writes, random);
+        }
+    }
+
+    @Test
+    @DisplayName("an entry that takes other bytes than the first pass counted fails the tree before its leaf is written, with every page the update took listed for the checkpoint to give back")
+    void runTreeSizeMismatch(@TempDir Path directory) throws Exception {
+        var random = new Random(73);
+        var writes = runWrites(random, 20_000, false);
+        try (var log = new Log(directory.resolve("1.log"));
+             var pages = PageFile.open(directory, cipher(true), 1 << 20, new HeapPool(1 << 20))) {
+            var run = replayRun(writes, log);
+            log.write();
+            var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+            var writer = pages.writer(42);
+            var update = new TreeUpdate(pages, writer, space);
+            var corrupted = new AtomicInteger(-1);
+            update.passHookForTests(sizes -> {
+                // A put halfway through, so leaves before it are written and units queued
+                var put = writes.size() / 3;
+                sizes[put]++;
+                corrupted.set(put);
+            });
+            var failure = assertThrows(IllegalStateException.class, () -> update.applyRun(run));
+            assertTrue(failure.getMessage().contains("was counted as"), failure.getMessage());
+            assertTrue(corrupted.get() >= 0, "the hook did not run");
+            assertTrue(update.allocated().size() > 1, "no page was taken before the failure");
+            writer.discard();
+            for (var unit : update.allocated()) {
+                space.release(unit.page(), unit.pages());
+            }
+            for (var page = PageFormat.FIRST_UNIT_PAGE; page < space.pageCount(); page++) {
+                assertTrue(space.isUnused(page), "page " + page + " was taken and not listed");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("a run that only removes keys leaves a tree that held no key empty, settles every entry, and takes and writes no page")
+    void runTreeOfRemovals(@TempDir Path directory) throws Exception {
+        var writes = new ArrayList<RunWrite>();
+        for (var i = 0; i < 500; i++) {
+            writes.add(new RunWrite("k%04d".formatted(i).getBytes(), null, RunKind.REMOVED));
+        }
+        try (var log = new Log(directory.resolve("1.log"));
+             var pages = PageFile.open(directory, cipher(true), 1 << 20, new HeapPool(1 << 20))) {
+            var run = replayRun(writes, log);
+            var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+            var writer = pages.writer(3);
+            var update = new TreeUpdate(pages, writer, space);
+            assertNull(update.applyRun(run));
+            writer.flush();
+            assertTrue(update.allocated().isEmpty(), "pages taken: " + update.allocated());
+            assertEquals(PageFormat.FIRST_UNIT_PAGE, space.pageCount());
+            for (var entry = 0; entry < run.size(); entry++) {
+                assertEquals(TreeSearch.ABSENT, run.settles()[entry]);
+            }
+        }
+    }
+
+    /// How a run holds the value of a write.
+    private enum RunKind {
+        /// In a chunk of the replay.
+        CHUNK,
+        /// In the log.
+        LOGGED,
+        /// On a home of a bulk commit.
+        HOME,
+        /// No value: the write removes its key.
+        REMOVED
+    }
+
+    private record RunWrite(byte[] key, byte[] value, RunKind kind) {
+    }
+
+    /// The entries of a bulk commit's run whose values lie on `array`, and where.
+    private record HomeValues(byte[] array, List<Integer> entries, List<Integer> offsets) {
+    }
+
+    private record Laid(TreeRoot root, List<PageRef> allocated, int pageCount, byte[] file) {
+    }
+
+    /// {@return `count` writes of distinct keys of 1 to 40 bytes, one in a hundred up to [KeyCodec#MAX_LENGTH], in an
+    /// order other than the keys': empty values, values at both sides of the bound of an inline value, values of units
+    /// of many pages and short ones, on the homes of a bulk commit if `committed`, else in chunks, in the log or
+    /// removed}
+    private static List<RunWrite> runWrites(Random random, int count, boolean committed) {
+        var keys = new TreeMap<byte[], Boolean>(UNSIGNED);
+        while (keys.size() < count) {
+            var key = new byte[random.nextInt(100) == 0 ? 257 + random.nextInt(com.github.auties00.ledger.KeyCodec.MAX_LENGTH - 256)
+                    : 1 + random.nextInt(40)];
+            random.nextBytes(key);
+            keys.put(key, Boolean.TRUE);
+        }
+        var writes = new ArrayList<RunWrite>(count);
+        for (var key : keys.keySet()) {
+            // The longest value a leaf holds inline under this key
+            var inline = TreeNodes.MAX_ENTRY - (TreeNodes.SLOT + 2 + key.length + 1 + 2);
+            var length = switch (random.nextInt(30)) {
+                case 0 -> 2_500 + random.nextInt(24_000);
+                case 1 -> inline;
+                case 2 -> inline + 1;
+                case 3 -> 0;
+                case 4 -> SpillQueue.LOG_VALUE_MIN + random.nextInt(300);
+                default -> random.nextInt(SpillQueue.LOG_VALUE_MIN + 200);
+            };
+            var value = new byte[Math.max(0, length)];
+            random.nextBytes(value);
+            var kind = committed ? RunKind.HOME
+                    : random.nextInt(10) == 0 ? RunKind.REMOVED
+                    : value.length >= SpillQueue.LOG_VALUE_MIN && random.nextBoolean() ? RunKind.LOGGED : RunKind.CHUNK;
+            writes.add(new RunWrite(key, kind == RunKind.REMOVED ? null : value, kind));
+        }
+        Collections.shuffle(writes, random);
+        return writes;
+    }
+
+    /// {@return the run of a replay of `writes`, its values in chunks of 64 KiB or placed in `log`}
+    private static PackedRun replayRun(List<RunWrite> writes, Log log) {
+        var builder = new PackedRun.Builder();
+        byte[] chunk = null;
+        MemorySegment view = null;
+        var fill = 0;
+        var stamp = 1L;
+        for (var write : writes) {
+            var key = write.key();
+            var hash = Segments.hash(key, 0, key.length);
+            var value = write.value();
+            switch (write.kind()) {
+                case REMOVED -> builder.delete(key, 0, key.length, hash, stamp);
+                case LOGGED -> {
+                    var place = log.logValue(value, stamp);
+                    builder.putLogged(key, 0, key.length, hash, stamp, log.view, place.frameOffset(), place.bodyIndex(),
+                            place.tagHigh(), place.tagLow(), value.length);
+                }
+                case CHUNK -> {
+                    if (chunk == null || fill + value.length > chunk.length) {
+                        chunk = new byte[Math.max(64 << 10, value.length)];
+                        view = MemorySegment.ofArray(chunk).asReadOnly();
+                        fill = 0;
+                    }
+                    System.arraycopy(value, 0, chunk, fill, value.length);
+                    builder.put(key, 0, key.length, hash, stamp, view, fill, value.length);
+                    fill += value.length;
+                }
+                case HOME -> throw new IllegalArgumentException("A replay puts no value on a home");
+            }
+            stamp++;
+        }
+        return builder.build(null, null);
+    }
+
+    /// {@return the run of a bulk commit of `writes`, its values on homes of 64 KiB each placed in `log` as the body of
+    /// a frame of its own; the homes and their entries go to `homes` if it is not `null`}
+    private static PackedRun committedRun(List<RunWrite> writes, Log log, List<HomeValues> homes) {
+        var keyBytes = 0L;
+        for (var write : writes) {
+            keyBytes += write.key().length;
+        }
+        var builder = PackedRun.Builder.forCommit(writes.size(), keyBytes);
+        byte[] home = null;
+        MemorySegment view = null;
+        HomeValues values = null;
+        var fill = 0;
+        var stamp = 1L;
+        for (var write : writes) {
+            var key = MemorySegment.ofArray(write.key()).asReadOnly();
+            var value = write.value();
+            if (home == null || fill + value.length > home.length) {
+                home = new byte[Math.max(64 << 10, value.length)];
+                view = MemorySegment.ofArray(home).asReadOnly();
+                fill = 0;
+                log.reserve(home);
+                values = new HomeValues(home, new ArrayList<>(), new ArrayList<>());
+                if (homes != null) {
+                    homes.add(values);
+                }
+            }
+            System.arraycopy(value, 0, home, fill, value.length);
+            var entry = builder.putHome(key, Segments.hash(key), stamp++, view, fill, value.length);
+            values.entries().add(entry);
+            values.offsets().add(fill);
+            fill += value.length;
+        }
+        return builder.buildCommitted(null);
+    }
+
+    /// {@return the states of the entries of `run` in the order of their keys, as a checkpoint makes them of a run with
+    /// no chain and no range removed: the run's entry for a put, a state of no version for a removal}
+    private static List<TreeUpdate.Op> runOps(PackedRun run) {
+        var ops = new ArrayList<TreeUpdate.Op>(run.size());
+        for (var position = 0; position < run.size(); position++) {
+            var entry = run.entryAt(position);
+            ops.add(run.removes(entry) ? new TreeUpdate.Op(run, entry, null) : TreeUpdate.Op.ofRun(run, entry));
+        }
+        return ops;
+    }
+
+    /// {@return the tree `run` leaves in a new data file in `directory`, written straight from the run if `streamed`,
+    /// else from the states of its entries, with `between` run between the passes if it is not `null`}
+    private static Laid layOut(Path directory, boolean encrypted, PackedRun run, boolean streamed, Consumer<int[]> between)
+            throws Exception {
+        Files.createDirectories(directory);
+        TreeRoot root;
+        List<PageRef> allocated;
+        int pageCount;
+        try (var pages = PageFile.open(directory, cipher(encrypted), 1 << 20, new HeapPool(1 << 20))) {
+            var space = new FreeSpace(PageFormat.FIRST_UNIT_PAGE, new BitSet());
+            var writer = pages.writer(42);
+            var update = new TreeUpdate(pages, writer, space);
+            if (between != null) {
+                update.passHookForTests(between);
+            }
+            root = streamed ? update.applyRun(run) : update.apply(null, runOps(run), List.of());
+            writer.flush();
+            allocated = List.copyOf(update.allocated());
+            pageCount = space.pageCount();
+            assertTrue(update.freed().isEmpty() && update.freedExternal().isEmpty(), "a new tree freed a unit");
+            verifyNodes(pages, root);
+        }
+        return new Laid(root, allocated, pageCount, Files.readAllBytes(directory.resolve(PageFile.FILE)));
+    }
+
+    private static void assertLaidAlike(Laid merged, Laid streamed) {
+        assertEquals(merged.root(), streamed.root());
+        assertEquals(merged.allocated(), streamed.allocated(), "the pages taken, in order");
+        assertEquals(merged.pageCount(), streamed.pageCount());
+        assertEquals(merged.file().length, streamed.file().length, "the data files differ in length");
+        assertEquals(-1, Arrays.mismatch(merged.file(), streamed.file()), "the data files differ");
+    }
+
+    /// Checks the tree `laid` wrote in `directory` against the puts of `writes`.
+    private static void verifyLaid(Path directory, boolean encrypted, Laid laid, List<RunWrite> writes, Random random)
+            throws Exception {
+        var model = new TreeMap<byte[], byte[]>(UNSIGNED);
+        var keys = new ArrayList<byte[]>(writes.size());
+        for (var write : writes) {
+            keys.add(write.key());
+            if (write.kind() != RunKind.REMOVED) {
+                model.put(write.key(), write.value());
+            }
+        }
+        try (var pages = PageFile.open(directory, cipher(encrypted), 1 << 20, new HeapPool(1 << 20))) {
+            verify(pages, laid.root(), model, random, keys);
+            verifyNodes(pages, laid.root());
+        }
+    }
+
+    private static PageCipher cipher(boolean encrypted) {
+        return new PageCipher(encrypted ? new SecretKeySpec(new byte[32], "AES") : null);
+    }
+
+    /// A segment of a log without encryption that holds values, or homes of values, as the bodies of frames of their
+    /// own, from which runs read them back as a store's do once their values left the heap.
+    private static final class Log implements AutoCloseable {
+        private final Path path;
+        private final SpillQueue queue;
+        private final LogSegmentView view;
+        private final ByteArrayOutputStream bytes;
+        // Where each array's frame starts, by the array
+        private final IdentityHashMap<byte[], Long> places;
+        // The arrays placed whose bytes are written at write(), in the order they were placed
+        private final List<byte[]> reserved;
+
+        Log(Path path) {
+            this.path = path;
+            this.queue = new SpillQueue(0, false);
+            this.view = queue.segment(1, path, null);
+            this.bytes = new ByteArrayOutputStream();
+            this.places = new IdentityHashMap<>();
+            this.reserved = new ArrayList<>();
+        }
+
+        /// Gives `array` a frame of its own, whose body is the bytes the array holds when the log is written.
+        void reserve(byte[] array) {
+            places.put(array, (long) bytes.size());
+            reserved.add(array);
+            bytes.writeBytes(new byte[LogWriter.FRAME_HEADER + array.length]);
+        }
+
+        /// {@return the place of `value`, given a frame of its own at the first call, in the log, as a write stamped
+        /// `stamp` holds it}
+        LogValue logValue(byte[] value, long stamp) {
+            if (!places.containsKey(value)) {
+                reserve(value);
+            }
+            var crypto = queue.takeCrypto();
+            try {
+                return crypto.logValue(view, places.get(value), 0, stamp, value, 0, value.length);
+            } finally {
+                queue.giveBack(crypto);
+            }
+        }
+
+        /// Writes the frames placed to the segment's file.
+        void write() throws IOException {
+            var file = bytes.toByteArray();
+            for (var array : reserved) {
+                var at = places.get(array).intValue() + LogWriter.FRAME_HEADER;
+                System.arraycopy(array, 0, file, at, array.length);
+            }
+            Files.write(path, file);
+        }
+
+        @Override
+        public void close() {
+            view.retire();
         }
     }
 

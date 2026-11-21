@@ -11,6 +11,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.RecursiveTask;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 /// Applies the writes of one checkpoint to a key space's tree, copy on write.
 ///
@@ -19,6 +20,13 @@ import java.util.concurrent.atomic.AtomicReference;
 /// anew into free pages, so the tree before the update stays whole for its readers and for recovery. A subtree a
 /// removed range covers is dropped without being rewritten. A rewritten node left less than a quarter full merges with
 /// a neighbour when both fit in one node.
+///
+/// The first tree of a key space whose writes are a run's alone is written straight from the run's arrays
+/// ([#applyRun(PackedRun)]), in two passes over its key order: the units of the values no leaf holds inline first, then
+/// the leaves one at a time, each built from the run's entries it takes and dropped once written, and known to the level
+/// above by a copy of its first key. The data file gets the units the states of the run's entries would give it, unit
+/// for unit, while the update holds a few ints per entry rather than a state, an entry and views of the key and the value
+/// of each, and keeps no leaf's plaintext reachable through its first key until the branches above are written.
 ///
 /// A leaf below the root that the writes change by a little is written as a delta record of what changed since its
 /// base leaf ([DeltaLeaves]); one that changes more, splits, or falls under a quarter full is written whole.
@@ -68,9 +76,13 @@ final class TreeUpdate {
     private final DeltaLeaves.Packer packer;
     // The first failure of a task of this update or of the updates of its subtrees, which all share it
     private final AtomicReference<Throwable> failure;
-    // Where the update copies the keys of the entries it writes whose chains hold them in words of their own: a view
-    // of a shared chunk costs a written key less than an array, a view and a memory session of its own
+    // Where the update copies the keys of the entries it writes whose chains hold them in words of their own, and the
+    // first keys of the leaves it writes from a run alone: a view of a shared chunk costs a key less than an array, a
+    // view and a memory session of its own
     private final KeySlab keys;
+    // Run with the sizes the first pass of the next tree written from a run alone counted, between its two passes, or
+    // null; for tests
+    private Consumer<int[]> passHookForTests;
     // The delta page the leaf of a record was last made from, which that read did not cache, and its reference: writing
     // the record anew reads the page again, and so do the records of the neighbouring leaves, which share it
     private byte[] deltaPage;
@@ -321,6 +333,116 @@ final class TreeUpdate {
                 }
             }
         }
+        return root(result);
+    }
+
+    /// {@return the root of the tree of a key space that held no key, after the writes of `run` alone, or `null` if the
+    /// run puts no key}
+    ///
+    /// It writes what [#apply(TreeRoot, List, List)] writes for the states of the run's entries in key order, a put's
+    /// state the run's entry itself ([Op#ofRun(PackedRun, int)]), over no tree and with no range removed: the same units,
+    /// on the same pages, under the same nonces, in the same order. As the merge does, it records that the tree held
+    /// none of the run's keys ([PackedRun#settles()]), unless the run's commits counted them ([PackedRun#committed()]).
+    ///
+    /// The first pass, over the run in key order, sizes the leaf entry of each put from the lengths of its key and its
+    /// value, read off the run's arrays, and queues a unit for each value no leaf holds inline, on pages it takes then.
+    /// The second splits the entries by those sizes, then builds and writes the leaves one at a time, each leaf's entries
+    /// made then and dropped once it is written. A spill between the passes moves a value without changing its length, so
+    /// it changes no size: the second pass reads each inline value where the run holds it then, or from the log into the
+    /// leaf.
+    ///
+    /// @throws IllegalStateException if an entry takes other bytes than the first pass counted, which would let a leaf
+    ///                               pass its capacity; nothing of its leaf is written then, and every page taken is in
+    ///                               [#allocated()]
+    TreeRoot applyRun(PackedRun run) throws IOException {
+        var size = run.size();
+        // Per put, in key order: its entry in the run, and the bytes its leaf entry takes
+        var puts = new int[size];
+        var sizes = new int[size];
+        // The unit of each put's value queued by the first pass, by put, made at the first
+        PageRef[] units = null;
+        // A bulk commit's run counted its puts as it applied them, so nothing is recorded for it
+        var settles = run.committed() ? null : run.settles();
+        var count = 0;
+        for (var position = 0; position < size; position++) {
+            var entry = run.entryAt(position);
+            if (settles != null) {
+                PackedRun.settle(settles, entry, false);
+            }
+            if (run.removes(entry)) {
+                continue;
+            }
+            var keyLength = run.keyLength(entry);
+            var length = run.valueLength(entry);
+            var outOfLine = !LeafEntry.fitsInline(keyLength, length);
+            if (outOfLine) {
+                if (units == null) {
+                    units = new PageRef[size];
+                }
+                var unitPages = PageFormat.pagesFor(length);
+                var page = allocate(unitPages);
+                // The writer builds the unit from the log or from the value only when it seals it; a value in the log
+                // stays there
+                units[count] = run.loggedLength(entry) >= 0 ? writer.writeLoggedValue(page, unitPages, run.version(entry))
+                        : writer.writeValue(page, unitPages, run.value(entry));
+            }
+            puts[count] = entry;
+            sizes[count++] = LeafEntry.size(keyLength, length, outOfLine);
+        }
+        if (count == 0) {
+            return null;
+        }
+        var hook = passHookForTests;
+        if (hook != null) {
+            passHookForTests = null;
+            hook.accept(sizes);
+        }
+        var leaves = TreeNodes.split(sizes, count);
+        var written = new ArrayList<Child>(leaves.size());
+        var entries = new ArrayList<LeafEntry>();
+        for (var leaf : leaves) {
+            for (var i = leaf[0]; i < leaf[1]; i++) {
+                var entry = streamedEntry(run, puts[i], units == null ? null : units[i]);
+                if (entry.size() != sizes[i]) {
+                    throw new IllegalStateException("An entry of " + entry.size() + " bytes was counted as " + sizes[i]);
+                }
+                entries.add(entry);
+            }
+            // Copied from the run's key, not viewed in the leaf: the view would keep the leaf's plaintext reachable
+            var firstKey = keys.copy(entries.getFirst().key());
+            written.add(writeLeaf(entries, 0, entries.size(), TreeNodes.fill(sizes, leaf[0], leaf[1]), Replaced.NONE, firstKey));
+            entries.clear();
+        }
+        return root(written);
+    }
+
+    /// Runs `hook` once, with the sizes the first pass counted, between the two passes of the next tree written from a
+    /// run alone ([#applyRun(PackedRun)]), after the value units are queued and before the first leaf is built.
+    void passHookForTests(Consumer<int[]> hook) {
+        this.passHookForTests = hook;
+    }
+
+    /// {@return the leaf entry of `entry` of `run`, which puts its key, in the tree [#applyRun(PackedRun)] writes: its
+    /// value in `unit`, if not `null`, else inline, read from the log into the leaf or viewed where the run holds it now}
+    private static LeafEntry streamedEntry(PackedRun run, int entry, PageRef unit) {
+        var key = run.key(entry);
+        if (unit != null) {
+            return new LeafEntry(key, null, unit, run.valueLength(entry));
+        }
+        // A value in the log stays there; one elsewhere may move to the log meanwhile, and is then read back from it
+        var logged = run.loggedLength(entry);
+        if (logged >= 0) {
+            return new LeafEntry(key, new PackedRun.LoggedEntry(run, entry), null, logged);
+        }
+        var value = run.value(entry);
+        return new LeafEntry(key, value, null, (int) value.byteSize());
+    }
+
+    /// {@return the root of the tree whose top level, written by the update, is `result`, or `null` if it is empty}
+    ///
+    /// The nodes of `result` under a quarter full merge with a neighbour, and branches are written over them until one
+    /// node is left; a root with one child gives way to the child, and a delta record left at the top is written whole.
+    private TreeRoot root(List<Child> result) throws IOException {
         mergeUnderfull(result);
         while (true) {
             while (result.size() > 1) {
@@ -1101,24 +1223,31 @@ final class TreeUpdate {
     private List<Child> writeLeaves(List<LeafEntry> entries, int[] sizes, List<int[]> runs, Replaced replaced) throws IOException {
         var out = new ArrayList<Child>(runs.size());
         for (var run : runs) {
-            var page = allocate(1);
-            var unit = TreeNodes.writeLeaf(entries, run[0], run[1]);
-            var blobs = false;
-            for (var i = run[0]; i < run[1]; i++) {
-                blobs |= entries.get(i).blob() != null;
-            }
-            var admitted = writer.admits(unit.length, !writer.saturated() && replaced.read(pages, run[0], run[1]));
-            var ref = writer.write(PageFormat.LEAF, 0, page, 1, unit, unit.length - PageFormat.HEADER, admitted);
-            if (!admitted) {
-                var reads = replaced.reads(pages, run[0], run[1]);
-                if (reads > 0) {
-                    pages.expect(ref, reads);
-                }
-            }
-            out.add(new Child(TreeNodes.leafKey(unit, TreeNodes.entry(unit, 0)), ref, run[1] - run[0], blobs, 0,
-                    TreeNodes.fill(sizes, run[0], run[1])));
+            out.add(writeLeaf(entries, run[0], run[1], TreeNodes.fill(sizes, run[0], run[1]), replaced, null));
         }
         return out;
+    }
+
+    /// {@return the leaf written of `entries` from `from` to `to`, which take `fill` bytes and replace the leaves of
+    /// `replaced`, known above by `firstKey`, or by a view of the leaf's own first key if `null`}
+    private Child writeLeaf(List<LeafEntry> entries, int from, int to, int fill, Replaced replaced,
+                            MemorySegment firstKey) throws IOException {
+        var page = allocate(1);
+        var unit = TreeNodes.writeLeaf(entries, from, to);
+        var blobs = false;
+        for (var i = from; i < to; i++) {
+            blobs |= entries.get(i).blob() != null;
+        }
+        var admitted = writer.admits(unit.length, !writer.saturated() && replaced.read(pages, from, to));
+        var ref = writer.write(PageFormat.LEAF, 0, page, 1, unit, unit.length - PageFormat.HEADER, admitted);
+        if (!admitted) {
+            var reads = replaced.reads(pages, from, to);
+            if (reads > 0) {
+                pages.expect(ref, reads);
+            }
+        }
+        var key = firstKey != null ? firstKey : TreeNodes.leafKey(unit, TreeNodes.entry(unit, 0));
+        return new Child(key, ref, to - from, blobs, 0, fill);
     }
 
     /// {@return the branches written of `children`, which replace the branches of `replaced`}

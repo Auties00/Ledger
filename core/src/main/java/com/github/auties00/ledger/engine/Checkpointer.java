@@ -90,6 +90,8 @@ final class Checkpointer implements IdleTicker.Watched {
     // What a checkpoint runs once it cut its commits, before it builds its trees, or null; for tests that commit there.
     // Plain: set before the checkpoints start
     private Runnable cutHookForTests;
+    // The trees the checkpoints wrote straight from a run, for tests; written holding the lock
+    private volatile int streamed;
     private final AtomicBoolean scheduled;
     // Whether a thread is finishing the sweep of the store
     private final AtomicBoolean sweeping;
@@ -286,6 +288,12 @@ final class Checkpointer implements IdleTicker.Watched {
     /// Runs `hook` in each checkpoint once it cut its commits, before it builds its trees; for tests that commit there.
     void hookCutForTests(Runnable hook) {
         this.cutHookForTests = hook;
+    }
+
+    /// {@return the trees of key spaces the checkpoints wrote straight from a run ([TreeUpdate#applyRun(PackedRun)]),
+    /// those of checkpoints that failed included; for tests}
+    int streamedForTests() {
+        return streamed;
     }
 
     /// {@return whether a checkpoint started on a thread of its own has not ended; for tests}
@@ -656,6 +664,11 @@ final class Checkpointer implements IdleTicker.Watched {
     /// counted it. Its cut closed the run to appends ([PackedRun#closeToAppends()]), so that view is at or below the
     /// cut.
     ///
+    /// A key space with no tree yet whose writes up to the cut are a run's alone, with no chain and no range removed
+    /// since, gets its tree written straight from the run ([TreeUpdate#applyRun(PackedRun)]): the first checkpoint after
+    /// a bulk load, or after the open of a store that crashed before its first checkpoint. It writes the tree the states
+    /// of the run's entries would give, without holding one per entry.
+    ///
     /// @param adopted receives the units of the file of large values the trees take
     private TreeRoot[] build(LiveLedger.Cut cut, TreeUpdate update, Set<PageRef> adopted) throws IOException {
         var roots = cut.base() == null ? new TreeRoot[cut.maxId() + 1] : cut.base().roots(cut.maxId() + 1);
@@ -675,84 +688,32 @@ final class Checkpointer implements IdleTicker.Watched {
             if (run != null && run.maxStamp() > bound) {
                 throw new IllegalStateException("A run of " + state.keyspace.name() + " holds writes on both sides of the cut");
             }
-            var runEntries = run == null ? 0 : run.size();
             if (run != null) {
                 // The homes a bulk commit's run let go of for its value frames, read back at once rather than one at a
                 // time as the merge reaches them
                 run.readBackHomes();
             }
-            var ops = new ArrayList<TreeUpdate.Op>(chains.length + runEntries);
             var removals = keyspace.removals();
-            // The next entry of the run in the order of the keys, or -1 past the last, compared with the chains in the
-            // run's arrays: the states of the run's keys hold the run, not a chain and a view of each key
-            var position = 0;
-            var next = runEntries == 0 ? -1 : run.entryAt(0);
-            Chain previous = null;
-            for (var chain : chains) {
-                if (previous != null && Chain.sameKey(previous, chain)) {
-                    continue;
-                }
-                previous = chain;
-                // The run's entries of the keys before the chain's go first; one of the chain's key goes with the chain
-                var entry = -1;
-                while (next >= 0) {
-                    var order = run.compareChain(chain, next);
-                    if (order < 0) {
-                        break;
-                    }
-                    var taken = next;
-                    position++;
-                    next = position < runEntries ? run.entryAt(position) : -1;
-                    if (order == 0) {
-                        entry = taken;
-                        break;
-                    }
-                    ops.add(runOp(run, taken, removals, treeBound, bound));
-                }
-                // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
-                // otherwise another one, or none
-                var current = chain.released() ? state.chain(chain.key()) : chain;
-                // The key, a segment of its own, only for the range removals to cover
-                var key = removals.length == 0 ? null : chain.key();
-                var version = KeyspaceState.resolve(current == null ? null : current.head, key, bound, removals);
-                if (version == null && !state.resident) {
-                    // No version at the cut in a paged key space: a commit that wrote the key rolled back, so the
-                    // tree is right, with the run's entry if it has one. A resident one holds every entry, so there the
-                    // key is gone
-                    if (entry >= 0) {
-                        ops.add(runOp(run, entry, removals, treeBound, bound));
-                    }
-                    continue;
-                }
-                // A blind write the cut takes, the chain's first and so at or below the cut, which sees a version of it:
-                // the leaf the update merges tells whether the tree held the key
-                var blind = current != null && current.blindState() == TreeSearch.UNKNOWN ? current : null;
-                if (version == null || version == Version.HIDDEN) {
-                    ops.add(new TreeUpdate.Op(chain, null, blind, run, entry));
-                } else {
-                    ops.add(new TreeUpdate.Op(chain, version, blind, run, entry));
-                    var external = version.external();
-                    if (external != null) {
-                        adopted.add(external);
-                    }
-                }
-            }
-            while (next >= 0) {
-                ops.add(runOp(run, next, removals, treeBound, bound));
-                position++;
-                next = position < runEntries ? run.entryAt(position) : -1;
-            }
-            var ranges = new ArrayList<TreeUpdate.Range>();
-            for (var removal : keyspace.removals()) {
-                if (removal.stamp() > treeBound && removal.stamp() <= bound) {
-                    ranges.add(new TreeUpdate.Range(removal.from(), removal.to()));
-                }
-            }
-            // Counted here, on the trees their reads keep, the range removals up to the cut whose count is not known
-            // yet: one that fails fails the checkpoint with its own failure
-            var pendingRanges = state.ranges.correction(cut.sequence());
             var base = roots[state.id];
-            var root = update.apply(base, ops, TreeUpdate.merge(ranges));
+            TreeRoot root;
+            long pendingRanges;
+            if (run != null && chains.length == 0 && base == null && !removedSince(removals, treeBound, bound)) {
+                pendingRanges = state.ranges.correction(cut.sequence());
+                root = update.applyRun(run);
+                streamed = streamed + 1;
+            } else {
+                var ops = ops(state, chains, run, removals, treeBound, bound, adopted);
+                var ranges = new ArrayList<TreeUpdate.Range>();
+                for (var removal : removals) {
+                    if (removal.stamp() > treeBound && removal.stamp() <= bound) {
+                        ranges.add(new TreeUpdate.Range(removal.from(), removal.to()));
+                    }
+                }
+                // Counted here, on the trees their reads keep, the range removals up to the cut whose count is not
+                // known yet: one that fails fails the checkpoint with its own failure
+                pendingRanges = state.ranges.correction(cut.sequence());
+                root = update.apply(base, ops, TreeUpdate.merge(ranges));
+            }
             // The update settled the blind writes up to the cut but those of keys it skipped, looked up here, in the run
             // first: its writes are older than the blind ones of its keys
             var merged = run;
@@ -773,6 +734,88 @@ final class Checkpointer implements IdleTicker.Watched {
             roots[state.id] = root;
         }
         return roots;
+    }
+
+    /// {@return whether a range removal of `removals` is newer than the trees `treeBound` holds and within `bound`}
+    private static boolean removedSince(RangeRemoval[] removals, long treeBound, long bound) {
+        for (var removal : removals) {
+            if (removal.stamp() > treeBound && removal.stamp() <= bound) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// {@return the states as of the cut of the keys of the key space of `state` written since the trees `treeBound`
+    /// holds, in key order: those of `chains`, sorted, and the entries of `run`, or `null`, the version of a key at
+    /// `bound` winning over the run's entry}
+    ///
+    /// @param removals the range removals of the key space
+    /// @param adopted receives the units of the file of large values the states take
+    private static List<TreeUpdate.Op> ops(KeyspaceState state, Chain[] chains, PackedRun run, RangeRemoval[] removals,
+                                           long treeBound, long bound, Set<PageRef> adopted) {
+        var runEntries = run == null ? 0 : run.size();
+        var ops = new ArrayList<TreeUpdate.Op>(chains.length + runEntries);
+        // The next entry of the run in the order of the keys, or -1 past the last, compared with the chains in the
+        // run's arrays: the states of the run's keys hold the run, not a chain and a view of each key
+        var position = 0;
+        var next = runEntries == 0 ? -1 : run.entryAt(0);
+        Chain previous = null;
+        for (var chain : chains) {
+            if (previous != null && Chain.sameKey(previous, chain)) {
+                continue;
+            }
+            previous = chain;
+            // The run's entries of the keys before the chain's go first; one of the chain's key goes with the chain
+            var entry = -1;
+            while (next >= 0) {
+                var order = run.compareChain(chain, next);
+                if (order < 0) {
+                    break;
+                }
+                var taken = next;
+                position++;
+                next = position < runEntries ? run.entryAt(position) : -1;
+                if (order == 0) {
+                    entry = taken;
+                    break;
+                }
+                ops.add(runOp(run, taken, removals, treeBound, bound));
+            }
+            // The key's chain now: this one until it is dropped, as a key gets a new chain only once its chain is;
+            // otherwise another one, or none
+            var current = chain.released() ? state.chain(chain.key()) : chain;
+            // The key, a segment of its own, only for the range removals to cover
+            var key = removals.length == 0 ? null : chain.key();
+            var version = KeyspaceState.resolve(current == null ? null : current.head, key, bound, removals);
+            if (version == null && !state.resident) {
+                // No version at the cut in a paged key space: a commit that wrote the key rolled back, so the
+                // tree is right, with the run's entry if it has one. A resident one holds every entry, so there the
+                // key is gone
+                if (entry >= 0) {
+                    ops.add(runOp(run, entry, removals, treeBound, bound));
+                }
+                continue;
+            }
+            // A blind write the cut takes, the chain's first and so at or below the cut, which sees a version of it:
+            // the leaf the update merges tells whether the tree held the key
+            var blind = current != null && current.blindState() == TreeSearch.UNKNOWN ? current : null;
+            if (version == null || version == Version.HIDDEN) {
+                ops.add(new TreeUpdate.Op(chain, null, blind, run, entry));
+            } else {
+                ops.add(new TreeUpdate.Op(chain, version, blind, run, entry));
+                var external = version.external();
+                if (external != null) {
+                    adopted.add(external);
+                }
+            }
+        }
+        while (next >= 0) {
+            ops.add(runOp(run, next, removals, treeBound, bound));
+            position++;
+            next = position < runEntries ? run.entryAt(position) : -1;
+        }
+        return ops;
     }
 
     /// {@return the state of the key of `entry` of `run` as of the cut: the run's put ([TreeUpdate.Op#ofRun(PackedRun, int)]),
