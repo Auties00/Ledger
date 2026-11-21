@@ -6,6 +6,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -22,7 +24,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// A unit sealed a part at a time, the cipher reading its content in place, against the same unit sealed whole, and the
-/// units of the file of large values whose tag follows their content, which only the streamed seal makes.
+/// units of the file of large values whose tag follows their content or that are sealed as records, which only the
+/// streamed seal makes.
 class PageCipherTest {
     private static final SecretKeySpec KEY = new SecretKeySpec(new byte[32], "AES");
 
@@ -226,5 +229,159 @@ class PageCipherTest {
         var tampered = parts.toByteArray();
         tampered[PageFormat.HEADER + length / 2] ^= 1;
         assertFalse(cipher.open(tampered, 0, pages, opened));
+    }
+
+    static Stream<Arguments> recordUnits() {
+        var first = PageFormat.FIRST_RECORD_CONTENT;
+        var record = PageFormat.RECORD_CONTENT;
+        // One record, one record and a byte, two whole records, a last record that ends on a page, four records
+        var lengths = new int[]{0, 1, first - 1, first, first + 1, record, record + 1, first + record, first + record + 1,
+                first + record + PageFormat.SIZE - PageFormat.TAG, first + 2 * record, first + 2 * record + 1_000, (3 << 20) + 5};
+        return Arrays.stream(lengths).boxed().flatMap(length -> Stream.of(true, false).map(cold -> Arguments.of(length, cold)));
+    }
+
+    @ParameterizedTest(name = "{0} bytes, cold: {1}")
+    @MethodSource("recordUnits")
+    @DisplayName("a unit of records seals each record as its own message under the unit's nonce with its index in the top bits, one write per record with zeros after the last, opens record by record and fails once a record, a tag, the header or the order changes")
+    void sealsRecords(int length, boolean cold) throws Exception {
+        var before = cold ? Sealing.coldLeftForTests(Sealing.COLD_BYTES) : -1;
+        try {
+            var cipher = new PageCipher(KEY);
+            var pages = PageFormat.pagesFor(PageFormat.RECORDS, length);
+            var content = new byte[length + 7];
+            new Random(length).nextBytes(content);
+            var header = new byte[PageFormat.HEADER];
+            PageFile.header(header, PageFormat.EXTERNAL, 0, 5, pages, length, 77L, 9);
+            header[PageFormat.FORMAT] = PageFormat.RECORDS;
+
+            var parts = new ByteArrayOutputStream();
+            var writes = new ArrayList<Integer>();
+            var buffer = new byte[PageFormat.RECORD];
+            // What the buffer held before must not reach the unit
+            Arrays.fill(buffer, (byte) 0x5A);
+            cipher.seal(header, content, 7, length, pages, buffer, (bytes, count) -> {
+                writes.add(count);
+                parts.write(bytes, 0, count);
+            });
+            var unit = parts.toByteArray();
+            var records = PageFormat.records(length);
+            assertEquals(pages * PageFormat.SIZE, unit.length);
+            assertEquals(records, writes.size(), "one write per record");
+            assertArrayEquals(header, Arrays.copyOf(unit, PageFormat.HEADER));
+            var end = (int) PageFormat.sealedLength(PageFormat.RECORDS, length);
+            assertArrayEquals(new byte[unit.length - end], Arrays.copyOfRange(unit, end, unit.length), "a byte after the last tag");
+            for (var i = 1; i < records; i++) {
+                assertEquals(i * PageFormat.RECORD, (int) PageFormat.recordPosition(i));
+                assertEquals(0, PageFormat.recordPosition(i) % PageFormat.SIZE, "record " + i + " starts off a page");
+            }
+
+            // Each record is the message AES-GCM makes of its content under the unit's nonce with the record's index
+            // in the top 16 bits of its first 8 bytes, with the header as additional data
+            var plain = new byte[PageFormat.HEADER + length];
+            System.arraycopy(header, 0, plain, 0, PageFormat.HEADER);
+            try (var opener = cipher.records()) {
+                for (var i = 0; i < records; i++) {
+                    var at = (int) PageFormat.recordPosition(i);
+                    var recordLength = PageFormat.recordLength(i, length);
+                    var nonce = Arrays.copyOfRange(header, PageFormat.NONCE, PageFormat.NONCE + 12);
+                    Bytes.i64(nonce, 0, 77L | (long) i << 48);
+                    var reference = Cipher.getInstance("AES/GCM/NoPadding");
+                    reference.init(Cipher.ENCRYPT_MODE, KEY, new GCMParameterSpec(128, nonce));
+                    reference.updateAAD(header);
+                    var expected = reference.doFinal(content, 7 + PageFormat.recordContent(i), recordLength);
+                    assertArrayEquals(expected, Arrays.copyOfRange(unit, at, at + recordLength + PageFormat.TAG), "record " + i);
+                    assertTrue(opener.open(header, i, unit, at, recordLength, plain, PageFormat.HEADER + PageFormat.recordContent(i)));
+                    if (records > 1) {
+                        assertFalse(opener.open(header, (i + 1) % records, unit, at, recordLength, new byte[recordLength], 0),
+                                "record " + i + " opened at another index");
+                    }
+                    var tampered = unit.clone();
+                    tampered[at + recordLength + PageFormat.TAG / 2] ^= 1;
+                    assertFalse(opener.open(header, i, tampered, at, recordLength, new byte[recordLength], 0), "the tag of record " + i);
+                    if (recordLength > 0) {
+                        tampered = unit.clone();
+                        tampered[at + recordLength / 2] ^= 1;
+                        assertFalse(opener.open(header, i, tampered, at, recordLength, new byte[recordLength], 0), "the content of record " + i);
+                    }
+                    // A record cut short of its last byte
+                    if (recordLength > 0) {
+                        assertFalse(opener.open(header, i, unit, at, recordLength - 1, new byte[recordLength], 0), "record " + i + " cut short");
+                    }
+                }
+                assertArrayEquals(Arrays.copyOfRange(content, 7, 7 + length), Arrays.copyOfRange(plain, PageFormat.HEADER, plain.length));
+                // Two whole records swapped
+                if (records >= 4) {
+                    var swapped = unit.clone();
+                    System.arraycopy(unit, PageFormat.RECORD, swapped, 2 * PageFormat.RECORD, PageFormat.RECORD);
+                    System.arraycopy(unit, 2 * PageFormat.RECORD, swapped, PageFormat.RECORD, PageFormat.RECORD);
+                    assertFalse(opener.open(header, 1, swapped, PageFormat.RECORD, PageFormat.RECORD_CONTENT, new byte[PageFormat.RECORD], 0));
+                    assertFalse(opener.open(header, 2, swapped, 2 * PageFormat.RECORD, PageFormat.RECORD_CONTENT, new byte[PageFormat.RECORD], 0));
+                }
+                // Another header: a changed byte, the length, another format, a nonce with bits in the index's place
+                var changed = new ArrayList<byte[]>();
+                for (var at : new int[]{3, PageFormat.LENGTH + 3, PageFormat.PAGES + 3, PageFormat.NONCE + 11}) {
+                    var other = header.clone();
+                    other[at] ^= 1;
+                    changed.add(other);
+                }
+                for (var format : new byte[]{PageFormat.VERSION, PageFormat.CLOSE_TAG}) {
+                    var other = header.clone();
+                    other[PageFormat.FORMAT] = format;
+                    changed.add(other);
+                }
+                var high = header.clone();
+                Bytes.i64(high, PageFormat.NONCE, 77L | 1L << 48);
+                changed.add(high);
+                var first = PageFormat.recordLength(0, length);
+                for (var other : changed) {
+                    assertFalse(opener.open(other, 0, unit, PageFormat.HEADER, first, new byte[first], 0));
+                }
+            }
+            // Neither the whole-unit opens nor the seals of whole units take a unit of this format
+            assertFalse(cipher.open(unit, 0, pages, new byte[unit.length]));
+            assertFalse(cipher.openContent(unit, 0, length, new byte[length], 0));
+            assertThrows(IllegalArgumentException.class, () -> new PageCipher(KEY).seal(unit.clone(), pages));
+            var otherFormat = unit.clone();
+            otherFormat[PageFormat.FORMAT] = PageFormat.CLOSE_TAG;
+            assertFalse(cipher.openContent(otherFormat, 0, length, new byte[length], 0));
+            otherFormat[PageFormat.FORMAT] = PageFormat.VERSION;
+            assertFalse(cipher.open(otherFormat, 0, pages, new byte[unit.length]));
+        } finally {
+            if (cold) {
+                Sealing.coldLeftForTests(before);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("a unit of records needs a store that encrypts, a nonce below 2^48, a buffer of a record and pages that hold its records")
+    void recordsRefused() {
+        var length = PageFormat.FIRST_RECORD_CONTENT + 100;
+        var pages = PageFormat.pagesFor(PageFormat.RECORDS, length);
+        var header = new byte[PageFormat.HEADER];
+        PageFile.header(header, PageFormat.EXTERNAL, 0, 5, pages, length, 77L, 9);
+        header[PageFormat.FORMAT] = PageFormat.RECORDS;
+        var content = new byte[length];
+        PageCipher.Output discard = (_, _) -> {
+        };
+        assertThrows(IllegalArgumentException.class, () -> new PageCipher(null).seal(header, content, 0, length, pages, new byte[PageFormat.RECORD], discard));
+        assertThrows(IllegalStateException.class, () -> new PageCipher(null).records());
+        assertThrows(IllegalArgumentException.class, () -> new PageCipher(KEY).seal(header, content, 0, length, pages, new byte[PageFormat.RECORD - 1], discard));
+        assertThrows(IllegalArgumentException.class, () -> new PageCipher(KEY).seal(header, content, 0, length, pages - 1, new byte[PageFormat.RECORD], discard));
+        var high = header.clone();
+        Bytes.i64(high, PageFormat.NONCE, (1L << 48) | 77L);
+        assertThrows(IllegalArgumentException.class, () -> new PageCipher(KEY).seal(high, content, 0, length, pages, new byte[PageFormat.RECORD], discard));
+        try (var opener = new PageCipher(KEY).records()) {
+            var sealed = new byte[PageFormat.RECORD];
+            assertThrows(IllegalArgumentException.class, () -> opener.open(header, 0, sealed, 0, 100, sealed, 200));
+        }
+        // The pages of a unit of records hold its tags too
+        assertEquals(PageFormat.pagesFor(PageFormat.FIRST_RECORD_CONTENT), PageFormat.pagesFor(PageFormat.RECORDS, PageFormat.FIRST_RECORD_CONTENT));
+        assertTrue(PageFormat.fits(PageFormat.RECORDS, 128, PageFormat.FIRST_RECORD_CONTENT));
+        assertFalse(PageFormat.fits(PageFormat.RECORDS, 128, PageFormat.FIRST_RECORD_CONTENT + 1));
+        assertTrue(PageFormat.fits(PageFormat.RECORDS, 129, PageFormat.FIRST_RECORD_CONTENT + 1));
+        assertEquals(4_097, PageFormat.pagesFor(PageFormat.RECORDS, 16 << 20));
+        assertEquals(33, PageFormat.records(16 << 20));
+        assertTrue(PageFormat.records(Integer.MAX_VALUE) < 1 << 16);
     }
 }

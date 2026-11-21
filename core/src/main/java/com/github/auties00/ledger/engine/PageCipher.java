@@ -19,17 +19,25 @@ class PageCipher {
     /// The content a streamed unit passes to the cipher in one call: small enough to stay out of the way of the
     /// cipher's intrinsic, which a cold JVM reaches only through calls that are not too large.
     private static final int SLICE = 64 << 10;
-    /// The content the first call to the cipher takes when a streamed unit holds as much: long enough that the cipher's
-    /// counter mode runs it as more than one chunk, as it runs every piece of a mebibyte an open of a unit of a
-    /// mebibyte or more cuts the unit into. The JIT compiles the counter mode's code from the calls it profiled, and a
-    /// JVM that saw only slices of [#SLICE] compiles it without that loop: the first open of a long unit then
-    /// deoptimizes it, and the opens after decrypt in the counter mode's Java code, several times slower than its
-    /// intrinsic, until the JIT compiled it again.
+    /// The content the first call to the cipher takes when a streamed unit of the first format or of format
+    /// [PageFormat#CLOSE_TAG] holds as much: long enough that the cipher's counter mode runs it as more than one chunk,
+    /// as it runs every piece of a mebibyte an open of a unit of a mebibyte or more cuts the unit into. The JIT compiles
+    /// the counter mode's code from the calls it profiled, and a JVM that saw only slices of [#SLICE] compiles it
+    /// without that loop: the first open of a long unit then deoptimizes it, and the opens after decrypt in the counter
+    /// mode's Java code, several times slower than its intrinsic, until the JIT compiled it again. A store that
+    /// encrypts seals no such unit of its own, as one longer than a record is of format [PageFormat#RECORDS], whose
+    /// records the cipher takes in one chunk each, sealed or opened; the units of those formats an earlier build wrote
+    /// are still opened whole.
     private static final int FIRST_SLICE = 640 << 10;
     /// The content at the start of a streamed unit that may go in the short slices of a cold process
     /// ([Sealing#slice(int)]): 1,400 calls past the first slice, so the cipher's methods reach the second compiler over
     /// four units, whose ends its profile then holds.
     private static final int UNIT_COLD_BYTES = 2 << 20;
+    /// The bytes of a unit's nonce: the 12 of AES-GCM's standard nonce.
+    private static final int NONCE_BYTES = 12;
+    /// The bit of the first 8 bytes of a unit's nonce from which the index of a record of a unit of format
+    /// [PageFormat#RECORDS] goes: the unit's own nonce keeps those bits zero.
+    static final int RECORD_SHIFT = 48;
 
     private final SecretKeySpec key;
     private final ConcurrentLinkedQueue<Cipher> ciphers;
@@ -52,7 +60,8 @@ class PageCipher {
     /// seal as zeros, so the unit is the one the whole pages, zero past the content, make.
     ///
     /// @throws IllegalArgumentException if `plain` ends before its content or past the unit, the content does not fit
-    ///                                  in the unit, or its header is of format [PageFormat#CLOSE_TAG]
+    ///                                  in the unit, or its header is of format [PageFormat#CLOSE_TAG] or
+    ///                                  [PageFormat#RECORDS]
     void seal(byte[] plain, int pages, byte[] out, int offset) {
         var length = pages * PageFormat.SIZE;
         var tag = length - PageFormat.TAG;
@@ -95,7 +104,8 @@ class PageCipher {
     /// The bytes of `unit` past the unit are left as they are.
     ///
     /// @throws IllegalArgumentException if `unit` is shorter than the unit, the content its header names does not fit
-    ///                                  in the unit, or its header is of format [PageFormat#CLOSE_TAG]
+    ///                                  in the unit, or its header is of format [PageFormat#CLOSE_TAG] or
+    ///                                  [PageFormat#RECORDS]
     void seal(byte[] unit, int pages) {
         var length = pages * PageFormat.SIZE;
         var tag = length - PageFormat.TAG;
@@ -148,14 +158,20 @@ class PageCipher {
     /// zeros, which are not sealed, up to the end of the unit. The cipher reads each whole slice of the content where
     /// it is; only the last part of the content and the padding after it are copied. The first slice of a content of
     /// [#FIRST_SLICE] bytes or more is that long, the others [#SLICE] bytes, or shorter in the first [#UNIT_COLD_BYTES]
-    /// while the process seals its first megabytes ([Sealing#slice(int)]).
+    /// while the process seals its first megabytes ([Sealing#slice(int)]). A header of format [PageFormat#RECORDS]
+    /// makes the unit [#sealRecords(byte\[\], byte\[\], int, int, int, byte\[\], Output)] makes.
     ///
     /// @param header the unit's header, filled in, of [PageFormat#HEADER] bytes
-    /// @param buffer the buffer the sealed bytes pass through, of at least 64 KiB
+    /// @param buffer the buffer the sealed bytes pass through, of at least 64 KiB, and of at least [PageFormat#RECORD]
+    ///               bytes for a unit of format [PageFormat#RECORDS]
     /// @throws IllegalArgumentException if the content does not fit in the unit, or the header is of format
-    ///                                  [PageFormat#CLOSE_TAG] in a store without encryption
+    ///                                  [PageFormat#CLOSE_TAG] or [PageFormat#RECORDS] in a store without encryption
     /// @throws IOException if `out` fails
     void seal(byte[] header, byte[] content, int contentOffset, int contentLength, int pages, byte[] buffer, Output out) throws IOException {
+        if (header[PageFormat.FORMAT] == PageFormat.RECORDS) {
+            sealRecords(header, content, contentOffset, contentLength, pages, buffer, out);
+            return;
+        }
         var tag = pages * PageFormat.SIZE - PageFormat.TAG;
         var padding = tag - PageFormat.HEADER - (long) contentLength;
         if (padding < 0) {
@@ -254,15 +270,162 @@ class PageCipher {
         }
     }
 
+    /// Seals the unit of format [PageFormat#RECORDS] of `pages` pages whose header is `header` and whose content is
+    /// the `contentLength` bytes of `content` at `contentOffset`, passing it to `out` a record at a time through
+    /// `buffer`.
+    ///
+    /// Each record is one message of AES-GCM under its own nonce, with the header as its additional data, written to
+    /// `out` in one call with its tag right after its ciphertext, the first after the header; the zeros after the last
+    /// record, up to the end of the unit, go with it. One cipher of the pool seals every record. The content is passed
+    /// to the cipher in slices of [#SLICE] bytes where it is, or shorter in the first [#UNIT_COLD_BYTES] of the unit
+    /// while the process seals its first megabytes ([Sealing#slice(int)]), and each record ends a message, so the
+    /// cipher's code is compiled from calls that finish messages.
+    ///
+    /// @param header the unit's header, filled in, of [PageFormat#HEADER] bytes, of format [PageFormat#RECORDS]
+    /// @param buffer the buffer the sealed bytes pass through, of at least [PageFormat#RECORD] bytes
+    /// @throws IllegalArgumentException if the store does not encrypt, the header is of another format, the content
+    ///                                  does not fit in the unit, the first 8 bytes of the header's nonce are 2^48 or
+    ///                                  more, or `buffer` is shorter than a record
+    /// @throws IOException if `out` fails
+    void sealRecords(byte[] header, byte[] content, int contentOffset, int contentLength, int pages, byte[] buffer, Output out)
+            throws IOException {
+        if (key == null || header[PageFormat.FORMAT] != PageFormat.RECORDS) {
+            throw new IllegalArgumentException("A unit of format " + PageFormat.RECORDS + " needs a store that encrypts and a header of its format");
+        }
+        if (!PageFormat.fits(PageFormat.RECORDS, pages, contentLength)) {
+            throw new IllegalArgumentException("A unit of " + pages + " pages cannot hold " + contentLength + " bytes in records");
+        }
+        if (Bytes.i64(header, PageFormat.NONCE) >>> RECORD_SHIFT != 0) {
+            throw new IllegalArgumentException("The nonce of a unit of records leaves no room for their index");
+        }
+        if (buffer.length < PageFormat.RECORD) {
+            throw new IllegalArgumentException("A record is sealed through " + PageFormat.RECORD + " bytes, not " + buffer.length);
+        }
+        var records = PageFormat.records(contentLength);
+        var unitEnd = (long) pages * PageFormat.SIZE;
+        var nonce = new byte[NONCE_BYTES];
+        var cipher = take();
+        try {
+            for (var record = 0; record < records; record++) {
+                var used = 0;
+                if (record == 0) {
+                    System.arraycopy(header, 0, buffer, 0, PageFormat.HEADER);
+                    used = PageFormat.HEADER;
+                }
+                var start = PageFormat.recordContent(record);
+                var length = PageFormat.recordLength(record, contentLength);
+                recordNonce(header, record, nonce);
+                cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, nonce));
+                cipher.updateAAD(header, 0, PageFormat.HEADER);
+                // Whole blocks per update, so the cipher holds nothing back and each slice's output is its length
+                var consumed = 0;
+                while (true) {
+                    var slice = start + consumed < UNIT_COLD_BYTES ? Sealing.slice(SLICE) : SLICE;
+                    if (length - consumed <= slice) {
+                        break;
+                    }
+                    used += cipher.update(content, contentOffset + start + consumed, slice, buffer, used);
+                    consumed += slice;
+                }
+                used += cipher.doFinal(content, contentOffset + start + consumed, length - consumed, buffer, used);
+                if (record == records - 1) {
+                    // The zeros up to the end of the unit, with the last record while the buffer has room for them
+                    var padding = unitEnd - PageFormat.recordPosition(record) - length - PageFormat.TAG;
+                    while (padding > 0) {
+                        if (used == buffer.length) {
+                            out.write(buffer, used);
+                            used = 0;
+                        }
+                        var count = (int) Math.min(buffer.length - used, padding);
+                        Arrays.fill(buffer, used, used + count, (byte) 0);
+                        used += count;
+                        padding -= count;
+                    }
+                }
+                out.write(buffer, used);
+            }
+        } catch (GeneralSecurityException exception) {
+            throw new IllegalStateException("A unit could not be sealed", exception);
+        } finally {
+            ciphers.offer(cipher);
+        }
+    }
+
+    /// Writes into `nonce` the nonce of record `record` of the unit of format [PageFormat#RECORDS] whose header is
+    /// `header`: the unit's own, with `record` in the top 16 bits of its first 8 bytes.
+    private static void recordNonce(byte[] header, int record, byte[] nonce) {
+        System.arraycopy(header, PageFormat.NONCE, nonce, 0, NONCE_BYTES);
+        Bytes.i64(nonce, 0, Bytes.i64(header, PageFormat.NONCE) | (long) record << RECORD_SHIFT);
+    }
+
+    /// {@return the opener of the records of units of format [PageFormat#RECORDS], which holds a cipher of the pool
+    /// until it is closed}
+    ///
+    /// @throws IllegalStateException if the store does not encrypt
+    Records records() {
+        if (key == null) {
+            throw new IllegalStateException("A store without encryption has no units of records");
+        }
+        return new Records(take());
+    }
+
+    /// Opens the records of units of format [PageFormat#RECORDS], one at a time, with one cipher of the pool, which
+    /// [#close()] gives back. It is used by one thread at a time.
+    final class Records implements AutoCloseable {
+        private final Cipher cipher;
+        private final byte[] nonce;
+
+        private Records(Cipher cipher) {
+            this.cipher = cipher;
+            this.nonce = new byte[NONCE_BYTES];
+        }
+
+        /// Opens record `record`, the `length` bytes of content and the tag that follows them in `sealed` at
+        /// `sealedOffset`, of the unit of format [PageFormat#RECORDS] whose header is the first [PageFormat#HEADER]
+        /// bytes of `header`, into `plain` at `plainOffset`.
+        ///
+        /// Out of place, the open runs the AES-GCM intrinsic that decrypts and authenticates in one pass. `plain` may
+        /// hold bytes of the record whether or not it authenticates.
+        ///
+        /// @return whether it authenticates; never for a header of another format, or one whose nonce leaves no room
+        ///         for the record's index
+        /// @throws IllegalArgumentException if `plain` is `sealed`
+        boolean open(byte[] header, int record, byte[] sealed, int sealedOffset, int length, byte[] plain, int plainOffset) {
+            if (plain == sealed) {
+                throw new IllegalArgumentException("A record opens out of place");
+            }
+            if (header[PageFormat.FORMAT] != PageFormat.RECORDS || Bytes.i64(header, PageFormat.NONCE) >>> RECORD_SHIFT != 0) {
+                return false;
+            }
+            recordNonce(header, record, nonce);
+            try {
+                cipher.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, nonce));
+                cipher.updateAAD(header, 0, PageFormat.HEADER);
+                cipher.doFinal(sealed, sealedOffset, length + PageFormat.TAG, plain, plainOffset);
+                return true;
+            } catch (AEADBadTagException _) {
+                return false;
+            } catch (GeneralSecurityException exception) {
+                throw new IllegalStateException("A record could not be opened", exception);
+            }
+        }
+
+        @Override
+        public void close() {
+            ciphers.offer(cipher);
+        }
+    }
+
     /// Opens the unit of `pages` pages sealed in `sealed` at `offset` into `plain`, header included.
     ///
-    /// A unit of format [PageFormat#CLOSE_TAG], whose tag is not at the end of the unit, fails: it opens through
-    /// [#openContent(byte\[\], int, int, byte\[\], int)].
+    /// A unit of format [PageFormat#CLOSE_TAG] or [PageFormat#RECORDS], whose tag is not at the end of the unit, fails:
+    /// it opens through [#openContent(byte\[\], int, int, byte\[\], int)] or [#records()].
     ///
     /// @param plain the array the plaintext goes to, of at least the unit's bytes before its tag
     /// @return whether it authenticates
     boolean open(byte[] sealed, int offset, int pages, byte[] plain) {
-        if (sealed[offset + PageFormat.FORMAT] == PageFormat.CLOSE_TAG) {
+        var format = sealed[offset + PageFormat.FORMAT];
+        if (format == PageFormat.CLOSE_TAG || format == PageFormat.RECORDS) {
             return false;
         }
         var length = pages * PageFormat.SIZE;
@@ -373,10 +536,12 @@ class PageCipher {
         return Bytes.i32(rest, PageFormat.HEADER + padding) == (int) crc.getValue();
     }
 
-    // Throws if the header at the start of `unit` is of format CLOSE_TAG, whose layout only the streamed seal makes
+    // Throws if the header at the start of `unit` is of format CLOSE_TAG or RECORDS, whose layouts only the streamed
+    // seal makes
     private static void checkTagAtEnd(byte[] unit) {
-        if (unit[PageFormat.FORMAT] == PageFormat.CLOSE_TAG) {
-            throw new IllegalArgumentException("A unit of format " + PageFormat.CLOSE_TAG + " is sealed a part at a time");
+        var format = unit[PageFormat.FORMAT];
+        if (format == PageFormat.CLOSE_TAG || format == PageFormat.RECORDS) {
+            throw new IllegalArgumentException("A unit of format " + format + " is sealed a part at a time");
         }
     }
 

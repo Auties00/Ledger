@@ -64,12 +64,17 @@ import java.util.concurrent.atomic.AtomicLong;
 /// more sized to fill whole regions: G1 gives such an array regions of its own, which a dead one keeps committed until
 /// a marking frees them, so a read that missed the page cache and allocated the sealed unit, the opened one and the
 /// caller's copy kept three of them committed, where a read that copies the value out, before a checkpoint takes the
-/// unit or after, allocates the caller's alone ([BlobFile#copyValue(PageRef, int, int)]). A miss the cache refuses
-/// takes one spare, the sealed unit, whose content opens straight into the caller's array; one the cache takes, or one
-/// of a unit an earlier build wrote with its tag at the end of its pages, takes the sealed and the opened unit, as the
-/// replay of a commit's large value does. A read that gives a view of the value, which the caller may keep, still
-/// opens the unit into an array of its own. Only an array that never left its reader comes back: one the page cache, a
-/// version, a view or a caller received never does, as a reader may still read it.
+/// unit or after, allocates the caller's alone ([BlobFile#copyValue(PageRef, int, int)]). A unit of format
+/// [PageFormat#RECORDS], which a store that encrypts writes for a value longer than a record, takes no spare on a miss
+/// the cache refuses, nor on the replay of a commit that wrote it: its records pass through an array of the pool of
+/// [PageFormat#RECORD] bytes, half a region of G1 at regions of 1 MiB, kept in the reserve and reused, and open
+/// straight into the caller's array; a read the cache takes opens them into one spare, which the cache keeps. A unit
+/// of an earlier format takes a spare for its sealed bytes: a miss the cache refuses takes that one, whose content opens
+/// straight into the caller's array, and one the cache takes, or one of a unit of the first format, whose tag ends its
+/// pages, takes the sealed and the opened unit, as the replay of a commit's large value of that format does. A read
+/// that gives a view of the value, which the caller may keep, still opens the unit into an array of its own. Only an
+/// array that never left its reader comes back: one the page cache, a version, a view or a caller received never does,
+/// as a reader may still read it.
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
@@ -86,8 +91,9 @@ public final class HeapPool {
     /// batches, about 2 MiB, take at once.
     static final long RESERVE = 4L << 20;
     /// The most arrays above [#MAX_POOLED] the pool keeps for the reads of large units: the sealed and the opened
-    /// array of one read that missed the cache and that the cache takes; a miss the cache refuses keeps one. Each more
-    /// would keep the regions of a unit committed while a marking is pending.
+    /// array of one read of a unit of an earlier format than [PageFormat#RECORDS] that missed the cache and that the
+    /// cache takes; a miss the cache refuses keeps one. Each more would keep the regions of a unit committed while a
+    /// marking is pending.
     static final int LARGE_SPARES = 2;
     // Moves the chunks of bursts a pool's reserve keeps to its overflow once a collection took the sentinel it
     // registered
@@ -654,6 +660,13 @@ public final class HeapPool {
         synchronized (largeLock) {
             Arrays.fill(largeSpares, null);
             largeNext = 0;
+        }
+    }
+
+    /// {@return the arrays above [#MAX_POOLED] taken so far, spares or new; for tests that count them}
+    int largeAcquiresForTests() {
+        synchronized (largeLock) {
+            return largeAcquires;
         }
     }
 

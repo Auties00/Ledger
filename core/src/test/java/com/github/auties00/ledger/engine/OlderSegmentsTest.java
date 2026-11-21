@@ -50,19 +50,24 @@ import static org.junit.jupiter.api.Assertions.fail;
 /// [#open(Path, boolean)]'s options and segments of 64 KiB, its process halted once the last commit was durable: the
 /// version 3 ones by f33bbc5, whose units of large values are of the first format and whose third segment is the
 /// prepared one, the version 4 ones by e0538fc, whose units of an encrypted store are of format
-/// [PageFormat#CLOSE_TAG] and whose fourth segment is the prepared one.
+/// [PageFormat#CLOSE_TAG] and whose fourth segment is the prepared one, and the version 5 ones by d26087c, which add a
+/// commit of a value of [#RECORDS_VALUE] bytes, a unit of format [PageFormat#CLOSE_TAG] in the encrypted store longer
+/// than the first record of a unit of format [PageFormat#RECORDS], and whose fourth segment is the prepared one.
 class OlderSegmentsTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, byte[]> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.bytes());
     private static final Keyspace<String, byte[]> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.bytes());
     /// The writes of a split commit: values of 300 to 500 bytes, about 1.2 MB of them, which take several value frames.
     private static final int SPLIT_WRITES = 3_000;
+    /// The large value of the fixtures of version 5 and later, longer than the first record of a unit of format
+    /// [PageFormat#RECORDS], which a build of segment version 5 wrote as one unit of format [PageFormat#CLOSE_TAG].
+    private static final int RECORDS_VALUE = 600_000;
 
     /// {@return the prepared, empty segment of the fixture of segment version `version`}
     private static long preparedSegment(int version) {
         return switch (version) {
             case 3 -> 3;
-            case 4 -> 4;
+            case 4, 5 -> 4;
             default -> throw new IllegalArgumentException("no fixture of segment version " + version);
         };
     }
@@ -86,7 +91,7 @@ class OlderSegmentsTest {
     }
 
     /// The writes of a commit, applied to the store or to the expected state.
-    private interface Writer {
+    interface Writer {
         void put(Keyspace<String, byte[]> keyspace, String key, byte[] value);
 
         void delete(Keyspace<String, byte[]> keyspace, String key);
@@ -96,8 +101,8 @@ class OlderSegmentsTest {
         void commit();
     }
 
-    // The commits the fixtures hold, as the older build wrote them
-    private static void writeFixture(Writer writer) {
+    // The commits the fixtures of segment version `version` hold, as the older build wrote them
+    static void writeFixture(Writer writer, int version) {
         for (var c = 0; c < 30; c++) {
             for (var w = 0; w < 8; w++) {
                 var key = "m-%04d".formatted(c * 8 + w);
@@ -121,12 +126,27 @@ class OlderSegmentsTest {
         writer.deleteRange(MESSAGES, "b-01000", "b-01100");
         writer.put(MESSAGES, "m-0001", value("m-0001", 1, 300));
         writer.commit();
+        if (version >= 5) {
+            writer.put(MESSAGES, "m-records", recordsValue());
+            writer.commit();
+        }
     }
 
-    private static Map<String, TreeMap<String, String>> fixtureState() {
+    /// {@return the value of [#RECORDS_VALUE] bytes the fixtures of version 5 and later hold: a random block of 4 KiB
+    /// over and over, which a plain store's fixture compresses}
+    private static byte[] recordsValue() {
+        var block = value("m-records", 0, 4_096);
+        var bytes = new byte[RECORDS_VALUE];
+        for (var at = 0; at < bytes.length; at += block.length) {
+            System.arraycopy(block, 0, bytes, at, Math.min(block.length, bytes.length - at));
+        }
+        return bytes;
+    }
+
+    private static Map<String, TreeMap<String, String>> fixtureState(int version) {
         var state = emptyState();
         writeFixture(model(state, () -> {
-        }));
+        }), version);
         return state;
     }
 
@@ -272,8 +292,8 @@ class OlderSegmentsTest {
     }
 
     @ParameterizedTest(name = "version {0}, encrypted {1}")
-    @CsvSource({"3,true", "3,false", "4,true", "4,false"})
-    @DisplayName("replays an uncheckpointed log of an older version, writes its own commits, a split one among them, to a segment of the current version past the older prepared one, and keeps them through a crash, a checkpoint and reopens")
+    @CsvSource({"3,true", "3,false", "4,true", "4,false", "5,true", "5,false"})
+    @DisplayName("replays an uncheckpointed log of an older version, writes its own commits, a split one and one of a value of records among them, to a segment of the current version past the older prepared one, and keeps them through a crash, a checkpoint and reopens")
     void opensOlderLog(int version, boolean encrypted, @TempDir Path directory) throws Exception {
         unpack(version, encrypted, directory);
         var log = directory.resolve("log");
@@ -281,13 +301,16 @@ class OlderSegmentsTest {
         var prepared = log.resolve("%016x.log".formatted(preparedSegment));
         assertEquals(version, segmentVersion(prepared));
         assertFalse(framesWritten(prepared), "the fixture's last segment is prepared and empty");
-        var expected = fixtureState();
+        var expected = fixtureState(version);
+        var older = unitFormats(directory);
         try (var ledger = open(directory, encrypted)) {
             assertEquals(expected, contents(ledger));
             var batch = ledger.newBatch();
             batch.put(MESSAGES, "m-large", value("m-large", 1, 30_000));
             batch.put(MESSAGES, "m-0002", value("m-0002", 1, 200));
+            batch.put(MESSAGES, "m-records-2", value("m-records-2", 0, RECORDS_VALUE + 1));
             ledger.commit(batch).awaitDurable();
+            expected.get(MESSAGES.name()).put("m-records-2", HexFormat.of().formatHex(value("m-records-2", 0, RECORDS_VALUE + 1)));
             var split = ledger.newBatch();
             putSplit((key, value) -> {
                 split.put(MESSAGES, key, value);
@@ -317,6 +340,14 @@ class OlderSegmentsTest {
         if (Files.exists(prepared)) {
             assertFalse(framesWritten(prepared), "a commit written into the older prepared segment");
         }
+        // The units the older build wrote stay in their format, and the new value's is of this build's
+        var formats = unitFormats(directory);
+        older.forEach((page, format) -> assertEquals(format, formats.get(page), "the unit at page " + page));
+        assertEquals(older.size() + 2, formats.size(), "the units of m-large and m-records-2 besides the older ones");
+        assertTrue(formats.containsValue(encrypted ? PageFormat.RECORDS : PageFormat.VERSION));
+        if (version >= 5) {
+            assertTrue(older.containsValue(encrypted ? PageFormat.CLOSE_TAG : PageFormat.VERSION));
+        }
         try (var ledger = open(directory, encrypted)) {
             assertEquals(expected, contents(ledger));
             ledger.checkpoint();
@@ -327,16 +358,34 @@ class OlderSegmentsTest {
         }
     }
 
+    /// {@return the format of each unit of the file of large values under `directory`, by its first page}
+    private static Map<Integer, Byte> unitFormats(Path directory) throws IOException {
+        var bytes = Files.readAllBytes(directory.resolve(BlobFile.FILE));
+        var formats = new TreeMap<Integer, Byte>();
+        for (var page = PageFormat.FIRST_UNIT_PAGE; (long) page * PageFormat.SIZE + PageFormat.HEADER <= bytes.length; ) {
+            var at = page * PageFormat.SIZE;
+            var pages = ByteBuffer.wrap(bytes).getInt(at + PageFormat.PAGES);
+            if (bytes[at + PageFormat.KIND] != PageFormat.EXTERNAL || ByteBuffer.wrap(bytes).getInt(at + PageFormat.PAGE) != page || pages <= 0) {
+                page++;
+                continue;
+            }
+            formats.put(page, bytes[at + PageFormat.FORMAT]);
+            page += pages;
+        }
+        return formats;
+    }
+
     /// The commits the current build adds to a fixture store, and the states each leaves visible.
     private static final class Continuation {
         final boolean encrypted;
         final List<Map<String, TreeMap<String, String>>> history = new ArrayList<>();
-        final Map<String, TreeMap<String, String>> state = fixtureState();
+        final Map<String, TreeMap<String, String>> state;
         int visible;
         int durable;
 
-        Continuation(boolean encrypted) {
+        Continuation(boolean encrypted, int version) {
             this.encrypted = encrypted;
+            this.state = fixtureState(version);
             history.add(copy(state));
         }
 
@@ -430,13 +479,13 @@ class OlderSegmentsTest {
     }
 
     @ParameterizedTest(name = "version {0}, encrypted {1}, part {2}")
-    @CsvSource({"3,true,0", "3,true,1", "3,false,0", "4,true,0", "4,true,1", "4,false,0"})
+    @CsvSource({"3,true,0", "3,true,1", "3,false,0", "4,true,0", "4,true,1", "4,false,0", "5,true,0", "5,true,1", "5,false,0"})
     @DisplayName("recovers a state between the last durable and the last visible commit at sampled forces of the writes that follow an older log, split commits among them, and keeps it through a checkpoint and a reopen")
     void powerLossAfterOlderLog(int version, boolean encrypted, int part) throws Exception {
         var dry = CrashFileSystem.create();
         unpack(version, encrypted, dry.getPath("/store"));
         var unpacked = dry.forces();
-        var dryRun = new Continuation(encrypted);
+        var dryRun = new Continuation(encrypted, version);
         dryRun.run(dry.getPath("/store"));
         assertEquals(dryRun.visible, dryRun.durable, "the dry run failed");
         var forces = dry.forces() - unpacked;
@@ -450,7 +499,7 @@ class OlderSegmentsTest {
             var disk = CrashFileSystem.create();
             unpack(version, encrypted, disk.getPath("/store"));
             disk.stopAtForce(force);
-            var continuation = new Continuation(encrypted);
+            var continuation = new Continuation(encrypted, version);
             continuation.run(disk.getPath("/store"));
             var survivor = disk.afterPowerLoss(new Random(random.nextLong()));
             Map<String, TreeMap<String, String>> recovered;
