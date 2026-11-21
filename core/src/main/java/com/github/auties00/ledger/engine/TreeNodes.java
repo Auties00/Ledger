@@ -188,15 +188,33 @@ final class TreeNodes {
 
     /// {@return entry `entry` of `unit`, a view of it}
     static LeafEntry entryAt(byte[] unit, int entry) {
-        var key = leafKey(unit, entry);
+        return entryAt(view(unit), unit, entry);
+    }
+
+    /// {@return entry `entry` of `unit`, its key and inline value slices of `view`, a read-only segment of the whole of
+    /// `unit` ([#view(byte\[\])])}
+    ///
+    /// A slice of a shared view is one segment per key or value, sharing the view's memory session. A view made for
+    /// each, as [#leafKey(byte\[\], int)] makes it, costs a session of its own, and two segments more whenever the JIT
+    /// compiler leaves the calls that make it out of the method it compiles, which depends on what ran before: a
+    /// checkpoint that merges a few hundred thousand writes allocated 15 to 30 MB more in that case.
+    static LeafEntry entryAt(MemorySegment view, byte[] unit, int entry) {
+        var key = view.asSlice(leafKeyOffset(entry), leafKeyLength(unit, entry));
         if (isRemoved(unit, entry)) {
             return LeafEntry.removed(key);
         }
         if (isBlob(unit, entry) || isExternal(unit, entry)) {
             return new LeafEntry(key, null, blobRef(unit, entry), blobLength(unit, entry), isExternal(unit, entry));
         }
-        var value = inlineValue(unit, entry);
-        return new LeafEntry(key, value, null, (int) value.byteSize());
+        var field = valueField(unit, entry);
+        var length = inlineValueLength(unit, field);
+        return new LeafEntry(key, view.asSlice(inlineValueOffset(field), length), null, length);
+    }
+
+    /// {@return a read-only segment of the whole of `unit`, whose slices are the views of its entries
+    /// ([#entryAt(MemorySegment, byte\[\], int)])}
+    static MemorySegment view(byte[] unit) {
+        return MemorySegment.ofArray(unit).asReadOnly();
     }
 
     /// {@return the read-only inline value of leaf entry `entry`}
@@ -334,8 +352,9 @@ final class TreeNodes {
     static List<LeafEntry> leafEntries(byte[] unit) {
         var count = count(unit);
         var entries = new ArrayList<LeafEntry>(count + 8);
+        var view = view(unit);
         for (var i = 0; i < count; i++) {
-            entries.add(entryAt(unit, entry(unit, i)));
+            entries.add(entryAt(view, unit, entry(unit, i)));
         }
         return entries;
     }

@@ -96,8 +96,9 @@ final class DeltaLeaves {
         var count = Bytes.u16(page, record + 16);
         var changes = new ArrayList<LeafEntry>(count);
         var position = record + RECORD_FIXED;
+        var view = TreeNodes.view(page);
         for (var i = 0; i < count; i++) {
-            changes.add(TreeNodes.entryAt(page, position));
+            changes.add(TreeNodes.entryAt(view, page, position));
             position += TreeNodes.entryLength(page, position);
         }
         return changes;
