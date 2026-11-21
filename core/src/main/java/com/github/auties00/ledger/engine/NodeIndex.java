@@ -4,6 +4,7 @@ import com.github.auties00.ledger.LedgerCorruptedException;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.Arrays;
 
 /// The search index a leaf or a branch of the [second format][PageFormat#INDEXED] holds: the prefix its keys share and
 /// the first bytes of each key after it, its head, together between the offsets of its entries and the entries.
@@ -71,6 +72,15 @@ final class NodeIndex {
         return (int) (mismatch == -1 ? firstLength : mismatch);
     }
 
+    /// {@return the bytes the key of `firstLength` bytes at `firstAt` of `first` and the key of `lastLength` bytes at
+    /// `lastAt` of `last` share, up to [#MAX_PREFIX], as [#prefix(MemorySegment, MemorySegment)] gives for them}
+    static int prefix(byte[] first, int firstAt, int firstLength, byte[] last, int lastAt, int lastLength) {
+        var firstCapped = Math.min(firstLength, MAX_PREFIX);
+        var lastCapped = Math.min(lastLength, MAX_PREFIX);
+        var mismatch = Arrays.mismatch(first, firstAt, firstAt + firstCapped, last, lastAt, lastAt + lastCapped);
+        return mismatch == -1 ? firstCapped : mismatch;
+    }
+
     /// {@return the 8 bytes of `key` from `from`, then zeros where it ends, as a big-endian number}
     static long head(MemorySegment key, int from) {
         var length = key.byteSize() - from;
@@ -86,13 +96,19 @@ final class NodeIndex {
 
     /// {@return the 8 bytes of `key` from `from`, then zeros where it ends, as a big-endian number}
     private static long head(byte[] key, int from) {
-        var length = key.length - from;
+        return head(key, 0, key.length, from);
+    }
+
+    /// {@return the 8 bytes from `from` of the key of `keyLength` bytes at `keyAt` of `unit`, then zeros where it ends,
+    /// as a big-endian number}
+    static long head(byte[] unit, int keyAt, int keyLength, int from) {
+        var length = keyLength - from;
         if (length >= Long.BYTES) {
-            return Bytes.i64(key, from);
+            return Bytes.i64(unit, keyAt + from);
         }
         var head = 0L;
         for (var i = 0; i < Long.BYTES; i++) {
-            head = head << 8 | (i < length ? key[from + i] & 0xFF : 0);
+            head = head << 8 | (i < length ? unit[keyAt + from + i] & 0xFF : 0);
         }
         return head;
     }
@@ -129,10 +145,26 @@ final class NodeIndex {
     /// @param heads the 8-byte heads of the keys after the prefix, in key order
     /// @return the position past the index
     static int write(byte[] unit, int position, MemorySegment first, int prefix, long[] heads, boolean wide) {
+        MemorySegment.copy(first, ValueLayout.JAVA_BYTE, 0, unit, position, prefix);
+        return writeHeads(unit, position + prefix, prefix, heads, wide);
+    }
+
+    /// Writes the index of a node at `position` of `unit`, as
+    /// [#write(byte\[\], int, MemorySegment, int, long\[\], boolean)] does, for a first key at `firstAt` of `first`.
+    ///
+    /// @return the position past the index
+    static int write(byte[] unit, int position, byte[] first, int firstAt, int prefix, long[] heads, boolean wide) {
+        System.arraycopy(first, firstAt, unit, position, prefix);
+        return writeHeads(unit, position + prefix, prefix, heads, wide);
+    }
+
+    /// Writes `heads` at `position` of `unit`, past a prefix of `prefix` bytes, and marks the node's header as holding
+    /// an index.
+    ///
+    /// @return the position past the heads
+    private static int writeHeads(byte[] unit, int position, int prefix, long[] heads, boolean wide) {
         unit[PageFormat.FORMAT] = PageFormat.INDEXED;
         unit[PageFormat.INDEX] = (byte) (prefix | (wide ? WIDE : 0));
-        MemorySegment.copy(first, ValueLayout.JAVA_BYTE, 0, unit, position, prefix);
-        position += prefix;
         for (var head : heads) {
             if (wide) {
                 Bytes.i64(unit, position, head);

@@ -36,7 +36,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /// The search index of leaves and branches: its searches against a sorted list and against the search of the same
 /// node without an index, on keys built to share prefixes, tie on their heads and end inside them; the room it takes;
-/// and trees of nodes without one, as an older version wrote them, that checkpoints rewrite in part.
+/// the leaf a delta record makes of the bytes of its base and its record, against the leaf their entries make; and trees
+/// of nodes without one, as an older version wrote them, that checkpoints rewrite in part.
 class NodeIndexTest {
     private static final Comparator<byte[]> UNSIGNED = Arrays::compareUnsigned;
     private static final byte[] HEX = "0123456789ABCDEF".getBytes(StandardCharsets.US_ASCII);
@@ -321,7 +322,9 @@ class NodeIndexTest {
             assertTrue(PageFormat.fits(1, base.length - PageFormat.HEADER));
             var changes = List.of(new TreeNodes.LeafEntry(segment(keys.get(5)), segment(new byte[32]), null, 32));
             var page = recordPage(new PageRef(8, 1, 5, 6), changes);
-            var leaf = DeltaLeaves.materialize(new PageRef(20, 1, 1, 2, 0), (ref, kind) -> kind == PageFormat.DELTA ? page : base);
+            DeltaLeaves.Source source = (ref, kind) -> kind == PageFormat.DELTA ? page : base;
+            var leaf = DeltaLeaves.materialize(new PageRef(20, 1, 1, 2, 0), source);
+            assertArrayEquals(byEntries(new PageRef(20, 1, 1, 2, 0), source), leaf);
             assertEquals(PageFormat.VERSION, leaf[PageFormat.FORMAT]);
             assertEquals(64, TreeNodes.count(leaf));
             for (var i = 0; i < keys.size(); i++) {
@@ -334,10 +337,333 @@ class NodeIndexTest {
                 removals.add(TreeNodes.LeafEntry.removed(segment(keys.get(i))));
             }
             var smaller = recordPage(new PageRef(8, 1, 5, 6), removals);
-            var indexed = DeltaLeaves.materialize(new PageRef(20, 1, 1, 2, 0), (ref, kind) -> kind == PageFormat.DELTA ? smaller : base);
+            DeltaLeaves.Source smallerSource = (ref, kind) -> kind == PageFormat.DELTA ? smaller : base;
+            var indexed = DeltaLeaves.materialize(new PageRef(20, 1, 1, 2, 0), smallerSource);
+            assertArrayEquals(byEntries(new PageRef(20, 1, 1, 2, 0), smallerSource), indexed);
             assertEquals(PageFormat.INDEXED, indexed[PageFormat.FORMAT]);
             assertEquals(54, TreeNodes.count(indexed));
             assertEquals(0, TreeNodes.lowerBound(indexed, keys.get(10)));
+        }
+    }
+
+    @Nested
+    @DisplayName("the leaf a delta record makes")
+    class Materialized {
+        private static final PageRef BASE = new PageRef(8, 1, 5, 6);
+
+        @ParameterizedTest(name = "keys of kind {0}")
+        @ValueSource(ints = {0, 1, 2, 3, 4, 5, 6})
+        @DisplayName("is byte for byte the leaf the base's entries with the record's applied make, for random bases and records of inline, blob and external entries, replacements, insertions and removals of keys the base holds and lacks")
+        void sameAsEntries(int kind) {
+            var random = new Random(97L * kind + 3);
+            var outcomes = new int[4];
+            for (var round = 0; round < 400; round++) {
+                var keys = keys(random, kind, 2 + random.nextInt(160));
+                var held = new ArrayList<byte[]>();
+                var absent = new ArrayList<byte[]>();
+                for (var key : keys) {
+                    (random.nextInt(3) != 0 ? held : absent).add(key);
+                }
+                var older = random.nextInt(6) == 0;
+                var base = new ArrayList<TreeNodes.LeafEntry>();
+                var fill = 0;
+                for (var key : held) {
+                    var entry = randomEntry(random, key);
+                    // A base an older version wrote fills its page without an index
+                    var size = older ? entry.size() - NodeIndex.HEAD : entry.size();
+                    if (fill + size > (older ? PageFormat.capacity(1) - 2 : TreeNodes.CAPACITY)) {
+                        break;
+                    }
+                    fill += size;
+                    base.add(entry);
+                }
+                var changes = new TreeMap<byte[], TreeNodes.LeafEntry>(UNSIGNED);
+                var replaced = random.nextInt(4);
+                for (var entry : base) {
+                    var draw = random.nextInt(8);
+                    if (draw < replaced) {
+                        var key = entry.key().toArray(ValueLayout.JAVA_BYTE);
+                        changes.put(key, random.nextInt(4) == 0 ? TreeNodes.LeafEntry.removed(segment(key)) : randomEntry(random, key));
+                    }
+                }
+                for (var key : absent) {
+                    if (random.nextInt(3) == 0) {
+                        changes.put(key, random.nextInt(5) == 0 ? TreeNodes.LeafEntry.removed(segment(key)) : randomEntry(random, key));
+                    }
+                }
+                var record = new ArrayList<>(changes.values());
+                var slot = random.nextInt(2);
+                // The record and a record of another leaf before it must fit the page
+                while (DeltaLeaves.recordSize(record) > PageFormat.capacity(1) - 2 - 4 - 64) {
+                    record.remove(random.nextInt(record.size()));
+                }
+                outcomes[compare(baseLeaf(base, older), recordPage(BASE, record, slot), slot)]++;
+            }
+            assertTrue(outcomes[0] > 0, "no leaf with an index was made");
+            if (kind != 6) {
+                assertTrue(outcomes[1] > 0, "no leaf without an index was made");
+                assertTrue(outcomes[2] > 0, "no leaf was too large");
+            }
+        }
+
+        @Test
+        @DisplayName("is byte for byte the leaf of entries for a record that replaces the base's first and last keys, inserts keys before and after them, removes keys the base holds and lacks, or removes every key")
+        void sameAsEntriesAtTheEnds() {
+            var random = new Random(41);
+            var keys = new ArrayList<byte[]>();
+            for (var i = 0; i < 40; i++) {
+                keys.add(("chat-0001-message-%04d".formatted(i * 2 + 10)).getBytes(StandardCharsets.US_ASCII));
+            }
+            var base = new ArrayList<TreeNodes.LeafEntry>();
+            for (var key : keys) {
+                base.add(randomEntry(random, key));
+            }
+            var leaf = baseLeaf(base, false);
+            // The first and the last key replaced, so the prefix and the first key come from the delta page
+            assertEquals(0, compare(leaf, recordPage(BASE, List.of(randomEntry(random, keys.getFirst()), randomEntry(random, keys.getLast())), 0), 0));
+            // Keys before and after every key of the base, sharing fewer bytes than the base's keys do
+            assertEquals(0, compare(leaf, recordPage(BASE, List.of(randomEntry(random, "a".getBytes(StandardCharsets.US_ASCII)),
+                    randomEntry(random, "chat-0001-message-0000".getBytes(StandardCharsets.US_ASCII)),
+                    randomEntry(random, "chat-0002".getBytes(StandardCharsets.US_ASCII))), 1), 1));
+            // Removals of keys the base holds and of keys it lacks, the first and the last among them
+            assertEquals(0, compare(leaf, recordPage(BASE, List.of(TreeNodes.LeafEntry.removed(segment(keys.get(0))),
+                    TreeNodes.LeafEntry.removed(segment("chat-0001-message-0011".getBytes(StandardCharsets.US_ASCII))),
+                    TreeNodes.LeafEntry.removed(segment(keys.get(20))),
+                    TreeNodes.LeafEntry.removed(segment(keys.getLast()))), 0), 0));
+            // Every key removed: an empty leaf, with an index of no prefix and no heads
+            var removals = new ArrayList<TreeNodes.LeafEntry>();
+            for (var key : keys) {
+                removals.add(TreeNodes.LeafEntry.removed(segment(key)));
+            }
+            var page = recordPage(BASE, removals, 1);
+            assertEquals(0, compare(leaf, page, 1));
+            var empty = DeltaLeaves.materialize(new PageRef(20, 1, 1, 2, 1), (ref, kind) -> kind == PageFormat.DELTA ? page : leaf);
+            assertEquals(0, TreeNodes.count(empty));
+            assertEquals(PageFormat.INDEXED, empty[PageFormat.FORMAT]);
+            assertEquals(0, empty[PageFormat.INDEX]);
+            assertTrue(TreeNodes.madeFromDelta(empty));
+            assertEquals(BASE, TreeNodes.base(empty, new PageRef(20, 1, 1, 2, 1)));
+            // An empty base that a record fills
+            var filled = new ArrayList<TreeNodes.LeafEntry>();
+            for (var key : keys) {
+                filled.add(randomEntry(random, key));
+            }
+            assertEquals(0, compare(baseLeaf(List.of(), false), recordPage(BASE, filled, 0), 0));
+        }
+
+        @Test
+        @DisplayName("takes heads of 8 bytes as the leaf of entries does, when the keys of 4-byte heads tie in long runs")
+        void wideHeads() {
+            var random = new Random(43);
+            var keys = new ArrayList<byte[]>();
+            for (var chat = 0; chat < 2; chat++) {
+                for (var i = 0; i < 30; i++) {
+                    keys.add(idKey(0x105 + chat, 1_000L * (0x105 + chat) + i));
+                }
+            }
+            keys.sort(UNSIGNED);
+            var base = new ArrayList<TreeNodes.LeafEntry>();
+            for (var i = 0; i < keys.size(); i += 2) {
+                base.add(new TreeNodes.LeafEntry(segment(keys.get(i)), segment(new byte[8]), null, 8));
+            }
+            var record = new ArrayList<TreeNodes.LeafEntry>();
+            for (var i = 1; i < keys.size(); i += 2) {
+                record.add(new TreeNodes.LeafEntry(segment(keys.get(i)), segment(new byte[8]), null, 8));
+            }
+            var leaf = baseLeaf(base, false);
+            var page = recordPage(BASE, record, 0);
+            assertEquals(0, compare(leaf, page, 0));
+            var made = DeltaLeaves.materialize(new PageRef(20, 1, 1, 2, 0), (ref, kind) -> kind == PageFormat.DELTA ? page : leaf);
+            assertTrue((made[PageFormat.INDEX] & 0x80) != 0, "the leaf takes heads of 4 bytes");
+        }
+
+        @Test
+        @DisplayName("fails as corrupted for a record that runs past its page, or names no record of it")
+        void corrupted() {
+            var leaf = baseLeaf(List.of(new TreeNodes.LeafEntry(segment(new byte[]{1}), segment(new byte[4]), null, 4)), false);
+            var changes = List.of(new TreeNodes.LeafEntry(segment(new byte[]{2}), segment(new byte[4]), null, 4));
+            var page = recordPage(BASE, changes, 0);
+            DeltaLeaves.Source source = (ref, kind) -> kind == PageFormat.DELTA ? page : leaf;
+            assertThrows(LedgerCorruptedException.class, () -> DeltaLeaves.materialize(new PageRef(20, 1, 1, 2, 1), source));
+            // The record's entry claims a value longer than the page holds
+            var record = Bytes.u16(page, PageFormat.HEADER + 2);
+            var overlong = page.clone();
+            Bytes.u16(overlong, record + 18 + 2 + 1 + 1, 60_000);
+            assertThrows(LedgerCorruptedException.class, () -> DeltaLeaves.materialize(new PageRef(20, 1, 1, 2, 0),
+                    (ref, kind) -> kind == PageFormat.DELTA ? overlong : leaf));
+            // More entries than the record holds, the rest of the page zeros past its end
+            var counted = page.clone();
+            Bytes.u16(counted, record + 16, 2_000);
+            assertThrows(LedgerCorruptedException.class, () -> DeltaLeaves.materialize(new PageRef(20, 1, 1, 2, 0),
+                    (ref, kind) -> kind == PageFormat.DELTA ? Arrays.copyOf(counted, PageFormat.SIZE - PageFormat.TAG) : leaf));
+        }
+
+        /// Makes the leaf of the record in `slot` of `page` over `base` by bytes and by entries, and checks both give the
+        /// same bytes or both fail.
+        ///
+        /// @return 0 for a leaf with an index, 1 for one without, 2 for a leaf too large
+        private int compare(byte[] base, byte[] page, int slot) {
+            var ref = new PageRef(20, 1, 1, 2, slot);
+            var outcome = -1;
+            // The page as a checkpoint fills it, and cut where its records end
+            for (var held : List.of(page, Arrays.copyOf(page, PageFormat.SIZE - PageFormat.TAG))) {
+                DeltaLeaves.Source source = (unit, kind) -> {
+                    if (kind == PageFormat.DELTA) {
+                        assertEquals(ref.unit(), unit);
+                        return held;
+                    }
+                    assertEquals(PageFormat.LEAF, kind);
+                    assertEquals(BASE, unit);
+                    return base;
+                };
+                var expected = byEntries(ref, source);
+                if (expected == null) {
+                    assertThrows(LedgerCorruptedException.class, () -> DeltaLeaves.materialize(ref, source));
+                    outcome = 2;
+                } else {
+                    var made = DeltaLeaves.materialize(ref, source);
+                    assertArrayEquals(expected, made);
+                    outcome = made[PageFormat.FORMAT] == PageFormat.INDEXED ? 0 : 1;
+                }
+            }
+            return outcome;
+        }
+    }
+
+    /// {@return the leaf the record `ref` makes, as the base's entries with the record's applied written as a leaf, or
+    /// `null` if it would not fit in a page}
+    private static byte[] byEntries(PageRef ref, DeltaLeaves.Source source) {
+        var page = source.read(ref.unit(), PageFormat.DELTA);
+        var record = Bytes.u16(page, PageFormat.HEADER + 2 + 2 * ref.slot());
+        var base = new PageRef(Bytes.i32(page, record), 1, Bytes.i64(page, record + 4), Bytes.i32(page, record + 12));
+        var entries = new ArrayList<TreeNodes.LeafEntry>();
+        var old = TreeNodes.leafEntries(source.read(base, PageFormat.LEAF));
+        var at = 0;
+        for (var change : DeltaLeaves.record(page, ref.slot())) {
+            while (at < old.size() && Segments.compare(old.get(at).key(), change.key()) < 0) {
+                entries.add(old.get(at++));
+            }
+            if (at < old.size() && Segments.compare(old.get(at).key(), change.key()) == 0) {
+                at++;
+            }
+            if (!change.isRemoved()) {
+                entries.add(change);
+            }
+        }
+        entries.addAll(old.subList(at, old.size()));
+        var size = entries.stream().mapToInt(TreeNodes.LeafEntry::size).sum();
+        var indexed = size <= TreeNodes.CAPACITY;
+        if (!indexed && 2 + size - NodeIndex.HEAD * entries.size() > PageFormat.capacity(1)) {
+            return null;
+        }
+        var unit = TreeNodes.writeLeaf(entries, 0, entries.size(), indexed);
+        TreeNodes.deltaHeader(unit, base, unit.length - PageFormat.HEADER);
+        return unit;
+    }
+
+    /// {@return an entry of `key` whose value is inline, held as a segment or an array, in a blob or in a unit of the
+    /// file of large values}
+    private static TreeNodes.LeafEntry randomEntry(Random random, byte[] key) {
+        return switch (random.nextInt(5)) {
+            case 0, 1 -> {
+                var value = new byte[random.nextInt(4) == 0 ? 0 : random.nextInt(120)];
+                random.nextBytes(value);
+                yield new TreeNodes.LeafEntry(segment(key), segment(value), null, value.length);
+            }
+            case 2 -> {
+                var value = new byte[random.nextInt(60)];
+                random.nextBytes(value);
+                yield new TreeNodes.LeafEntry(segment(key), value, null, value.length);
+            }
+            default -> new TreeNodes.LeafEntry(segment(key), null,
+                    new PageRef(random.nextInt(1 << 24), 1 + random.nextInt(64), random.nextLong(), random.nextInt()),
+                    random.nextInt(1 << 26), random.nextBoolean());
+        };
+    }
+
+    /// {@return the leaf of `entries`, as a base leaf: with an index, or of the first format if `older`}
+    private static byte[] baseLeaf(List<TreeNodes.LeafEntry> entries, boolean older) {
+        var unit = TreeNodes.writeLeaf(entries, 0, entries.size(), !older);
+        PageFile.header(unit, PageFormat.LEAF, 0, 8, 1, unit.length - PageFormat.HEADER, 5, 6);
+        return unit;
+    }
+
+    /// {@return a delta page as a checkpoint fills it, with no header, holding the record of `changes` to `base` in
+    /// `slot`, 0 or 1, after a record of another leaf in slot 0 if `slot` is 1}
+    private static byte[] recordPage(PageRef base, List<TreeNodes.LeafEntry> changes, int slot) {
+        var page = new byte[PageFormat.SIZE];
+        var low = PageFormat.SIZE - PageFormat.TAG;
+        var records = new ArrayList<List<TreeNodes.LeafEntry>>();
+        var bases = new ArrayList<PageRef>();
+        if (slot == 1) {
+            records.add(List.of(TreeNodes.LeafEntry.removed(segment(new byte[]{0x55}))));
+            bases.add(new PageRef(30, 1, 7, 8));
+        }
+        records.add(changes);
+        bases.add(base);
+        for (var i = 0; i < records.size(); i++) {
+            var record = records.get(i);
+            low -= DeltaLeaves.recordSize(record);
+            Bytes.i32(page, low, bases.get(i).page());
+            Bytes.i64(page, low + 4, bases.get(i).nonceHigh());
+            Bytes.i32(page, low + 12, bases.get(i).nonceLow());
+            Bytes.u16(page, low + 16, record.size());
+            var position = low + 18;
+            for (var change : record) {
+                position = TreeNodes.writeEntry(page, position, change);
+            }
+            Bytes.u16(page, PageFormat.HEADER + 2 + 2 * i, low);
+        }
+        Bytes.u16(page, PageFormat.HEADER, records.size());
+        return page;
+    }
+
+    @Nested
+    @DisplayName("the index of keys in arrays")
+    class ByteRanges {
+        @Test
+        @DisplayName("takes the prefix, the heads and the first key's bytes the index of keys in segments takes, for keys at any offset of arrays with other bytes after them")
+        void sameAsSegments() {
+            var random = new Random(53);
+            for (var round = 0; round < 3_000; round++) {
+                var kind = random.nextInt(7);
+                var keys = keys(random, kind, 2 + random.nextInt(6));
+                // Keys shorter than a head, as long as the longest prefix, and keys that are the prefix of the others
+                keys.add(Arrays.copyOf(keys.getFirst(), Math.min(keys.getFirst().length, random.nextInt(9))));
+                keys.add(Arrays.copyOf(keys.getLast(), NodeIndex.MAX_PREFIX));
+                keys.sort(UNSIGNED);
+                var first = keys.get(random.nextInt(keys.size()));
+                var last = keys.get(random.nextInt(keys.size()));
+                var firstAt = random.nextInt(40);
+                var lastAt = random.nextInt(40);
+                var firstUnit = embedded(random, first, firstAt);
+                var lastUnit = embedded(random, last, lastAt);
+                var prefix = NodeIndex.prefix(segment(first), segment(last));
+                assertEquals(prefix, NodeIndex.prefix(firstUnit, firstAt, first.length, lastUnit, lastAt, last.length));
+                for (var from = 0; from <= first.length; from++) {
+                    assertEquals(NodeIndex.head(segment(first), from), NodeIndex.head(firstUnit, firstAt, first.length, from),
+                            "the head from " + from + " of a key of " + first.length + " bytes");
+                }
+                var heads = new long[random.nextInt(6)];
+                for (var i = 0; i < heads.length; i++) {
+                    heads[i] = random.nextLong();
+                }
+                var wide = random.nextBoolean();
+                var position = PageFormat.HEADER + 2 + random.nextInt(20);
+                var bySegment = new byte[position + NodeIndex.length(heads.length, prefix, wide) + 8];
+                var byArray = bySegment.clone();
+                assertEquals(NodeIndex.write(bySegment, position, segment(first), prefix, heads, wide),
+                        NodeIndex.write(byArray, position, firstUnit, firstAt, prefix, heads, wide));
+                assertArrayEquals(bySegment, byArray);
+            }
+        }
+
+        /// {@return an array holding `key` at `at`, random bytes before and after it}
+        private static byte[] embedded(Random random, byte[] key, int at) {
+            var unit = new byte[at + key.length + 1 + random.nextInt(16)];
+            random.nextBytes(unit);
+            System.arraycopy(key, 0, unit, at, key.length);
+            return unit;
         }
     }
 

@@ -90,11 +90,12 @@ import java.util.concurrent.atomic.AtomicLong;
 /// reads a read from the file needs, so the unit's next read from the file, once the collector took the array, caches
 /// it as the doorkeeper counts it, at most one read later than if every read had read the file. What the cache holds
 /// stays what reads used often enough, and the first reads of a session allocate no more than they did when the cache
-/// took every unit at once, as long as the collector has not run between the reads. A delta page read for a leaf the
-/// cache refused is refused with it, and the reads of the page's other records take it from there without putting it
-/// ([#recallWeak(long, PageRef)]): the page holds the records of several leaves, which random reads rarely reach, and
-/// kept 4 KB for one leaf the cache did not even take. Writes, the lookups of a commit, the reads of a checkpoint and
-/// of a resident key space, the root of a tree, and the units of a scan past its first leaves and values cache as they
+/// took every unit at once, as long as the collector has not run between the reads. A delta page read to make the
+/// leaf of one of its records is refused, whether or not the cache takes the leaf, and the reads of the page's other
+/// records take it from there without putting it ([#recallWeak(long, PageRef)]): the page holds the records of several
+/// leaves, which random reads rarely reach, and the cache keeps the leaf it makes, so a page or a base cached beside it
+/// would be used again only once the cache evicted the leaf. Writes, the lookups of a commit, the reads of a checkpoint and of a
+/// resident key space, the root of a tree, and the units of a scan past its first leaves and values cache as they
 /// would unscreened.
 ///
 /// The table of the refused units is itself reached only weakly ([Refusals]): it holds nothing a collection keeps, so

@@ -299,6 +299,44 @@ class CheckpointCacheTest {
         }
 
         @Test
+        @DisplayName("leave a delta record's leaf they left out of the cache for a reader to make again from its base and its delta page, both read from the file, as a read whose leaf the cache took kept neither")
+        void recordLeftOutMadeFromFile(@TempDir Path directory) throws Exception {
+            try (var tree = new Tree(directory, 64 * MIB, false).filled()) {
+                tree.makeRecords(100);
+                tree.cache.clearForTests();
+                // A lookup takes the leaf into the cache, and neither its base nor its delta page
+                var record = tree.path(key(100)).getLast();
+                assertTrue(TreeSearch.contains(tree.pages, tree.root, MemorySegment.ofArray(key(100))));
+                var leaf = tree.cache.peek(record);
+                assertNotNull(leaf, "the leaf a lookup read");
+                var base = TreeNodes.base(leaf, record);
+                assertNull(tree.cache.peek(base), "the base of a leaf the cache took");
+                assertNull(tree.cache.peek(record.unit()), "the delta page of a leaf the cache took");
+
+                // With the leaf evicted, a checkpoint that rewrites the record over the same base, the next one not
+                // following at once, leaves the new leaf and its delta page out of the cache
+                tree.cache.clearForTests();
+                tree.apply(List.of(new TreeUpdate.Op(segment(key(100)), segment(new byte[152]))),
+                        tree.pages.writer(tree.random.nextLong(), () -> false, () -> false));
+                var rewritten = tree.path(key(100)).getLast();
+                assertTrue(rewritten.isRecord(), "the leaf of the key is no delta record");
+                assertEquals(base, TreeNodes.base(tree.unit(rewritten), rewritten), "the record changed its base");
+                assertNull(tree.cache.peek(rewritten), "the leaf the checkpoint left out");
+                assertNull(tree.cache.peek(rewritten.unit()), "the delta page the checkpoint left out");
+                assertNull(tree.cache.peek(base), "the base");
+
+                // The read makes the leaf of two reads of the file: the delta page and the base
+                var acquires = tree.pool.acquiresForTests();
+                var made = tree.pages.read(rewritten, PageFile.NODE, true);
+                assertEquals(2, tree.pool.acquiresForTests() - acquires, "the units read from the file");
+                assertSame(made, tree.cache.peek(rewritten), "the leaf an unscreened read made");
+                assertNull(tree.cache.peek(base), "the base of a leaf the cache took");
+                assertNull(tree.cache.peek(rewritten.unit()), "the delta page of a leaf the cache took");
+                assertArrayEquals(new byte[152], read(tree.pages, tree.root, key(100)));
+            }
+        }
+
+        @Test
         @DisplayName("read a delta page once for all the records of it that the checkpoint replaces, and leave it out of a screening cache")
         void deltaPageReadOnce(@TempDir Path directory) throws Exception {
             try (var tree = new Tree(directory, 64 * MIB, false).filled()) {

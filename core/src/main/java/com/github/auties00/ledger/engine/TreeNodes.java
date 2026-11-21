@@ -452,7 +452,7 @@ final class TreeNodes {
     }
 
     /// Checks that a node written up to `position` fills `unit`, which the sizes of its entries or children gave.
-    private static void filled(byte[] unit, int position) {
+    static void filled(byte[] unit, int position) {
         if (position != unit.length) {
             throw new IllegalStateException("A node of " + (unit.length - PageFormat.HEADER) + " bytes of content took "
                     + (position - PageFormat.HEADER));

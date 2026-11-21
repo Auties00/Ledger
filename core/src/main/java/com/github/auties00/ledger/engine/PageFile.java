@@ -206,7 +206,7 @@ final class PageFile implements AutoCloseable {
     /// content ([PageFormat#cachedLength(int, int)]); one read past it holds its whole pages.
     ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
-    /// @param cached whether to keep the unit in the cache, and the units a delta record's leaf is made of
+    /// @param cached whether to keep the unit in the cache
     /// @throws LedgerCorruptedException if the unit fails authentication or is not the one `ref` names
     /// @throws LedgerIoException if the file cannot be read
     byte[] read(PageRef ref, byte kind, boolean cached) {
@@ -244,7 +244,7 @@ final class PageFile implements AutoCloseable {
 
     /// {@return the plaintext of the unit `ref` names, from the file, for a read that found the cache without it}
     ///
-    /// A delta record still reads its delta page and its base through the cache.
+    /// A delta record reads its delta page and its base from the cache if it holds them, and caches neither.
     ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     /// @param cached whether to keep the unit in the cache
@@ -257,14 +257,14 @@ final class PageFile implements AutoCloseable {
 
     /// {@return the plaintext of the unit `ref` names, from the file, for a read that found the cache without it}
     ///
-    /// A delta record still reads its delta page and its base through the cache. A screened read of a delta record
-    /// asks the cache first whether it takes the leaf: if not, neither the base nor the delta page goes to the cache,
-    /// the leaf is [refused][PageCache#refuse(long, PageRef, byte\[\])], and the delta page, which the other records of
-    /// its page share, is refused with it, so their reads take it back ([PageCache#recallWeak(long, PageRef)]) without
-    /// reading it while the collector has not taken it. A read that caches what it reads as read first takes back a
-    /// unit, or the leaf of a delta record, the cache [refused][#recalled(PageRef, byte, int)] lately, reading nothing;
-    /// that recall counts as the read, and caches the unit a read later than a read from the file would, and a recall
-    /// that finds nothing counts as none.
+    /// A delta record reads its delta page and its base from the cache if it holds them, and caches neither: the cache
+    /// keeps only the leaf they make, if it takes it, and a screened read whose leaf it does not take
+    /// [refuses][PageCache#refuse(long, PageRef, byte\[\])] the leaf. A delta page read from the file, which the other
+    /// records of its page share, is refused, so their reads take it back ([PageCache#recallWeak(long, PageRef)])
+    /// without reading it while the collector has not taken it. A read that caches what it reads as read first takes
+    /// back a unit, or the leaf of a delta record, the cache [refused][#recalled(PageRef, byte, int)] lately, reading
+    /// nothing; that recall counts as the read, and caches the unit a read later than a read from the file would, and a
+    /// recall that finds nothing counts as none.
     ///
     /// @param kind the kind the unit must have, or [#NODE] for a leaf or a branch
     /// @param cached whether to keep the unit in the cache
@@ -283,14 +283,14 @@ final class PageFile implements AutoCloseable {
             }
         }
         if (ref.isRecord()) {
-            // The delta page and the base go to the cache as the entries it evicts first: the leaf they make is what a
-            // read uses again, and holding all three filled the cache with each leaf twice. The leaf's admission is
-            // decided before they are read: a base or a delta page cached for a leaf the cache refused would stay for
-            // a read that rarely comes, as random reads seldom reach the other records of a delta page
+            // Only the leaf goes to the cache: it is what a read uses again, while its base and its delta page are read
+            // again only to make it once the cache evicted it, and random reads seldom reach the other records of a
+            // delta page. The delta page is refused rather than cached, so the reads of those records take it back
+            // while the collector has not taken it
             var admitted = cache.admits(PageCache.dataKey(ref.page(), ref.slot()), ref, screened);
             var leaf = DeltaLeaves.materialize(ref, (unit, unitKind) -> unitKind == PageFormat.DELTA
-                    ? deltaPage(unit, cached, admitted)
-                    : read(unit, unitKind, cached && admitted, false));
+                    ? deltaPage(unit, cached)
+                    : read(unit, unitKind, false, false));
             if (!kindMatches(leaf[PageFormat.KIND], kind)) {
                 throw new LedgerCorruptedException(path + " holds a delta record where a branch belongs, at page " + ref.page(), null);
             }
@@ -312,15 +312,15 @@ final class PageFile implements AutoCloseable {
 
     /// {@return the plaintext of the delta page `ref` names, for a read that makes the leaf of one of its records}
     ///
-    /// A page the cache holds counts as read. Otherwise, for a leaf the cache takes, the page goes to the cache as an
-    /// entry it evicts first; for one it refused, the page is refused too, held weakly, and the reads of the page's
-    /// other records find it there ([PageCache#recallWeak(long, PageRef)]) until the collector takes it or a read
-    /// whose leaf the cache takes caches it. A refused page is opened to the end of its content, as the cache keeps
-    /// it, so a [recall][PageCache#recall(long, PageRef, int)] of it caches what any read would.
+    /// A page the cache holds, as a checkpoint that wrote or kept it left it, counts as read. Otherwise the page is
+    /// refused, held weakly, whether or not the cache takes the leaf, and the reads of the page's other records find
+    /// it there ([PageCache#recallWeak(long, PageRef)]) until the collector takes it. A refused page is opened to the
+    /// end of its content, as the cache keeps it, so a [recall][PageCache#recall(long, PageRef, int)] of it caches what
+    /// any read would.
     ///
-    /// @param cached whether the read keeps what it reads in the cache, or refuses it if not `admitted`
-    /// @param admitted whether the cache takes the leaf the read makes; if not, the read is screened
-    private byte[] deltaPage(PageRef ref, boolean cached, boolean admitted) {
+    /// @param cached whether the read keeps what it reads in the cache; if not, a page the cache does not hold is read
+    ///               from the file and neither cached nor refused
+    private byte[] deltaPage(PageRef ref, boolean cached) {
         var hit = cache.get(ref);
         if (hit != null && kindMatches(hit[PageFormat.KIND], PageFormat.DELTA)) {
             return hit;
@@ -329,18 +329,12 @@ final class PageFile implements AutoCloseable {
             return load(ref, PageFormat.DELTA, false, false);
         }
         var refused = recalledWeak(ref, PageFormat.DELTA);
-        if (admitted) {
-            if (refused == null) {
-                return load(ref, PageFormat.DELTA, true, false);
-            }
-            cache.put(ref, refused, false);
-            return refused;
-        }
         if (refused != null) {
             return refused;
         }
         var page = open(ref, PageFormat.DELTA, true, true);
-        // Refused before the leaf it makes, so the leaf, refused last, takes the first slot of a pair they share
+        // Refused before the leaf it makes, so a leaf the cache refuses, refused last, takes the first slot of a pair
+        // they share
         cache.refuse(PageCache.dataKey(ref.page(), ref.slot()), ref, page);
         return page;
     }
