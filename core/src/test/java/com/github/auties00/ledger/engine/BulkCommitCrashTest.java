@@ -25,8 +25,8 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 /// Power loss at sampled forces of a workload past [LiveLedger#BULK_RUN_WRITES]: bulk commits appending to one run,
 /// their values moved to the log by the spill, beside large values, small overwrites and removals of the run's keys,
-/// a checkpoint and a reopen. The store recovers a state between its last durable and its last visible commit, keeps
-/// it through a checkpoint, and opens to it again.
+/// a checkpoint and a reopen, with keys of one length, or of several in some bulk commits. The store recovers a state
+/// between its last durable and its last visible commit, keeps it through a checkpoint, and opens to it again.
 class BulkCommitCrashTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> MESSAGES = Keyspace.paged("messages", KeyCodec.utf8(), ValueCodec.utf8());
@@ -56,14 +56,17 @@ class BulkCommitCrashTest {
 
     private static final class Workload {
         final boolean encrypted;
+        // Whether some bulk commits put keys of other lengths than the rest
+        final boolean mixed;
         final List<Map<String, TreeMap<String, String>>> history = new ArrayList<>();
         final Map<String, TreeMap<String, String>> state = new TreeMap<>();
         int visible;
         int durable;
         int appended;
 
-        Workload(boolean encrypted) {
+        Workload(boolean encrypted, boolean mixed) {
             this.encrypted = encrypted;
+            this.mixed = mixed;
             state.put(MESSAGES.name(), new TreeMap<>());
             state.put(CHATS.name(), new TreeMap<>());
             history.add(copy(state));
@@ -80,6 +83,9 @@ class BulkCommitCrashTest {
                     var next = copy(state);
                     for (var i = 0; i < BULK; i++) {
                         var key = "b%02d-%05d".formatted(step, i);
+                        if (mixed && (step == 2 || step == 7) && i % 7 == 0) {
+                            key += "x".repeat(1 + i % 5);
+                        }
                         var value = value(key, step, LENGTHS[(i + step) % LENGTHS.length]);
                         batch.put(MESSAGES, key, value);
                         next.get(MESSAGES.name()).put(key, value);
@@ -167,12 +173,12 @@ class BulkCommitCrashTest {
         return contents;
     }
 
-    @ParameterizedTest(name = "encrypted {0}, part {1}")
-    @CsvSource({"true,0", "true,1", "false,0"})
+    @ParameterizedTest(name = "encrypted {0}, part {1}, keys of several lengths {2}")
+    @CsvSource({"true,0,false", "true,1,false", "false,0,false", "false,1,true"})
     @DisplayName("recovers a state between the last durable and the last visible commit at sampled forces of a workload of appending bulk commits, spills and large values")
-    void sampledForces(boolean encrypted, int part) throws Exception {
+    void sampledForces(boolean encrypted, int part, boolean mixed) throws Exception {
         var dry = CrashFileSystem.create();
-        var dryRun = new Workload(encrypted);
+        var dryRun = new Workload(encrypted, mixed);
         dryRun.run(dry.getPath("/store"));
         assertTrue(dryRun.appended > 0, "no bulk commit appended");
         var forces = dry.forces();
@@ -185,7 +191,7 @@ class BulkCommitCrashTest {
         for (var force : points) {
             var disk = CrashFileSystem.create();
             disk.stopAtForce(force);
-            var workload = new Workload(encrypted);
+            var workload = new Workload(encrypted, mixed);
             workload.run(disk.getPath("/store"));
             var survivor = disk.afterPowerLoss(new Random(random.nextLong()));
             Map<String, TreeMap<String, String>> recovered;
