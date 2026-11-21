@@ -1049,12 +1049,14 @@ class BulkCommitRunTest {
             var run = ledger.state(MESSAGES).run;
             var lengths = run.arrayLengthsForTests();
             var slots = run.slotsForTests();
-            assertEquals(BULK, lengths[0]);
+            assertEquals(Integer.BYTES, run.keyLengthForTests());
+            assertEquals(0, lengths[0], "a run of keys of one length kept their ends");
             // Overwrites of the run's keys alone: the append takes nothing and leaves the run as it was
             batch = ledger.newBatch();
             puts(batch, expected, 0, BULK, 1, LENGTHS);
             ledger.commit(batch).awaitDurable();
             assertSame(run, ledger.state(MESSAGES).run);
+            assertEquals(Integer.BYTES, run.keyLengthForTests(), "an append that took no key made the ends of the keys");
             assertArrayEquals(lengths, run.arrayLengthsForTests());
             assertEquals(slots, run.slotsForTests());
             verify(ledger, expected);
@@ -1067,7 +1069,9 @@ class BulkCommitRunTest {
             assertTrue(appended.sharesArraysForTests(run));
             assertEquals(BULK + 100, appended.size());
             var grown = appended.arrayLengthsForTests();
-            assertEquals(Math.max(BULK + 100, lengths[0] + (lengths[0] >> 1)), grown[0], "the ends of the keys");
+            // The append made the ends of the run's keys, with the room the ends of BULK keys would have grown to
+            assertEquals(0, appended.keyLengthForTests());
+            assertEquals(Math.max(BULK + 100, BULK + (BULK >> 1)), grown[0], "the ends of the keys");
             assertEquals(lengths[1], grown[1], "the words");
             assertTrue(4L * (BULK + 100) <= 3L * slots, "the test's run needs a larger table");
             assertEquals(slots, appended.slotsForTests(), "the hash table");
@@ -1113,7 +1117,13 @@ class BulkCommitRunTest {
                 assertThrows(IllegalArgumentException.class, () -> ledger.commit(taken));
                 assertSame(run, ledger.state(MESSAGES).run, "a commit taken back published a view");
                 assertEquals(BULK, run.size());
-                assertArrayEquals(lengths, run.arrayLengthsForTests(), "the room of a commit taken back was kept");
+                // The commit made the ends of the run's keys as it took its first key, and leaves them to its entries
+                assertEquals(0, lengths[0]);
+                assertEquals(0, run.keyLengthForTests());
+                var after = run.arrayLengthsForTests();
+                assertEquals(BULK, after[0], "the room of a commit taken back was kept");
+                assertArrayEquals(Arrays.copyOfRange(lengths, 1, lengths.length), Arrays.copyOfRange(after, 1, after.length),
+                        "the room of a commit taken back was kept");
                 assertEquals(slots, run.slotsForTests(), "the hash table of a commit taken back was kept");
                 for (var message = BULK; message < 5 * BULK; message += 97) {
                     assertTrue(ledger.get(MESSAGES, key(message)).isEmpty(), "message " + message + " of a commit taken back");
@@ -1352,6 +1362,107 @@ class BulkCommitRunTest {
             verify(ledger, expected);
             ledger.checkpoint();
             verify(ledger, expected);
+        }
+    }
+
+    /// {@return the key of `message` of `length` bytes, at least 4, unique by its first four}
+    private static byte[] key(int message, int length) {
+        var key = new byte[length];
+        ByteBuffer.wrap(key).putInt(message);
+        for (var i = Integer.BYTES; i < length; i++) {
+            key[i] = (byte) (message * 7 + i);
+        }
+        return key;
+    }
+
+    @ParameterizedTest(name = "encrypted: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("readers of every older view of a run of keys of one length find, scan, count and order its keys while bulk commits append keys of that length and of others, which make the ends of every key, across chunks of the keys")
+    void oneLengthAppendsUnderReaders(boolean encrypted, @TempDir Path directory) throws Exception {
+        // New keys per commit and, if not 0, every how many is of another length than 24 bytes: the first commit's
+        // keys fill a chunk of 10,922 keys and part of the next, and no commit's are a multiple of it
+        int[][] commits = {{12_000, 0}, {7_001, 11}, {5_003, 0}, {4_007, 13}};
+        try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
+            var expected = new TreeMap<byte[], byte[]>(Arrays::compareUnsigned);
+            var stop = new AtomicBoolean();
+            var failure = new AtomicReference<Throwable>();
+            var readers = new ArrayList<Thread>();
+            var snapshots = new ArrayList<Snapshot>();
+            try {
+                var next = 0;
+                for (var commit = 0; commit < commits.length; commit++) {
+                    var batch = ledger.newBatch();
+                    for (var i = 0; i < commits[commit][0]; i++) {
+                        var message = next++;
+                        var every = commits[commit][1];
+                        var key = key(message, every > 0 && i % every == 0 ? 9 + message % 32 : 24);
+                        var value = value(message, commit, LENGTHS);
+                        batch.put(MESSAGES, key, value);
+                        expected.put(key, value);
+                    }
+                    ledger.commit(batch);
+                    var run = ledger.state(MESSAGES).run;
+                    assertEquals(next, run.size(), "the bulk commit did not append to the run");
+                    assertEquals(commit == 0 ? 24 : 0, run.keyLengthForTests());
+                    // A reader of this view, whose order a scan makes beside the next commit's append
+                    var snapshot = ledger.snapshot();
+                    snapshots.add(snapshot);
+                    var state = new TreeMap<>(expected);
+                    var seed = commit;
+                    readers.add(Thread.ofPlatform().start(() -> readView(snapshot, state, stop, failure, seed)));
+                }
+                Thread.sleep(100);
+            } finally {
+                stop.set(true);
+                for (var reader : readers) {
+                    reader.join();
+                }
+                for (var snapshot : snapshots) {
+                    snapshot.close();
+                }
+            }
+            if (failure.get() != null) {
+                throw new AssertionError(failure.get());
+            }
+            verifyKeys(ledger, expected);
+            ledger.checkpoint();
+            verifyKeys(ledger, expected);
+        }
+    }
+
+    // Reads `view`, whose messages are those of `state`, numbered from 0, until `stop` is set and twice at least: point
+    // reads of its keys and of keys of later commits, a count, and scans between two of its keys
+    private static void readView(View view, TreeMap<byte[], byte[]> state, AtomicBoolean stop,
+                                 AtomicReference<Throwable> failure, int seed) {
+        var random = new Random(seed);
+        var keys = new ArrayList<>(state.keySet());
+        try {
+            for (var round = 0; !stop.get() || round < 2; round++) {
+                for (var i = 0; i < 200; i++) {
+                    var key = keys.get(random.nextInt(keys.size()));
+                    assertArrayEquals(state.get(key), view.get(MESSAGES, key).orElseThrow(), "a key of the view");
+                    var later = state.size() + random.nextInt(10_000);
+                    assertTrue(view.get(MESSAGES, key(later, 24)).isEmpty(), "a key of a later commit");
+                }
+                assertEquals(state.size(), view.size(MESSAGES), "keys counted");
+                var from = keys.get(random.nextInt(keys.size()));
+                var to = keys.get(random.nextInt(keys.size()));
+                if (Arrays.compareUnsigned(from, to) > 0) {
+                    var swap = from;
+                    from = to;
+                    to = swap;
+                }
+                var wanted = state.subMap(from, to);
+                var range = view.range(MESSAGES, KeyRange.between(from, to), Integer.MAX_VALUE);
+                assertEquals(wanted.size(), range.size(), "keys scanned");
+                var index = 0;
+                for (var entry : wanted.entrySet()) {
+                    assertArrayEquals(entry.getKey(), range.get(index).key(), "keys scanned out of order");
+                    assertArrayEquals(entry.getValue(), range.get(index++).value());
+                }
+            }
+        } catch (Throwable throwable) {
+            failure.compareAndSet(null, throwable);
         }
     }
 

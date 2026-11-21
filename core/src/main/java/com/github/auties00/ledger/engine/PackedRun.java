@@ -38,7 +38,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /// shorter than [SpillQueue#LOG_VALUE_MIN] in the replay's chunks ([ReplayValues]), and a longer one stays in the log,
 /// where the run keeps its place, its tag and its stamp, which the tag binds, as a [LogValue] would. A message that took a
 /// chain, a version, a [LogValue], an entry of the hash index, of the dirty and blind lists, and a node of the ordered
-/// map once scanned, about 300 bytes over its key and value, takes about 50 here.
+/// map once scanned, about 300 bytes over its key and value, takes about 50 here. A run whose keys all have one length,
+/// as the keys of most key spaces do, keeps no ends: each key lies where the index of its entry puts it ([KeyLayout]),
+/// until its builder places a key of another length or a commit appends to it, which make the ends of every key.
 ///
 /// A bulk commit makes a run too ([#committed()]): the puts of new keys of a paged key space whose latest tree holds
 /// none of its entries, at least [LiveLedger#BULK_RUN_WRITES] of them in one batch, which the commit counts as it
@@ -91,6 +93,8 @@ final class PackedRun {
     static final int KEY_CHUNK = 1 << 18;
     private static final int KEY_CHUNK_BITS = Integer.numberOfTrailingZeros(KEY_CHUNK);
     private static final int KEY_OFFSET_MASK = KEY_CHUNK - 1;
+    // The bits of the index of an entry, which is below MAX_ENTRIES
+    private static final int ENTRY_BITS = 24;
     /// The words of the entries a chunk holds: 64 KiB, which never moves once a bulk commit's run has it, as the spill
     /// switches the words of earlier commits while a later one appends.
     static final int WORD_CHUNK = 1 << 13;
@@ -145,6 +149,9 @@ final class PackedRun {
         if (KeyCodec.MAX_LENGTH > KEY_CHUNK) {
             throw new ExceptionInInitializerError("A key does not fit a chunk of the keys");
         }
+        if (MAX_ENTRIES >= 1 << ENTRY_BITS) {
+            throw new ExceptionInInitializerError("The index of an entry does not fit the division of a key layout");
+        }
     }
 
     // The arrays of the run, which every view of it shares
@@ -194,7 +201,7 @@ final class PackedRun {
         this.pages = pages;
         this.previous = previous;
         this.lock = new Object();
-        this.order = committed ? null : mergeSorted(storage.keys, storage.keyEnds, size);
+        this.order = committed ? null : mergeSorted(storage.keys, storage.layout, storage.keyEnds, size);
         this.firstHome = firstHome;
         this.endHome = endHome;
         this.homeSections = homeSections;
@@ -289,9 +296,14 @@ final class PackedRun {
     /// {@return the entry of `key`, whose hash is `hash` ([Segments#hash(MemorySegment)]), or -1 if the view holds none}
     int find(MemorySegment key, int hash) {
         var storage = this.storage;
-        // Loaded after the view, so they hold every entry of it; a slot of an entry past the view is skipped, not an end
+        // Loaded after the view, so they hold every entry of it; a slot of an entry past the view is skipped, not an end.
+        // The layout before the ends, which a run publishes before it lets go of its layout
         var slots = storage.slots;
-        var keyEnds = storage.keyEnds;
+        var layout = storage.layout;
+        if (layout != null && layout.length() != key.byteSize()) {
+            return -1;
+        }
+        var keyEnds = layout == null ? storage.keyEnds : null;
         var keys = storage.keys;
         var size = this.size;
         var mask = slots.length - 1;
@@ -303,8 +315,8 @@ final class PackedRun {
             }
             var entry = (slot & ENTRY_MASK) - 1;
             if ((slot & TAG_MASK) == tag && entry < size) {
-                var start = keyStart(keyEnds, entry);
-                var length = keyEnds[entry] - start;
+                var start = keyStart(layout, keyEnds, entry);
+                var length = keyEnd(layout, keyEnds, start, entry) - start;
                 if (length == key.byteSize() && Segments.compare(keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK, length, key) == 0) {
                     return entry;
                 }
@@ -317,7 +329,11 @@ final class PackedRun {
         var hash = Segments.hash(key);
         var storage = this.storage;
         var slots = storage.slots;
-        var keyEnds = storage.keyEnds;
+        var layout = storage.layout;
+        if (layout != null && layout.length() != key.length) {
+            return -1;
+        }
+        var keyEnds = layout == null ? storage.keyEnds : null;
         var keys = storage.keys;
         var size = this.size;
         var mask = slots.length - 1;
@@ -329,8 +345,8 @@ final class PackedRun {
             }
             var entry = (slot & ENTRY_MASK) - 1;
             if ((slot & TAG_MASK) == tag && entry < size) {
-                var start = keyStart(keyEnds, entry);
-                var length = keyEnds[entry] - start;
+                var start = keyStart(layout, keyEnds, entry);
+                var length = keyEnd(layout, keyEnds, start, entry) - start;
                 if (length == key.length
                         && Segments.compare(keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK, length, key, 0, key.length) == 0) {
                     return entry;
@@ -352,26 +368,32 @@ final class PackedRun {
     /// {@return the key of `entry`, a read-only slice of the run's keys}
     MemorySegment key(int entry) {
         var storage = this.storage;
-        var keyEnds = storage.keyEnds;
-        var start = keyStart(keyEnds, entry);
-        return storage.keyViews[start >>> KEY_CHUNK_BITS].asSlice(start & KEY_OFFSET_MASK, keyEnds[entry] - start);
+        var layout = storage.layout;
+        var keyEnds = layout == null ? storage.keyEnds : null;
+        var start = keyStart(layout, keyEnds, entry);
+        return storage.keyViews[start >>> KEY_CHUNK_BITS].asSlice(start & KEY_OFFSET_MASK,
+                keyEnd(layout, keyEnds, start, entry) - start);
     }
 
     /// {@return the order of the key of `chain` and that of `entry`, as [Segments#compare(MemorySegment, MemorySegment)]
     /// gives, without a view of the entry's key}
     int compareChain(Chain chain, int entry) {
         var storage = this.storage;
-        var keyEnds = storage.keyEnds;
-        var start = keyStart(keyEnds, entry);
-        return chain.compareKey(storage.keyViews[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK, keyEnds[entry] - start);
+        var layout = storage.layout;
+        var keyEnds = layout == null ? storage.keyEnds : null;
+        var start = keyStart(layout, keyEnds, entry);
+        return chain.compareKey(storage.keyViews[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK,
+                keyEnd(layout, keyEnds, start, entry) - start);
     }
 
     /// {@return the order of the key of `entry` and `key`, as [Segments#compare(MemorySegment, MemorySegment)] gives}
     int compareKey(int entry, MemorySegment key) {
         var storage = this.storage;
-        var keyEnds = storage.keyEnds;
-        var start = keyStart(keyEnds, entry);
-        return Segments.compare(storage.keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK, keyEnds[entry] - start, key);
+        var layout = storage.layout;
+        var keyEnds = layout == null ? storage.keyEnds : null;
+        var start = keyStart(layout, keyEnds, entry);
+        return Segments.compare(storage.keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK,
+                keyEnd(layout, keyEnds, start, entry) - start, key);
     }
 
     /// {@return the value of `entry`, which puts its key, read-only: a slice of a chunk or of a home, or read from the
@@ -704,10 +726,18 @@ final class PackedRun {
         return storage.slots.length;
     }
 
-    /// {@return the entries the arrays of the run have room for, for tests: `keyEnds`, the words of all chunks, then
-    /// the places in the log of all chunks of the logged values}
+    /// {@return the entries the arrays of the run have room for, for tests: `keyEnds`, 0 if the run keeps no ends of
+    /// its keys, the words of all chunks, then the places in the log of all chunks of the logged values}
     int[] arrayLengthsForTests() {
-        return new int[]{storage.keyEnds.length, wordRoom(storage.words), logRoom(storage.places.logs())};
+        var keyEnds = storage.keyEnds;
+        return new int[]{keyEnds == null ? 0 : keyEnds.length, wordRoom(storage.words), logRoom(storage.places.logs())};
+    }
+
+    /// {@return the bytes every key of the run has, which place them, or 0 if the run keeps the ends of its keys, for
+    /// tests}
+    int keyLengthForTests() {
+        var layout = storage.layout;
+        return layout == null ? 0 : layout.length();
     }
 
     // The words `words` has room for, over all its chunks
@@ -728,12 +758,57 @@ final class PackedRun {
         return room;
     }
 
+    // Where the key of `entry` starts, as its chunk times KEY_CHUNK plus its offset in the chunk: where `layout` puts it
+    // if the keys of the run share one, else from `keyEnds`, which a reader loads after the layout, and only if that is
+    // null
+    private static int keyStart(KeyLayout layout, int[] keyEnds, int entry) {
+        return layout != null ? layout.start(entry) : keyStart(keyEnds, entry);
+    }
+
+    // Where the key of `entry`, which starts at `start`, ends, from the arrays keyStart(KeyLayout, int[], int) takes
+    private static int keyEnd(KeyLayout layout, int[] keyEnds, int start, int entry) {
+        return layout != null ? start + layout.length() : keyEnds[entry];
+    }
+
     // Where the key of `entry` starts, given where each key ends: where the key before it ends, unless the key did not
     // fit the rest of that chunk, or starts the keys of a commit, and starts the chunk of its last byte; a key has at
     // least one byte
     private static int keyStart(int[] keyEnds, int entry) {
         var previous = entry == 0 ? 0 : keyEnds[entry - 1];
         return Math.max(previous, (keyEnds[entry] - 1) & ~KEY_OFFSET_MASK);
+    }
+
+    /// The place of every key of a run whose keys all have `length` bytes, which keeps no ends of its keys: a chunk of
+    /// the keys holds `perChunk` of them, and the key of entry `e` lies at `(e % perChunk) * length` of chunk
+    /// `e / perChunk`, where the builder places it, since a key that does not fit the rest of a chunk starts the next.
+    ///
+    /// The division is a multiplication and a shift ([#chunk(int)]): `multiplier` is `2^shift / perChunk` rounded up,
+    /// and `shift` is 24 plus the bits of `perChunk - 1`, which makes the quotient exact for every index below 2^24
+    /// (Granlund and Montgomery, "Division by Invariant Integers using Multiplication", theorem 4.2).
+    ///
+    /// @param length the bytes of every key, at least 1
+    /// @param perChunk the keys a chunk holds
+    /// @param multiplier the multiplier of the division by `perChunk`
+    /// @param shift the shift of the division by `perChunk`
+    record KeyLayout(int length, int perChunk, long multiplier, int shift) {
+        /// {@return the layout of keys of `length` bytes, from 1 to [PackedRun#KEY_CHUNK]}
+        static KeyLayout of(int length) {
+            var perChunk = KEY_CHUNK / length;
+            var shift = ENTRY_BITS + Integer.SIZE - Integer.numberOfLeadingZeros(perChunk - 1);
+            return new KeyLayout(length, perChunk, ((1L << shift) + perChunk - 1) / perChunk, shift);
+        }
+
+        /// {@return the chunk of the key of `entry`, an index below 2^24: `entry / perChunk`}
+        int chunk(int entry) {
+            return (int) (entry * multiplier >>> shift);
+        }
+
+        /// {@return where the key of `entry` starts, as its chunk times [PackedRun#KEY_CHUNK] plus its offset in the
+        /// chunk}
+        int start(int entry) {
+            var chunk = chunk(entry);
+            return chunk << KEY_CHUNK_BITS | (entry - chunk * perChunk) * length;
+        }
     }
 
     private static int chunkOf(long value) {
@@ -1187,8 +1262,10 @@ final class PackedRun {
     private int[] mergeOrder(Storage storage, int[] made) {
         var from = made == null ? 0 : made.length;
         var keys = storage.keys;
-        var keyEnds = storage.keyEnds;
-        var sorted = KeySort.sort(keys, keyEnds, from, size);
+        // Loaded once for the sort, the layout first: a commit that appends meanwhile may make the ends
+        var layout = storage.layout;
+        var keyEnds = layout == null ? storage.keyEnds : null;
+        var sorted = KeySort.sort(keys, layout, keyEnds, from, size);
         storage.sorted.addAndGet(size - from);
         if (made == null) {
             return sorted;
@@ -1197,7 +1274,7 @@ final class PackedRun {
         var left = 0;
         var right = 0;
         for (var out = 0; out < merged.length; out++) {
-            if (left < made.length && (right >= sorted.length || compareEntries(keys, keyEnds, made[left], sorted[right]) < 0)) {
+            if (left < made.length && (right >= sorted.length || compareEntries(keys, layout, keyEnds, made[left], sorted[right]) < 0)) {
                 merged[out] = made[left++];
             } else {
                 merged[out] = sorted[right++];
@@ -1209,7 +1286,7 @@ final class PackedRun {
     // The entries of a replay's run sorted by key, which the open makes once, at its peak of heap: a bottom-up merge
     // sort of their indexes, which moves no key and takes 4 bytes of scratch per entry where KeySort takes 20, and
     // leaves KeySort to the bulk commits' runs, whose orders it merges view by view
-    private static int[] mergeSorted(byte[][] keys, int[] keyEnds, int size) {
+    private static int[] mergeSorted(byte[][] keys, KeyLayout layout, int[] keyEnds, int size) {
         var sorted = new int[size];
         for (var i = 0; i < size; i++) {
             sorted[i] = i;
@@ -1227,7 +1304,7 @@ final class PackedRun {
                 var left = low;
                 var right = middle;
                 for (var out = low; out < high; out++) {
-                    if (left < middle && (right >= high || compareEntries(keys, keyEnds, from[left], from[right]) <= 0)) {
+                    if (left < middle && (right >= high || compareEntries(keys, layout, keyEnds, from[left], from[right]) <= 0)) {
                         to[out] = from[left++];
                     } else {
                         to[out] = from[right++];
@@ -1242,11 +1319,12 @@ final class PackedRun {
     }
 
     // The order of the keys of entries `left` and `right`
-    private static int compareEntries(byte[][] keys, int[] keyEnds, int left, int right) {
-        var leftStart = keyStart(keyEnds, left);
-        var rightStart = keyStart(keyEnds, right);
-        return Segments.compare(keys[leftStart >>> KEY_CHUNK_BITS], leftStart & KEY_OFFSET_MASK, keyEnds[left] - leftStart,
-                keys[rightStart >>> KEY_CHUNK_BITS], rightStart & KEY_OFFSET_MASK, keyEnds[right] - rightStart);
+    private static int compareEntries(byte[][] keys, KeyLayout layout, int[] keyEnds, int left, int right) {
+        var leftStart = keyStart(layout, keyEnds, left);
+        var rightStart = keyStart(layout, keyEnds, right);
+        return Segments.compare(keys[leftStart >>> KEY_CHUNK_BITS], leftStart & KEY_OFFSET_MASK,
+                keyEnd(layout, keyEnds, leftStart, left) - leftStart, keys[rightStart >>> KEY_CHUNK_BITS],
+                rightStart & KEY_OFFSET_MASK, keyEnd(layout, keyEnds, rightStart, right) - rightStart);
     }
 
     /// Sorts entries of a run by their keys, which are all different, as [ChainSort] sorts chains: by the first 8 bytes
@@ -1260,6 +1338,8 @@ final class PackedRun {
         private static final int DIGIT_BITS = 8;
         private static final int BUCKETS = 1 << DIGIT_BITS;
         private final byte[][] keys;
+        // The layout of the keys, or null and where each key ends
+        private final KeyLayout layout;
         private final int[] keyEnds;
         // Per position of the entries being sorted, 8 bytes of its key; and the arrays a pass moves them through
         private final long[] words;
@@ -1267,8 +1347,9 @@ final class PackedRun {
         private final int[] scratchEntries;
         private final int[] counts;
 
-        private KeySort(byte[][] keys, int[] keyEnds, int length) {
+        private KeySort(byte[][] keys, KeyLayout layout, int[] keyEnds, int length) {
             this.keys = keys;
+            this.layout = layout;
             this.keyEnds = keyEnds;
             this.words = new long[length];
             this.scratchWords = new long[length];
@@ -1276,9 +1357,9 @@ final class PackedRun {
             this.counts = new int[BUCKETS];
         }
 
-        /// {@return the entries from `from`, included, to `to`, excluded, of the run whose keys lie in `keys` and end
-        /// at `keyEnds`, in the order of their keys}
-        static int[] sort(byte[][] keys, int[] keyEnds, int from, int to) {
+        /// {@return the entries from `from`, included, to `to`, excluded, of the run whose keys lie in `keys` where
+        /// `layout` places them, or, if it is `null`, end at `keyEnds`, in the order of their keys}
+        static int[] sort(byte[][] keys, KeyLayout layout, int[] keyEnds, int from, int to) {
             var length = to - from;
             var entries = new int[length];
             for (var i = 0; i < length; i++) {
@@ -1287,7 +1368,7 @@ final class PackedRun {
             if (length < 2) {
                 return entries;
             }
-            var sort = new KeySort(keys, keyEnds, length);
+            var sort = new KeySort(keys, layout, keyEnds, length);
             if (length <= SMALL_RUN) {
                 sort.compareSort(entries, 0, length);
                 return entries;
@@ -1301,8 +1382,8 @@ final class PackedRun {
 
         // The 8 bytes of the key of `entry` at `at`, big-endian, zero past its end
         private long word(int entry, int at) {
-            var start = keyStart(keyEnds, entry);
-            var length = keyEnds[entry] - start;
+            var start = keyStart(layout, keyEnds, entry);
+            var length = keyEnd(layout, keyEnds, start, entry) - start;
             if (at >= length) {
                 return 0;
             }
@@ -1344,7 +1425,8 @@ final class PackedRun {
             var longer = false;
             for (var i = from; i < to; i++) {
                 var entry = entries[i];
-                longer |= keyEnds[entry] - keyStart(keyEnds, entry) > at;
+                var start = keyStart(layout, keyEnds, entry);
+                longer |= keyEnd(layout, keyEnds, start, entry) - start > at;
                 words[i] = word(entry, at);
             }
             if (!longer) {
@@ -1404,7 +1486,7 @@ final class PackedRun {
                 for (var i = from + 1; i < to; i++) {
                     var entry = entries[i];
                     var j = i - 1;
-                    while (j >= from && compareEntries(keys, keyEnds, entries[j], entry) > 0) {
+                    while (j >= from && compareEntries(keys, layout, keyEnds, entries[j], entry) > 0) {
                         entries[j + 1] = entries[j];
                         j--;
                     }
@@ -1415,14 +1497,14 @@ final class PackedRun {
             var middle = (from + to) >>> 1;
             compareSort(entries, from, middle);
             compareSort(entries, middle, to);
-            if (compareEntries(keys, keyEnds, entries[middle - 1], entries[middle]) <= 0) {
+            if (compareEntries(keys, layout, keyEnds, entries[middle - 1], entries[middle]) <= 0) {
                 return;
             }
             System.arraycopy(entries, from, scratchEntries, from, to - from);
             var left = from;
             var right = middle;
             for (var out = from; out < to; out++) {
-                if (left < middle && (right >= to || compareEntries(keys, keyEnds, scratchEntries[left], scratchEntries[right]) <= 0)) {
+                if (left < middle && (right >= to || compareEntries(keys, layout, keyEnds, scratchEntries[left], scratchEntries[right]) <= 0)) {
                     entries[out] = scratchEntries[left++];
                 } else {
                     entries[out] = scratchEntries[right++];
@@ -1441,6 +1523,7 @@ final class PackedRun {
     /// table it adds to before any entry it adds there.
     static final class Builder {
         private static final int FIRST_ENTRIES = 64;
+        private static final int UNDECIDED = -1;
         private final Storage storage;
         // The view the builder appends to, or null for a new run
         private final PackedRun after;
@@ -1462,10 +1545,18 @@ final class PackedRun {
         private long maxStamp;
         // The home the last value went on, which the builder added
         private MemorySegment lastHome;
-        // The entries the replay's `keyEnds` grows to room for when it is next full, or 0 to double it
+        // The entries the builder has room for, which the ends of the keys hold if the run keeps them; the replay's
+        // first chunk of words grows to it
+        private int room;
+        // The entries the replay's room grows to when it is next full, or 0 to double it
         private int reserved;
-        // The lengths of the ends of the keys, the chunks of the words and the hash table before a bulk commit's builder
-        // made room for its puts, which it gives back as far as its entries do not take it
+        // The bytes of every key the builder placed while they share them, which the run's layout places; 0 once the
+        // run keeps the ends of its keys; UNDECIDED until the first key, which sets the layout of a new run and makes
+        // the ends of one the builder appends to
+        private int keyLength;
+        // The lengths of the ends of the keys, as many as the run's entries if it kept none, the chunks of the words
+        // and the hash table before a bulk commit's builder made room for its puts, which it gives back as far as its
+        // entries do not take it
         private int priorKeyEnds;
         private int priorWordChunks;
         private int priorSlots;
@@ -1492,7 +1583,8 @@ final class PackedRun {
             this.firstChunkBytes = (int) Math.clamp(keyBytes, 1, KEY_CHUNK);
             storage.keys = new byte[][]{new byte[firstChunkBytes]};
             storage.keyViews = new MemorySegment[0];
-            storage.keyEnds = new int[capacity];
+            this.room = capacity;
+            this.keyLength = UNDECIDED;
             storage.words = new long[0][];
             if (committed) {
                 storage.homes = new MemorySegment[0][];
@@ -1527,14 +1619,25 @@ final class PackedRun {
             if (view.size != firstEntry) {
                 throw new IllegalStateException("A run's newest view holds " + view.size + " of its " + firstEntry + " entries");
             }
-            this.priorKeyEnds = storage.keyEnds.length;
             this.priorWordChunks = storage.words.length;
             this.priorSlots = storage.slots.length;
             // Room for the planned entries, made before any is added, so no array a reader may load moves after
             var needed = (int) Math.min(MAX_ENTRIES, (long) firstEntry + Math.max(1, planned));
             var keyEnds = storage.keyEnds;
-            if (needed > keyEnds.length) {
-                storage.keyEnds = Arrays.copyOf(keyEnds, keyEndsFor(needed, keyEnds.length));
+            if (keyEnds == null) {
+                // The keys of the run share one length, or there is none: the commit's keys start a chunk of their
+                // own, so its first key makes the ends of every key, of this room, which the layout of the run's
+                // keys would have taken had they been kept, trimmed to the entries
+                this.priorKeyEnds = firstEntry;
+                this.room = keyEndsFor(needed, firstEntry);
+                this.keyLength = UNDECIDED;
+            } else {
+                this.priorKeyEnds = keyEnds.length;
+                if (needed > keyEnds.length) {
+                    keyEnds = Arrays.copyOf(keyEnds, keyEndsFor(needed, keyEnds.length));
+                    storage.keyEnds = keyEnds;
+                }
+                this.room = keyEnds.length;
             }
             addWordChunks(needed);
             // The commit's keys start a chunk of their own, made here rather than at the first key, so a put takes no
@@ -1702,9 +1805,9 @@ final class PackedRun {
             setWord(entry, LOGGED | (long) length << 32 | (index & 0xFFFF_FFFFL));
         }
 
-        /// {@return the entries the builder has room for before its ends of the keys grow}
+        /// {@return the entries the builder has room for before its ends of the keys, if the run keeps them, grow}
         int capacity() {
-            return storage.keyEnds.length;
+            return room;
         }
 
         /// {@return the entries each chunk of the places in the log of the logged values has room for, for tests}
@@ -1716,10 +1819,10 @@ final class PackedRun {
             return lengths;
         }
 
-        /// Makes the next growth of the ends of the keys of a replay's builder give them room for `capacity` entries in
-        /// all, rather than for twice the entries, if that is more than the builder holds then, and the first chunk of
-        /// the words the same room up to a whole chunk; the growths after that one double the ends again, and a later
-        /// call replaces the room an earlier one asked for before they grew.
+        /// Makes the next growth of the room of a replay's builder, which its ends of the keys hold if the run keeps
+        /// them, give it room for `capacity` entries in all, rather than for twice the entries, if that is more than
+        /// the builder holds then, and the first chunk of the words the same room up to a whole chunk; the growths after
+        /// that one double the room again, and a later call replaces the room an earlier one asked for before it grew.
         ///
         /// The other words and the places in the log of the logged values lie in whole chunks that never move, so they
         /// take no room in advance; the hash table keeps doubling as the entries fill it; and [#build] still trims
@@ -1833,7 +1936,8 @@ final class PackedRun {
         // The slot of `slots`, the run's hash table, that holds the entry of `key`, whose hash is `hash`, or the empty
         // one it would take
         private int slotOf(int[] slots, MemorySegment key, int hash) {
-            var keyEnds = storage.keyEnds;
+            var layout = storage.layout;
+            var keyEnds = layout == null ? storage.keyEnds : null;
             var keys = storage.keys;
             var mask = slots.length - 1;
             var tag = hash & TAG_MASK;
@@ -1844,8 +1948,8 @@ final class PackedRun {
                 }
                 if ((slot & TAG_MASK) == tag) {
                     var entry = (slot & ENTRY_MASK) - 1;
-                    var start = keyStart(keyEnds, entry);
-                    var length = keyEnds[entry] - start;
+                    var start = keyStart(layout, keyEnds, entry);
+                    var length = keyEnd(layout, keyEnds, start, entry) - start;
                     if (length == key.byteSize()
                             && Segments.compare(keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK, length, key) == 0) {
                         return i;
@@ -1856,7 +1960,8 @@ final class PackedRun {
 
         // As slotOf for the key that is the keyLength bytes at keyFrom of keyArray
         private int slotOf(int[] slots, byte[] keyArray, int keyFrom, int keyLength, int hash) {
-            var keyEnds = storage.keyEnds;
+            var layout = storage.layout;
+            var keyEnds = layout == null ? storage.keyEnds : null;
             var keys = storage.keys;
             var mask = slots.length - 1;
             var tag = hash & TAG_MASK;
@@ -1867,8 +1972,8 @@ final class PackedRun {
                 }
                 if ((slot & TAG_MASK) == tag) {
                     var entry = (slot & ENTRY_MASK) - 1;
-                    var start = keyStart(keyEnds, entry);
-                    var length = keyEnds[entry] - start;
+                    var start = keyStart(layout, keyEnds, entry);
+                    var length = keyEnd(layout, keyEnds, start, entry) - start;
                     if (length == keyLength && Segments.compare(keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK,
                             length, keyArray, keyFrom, keyLength) == 0) {
                         return i;
@@ -1913,6 +2018,11 @@ final class PackedRun {
         // before where the keys now end the caller copies the key into: the last chunk, or a new one
         private byte[] place(int length) {
             roomFor(storage.entries);
+            if (keyLength != 0 && length != keyLength) {
+                // The first key, or one of another length than those before: out of line, which keeps the put small
+                // enough for the compiler to inline it into the commit's loop
+                layOut(length);
+            }
             var start = storage.keyBytes;
             if ((start & KEY_OFFSET_MASK) + length > KEY_CHUNK) {
                 // The rest of the chunk is too short: the key starts the next one
@@ -1944,7 +2054,9 @@ final class PackedRun {
         // run's hash table, which doubles past three quarters full; returns the entry
         private int add(int[] slots, int i, int hash) {
             var entry = storage.entries;
-            storage.keyEnds[entry] = storage.keyBytes;
+            if (keyLength == 0) {
+                storage.keyEnds[entry] = storage.keyBytes;
+            }
             storage.entries = entry + 1;
             slots[i] = (hash & TAG_MASK) | (entry + 1);
             if (4L * (entry + 1) > 3L * slots.length) {
@@ -1953,14 +2065,17 @@ final class PackedRun {
             return entry;
         }
 
-        // Makes room for `entry` in the ends of the keys and the words
+        // Makes room for `entry` in the ends of the keys, if the run keeps them, and the words
         private void roomFor(int entry) {
-            var keyEnds = storage.keyEnds;
-            if (entry == keyEnds.length) {
+            if (entry == room) {
                 var capacity = committed ? Math.max(entry + 1, entry + (entry >> 1))
                         : reserved > entry ? reserved : 2 * entry;
-                storage.keyEnds = Arrays.copyOf(keyEnds, Math.min(MAX_ENTRIES, capacity));
+                room = Math.min(MAX_ENTRIES, capacity);
                 reserved = 0;
+                var keyEnds = storage.keyEnds;
+                if (keyEnds != null) {
+                    storage.keyEnds = Arrays.copyOf(keyEnds, room);
+                }
             }
             var words = storage.words;
             var chunk = entry >>> WORD_CHUNK_BITS;
@@ -1969,28 +2084,63 @@ final class PackedRun {
                     addWordChunks(entry + 1);
                 } else {
                     var grown = Arrays.copyOf(words, chunk + 1);
-                    grown[chunk] = new long[chunk == 0 ? Math.min(WORD_CHUNK, storage.keyEnds.length) : WORD_CHUNK];
+                    grown[chunk] = new long[chunk == 0 ? Math.min(WORD_CHUNK, room) : WORD_CHUNK];
                     storage.words = grown;
                 }
             } else if ((entry & WORD_MASK) == words[chunk].length) {
                 // The replay's first chunk, shorter than a chunk while it is the last; a bulk commit's are whole. It
-                // grows to the room of the ends of the keys, which a reservation may have made more than twice it
-                words[chunk] = Arrays.copyOf(words[chunk],
-                        Math.min(WORD_CHUNK, Math.max(2 * words[chunk].length, storage.keyEnds.length)));
+                // grows to the builder's room, which a reservation may have made more than twice it
+                words[chunk] = Arrays.copyOf(words[chunk], Math.min(WORD_CHUNK, Math.max(2 * words[chunk].length, room)));
             }
+        }
+
+        // Decides where the key of `length` bytes about to be placed, and the keys after it, are found: by the layout
+        // of keys of its length, for the first key of a new run; else by the ends of the keys, made here for every
+        // entry of the run, where the layout placed their keys, as the first key of a commit that appends to a run of
+        // keys of one length, whose keys start a chunk of their own, and a key of another length than those before
+        // need. The ends are published before the run lets go of its layout, so a reader of an earlier view that loads
+        // the layout, finding none, finds the ends.
+        private void layOut(int length) {
+            var storage = this.storage;
+            if (keyLength == UNDECIDED && after == null) {
+                storage.layout = KeyLayout.of(length);
+                keyLength = length;
+                return;
+            }
+            var keyEnds = new int[room];
+            var layout = storage.layout;
+            if (layout != null) {
+                var perChunk = layout.perChunk();
+                var bytes = layout.length();
+                var chunk = 0;
+                var inChunk = 0;
+                for (var entry = 0; entry < storage.entries; entry++) {
+                    // Added, not or'ed: the last key of a chunk the keys fill exactly ends at the start of the next
+                    keyEnds[entry] = (chunk << KEY_CHUNK_BITS) + ++inChunk * bytes;
+                    if (inChunk == perChunk) {
+                        chunk++;
+                        inChunk = 0;
+                    }
+                }
+            }
+            storage.keyEnds = keyEnds;
+            storage.layout = null;
+            keyLength = 0;
         }
 
         // Places every entry of the run in a new hash table of `length` slots by the hash of its key, and publishes it:
         // a reader that loaded the table before finds every entry of its view there
         private void rehash(int length) {
-            var keyEnds = storage.keyEnds;
+            var layout = storage.layout;
+            var keyEnds = layout == null ? storage.keyEnds : null;
             var keys = storage.keys;
             var grown = new int[length];
             var mask = length - 1;
             var entries = storage.entries;
             for (var entry = 0; entry < entries; entry++) {
-                var start = keyStart(keyEnds, entry);
-                var hash = Segments.hash(keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK, keyEnds[entry] - start);
+                var start = keyStart(layout, keyEnds, entry);
+                var hash = Segments.hash(keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK,
+                        keyEnd(layout, keyEnds, start, entry) - start);
                 var i = hash & mask;
                 while (grown[i] != 0) {
                     i = (i + 1) & mask;
@@ -2043,7 +2193,7 @@ final class PackedRun {
             var entries = storage.entries;
             var keyEnds = storage.keyEnds;
             var keyEndsLength = entries > priorKeyEnds ? keyEndsFor(entries, priorKeyEnds) : priorKeyEnds;
-            if (keyEnds.length > keyEndsLength) {
+            if (keyEnds != null && keyEnds.length > keyEndsLength) {
                 storage.keyEnds = Arrays.copyOf(keyEnds, keyEndsLength);
             }
             var words = storage.words;
@@ -2088,7 +2238,7 @@ final class PackedRun {
             var size = storage.entries;
             finishKeys();
             var keyEnds = storage.keyEnds;
-            if (keyEnds.length != size) {
+            if (keyEnds != null && keyEnds.length != size) {
                 storage.keyEnds = Arrays.copyOf(keyEnds, size);
             }
             var words = storage.words;
@@ -2152,7 +2302,11 @@ final class PackedRun {
         volatile byte[][] keys;
         // Read-only views of the chunks of `keys`, which the slices of a key are made of, made as each view is built
         volatile MemorySegment[] keyViews;
+        // Null while the keys share `layout`, and while the run has none; once made, never null again
         volatile int[] keyEnds;
+        // The place of every key while they all have one length, set at the first key of the run, or null: set to null,
+        // never back, after `keyEnds` is made, so a reader loads it first and the ends only if it is null
+        volatile KeyLayout layout;
         // The kind and place of each entry's value, in chunks of WORD_CHUNK, read with an acquire: the spill of a bulk
         // commit's run switches it
         volatile long[][] words;

@@ -25,6 +25,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
@@ -795,7 +796,13 @@ class PackedRunTest {
             assertEquals(PackedRun.KEY_CHUNK, chunks[i], "chunk " + i + " is not whole");
         }
         assertEquals(placed[0] - last * PackedRun.KEY_CHUNK, chunks[last], "the last chunk is not trimmed to its keys");
+        assertEquals(0, run.keyLengthForTests(), "a run of keys of many lengths did not make their ends");
+        checkRun(run, model, random);
+    }
 
+    /// Checks that `run`, built over no tree, finds, compares, orders and scans every key of `model`, as a removal if
+    /// its value is `null`, and no other key.
+    private static void checkRun(PackedRun run, TreeMap<ByteBuffer, byte[]> model, Random random) {
         var sorted = new ArrayList<>(model.keySet());
         assertEquals(sorted.size(), run.size());
         for (var position = 0; position < run.size(); position++) {
@@ -852,6 +859,108 @@ class PackedRunTest {
             assertEquals(range, scanRun(run, from, to, false));
             assertEquals(range.reversed(), scanRun(run, from, to, true));
         }
+    }
+
+    @Test
+    @DisplayName("the layout of keys of one length divides every entry index below 2^24 by the keys a chunk holds exactly, at and around each multiple of it and at random, for every key length")
+    void keyLayoutDivides() {
+        var random = new Random(7);
+        var bound = 1 << 24;
+        var checked = new BitSet();
+        for (var length = 1; length <= PackedRun.KEY_CHUNK; length = length < KeyCodec.MAX_LENGTH ? length + 1 : 2 * length) {
+            var layout = PackedRun.KeyLayout.of(length);
+            var perChunk = PackedRun.KEY_CHUNK / length;
+            assertEquals(perChunk, layout.perChunk());
+            if (!checked.get(perChunk)) {
+                checked.set(perChunk);
+                for (var multiple = (long) perChunk; multiple - 1 < bound; multiple += perChunk) {
+                    for (var entry = (int) multiple - 1; entry <= multiple + 1 && entry < bound; entry++) {
+                        if (layout.chunk(entry) != entry / perChunk) {
+                            fail("keys of " + length + " bytes: entry " + entry + " in chunk " + layout.chunk(entry));
+                        }
+                    }
+                }
+            }
+            for (var i = 0; i < 2_000; i++) {
+                var entry = random.nextInt(bound);
+                assertEquals(entry / perChunk, layout.chunk(entry), "keys of " + length + " bytes: entry " + entry);
+                assertEquals(entry / perChunk * PackedRun.KEY_CHUNK + entry % perChunk * length, layout.start(entry));
+            }
+        }
+    }
+
+    static Stream<Arguments> oneLengthConversions() {
+        return Stream.of(Arguments.of(24, 0), Arguments.of(24, 1), Arguments.of(24, 10_922), Arguments.of(24, 10_923),
+                Arguments.of(24, 25_000), Arguments.of(32, 8_192), Arguments.of(32, 16_385), Arguments.of(1_024, 256),
+                Arguments.of(1_024, 300));
+    }
+
+    @ParameterizedTest(name = "{1} keys of {0} bytes")
+    @MethodSource("oneLengthConversions")
+    @DisplayName("a builder of keys of one length keeps no ends of them and places as many in each chunk as fit; at the first key of another length it makes the ends of every key where they lie, and either run finds, compares, orders and scans every key as a sorted map of them does")
+    void keysOfOneLength(int length, int before) {
+        var random = new Random(length * 31L + before);
+        var valueBytes = new byte[64 << 10];
+        random.nextBytes(valueBytes);
+        var valueChunk = MemorySegment.ofArray(valueBytes).asReadOnly();
+        var model = new TreeMap<ByteBuffer, byte[]>(Expected::compare);
+        // Two builders given the same writes: the first sees keys of one length alone, the second keys of others after
+        var oneLength = new PackedRun.Builder();
+        var mixed = new PackedRun.Builder();
+        var stamp = new long[1];
+        var keys = new ArrayList<byte[]>();
+        var built = new AtomicBoolean();
+        Consumer<byte[]> write = key -> {
+            var hash = Segments.hash(key, 0, key.length);
+            var removes = random.nextInt(8) == 0;
+            var size = random.nextInt(100);
+            var offset = random.nextInt(valueBytes.length - size);
+            for (var builder : built.get() ? List.of(mixed) : List.of(oneLength, mixed)) {
+                if (removes) {
+                    builder.delete(key, 0, key.length, hash, stamp[0]);
+                } else {
+                    builder.put(key, 0, key.length, hash, stamp[0], valueChunk, offset, size);
+                }
+            }
+            stamp[0]++;
+            model.put(ByteBuffer.wrap(key), removes ? null : Arrays.copyOfRange(valueBytes, offset, offset + size));
+        };
+        for (var id = 0; id < before; id++) {
+            var key = longKey(id % 4, id, length);
+            write.accept(key);
+            keys.add(key);
+            if (random.nextInt(10) == 0) {
+                // A write of a key the builders hold, which places none
+                write.accept(keys.get(random.nextInt(keys.size())));
+            }
+        }
+        checkBuilder(oneLength, model, random);
+        var run = oneLength.build(null, null);
+        built.set(true);
+        assertEquals(before, run.size());
+        if (before > 0) {
+            assertEquals(length, run.keyLengthForTests());
+            assertEquals(0, run.arrayLengthsForTests()[0], "a run of keys of one length kept their ends");
+            var perChunk = PackedRun.KEY_CHUNK / length;
+            var chunks = run.keyChunkLengthsForTests();
+            assertEquals((before + perChunk - 1) / perChunk, chunks.length, "chunks of the keys");
+            assertEquals(((before - 1) % perChunk + 1) * length, chunks[chunks.length - 1], "the last chunk is not trimmed to its keys");
+            checkRun(run, new TreeMap<>(model), random);
+        }
+        // A key of another length, then keys of that length and of the first
+        var other = longKey(5, -1, length == 24 ? 7 : 24);
+        write.accept(other);
+        keys.add(other);
+        for (var id = before; id < before + 3_000; id++) {
+            var key = longKey(id % 4, id, random.nextInt(3) == 0 ? 5 + random.nextInt(KeyCodec.MAX_LENGTH - 4) : length);
+            write.accept(key);
+            keys.add(key);
+        }
+        checkBuilder(mixed, model, random);
+        var converted = mixed.build(null, null);
+        assertEquals(0, converted.keyLengthForTests());
+        assertEquals(converted.size(), converted.arrayLengthsForTests()[0]);
+        checkRun(converted, model, random);
     }
 
     /// Checks that `builder` finds every key of `model`, as a removal if its value is `null`, and no other key.
@@ -1213,8 +1322,9 @@ class PackedRunTest {
         assertEquals(40_000, builder.capacity(), "room below the entries held did not leave the arrays to double");
         var run = builder.build(null, null);
         assertEquals(20_001, run.size());
+        assertEquals(5, run.keyLengthForTests());
         var lengths = run.arrayLengthsForTests();
-        assertEquals(20_001, lengths[0]);
+        assertEquals(0, lengths[0], "a run of keys of one length kept their ends");
         assertEquals(20_001, lengths[1]);
         for (var i = 2; i < lengths.length; i++) {
             assertEquals(15_001, lengths[i], "logged values trimmed");
@@ -1257,7 +1367,7 @@ class PackedRunTest {
         assertArrayEquals(new int[]{2_048, 2_048, 2_048, 2_048}, builder.loggedLengthsForTests());
         var run = builder.build(null, null);
         var lengths = run.arrayLengthsForTests();
-        assertEquals(4_097, lengths[0]);
+        assertEquals(0, lengths[0], "a run of keys of one length kept their ends");
         assertEquals(4_097, lengths[1]);
         for (var i = 2; i < lengths.length; i++) {
             assertEquals(8_192, lengths[i]);
@@ -1342,7 +1452,7 @@ class PackedRunTest {
         var run = values.stopRun(state).build(null, null);
         assertEquals(keys, run.size());
         var lengths = run.arrayLengthsForTests();
-        assertEquals(keys, lengths[0]);
+        assertEquals(0, lengths[0], "a run of keys of one length kept their ends");
         assertEquals(keys, lengths[1]);
         for (var id = 0; id < keys; id += 97) {
             assertTrue(run.find(MemorySegment.ofArray(key(id % 4, id))) >= 0, "lost key " + id);
@@ -1378,7 +1488,7 @@ class PackedRunTest {
             assertTrue(run.size() > ReplayValues.RESERVE_AT, "the run holds " + run.size() + " entries");
             assertTrue(ledger.replayReservationsForTests() > 0, "the replay grew its run by doubling alone");
             var lengths = run.arrayLengthsForTests();
-            assertEquals(run.size(), lengths[0]);
+            assertEquals(0, lengths[0], "a run of keys of one length kept their ends");
             assertEquals(run.size(), lengths[1]);
             Expected match = null;
             for (var commit = durable; commit < history.size() && match == null; commit++) {
