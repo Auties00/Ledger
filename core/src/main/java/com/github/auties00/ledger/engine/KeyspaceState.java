@@ -49,15 +49,14 @@ import java.util.function.LongSupplier;
 ///
 /// A paged key space of a store that crashed may also hold the writes its open replayed as a [PackedRun], which the
 /// readers of the tree the store opened from read as part of it ([Reads#runOf(KeyspaceState, ReadPoint)]), until every
-/// reader reads a later tree, which holds them. So may one the bulk commits wrote while its latest tree held none of its
-/// entries: the readers at or after a commit read the view of the run that commit published as part of their trees,
-/// until every reader reads a tree that holds the run.
+/// reader reads a later tree, which holds them. So may one that commits of many puts wrote, counted by them while its
+/// latest tree held none of its entries, or counted against that tree otherwise ([#runCorrection(long)]): the readers
+/// at or after a commit read the view of the run that commit published as part of their trees, until every reader
+/// reads a tree that holds the run.
 ///
 /// Readers use it concurrently with the commits. Commits create chains before they are given a sequence; everything
 /// else changes only under it.
 final class KeyspaceState {
-    /// What [#replayed] holds while the change a run makes to the count is not known yet.
-    private static final long UNCOUNTED = Long.MIN_VALUE;
     /// The dropped chains from which [#removeDropped()] spreads the removals over the processors.
     private static final int PARALLEL_REMOVALS = 4_096;
     /// The dropped chains the list may hold, at least, before a commit sweeps them off it; past it, as many as memory
@@ -98,14 +97,15 @@ final class KeyspaceState {
     // The writes whose effect on the count the trees settle
     final BlindWrites blind;
     /// The writes the open replayed into the key space as a run, which the readers of the tree the store opened from
-    /// read as part of it, or the newest view of the run of the bulk commits, which the readers at or after each commit
-    /// read as part of their trees ([PackedRun#at(long)]); or `null`: none was replayed and no bulk commit made one, or
-    /// every reader reads a tree that holds it. Published by the open's replay, before any reader exists, or by each
-    /// bulk commit, holding both roles before its sequence is visible, and cleared holding the publishing role.
+    /// read as part of it, or the newest view of the run of the commits that keep their puts of new keys in one, which
+    /// the readers at or after each commit read as part of their trees ([PackedRun#at(long)]); or `null`: none was
+    /// replayed and no commit made one, or every reader reads a tree that holds it. Published by the open's replay,
+    /// before any reader exists, or by each commit, holding both roles before its sequence is visible, and cleared
+    /// holding the publishing role.
     volatile PackedRun run;
-    // The change the run makes to the count, against the tree the store opened from: 0 without one, UNCOUNTED until
-    // known. Kept once the run is gone, as the counts of the commits leave the run's writes out
-    private volatile long replayed;
+    // The change the uncounted runs released so far, the replay's included, make to the count: the counts of the
+    // commits leave their writes out, so it is kept once each run is gone. Stored before the run is cleared
+    private volatile long kept;
     // The range removals whose count is not known yet
     final PendingRanges ranges;
     // The copies of the keys the chains hold, and of the map's keys of the chains that hold their keys in words of
@@ -1023,12 +1023,12 @@ final class KeyspaceState {
     ///
     /// It looks up in the trees of `point` the keys of the blind writes up to its sequence whose effect is not known
     /// yet, which reads the file for those of a tree larger than the page cache, and counts the range removals up to
-    /// its sequence whose count is not known yet, which reads the nodes on the paths to their bounds. Before the first
-    /// checkpoint after an open that replayed writes into a run, the first count also looks up each key of the run in
-    /// the tree the store opened from ([#replayCorrection()]).
+    /// its sequence whose count is not known yet, which reads the nodes on the paths to their bounds. Before the
+    /// checkpoint that takes an uncounted run, the first count of each view also looks up each key of the view no count
+    /// before looked up in the tree the run is counted against ([#runCorrection(long)]).
     long count(ReadPoint point) {
         var sequence = point.bound() >>> Reads.OP_BITS;
-        return known(sequence) + replayCorrection() + blind.correction(sequence, key -> Reads.inTreeOnly(this, key, point))
+        return known(sequence) + runCorrection(point.bound()) + blind.correction(sequence, key -> Reads.inTreeOnly(this, key, point))
                 + ranges.correction(sequence);
     }
 
@@ -1038,18 +1038,18 @@ final class KeyspaceState {
     /// No blind write of a key the run holds is listed: the replay's writes of such a key that went to chains took the
     /// run's entry as the key's state, and every later write finds the run's entry in place of a blind lookup.
     void publishRun(PackedRun run) {
-        replayed = UNCOUNTED;
         this.run = run;
     }
 
-    /// Makes `run`, the view of the puts of new keys bulk commits counted as they applied them, up to those of the
-    /// commit that publishes it, part of the tree of every reader at or after the commit; called by the commit, holding
-    /// both roles, before its sequence is visible.
+    /// Makes `run`, the view of the puts of new keys commits kept in a run, up to those of the commit that publishes
+    /// it, part of the tree of every reader at or after the commit; called by the commit, holding both roles, before
+    /// its sequence is visible.
     ///
-    /// The run makes no correction to the count, so what [#replayCorrection()] keeps of a replay's run stays as it is.
+    /// A counted run makes no correction to the count; an uncounted one corrects it, against the latest tree when it
+    /// was made, from each view on ([#runCorrection(long)]).
     void publishBulkRun(PackedRun run) {
-        if (!run.committed()) {
-            throw new IllegalArgumentException("A run a replay made is no bulk commit's");
+        if (!run.appended()) {
+            throw new IllegalArgumentException("A run a replay made is no commit's");
         }
         this.run = run;
     }
@@ -1063,28 +1063,50 @@ final class KeyspaceState {
         }
     }
 
-    /// {@return the change the writes the open replayed as a run make to the count of the key space, against the tree
-    /// the store opened from, counted at the first call; 0 if there are none}
+    /// {@return the change the uncounted runs make to the count of the key space for a reader at `bound`: those
+    /// released, and the view of the uncounted run in memory that reader reads, against the tree it is counted against
+    /// ([PackedRun#correction()]); 0 if there were none}
     ///
-    /// Only a reader of the tree the store opened from, or the checkpoint that merges the run into it, counts it: the
-    /// run is released once every reader reads a later tree, and only after it is counted. A bulk commit's run, which
-    /// its commit counted, changes nothing here; what a replay's run released before it changed stays.
-    long replayCorrection() {
-        var correction = replayed;
-        if (correction == UNCOUNTED) {
-            correction = run.correction();
-            replayed = correction;
+    /// The counts of the commits leave the writes of an uncounted run out, as no tree lookup tells whether they add an
+    /// entry; the run's correction does, from the reader's view of it, whatever tree the reader reads, as the counts
+    /// are cumulative. A reader below the run's first view takes what the runs released before it left. The first
+    /// count of a view looks up its keys no earlier count or checkpoint settled; the checkpoint that takes the run
+    /// counts its newest view, settling every key, before the tree it is counted against can go.
+    ///
+    /// @param bound the bound of the reader, [Long#MAX_VALUE] for the newest view
+    long runCorrection(long bound) {
+        // The run first: a release stores the total before it clears the run, so a reader that finds no run reads it
+        var current = run;
+        if (current != null && !current.counted()) {
+            var view = current.at(bound);
+            return current.keptBefore() + (view == null ? 0 : view.correction());
         }
-        return correction;
+        return kept;
     }
 
-    /// Releases the run of the writes the open replayed, once every reader's tree is at or above `cutBound`, the bound of
-    /// the checkpoint every reader's tree holds, and that tree holds the run; holding the publishing role.
+    /// {@return what the uncounted runs released so far left to the count, which a run made now starts from}
+    long keptCorrection() {
+        return kept;
+    }
+
+    /// Releases the run once every reader's tree is at or above `cutBound`, the bound of the checkpoint every reader's
+    /// tree holds, and that tree holds the run; holding the publishing role.
+    ///
+    /// An uncounted run stays until the checkpoint that took it counted its newest view ([PackedRun#knownCorrection()]),
+    /// which it then leaves to the count, as the tree it was counted against may go with the release.
     void releaseRun(long cutBound) {
         var current = run;
-        if (current != null && cutBound >= current.maxStamp() && (current.committed() || replayed != UNCOUNTED)) {
-            run = null;
+        if (current == null || cutBound < current.maxStamp()) {
+            return;
         }
+        if (!current.counted()) {
+            var correction = current.knownCorrection();
+            if (correction == Long.MIN_VALUE) {
+                return;
+            }
+            kept = current.keptBefore() + correction;
+        }
+        run = null;
     }
 
     /// The chains of a range in memory, one at a time, in the order of a scan.

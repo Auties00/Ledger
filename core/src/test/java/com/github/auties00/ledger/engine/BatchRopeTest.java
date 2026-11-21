@@ -516,6 +516,7 @@ class BatchRopeTest {
         @DisplayName("keeps a paged value on a chunk of values only, at most a chunk, and a resident value on its own array")
         void retention(@TempDir Path directory) throws Exception {
             try (var ledger = (LiveLedger) options(directory).build()) {
+                ledger.keepIdleCommitsOnChainsForTests();
                 var batch = ledger.newBatch();
                 for (var i = 0; i < 400; i++) {
                     batch.put(MESSAGES, key(i), value(i, 2_000));

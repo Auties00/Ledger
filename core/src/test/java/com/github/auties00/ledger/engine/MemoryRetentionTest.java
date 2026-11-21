@@ -75,6 +75,7 @@ class MemoryRetentionTest {
         try (var ledger = (LiveLedger) Ledger.builder().directory(directory).encryption(Encryption.key(new byte[32]))
                 .keyspace(SESSIONS).keyspace(MESSAGES).build()) {
             ledger.valueSlab().forceColdForTests();
+            ledger.keepIdleCommitsOnChainsForTests();
             ledger.commit(ledger.newBatch().put(SESSIONS, new byte[]{1}, new byte[1_500]).put(MESSAGES, new byte[]{1}, new byte[1_500]))
                     .awaitDurable();
             // The session's bytes, which the store holds a copy of, are not kept for the message: the session took an
@@ -388,6 +389,7 @@ class MemoryRetentionTest {
     @DisplayName("a commit of fewer writes stays the pipeline's last until a tick lets go of it")
     void smallCommitWaitsForATick(@TempDir Path path) throws Exception {
         try (var ledger = forgetting(true, path)) {
+            ledger.keepIdleCommitsOnChainsForTests();
             var batch = commitWrites(ledger, 1, LiveLedger.FORGET_AFTER_WRITES - 1);
             assertFalse(collected(batch), "a commit of " + (LiveLedger.FORGET_AFTER_WRITES - 1) + " writes let go of itself");
             ledger.checkpointer().tick();

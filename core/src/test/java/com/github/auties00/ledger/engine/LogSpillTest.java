@@ -1098,6 +1098,7 @@ class LogSpillTest {
         // they would go to the log
         int[] lengths = {100, 200, 300};
         try (var ledger = openJudged(directory, encrypted, 0, Duration.ZERO, 6L << 20)) {
+            ledger.keepIdleCommitsOnChainsForTests();
             writeBulk(ledger, expected, 0, count, lengths, 0);
             assertTrue(ledger.state(MESSAGES).overwrites.spills(), "values written once may not leave the heap");
             var spills = ledger.spills();
@@ -1194,6 +1195,7 @@ class LogSpillTest {
             try (var ledger = openSized(store, encrypted, 0, Duration.ZERO, 6L << 20)) {
                 if (chained) {
                     // A tree that holds the key space, so the batch goes to chains rather than to a bulk run
+                    ledger.keepIdleCommitsOnChainsForTests();
                     var seed = new byte[1_000];
                     ledger.commit(ledger.newBatch().put(MESSAGES, key(1_000_000), seed)).awaitDurable();
                     expected.messages.put(1_000_000, seed);
@@ -1210,7 +1212,7 @@ class LogSpillTest {
                     assertNull(run, "a bulk run over a tree that holds the key space");
                 } else {
                     assertNotNull(run, "no bulk run in an empty key space");
-                    assertTrue(run.committed());
+                    assertTrue(run.counted());
                 }
                 assertEquals(unpaid + (moves ? 0 : 1), spills.unpaidRecordsForTests(), "records judged not to pay");
                 spillNow(ledger);
@@ -2456,6 +2458,7 @@ class LogSpillTest {
         int[] lengths = {SpillQueue.LOG_VALUE_MIN, 700, 1_500};
         var own = 200 << 10;
         try (var ledger = openSized(directory, encrypted, 0, Duration.ZERO, 16L << 20)) {
+            ledger.keepIdleCommitsOnChainsForTests();
             writeSplit(ledger, expected, 0, count, lengths, own);
             spillNow(ledger);
             var spills = ledger.spills();
@@ -2504,7 +2507,7 @@ class LogSpillTest {
     private static PackedRun bulkRun(LiveLedger ledger) {
         var run = ledger.state(MESSAGES).run;
         assertNotNull(run, "the bulk commit made no run");
-        assertTrue(run.committed());
+        assertTrue(run.counted());
         return run;
     }
 
