@@ -75,8 +75,8 @@ import java.util.concurrent.atomic.AtomicLong;
 /// as a reader may still read it.
 ///
 /// The window a checkpoint seals its units into ([PageFile.Writer]), which is no pooled size, comes back apart
-/// ([#releaseWindow(byte\[\])]), at most [#WINDOW_SPARES] of them, reached only weakly: the next checkpoint of any store
-/// of the process takes it again, unless a collection ran between the two.
+/// ([#releaseWindow(byte\[\])]), at most [#WINDOW_SPARES] of them, reached only weakly: the next checkpoint of any
+/// store of the process takes it again, unless a collection ran between the two.
 public final class HeapPool {
     private static final int MIN_SHIFT = 12;
     private static final int MAX_SHIFT = 20;
@@ -509,14 +509,14 @@ public final class HeapPool {
         }
     }
 
-    /// Returns `array`, one of the chunks of a body or a rope of more than [#BURST_KEPT_CHUNKS] or the array of a
-    /// checkpoint's unit longer than its window, to the overflow alone, never to the reserve, unless it is not one of
-    /// the pooled sizes or the pool is full.
+    /// Returns `array`, one of the chunks of a body or a rope of more than [#BURST_KEPT_CHUNKS] or an array a
+    /// checkpoint sealed a unit into ([PageFile.Writer]), to the overflow alone, never to the reserve, unless it is not
+    /// one of the pooled sizes or the pool is full.
     ///
-    /// The caller holds the overflow ([#hold()]) from before its first array goes back until after its last has, so
-    /// a collection during its work keeps them and its next commit takes them again; once it ends, the first
-    /// collection frees them, where the reserve would keep up to [#RESERVE_PER_SIZE] of each size it used. An array
-    /// given back while nothing holds the overflow is left to the next collection.
+    /// The work of a body or a rope holds the overflow ([#hold()]) from before its first array goes back until after
+    /// its last has, so a collection during its work keeps them and its next commit takes them again; once it ends,
+    /// the first collection frees them, where the reserve would keep up to [#RESERVE_PER_SIZE] of each size it used. An
+    /// array given back while nothing holds the overflow, as a checkpoint's are, is left to the next collection.
     ///
     /// @param array an array [#acquire] returned, which the caller no longer uses
     void releaseHeld(byte[] array) {
@@ -668,10 +668,9 @@ public final class HeapPool {
     /// {@return the shortest window a checkpoint's writer gave back ([#releaseWindow(byte\[\])]) that holds at least
     /// `capacity` bytes, or `null` if the pool keeps none}
     ///
-    /// The window of a checkpoint is the one array it seals its units into, which it holds from its first flush to its
-    /// last: the checkpoints of the stores of a process, the closes of many stores one after another or the ticks of
-    /// idle ones, take the window of the one before them again, as they took the arrays of their seals from the pool
-    /// before they had a window.
+    /// The window of a checkpoint is the one array it seals the units of its flushes of more than one window into,
+    /// which it holds from the first such flush to its last: a checkpoint of any store of the process takes the window
+    /// of the one before it again, unless a collection ran between the two.
     byte[] acquireWindow(int capacity) {
         synchronized (windowLock) {
             var best = -1;
