@@ -10,6 +10,7 @@ import com.github.auties00.ledger.benchmark.engine.SealedEngine;
 import com.github.auties00.ledger.benchmark.engine.WriteBatch;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
@@ -39,6 +40,10 @@ public final class Stores {
     static final boolean TIMED_TEMPLATES = "timed".equals(System.getProperty("ledger.bench.templates", System.getenv("LEDGER_BENCH_TEMPLATES")));
     /// The checkpoint interval of a template build: far above the builder's own interval, so Ledger never starts one.
     private static final long TEMPLATE_NO_AUTOMATIC_CHECKPOINT = 1L << 40;
+    /// The build mode a template's [#COMPLETE_MARKER] holds: a template is reused only by a JVM that builds in the
+    /// same mode, so a bench directory that holds a template of the other mode, or an empty marker from a harness
+    /// that predates the ordered build, gets it rebuilt rather than measured as this mode.
+    static final String TEMPLATE_MODE = TIMED_TEMPLATES ? "timed" : "ordered";
 
     private Stores() {
     }
@@ -127,7 +132,7 @@ public final class Stores {
     /// @throws IOException if the template cannot be built
     public static Path template(EngineKind kind, EngineSettings settings, boolean sealed, Corpus corpus) throws IOException {
         var template = root().resolve("templates").resolve(kind.id() + (sealed ? "-sealed-" : "-") + corpus.messages());
-        if (!Files.exists(template.resolve(COMPLETE_MARKER))) {
+        if (!complete(template)) {
             Directories.delete(template);
             var started = System.nanoTime();
             if (TIMED_TEMPLATES) {
@@ -154,11 +159,17 @@ public final class Stores {
                 }
             }
             // The marker goes last, so an interrupted build is redone
-            Files.createFile(template.resolve(COMPLETE_MARKER));
+            Files.writeString(template.resolve(COMPLETE_MARKER), TEMPLATE_MODE, StandardCharsets.US_ASCII);
             TemplateFingerprint.built(template, System.nanoTime() - started);
         }
         TemplateFingerprint.used(template);
         return template;
+    }
+
+    /// {@return whether `template` is a complete template built in [#TEMPLATE_MODE]}
+    private static boolean complete(Path template) throws IOException {
+        var marker = template.resolve(COMPLETE_MARKER);
+        return Files.isRegularFile(marker) && TEMPLATE_MODE.equals(Files.readString(marker, StandardCharsets.US_ASCII));
     }
 
     /// {@return a batch of one metadata record per chat of `corpus` and [#SESSIONS] sessions}
@@ -194,7 +205,7 @@ public final class Stores {
             throw new IllegalArgumentException("The floor keeps nothing across a reopen, so it has no loaded store");
         }
         var template = root().resolve("templates").resolve("generic-" + kind.id() + "-" + keys + "-" + valueSize);
-        if (!Files.exists(template.resolve(COMPLETE_MARKER))) {
+        if (!complete(template)) {
             Directories.delete(template);
             var started = System.nanoTime();
             var corpus = new Corpus(1);
@@ -223,7 +234,7 @@ public final class Stores {
                     builder.write(batch);
                 }
             }
-            Files.createFile(template.resolve(COMPLETE_MARKER));
+            Files.writeString(template.resolve(COMPLETE_MARKER), TEMPLATE_MODE, StandardCharsets.US_ASCII);
             TemplateFingerprint.built(template, System.nanoTime() - started);
         }
         TemplateFingerprint.used(template);

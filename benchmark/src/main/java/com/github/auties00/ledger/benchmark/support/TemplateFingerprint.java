@@ -13,8 +13,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /// The shape of the store templates this JVM used: the size and name of every file, which two builds of one template
 /// share when they laid it out alike (the bytes differ anyway, as every checkpoint draws its own nonces).
 ///
-/// Each template is printed once per JVM, as a line starting with `[template]`, the first time it is used, and the
-/// line of a template this JVM built gives the build time. The memory counters report the shape of the last template
+/// Each template is printed once per JVM, as a line starting with `[template]`, the first time it is used, ending with
+/// the mode it was built in (`mode=ordered` or `mode=timed`, which its `.complete` marker holds, so the marker's size
+/// in the listing tells the modes apart too), and the line of a template this JVM built gives the build time. The memory counters report the shape of the last template
 /// as `templateBytes`, `templateFiles` and `templateShape`, once per JVM, in its first measured iteration, so that
 /// their score is the value of one JVM rather than a sum over iterations.
 public final class TemplateFingerprint {
@@ -55,8 +56,8 @@ public final class TemplateFingerprint {
         var shape = shapeOf(template);
         last = shape;
         if (PRINTED.add(template)) {
-            System.out.printf("[template] %s bytes=%d files=%d shape=%013x %s%n", template.getFileName(), shape.bytes(),
-                    shape.files(), shape.hash(), shape.listing());
+            System.out.printf("[template] %s bytes=%d files=%d shape=%013x %s mode=%s%n", template.getFileName(),
+                    shape.bytes(), shape.files(), shape.hash(), shape.listing(), Stores.TEMPLATE_MODE);
         }
     }
 
