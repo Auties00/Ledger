@@ -665,52 +665,44 @@ public final class HeapPool {
         }
     }
 
-    /// {@return the shortest window a checkpoint's writer gave back ([#releaseWindow(byte\[\])]) that holds at least
-    /// `capacity` bytes, or `null` if the pool keeps none}
+    /// {@return a window a checkpoint's writer gave back ([#releaseWindow(byte\[\])]), of
+    /// [PageFile#WINDOW_BYTES], or `null` if the pool keeps none}
     ///
     /// The window of a checkpoint is the one array it seals the units of its flushes of more than one window into,
     /// which it holds from the first such flush to its last: a checkpoint of any store of the process takes the window
     /// of the one before it again, unless a collection ran between the two.
-    byte[] acquireWindow(int capacity) {
+    byte[] acquireWindow() {
         synchronized (windowLock) {
-            var best = -1;
-            byte[] taken = null;
             for (var slot = 0; slot < windowSpares.length; slot++) {
                 var spare = windowSpares[slot];
                 var array = spare == null ? null : spare.get();
-                if (array != null && array.length >= capacity && (taken == null || array.length < taken.length)) {
-                    best = slot;
-                    taken = array;
+                windowSpares[slot] = null;
+                if (array != null) {
+                    return array;
                 }
             }
-            if (taken != null) {
-                windowSpares[best] = null;
-            }
-            return taken;
+            return null;
         }
     }
 
     /// Keeps `array`, a checkpoint's window, for the window of the next checkpoint of any store of the process,
-    /// reached only weakly, so the first collection after it frees it, as it frees the overflow: in a free slot, or in
-    /// place of the shortest spare if that one is shorter.
+    /// reached only weakly, so the first collection after it frees it, as it frees the overflow: in a slot that holds
+    /// none, or whose window a collection freed, and not at all if every slot holds one.
     ///
-    /// @param array a window whose every flush sealed and wrote its units: one a seal or a write failed on may hold
-    ///              the plaintext of a value, which the window of another store's checkpoint would keep
+    /// @param array a window of [PageFile#WINDOW_BYTES] whose every flush sealed and wrote its units: one a seal or a
+    ///              write failed on may hold the plaintext of a value, which the window of another store's checkpoint
+    ///              would keep
     void releaseWindow(byte[] array) {
+        if (array.length != PageFile.WINDOW_BYTES) {
+            throw new IllegalArgumentException("A window of " + array.length + " bytes");
+        }
         synchronized (windowLock) {
-            var slot = 0;
-            var shortest = Integer.MAX_VALUE;
-            for (var i = 0; i < windowSpares.length && shortest > 0; i++) {
-                var spare = windowSpares[i];
-                var kept = spare == null ? null : spare.get();
-                var length = kept == null ? 0 : kept.length;
-                if (length < shortest) {
-                    shortest = length;
-                    slot = i;
+            for (var slot = 0; slot < windowSpares.length; slot++) {
+                var spare = windowSpares[slot];
+                if (spare == null || spare.get() == null) {
+                    windowSpares[slot] = new WeakReference<>(array);
+                    return;
                 }
-            }
-            if (shortest < array.length) {
-                windowSpares[slot] = new WeakReference<>(array);
             }
         }
     }

@@ -45,10 +45,11 @@ import java.util.concurrent.locks.ReentrantLock;
 /// of them: each checkpoint and each tick of the [IdleTicker] drops those released since the last on a virtual thread
 /// ([#dropReleased()]). The clock would otherwise keep them, unread, until it evicted them or two ticks passed.
 ///
-/// A checkpoint seals its units into one array of its own, its writer's window ([PageFile.Writer]), and reads the units
-/// it replaces into arrays of the pool's reserve, one at a time on each thread that reads; it holds none of the pool's
-/// overflow, so the arrays the commits give back past the reserve while it runs are freed by the next collection, as
-/// they are while none runs.
+/// A checkpoint whose units fit one window seals each into an array of the pool, which goes back to the pool's overflow
+/// once all are written, and one with more seals them side by side into its writer's window, a spare window of the
+/// pool's or a new one ([PageFile.Writer]); it reads the units it replaces into arrays of the pool's reserve, one at a
+/// time on each thread that reads. It holds none of the pool's overflow, so the arrays the commits give back past the
+/// reserve while it runs are freed by the next collection, as they are while none runs.
 ///
 /// A checkpoint that fails before its superblock gives its pages back, and the next one retries. One that fails while
 /// it writes its superblock leaves it unknown whether that superblock is durable, so the pages it wrote stay in use and

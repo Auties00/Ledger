@@ -196,7 +196,7 @@ class CheckpointWindowTest {
             assertEquals(1, writer.windowsTakenForTests());
             assertFalse(pages.released.contains(window), "the window went to the pool's arrays");
             assertEquals(window.length, pages.pool.windowSpareBytesForTests(), "the window the pool keeps for the next checkpoint");
-            assertSame(window, pages.pool.acquireWindow(PageFormat.SIZE), "the window the next checkpoint takes");
+            assertSame(window, pages.pool.acquireWindow(), "the window the next checkpoint takes");
             assertSealedAlone(pages.path, more, encrypted);
         }
     }

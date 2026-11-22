@@ -186,11 +186,6 @@ final class TreeNodes {
         };
     }
 
-    /// {@return entry `entry` of `unit`, a view of it}
-    static LeafEntry entryAt(byte[] unit, int entry) {
-        return entryAt(view(unit), unit, entry);
-    }
-
     /// {@return entry `entry` of `unit`, its key and inline value slices of `view`, a read-only segment of the whole of
     /// `unit` ([#view(byte\[\])])}
     ///

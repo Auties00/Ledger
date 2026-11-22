@@ -1098,7 +1098,7 @@ final class PageFile implements AutoCloseable {
     /// A flush of more than one window of units, [#WINDOW_BYTES] each, seals the units of a window side by side, in the
     /// order of their pages, into one array the writer keeps until its checkpoint's last flush ([#finish()]), its
     /// window, and writes each run of consecutive pages from it with one call. The window comes from the pool's spare
-    /// windows ([HeapPool#acquireWindow(int)]), reached only weakly, and goes back there once the last flush wrote it.
+    /// windows ([HeapPool#acquireWindow()]), reached only weakly, and goes back there once the last flush wrote it.
     /// A flush of a single window, before the writer has one, seals each unit into an array of the pool, which goes
     /// back to the pool's overflow alone once the flush wrote them all: a checkpoint of a few units, as a close's or an
     /// idle tick's often is, takes them from the reserve the store's commits and reads fill, and allocates no window.
@@ -1385,7 +1385,7 @@ final class PageFile implements AutoCloseable {
             if (window != null) {
                 return;
             }
-            var taken = pool.acquireWindow(WINDOW_BYTES);
+            var taken = pool.acquireWindow();
             window = taken != null ? taken : new byte[WINDOW_BYTES];
             windowsTaken++;
         }
