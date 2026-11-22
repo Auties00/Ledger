@@ -705,6 +705,178 @@ class MediumCommitRunTest {
         }
     }
 
+    // The texts of `expected`, through point reads and the count
+    private static void verifyTexts(View view, TreeMap<String, String> expected, int last) {
+        assertEquals(expected.size(), view.size(TEXTS), "texts counted");
+        for (var text = 0; text <= last; text++) {
+            var name = text(text);
+            assertEquals(expected.get(name), view.get(TEXTS, name).orElse(null), "text " + name);
+        }
+    }
+
+    private static String text(int text) {
+        return "text-%06d".formatted(text);
+    }
+
+    @Test
+    @DisplayName("a removal of a commit that runs alone, looked up in the tree before its turn, finds the put an idle commit kept in the uncounted run meanwhile")
+    void removalLookedUpBeforeAnIdleRunPut(@TempDir Path directory) throws Exception {
+        var removed = POPULATED + 50;
+        try (var ledger = open(directory, false, Long.MAX_VALUE)) {
+            var expected = populate(ledger);
+            var texts = new TreeMap<String, String>();
+            ledger.hookPlanForTests(() -> {
+                ledger.hookPlanForTests(null);
+                // The commit below has looked its writes up, the removal finding no entry in the tree, and holds no
+                // role and no sequence: the store is idle
+                var batch = ledger.newBatch();
+                for (var i = 0; i < 100; i++) {
+                    put(batch, expected, POPULATED + i, 1);
+                }
+                ledger.commit(batch);
+                var run = ledger.state(MESSAGES).run;
+                assertNotNull(run, "the idle commit made no run");
+                assertFalse(run.counted());
+                assertTrue(run.find(MemorySegment.ofArray(key(removed))) >= 0, "the run does not hold the key");
+            });
+            // A bulk commit over the empty texts runs alone, and its removal of a message opens no chain
+            var bulk = ledger.newBatch();
+            for (var i = 0; i < LiveLedger.BULK_RUN_WRITES; i++) {
+                bulk.put(TEXTS, text(i), "bulk " + i);
+                texts.put(text(i), "bulk " + i);
+            }
+            bulk.delete(MESSAGES, key(removed));
+            ledger.commit(bulk);
+            expected.remove(removed);
+            assertTrue(ledger.get(MESSAGES, key(removed)).isEmpty(), "the removal committed after the put was lost");
+            verifyPoints(ledger, expected, POPULATED + 200);
+            verifyTexts(ledger, texts, LiveLedger.BULK_RUN_WRITES);
+            ledger.checkpoint();
+            verify(ledger, expected, POPULATED + 200);
+            verifyTexts(ledger, texts, LiveLedger.BULK_RUN_WRITES);
+        }
+        try (var ledger = open(directory, false, Long.MAX_VALUE)) {
+            assertTrue(ledger.get(MESSAGES, key(removed)).isEmpty(), "the removal was lost at the reopen");
+        }
+    }
+
+    @Test
+    @DisplayName("a batch that removes a range and a key, racing idle commits that keep the key in the uncounted run, never leaves the put visible when the removal is the newer")
+    void rangeBatchRacingIdleRunPuts(@TempDir Path directory) throws Exception {
+        try (var ledger = open(directory, false, Long.MAX_VALUE)) {
+            var expected = populate(ledger);
+            var texts = ledger.newBatch();
+            for (var i = 0; i < 20; i++) {
+                texts.put(TEXTS, text(i), "text");
+            }
+            ledger.commit(texts).awaitDurable();
+            var newer = 0;
+            for (var attempt = 0; attempt < 200; attempt++) {
+                var removed = POPULATED + attempt * 100 + 50;
+                var start = new CountDownLatch(1);
+                var rangeSequence = new AtomicLong();
+                var failure = new AtomicReference<Throwable>();
+                var other = Thread.ofPlatform().start(() -> {
+                    try {
+                        start.await();
+                        var range = ledger.newBatch();
+                        range.delete(MESSAGES, key(removed));
+                        range.deleteRange(TEXTS, KeyRange.between(text(0), text(1)));
+                        rangeSequence.set(ledger.commit(range).sequence());
+                    } catch (Throwable throwable) {
+                        failure.set(throwable);
+                    }
+                });
+                var batch = ledger.newBatch();
+                for (var i = 0; i < 100; i++) {
+                    put(batch, expected, POPULATED + attempt * 100 + i, 1);
+                }
+                start.countDown();
+                var sequence = ledger.commit(batch).sequence();
+                other.join();
+                assertNull(failure.get());
+                if (rangeSequence.get() > sequence) {
+                    newer++;
+                    expected.remove(removed);
+                    assertTrue(ledger.get(MESSAGES, key(removed)).isEmpty(),
+                            "attempt " + attempt + ": a removal committed after an idle commit's put was lost");
+                }
+            }
+            assertTrue(newer > 0, "no removal came after the idle commit's put");
+            verifyPoints(ledger, expected, POPULATED + 20_000);
+            ledger.checkpoint();
+            verify(ledger, expected, POPULATED + 20_000);
+        }
+    }
+
+    @Test
+    @DisplayName("a bulk commit planned into a counted run, which finds a tree and an uncounted run of its key space at its turn, appends to that run and counts its puts and removals exactly")
+    void countedPlanFindsUncountedRun(@TempDir Path directory) throws Exception {
+        var texts = new TreeMap<String, String>();
+        var last = LiveLedger.BULK_RUN_WRITES + 200;
+        try (var ledger = open(directory, true, Long.MAX_VALUE)) {
+            var expected = populate(ledger);
+            ledger.hookPlanForTests(() -> {
+                ledger.hookPlanForTests(null);
+                try {
+                    // The texts get a tree, then an uncounted run over it of keys the bulk commit puts and removes
+                    var small = ledger.newBatch();
+                    for (var i = 0; i < 50; i++) {
+                        small.put(TEXTS, text(i * 7), "tree " + i);
+                        texts.put(text(i * 7), "tree " + i);
+                    }
+                    ledger.commit(small).awaitDurable();
+                    ledger.checkpoint();
+                    var idle = ledger.newBatch();
+                    for (var i = 0; i < 100; i++) {
+                        idle.put(TEXTS, text(i * 3 + 1), "idle " + i);
+                        texts.put(text(i * 3 + 1), "idle " + i);
+                    }
+                    ledger.commit(idle);
+                } catch (InterruptedException exception) {
+                    throw new AssertionError(exception);
+                }
+                var run = ledger.state(TEXTS).run;
+                assertNotNull(run, "the idle commit made no run");
+                assertFalse(run.counted());
+            });
+            var bulk = ledger.newBatch();
+            for (var i = 0; i < LiveLedger.BULK_RUN_WRITES; i++) {
+                bulk.put(TEXTS, text(i), "bulk " + i);
+            }
+            // Keys of the tree, of the idle commit's run, and of neither
+            var removals = new ArrayList<String>();
+            for (var i = 0; i < 30; i++) {
+                removals.add(text(i * 7));
+                removals.add(text(i * 3 + 1));
+                removals.add(text(LiveLedger.BULK_RUN_WRITES + 100 + i));
+            }
+            for (var removal : removals) {
+                bulk.delete(TEXTS, removal);
+            }
+            bulk.delete(MESSAGES, key(10));
+            ledger.commit(bulk);
+            for (var i = 0; i < LiveLedger.BULK_RUN_WRITES; i++) {
+                texts.put(text(i), "bulk " + i);
+            }
+            for (var removal : removals) {
+                texts.remove(removal);
+            }
+            expected.remove(10);
+            var run = ledger.state(TEXTS).run;
+            assertNotNull(run);
+            assertFalse(run.counted(), "the bulk commit made a counted run over a populated tree");
+            verifyTexts(ledger, texts, last);
+            verifyPoints(ledger, expected, POPULATED);
+            ledger.checkpoint();
+            verifyTexts(ledger, texts, last);
+            verify(ledger, expected, POPULATED);
+        }
+        try (var ledger = open(directory, true, Long.MAX_VALUE)) {
+            verifyTexts(ledger, texts, last);
+        }
+    }
+
     @ParameterizedTest(name = "round {0}")
     @ValueSource(ints = {0, 1, 2})
     @DisplayName("medium commits beside pipelined commits, checkpoints, releases and counting readers keep every snapshot's count and reads in agreement and the counts exact")

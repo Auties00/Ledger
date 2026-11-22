@@ -234,6 +234,9 @@ public final class LiveLedger implements Ledger {
     private Checkpointer checkpointer;
     // The trees of the latest published checkpoint, or null
     private volatile TreeVersion tree;
+    // The views commits have published of the runs of their puts of new keys, counted holding the roles after each
+    // view is the key space's run: a lookup made before a commit's turn holds while this and the trees are unchanged
+    private volatile long runViews;
     // The file of large values, or null for a store in memory
     private BlobFile blobs;
     // The threshold of the key spaces the store finds in its catalog without being opened with them
@@ -1224,7 +1227,7 @@ public final class LiveLedger implements Ledger {
                 var key = writes.key(index);
                 var value = writes.value(index);
                 var unit = units == null ? null : units[index];
-                var inTree = hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree);
+                var inTree = hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree, runViews);
                 var bulk = applier.bulkRun(state);
                 if (bulk != null) {
                     // Hashed once for the chain index and the run's table
@@ -1245,7 +1248,7 @@ public final class LiveLedger implements Ledger {
             }
             case ArrayWriteBatch.DELETE -> {
                 var key = writes.key(index);
-                var inTree = hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree);
+                var inTree = hints == null ? TreeSearch.UNKNOWN : hints.of(index, tree, runViews);
                 var bulk = applier.bulkRun(state);
                 if (bulk != null && bulk.builder.find(key) >= 0) {
                     // Removed on a chain over the run's entry, which the run keeps
@@ -1474,6 +1477,8 @@ public final class LiveLedger implements Ledger {
         var keyspaceStates = new KeyspaceState[size];
         // Only a batch that puts to a resident key space has values to decode
         var decoded = writes.residentPuts() > 0 ? new Object[size] : null;
+        // Before the trees and the lookups, so that a run's view published after them is never taken as seen
+        var views = runViews;
         var trees = pages == null ? null : tree;
         var found = trees == null ? null : new byte[size];
         var keys = new MemorySegment[size];
@@ -1499,7 +1504,7 @@ public final class LiveLedger implements Ledger {
                 }
             }
         }
-        var hints = found == null ? null : new Hints(trees, found);
+        var hints = found == null ? null : new Hints(trees, views, found);
         var pending = new PendingCommit(writes, chains, keyspaceStates, keys, decoded, units, hints);
         if (arrivalTail.commit == arrivalCursor.commit && !sequencingWanted.held() && sequencing.tryAcquireBriefly()) {
             // No commit arrived before this one: it takes its sequence without the queue, and lets the role go with
@@ -1824,7 +1829,7 @@ public final class LiveLedger implements Ledger {
             predecessor.awaitApplied();
         }
         var writes = pending.writes;
-        var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(index, tree);
+        var inTree = pending.hints == null ? TreeSearch.UNKNOWN : pending.hints.of(index, tree, runViews);
         var key = pending.keys[index];
         if (writes.kind(index) == ArrayWriteBatch.PUT) {
             applier.put(pending.states[index], pending.chains[index], key, writes.value(index), writes.ownValue(index),
@@ -2654,6 +2659,8 @@ public final class LiveLedger implements Ledger {
     /// @param bulk the key spaces the batch may keep its puts of new keys of in runs, or `null`
     /// @return how each write learns whether its key existed, or `null` if the store has no trees
     private Hints prefetch(ArrayWriteBatch writes, BulkPlan bulk) {
+        // Before the trees and the lookups, so that a run's view published after them is never taken as seen
+        var views = runViews;
         var trees = pages == null ? null : tree;
         var point = trees == null ? null : new ReadPoint(Reads.boundOf(latest()), trees, pages);
         var size = writes.size();
@@ -2680,7 +2687,7 @@ public final class LiveLedger implements Ledger {
                 // A helper that would not start: the lookups left unknown read the trees as the writes apply
             }
         }
-        return found == null ? null : new Hints(trees, found);
+        return found == null ? null : new Hints(trees, views, found);
     }
 
     /// Opens the chain of the key of write `index` if it puts, and looks the key up in the pages of the trees of
@@ -2713,8 +2720,8 @@ public final class LiveLedger implements Ledger {
         }
         // The run the open replayed, or bulk commits made, is part of the tree of `point` for its readers; the key's
         // chain, of a put after a bulk commit or a replay, holds its hash already. The answer serves the write as it
-        // applies, after every view published since `point`, so the lookup reads the newest view: a run only gains
-        // entries until a newer tree, which the answer is not used with, holds it
+        // applies, after every view published since `point`, so the lookup reads the newest view; the answer is not
+        // used once a newer tree holds the run or a commit published another view of it (Hints)
         var run = state.run;
         if (run != null && run.maxStamp() <= point.treeBound()) {
             run = null;
@@ -2780,18 +2787,26 @@ public final class LiveLedger implements Ledger {
         }
     }
 
-    /// Whether the trees held the keys of a batch's writes, as a commit found before it was given a sequence.
+    /// Whether the trees, with the runs read over them, held the keys of a batch's writes, as a commit found before it
+    /// was given a sequence.
+    ///
+    /// An answer holds only while the trees and the runs are those the lookups read. Runs only gain entries until a
+    /// newer tree holds them, but a commit that runs alone may keep a put of a key in a run between the lookup and the
+    /// write: with the key absent from the trees and its removal opening no chain before its turn, the removal would
+    /// take the key for absent and leave the put visible.
     ///
     /// @param tree the trees the lookups read
+    /// @param runViews the views of runs the store's commits had published before the lookups read the runs
     /// @param found per write, [TreeSearch#FOUND], [TreeSearch#ABSENT], or [TreeSearch#UNKNOWN] for one not looked up
-    record Hints(TreeVersion tree, byte[] found) {
+    record Hints(TreeVersion tree, long runViews, byte[] found) {
         /// {@return what the lookups found for write `write`, or [TreeSearch#UNKNOWN] if the writer reads trees
-        /// other than theirs}
+        /// other than theirs, or runs that gained a view since}
         ///
         /// @param current the trees the writer reads
-        byte of(int write, TreeVersion current) {
+        /// @param views the views of runs the store's commits have published when the writer reads
+        byte of(int write, TreeVersion current, long views) {
             var hint = found[write];
-            return hint == TreeSearch.BLIND || tree == current ? hint : TreeSearch.UNKNOWN;
+            return hint == TreeSearch.BLIND || tree == current && runViews == views ? hint : TreeSearch.UNKNOWN;
         }
     }
 
@@ -3981,6 +3996,7 @@ public final class LiveLedger implements Ledger {
                     bulk.listed.run(run);
                 }
                 bulk.state.publishBulkRun(run);
+                runViews++;
             }
         }
 
