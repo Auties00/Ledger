@@ -13,7 +13,10 @@
      JDK 26 has no throttle for jdk.ThreadPark and jdk.JavaMonitorEnter (a throttle setting on them records as many
      events as none), so every park and contended monitor enter is recorded with its stack trace: on a workload that
      parks often, such as GroupCommit with many committers, read the recording's jdk.DataLoss count and compare the
-     profiled side's score with an unprofiled one before trusting its waits.
+     profiled side's score with an unprofiled one before trusting its waits. On GroupCommit with 256 committers
+     (runs 45001844487 and 45001887530, profiled head against unprofiled base, 3 rounds) a recording held 196,000-
+     202,000 parks on ubuntu and 130,000-138,000 on windows, with no jdk.DataLoss, and the profiled side's throughput
+     was 0.99x on ubuntu and 1.02x on windows.
      Use with JMH's JFR profiler, which records only the measurement iterations:
        -prof jfr:configName=<path to this file>
      In a compare (ci-data's compare.yml), pass
