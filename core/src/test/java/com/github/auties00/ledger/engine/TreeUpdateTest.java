@@ -11,6 +11,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -31,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.zip.CRC32C;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -345,6 +347,44 @@ class TreeUpdateTest {
         }
     }
 
+    @ParameterizedTest(name = "let go of before the first pass: {0}")
+    @ValueSource(booleans = {true, false})
+    @DisplayName("homes a bulk commit's run let go of for their value frames, before its tree is written or between the two passes, are read back from those frames, and the tree is the one the states of the run's entries write, unit for unit")
+    void framedHomesInRunPasses(boolean beforeFirstPass, @TempDir Path directory) throws Exception {
+        var random = new Random(beforeFirstPass ? 73 : 79);
+        var writes = runWrites(random, 20_000, true);
+        try (var log = new Log(directory.resolve("1.log"))) {
+            var homes = new ArrayList<HomeValues>();
+            var streamedRun = committedRun(writes, log, homes, 1L);
+            var mergedRun = committedRun(writes, log, null);
+            log.write();
+            var frames = new int[homes.size()];
+            var offsets = new long[homes.size()];
+            var lengths = new int[homes.size()];
+            for (var home = 0; home < homes.size(); home++) {
+                frames[home] = home;
+                offsets[home] = log.places.get(homes.get(home).array());
+                lengths[home] = homes.get(home).array().length;
+            }
+            var dropped = new AtomicBoolean();
+            Runnable drop = () -> {
+                assertTrue(dropped.compareAndSet(false, true));
+                streamedRun.dropHomes(frames, log.view, offsets, lengths, 1L);
+                assertEquals(homes.size(), streamedRun.framedHomesForTests(), "homes let go of");
+                assertEquals(0, streamedRun.homesForTests(), "homes the run still holds");
+            };
+            if (beforeFirstPass) {
+                drop.run();
+            }
+            var streamed = layOut(directory.resolve("streamed"), true, streamedRun, true, beforeFirstPass ? null : _ -> drop.run());
+            assertTrue(dropped.get(), "the homes were never let go of");
+            assertTrue(streamedRun.homesForTests() > 0, "no home read back from its frame");
+            var merged = layOut(directory.resolve("merged"), true, mergedRun, false, null);
+            assertLaidAlike(merged, streamed);
+            verifyLaid(directory.resolve("streamed"), true, streamed, writes, random);
+        }
+    }
+
     @Test
     @DisplayName("an entry that takes other bytes than the first pass counted fails the tree before its leaf is written, with every page the update took listed for the checkpoint to give back")
     void runTreeSizeMismatch(@TempDir Path directory) throws Exception {
@@ -496,6 +536,13 @@ class TreeUpdateTest {
     /// {@return the run of a bulk commit of `writes`, its values on homes of 64 KiB each placed in `log` as the body of
     /// a frame of its own; the homes and their entries go to `homes` if it is not `null`}
     private static PackedRun committedRun(List<RunWrite> writes, Log log, List<HomeValues> homes) {
+        return committedRun(writes, log, homes, -1);
+    }
+
+    /// {@return the run of a bulk commit of `writes`, as [#committedRun(List, Log, List)] makes it, each home the body
+    /// of a value frame of the commit at `sequence` that a run can let go of it for, or of a frame of no commit if
+    /// `sequence` is negative}
+    private static PackedRun committedRun(List<RunWrite> writes, Log log, List<HomeValues> homes, long sequence) {
         var keyBytes = 0L;
         for (var write : writes) {
             keyBytes += write.key().length;
@@ -513,7 +560,11 @@ class TreeUpdateTest {
                 home = new byte[Math.max(64 << 10, value.length)];
                 view = MemorySegment.ofArray(home).asReadOnly();
                 fill = 0;
-                log.reserve(home);
+                if (sequence < 0) {
+                    log.reserve(home);
+                } else {
+                    log.reserveValueFrame(home, sequence);
+                }
                 values = new HomeValues(home, new ArrayList<>(), new ArrayList<>());
                 if (homes != null) {
                     homes.add(values);
@@ -604,6 +655,8 @@ class TreeUpdateTest {
         private final IdentityHashMap<byte[], Long> places;
         // The arrays placed whose bytes are written at write(), in the order they were placed
         private final List<byte[]> reserved;
+        // The commit of each array placed as the body of a value frame, which write() gives its header and checksum
+        private final IdentityHashMap<byte[], Long> valueFrames;
 
         Log(Path path) {
             this.path = path;
@@ -612,6 +665,7 @@ class TreeUpdateTest {
             this.bytes = new ByteArrayOutputStream();
             this.places = new IdentityHashMap<>();
             this.reserved = new ArrayList<>();
+            this.valueFrames = new IdentityHashMap<>();
         }
 
         /// Gives `array` a frame of its own, whose body is the bytes the array holds when the log is written.
@@ -619,6 +673,15 @@ class TreeUpdateTest {
             places.put(array, (long) bytes.size());
             reserved.add(array);
             bytes.writeBytes(new byte[LogWriter.FRAME_HEADER + array.length]);
+        }
+
+        /// Gives `array` a value frame of its own of the commit at `sequence`, as a split commit's frames hold the homes
+        /// of its run, whose body is the bytes the array holds when the log is written, sealed by a checksum past it.
+        void reserveValueFrame(byte[] array, long sequence) {
+            places.put(array, (long) bytes.size());
+            reserved.add(array);
+            valueFrames.put(array, sequence);
+            bytes.writeBytes(new byte[LogWriter.FRAME_HEADER + array.length + Integer.BYTES]);
         }
 
         /// {@return the place of `value`, given a frame of its own at the first call, in the log, as a write stamped
@@ -639,8 +702,20 @@ class TreeUpdateTest {
         void write() throws IOException {
             var file = bytes.toByteArray();
             for (var array : reserved) {
-                var at = places.get(array).intValue() + LogWriter.FRAME_HEADER;
+                var start = places.get(array).intValue();
+                var at = start + LogWriter.FRAME_HEADER;
                 System.arraycopy(array, 0, file, at, array.length);
+                var sequence = valueFrames.get(array);
+                if (sequence != null) {
+                    var header = ByteBuffer.wrap(file);
+                    header.putInt(start, LogWriter.MAGIC);
+                    header.putInt(start + 4, array.length + Integer.BYTES);
+                    header.putLong(start + 8, sequence);
+                    file[start + 16] = FrameBody.VALUES;
+                    var crc = new CRC32C();
+                    crc.update(file, start, LogWriter.FRAME_HEADER + array.length);
+                    header.putInt(at + array.length, (int) crc.getValue());
+                }
             }
             Files.write(path, file);
         }
