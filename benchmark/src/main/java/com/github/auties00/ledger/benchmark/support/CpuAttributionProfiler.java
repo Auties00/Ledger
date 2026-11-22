@@ -11,10 +11,13 @@ import org.openjdk.jmh.infra.BenchmarkParams;
 import org.openjdk.jmh.infra.IterationParams;
 import org.openjdk.jmh.profile.InternalProfiler;
 import org.openjdk.jmh.results.AggregationPolicy;
+import org.openjdk.jmh.results.Aggregator;
 import org.openjdk.jmh.results.IterationResult;
 import org.openjdk.jmh.results.Result;
+import org.openjdk.jmh.results.ResultRole;
 import org.openjdk.jmh.results.ScalarResult;
 import org.openjdk.jmh.runner.IterationType;
+import org.openjdk.jmh.util.ListStatistics;
 
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
@@ -23,9 +26,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -39,9 +44,20 @@ import java.util.concurrent.atomic.AtomicLong;
 /// Run with `-prof com.github.auties00.ledger.benchmark.support.CpuAttributionProfiler`. Options, joined by `;`
 /// (no spaces, so they survive compare.yml's word splitting): `jfr=true` also streams JFR in process to count
 /// deoptimizations, compilations and GC pauses, inside the iteration and inside the timed part of each operation the
-/// benchmark marks with [MeasuredOp] (each iteration then waits, untimed, about a second for the stream's flush);
-/// `period=<ms>` sets the thread sampling period (default 10); `pause=<ms>` sleeps that long after each iteration,
-/// untimed, without JFR, to tell the effect of `jfr=true`'s wait for the stream apart from that of JFR itself.
+/// benchmark marks with [MeasuredOp]; `period=<ms>` sets the thread sampling period (default 10); `pause=<ms>` sleeps
+/// that long after each iteration, untimed, without JFR, as a way to measure what spacing iterations apart does to a
+/// workload.
+///
+/// The stream delivers events at each flush, about once a second, so the JFR results of an iteration arrive late. No
+/// iteration waits for them but the last measured one, which waits for the stream to deliver every iteration not yet
+/// reported (at most 5 s): the measured iterations follow one another as they would without the profiler, and the
+/// untimed wait only comes after the last of them. Each JFR result of an iteration is therefore reported by the first
+/// later iteration of the same kind (warm-up or measurement) that finds it delivered, by the last measured iteration
+/// otherwise; a warm-up iteration's results that arrive during the measurement are only printed. An iteration can
+/// thus report the JFR results of none, one or several iterations: they keep one value per iteration
+/// ([WindowResult]), so their scores and errors are means over iterations, but the `rawData` slots of the `jfr.*`
+/// and `op.*` results do not line up with the iterations. Each iteration's own JFR values are printed as a
+/// `cpu-attribution: jfr <warmup|measure> <index>/<count>` line.
 ///
 /// Results (per op unless noted; `<group>` is `worker` for the JMH benchmark threads, one group per Ledger platform
 /// thread name with its index dropped, such as `io`, `checkpoint` and `prepare`, `carrier` for the virtual-thread
@@ -63,7 +79,7 @@ import java.util.concurrent.atomic.AtomicLong;
 ///   fork's first iteration, warm-up included; MAX over iterations), and when the benchmark marks its timed code:
 ///   `op.ms`, `op.cpu.worker.norm` (worker CPU inside the timed code, ns/op), `op.gc.count`, `op.gc.pause.ms`,
 ///   `op.deopt.ledger` (summed over the iteration's operations). Every Ledger deoptimization is also printed to the
-///   log as a `cpu-attribution: deopt` line.
+///   log as a `cpu-attribution: deopt` line, when its iteration's results arrive.
 ///
 /// The window is JMH's iteration window, which also holds `Level.Iteration` setup and teardown, the same window
 /// `-prof gc` normalizes over; the `op.*` results are the only ones limited to the timed code.
@@ -101,6 +117,17 @@ public final class CpuAttributionProfiler implements InternalProfiler {
     private final AtomicLong nextMark = new AtomicLong();
     private long windowMark;
     private long ledgerDeoptsTotal;
+    /// The iterations whose JFR results the stream has not delivered yet, oldest first.
+    private final ArrayDeque<Window> pending = new ArrayDeque<>();
+    private IterationType iterationType;
+    private int iterationIndex;
+
+    /// One iteration's window in the stream: the ids of the marks committed at its edges.
+    private record Window(IterationType type, int index, int count, long startMark, long endMark) {
+        String name() {
+            return (type == IterationType.WARMUP ? "warmup " : "measure ") + index + "/" + count;
+        }
+    }
 
     private static final class Tracked {
         final String group;
@@ -170,6 +197,11 @@ public final class CpuAttributionProfiler implements InternalProfiler {
         if (jfr && stream == null) {
             startStream();
         }
+        if (iterationParams.getType() != iterationType) {
+            iterationType = iterationParams.getType();
+            iterationIndex = 0;
+        }
+        iterationIndex++;
         if (stream != null) {
             windowMark = mark();
         }
@@ -245,10 +277,12 @@ public final class CpuAttributionProfiler implements InternalProfiler {
         for (var entry : cpuByGroup.entrySet()) {
             line.append(' ').append(entry.getKey()).append('=').append(TimeUnit.NANOSECONDS.toMicros(entry.getValue())).append("us");
         }
-        if (stream != null) {
-            jfrResults(out, line, measuredOps);
-        }
         System.out.println(line);
+        if (stream != null) {
+            var type = iterationParams.getType();
+            pending.add(new Window(type, iterationIndex, iterationParams.getCount(), windowMark, mark()));
+            jfrResults(out, type, type == IterationType.MEASUREMENT && iterationIndex >= iterationParams.getCount());
+        }
         if (pauseMillis > 0) {
             try {
                 Thread.sleep(pauseMillis);
@@ -259,15 +293,44 @@ public final class CpuAttributionProfiler implements InternalProfiler {
         return out;
     }
 
-    /// Adds the results that come from the JFR stream, once the stream has delivered the window's closing mark.
-    private void jfrResults(List<Result> out, StringBuilder line, long measuredOps) {
-        var endMark = mark();
-        var start = awaitMark(windowMark);
-        var end = awaitMark(endMark);
-        if (start == null || end == null) {
-            System.out.println("cpu-attribution: the JFR stream did not deliver the window marks");
-            return;
+    /// Reports the JFR results of every pending iteration the stream has delivered, oldest first, adding to `out`
+    /// those of iterations of `type`; with `last`, first waits for the stream to deliver them all.
+    private void jfrResults(List<Result> out, IterationType type, boolean last) {
+        if (last && awaitMark(pending.getLast().endMark()) == null) {
+            System.out.println("cpu-attribution: the JFR stream did not deliver the last iteration's marks in 5 s");
         }
+        var values = new LinkedHashMap<String, WindowValues>();
+        while (!pending.isEmpty()) {
+            var window = pending.peekFirst();
+            var start = marks.get(window.startMark());
+            var end = marks.get(window.endMark());
+            if (end == null && !last) {
+                break;
+            }
+            pending.removeFirst();
+            if (start == null || end == null) {
+                System.out.println("cpu-attribution: the JFR stream did not deliver the marks of " + window.name());
+                continue;
+            }
+            var sink = window.type() == type ? values : new LinkedHashMap<String, WindowValues>();
+            windowResults(window, start, end, sink);
+        }
+        for (var entry : values.entrySet()) {
+            var metric = entry.getValue();
+            out.add(new WindowResult(entry.getKey(), metric.values(), metric.unit(), metric.policy()));
+        }
+    }
+
+    /// The values of one JFR result over the iterations an iteration reports.
+    private record WindowValues(ListStatistics values, String unit, AggregationPolicy policy) {
+    }
+
+    private static void add(Map<String, WindowValues> sink, String label, double value, String unit, AggregationPolicy policy) {
+        sink.computeIfAbsent(label, _ -> new WindowValues(new ListStatistics(), unit, policy)).values().addValue(value);
+    }
+
+    /// Computes one iteration's JFR results into `sink`, prints them, and drops the events up to its end.
+    private void windowResults(Window window, Instant start, Instant end, Map<String, WindowValues> sink) {
         long deoptLedger = 0;
         long deoptAll = 0;
         var printed = 0;
@@ -300,11 +363,13 @@ public final class CpuAttributionProfiler implements InternalProfiler {
             }
         }
         ledgerDeoptsTotal += deoptLedger;
-        out.add(new ScalarResult("jfr.deopt.ledger", deoptLedger, "#", AggregationPolicy.AVG));
-        out.add(new ScalarResult("jfr.deopt.all", deoptAll, "#", AggregationPolicy.AVG));
-        out.add(new ScalarResult("jfr.c2.ledger", c2Ledger, "#", AggregationPolicy.AVG));
-        out.add(new ScalarResult("jfr.deopt.ledger.total", ledgerDeoptsTotal, "#", AggregationPolicy.MAX));
-        line.append(" deoptLedger=").append(deoptLedger).append(" c2Ledger=").append(c2Ledger);
+        add(sink, "jfr.deopt.ledger", deoptLedger, "#", AggregationPolicy.AVG);
+        add(sink, "jfr.deopt.all", deoptAll, "#", AggregationPolicy.AVG);
+        add(sink, "jfr.c2.ledger", c2Ledger, "#", AggregationPolicy.AVG);
+        add(sink, "jfr.deopt.ledger.total", ledgerDeoptsTotal, "#", AggregationPolicy.MAX);
+        var line = new StringBuilder("cpu-attribution: jfr ").append(window.name())
+                .append(" deoptLedger=").append(deoptLedger).append(" deoptAll=").append(deoptAll)
+                .append(" c2Ledger=").append(c2Ledger).append(" deoptLedgerTotal=").append(ledgerDeoptsTotal);
         if (!windowOps.isEmpty()) {
             long opNanos = 0;
             long opCpu = 0;
@@ -320,20 +385,64 @@ public final class CpuAttributionProfiler implements InternalProfiler {
                     opGcPause += collection.pauseNanos();
                 }
             }
-            out.add(new ScalarResult("op.ms", opNanos / 1e6, "ms", AggregationPolicy.AVG));
-            out.add(new ScalarResult("op.cpu.worker.norm", (double) opCpu / windowOps.size(), "ns/op", AggregationPolicy.AVG));
-            out.add(new ScalarResult("op.gc.count", opGcCount, "#", AggregationPolicy.AVG));
-            out.add(new ScalarResult("op.gc.pause.ms", opGcPause / 1e6, "ms", AggregationPolicy.AVG));
-            out.add(new ScalarResult("op.deopt.ledger", opDeoptLedger, "#", AggregationPolicy.AVG));
-            line.append(" op=").append(TimeUnit.NANOSECONDS.toMicros(opNanos)).append("us")
+            add(sink, "op.ms", opNanos / 1e6, "ms", AggregationPolicy.AVG);
+            add(sink, "op.cpu.worker.norm", (double) opCpu / windowOps.size(), "ns/op", AggregationPolicy.AVG);
+            add(sink, "op.gc.count", opGcCount, "#", AggregationPolicy.AVG);
+            add(sink, "op.gc.pause.ms", opGcPause / 1e6, "ms", AggregationPolicy.AVG);
+            add(sink, "op.deopt.ledger", opDeoptLedger, "#", AggregationPolicy.AVG);
+            line.append(" ops=").append(windowOps.size())
+                    .append(" op=").append(TimeUnit.NANOSECONDS.toMicros(opNanos)).append("us")
                     .append(" opWorker=").append(TimeUnit.NANOSECONDS.toMicros(opCpu)).append("us")
-                    .append(" opGc=").append(opGcCount).append('/').append(TimeUnit.NANOSECONDS.toMicros(opGcPause)).append("us");
+                    .append(" opGc=").append(opGcCount).append('/').append(TimeUnit.NANOSECONDS.toMicros(opGcPause)).append("us")
+                    .append(" opDeoptLedger=").append(opDeoptLedger);
         }
+        System.out.println(line);
         deopts.removeIf(deopt -> !deopt.start().isAfter(end));
         collections.removeIf(collection -> !collection.start().isAfter(end));
         ops.removeIf(op -> !op.start().isAfter(end));
         compilationsLedgerC2.removeIf(compilation -> !compilation.isAfter(end));
-        marks.keySet().removeIf(id -> id <= endMark);
+        marks.keySet().removeIf(id -> id <= window.endMark());
+    }
+
+    /// A JFR result holding one value per iteration it covers, so that an iteration that reports several iterations
+    /// weighs each of them as one iteration in the means over iterations and forks.
+    public static final class WindowResult extends Result<WindowResult> {
+        private static final long serialVersionUID = 1L;
+
+        WindowResult(String label, ListStatistics values, String unit, AggregationPolicy policy) {
+            super(ResultRole.SECONDARY, label, values, unit, policy);
+        }
+
+        @Override
+        protected Aggregator<WindowResult> getThreadAggregator() {
+            return WindowResult::merge;
+        }
+
+        @Override
+        protected Aggregator<WindowResult> getIterationAggregator() {
+            return WindowResult::merge;
+        }
+
+        private static WindowResult merge(Collection<WindowResult> results) {
+            var values = new ListStatistics();
+            WindowResult first = null;
+            for (var result : results) {
+                if (first == null) {
+                    first = result;
+                }
+                var data = result.getStatistics().getRawData();
+                while (data.hasNext()) {
+                    var entry = data.next();
+                    for (long count = 0; count < entry.getValue(); count++) {
+                        values.addValue(entry.getKey());
+                    }
+                }
+            }
+            if (first == null) {
+                throw new IllegalArgumentException("No results to merge");
+            }
+            return new WindowResult(first.getLabel(), values, first.getScoreUnit(), first.policy);
+        }
     }
 
     private static boolean inside(Instant time, Instant start, Instant end) {
@@ -398,7 +507,8 @@ public final class CpuAttributionProfiler implements InternalProfiler {
         return event.id;
     }
 
-    /// Waits, untimed, for the stream to deliver a mark: events reach the stream at each flush, about once a second.
+    /// Waits, untimed, at most 5 s for the stream to deliver a mark: events reach the stream at each flush, about once a
+    /// second.
     private Instant awaitMark(long id) {
         var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < deadline) {

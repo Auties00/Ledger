@@ -93,7 +93,8 @@ Run one benchmark process per bench directory at a time. Each run deletes the st
 The JMH options that matter:
 - `-p name=value,...` overrides a parameter;
 - `-rf json -rff results.json` keeps the results;
-- `-prof gc` adds allocation rates.
+- `-prof gc` adds allocation rates;
+- `-prof com.github.auties00.ledger.benchmark.support.CpuAttributionProfiler` splits each iteration's CPU time and allocation by thread group, and with `:jfr=true` counts the deoptimizations, compilations and collections inside it and inside the timed part of the workloads that mark it (`support.MeasuredOp`); its class doc lists its options and results.
 
 A full run takes several hours. A quick pass to check that everything works: `-wi 0 -i 1 -r 1s -p messages=20000`.
 
