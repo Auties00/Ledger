@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -61,6 +62,13 @@ final class Checkpointer implements IdleTicker.Watched {
     /// on a thread no commit waits for, while forcing a spare that a copy of the store left in the OS cache held the
     /// first durable commit after the open for tens of milliseconds.
     private static final int SPARES = 0;
+    /// The most spare segments a running store keeps ([#spares()]).
+    private static final int MAX_SPARES = 64;
+    /// The most bytes of spare segments a running store keeps for the cycles of waiting commits, past those of the
+    /// interval ([#spares()]): [#MAX_SPARES] segments of the default 16 MiB.
+    private static final long MAX_SPARE_BYTES = 1L << 30;
+    /// The checkpoint cycles whose segments the spares cover ([#measureCycle]).
+    private static final int CYCLES_COVERED = 4;
     /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint, whatever the heap.
     private static final int MAX_BACKLOG = 6;
     /// The checkpoint intervals of log the trees may lack before commits wait for a checkpoint, if the writes behind it
@@ -135,6 +143,22 @@ final class Checkpointer implements IdleTicker.Watched {
     // The first log segment the last published checkpoint needs, before which the segments that values moved to are
     // retired once no reader needs them, or 0; guarded by the lock
     private long retireTarget;
+    // At the last checkpoint that measured its cycle, or at the open: the segment of its cut, the segment the log
+    // wrote at its retirement, the log's bytes at the cut, and the groups the log had written and those a commit
+    // waited for at its retirement. Guarded by the lock
+    private long measuredSegment;
+    private long measuredCurrent;
+    private long measuredBytes;
+    private long measuredGroups;
+    private long measuredWaits;
+    // The spares the last cycles of waiting commits call for ([#measureCycle]), or 0 if the commits did not wait, and
+    // those each of the last CYCLES_COVERED cycles of at least half an interval called for alone, the last one at
+    // coveredCycle; guarded by the lock
+    private int cycleSpares;
+    private final int[] coveredSpares;
+    private int coveredCycle;
+    // The cycles measured, for tests; written holding the lock
+    private volatile int cycles;
 
     /// Creates the checkpointer of `ledger`.
     ///
@@ -166,6 +190,7 @@ final class Checkpointer implements IdleTicker.Watched {
         this.durableEpoch = durableEpoch;
         this.loggedEpoch = loggedEpoch;
         this.heapBudget = heapBudget;
+        this.coveredSpares = new int[CYCLES_COVERED];
         this.progressLock = new ReentrantLock();
         this.progress = progressLock.newCondition();
     }
@@ -180,6 +205,17 @@ final class Checkpointer implements IdleTicker.Watched {
         publishedBytes = -replayedBytes;
         publishedHeap = -replayedHeap;
         appendedAtTick = log.appendedBytes();
+        lock.lock();
+        try {
+            // The first cycle is measured from the open, whose log has no spare to prepare segments from
+            measuredSegment = log.currentSegment();
+            measuredCurrent = measuredSegment;
+            measuredBytes = log.appendedBytes();
+            measuredGroups = log.forces();
+            measuredWaits = log.waitedGroups();
+        } finally {
+            lock.unlock();
+        }
         OPEN.add(this);
         IdleTicker.watch(this);
     }
@@ -301,6 +337,21 @@ final class Checkpointer implements IdleTicker.Watched {
     /// {@return whether a checkpoint started on a thread of its own has not ended; for tests}
     boolean startedForTests() {
         return scheduled.get();
+    }
+
+    /// {@return the spare segments a retirement keeps now ([#spares()]); for tests}
+    int sparesForTests() {
+        lock.lock();
+        try {
+            return spares();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /// {@return the checkpoint cycles measured for the spares since the store opened ([#measureCycle]); for tests}
+    int cyclesForTests() {
+        return cycles;
     }
 
     /// {@return whether a thread is finishing the sweep of the store; for tests}
@@ -558,7 +609,10 @@ final class Checkpointer implements IdleTicker.Watched {
             endedSaturated = !closing && saturated();
             signalProgress();
             ledger.pruneCut(cut);
-            // While the store runs, as many as a checkpoint interval fills, so the log seldom writes into a new file
+            if (!closing) {
+                measureCycle(cut);
+            }
+            // While the store runs, as many as a checkpoint cycle fills, so the log seldom writes into a new file
             retire(retireLogged(cut.logStart(), closing), closing ? SPARES : spares());
             try {
                 var end = space.trim();
@@ -595,9 +649,69 @@ final class Checkpointer implements IdleTicker.Watched {
                 || (blobs.epochTaken() && Integer.compareUnsigned(blobs.epoch(), durableEpoch) > 0);
     }
 
-    /// {@return the spare segments kept while the store runs: as many as a checkpoint interval fills}
+    /// {@return the spare segments kept while the store runs: as many as a checkpoint interval fills, counted in its
+    /// appended bytes, or, while commits wait for the groups, as many as the last checkpoint cycles filled, with a margin
+    /// ([#measureCycle])}
+    ///
+    /// A preparation takes a spare, which has its blocks already, before it creates a new file, which it writes with
+    /// zeros and forces where commits wait for the forces, or leaves to grow, so that every group into it is a write
+    /// and a force of a growing file rather than one write through. The interval counts the bytes the commits appended,
+    /// and the log fills more segments than those bytes: every group is padded to a block, so a log of durable commits
+    /// of one write of 1.5 KB each fills two and a half times the segments its bytes name, and 64 waiting committers a
+    /// third more. While commits wait, the pool covers the segments a cycle fills, up to [#MAX_SPARES] segments and
+    /// [#MAX_SPARE_BYTES] of them, so a store of such commits holds, beside the segments it writes, as many spares as a
+    /// cycle fills and the margin, which raises both the least and the most its log directory holds. A store whose
+    /// commits do not wait, as an ingest or a log of deferred writes, keeps the interval's count.
     private int spares() {
-        return (int) Math.min(64, every / log.segmentSize() + 1);
+        var segment = log.segmentSize();
+        var interval = (int) Math.min(MAX_SPARES, every / segment + 1);
+        var cap = (int) Math.min(MAX_SPARES, MAX_SPARE_BYTES / segment);
+        return Math.max(interval, Math.min(cap, cycleSpares));
+    }
+
+    /// Measures the checkpoint cycle that ends at `cut` for [#spares()], once the checkpoint is durable, holding the
+    /// lock: the segments the log filled since the last measured cycle, between the two cuts or between the two
+    /// retirements, whichever is more, plus a quarter, and at least two, for a cycle that fills more than the one before
+    /// and the segment of the cut, which is not retired. The pool covers the longest of the last [#CYCLES_COVERED]
+    /// cycles, whose length moves with how long their checkpoints took: a shorter cycle between longer ones deletes no
+    /// spare the next one needs.
+    ///
+    /// A cycle in which commits waited for no group, or for less than a quarter of the groups the log wrote, sets the
+    /// count back to the interval's: an ingest that waits once at its end has nothing to gain from spares, which only
+    /// let the groups commits wait for be written through. A cycle shorter than half an interval, as one an idle store
+    /// or [Ledger#checkpoint()][com.github.auties00.ledger.Ledger#checkpoint()] starts, lowers the count by at most
+    /// half, so one such cycle in a busy store leaves it most of its spares, while a store that went quiet comes back
+    /// to the interval's count within a few. A checkpoint that fails measures nothing, and the next one measures both
+    /// cycles.
+    private void measureCycle(LiveLedger.Cut cut) {
+        var current = log.currentSegment();
+        var groups = log.forces();
+        var waits = log.waitedGroups();
+        var bytes = cut.logBytes() - measuredBytes;
+        var waited = waits - measuredWaits;
+        if (waited == 0 || 4 * waited < groups - measuredGroups) {
+            cycleSpares = 0;
+            Arrays.fill(coveredSpares, 0);
+        } else if (bytes > 0) {
+            var filled = Math.max(Math.max(0, cut.logStart() - measuredSegment), current - measuredCurrent);
+            var spares = (int) Math.min(MAX_SPARES, filled + Math.max(2, filled / 4));
+            if (bytes >= every / 2) {
+                coveredCycle = (coveredCycle + 1) % CYCLES_COVERED;
+                coveredSpares[coveredCycle] = spares;
+                cycleSpares = 0;
+                for (var covered : coveredSpares) {
+                    cycleSpares = Math.max(cycleSpares, covered);
+                }
+            } else {
+                cycleSpares = Math.max(spares, cycleSpares / 2);
+            }
+        }
+        cycles++;
+        measuredSegment = cut.logStart();
+        measuredBytes = cut.logBytes();
+        measuredCurrent = current;
+        measuredGroups = groups;
+        measuredWaits = waits;
     }
 
     /// Retires the segments before `first` that values moved to and no reader may need any more, every one of them if

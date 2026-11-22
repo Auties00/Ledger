@@ -371,8 +371,8 @@ final class LogWriter {
     private boolean waitedBefore;
     // Whether a commit waited since the last group began to be written
     private volatile boolean waitedGroup;
-    // The groups written since the store opened that a commit waited for; owned by the flush task
-    private long waitedGroups;
+    // The groups written since the store opened that a commit waited for; written by the flush task only
+    private volatile long waitedGroups;
     private final Cipher cipher;
     private final CRC32C crc;
     // The buffer frames are sealed into and written from, a slice at a time whatever their size; it grows up to OUTPUT
@@ -2720,10 +2720,20 @@ final class LogWriter {
         return forces;
     }
 
+    /// {@return the groups written since the writer opened that a commit waited for, of the [#forces()]}
+    long waitedGroups() {
+        return waitedGroups;
+    }
+
     /// {@return whether the work on the segment after the current one, if any was started, is over, for tests}
     boolean nextSettled() {
         var preparation = next;
         return preparation == null || preparation.isDone();
+    }
+
+    /// {@return the files of the log, for tests}
+    LogFiles filesForTests() {
+        return files;
     }
 
     /// {@return the groups written through so far, for tests}

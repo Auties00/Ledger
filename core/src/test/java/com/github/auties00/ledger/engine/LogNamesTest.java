@@ -592,6 +592,89 @@ class LogNamesTest {
     }
 
     @Nested
+    @DisplayName("the spare segments of a running store")
+    class SparePool {
+        /// Opens a store of 1 MiB segments that checkpoints every 4 MiB of log, as the default one of 16 MiB segments
+        /// checkpoints every 256 MiB at a scale a test runs.
+        private static LiveLedger scaled(Path directory) {
+            return (LiveLedger) ((LedgerBuilder) Ledger.builder().directory(directory).encryption(Encryption.key(KEY))
+                    .keyspace(NAMES).checkpointEvery(4L << 20))
+                    .segmentSize(1L << 20)
+                    .writeThrough(WriteThrough.Mode.DSYNC)
+                    .build();
+        }
+
+        @Test
+        @DisplayName("cover a checkpoint cycle of durable commits of one small group each, which fill more segments than the interval's bytes name: once the second checkpoint retired, the log seldom prepares a new file")
+        void coverTheCycle() throws Exception {
+            var disk = CrashFileSystem.create();
+            try (var ledger = scaled(disk.getPath("/store"))) {
+                var checkpointer = ledger.checkpointer();
+                var log = ledger.logForTests();
+                var files = log.filesForTests();
+                var value = "v".repeat(1_500);
+                var fresh = -1L;
+                var rollovers = -1L;
+                for (var commit = 0; checkpointer.cyclesForTests() < 8; commit++) {
+                    assertTrue(commit < 200_000, "the checkpoints did not keep up");
+                    ledger.commit(ledger.newBatch().put(NAMES, "s" + commit % 500, value)).awaitDurable();
+                    if (fresh < 0 && checkpointer.cyclesForTests() >= 2) {
+                        fresh = files.freshPreparationsForTests();
+                        rollovers = log.rollovers();
+                    }
+                }
+                // About 11 segments a cycle: the interval's count of 5 spares left more than half of them new files. A
+                // checkpoint that ran far longer than the four before it, on a loaded machine, may still leave a few,
+                // and the short segments the log moved on from, when they become spares, a few more
+                var newFiles = files.freshPreparationsForTests() - fresh;
+                var prepared = log.rollovers() - rollovers;
+                assertTrue(newFiles * 4 <= prepared, () -> newFiles + " new files of " + prepared + " segments");
+                // The interval names 5 segments
+                assertTrue(checkpointer.sparesForTests() > 5, () -> checkpointer.sparesForTests() + " spares");
+            }
+        }
+
+        @Test
+        @DisplayName("number as many as the interval fills, counted in its bytes, for a store whose commits do not wait")
+        void deferredKeepsInterval() throws Exception {
+            var disk = CrashFileSystem.create();
+            try (var ledger = scaled(disk.getPath("/store"))) {
+                var checkpointer = ledger.checkpointer();
+                var value = "v".repeat(1_500);
+                for (var commit = 0; checkpointer.cyclesForTests() < 3; commit++) {
+                    assertTrue(commit < 200_000, "the checkpoints did not keep up");
+                    ledger.commit(ledger.newBatch().put(NAMES, "s" + commit % 500, value));
+                }
+                ledger.awaitDurable();
+                assertEquals(5, checkpointer.sparesForTests());
+            }
+        }
+
+        @Test
+        @DisplayName("go back to as many as the interval fills once the store checkpoints after a few commits at a time")
+        void shortCycles() throws Exception {
+            var disk = CrashFileSystem.create();
+            try (var ledger = scaled(disk.getPath("/store"))) {
+                var checkpointer = ledger.checkpointer();
+                var value = "v".repeat(1_500);
+                var commit = 0;
+                while (checkpointer.cyclesForTests() < 3) {
+                    assertTrue(commit < 100_000, "the checkpoints did not keep up");
+                    ledger.commit(ledger.newBatch().put(NAMES, "s" + commit++ % 500, value)).awaitDurable();
+                }
+                assertTrue(checkpointer.sparesForTests() > 5, () -> checkpointer.sparesForTests() + " spares");
+                for (var round = 0; round < 6; round++) {
+                    for (var index = 0; index < 100; index++) {
+                        ledger.commit(ledger.newBatch().put(NAMES, "s" + commit++ % 500, value)).awaitDurable();
+                    }
+                    ledger.checkpoint();
+                }
+                assertEquals(5, checkpointer.sparesForTests());
+            }
+        }
+    }
+
+    @Nested
     @DisplayName("on a file system that journals names as NTFS does")
     class Ntfs {
         /// Runs a store that writes through into spares, stops the process at the change `stop` lets through and then

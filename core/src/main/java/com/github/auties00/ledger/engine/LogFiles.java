@@ -31,7 +31,8 @@ import java.util.zip.CRC32C;
 /// no file size and no block allocation to record, which on ext4 halved the time of a durable commit and spared one
 /// force in a thousand a wait of tens of milliseconds for a journal commit, and lets the log write a group through to
 /// stable storage with no metadata to write beside it ([WriteThrough]). Once a checkpoint makes segments obsolete, they
-/// become spares ([#retireBefore(long, int)]) instead of being deleted.
+/// become spares ([#retireBefore(long, int)]) instead of being deleted, as many as the checkpointer asks for: while
+/// the store runs, as many as a checkpoint cycle fills, so that the log seldom prepares a new file.
 ///
 /// It is safe for concurrent use: the log writer prepares while a checkpoint retires.
 final class LogFiles {
@@ -47,6 +48,8 @@ final class LogFiles {
     private final Object lock;
     // When a new segment may be written with zeros first
     private final ZeroFill zeroFill;
+    // The segments prepared from a new file rather than a spare, for tests; written holding the lock
+    private volatile long freshPreparations;
 
     /// Creates the files of the log in `directory`.
     ///
@@ -146,6 +149,7 @@ final class LogFiles {
             Path source;
             var fresh = spares.isEmpty();
             if (fresh) {
+                freshPreparations++;
                 source = directory.resolve("%016x".formatted(number) + PREPARING);
                 Files.deleteIfExists(source);
                 Files.createFile(source);
@@ -287,6 +291,11 @@ final class LogFiles {
                 Files.deleteIfExists(spares.get(i));
             }
         }
+    }
+
+    /// {@return the segments prepared from a new file rather than a spare since these files were made, for tests}
+    long freshPreparationsForTests() {
+        return freshPreparations;
     }
 
     /// Deletes the files a preparation left when a crash cut it short.
