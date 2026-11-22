@@ -20,7 +20,7 @@ public class TemplateCounters {
     public long templateBytes;
     /// The number of the template's files.
     public long templateFiles;
-    /// A 52-bit hash of the name and size of every file of the template.
+    /// A 52-bit hash of the name and size of every file of the template but its log segments, which count by size.
     public long templateShape;
 
     private boolean measuring;

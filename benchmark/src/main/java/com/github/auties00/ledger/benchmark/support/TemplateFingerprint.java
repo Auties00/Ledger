@@ -31,7 +31,11 @@ public final class TemplateFingerprint {
     ///
     /// @param bytes the total size of its files
     /// @param files the number of its files
-    /// @param hash a 52-bit FNV-1a hash of [#listing()]
+    /// @param hash a 52-bit FNV-1a hash of [#listing()], with the files under `log/` hashed by their total size alone:
+    ///             the number of the segment a closed Ledger store keeps for its next open counts the segments the
+    ///             log made, which its background spares make depend on thread timing (16 or 17 for one build of
+    ///             the 200,000-message template on two runners, whose data files were equal), and reading the copy
+    ///             never depends on it
     /// @param listing every file's path relative to the template and its size, in path order
     public record Shape(long bytes, int files, long hash, String listing) {
     }
@@ -84,8 +88,18 @@ public final class TemplateFingerprint {
             listing.append(entry.getKey()).append('=').append(entry.getValue());
             bytes += entry.getValue();
         }
+        var hashed = new StringBuilder();
+        var logBytes = 0L;
+        for (var entry : sizes.entrySet()) {
+            if (entry.getKey().startsWith("log/")) {
+                logBytes += entry.getValue();
+            } else {
+                hashed.append(entry.getKey()).append('=').append(entry.getValue()).append(',');
+            }
+        }
+        hashed.append("log=").append(logBytes);
         var hash = 0xcbf29ce484222325L;
-        for (var b : listing.toString().getBytes(StandardCharsets.UTF_8)) {
+        for (var b : hashed.toString().getBytes(StandardCharsets.UTF_8)) {
             hash = (hash ^ (b & 0xff)) * 0x100000001b3L;
         }
         return new Shape(bytes, sizes.size(), hash & HASH_MASK, listing.toString());
