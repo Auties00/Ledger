@@ -911,6 +911,11 @@ final class PackedRun {
         return storage.slots.length;
     }
 
+    /// {@return the run's hash table, the ends of its keys or `null`, and its chunks of words, for tests}
+    Object[] arraysForTests() {
+        return new Object[]{storage.slots, storage.keyEnds, storage.words};
+    }
+
     /// {@return the entries the arrays of the run have room for, for tests: `keyEnds`, 0 if the run keeps no ends of
     /// its keys, the words of all chunks, then the places in the log of all chunks of the logged values}
     int[] arrayLengthsForTests() {
@@ -1774,6 +1779,8 @@ final class PackedRun {
         private int priorKeyEnds;
         private int priorWordChunks;
         private int priorSlots;
+        // Whether the builder appends at most a quarter of the run's entries, and keeps the room it made for them
+        private boolean keepsRoom;
         // Per home of the builder, from firstHome, as the view keeps them, once a value placed in the section of a
         // split frame said; null before
         private int[] homeSections;
@@ -1842,6 +1849,7 @@ final class PackedRun {
             }
             this.priorWordChunks = storage.words.length;
             this.priorSlots = storage.slots.length;
+            this.keepsRoom = 4L * Math.max(1, planned) <= firstEntry;
             // Room for the planned entries, made before any is added, so no array a reader may load moves after
             var needed = (int) Math.min(MAX_ENTRIES, (long) firstEntry + Math.max(1, planned));
             var keyEnds = storage.keyEnds;
@@ -2455,8 +2463,19 @@ final class PackedRun {
         /// the entries leave it under half full. A reader of an earlier view keeps reading the arrays it loaded, and
         /// every array put in their place holds every entry, published before the view that adds any.
         ///
+        /// A builder that appends at most a quarter of the run's entries keeps the room it made: a run near the length
+        /// at which its arrays grow, taking a medium commit's puts of keys it or the chains hold, would otherwise copy
+        /// its ends, add a chunk of words and hash every key into a table twice as long before each such commit, and
+        /// undo it all as the commit publishes, work and garbage of the whole run for a commit of a few hundred puts.
+        /// What it keeps is room for at most a quarter more entries: ends half again as long, the chunks of words of
+        /// those entries and a table at most twice as long as the entries take, which the run's next growth uses. A
+        /// larger append gives its room back, as hashing the run again costs no more than four times its puts.
+        ///
         /// @return whether it published a new hash table, which holds every entry of the run
         private boolean giveBackRoom() {
+            if (after != null && keepsRoom) {
+                return false;
+            }
             var storage = this.storage;
             var entries = storage.entries;
             var keyEnds = storage.keyEnds;

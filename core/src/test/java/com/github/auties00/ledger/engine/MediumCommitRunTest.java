@@ -719,6 +719,66 @@ class MediumCommitRunTest {
     }
 
     @Test
+    @DisplayName("medium commits that overwrite keys of a run just below the length at which its arrays grow keep the hash table, key ends and words the first made, rather than growing and giving them back each time")
+    void overwritesNearGrowthKeepRoom(@TempDir Path directory) throws Exception {
+        try (var ledger = open(directory, false, Long.MAX_VALUE)) {
+            var expected = populate(ledger);
+            // 24,400 entries fill at most three quarters of 32,768 slots, 24,600 more
+            var entries = 24_400;
+            for (var commit = 0; commit < entries / 200; commit++) {
+                var batch = ledger.newBatch();
+                for (var i = 0; i < 200; i++) {
+                    var message = POPULATED + commit * 200 + i;
+                    batch.put(MESSAGES, key(message), new byte[]{(byte) message});
+                    expected.put(message, new byte[]{(byte) message});
+                }
+                ledger.commit(batch);
+            }
+            var run = ledger.state(MESSAGES).run;
+            assertNotNull(run);
+            assertEquals(entries, run.size());
+            assertEquals(32_768, run.slotsForTests());
+            Object[] kept = null;
+            for (var commit = 0; commit < 10; commit++) {
+                var batch = ledger.newBatch();
+                for (var i = 0; i < 200; i++) {
+                    var message = POPULATED + (commit * 2_003 + i * 97) % entries;
+                    var value = new byte[]{(byte) commit, (byte) message};
+                    batch.put(MESSAGES, key(message), value);
+                    expected.put(message, value);
+                }
+                ledger.commit(batch);
+                assertSame(run, ledger.state(MESSAGES).run, "an overwrite of the run's keys published a view");
+                assertEquals(entries, run.size());
+                var arrays = run.arraysForTests();
+                if (kept == null) {
+                    assertEquals(65_536, run.slotsForTests(), "the first overwrite gave its table back");
+                    kept = arrays;
+                } else {
+                    for (var i = 0; i < arrays.length; i++) {
+                        assertSame(kept[i], arrays[i], "array " + i + " made again by overwrite " + commit);
+                    }
+                }
+            }
+            assertNotNull(kept[1], "the run keeps no ends of its keys");
+            // The next growth uses the room kept
+            var batch = ledger.newBatch();
+            for (var i = 0; i < 200; i++) {
+                var message = POPULATED + entries + i;
+                batch.put(MESSAGES, key(message), new byte[]{(byte) message});
+                expected.put(message, new byte[]{(byte) message});
+            }
+            ledger.commit(batch);
+            var appended = ledger.state(MESSAGES).run;
+            assertEquals(entries + 200, appended.size());
+            assertSame(kept[0], appended.arraysForTests()[0], "an append into the room kept made the table again");
+            verifyPoints(ledger, expected, POPULATED + entries + 200);
+            ledger.checkpoint();
+            verify(ledger, expected, POPULATED + entries + 200);
+        }
+    }
+
+    @Test
     @DisplayName("a removal of a commit that runs alone, looked up in the tree before its turn, finds the put an idle commit kept in the uncounted run meanwhile")
     void removalLookedUpBeforeAnIdleRunPut(@TempDir Path directory) throws Exception {
         var removed = POPULATED + 50;
