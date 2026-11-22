@@ -7,6 +7,7 @@ import com.github.auties00.ledger.benchmark.engine.EngineSettings;
 import com.github.auties00.ledger.benchmark.engine.Keyspace;
 import com.github.auties00.ledger.benchmark.engine.WriteBatch;
 import com.github.auties00.ledger.benchmark.support.Jvm;
+import com.github.auties00.ledger.benchmark.support.MeasuredOp;
 import com.github.auties00.ledger.benchmark.support.Stores;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
@@ -51,7 +52,9 @@ public class AppStateSyncBenchmark {
     @Warmup(iterations = 2)
     @Measurement(iterations = 5)
     public void applySnapshot(SnapshotState state) throws IOException {
+        var op = MeasuredOp.start();
         state.store.engine().write(state.snapshot, Durability.DURABLE);
+        op.finish();
     }
 
     /// Applies one patch durably.
