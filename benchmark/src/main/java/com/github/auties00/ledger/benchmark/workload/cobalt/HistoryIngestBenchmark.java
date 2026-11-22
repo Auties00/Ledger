@@ -4,6 +4,7 @@ import com.github.auties00.ledger.benchmark.data.Corpus;
 import com.github.auties00.ledger.benchmark.engine.EngineKind;
 import com.github.auties00.ledger.benchmark.support.IoCounters;
 import com.github.auties00.ledger.benchmark.support.Jvm;
+import com.github.auties00.ledger.benchmark.support.MeasuredOp;
 import com.github.auties00.ledger.benchmark.support.ProcessProbe;
 import com.github.auties00.ledger.benchmark.support.Stores;
 import org.openjdk.jmh.annotations.Benchmark;
@@ -93,7 +94,9 @@ public class HistoryIngestBenchmark {
     @Benchmark
     public void ingest(IoCounters counters) throws IOException {
         var writtenBefore = ProcessProbe.bytesWritten();
+        var op = MeasuredOp.start();
         Stores.ingest(store.engine(), corpus, batchSize);
+        op.finish();
         counters.bytesWritten = ProcessProbe.bytesWritten() - writtenBefore;
         counters.payloadBytes = payloadBytes;
         counters.sizeOnDisk = store.engine().sizeOnDisk();

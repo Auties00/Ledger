@@ -6,6 +6,7 @@ import com.github.auties00.ledger.benchmark.engine.EngineKind;
 import com.github.auties00.ledger.benchmark.engine.Keyspace;
 import com.github.auties00.ledger.benchmark.support.Directories;
 import com.github.auties00.ledger.benchmark.support.Jvm;
+import com.github.auties00.ledger.benchmark.support.MeasuredOp;
 import com.github.auties00.ledger.benchmark.support.MemoryCounters;
 import com.github.auties00.ledger.benchmark.support.Stores;
 import com.github.auties00.ledger.benchmark.support.TemplateCounters;
@@ -104,6 +105,7 @@ public class ReopenBenchmark {
     @BenchmarkMode(Mode.SingleShotTime)
     public void openAndShowFirstChat(Blackhole blackhole, TemplateCounters template) throws IOException {
         template.record();
+        var op = MeasuredOp.start();
         var engine = open();
         for (var session = 0; session < 100; session++) {
             blackhole.consume(engine.get(Keyspace.SESSIONS, Corpus.sessionKey(session)));
@@ -112,6 +114,7 @@ public class ReopenBenchmark {
             blackhole.consume(value);
             return true;
         });
+        op.finish();
     }
 
     /// Opens the store and reads every chat and every session.
@@ -123,6 +126,7 @@ public class ReopenBenchmark {
     @BenchmarkMode(Mode.SingleShotTime)
     public void openAndListChats(Blackhole blackhole, TemplateCounters template) throws IOException {
         template.record();
+        var op = MeasuredOp.start();
         var engine = open();
         var chats = engine.scan(Keyspace.CHATS, Corpus.chatStart(0), Corpus.chatEnd(corpus.chats() - 1), false, Integer.MAX_VALUE, (key, value) -> {
             blackhole.consume(value);
@@ -133,6 +137,7 @@ public class ReopenBenchmark {
             blackhole.consume(value);
             return true;
         });
+        op.finish();
         if (chats != corpus.chats() || sessions != Stores.SESSIONS) {
             throw new IllegalStateException("The store returned " + chats + " chats and " + sessions + " sessions");
         }
@@ -147,6 +152,7 @@ public class ReopenBenchmark {
     @BenchmarkMode(Mode.SingleShotTime)
     public void footprint(MemoryCounters counters, TemplateCounters template) throws IOException {
         template.record();
+        var op = MeasuredOp.start();
         var engine = open();
         var random = new SplittableRandom(11);
         var visited = new long[1];
@@ -157,6 +163,7 @@ public class ReopenBenchmark {
                 return true;
             });
         }
+        op.finish();
         counters.record();
         if (visited[0] == 0) {
             throw new IllegalStateException("The store returned no messages");

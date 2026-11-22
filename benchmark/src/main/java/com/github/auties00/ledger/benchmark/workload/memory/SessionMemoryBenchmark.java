@@ -9,6 +9,7 @@ import com.github.auties00.ledger.benchmark.engine.WriteBatch;
 import com.github.auties00.ledger.benchmark.support.Arrivals;
 import com.github.auties00.ledger.benchmark.support.Directories;
 import com.github.auties00.ledger.benchmark.support.Jvm;
+import com.github.auties00.ledger.benchmark.support.MeasuredOp;
 import com.github.auties00.ledger.benchmark.support.PeakCounters;
 import com.github.auties00.ledger.benchmark.support.Stores;
 import com.github.auties00.ledger.benchmark.support.TemplateCounters;
@@ -112,6 +113,7 @@ public class SessionMemoryBenchmark {
     public void session(PeakCounters counters, TemplateCounters template) throws IOException {
         template.record();
         counters.begin();
+        var op = MeasuredOp.start();
         var engine = open();
         var read = new long[1];
         Engine.EntryVisitor visitor = (key, value) -> {
@@ -151,6 +153,7 @@ public class SessionMemoryBenchmark {
             }
             engine.write(batch, Durability.DURABLE);
         }
+        op.finish();
         batch.clear();
         counters.end();
         if (read[0] == 0) {

@@ -10,6 +10,7 @@ import com.github.auties00.ledger.benchmark.engine.WriteBatch;
 import com.github.auties00.ledger.benchmark.support.Arrivals;
 import com.github.auties00.ledger.benchmark.support.Directories;
 import com.github.auties00.ledger.benchmark.support.Jvm;
+import com.github.auties00.ledger.benchmark.support.MeasuredOp;
 import com.github.auties00.ledger.benchmark.support.PeakCounters;
 import com.github.auties00.ledger.benchmark.support.Stores;
 import org.openjdk.jmh.annotations.Benchmark;
@@ -156,6 +157,7 @@ public class OperationMemoryBenchmark {
     @Benchmark
     public void recoverAfterCrash(RecoveryState state, PeakCounters counters, Blackhole blackhole) throws IOException {
         counters.begin();
+        var op = MeasuredOp.start();
         var engine = state.open();
         for (var session = 0; session < 100; session++) {
             blackhole.consume(engine.get(Keyspace.SESSIONS, Corpus.sessionKey(session)));
@@ -164,6 +166,7 @@ public class OperationMemoryBenchmark {
             blackhole.consume(value);
             return true;
         });
+        op.finish();
         counters.end();
         if (page == 0) {
             throw new IllegalStateException("The recovered store returned no messages");
