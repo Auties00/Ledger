@@ -33,6 +33,12 @@ public final class Stores {
     private static final int INGEST_BATCH = 5_000;
     private static final String COMPLETE_MARKER = ".complete";
     private static final AtomicBoolean STALE_RUNS_DELETED = new AtomicBoolean();
+    /// Whether templates are built as they were before [TemplateBuilder]: deferred writes, with the checkpoints Ledger
+    /// starts on its own thread, so that thread timing decides the layout. Set the `ledger.bench.templates` system
+    /// property or the `LEDGER_BENCH_TEMPLATES` environment variable to `timed`; anything else builds them in order.
+    static final boolean TIMED_TEMPLATES = "timed".equals(System.getProperty("ledger.bench.templates", System.getenv("LEDGER_BENCH_TEMPLATES")));
+    /// The checkpoint interval of a template build: far above the builder's own interval, so Ledger never starts one.
+    private static final long TEMPLATE_NO_AUTOMATIC_CHECKPOINT = 1L << 40;
 
     private Stores() {
     }
@@ -121,24 +127,55 @@ public final class Stores {
     /// @throws IOException if the template cannot be built
     public static Path template(EngineKind kind, EngineSettings settings, boolean sealed, Corpus corpus) throws IOException {
         var template = root().resolve("templates").resolve(kind.id() + (sealed ? "-sealed-" : "-") + corpus.messages());
-        if (Files.exists(template.resolve(COMPLETE_MARKER))) {
-            return template;
-        }
-        Directories.delete(template);
-        try (var engine = openAt(kind, template, settings, sealed)) {
-            ingest(engine, corpus, INGEST_BATCH);
-            var batch = new WriteBatch();
-            for (var chat = 0; chat < corpus.chats(); chat++) {
-                batch.put(Keyspace.CHATS, Corpus.chatStart(chat), corpus.slice(chat, CHAT_BYTES));
+        if (!Files.exists(template.resolve(COMPLETE_MARKER))) {
+            Directories.delete(template);
+            var started = System.nanoTime();
+            if (TIMED_TEMPLATES) {
+                try (var engine = openAt(kind, template, settings, sealed)) {
+                    ingest(engine, corpus, INGEST_BATCH);
+                    engine.write(metadata(corpus), Durability.DURABLE);
+                }
+            } else {
+                try (var builder = new TemplateBuilder(openAt(kind, template, templateSettings(settings), sealed))) {
+                    var batch = new WriteBatch();
+                    for (var index = 0; index < corpus.messages(); index++) {
+                        var chat = corpus.chat(index);
+                        var sequence = corpus.sequence(index);
+                        var key = corpus.messageKey(chat, sequence);
+                        batch.put(Keyspace.MESSAGES, key, corpus.body(chat, sequence));
+                        batch.put(Keyspace.MESSAGE_IDS, corpus.idKey(chat, sequence), key);
+                        if (batch.size() >= INGEST_BATCH * 2) {
+                            builder.write(batch);
+                            batch.clear();
+                        }
+                    }
+                    builder.write(batch);
+                    builder.write(metadata(corpus));
+                }
             }
-            for (var session = 0; session < SESSIONS; session++) {
-                batch.put(Keyspace.SESSIONS, Corpus.sessionKey(session), corpus.slice(~session, SESSION_BYTES));
-            }
-            engine.write(batch, Durability.DURABLE);
+            // The marker goes last, so an interrupted build is redone
+            Files.createFile(template.resolve(COMPLETE_MARKER));
+            TemplateFingerprint.built(template, System.nanoTime() - started);
         }
-        // The marker goes last, so an interrupted build is redone
-        Files.createFile(template.resolve(COMPLETE_MARKER));
+        TemplateFingerprint.used(template);
         return template;
+    }
+
+    /// {@return a batch of one metadata record per chat of `corpus` and [#SESSIONS] sessions}
+    private static WriteBatch metadata(Corpus corpus) {
+        var batch = new WriteBatch();
+        for (var chat = 0; chat < corpus.chats(); chat++) {
+            batch.put(Keyspace.CHATS, Corpus.chatStart(chat), corpus.slice(chat, CHAT_BYTES));
+        }
+        for (var session = 0; session < SESSIONS; session++) {
+            batch.put(Keyspace.SESSIONS, Corpus.sessionKey(session), corpus.slice(~session, SESSION_BYTES));
+        }
+        return batch;
+    }
+
+    /// {@return `settings` for a template build: Ledger starts no checkpoint of its own before the builder's}
+    private static EngineSettings templateSettings(EngineSettings settings) {
+        return settings.withCheckpointEvery(TEMPLATE_NO_AUTOMATIC_CHECKPOINT);
     }
 
     /// Opens a store holding `keys` entries of `valueSize` bytes in [Keyspace#GENERIC], copied from a template built
@@ -159,20 +196,37 @@ public final class Stores {
         var template = root().resolve("templates").resolve("generic-" + kind.id() + "-" + keys + "-" + valueSize);
         if (!Files.exists(template.resolve(COMPLETE_MARKER))) {
             Directories.delete(template);
+            var started = System.nanoTime();
             var corpus = new Corpus(1);
-            try (var engine = openAt(kind, template, settings, false)) {
-                var batch = new WriteBatch();
-                for (var key = 0; key < keys; key++) {
-                    batch.put(Keyspace.GENERIC, Corpus.hashedKey(key, 16), corpus.slice(key, valueSize));
-                    if (batch.size() == INGEST_BATCH * 2) {
-                        engine.write(batch, Durability.DEFERRED);
-                        batch.clear();
+            if (TIMED_TEMPLATES) {
+                try (var engine = openAt(kind, template, settings, false)) {
+                    var batch = new WriteBatch();
+                    for (var key = 0; key < keys; key++) {
+                        batch.put(Keyspace.GENERIC, Corpus.hashedKey(key, 16), corpus.slice(key, valueSize));
+                        if (batch.size() == INGEST_BATCH * 2) {
+                            engine.write(batch, Durability.DEFERRED);
+                            batch.clear();
+                        }
                     }
+                    engine.write(batch, Durability.DURABLE);
                 }
-                engine.write(batch, Durability.DURABLE);
+            } else {
+                try (var builder = new TemplateBuilder(openAt(kind, template, templateSettings(settings), false))) {
+                    var batch = new WriteBatch();
+                    for (var key = 0; key < keys; key++) {
+                        batch.put(Keyspace.GENERIC, Corpus.hashedKey(key, 16), corpus.slice(key, valueSize));
+                        if (batch.size() == INGEST_BATCH * 2) {
+                            builder.write(batch);
+                            batch.clear();
+                        }
+                    }
+                    builder.write(batch);
+                }
             }
             Files.createFile(template.resolve(COMPLETE_MARKER));
+            TemplateFingerprint.built(template, System.nanoTime() - started);
         }
+        TemplateFingerprint.used(template);
         var directory = runDirectory(kind);
         Directories.copy(template, directory);
         return new Store(openAt(kind, directory, settings, false), directory);

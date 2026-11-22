@@ -64,6 +64,9 @@ public final class LedgerEngine implements Engine {
         if (residentAtOpen) {
             options.loadResidentAtOpen(true);
         }
+        if (settings.checkpointEvery() > 0) {
+            options.checkpointEvery(settings.checkpointEvery());
+        }
         for (var keyspace : Keyspace.values()) {
             var name = keyspace.name().toLowerCase(Locale.ROOT).replace('_', '-');
             var resident = keyspace == Keyspace.SESSIONS || keyspace == Keyspace.CHATS;

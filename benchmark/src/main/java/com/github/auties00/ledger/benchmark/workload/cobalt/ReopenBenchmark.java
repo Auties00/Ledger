@@ -8,6 +8,7 @@ import com.github.auties00.ledger.benchmark.support.Directories;
 import com.github.auties00.ledger.benchmark.support.Jvm;
 import com.github.auties00.ledger.benchmark.support.MemoryCounters;
 import com.github.auties00.ledger.benchmark.support.Stores;
+import com.github.auties00.ledger.benchmark.support.TemplateCounters;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -97,10 +98,12 @@ public class ReopenBenchmark {
     /// Opens the store and reads what the first screen and the first sends need.
     ///
     /// @param blackhole consumes what is read
+    /// @param template receives the shape of the template the store was copied from
     /// @throws IOException if the engine fails to open or read
     @Benchmark
     @BenchmarkMode(Mode.SingleShotTime)
-    public void openAndShowFirstChat(Blackhole blackhole) throws IOException {
+    public void openAndShowFirstChat(Blackhole blackhole, TemplateCounters template) throws IOException {
+        template.record();
         var engine = open();
         for (var session = 0; session < 100; session++) {
             blackhole.consume(engine.get(Keyspace.SESSIONS, Corpus.sessionKey(session)));
@@ -114,10 +117,12 @@ public class ReopenBenchmark {
     /// Opens the store and reads every chat and every session.
     ///
     /// @param blackhole consumes what is read
+    /// @param template receives the shape of the template the store was copied from
     /// @throws IOException if the engine fails to open or read, or returns fewer entries than the store holds
     @Benchmark
     @BenchmarkMode(Mode.SingleShotTime)
-    public void openAndListChats(Blackhole blackhole) throws IOException {
+    public void openAndListChats(Blackhole blackhole, TemplateCounters template) throws IOException {
+        template.record();
         var engine = open();
         var chats = engine.scan(Keyspace.CHATS, Corpus.chatStart(0), Corpus.chatEnd(corpus.chats() - 1), false, Integer.MAX_VALUE, (key, value) -> {
             blackhole.consume(value);
@@ -136,10 +141,12 @@ public class ReopenBenchmark {
     /// Opens the store, warms it with 1,000 chat pages and records the memory it holds.
     ///
     /// @param counters receives the memory
+    /// @param template receives the shape of the template the store was copied from
     /// @throws IOException if the engine fails to open or read
     @Benchmark
     @BenchmarkMode(Mode.SingleShotTime)
-    public void footprint(MemoryCounters counters) throws IOException {
+    public void footprint(MemoryCounters counters, TemplateCounters template) throws IOException {
+        template.record();
         var engine = open();
         var random = new SplittableRandom(11);
         var visited = new long[1];

@@ -11,6 +11,7 @@ import com.github.auties00.ledger.benchmark.support.Directories;
 import com.github.auties00.ledger.benchmark.support.Jvm;
 import com.github.auties00.ledger.benchmark.support.PeakCounters;
 import com.github.auties00.ledger.benchmark.support.Stores;
+import com.github.auties00.ledger.benchmark.support.TemplateCounters;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -105,9 +106,11 @@ public class SessionMemoryBenchmark {
     /// Opens the store, runs one session over it and records the memory the open store holds.
     ///
     /// @param counters receives the memory
+    /// @param template receives the shape of the template the store was copied from
     /// @throws IOException if the engine fails to open, read or write, or a read finds less than the store holds
     @Benchmark
-    public void session(PeakCounters counters) throws IOException {
+    public void session(PeakCounters counters, TemplateCounters template) throws IOException {
+        template.record();
         counters.begin();
         var engine = open();
         var read = new long[1];
