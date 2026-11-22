@@ -269,9 +269,11 @@ class TreeUpdateTest {
             var streamed = layOut(directory.resolve("streamed"), encrypted, streamedRun, true, null);
             var merged = layOut(directory.resolve("merged"), encrypted, mergedRun, false, null);
             assertLaidAlike(merged, streamed);
-            assertArrayEquals(mergedRun.settles(), streamedRun.settles(), "the settles differ");
+            for (var entry = 0; entry < streamedRun.size(); entry++) {
+                assertEquals(mergedRun.settledForTests(entry), streamedRun.settledForTests(entry), "the settles differ");
+            }
             for (var position = 0; position < streamedRun.size(); position++) {
-                assertEquals(TreeSearch.ABSENT, streamedRun.settles()[streamedRun.entryAt(position)], "an entry is not settled");
+                assertEquals(TreeSearch.ABSENT, streamedRun.settledForTests(streamedRun.entryAt(position)), "an entry is not settled");
             }
             assertEquals(mergedRun.correction(), streamedRun.correction());
             verifyLaid(directory.resolve("streamed"), encrypted, streamed, writes, random);
@@ -291,7 +293,7 @@ class TreeUpdateTest {
             var merged = layOut(directory.resolve("merged"), encrypted, mergedRun, false, null);
             assertLaidAlike(merged, streamed);
             for (var position = 0; position < streamedRun.size(); position++) {
-                assertEquals(TreeSearch.UNKNOWN, streamedRun.settles()[streamedRun.entryAt(position)], "a counted run was settled");
+                assertEquals(TreeSearch.UNKNOWN, streamedRun.settledForTests(streamedRun.entryAt(position)), "a counted run was settled");
             }
             verifyLaid(directory.resolve("streamed"), encrypted, streamed, writes, random);
         }
@@ -394,7 +396,7 @@ class TreeUpdateTest {
             assertTrue(update.allocated().isEmpty(), "pages taken: " + update.allocated());
             assertEquals(PageFormat.FIRST_UNIT_PAGE, space.pageCount());
             for (var entry = 0; entry < run.size(); entry++) {
-                assertEquals(TreeSearch.ABSENT, run.settles()[entry]);
+                assertEquals(TreeSearch.ABSENT, run.settledForTests(entry));
             }
         }
     }
@@ -498,7 +500,7 @@ class TreeUpdateTest {
         for (var write : writes) {
             keyBytes += write.key().length;
         }
-        var builder = PackedRun.Builder.forCommit(writes.size(), keyBytes);
+        var builder = PackedRun.Builder.forCommit(writes.size(), keyBytes, null, 0);
         byte[] home = null;
         MemorySegment view = null;
         HomeValues values = null;

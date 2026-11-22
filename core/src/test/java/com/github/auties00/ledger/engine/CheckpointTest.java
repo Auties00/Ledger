@@ -14,7 +14,6 @@ import com.github.auties00.ledger.LedgerIoException;
 import com.github.auties00.ledger.testkit.ChangeInterceptor;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
 import com.github.auties00.ledger.View;
-import com.github.auties00.ledger.WriteBatch;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -209,20 +208,7 @@ class CheckpointTest {
                 ledger.checkpoint();
                 assertEquals(100, ledger.size(MESSAGES));
                 try (var before = ledger.snapshot()) {
-                    var writes = ledger.newBatch();
-                    for (var i = 0; i < 50; i++) {
-                        writes.put(MESSAGES, "k" + i, "w");
-                    }
-                    for (var i = 100; i < 130; i++) {
-                        writes.put(MESSAGES, "k" + i, "w");
-                    }
-                    for (var i = 50; i < 70; i++) {
-                        writes.delete(MESSAGES, "k" + i);
-                    }
-                    for (var i = 200; i < 210; i++) {
-                        writes.delete(MESSAGES, "k" + i);
-                    }
-                    ledger.commit(writes);
+                    commitBlindWrites(ledger);
                     // Every write found its key only in the tree, or nowhere
                     assertEquals(110, live.state(MESSAGES).blind.listed());
                     assertEquals(100, before.size(MESSAGES));
@@ -322,7 +308,7 @@ class CheckpointTest {
                 ledger.commit(seed);
                 ledger.checkpoint();
                 try (var before = ledger.snapshot()) {
-                    ledger.commit(blindBatch(ledger));
+                    commitBlindWrites(ledger);
                     assertEquals(110, live.state(MESSAGES).blind.listed());
                     ledger.checkpoint();
                     // The snapshot reads below every write the checkpoint settled, so none folds
@@ -414,7 +400,7 @@ class CheckpointTest {
             }
         }
 
-        /// Seeds 100 keys, checkpoints them, and commits [#blindBatch(Ledger)].
+        /// Seeds 100 keys, checkpoints them, and commits [#commitBlindWrites(Ledger)].
         private static void seedBlindWrites(Ledger ledger) {
             var seed = ledger.newBatch();
             for (var i = 0; i < 100; i++) {
@@ -422,26 +408,29 @@ class CheckpointTest {
             }
             ledger.commit(seed);
             ledger.checkpoint();
-            ledger.commit(blindBatch(ledger));
+            commitBlindWrites(ledger);
         }
 
-        /// {@return 110 blind writes over the keys `k0` to `k99`: 50 overwrites, 30 new keys, 20 removals of keys
-        /// there and 10 of keys never written, which leave 110 keys}
-        private static WriteBatch blindBatch(Ledger ledger) {
+        /// Commits 110 blind writes over the keys `k0` to `k99`: 50 overwrites, 30 new keys, 20 removals of keys there
+        /// and 10 of keys never written, which leave 110 keys. Two commits of fewer than
+        /// [LiveLedger#RUN_APPEND_WRITES] puts each, so no put goes to a run in place of a chain.
+        private static void commitBlindWrites(Ledger ledger) {
             var writes = ledger.newBatch();
             for (var i = 0; i < 50; i++) {
-                writes.put(MESSAGES, "k" + i, "w");
-            }
-            for (var i = 100; i < 130; i++) {
                 writes.put(MESSAGES, "k" + i, "w");
             }
             for (var i = 50; i < 70; i++) {
                 writes.delete(MESSAGES, "k" + i);
             }
+            ledger.commit(writes);
+            writes = ledger.newBatch();
+            for (var i = 100; i < 130; i++) {
+                writes.put(MESSAGES, "k" + i, "w");
+            }
             for (var i = 200; i < 210; i++) {
                 writes.delete(MESSAGES, "k" + i);
             }
-            return writes;
+            ledger.commit(writes);
         }
     }
 
@@ -651,19 +640,21 @@ class CheckpointTest {
         }
 
         @Test
-        @DisplayName("a checkpoint takes the chains of a large commit to a paged key space its tree holds out of memory, with the next commit's maintenance")
+        @DisplayName("a checkpoint takes the chains of commits to a paged key space its tree holds out of memory, with the next commit's maintenance")
         void releasesChains(@TempDir Path directory) {
             try (var ledger = open(directory, MESSAGES, CHATS)) {
                 var live = (LiveLedger) ledger;
-                // A tree that holds the key space, so the batch goes to chains rather than to a bulk commit's run
+                // A tree that holds the key space, and commits of fewer puts than take a run, so the writes go to chains
                 ledger.commit(ledger.newBatch().put(MESSAGES, "first", "x"));
                 ledger.checkpoint();
-                var batch = ledger.newBatch();
-                for (var i = 0; i < 5_000; i++) {
-                    batch.put(MESSAGES, "m%05d".formatted(i), "message " + i);
+                for (var from = 0; from < 5_000; from += 50) {
+                    var batch = ledger.newBatch();
+                    for (var i = from; i < from + 50; i++) {
+                        batch.put(MESSAGES, "m%05d".formatted(i), "message " + i);
+                    }
+                    ledger.commit(batch);
                 }
-                ledger.commit(batch);
-                assertNull(live.state(MESSAGES).run, "a bulk commit's run over a tree that holds the key space");
+                assertNull(live.state(MESSAGES).run, "a run of commits of 50 puts");
                 assertTrue(live.state(MESSAGES).chains() >= 5_000, () -> live.state(MESSAGES).chains() + " chains in memory");
                 ledger.checkpoint();
                 // The next commit's maintenance and the checkpoint's pruning drop what the tree holds

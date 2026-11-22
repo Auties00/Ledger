@@ -65,13 +65,13 @@ final class Reads {
         return state.resident && decoded != null ? (V) decoded : keyspace.values().decode(value);
     }
 
-    /// {@return the run of the writes the open replayed into `state`, or the view of the run of bulk commits, that
+    /// {@return the run of the writes the open replayed into `state`, or the view of the run of commits, that
     /// `point` reads as part of its tree, or `null`}
     ///
     /// The run is part of the tree a reader reads while that tree is older than the run's writes, or the reader reads
     /// none, and the reader sees them: every checkpoint after the open holds every write of the replay's run, every one
-    /// at or after the last bulk commit of a run every write of it, and a reader sees the view of the newest bulk
-    /// commit at or before its sequence, and none of the run before its first ([PackedRun#at(long)]).
+    /// at or after the last commit of a run every write of it, and a reader sees the view of the newest commit at or
+    /// before its sequence, and none of the run before its first ([PackedRun#at(long)]).
     static PackedRun runOf(KeyspaceState state, ReadPoint point) {
         var run = state.run;
         return run == null || run.maxStamp() <= point.treeBound() ? null : run.at(point.bound());

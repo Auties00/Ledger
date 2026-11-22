@@ -93,7 +93,7 @@ class BulkCommitCrashTest {
                     var commit = ledger.commit(batch);
                     commit(next);
                     var run = ledger.state(MESSAGES).run;
-                    if (run != null && run.committed() && run.size() > BULK) {
+                    if (run != null && run.counted() && run.size() > BULK) {
                         appended++;
                     }
                     // Small commits: overwrites and removals of the run's keys, large values, a resident write

@@ -28,8 +28,8 @@ import java.util.concurrent.atomic.AtomicReference;
 /// the run as it hides a key of the tree.
 ///
 /// The writes of the run are listed in no [BlindWrites]: the run's effect on the count of the key space, against the
-/// open's tree, is [#correction()], which the first checkpoint finds as a by-product of merging the run into the tree
-/// ([#settle(byte\[\], int, boolean)]), and a count before then by looking each key up. A write the replay sent to a
+/// open's tree ([#base()]), is [#correction()], which the first checkpoint finds as a by-product of merging the run into
+/// the tree ([#settle(int, boolean)]), and a count before then by looking each key up. A write the replay sent to a
 /// chain whose key the run holds takes the run's entry as the key's state before it, as the builder's entry while the
 /// replay runs and the run's after, so it is exact, never blind.
 ///
@@ -42,14 +42,20 @@ import java.util.concurrent.atomic.AtomicReference;
 /// as the keys of most key spaces do, keeps no ends: each key lies where the index of its entry puts it ([KeyLayout]),
 /// until its builder places a key of another length or a commit appends to it, which make the ends of every key.
 ///
-/// A bulk commit makes a run too ([#committed()]): the puts of new keys of a paged key space whose latest tree holds
-/// none of its entries, at least [LiveLedger#BULK_RUN_WRITES] of them in one batch, which the commit counts as it
-/// applies them, so the run makes no [#correction()] to the count. A later bulk commit into the same key space appends
-/// its puts of new keys to the arrays of that run, until the cut of a checkpoint closes it to appends
-/// ([#closeToAppends()]): each commit's puts are a range of entries after those of the commits before, and the commit
-/// publishes a view of the run that holds every entry up to its own ([#size()]), whose [#previous()] view holds those
-/// before. A reader reads the newest view whose commit it sees ([#at(long)]): a key of a later commit is never one it
-/// finds, a slot of the hash table naming an entry past the view's last being skipped, so it reads as of its sequence.
+/// Commits make a run too ([#appended()]): the puts of new keys of a paged key space, at least
+/// [LiveLedger#BULK_RUN_WRITES] of them in one batch over a key space whose latest tree holds none of its entries, or at
+/// least [LiveLedger#RUN_APPEND_WRITES] in a batch that finds the store idle. A run over a key space no tree holds any
+/// entry of is counted ([#counted()]): its commits count its puts as they apply them, so it makes no [#correction()] to
+/// the count. A run over a populated key space is not: it is counted against the key space's latest tree when its first
+/// commit applied ([#base()]), which stays the latest until the cut that closes the run, as no run is made while a cut
+/// waits for its trees; its commits look none of its keys up, and its [#correction()] counts it, view by view, from
+/// what the checkpoint that takes it settled or, before then, by looking each key up, each answer kept for every view.
+/// A later commit into the same key space appends its puts of new keys to the arrays of that run, until the cut of a
+/// checkpoint closes it to appends ([#closeToAppends()]): each commit's puts are a range of entries after those of the
+/// commits before, and the commit publishes a view of the run that holds every entry up to its own ([#size()]), whose
+/// [#previous()] view holds those before. A reader reads the newest view whose commit it sees ([#at(long)]), which a
+/// binary search of the run's views finds: a key of a later commit is never one it finds, a slot of the hash table
+/// naming an entry past the view's last being skipped, so it reads as of its sequence.
 /// The run is part of the tree of every reader at or after its first commit ([#minStamp()]) and of none before, until
 /// a checkpoint at or after its last commit takes it, which is one cut after the run was closed: no checkpoint takes
 /// part of a run. Its values lie where the batches put them, on the arrays the commits' versions would have sliced (its
@@ -70,12 +76,14 @@ import java.util.concurrent.atomic.AtomicReference;
 ///
 /// The arrays of a run are shared by its views and are only ever added to: a commit that appends writes past the
 /// entries of every view, the hash table only gains slots (a table grown or rebuilt is a new array, published before
-/// any entry it adds), and the words, homes and places in the log the spill writes lie in chunks that never move, so
-/// the spill of an earlier commit's values runs beside a later commit's append. A view is immutable but for the place
-/// of the values of a bulk commit's run, which the spill switches with one release store of the entry's word after it
-/// published where the value went, and its homes, which a drop or a read back sets with a release store, so readers use
-/// it without synchronization: every read of a word or of a home is an acquire.
-/// [#correction()], the tree lookups it caches and the order of the keys made late take a lock of the view's own.
+/// any entry it adds), the keys of a commit continue the last chunk of the keys, which a longer copy replaces in a copy
+/// of the chunks, published before the entries it adds, and the words, homes, answers of the base and places in the
+/// log the spill writes lie in chunks that never move, so the spill of an earlier commit's values runs beside a later
+/// commit's append. A view is immutable but for the place of the values of a commits' run, which the spill switches
+/// with one release store of the entry's word after it published where the value went, and its homes, which a drop or
+/// a read back sets with a release store, so readers use it without synchronization: every read of a word or of a home
+/// is an acquire. The order of the keys made late takes a lock of the view's own; the lookups [#correction()] makes
+/// write the answers every thread finds the same.
 final class PackedRun {
     /// The entries a run holds at most: the low bits of a slot of the hash table hold an entry's index plus one.
     static final int MAX_ENTRIES = (1 << 24) - 2;
@@ -132,6 +140,15 @@ final class PackedRun {
     private static final VarHandle WORDS = MethodHandles.arrayElementVarHandle(long[].class);
     private static final VarHandle HOMES = MethodHandles.arrayElementVarHandle(MemorySegment[].class);
     private static final VarHandle FRAMED = MethodHandles.arrayElementVarHandle(FramedHome[].class);
+    private static final VarHandle CORRECTED;
+
+    static {
+        try {
+            CORRECTED = MethodHandles.lookup().findVarHandle(Storage.class, "corrected", Corrected.class);
+        } catch (ReflectiveOperationException exception) {
+            throw new ExceptionInInitializerError(exception);
+        }
+    }
     // A value's place in the log: the index of its segment in the table above the bits of where its frame starts
     private static final int FRAME_BITS = 48;
     private static final long FRAME_MASK = (1L << FRAME_BITS) - 1;
@@ -140,6 +157,8 @@ final class PackedRun {
     private static final int TAG_MASK = ~ENTRY_MASK;
     private static final MemorySegment EMPTY = MemorySegment.ofArray(new byte[0]).asReadOnly();
     private static final Places NO_PLACES = new Places(new MemorySegment[0], new long[0][], 0, new LogSegmentView[0]);
+    // What a view's correction holds while it is not known
+    private static final long UNCOUNTED = Long.MIN_VALUE;
 
     static {
         if (ReplayValues.CHUNK_BYTES > 1 << OFFSET_BITS || SpillQueue.LOG_VALUE_MIN > LENGTH_MASK
@@ -158,27 +177,31 @@ final class PackedRun {
     private final Storage storage;
     // The entries of the view: those of its commit and of every commit before
     private final int size;
+    // The index of the view among the views of the run (`Storage.views`), in the order of their commits
+    private final int index;
     // The stamps of the oldest write of the run, of the oldest of the commit that made the view, and of the newest
     // write the view holds: a reader below the first reads no view, one below the second an older view, and one whose
     // tree is at or above the third reads the tree alone
     private final long minStamp;
     private final long fromStamp;
     private final long maxStamp;
-    // Whether the commits that made the run counted their writes, as bulk commits do
-    private final boolean committed;
-    // The root of the key space's tree the store opened from, or null, and the file it is in: what the run's writes are
-    // counted against
+    // Whether the commits that made the run counted their writes, as those of a run over an empty tree do
+    private final boolean counted;
+    // Whether commits made the run, which then keeps its values on their homes and takes appends until a cut, rather
+    // than the open's replay
+    private final boolean appended;
+    // The root of the key space's tree the run's writes are counted against, or null: the tree the store opened from,
+    // for a replay's run, or the latest tree when the run's first commit applied, for an uncounted run of commits
     private final TreeRoot base;
     private final PageFile pages;
-    // The view of the commits before this one's, or null for the first, or once every reader reads this one or a later
-    // one; cleared holding the store's publishing role
-    private volatile PackedRun previous;
-    // Guards the lookups of the keys in `base` that the count of the run makes, and the late sort of the view's keys
+    // The change the uncounted runs the key space released before this run was made left to its count
+    private final long keptBefore;
+    // Guards the late sort of the view's keys
     private final Object lock;
-    // The entries in the order of their keys; null until the first need for a view of a bulk commit's run
+    // The entries in the order of their keys; null until the first need for a view of a commits' run
     private volatile int[] order;
-    // Per entry, whether `base` holds its key, as TreeSearch.FOUND or ABSENT, or UNKNOWN; made at the first need
-    private volatile byte[] inBase;
+    // The change the view's entries make to the count of `base`, or UNCOUNTED until known ([#correction()])
+    private volatile long correction;
     // The homes of the commit that made the view, from `firstHome`, included, to `endHome`, excluded, of the run's
     private final int firstHome;
     private final int endHome;
@@ -188,20 +211,23 @@ final class PackedRun {
     private final int[] homeSections;
     private final int[] homeEnds;
 
-    private PackedRun(Storage storage, int size, long minStamp, long fromStamp, long maxStamp, boolean committed,
-                      TreeRoot base, PageFile pages, PackedRun previous, int firstHome, int endHome, int[] homeSections,
-                      int[] homeEnds) {
+    private PackedRun(Storage storage, int size, int index, long minStamp, long fromStamp, long maxStamp,
+                      boolean counted, boolean appended, TreeRoot base, long keptBefore, PageFile pages, int firstHome,
+                      int endHome, int[] homeSections, int[] homeEnds) {
         this.storage = storage;
         this.size = size;
+        this.index = index;
         this.minStamp = minStamp;
         this.fromStamp = fromStamp;
         this.maxStamp = maxStamp;
-        this.committed = committed;
+        this.counted = counted;
+        this.appended = appended;
         this.base = base;
+        this.keptBefore = keptBefore;
         this.pages = pages;
-        this.previous = previous;
         this.lock = new Object();
-        this.order = committed ? null : mergeSorted(storage.keys, storage.layout, storage.keyEnds, size);
+        this.order = appended ? null : mergeSorted(storage.keys, storage.layout, storage.keyEnds, size);
+        this.correction = counted ? size : UNCOUNTED;
         this.firstHome = firstHome;
         this.endHome = endHome;
         this.homeSections = homeSections;
@@ -223,17 +249,38 @@ final class PackedRun {
         return fromStamp;
     }
 
-    /// {@return whether the commits that made the run counted their writes, so the run makes no [#correction()] to the
-    /// count of its key space: a bulk commit's run}
-    boolean committed() {
-        return committed;
+    /// {@return whether the commits that made the run counted their writes as they applied them, so the run makes no
+    /// [#correction()] to the count of its key space: a run of commits over a key space whose latest tree held none of
+    /// its entries}
+    boolean counted() {
+        return counted;
+    }
+
+    /// {@return whether commits made the run ([Builder#forCommit]), rather than the open's replay: its values lie on
+    /// the homes of its commits until they spill, the order of a view's keys is made at its first need, and later
+    /// commits may append to it until a cut closes it}
+    boolean appended() {
+        return appended;
+    }
+
+    /// {@return the root of the tree the run's writes are counted against, or `null`: the tree the store opened from,
+    /// for a replay's run, or the key space's latest tree when the run's first commit applied, for an uncounted run of
+    /// commits}
+    TreeRoot base() {
+        return base;
+    }
+
+    /// {@return the change the uncounted runs its key space released before this run was made, the replay's
+    /// included, left to the count of the key space: what the count adds below the run's first view}
+    long keptBefore() {
+        return keptBefore;
     }
 
     /// {@return the stamp of the newest write the view holds}
     ///
     /// A reader takes the run as part of its tree while that tree's bound is below it: then the tree is the one the
-    /// store opened from, or one older than the bulk commits that made the run, or there is none. No tree holds part
-    /// of a run, so the newest view's tells for each of its views.
+    /// run's writes are counted against, or one older than the commits that made the run, or there is none. No tree
+    /// holds part of a run, so the newest view's tells for each of its views.
     long maxStamp() {
         return maxStamp;
     }
@@ -243,49 +290,89 @@ final class PackedRun {
         return size;
     }
 
-    /// {@return the view of the commits before the one that made this view, or `null` for the first, or once every
+    /// {@return the view of the commit before the one that made this view, or `null` for the first, or once every
     /// reader reads this view or a later one}
     PackedRun previous() {
-        return previous;
+        if (index == 0) {
+            return null;
+        }
+        var views = storage.views;
+        return index - 1 < storage.firstView ? null : views[index - 1];
     }
 
     /// {@return the view of the run a reader at `bound` reads, this one or an older one: the newest whose commit is at
     /// or below `bound`, or `null` if the run's first commit is above it}
     ///
     /// Called on the newest view a reader found, which takes no step unless a commit appended since the reader's
-    /// sequence; every view a reader can need is still linked ([#dropBelow(long)]).
+    /// sequence; an older view is found by a binary search of the views of the run (`Storage.views`), every one a
+    /// reader can need being still held there ([#dropBelow(long)]).
     PackedRun at(long bound) {
-        var view = this;
-        while (view != null && view.fromStamp > bound) {
-            view = view.previous;
+        if (fromStamp <= bound) {
+            return this;
         }
-        return view;
+        // The views a drop let go of are below every view a reader at or above the oldest reader's bound needs, so a
+        // slot found empty counts as at or below `bound`
+        var views = storage.views;
+        var low = 0;
+        var high = index - 1;
+        var found = -1;
+        while (low <= high) {
+            var middle = (low + high) >>> 1;
+            var view = views[middle];
+            if (view == null || view.fromStamp <= bound) {
+                found = middle;
+                low = middle + 1;
+            } else {
+                high = middle - 1;
+            }
+        }
+        return found < 0 ? null : views[found];
     }
 
-    /// {@return whether a later bulk commit may append to the run: a bulk commit's that no checkpoint's cut closed}
+    /// {@return whether a later commit may append to the run: a commits' run that no checkpoint's cut closed}
     boolean appendable() {
         return storage.appendable;
     }
 
-    /// Closes the run to later bulk commits, which then keep their writes on chains until a checkpoint takes the run:
-    /// called by the cut of a checkpoint, holding the store's publishing role, which a bulk commit holds from before
-    /// it applies to after it publishes, so the checkpoint takes the newest view whole or none of the run.
+    /// Closes the run to later commits, which then keep their writes on chains until a checkpoint takes the run:
+    /// called by the cut of a checkpoint, holding the store's publishing role, which a commit that appends holds from
+    /// before it applies to after it publishes, so the checkpoint takes the newest view whole or none of the run.
     void closeToAppends() {
         storage.appendable = false;
     }
 
+    /// {@return whether a reader made the order of a view's keys, for a scan or the count of a range, since the run
+    /// was made: each view a later commit appends then needs an order of its own, which costs as much as its
+    /// entries, so only commits large enough to pay for it append}
+    boolean ordered() {
+        return storage.ordered;
+    }
+
     /// Lets go of the views older than the newest of this view and the ones before it whose commit is at or below
     /// `oldestBound`, the bound of the oldest sequence any reader reads at, so they and the orders they made can go:
-    /// every reader reads that view or a later one. Called holding the store's publishing role.
+    /// every reader reads that view or a later one. Called on the newest view, holding the store's publishing role.
     void dropBelow(long oldestBound) {
-        for (var view = this; view != null; view = view.previous) {
-            if (view.fromStamp <= oldestBound) {
-                if (view.previous != null) {
-                    view.previous = null;
-                }
-                return;
+        var views = storage.views;
+        var first = storage.firstView;
+        var low = first;
+        var high = index;
+        var kept = -1;
+        while (low <= high) {
+            var middle = (low + high) >>> 1;
+            if (views[middle].fromStamp <= oldestBound) {
+                kept = middle;
+                low = middle + 1;
+            } else {
+                high = middle - 1;
             }
         }
+        if (kept <= first) {
+            return;
+        }
+        for (var i = first; i < kept; i++) {
+            views[i] = null;
+        }
+        storage.firstView = kept;
     }
 
     /// {@return the entry of `key`, or -1 if the view holds none}
@@ -576,7 +663,9 @@ final class PackedRun {
         return order()[position];
     }
 
-    /// {@return the entries in the order of their keys, made at the first call for a view of a bulk commit's run}
+    /// {@return the entries in the order of their keys, made at the first call for a view of a commits' run}
+    ///
+    /// A run made late for a reader marks the run [ordered][#ordered()]; a checkpoint's needs the run closed anyway.
     private int[] order() {
         var sorted = order;
         if (sorted == null) {
@@ -585,78 +674,147 @@ final class PackedRun {
                 if (sorted == null) {
                     sorted = sortedOrder();
                     order = sorted;
+                    if (!storage.ordered) {
+                        storage.ordered = true;
+                    }
                 }
             }
         }
         return sorted;
     }
 
-    /// {@return the array a checkpoint records in whether the tree the store opened from holds each entry's key, as it
-    /// merges the entries into that tree ([#settle(byte\[\], int, boolean)])}
-    byte[] settles() {
-        var known = inBase;
-        if (known == null) {
-            synchronized (lock) {
-                known = inBase;
-                if (known == null) {
-                    known = new byte[size];
-                    inBase = known;
-                }
-            }
-        }
-        return known;
-    }
-
-    /// Records whether the tree the store opened from holds the key of `entry`, as a checkpoint that merges the run into
-    /// that tree finds it; every thread that finds out finds the same answer.
-    static void settle(byte[] settles, int entry, boolean found) {
-        settles[entry] = found ? TreeSearch.FOUND : TreeSearch.ABSENT;
-    }
-
-    /// {@return the change the run makes to the count of its key space, against the tree the store opened from: a put of
-    /// a key the tree lacks adds an entry, a removal of a key it holds takes one away}
+    /// Records whether the tree the run's writes are counted against ([#base()]) holds the key of `entry`, as a
+    /// checkpoint that merges the run into that tree finds it; every thread that finds out finds the same answer.
     ///
-    /// It looks up in that tree each key no checkpoint merging the run has settled, which reads the file for a tree
-    /// larger than the page cache; the answers are kept. Callers keep the result, which no later write changes.
+    /// The answers lie in chunks of the run's own that never move, which the views share: an entry is recorded only
+    /// once a view holds it, so the byte of an entry a commit added and took back is never written.
+    void settle(int entry, boolean found) {
+        knownChunk(entry >>> WORD_CHUNK_BITS)[entry & WORD_MASK] = found ? TreeSearch.FOUND : TreeSearch.ABSENT;
+    }
+
+    // The chunk of the answers of whether `base` holds each key of the entries of chunk `chunk` of the words, made at
+    // the first need
+    private byte[] knownChunk(int chunk) {
+        var known = storage.known;
+        if (chunk < known.length && known[chunk] != null) {
+            return known[chunk];
+        }
+        synchronized (storage.knownLock) {
+            known = storage.known;
+            if (chunk >= known.length) {
+                known = Arrays.copyOf(known, Math.max(chunk + 1, 2 * known.length));
+            } else if (known[chunk] != null) {
+                return known[chunk];
+            } else {
+                known = known.clone();
+            }
+            var added = new byte[WORD_CHUNK];
+            known[chunk] = added;
+            storage.known = known;
+            return added;
+        }
+    }
+
+    /// {@return the change the view makes to the count of its key space, against [#base()]: a put of a key that tree
+    /// lacks adds an entry, a removal of a key it holds takes one away}
+    ///
+    /// It looks up in that tree each key of the view no checkpoint merging the run and no earlier count settled, which
+    /// reads the file for a tree larger than the page cache; the answers are kept, and so is the result, from which
+    /// the count of another view of the run takes only the entries between the two. No later write changes it.
+    ///
+    /// @throws IllegalStateException if a key is not settled once the checkpoint that takes the run counted it
+    ///                               ([#settledByCheckpoint()]): the tree may be gone
     long correction() {
-        return countBetween(0, size);
+        var known = correction;
+        if (known != UNCOUNTED) {
+            return known;
+        }
+        var storage = this.storage;
+        var prefix = storage.corrected;
+        long total;
+        if (prefix == null) {
+            total = countEntries(0, size);
+        } else if (prefix.size() <= size) {
+            total = prefix.total() + countEntries(prefix.size(), size);
+        } else {
+            total = prefix.total() - countEntries(size, prefix.size());
+        }
+        correction = total;
+        while (prefix == null || prefix.size() < size) {
+            var counted = new Corrected(size, total);
+            if (CORRECTED.compareAndSet(storage, prefix, counted)) {
+                break;
+            }
+            prefix = storage.corrected;
+        }
+        return total;
+    }
+
+    /// {@return the change the view makes to the count of its key space, as [#correction()] gives it, if known; or
+    /// [Long#MIN_VALUE] if no count has made it yet}
+    long knownCorrection() {
+        return correction;
+    }
+
+    /// Records that the checkpoint taking the run counted it, which settled every entry against [#base()]: no count
+    /// looks a key up in that tree from then on, which a later checkpoint may reuse the pages of.
+    void settledByCheckpoint() {
+        storage.settled = true;
     }
 
     /// {@return the change the entries of the view from `from`, included, to `to`, excluded, either `null` for no
-    /// bound, make to the count of the tree the store opened from in that range}
+    /// bound, make to the count of [#base()] in that range}
     ///
-    /// A bulk commit's run puts keys no tree it is read over holds, so each of its entries in the range adds one, which
-    /// takes no lookup and records nothing.
+    /// A counted run puts keys no tree it is read over holds, so each of its entries in the range adds one, which takes
+    /// no lookup and records nothing.
     long correction(MemorySegment from, MemorySegment to) {
+        if (from == null && to == null) {
+            return correction();
+        }
         var first = lowerPosition(from);
         var last = to == null ? size : lowerPosition(to);
         if (first >= last) {
             return 0;
         }
-        return committed ? last - first : countBetween(first, last);
-    }
-
-    // The change the entries at positions first to last, excluded, of the key order make to the count of `base`
-    private long countBetween(int first, int last) {
-        var known = settles();
+        if (counted) {
+            return last - first;
+        }
         var order = order();
+        // Read before the answers: the checkpoint that sets it recorded every answer first
+        var settled = storage.settled;
         var total = 0L;
-        synchronized (lock) {
-            for (var position = first; position < last; position++) {
-                var entry = order[position];
-                var state = known[entry];
-                if (state == TreeSearch.UNKNOWN) {
-                    state = base != null && TreeSearch.contains(pages, base, key(entry)) ? TreeSearch.FOUND : TreeSearch.ABSENT;
-                    known[entry] = state;
-                }
-                if (word(entry) < 0) {
-                    total -= state == TreeSearch.FOUND ? 1 : 0;
-                } else {
-                    total += state == TreeSearch.FOUND ? 0 : 1;
-                }
-            }
+        for (var position = first; position < last; position++) {
+            total += change(order[position], settled);
         }
         return total;
+    }
+
+    // The change the entries from `from`, included, to `to`, excluded, make to the count of `base`
+    private long countEntries(int from, int to) {
+        var settled = storage.settled;
+        var total = 0L;
+        for (var entry = from; entry < to; entry++) {
+            total += change(entry, settled);
+        }
+        return total;
+    }
+
+    // The change `entry` makes to the count of `base`, looking its key up there unless known; `settled` as read before
+    // the answer, which a lookup then must not need
+    private int change(int entry, boolean settled) {
+        var known = knownChunk(entry >>> WORD_CHUNK_BITS);
+        var state = known[entry & WORD_MASK];
+        if (state == TreeSearch.UNKNOWN) {
+            if (settled) {
+                throw new IllegalStateException("A run's key is unsettled after the checkpoint that took it counted it");
+            }
+            state = base != null && TreeSearch.contains(pages, base, key(entry)) ? TreeSearch.FOUND : TreeSearch.ABSENT;
+            known[entry & WORD_MASK] = state;
+        }
+        if (word(entry) < 0) {
+            return state == TreeSearch.FOUND ? -1 : 0;
+        }
+        return state == TreeSearch.FOUND ? 0 : 1;
     }
 
     /// {@return where the value of `entry` lies, for tests: the [LogValue] of a value in the log, the chunk of one in a
@@ -765,6 +923,14 @@ final class PackedRun {
     int keyLengthForTests() {
         var layout = storage.layout;
         return layout == null ? 0 : layout.length();
+    }
+
+    /// {@return whether [#base()] holds the key of `entry` as recorded ([#settle(int, boolean)]), as
+    /// [TreeSearch#FOUND] or [TreeSearch#ABSENT], or [TreeSearch#UNKNOWN] if no answer is recorded, for tests}
+    byte settledForTests(int entry) {
+        var known = storage.known;
+        var chunk = entry >>> WORD_CHUNK_BITS;
+        return chunk < known.length && known[chunk] != null ? known[chunk][entry & WORD_MASK] : TreeSearch.UNKNOWN;
     }
 
     // The words `words` has room for, over all its chunks
@@ -1553,27 +1719,36 @@ final class PackedRun {
     }
 
     /// Collects the writes of one paged key space into a [PackedRun]: those the open replays, the newest of each key,
-    /// or the puts of new keys of a bulk commit, which a later bulk commit's builder appends to
+    /// or the puts of new keys of a commit, which a later commit's builder appends to
     /// ([#appending(PackedRun, int, long)]).
     ///
-    /// Used by the replay, on the opening thread, and by a bulk commit, on its committing thread, each of which builds
-    /// one view and uses the builder no more. A builder of a new run writes arrays no reader sees until the run is
-    /// built; one that appends writes past the entries of every view of the run, publishing each array it grows or
-    /// table it adds to before any entry it adds there.
+    /// Used by the replay, on the opening thread, and by a commit, on its committing thread, each of which builds one
+    /// view and uses the builder no more. A builder of a new run writes arrays no reader sees until the run is built;
+    /// one that appends writes past the entries of every view of the run, publishing each array it grows or replaces,
+    /// or table it adds to, before any entry it adds there.
     static final class Builder {
         private static final int FIRST_ENTRIES = 64;
         private static final int UNDECIDED = -1;
         private final Storage storage;
         // The view the builder appends to, or null for a new run
         private final PackedRun after;
+        // Whether the builder is a commit's, whose values lie on homes, rather than the replay's
         private final boolean committed;
-        // Where the builder's entries, keys, chunks of keys and homes start in the run's arrays
+        // Whether the commits count the puts they add, the run being over a key space whose latest tree held none of
+        // its entries; the tree the run is counted against otherwise, and what released runs left to the count
+        private final boolean counted;
+        private final TreeRoot base;
+        private final long keptBefore;
+        // Where the builder's entries, keys, chunks of keys and homes start in the run's arrays: the first chunk is
+        // the run's last, which the builder's keys continue, or one the builder added
         private final int firstEntry;
         private final int firstKeyBytes;
         private final int firstChunk;
         private final int firstHome;
-        // The bytes of the builder's first chunk of keys, which doubles, up to a whole chunk, while it is the last
-        private final int firstChunkBytes;
+        // The chunks of the keys before the builder added to them or replaced one, which a rollback puts back
+        private final byte[][] priorKeys;
+        // The first chunk of the keys whose read-only view the builder makes: one it added or replaced by a copy
+        private int staleFrom;
         // The replay's chunks of short values and the places in the log of its long ones; null for a bulk commit's
         private final ArrayList<MemorySegment> chunks;
         private long[][] logs;
@@ -1606,23 +1781,28 @@ final class PackedRun {
 
         /// Creates the builder of the run of an open's replay.
         Builder() {
-            this(FIRST_ENTRIES, FIRST_ENTRIES * 32L, false, tableFor(FIRST_ENTRIES));
+            this(FIRST_ENTRIES, FIRST_ENTRIES * 32L, false, false, null, 0, tableFor(FIRST_ENTRIES));
         }
 
         // A builder of a new run with room for `entries` entries of `keyBytes` bytes of keys in all, whose hash table
         // starts with `slots` slots
-        private Builder(int entries, long keyBytes, boolean committed, int slots) {
+        private Builder(int entries, long keyBytes, boolean committed, boolean counted, TreeRoot base, long keptBefore,
+                        int slots) {
             var capacity = Math.max(1, entries);
             this.storage = new Storage();
             this.after = null;
             this.committed = committed;
+            this.counted = counted;
+            this.base = base;
+            this.keptBefore = keptBefore;
             this.firstEntry = 0;
             this.firstKeyBytes = 0;
             this.firstChunk = 0;
             this.firstHome = 0;
-            this.firstChunkBytes = (int) Math.clamp(keyBytes, 1, KEY_CHUNK);
-            storage.keys = new byte[][]{new byte[firstChunkBytes]};
+            storage.keys = new byte[][]{new byte[(int) Math.clamp(keyBytes, 1, KEY_CHUNK)]};
             storage.keyViews = new MemorySegment[0];
+            this.priorKeys = storage.keys;
+            this.staleFrom = 0;
             this.room = capacity;
             this.keyLength = UNDECIDED;
             storage.words = new long[0][];
@@ -1647,11 +1827,12 @@ final class PackedRun {
             this.storage = view.storage;
             this.after = view;
             this.committed = true;
+            this.counted = view.counted;
+            this.base = view.base;
+            this.keptBefore = view.keptBefore;
             this.firstEntry = storage.entries;
             this.firstKeyBytes = storage.keyBytes;
-            this.firstChunk = storage.keys.length;
             this.firstHome = storage.homeCount;
-            this.firstChunkBytes = (int) Math.clamp(keyBytes, 1, KEY_CHUNK);
             this.chunks = null;
             this.segments = null;
             this.minStamp = Long.MAX_VALUE;
@@ -1665,9 +1846,9 @@ final class PackedRun {
             var needed = (int) Math.min(MAX_ENTRIES, (long) firstEntry + Math.max(1, planned));
             var keyEnds = storage.keyEnds;
             if (keyEnds == null) {
-                // The keys of the run share one length, or there is none: the commit's keys start a chunk of their
-                // own, so its first key makes the ends of every key, of this room, which the layout of the run's
-                // keys would have taken had they been kept, trimmed to the entries
+                // The keys of the run share one length, or there is none: the commit's keys may start a chunk of
+                // their own, so its first key makes the ends of every key, of this room, which the layout of the
+                // run's keys would have taken had they been kept, trimmed to the entries
                 this.priorKeyEnds = firstEntry;
                 this.room = keyEndsFor(needed, firstEntry);
                 this.keyLength = UNDECIDED;
@@ -1680,28 +1861,59 @@ final class PackedRun {
                 this.room = keyEnds.length;
             }
             addWordChunks(needed);
-            // The commit's keys start a chunk of their own, made here rather than at the first key, so a put takes no
-            // branch only the first of each commit takes, which the compiler would leave out of a commit's loop and
-            // then deoptimize the loop at the next commit's first key
-            var keys = Arrays.copyOf(storage.keys, firstChunk + 1);
-            keys[firstChunk] = new byte[firstChunkBytes];
-            storage.keys = keys;
-            storage.keyBytes = firstChunk << KEY_CHUNK_BITS;
+            // The room of the commit's keys, made here rather than at the first key, so a put takes no branch only the
+            // first of each commit takes, which the compiler would leave out of a commit's loop and then deoptimize the
+            // loop at the next commit's first key: the rest of the last chunk if they fit it, which grows to hold them,
+            // so commits of a few keys share chunks rather than each taking one of the 4,096 a run may have; a chunk of
+            // their own otherwise, the last one before it cut to the keys it holds. A chunk a view holds keys of is
+            // replaced by a longer or shorter copy, in a copy of the chunks: a reader keeps reading the ones it loaded
+            var keys = storage.keys;
+            this.priorKeys = keys;
+            var last = keys.length - 1;
+            var used = storage.keyBytes - (last << KEY_CHUNK_BITS);
+            var wanted = (int) Math.clamp(keyBytes, 1, KEY_CHUNK);
+            if (used + keyBytes <= KEY_CHUNK) {
+                this.firstChunk = last;
+                this.staleFrom = last + 1;
+                if (keys[last].length < used + wanted) {
+                    var grown = keys.clone();
+                    grown[last] = Arrays.copyOf(keys[last], (int) Math.min(KEY_CHUNK, Math.max(used + wanted, 2L * keys[last].length)));
+                    storage.keys = grown;
+                    this.staleFrom = last;
+                }
+            } else {
+                this.firstChunk = last + 1;
+                var grown = Arrays.copyOf(keys, last + 2);
+                if (used < keys[last].length) {
+                    grown[last] = Arrays.copyOf(keys[last], used);
+                    this.staleFrom = last;
+                } else {
+                    this.staleFrom = last + 1;
+                }
+                grown[last + 1] = new byte[wanted];
+                storage.keys = grown;
+                storage.keyBytes = (last + 1) << KEY_CHUNK_BITS;
+            }
             if (4L * needed > 3L * storage.slots.length) {
                 rehash(tableFor(needed));
             }
         }
 
-        /// {@return the builder of the run a bulk commit makes of its puts of new keys, with room for `entries` entries
-        /// of `keyBytes` bytes of keys in all, which it takes without growing an array: a bulk commit knows both before
-        /// it applies}
-        static Builder forCommit(int entries, long keyBytes) {
-            return new Builder(entries, keyBytes, true, commitTable(Math.max(1, entries)));
+        /// {@return the builder of the run a commit makes of its puts of new keys, with room for `entries` entries of
+        /// `keyBytes` bytes of keys in all, which it takes without growing an array: a commit knows both before it
+        /// applies}
+        ///
+        /// @param base the latest tree of the key space, which the commits look none of their keys up in and the run's
+        ///             count is corrected against ([PackedRun#correction()]); or `null` if no tree holds an entry of
+        ///             it, so the commits count their puts ([PackedRun#counted()])
+        /// @param keptBefore what the uncounted runs the key space released left to its count
+        static Builder forCommit(int entries, long keyBytes, TreeRoot base, long keptBefore) {
+            return new Builder(entries, keyBytes, true, base == null, base, keptBefore, commitTable(Math.max(1, entries)));
         }
 
-        /// {@return the builder of a bulk commit that appends its puts of new keys to the run whose newest view is
-        /// `view`, a bulk commit's run still [appendable][PackedRun#appendable()], with room for `planned` more entries
-        /// of `keyBytes` bytes of keys in all}
+        /// {@return the builder of a commit that appends its puts of new keys to the run whose newest view is `view`, a
+        /// commits' run still [appendable][PackedRun#appendable()], with room for `planned` more entries of `keyBytes`
+        /// bytes of keys in all}
         ///
         /// The commit holds both roles, so no other commit appends, cuts the run or publishes a view of it until it
         /// publishes its own ([#buildCommitted(PageFile)]) or takes its writes back ([#rollback()]).
@@ -1715,9 +1927,9 @@ final class PackedRun {
             return (int) Math.min(MAX_ENTRIES, Math.max(entries, length + (length >> 1)));
         }
 
-        // The slots of the hash table of a bulk commit's new run of `entries` entries, two thirds full: the commit
-        // knows its entries before it applies, and a power of two would leave the table between three eighths and
-        // three quarters full
+        // The slots of the hash table of a commit's new run of `entries` entries, two thirds full: the commit knows
+        // its entries before it applies, and a power of two would leave the table between three eighths and three
+        // quarters full
         private static int commitTable(long entries) {
             return (int) Math.max(2, entries + (entries + 1) / 2);
         }
@@ -1743,6 +1955,11 @@ final class PackedRun {
                 }
                 storage.words = grown;
             }
+        }
+
+        /// {@return whether the commits count the puts the builder takes as they apply them ([PackedRun#counted()])}
+        boolean counted() {
+            return counted;
         }
 
         /// {@return whether the builder holds no entry of its own}
@@ -2088,10 +2305,13 @@ final class PackedRun {
             } else {
                 chunk = keys[chunkIndex];
                 if (offset + length > chunk.length) {
-                    // Only the builder's first chunk is shorter than a chunk, and it is the last until it is whole; no
-                    // view reads it before the builder's is published
+                    // Only the last chunk is shorter than a chunk; a view may read the keys before the builder's in it,
+                    // so the longer copy goes in a copy of the chunks, and the builder makes its view
                     chunk = Arrays.copyOf(chunk, Math.min(KEY_CHUNK, Math.max(offset + length, 2 * chunk.length)));
+                    keys = keys.clone();
                     keys[chunkIndex] = chunk;
+                    storage.keys = keys;
+                    staleFrom = Math.min(staleFrom, chunkIndex);
                 }
             }
             storage.keyBytes = start + length;
@@ -2145,7 +2365,7 @@ final class PackedRun {
         // Decides where the key of `length` bytes about to be placed, and the keys after it, are found: by the layout
         // of keys of its length, for the first key of a new run; else by the ends of the keys, made here for every
         // entry of the run, where the layout placed their keys, as the first key of a commit that appends to a run of
-        // keys of one length, whose keys start a chunk of their own, and a key of another length than those before
+        // keys of one length, whose keys may start a chunk of their own, and a key of another length than those before
         // need. The ends are published before the run lets go of its layout, so a reader of an earlier view that loads
         // the layout, finding none, finds the ends.
         private void layOut(int length) {
@@ -2217,9 +2437,9 @@ final class PackedRun {
             storage.homeCount = firstHome;
             homeSections = null;
             homeEnds = null;
-            if (storage.keys.length != firstChunk) {
-                storage.keys = Arrays.copyOf(storage.keys, firstChunk);
-            }
+            // The chunks every view reads, whose views the builder did not replace: the bytes it wrote past the keys of
+            // the views in the last one are read by no one, and the next builder writes over them
+            storage.keys = priorKeys;
             storage.keyBytes = firstKeyBytes;
             var added = storage.entries != firstEntry;
             storage.entries = firstEntry;
@@ -2264,23 +2484,27 @@ final class PackedRun {
             return false;
         }
 
-        // Trims the last chunk of the builder's keys to the bytes its keys take, and makes the read-only views of the
-        // builder's chunks
-        private void finishKeys() {
+        // Makes the read-only views of the chunks of keys the builder added or replaced, publishing them in a copy of the
+        // views; for the replay, whose run no later commit appends to, first trims the last chunk to the bytes its keys
+        // take
+        private void finishKeys(boolean trim) {
             var keys = storage.keys;
-            if (keys.length == firstChunk) {
+            if (trim) {
+                var last = keys.length - 1;
+                var used = storage.keyBytes - last * KEY_CHUNK;
+                if (used < keys[last].length) {
+                    keys[last] = Arrays.copyOf(keys[last], used);
+                }
+            }
+            if (staleFrom >= keys.length) {
                 return;
             }
-            var last = keys.length - 1;
-            var used = storage.keyBytes - last * KEY_CHUNK;
-            if (used < keys[last].length) {
-                keys[last] = Arrays.copyOf(keys[last], used);
-            }
             var views = Arrays.copyOf(storage.keyViews, keys.length);
-            for (var c = firstChunk; c < keys.length; c++) {
+            for (var c = staleFrom; c < keys.length; c++) {
                 views[c] = MemorySegment.ofArray(keys[c]).asReadOnly();
             }
             storage.keyViews = views;
+            staleFrom = keys.length;
         }
 
         /// {@return the run of the writes recorded, counted against `base`, the root of the key space's tree the store
@@ -2291,7 +2515,7 @@ final class PackedRun {
         PackedRun build(TreeRoot base, PageFile pages) {
             var storage = this.storage;
             var size = storage.entries;
-            finishKeys();
+            finishKeys(true);
             var keyEnds = storage.keyEnds;
             if (keyEnds != null && keyEnds.length != size) {
                 storage.keyEnds = Arrays.copyOf(keyEnds, size);
@@ -2316,18 +2540,20 @@ final class PackedRun {
                     segments.toArray(LogSegmentView[]::new));
             this.logs = null;
             chunks.clear();
-            return new PackedRun(storage, size, minStamp, minStamp, maxStamp, false, base, pages, null, 0, 0, null, null);
+            return storage.addView(new PackedRun(storage, size, 0, minStamp, minStamp, maxStamp, false, false, base,
+                    keptBefore, pages, 0, 0, null, null));
         }
 
-        /// {@return the view of the run holding the puts of new keys a bulk commit recorded and counted, none of which
-        /// the latest tree of `pages` held when the commit applied, nor any tree a reader that reads the view reads,
-        /// with those of the views before if the builder appends}
+        /// {@return the view of the run holding the puts of new keys a commit recorded, with those of the views before
+        /// if the builder appends: counted by the commits if none of their keys was in the latest tree of `pages` when
+        /// the run was made, nor is in any tree a reader that reads the view reads; corrected against that tree
+        /// otherwise}
         ///
         /// A builder of a new run makes it [appendable][PackedRun#appendable()]. The view is published by the commit,
         /// before its sequence is visible.
         PackedRun buildCommitted(PageFile pages) {
             var storage = this.storage;
-            finishKeys();
+            finishKeys(false);
             giveBackRoom();
             var endHome = storage.homeCount;
             var sections = homeSections == null ? null : Arrays.copyOf(homeSections, endHome - firstHome);
@@ -2337,11 +2563,12 @@ final class PackedRun {
             if (after == null) {
                 storage.places = NO_PLACES;
                 storage.appendable = true;
-                return new PackedRun(storage, storage.entries, minStamp, minStamp, maxStamp, true, null, pages, null,
-                        firstHome, endHome, sections, ends);
+                return storage.addView(new PackedRun(storage, storage.entries, 0, minStamp, minStamp, maxStamp, counted,
+                        true, base, keptBefore, pages, firstHome, endHome, sections, ends));
             }
-            return new PackedRun(storage, storage.entries, after.minStamp, minStamp, Math.max(after.maxStamp, maxStamp),
-                    true, null, pages, after, firstHome, endHome, sections, ends);
+            return storage.addView(new PackedRun(storage, storage.entries, after.index + 1, after.minStamp, minStamp,
+                    Math.max(after.maxStamp, maxStamp), counted, true, base, keptBefore, pages, firstHome, endHome,
+                    sections, ends));
         }
     }
 
@@ -2380,12 +2607,26 @@ final class PackedRun {
         // null until the first drop, and a chunk null while no home of it was let go of. Written by the drops alone,
         // which take turns
         volatile FramedHome[][] framed;
-        // Open addressing on the hash of the keys, of any length and at most three quarters full: two thirds of a bulk
+        // Open addressing on the hash of the keys, of any length and at most three quarters full: two thirds of a
         // commit's new run, a power of two for a replay's run and once a commit appends past three quarters; replaced
         // by a larger table, or one without the entries of a commit taken back, never changed but to add a slot
         volatile int[] slots;
-        // Whether a later bulk commit may append to the run: set by the first, cleared by a checkpoint's cut
+        // Whether a later commit may append to the run: set by the first, cleared by a checkpoint's cut
         volatile boolean appendable;
+        // Whether a reader made the order of a view's keys
+        volatile boolean ordered;
+        // The views of the run by index, in the order of their commits, each added before it is published; those a
+        // drop let go of, below `firstView`, are cleared. Written holding the store's publishing role
+        volatile PackedRun[] views = new PackedRun[1];
+        volatile int firstView;
+        // Per entry, in chunks of WORD_CHUNK made at their first need, whether the run's base holds its key, as
+        // TreeSearch.FOUND or ABSENT, or UNKNOWN; a chunk never moves, and the chunks grow in a copy under knownLock
+        volatile byte[][] known = new byte[0][];
+        final Object knownLock = new Object();
+        // The change the first entries of the run make to the count of the base, as the longest view counted made it
+        volatile Corrected corrected;
+        // Whether the checkpoint that takes the run counted it, settling every entry: no count looks a key up after
+        volatile boolean settled;
         // The entries, where the last key ends, and the homes, as the last commit to append left them
         int entries;
         int keyBytes;
@@ -2397,6 +2638,24 @@ final class PackedRun {
         final AtomicReference<int[]> lastOrder = new AtomicReference<>();
         // The entries the orders of the views sorted, for tests
         final AtomicLong sorted = new AtomicLong();
+
+        // Adds `view`, made of these arrays, as the view of its index, and returns it
+        PackedRun addView(PackedRun view) {
+            var views = this.views;
+            if (view.index >= views.length) {
+                views = Arrays.copyOf(views, Math.max(view.index + 1, 2 * views.length));
+            }
+            views[view.index] = view;
+            this.views = views;
+            return view;
+        }
+    }
+
+    /// The change the first `size` entries of a run make to the count of its base, as a view of that many counted it.
+    ///
+    /// @param size the entries
+    /// @param total the change
+    private record Corrected(int size, long total) {
     }
 
     /// A scan's walk over the entries of the tree the store opened from with the run over them: a key of the run takes

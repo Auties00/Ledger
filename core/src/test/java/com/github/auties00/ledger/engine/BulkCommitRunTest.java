@@ -41,7 +41,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/// The runs a bulk commit keeps its puts of new keys in ([PackedRun#committed()]): a batch of at least
+/// The runs a bulk commit keeps its puts of new keys in ([PackedRun#appended()]): a batch of at least
 /// [LiveLedger#BULK_RUN_WRITES] puts to a paged key space whose latest tree holds none of its entries runs alone and
 /// keeps those puts in arrays, which every read, scan, count, later write, range removal, checkpoint, snapshot, spill
 /// and crash sees as the chains they replaced showed them. The expected state of every test is kept beside the store and
@@ -52,6 +52,8 @@ class BulkCommitRunTest {
     private static final Keyspace<String, String> TEXTS = Keyspace.paged("texts", KeyCodec.utf8(), ValueCodec.utf8());
     private static final Keyspace<String, String> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
     private static final int BULK = LiveLedger.BULK_RUN_WRITES + 500;
+    // The puts of a commit that keeps them on chains
+    private static final int SMALL = LiveLedger.RUN_APPEND_WRITES - 4;
     // Empty, short, at the log's threshold, between it and the verdict's paying length, and above
     private static final int[] LENGTHS = {0, 40, SpillQueue.LOG_VALUE_MIN, 200, 700, 1_500};
     // Values that move to the log once their record drains: mostly long, so the record's verdict lets all move
@@ -156,7 +158,7 @@ class BulkCommitRunTest {
                 var batch = ledger.newBatch();
                 puts(batch, expected, 0, BULK, 0, LENGTHS);
                 // Below the threshold: chains
-                for (var i = 0; i < 100; i++) {
+                for (var i = 0; i < LiveLedger.RUN_APPEND_WRITES - 1; i++) {
                     batch.put(TEXTS, "t" + i, "text " + i);
                     expected.texts.put("t" + i, "text " + i);
                 }
@@ -164,7 +166,7 @@ class BulkCommitRunTest {
                 ledger.commit(batch).awaitDurable();
                 var run = ledger.state(MESSAGES).run;
                 assertNotNull(run, "the bulk commit made no run");
-                assertTrue(run.committed());
+                assertTrue(run.counted());
                 assertEquals(BULK, run.size());
                 assertEquals(0, ledger.state(MESSAGES).chains(), "a put of a new key took a chain");
                 assertNull(ledger.state(TEXTS).run, "a run below the threshold");
@@ -219,7 +221,7 @@ class BulkCommitRunTest {
             var batch = ledger.newBatch();
             puts(batch, alone, 0, BULK, 0, lengths);
             ledger.commit(batch).awaitDurable();
-            assertTrue(ledger.state(MESSAGES).run.committed());
+            assertTrue(ledger.state(MESSAGES).run.counted());
             // Keys of one length: the run keeps no ends of its keys, and the first pass reads their length off its layout
             assertEquals(Integer.BYTES, ledger.state(MESSAGES).run.keyLengthForTests());
             var streamed = ledger.checkpointer().streamedForTests();
@@ -276,7 +278,7 @@ class BulkCommitRunTest {
         try (var ledger = open(directory.resolve("replayed"), encrypted, 0)) {
             var run = ledger.state(MESSAGES).run;
             assertNotNull(run, "the replay made no run");
-            assertFalse(run.committed());
+            assertFalse(run.appended());
             assertEquals(Integer.BYTES, run.keyLengthForTests(), "the replay's run keeps the ends of keys of one length");
             assertEquals(0, ledger.state(MESSAGES).chains(), "a replayed write took a chain");
             verify(ledger, replayed);
@@ -325,7 +327,7 @@ class BulkCommitRunTest {
             ledger.commit(batch).awaitDurable();
             var run = ledger.state(MESSAGES).run;
             assertNotNull(run);
-            assertTrue(run.committed());
+            assertTrue(run.counted());
             assertEquals(BULK, run.size());
             verify(ledger, expected);
             ledger.checkpoint();
@@ -341,7 +343,7 @@ class BulkCommitRunTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
-    @DisplayName("a bulk commit's run is not made where a tree holds the key space, a range removal is newer than the tree, or the batch removes a range of it, and a later bulk commit appends to the run in memory")
+    @DisplayName("a bulk commit's run is not made where a range removal is newer than the tree, or the batch removes a range of it, is uncounted where a tree holds the key space, and a later bulk commit appends to the run in memory")
     void ineligibleKeyspaces(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
@@ -353,11 +355,13 @@ class BulkCommitRunTest {
             assertNull(ledger.state(MESSAGES).run, "a run under a range removal newer than the tree");
             verify(ledger, expected);
             ledger.checkpoint();
-            // The tree holds the key space
+            // The tree holds the key space: the idle commit's run is counted against it
             batch = ledger.newBatch();
             puts(batch, expected, BULK, BULK, 0, LENGTHS);
             ledger.commit(batch).awaitDurable();
-            assertNull(ledger.state(MESSAGES).run, "a run over a tree that holds the key space");
+            var over = ledger.state(MESSAGES).run;
+            assertNotNull(over, "no run of an idle commit over a tree that holds the key space");
+            assertFalse(over.counted(), "a run over a tree that holds the key space counted its puts");
             verify(ledger, expected);
         }
         var other = directory.resolve("other");
@@ -495,7 +499,7 @@ class BulkCommitRunTest {
         // A budget no commit reaches, so every record listed stays queued
         try (var ledger = open(directory, false, 1L << 30)) {
             var state = ledger.state(MESSAGES);
-            var size = bulk ? keys : 1_000;
+            var size = bulk ? keys : SMALL;
             for (var first = 0; first < keys; first += size) {
                 var batch = ledger.newBatch();
                 for (var message = first; message < first + size; message++) {
@@ -522,12 +526,12 @@ class BulkCommitRunTest {
         }
     }
 
-    /// Fills `keys` keys of [#MESSAGES] with `value`, by one bulk commit or by commits of 1,000 puts, checks that the
+    /// Fills `keys` keys of [#MESSAGES] with `value`, by one bulk commit or by commits of [#SMALL] puts, checks that the
     /// key space's values may then leave the heap and returns the key space's state.
     private static KeyspaceState fill(LiveLedger ledger, boolean bulk, int keys, byte[] value)
             throws InterruptedException {
         var state = ledger.state(MESSAGES);
-        var size = bulk ? keys : 1_000;
+        var size = bulk ? keys : SMALL;
         for (var first = 0; first < keys; first += size) {
             var batch = ledger.newBatch();
             for (var message = first; message < first + size; message++) {
@@ -592,7 +596,7 @@ class BulkCommitRunTest {
             var state = ledger.state(MESSAGES);
             var run = state.run;
             assertNotNull(run, "the replay packed no run");
-            assertFalse(run.committed());
+            assertFalse(run.counted());
             assertEquals(0, state.chains());
             // Puts of new keys, all sampled in a commit of 1,000 until the first judgement, let the values leave the
             // heap
@@ -705,7 +709,7 @@ class BulkCommitRunTest {
             ledger.commit(batch).awaitDurable();
             var run = ledger.state(MESSAGES).run;
             assertNotNull(run, "no run over an emptied key space");
-            assertTrue(run.committed());
+            assertTrue(run.counted());
             verify(ledger, expected);
             ledger.checkpoint();
             verify(ledger, expected);
@@ -911,7 +915,7 @@ class BulkCommitRunTest {
             ledger.commit(batch).awaitDurable();
             var run = ledger.state(MESSAGES).run;
             assertNotNull(run, "the bulk commit made no run");
-            assertTrue(run.committed());
+            assertTrue(run.counted());
             assertEquals(3_000, run.size());
             var chunks = run.keyChunkLengthsForTests();
             assertTrue(chunks.length > 4, () -> "keys in " + Arrays.toString(chunks));
@@ -1247,7 +1251,7 @@ class BulkCommitRunTest {
             ledger.commit(batch).awaitDurable();
             var run = ledger.state(MESSAGES).run;
             assertNotNull(run);
-            assertTrue(run.committed());
+            assertTrue(run.counted());
             assertEquals(count, run.size());
             assertEquals(150_000, run.slotsForTests());
             assertTrue(4L * run.slotsForTests() + 16 < 1 << 20, "the hash table is a humongous array");
@@ -1269,7 +1273,7 @@ class BulkCommitRunTest {
         try (var ledger = open(directory, encrypted, 0)) {
             var run = ledger.state(MESSAGES).run;
             assertNotNull(run);
-            assertFalse(run.committed());
+            assertFalse(run.appended());
             var slots = run.slotsForTests();
             assertEquals(0, slots & (slots - 1), "the replay's table of " + slots + " slots is not a power of two");
             for (var message = 0; message < count + 1_000; message++) {
@@ -1312,7 +1316,7 @@ class BulkCommitRunTest {
 
     @ParameterizedTest(name = "encrypted: {0}")
     @ValueSource(booleans = {true, false})
-    @DisplayName("a checkpoint's cut closes the run to appends: bulk commits during and after it go to chains, counted exactly, and the checkpoint takes the run whole")
+    @DisplayName("a checkpoint's cut closes the run to appends: bulk commits during it go to chains, counted exactly, the checkpoint takes the run whole, and a bulk commit after it makes an uncounted run")
     void cutClosesRun(boolean encrypted, @TempDir Path directory) throws Exception {
         var expected = new Expected();
         try (var ledger = open(directory, encrypted, Long.MAX_VALUE)) {
@@ -1346,11 +1350,13 @@ class BulkCommitRunTest {
             ledger.checkpointer().hookCutForTests(null);
             assertNull(ledger.state(MESSAGES).run, "the checkpoint left the run it took");
             verify(ledger, expected);
-            // The tree now holds the key space: chains again
+            // The tree now holds the key space: an uncounted run, counted against it
             batch = ledger.newBatch();
             puts(batch, expected, 3 * BULK, BULK, 0, LENGTHS);
             ledger.commit(batch).awaitDurable();
-            assertNull(ledger.state(MESSAGES).run);
+            var over = ledger.state(MESSAGES).run;
+            assertNotNull(over);
+            assertFalse(over.counted());
             verify(ledger, expected);
             ledger.checkpoint();
             verify(ledger, expected);

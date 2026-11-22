@@ -1648,7 +1648,7 @@ class PackedRunTest {
     @ValueSource(ints = {1, 2, 3, 5, 7, 9, 13, 100, 2_548, 666_667})
     @DisplayName("a bulk commit's new run takes a hash table two thirds full of its entries, of any length, and finds every key through both finds and no other")
     void commitTableTwoThirds(int entries) {
-        var builder = PackedRun.Builder.forCommit(entries, 8L * entries);
+        var builder = PackedRun.Builder.forCommit(entries, 8L * entries, null, 0);
         var keys = tableKeys(0, entries);
         putEmpty(builder, keys);
         var run = builder.buildCommitted(null);
@@ -1682,7 +1682,7 @@ class PackedRunTest {
         for (var id = -1; keys.size() < entries; id--) {
             keys.add(tableKey(id));
         }
-        var builder = PackedRun.Builder.forCommit(entries, 8L * entries);
+        var builder = PackedRun.Builder.forCommit(entries, 8L * entries, null, 0);
         putEmpty(builder, keys);
         var run = builder.buildCommitted(null);
         assertEquals(slots, run.slotsForTests());
@@ -1715,13 +1715,13 @@ class PackedRunTest {
     @DisplayName("a new run whose commit took fewer entries than it planned keeps its table while they fill half of it, and takes one two thirds full of them below")
     void newRunGivesBackTable() {
         // 1,000 planned puts: 1,500 slots, kept down to 750 entries
-        var kept = PackedRun.Builder.forCommit(1_000, 8_000);
+        var kept = PackedRun.Builder.forCommit(1_000, 8_000, null, 0);
         var keys = tableKeys(0, 750);
         putEmpty(kept, keys);
         var run = kept.buildCommitted(null);
         assertEquals(1_500, run.slotsForTests());
         assertFinds(run, keys, tableKeys(750, 300));
-        var shrunk = PackedRun.Builder.forCommit(1_000, 8_000);
+        var shrunk = PackedRun.Builder.forCommit(1_000, 8_000, null, 0);
         keys = tableKeys(0, 749);
         putEmpty(shrunk, keys);
         run = shrunk.buildCommitted(null);
@@ -1732,7 +1732,7 @@ class PackedRunTest {
     @Test
     @DisplayName("an append to a run of a table two thirds full keeps the table while the entries fill at most three quarters of it, and makes a power of two past that, where older views and the newest find their own keys")
     void appendsToCommitTable() {
-        var builder = PackedRun.Builder.forCommit(1_000, 8_000);
+        var builder = PackedRun.Builder.forCommit(1_000, 8_000, null, 0);
         var first = tableKeys(0, 1_000);
         putEmpty(builder, first);
         var run = builder.buildCommitted(null);
@@ -1763,7 +1763,7 @@ class PackedRunTest {
     @Test
     @DisplayName("readers of the first view of a run of a table two thirds full find its keys and none of the later commits' while appends grow the table past three quarters")
     void readersAcrossAppendRehash() throws Exception {
-        var builder = PackedRun.Builder.forCommit(3_000, 24_000);
+        var builder = PackedRun.Builder.forCommit(3_000, 24_000, null, 0);
         var first = tableKeys(0, 3_000);
         putEmpty(builder, first);
         var run = builder.buildCommitted(null);
@@ -1821,7 +1821,7 @@ class PackedRunTest {
     @Test
     @DisplayName("a commit taken back as it appends to a run of a table two thirds full gives back the table of exactly its earlier length, which finds every key of the newest view, and the next append takes it")
     void rollbackRestoresCommitTable() {
-        var builder = PackedRun.Builder.forCommit(1_000, 8_000);
+        var builder = PackedRun.Builder.forCommit(1_000, 8_000, null, 0);
         var first = tableKeys(0, 1_000);
         putEmpty(builder, first);
         var run = builder.buildCommitted(null);

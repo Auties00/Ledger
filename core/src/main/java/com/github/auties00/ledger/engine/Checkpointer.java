@@ -658,11 +658,13 @@ final class Checkpointer implements IdleTicker.Watched {
     /// A checkpoint of the trees the store opened from merges the run of the writes the open replayed into each paged key
     /// space ([PackedRun]) with the keys written since: a key's version at the cut wins over the run's entry, which
     /// is the key's state where no version is at or below the cut. The update records whether the tree held each key of
-    /// the run, which counts the run's writes. A checkpoint that fails leaves the run to the next one, which merges it
-    /// again, over the same trees. A checkpoint whose cut is at or after the bulk commits of a run merges the run's
-    /// newest view the same way, over trees older than its first commit, which hold none of its keys; its commits
-    /// counted it. Its cut closed the run to appends ([PackedRun#closeToAppends()]), so that view is at or below the
-    /// cut.
+    /// the run, and the count of the run looks up the keys the update skipped, which counts the run's writes before the
+    /// trees the run is counted against can go ([PackedRun#settledByCheckpoint()]). A checkpoint that fails leaves the
+    /// run to the next one, which merges it again, over the same trees. A checkpoint whose cut is at or after the
+    /// commits of a run merges the run's newest view the same way, over trees older than its first commit: a counted
+    /// run's over trees that hold none of its keys, as its commits counted it; an uncounted run's over the trees it is
+    /// counted against, which were the latest from its first commit to the cut. Its cut closed the run to appends
+    /// ([PackedRun#closeToAppends()]), so that view is at or below the cut.
     ///
     /// A key space with no tree yet whose writes up to the cut are a run's alone, with no chain and no range removed
     /// since, gets its tree written straight from the run ([TreeUpdate#applyRun(PackedRun)]): the first checkpoint after
@@ -687,6 +689,9 @@ final class Checkpointer implements IdleTicker.Watched {
             }
             if (run != null && run.maxStamp() > bound) {
                 throw new IllegalStateException("A run of " + state.keyspace.name() + " holds writes on both sides of the cut");
+            }
+            if (run != null && !run.counted() && run.base() != roots[state.id]) {
+                throw new IllegalStateException("A run of " + state.keyspace.name() + " is counted against other trees than the cut's");
             }
             if (run != null) {
                 // The homes a bulk commit's run let go of for its value frames, read back at once rather than one at a
@@ -725,8 +730,12 @@ final class Checkpointer implements IdleTicker.Watched {
                 return base != null && TreeSearch.contains(pages, base, key);
             });
             var count = root == null ? 0 : root.count();
-            // Counted from what the update settled, and kept once the run is gone
-            var expected = keyspace.count() + state.replayCorrection() + blind + pendingRanges;
+            // Counted from what the update settled, and the keys of an uncounted run it skipped looked up while the
+            // trees are still the latest; kept once the run is gone
+            var expected = keyspace.count() + state.runCorrection(bound) + blind + pendingRanges;
+            if (run != null && !run.counted()) {
+                run.settledByCheckpoint();
+            }
             if (count != expected) {
                 throw new IllegalStateException("The checkpoint of " + state.keyspace.name() + " holds " + count
                         + " entries where the store counts " + expected);

@@ -135,7 +135,7 @@ final class TreeUpdate {
     /// @param blind the chain of the key, if a blind write the checkpoint takes needs to know whether the tree held
     ///              the key ([BlindWrites]), which the update records on it; or `null`
     /// @param run the [PackedRun] whose entry `entry` is the key's, which the update tells whether the tree held the
-    ///            key ([PackedRun#settles()]); or `null`
+    ///            key ([PackedRun#settle(int, boolean)]); or `null`
     /// @param entry the key's entry in `run`, or -1
     record Op(Chain keyed, Version version, Chain blind, PackedRun run, int entry) {
         /// What the state of a put only a run holds keeps in place of a version: the put of the run's entry.
@@ -221,14 +221,14 @@ final class TreeUpdate {
 
         /// Records on the chain of a blind write, and for the run that holds the key, whether the tree held the key.
         ///
-        /// A bulk commit's run counted its puts as it applied them ([PackedRun#committed()]), so nothing is recorded
-        /// for it.
+        /// A counted run's commits counted its puts as they applied them ([PackedRun#counted()]), so nothing is
+        /// recorded for it.
         void settle(boolean inTree) {
             if (blind != null) {
                 blind.settle(inTree);
             }
-            if (run != null && entry >= 0 && !run.committed()) {
-                PackedRun.settle(run.settles(), entry, inTree);
+            if (run != null && entry >= 0 && !run.counted()) {
+                run.settle(entry, inTree);
             }
         }
     }
@@ -342,7 +342,8 @@ final class TreeUpdate {
     /// It writes what [#apply(TreeRoot, List, List)] writes for the states of the run's entries in key order, a put's
     /// state the run's entry itself ([Op#ofRun(PackedRun, int)]), over no tree and with no range removed: the same units,
     /// on the same pages, under the same nonces, in the same order. As the merge does, it records that the tree held
-    /// none of the run's keys ([PackedRun#settles()]), unless the run's commits counted them ([PackedRun#committed()]).
+    /// none of the run's keys ([PackedRun#settle(int, boolean)]), unless the run's commits counted them
+    /// ([PackedRun#counted()]).
     ///
     /// The first pass, over the run in key order, sizes the leaf entry of each put from the lengths of its key and its
     /// value, read off the run's arrays, and queues a unit for each value no leaf holds inline, on pages it takes then.
@@ -361,13 +362,13 @@ final class TreeUpdate {
         var sizes = new int[size];
         // The unit of each put's value queued by the first pass, by put, made at the first
         PageRef[] units = null;
-        // A bulk commit's run counted its puts as it applied them, so nothing is recorded for it
-        var settles = run.committed() ? null : run.settles();
+        // A counted run's commits counted its puts as they applied them, so nothing is recorded for it
+        var settles = !run.counted();
         var count = 0;
         for (var position = 0; position < size; position++) {
             var entry = run.entryAt(position);
-            if (settles != null) {
-                PackedRun.settle(settles, entry, false);
+            if (settles) {
+                run.settle(entry, false);
             }
             if (run.removes(entry)) {
                 continue;

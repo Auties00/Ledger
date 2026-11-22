@@ -184,7 +184,7 @@ class BulkCommitSpillReadsTest {
                 ledger.commit(batch).awaitDurable();
                 committed++;
                 var run = ledger.state(MESSAGES).run;
-                if (run != null && run.committed()) {
+                if (run != null && run.counted()) {
                     maxAppendedSize.accumulateAndGet(run.size(), Math::max);
                 }
                 Thread.sleep(10);
