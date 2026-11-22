@@ -50,14 +50,19 @@ import java.util.concurrent.atomic.AtomicLong;
 ///
 /// The stream delivers events at each flush, about once a second, so the JFR results of an iteration arrive late. No
 /// iteration waits for them but the last measured one, which waits for the stream to deliver every iteration not yet
-/// reported (at most 5 s): the measured iterations follow one another as they would without the profiler, and the
-/// untimed wait only comes after the last of them. Each JFR result of an iteration is therefore reported by the first
-/// later iteration of the same kind (warm-up or measurement) that finds it delivered, by the last measured iteration
-/// otherwise; a warm-up iteration's results that arrive during the measurement are only printed. An iteration can
+/// reported (at most 5 s), so no untimed wait spaces the measured iterations apart. Each JFR result of an iteration
+/// is therefore reported by the first later iteration of the same kind (warm-up or measurement) that finds it
+/// delivered, by the last measured iteration otherwise; a warm-up iteration's results that arrive during the measurement are only printed. An iteration can
 /// thus report the JFR results of none, one or several iterations: they keep one value per iteration
 /// ([WindowResult]), so their scores and errors are means over iterations, but the `rawData` slots of the `jfr.*`
 /// and `op.*` results do not line up with the iterations. Each iteration's own JFR values are printed as a
 /// `cpu-attribution: jfr <warmup|measure> <index>/<count>` line.
+///
+/// The stream itself still allocates, 1.1-5.9 MB per iteration on AppStateSync.applySnapshot, which moves where the
+/// young collections land: with `jfr=true` applySnapshot's one collection fell before its timed write instead of
+/// inside it (ubuntu run 44987935698: 1.18x faster than the unprofiled side, with `op.gc.count` 0 in every measured
+/// iteration). The scores and memory counters of a side with `jfr=true` are therefore not comparable with unprofiled
+/// ones; `op.gc.count` shows where the collections landed.
 ///
 /// Results (per op unless noted; `<group>` is `worker` for the JMH benchmark threads, one group per Ledger platform
 /// thread name with its index dropped, such as `io`, `checkpoint` and `prepare`, `carrier` for the virtual-thread
@@ -77,9 +82,12 @@ import java.util.concurrent.atomic.AtomicLong;
 /// - With `jfr=true`: `jfr.deopt.ledger`, `jfr.deopt.all`, `jfr.c2.ledger` (deoptimizations of Ledger methods, all
 ///   deoptimizations, and C2 compilations of Ledger methods during the iteration), `jfr.deopt.ledger.total` (since the
 ///   fork's first iteration, warm-up included; MAX over iterations), and when the benchmark marks its timed code:
-///   `op.ms`, `op.cpu.worker.norm` (worker CPU inside the timed code, ns/op), `op.gc.count`, `op.gc.pause.ms`,
-///   `op.deopt.ledger` (summed over the iteration's operations). Every Ledger deoptimization is also printed to the
-///   log as a `cpu-attribution: deopt` line, when its iteration's results arrive.
+///   `op.ms`, `op.cpu.worker.norm` (worker CPU inside the timed code, ns/op), `op.gc.count`, `op.gc.pause.ms`
+///   (the stop-the-world collections, young, mixed and full, that start inside the timed code, and their pauses: the
+///   collections `gc.count.window` counts; G1's concurrent cycles and their remark and cleanup pauses are left out),
+///   `op.deopt.ledger` (summed over the iteration's operations). A C2 compilation counts in the iteration in which it
+///   ends. Every Ledger deoptimization is also printed to the log as a `cpu-attribution: deopt` line, when its
+///   iteration's results arrive.
 ///
 /// The window is JMH's iteration window, which also holds `Level.Iteration` setup and teardown, the same window
 /// `-prof gc` normalizes over; the `op.*` results are the only ones limited to the timed code.
@@ -460,31 +468,45 @@ public final class CpuAttributionProfiler implements InternalProfiler {
 
     private void startStream() {
         jdk.jfr.FlightRecorder.register(Mark.class);
-        jdk.jfr.FlightRecorder.register(MeasuredOp.class);
+        MeasuredOp.enable();
         stream = new RecordingStream();
         stream.enable("jdk.Deoptimization").withoutStackTrace();
         stream.enable("jdk.GarbageCollection");
         stream.enable("jdk.Compilation").withThreshold(Duration.ZERO);
-        stream.enable("ledger.benchmark.MeasuredOp");
+        stream.enable(MeasuredOp.EVENT_NAME);
         stream.enable("ledger.benchmark.ProfilerMark");
         stream.onEvent("jdk.Deoptimization", event -> {
             var method = event.getValue("method");
             var ledger = method instanceof RecordedMethod recorded && isLedger(recorded);
             deopts.add(new Deopt(event.getStartTime(), ledger, ledger ? describeDeopt(event, (RecordedMethod) method) : ""));
         });
-        stream.onEvent("jdk.GarbageCollection", event -> collections.add(new Gc(event.getStartTime(),
-                event.getDuration("sumOfPauses").toNanos())));
+        stream.onEvent("jdk.GarbageCollection", event -> {
+            if (!concurrentCycle(event.getString("name"))) {
+                collections.add(new Gc(event.getStartTime(), event.getDuration("sumOfPauses").toNanos()));
+            }
+        });
         stream.onEvent("jdk.Compilation", event -> {
             if (event.getValue("compileLevel") instanceof Number level && level.intValue() == 4
                     && event.getValue("method") instanceof RecordedMethod method
                     && isLedger(method)) {
-                compilationsLedgerC2.add(event.getStartTime());
+                // By its end, when the event is committed: one that ends after a window's closing mark reaches the
+                // stream after that window has been reported, so attributing it by its start would drop it
+                compilationsLedgerC2.add(event.getEndTime());
             }
         });
-        stream.onEvent("ledger.benchmark.MeasuredOp", event -> ops.add(new Op(event.getStartTime(), event.getEndTime(),
+        stream.onEvent(MeasuredOp.EVENT_NAME, event -> ops.add(new Op(event.getStartTime(), event.getEndTime(),
                 event.getLong("workerCpu"))));
         stream.onEvent("ledger.benchmark.ProfilerMark", event -> marks.put(event.getLong("id"), event.getStartTime()));
         stream.startAsync();
+    }
+
+    /// Whether a `jdk.GarbageCollection` event is a concurrent cycle rather than a stop-the-world collection: G1's
+    /// concurrent mark (`G1Old`, whose `sumOfPauses` are its remark and cleanup pauses, which can fall outside the
+    /// operation the cycle started in), and the collections of ZGC and Shenandoah. These are the collections that
+    /// [#gcCount()] leaves out by skipping the `Concurrent` collector beans.
+    private static boolean concurrentCycle(String name) {
+        return name == null || name.equals("G1Old") || name.startsWith("Z") || name.startsWith("Shenandoah")
+                || name.contains("Concurrent");
     }
 
     private static boolean isLedger(RecordedMethod method) {
