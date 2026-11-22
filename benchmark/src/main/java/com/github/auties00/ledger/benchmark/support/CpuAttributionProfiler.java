@@ -40,7 +40,8 @@ import java.util.concurrent.atomic.AtomicLong;
 /// (no spaces, so they survive compare.yml's word splitting): `jfr=true` also streams JFR in process to count
 /// deoptimizations, compilations and GC pauses, inside the iteration and inside the timed part of each operation the
 /// benchmark marks with [MeasuredOp] (each iteration then waits, untimed, about a second for the stream's flush);
-/// `period=<ms>` sets the thread sampling period (default 10).
+/// `period=<ms>` sets the thread sampling period (default 10); `pause=<ms>` sleeps that long after each iteration,
+/// untimed, without JFR, to tell the effect of `jfr=true`'s wait for the stream apart from that of JFR itself.
 ///
 /// Results (per op unless noted; `<group>` is `worker` for the JMH benchmark threads, one group per Ledger platform
 /// thread name with its index dropped, such as `io`, `checkpoint` and `prepare`, `carrier` for the virtual-thread
@@ -74,6 +75,7 @@ public final class CpuAttributionProfiler implements InternalProfiler {
 
     private final boolean jfr;
     private final long periodMillis;
+    private final long pauseMillis;
 
     private final Object lock = new Object();
     /// Every thread seen since the window opened, by id; guarded by [#lock].
@@ -137,16 +139,20 @@ public final class CpuAttributionProfiler implements InternalProfiler {
     public CpuAttributionProfiler(String initLine) {
         var jfr = false;
         var period = 10L;
+        var pause = 0L;
         for (var option : initLine.split("[;,]")) {
             var pair = option.trim().split("=", 2);
             if (pair.length == 2 && pair[0].equals("jfr")) {
                 jfr = Boolean.parseBoolean(pair[1]);
             } else if (pair.length == 2 && pair[0].equals("period")) {
                 period = Math.max(1, Long.parseLong(pair[1]));
+            } else if (pair.length == 2 && pair[0].equals("pause")) {
+                pause = Math.max(0, Long.parseLong(pair[1]));
             }
         }
         this.jfr = jfr;
         this.periodMillis = period;
+        this.pauseMillis = pause;
     }
 
     @Override
@@ -243,6 +249,13 @@ public final class CpuAttributionProfiler implements InternalProfiler {
             jfrResults(out, line, measuredOps);
         }
         System.out.println(line);
+        if (pauseMillis > 0) {
+            try {
+                Thread.sleep(pauseMillis);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+            }
+        }
         return out;
     }
 
