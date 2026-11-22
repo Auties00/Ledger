@@ -5,6 +5,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -31,8 +32,12 @@ import java.util.zip.CRC32C;
 /// no file size and no block allocation to record, which on ext4 halved the time of a durable commit and spared one
 /// force in a thousand a wait of tens of milliseconds for a journal commit, and lets the log write a group through to
 /// stable storage with no metadata to write beside it ([WriteThrough]). Once a checkpoint makes segments obsolete, they
-/// become spares ([#retireBefore(long, int)]) instead of being deleted, as many as the checkpointer asks for: while
-/// the store runs, as many as a checkpoint cycle fills, so that the log seldom prepares a new file.
+/// become spares ([#retireBefore(long, int, long)]) instead of being deleted, as many as the checkpointer asks for: while
+/// the store runs, as many as a checkpoint cycle fills, so that the log seldom prepares a new file. A retirement keeps
+/// the longest of the obsolete segments and spares, up to a segment's length, and a preparation takes the longest
+/// spare: a group lands below the bytes of a spare of the full length wherever it lands, while a short one, which the
+/// log left early for a segment it could write through, holds only a few groups before the rest are written into the
+/// cache and forced with the file's growth.
 ///
 /// It is safe for concurrent use: the log writer prepares while a checkpoint retires.
 final class LogFiles {
@@ -100,16 +105,33 @@ final class LogFiles {
         return numbers;
     }
 
-    private List<Path> spares() throws IOException {
-        var spares = new ArrayList<Path>();
+    /// {@return the spares, with their lengths}
+    private List<Spare> spares() throws IOException {
+        var spares = new ArrayList<Spare>();
         try (var files = Files.list(directory)) {
             for (var file : (Iterable<Path>) files::iterator) {
                 if (file.getFileName().toString().endsWith(SPARE)) {
-                    spares.add(file);
+                    var length = length(file);
+                    if (length >= 0) {
+                        spares.add(new Spare(file, length));
+                    }
                 }
             }
         }
         return spares;
+    }
+
+    /// {@return the length of `file`, or -1 if it is gone}
+    private static long length(Path file) throws IOException {
+        try {
+            return Files.size(file);
+        } catch (NoSuchFileException _) {
+            return -1;
+        }
+    }
+
+    /// An obsolete segment, kept as a spare or about to be, and its length.
+    private record Spare(Path path, long length) {
     }
 
     /// A segment ready to be written.
@@ -154,7 +176,14 @@ final class LogFiles {
                 Files.deleteIfExists(source);
                 Files.createFile(source);
             } else {
-                source = spares.getFirst();
+                // The longest: a group is written through only below the bytes its segment has
+                var longest = spares.getFirst();
+                for (var spare : spares) {
+                    if (spare.length() > longest.length()) {
+                        longest = spare;
+                    }
+                }
+                source = longest.path();
             }
             var salt = new byte[LogWriter.SALT_BYTES];
             SALTS.nextBytes(salt);
@@ -270,8 +299,18 @@ final class LogFiles {
     }
 
     /// Turns the segments numbered below `first`, which a durable checkpoint made obsolete, into spares until there
-    /// are `keep`, and deletes the others and any spare past `keep`.
+    /// are `keep`, and deletes the others and any spare past `keep`, keeping the longest of them all.
     void retireBefore(long first, int keep) throws IOException {
+        retireBefore(first, keep, Long.MAX_VALUE);
+    }
+
+    /// Turns the segments numbered below `first`, which a durable checkpoint made obsolete, into spares until there
+    /// are `keep`, and deletes the others and any spare past `keep`, keeping the longest of them all, up to `length`: a
+    /// segment the log left early for one it could write its groups through is deleted before one of the full length,
+    /// and a segment that a frame larger than `length` made longer is cut to it as it becomes a spare.
+    ///
+    /// Only segments below `first` change, which recovery no longer reads, so a crash at any point leaves the log whole.
+    void retireBefore(long first, int keep, long length) throws IOException {
         synchronized (lock) {
             var spares = spares();
             for (var number : segments()) {
@@ -279,16 +318,29 @@ final class LogFiles {
                     break;
                 }
                 var path = segment(number);
-                if (spares.size() < keep) {
-                    var spare = directory.resolve("%016x".formatted(number) + SPARE);
-                    Files.move(path, spare, StandardCopyOption.ATOMIC_MOVE);
-                    spares.add(spare);
-                } else {
-                    Files.deleteIfExists(path);
+                var size = length(path);
+                if (size >= 0) {
+                    spares.add(new Spare(path, size));
                 }
             }
-            for (var i = keep; i < spares.size(); i++) {
-                Files.deleteIfExists(spares.get(i));
+            // Stable: of equal lengths, the spares kept already stay and the older segments become spares
+            spares.sort((left, right) -> Long.compare(Math.min(right.length(), length), Math.min(left.length(), length)));
+            for (var i = 0; i < spares.size(); i++) {
+                var path = spares.get(i).path();
+                if (i >= keep) {
+                    Files.deleteIfExists(path);
+                    continue;
+                }
+                if (spares.get(i).length() > length) {
+                    try (var channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
+                        channel.truncate(length);
+                    }
+                }
+                var name = path.getFileName().toString();
+                if (name.endsWith(SEGMENT)) {
+                    var spare = directory.resolve(name.substring(0, name.length() - SEGMENT.length()) + SPARE);
+                    Files.move(path, spare, StandardCopyOption.ATOMIC_MOVE);
+                }
             }
         }
     }

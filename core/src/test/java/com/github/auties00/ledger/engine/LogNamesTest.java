@@ -20,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.TreeMap;
@@ -589,6 +590,42 @@ class LogNamesTest {
             Files.write(directory.resolve("%016x.spare".formatted(1L)), new byte[5 * LogWriter.ALIGNMENT]);
             assertEquals(5L * LogWriter.ALIGNMENT, files.prepare(2, SEGMENT, false, true, () -> false).valid());
         }
+
+        @Test
+        @DisplayName("is the longest spare, so the log writes the most groups of it through")
+        void longest() throws Exception {
+            var directory = CrashFileSystem.create().getPath("/log");
+            var files = files(directory);
+            Files.write(directory.resolve("%016x.spare".formatted(1L)), new byte[3 * LogWriter.ALIGNMENT]);
+            Files.write(directory.resolve("%016x.spare".formatted(2L)), new byte[(int) SEGMENT]);
+            Files.write(directory.resolve("%016x.spare".formatted(3L)), new byte[5 * LogWriter.ALIGNMENT]);
+            var prepared = files.prepare(4, SEGMENT, false, true, () -> false);
+            assertEquals(SEGMENT, prepared.valid());
+            assertEquals(0, files.freshPreparationsForTests());
+            assertTrue(Files.notExists(directory.resolve("%016x.spare".formatted(2L))));
+        }
+
+        @Test
+        @DisplayName("comes from a retirement that keeps the longest obsolete segments, cuts a longer one to a segment and touches no later one")
+        void retirementKeepsLongest() throws Exception {
+            var directory = CrashFileSystem.create().getPath("/log");
+            var files = files(directory);
+            Files.write(directory.resolve("%016x.spare".formatted(1L)), new byte[2 * LogWriter.ALIGNMENT]);
+            var lengths = new long[]{SEGMENT, 3 * LogWriter.ALIGNMENT, 2 * SEGMENT, SEGMENT / 2, SEGMENT, SEGMENT};
+            for (var index = 0; index < lengths.length; index++) {
+                Files.write(files.segment(index + 2), new byte[(int) lengths[index]]);
+            }
+            files.retireBefore(7, 3, SEGMENT);
+            assertEquals(List.of(7L), files.segments());
+            assertEquals(SEGMENT, Files.size(files.segment(7)));
+            try (var listed = Files.list(directory)) {
+                var spares = listed.filter(file -> file.toString().endsWith(".spare")).sorted().toList();
+                assertEquals(3, spares.size(), spares::toString);
+                for (var spare : spares) {
+                    assertEquals(SEGMENT, Files.size(spare), spare::toString);
+                }
+            }
+        }
     }
 
     @Nested
@@ -624,11 +661,10 @@ class LogNamesTest {
                     }
                 }
                 // About 11 segments a cycle: the interval's count of 5 spares left more than half of them new files. A
-                // checkpoint that ran far longer than the four before it, on a loaded machine, may still leave a few,
-                // and the short segments the log moved on from, when they become spares, a few more
+                // checkpoint that ran far longer than the four before it, on a loaded machine, may still leave a few
                 var newFiles = files.freshPreparationsForTests() - fresh;
                 var prepared = log.rollovers() - rollovers;
-                assertTrue(newFiles * 4 <= prepared, () -> newFiles + " new files of " + prepared + " segments");
+                assertTrue(newFiles * 10 <= prepared, () -> newFiles + " new files of " + prepared + " segments");
                 // The interval names 5 segments
                 assertTrue(checkpointer.sparesForTests() > 5, () -> checkpointer.sparesForTests() + " spares");
             }

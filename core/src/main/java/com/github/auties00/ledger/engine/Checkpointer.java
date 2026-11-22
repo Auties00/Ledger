@@ -751,7 +751,7 @@ final class Checkpointer implements IdleTicker.Watched {
     /// Retires the log segments before `first`, keeping `spares` of them to be prepared again.
     private void retire(long first, int spares) {
         try {
-            files.retireBefore(first, spares);
+            files.retireBefore(first, spares, log.segmentSize());
         } catch (IOException exception) {
             // Obsolete segments wait for the next checkpoint
         }
