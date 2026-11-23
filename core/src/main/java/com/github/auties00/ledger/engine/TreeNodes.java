@@ -218,6 +218,13 @@ final class TreeNodes {
         return MemorySegment.ofArray(unit).asSlice(inlineValueOffset(field), inlineValueLength(unit, field)).asReadOnly();
     }
 
+    /// {@return the read-only inline value of leaf entry `entry`, a slice of `view`, a read-only view of the whole of
+    /// `unit` ([#view(byte\[\])])}
+    static MemorySegment inlineValue(MemorySegment view, byte[] unit, int entry) {
+        var field = valueField(unit, entry);
+        return view.asSlice(inlineValueOffset(field), inlineValueLength(unit, field));
+    }
+
     /// {@return the inline value of leaf entry `entry`, in a new array}
     static byte[] inlineValueBytes(byte[] unit, int entry) {
         var field = valueField(unit, entry);

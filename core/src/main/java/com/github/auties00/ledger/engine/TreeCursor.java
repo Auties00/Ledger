@@ -78,8 +78,15 @@ final class TreeCursor implements StoredCursor {
     private int[] indexes;
     private int depth;
     private byte[] leaf;
+    // A read-only view of the whole of the leaf: the keys and inline values the cursor hands out are slices of it, which
+    // share its memory session rather than each making one of its own
+    private MemorySegment leafView;
+    // Whether every entry of the leaf is within the far bound of the range, so that no entry of it is compared with it
+    private boolean leafInRange;
     private int index;
+    // The offset of the current entry in the leaf and the length of its key, valid once next() returned true
     private int entry;
+    private int keyLength;
     private boolean started;
     private boolean exhausted;
     // The leaves and blobs read so far, up to ADMITTED
@@ -185,8 +192,29 @@ final class TreeCursor implements StoredCursor {
             push(unit, child);
             unit = child(unit, child);
         }
-        leaf = unit;
+        enter(unit);
         index = first(unit);
+    }
+
+    /// Makes leaf `unit` the one the cursor reads.
+    private void enter(byte[] unit) {
+        leaf = unit;
+        leafView = TreeNodes.view(unit);
+        leafInRange = inRange(unit);
+    }
+
+    /// {@return whether every entry of leaf `unit` is within the bound the cursor runs towards, as
+    /// [#pastRange(byte\[\], int)] tests it: its last key in the cursor's order before `to` ascending, at or after
+    /// `from` descending}
+    private boolean inRange(byte[] unit) {
+        var count = TreeNodes.count(unit);
+        if (count == 0) {
+            return true;
+        }
+        if (descending) {
+            return from == null || !pastRange(unit, TreeNodes.entry(unit, 0));
+        }
+        return to == null || !pastRange(unit, TreeNodes.entry(unit, count - 1));
     }
 
     /// {@return the index of the first entry of leaf `unit` in the cursor's range and order, which is out of the leaf
@@ -227,7 +255,8 @@ final class TreeCursor implements StoredCursor {
             }
         }
         entry = TreeNodes.entry(leaf, index);
-        if (pastRange(leaf, entry)) {
+        keyLength = TreeNodes.leafKeyLength(leaf, entry);
+        if (!leafInRange && pastRange(leaf, entry)) {
             exhausted = true;
             return false;
         }
@@ -269,7 +298,7 @@ final class TreeCursor implements StoredCursor {
                     push(node, edge);
                     node = child(node, edge);
                 }
-                leaf = node;
+                enter(node);
                 index = descending ? TreeNodes.count(node) - 1 : 0;
                 return true;
             }
@@ -284,24 +313,24 @@ final class TreeCursor implements StoredCursor {
         return descending ? index == 0 : index == TreeNodes.count(leaf) - 1;
     }
 
-    /// {@return the key of the current entry, a read-only view of the leaf}
+    /// {@return the key of the current entry, a read-only slice of the view of the leaf}
     @Override
     public MemorySegment key() {
-        return TreeNodes.leafKey(leaf, entry);
+        return leafView.asSlice(TreeNodes.leafKeyOffset(entry), keyLength);
     }
 
     /// {@return a negative number, zero or a positive number as the current entry's key sorts before, with or after
     /// `key`}
     @Override
     public int compareKey(MemorySegment key) {
-        return TreeNodes.compare(leaf, TreeNodes.leafKeyOffset(entry), TreeNodes.leafKeyLength(leaf, entry), key);
+        return TreeNodes.compare(leaf, TreeNodes.leafKeyOffset(entry), keyLength, key);
     }
 
     /// {@return the value of the current entry, read-only, read from its blob if it has one}
     @Override
     public MemorySegment value() {
         if (TreeNodes.isInline(leaf, entry)) {
-            return TreeNodes.inlineValue(leaf, entry);
+            return TreeNodes.inlineValue(leafView, leaf, entry);
         }
         var admit = admit();
         if (wanted > 0 && !TreeNodes.isExternal(leaf, entry)) {
