@@ -335,31 +335,67 @@ final class TreeCursor implements StoredCursor {
         var admit = admit();
         if (wanted > 0 && !TreeNodes.isExternal(leaf, entry)) {
             var ref = TreeNodes.blobRef(leaf, entry);
-            var blob = pages.cached(ref, PageFormat.VALUE);
-            if (blob == null && admit && screen != PageCache.UNSCREENED) {
-                blob = pages.recalled(ref, PageFormat.VALUE, screen);
-            }
-            if (blob == null) {
-                blob = takeValue(ref);
-                if (blob == null && !leafGathered && pages.coldReads() && !pages.cache().seen(ref)) {
-                    gatherValues();
-                    blob = takeValue(ref);
-                }
-                var cached = admit || pages.cache().hasRoom(blobBytes());
-                if (blob == null) {
-                    blob = pages.load(ref, PageFormat.VALUE, cached, admit, screen);
-                } else if (admit && screen != PageCache.UNSCREENED) {
-                    pages.cache().putScreened(ref, blob, screen);
-                } else if (cached) {
-                    pages.cache().put(ref, blob, admit);
-                }
-            }
-            return TreeSearch.blobValue(leaf, entry, ref, blob);
+            return TreeSearch.blobValue(leaf, entry, ref, blob(ref, admit));
         }
         if (admit) {
             return TreeSearch.value(pages, leaf, entry, true, true, screen);
         }
         return TreeSearch.value(pages, leaf, entry, pages.cache().hasRoom(blobBytes()), false);
+    }
+
+    /// {@return the key of the current entry in a new array, copied out of the leaf}
+    @Override
+    public byte[] keyBytes() {
+        return Segments.toBytes(leaf, TreeNodes.leafKeyOffset(entry), keyLength);
+    }
+
+    /// {@return the value of the current entry in a new array, read and cached as [#value()] reads and caches it, and
+    /// copied out of the leaf or the blob that holds it}
+    @Override
+    public byte[] valueBytes() {
+        if (TreeNodes.isInline(leaf, entry)) {
+            return TreeNodes.inlineValueBytes(leaf, entry);
+        }
+        var admit = admit();
+        if (wanted > 0 && !TreeNodes.isExternal(leaf, entry)) {
+            var ref = TreeNodes.blobRef(leaf, entry);
+            return TreeSearch.blobBytes(leaf, entry, ref, blob(ref, admit));
+        }
+        if (admit) {
+            return TreeSearch.valueBytes(pages, leaf, entry, true, true, screen);
+        }
+        return TreeSearch.valueBytes(pages, leaf, entry, pages.cache().hasRoom(blobBytes()), false,
+                PageCache.UNSCREENED);
+    }
+
+    /// {@return the plaintext of `ref`, the blob in the data file of the current entry, from the cache, from what the
+    /// cursor read ahead, or from the file}
+    ///
+    /// A blob neither the cache nor the cursor holds is gathered with the blobs of the rest of the leaf while the reads
+    /// are cold; one the cursor read ahead goes to the cache as the cursor's own read would have.
+    ///
+    /// @param admit whether the blob goes to the cache, as [#admit()] answered for the entry
+    private byte[] blob(PageRef ref, boolean admit) {
+        var blob = pages.cached(ref, PageFormat.VALUE);
+        if (blob == null && admit && screen != PageCache.UNSCREENED) {
+            blob = pages.recalled(ref, PageFormat.VALUE, screen);
+        }
+        if (blob == null) {
+            blob = takeValue(ref);
+            if (blob == null && !leafGathered && pages.coldReads() && !pages.cache().seen(ref)) {
+                gatherValues();
+                blob = takeValue(ref);
+            }
+            var cached = admit || pages.cache().hasRoom(blobBytes());
+            if (blob == null) {
+                blob = pages.load(ref, PageFormat.VALUE, cached, admit, screen);
+            } else if (admit && screen != PageCache.UNSCREENED) {
+                pages.cache().putScreened(ref, blob, screen);
+            } else if (cached) {
+                pages.cache().put(ref, blob, admit);
+            }
+        }
+        return blob;
     }
 
     /// {@return the bytes the cache keeps of the blob of the current entry}

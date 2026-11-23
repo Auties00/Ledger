@@ -419,14 +419,44 @@ final class Reads {
                 : keyspace.values().decode(TreeSearch.value(point.pages(), unit, entry, true, true, screen)));
     }
 
+    /// {@return the decoded key of the entry `stored` is at: for byte array keys a copy out of the array that holds it,
+    /// else a decode of `key`, its segment if the scan made one, or of one made for the call}
+    @SuppressWarnings("unchecked")
+    private static <K> K storedKey(Keyspace<K, ?> keyspace, StoredCursor stored, MemorySegment key) {
+        var keys = keyspace.keys();
+        if (keys == BuiltinCodecs.BYTES_KEY) {
+            return (K) stored.keyBytes();
+        }
+        return keys.decode(key == null ? stored.key() : key);
+    }
+
+    /// {@return the decoded value of the entry `stored` is at: for byte array values a copy out of the array that holds
+    /// it, else a decode of its segment}
+    @SuppressWarnings("unchecked")
+    private static <V> V storedValue(Keyspace<?, V> keyspace, StoredCursor stored) {
+        var values = keyspace.values();
+        return values == BuiltinCodecs.BYTES_VALUE ? (V) stored.valueBytes() : values.decode(stored.value());
+    }
+
     static <K, V> List<Entry<K, V>> range(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, int limit, ReadPoint point) {
         if (limit < 1) {
             throw new IllegalArgumentException("limit must be positive: " + limit);
         }
         var entries = new ArrayList<Entry<K, V>>(Math.min(limit, 64));
-        scan(state, keyspace, range, point, limit, (key, value, decoded) -> {
-            entries.add(new Entry<>(keyspace.keys().decode(key), value(state, keyspace, value, decoded)));
-            return entries.size() < limit;
+        scan(state, keyspace, range, point, limit, new Visitor() {
+            @Override
+            public boolean visit(MemorySegment key, MemorySegment value, Object decoded) {
+                entries.add(new Entry<>(keyspace.keys().decode(key), value(state, keyspace, value, decoded)));
+                return entries.size() < limit;
+            }
+
+            @Override
+            public boolean visitStored(StoredCursor stored, MemorySegment key) {
+                // The key first, as the scan reads it before the value
+                var decodedKey = storedKey(keyspace, stored, key);
+                entries.add(new Entry<>(decodedKey, storedValue(keyspace, stored)));
+                return entries.size() < limit;
+            }
         });
         return entries;
     }
@@ -434,8 +464,18 @@ final class Reads {
     static <K, V> long forEach(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, ReadPoint point,
                                BiPredicate<? super K, ? super V> visitor) {
         Objects.requireNonNull(visitor, "visitor");
-        return scan(state, keyspace, range, point, (key, value, decoded) ->
-                visitor.test(keyspace.keys().decode(key), value(state, keyspace, value, decoded)));
+        return scan(state, keyspace, range, point, new Visitor() {
+            @Override
+            public boolean visit(MemorySegment key, MemorySegment value, Object decoded) {
+                return visitor.test(keyspace.keys().decode(key), value(state, keyspace, value, decoded));
+            }
+
+            @Override
+            public boolean visitStored(StoredCursor stored, MemorySegment key) {
+                var decodedKey = storedKey(keyspace, stored, key);
+                return visitor.test(decodedKey, storedValue(keyspace, stored));
+            }
+        });
     }
 
     static <K, V> Optional<Entry<K, V>> first(KeyspaceState state, Keyspace<K, V> keyspace, KeyRange<K> range, ReadPoint point) {
@@ -592,11 +632,12 @@ final class Reads {
                         }
                     }
                 } else {
-                    var key = tree.key();
-                    if (!hiddenSinceTree(key, point, removals)) {
+                    // A segment of the key only for the range removals to test, which the consumer then reuses
+                    var key = removals.length == 0 ? null : tree.key();
+                    if (key == null || !hiddenSinceTree(key, point, removals)) {
                         visited++;
                         tree.took();
-                        if (!consumer.visit(key, tree.value(), null)) {
+                        if (!consumer.visitStored(tree, key)) {
                             break;
                         }
                     }
@@ -622,5 +663,17 @@ final class Reads {
         /// @param decoded the decoded value of a resident key space, or `null`
         /// @return whether to go on
         boolean visit(MemorySegment key, MemorySegment value, Object decoded);
+
+        /// Receives the entry `stored` is at, one of the tree or of the run read over it that no version in memory
+        /// shadows: [#visit(MemorySegment, MemorySegment, Object)] with its key and value by default, the key read before
+        /// the value.
+        ///
+        /// A consumer that overrides it reads the entry through `stored` before it returns, and keeps no segment of it.
+        ///
+        /// @param key the key's segment the scan made, or `null` if it made none
+        /// @return whether to go on
+        default boolean visitStored(StoredCursor stored, MemorySegment key) {
+            return visit(key == null ? stored.key() : key, stored.value(), null);
+        }
     }
 }

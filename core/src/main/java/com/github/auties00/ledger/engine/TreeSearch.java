@@ -194,6 +194,23 @@ final class TreeSearch {
                 TreeNodes.blobLength(unit, entry));
     }
 
+    /// {@return the value of leaf entry `entry` of `unit` in a new array, read and cached as
+    /// [#value(PageFile, byte\[\], int, boolean, boolean, int)] reads and caches it, and copied out of the array that
+    /// holds it}
+    ///
+    /// A value in a unit of the file of large values is read through [BlobFile#read(PageRef, boolean, boolean, int)]
+    /// as that read reads it, not copied out as [#valueBytes(PageFile, byte\[\], int, int)] copies it: a scan's
+    /// values go to the cache as its cursor decides.
+    ///
+    /// @throws LedgerCorruptedException if the leaf records a value longer than its blob's content
+    static byte[] valueBytes(PageFile pages, byte[] unit, int entry, boolean cached, boolean referenced, int screen) {
+        if (TreeNodes.isInline(unit, entry)) {
+            return TreeNodes.inlineValueBytes(unit, entry);
+        }
+        return Segments.toBytes(blob(pages, unit, entry, cached, referenced, screen), PageFormat.HEADER,
+                TreeNodes.blobLength(unit, entry));
+    }
+
     /// {@return the array of the blob of leaf entry `entry` of `unit`, which has one, with the value after its header}
     ///
     /// @param cached whether a blob read from the file goes to the cache
@@ -218,6 +235,15 @@ final class TreeSearch {
     static MemorySegment blobValue(byte[] unit, int entry, PageRef ref, byte[] blob) {
         checkBlob(unit, entry, ref, blob);
         return MemorySegment.ofArray(blob).asSlice(PageFormat.HEADER, TreeNodes.blobLength(unit, entry)).asReadOnly();
+    }
+
+    /// {@return the value of leaf entry `entry` of `unit`, which has a blob in the data file, in a new array copied out
+    /// of `blob`, the plaintext of the unit `ref` names}
+    ///
+    /// @throws LedgerCorruptedException if the leaf records a value longer than the blob's content
+    static byte[] blobBytes(byte[] unit, int entry, PageRef ref, byte[] blob) {
+        checkBlob(unit, entry, ref, blob);
+        return Segments.toBytes(blob, PageFormat.HEADER, TreeNodes.blobLength(unit, entry));
     }
 
     // Throws if leaf entry `entry` of `unit` records a value longer than the content of `blob`, its blob

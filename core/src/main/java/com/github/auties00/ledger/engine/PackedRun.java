@@ -489,6 +489,16 @@ final class PackedRun {
                 keyEnd(layout, keyEnds, start, entry) - start);
     }
 
+    /// {@return the key of `entry` in a new array, copied out of the run's keys}
+    byte[] keyBytes(int entry) {
+        var storage = this.storage;
+        var layout = storage.layout;
+        var keyEnds = layout == null ? storage.keyEnds : null;
+        var start = keyStart(layout, keyEnds, entry);
+        return Segments.toBytes(storage.keys[start >>> KEY_CHUNK_BITS], start & KEY_OFFSET_MASK,
+                keyEnd(layout, keyEnds, start, entry) - start);
+    }
+
     /// {@return the order of the key of `chain` and that of `entry`, as [Segments#compare(MemorySegment, MemorySegment)]
     /// gives, without a view of the entry's key}
     int compareChain(Chain chain, int entry) {
@@ -2779,6 +2789,16 @@ final class PackedRun {
         @Override
         public MemorySegment value() {
             return current == RUN ? run.value(runEntry) : tree.value();
+        }
+
+        @Override
+        public byte[] keyBytes() {
+            return current == RUN ? run.keyBytes(runEntry) : tree.keyBytes();
+        }
+
+        @Override
+        public byte[] valueBytes() {
+            return current == RUN ? run.valueBytes(runEntry) : tree.valueBytes();
         }
 
         @Override
