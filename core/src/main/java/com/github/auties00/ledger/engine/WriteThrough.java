@@ -258,10 +258,7 @@ final class WriteThrough {
     private MemorySegment copy(byte[] bytes, int length) throws IOException {
         var size = buffer == null ? 0 : buffer.byteSize();
         if (length > size) {
-            var grown = Math.max(length, size + (size >> 2));
-            replace(Math.min(Math.max(length, LogWriter.OUTPUT), (grown + LogWriter.ALIGNMENT - 1) / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT));
-            smallWrites = 0;
-            smallPeak = 0;
+            reserve(length);
         } else if (2L * length <= size) {
             smallPeak = Math.max(smallPeak, length);
             if (++smallWrites >= SHRINK_AFTER) {
@@ -280,6 +277,20 @@ final class WriteThrough {
         }
         MemorySegment.copy(bytes, 0, buffer, ValueLayout.JAVA_BYTE, 0, length);
         return buffer;
+    }
+
+    /// Grows the buffer to hold a group of `length` bytes as [#copy(byte\[\], int)] grows it, so a group's write that
+    /// finds it grown only copies.
+    ///
+    /// @throws IOException if native memory has no room for a buffer that holds the group
+    void reserve(int length) throws IOException {
+        var size = buffer == null ? 0 : buffer.byteSize();
+        if (length > size) {
+            var grown = Math.max(length, size + (size >> 2));
+            replace(Math.min(Math.max(length, LogWriter.OUTPUT), (grown + LogWriter.ALIGNMENT - 1) / LogWriter.ALIGNMENT * LogWriter.ALIGNMENT));
+            smallWrites = 0;
+            smallPeak = 0;
+        }
     }
 
     /// Replaces the buffer with one of `size` bytes, the old one given back to the collector with its view.

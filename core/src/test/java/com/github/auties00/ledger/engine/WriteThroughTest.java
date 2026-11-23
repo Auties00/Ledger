@@ -34,6 +34,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -50,6 +51,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -1673,6 +1675,238 @@ class WriteThroughTest {
             }
             try (var reopened = open(disk.getPath("/store"), encrypted, WriteThrough.Mode.OFF)) {
                 assertEquals(model, contents(reopened));
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("the first commits after an open")
+    class Linger {
+        // Far longer than any test waits, so a linger that ends within the wait ended early
+        private static final long LONG_LINGER = TimeUnit.SECONDS.toNanos(30);
+        private static final long WAIT_NANOS = TimeUnit.SECONDS.toNanos(10);
+
+        /// Writes a few durable commits into a new store at `directory` and closes it, so the next open writes into the
+        /// segment the close kept.
+        private static void seed(Path directory, WriteThrough.Mode mode, Map<String, String> model) throws InterruptedException {
+            try (var ledger = open(directory, mode)) {
+                for (var i = 0; i < 4; i++) {
+                    commit(ledger, model, "s" + i);
+                }
+            }
+        }
+
+        private static Ledger reopen(Path directory, WriteThrough.Mode mode, long linger) {
+            var ledger = open(directory, mode);
+            log(ledger).lingerNanos = linger;
+            return ledger;
+        }
+
+        private static void await(BooleanSupplier condition, String message) {
+            var deadline = System.nanoTime() + WAIT_NANOS;
+            while (!condition.getAsBoolean()) {
+                assertTrue(System.nanoTime() < deadline, message);
+                Thread.onSpinWait();
+            }
+        }
+
+        private static void deferred(Ledger ledger, Map<String, String> model, String key) {
+            ledger.commit(ledger.newBatch().put(NAMES, key, "d" + key));
+            model.put(key, "d" + key);
+        }
+
+        @Test
+        @DisplayName("a deferred commit and the durable one after it make one group, written through by the durable commit's thread, and the linger ends with it")
+        void oneGroup() throws Exception {
+            var disk = CrashFileSystem.create();
+            var directory = disk.getPath("/store");
+            var model = new TreeMap<String, String>();
+            seed(directory, WriteThrough.Mode.DSYNC, model);
+            try (var ledger = reopen(directory, WriteThrough.Mode.DSYNC, LONG_LINGER)) {
+                var log = log(ledger);
+                ledger.commit(ledger.newBatch().deleteRange(NAMES, KeyRange.between("s0", "s2")));
+                model.remove("s0");
+                model.remove("s1");
+                await(log::lingeringForTests, "the flush did not linger after the deferred commit");
+                ledger.commit(ledger.newBatch().deleteRange(NAMES, KeyRange.between("s2", "s3"))).awaitDurable();
+                model.remove("s2");
+                assertEquals(1, log.forces(), "the two commits made more than one group");
+                assertEquals(1, log.writtenThrough(), "their group was not written through");
+                assertEquals(1, log.ledGroupsForTests(), "the durable commit did not write the group itself");
+                assertEquals(1, log.lingersForTests());
+                await(() -> !log.lingeringForTests(), "the linger outlasted the group that took its frames");
+                survivesPowerLoss(disk, model);
+            }
+        }
+
+        @Test
+        @DisplayName("a deferred commit and the durable one after it make one group on the platform's file system")
+        void oneGroupOnDisk(@TempDir Path directory) throws Exception {
+            var model = new TreeMap<String, String>();
+            seed(directory, WriteThrough.Mode.AUTO, model);
+            try (var ledger = reopen(directory, WriteThrough.Mode.AUTO, LONG_LINGER)) {
+                var log = log(ledger);
+                deferred(ledger, model, "a");
+                await(log::lingeringForTests, "the flush did not linger after the deferred commit");
+                commit(ledger, model, "b");
+                assertEquals(1, log.forces(), "the two commits made more than one group");
+                assertEquals(1, log.ledGroupsForTests(), "the durable commit did not write the group itself");
+            }
+            try (var reopened = open(directory, WriteThrough.Mode.OFF)) {
+                assertEquals(model, contents(reopened));
+            }
+        }
+
+        @Test
+        @DisplayName("a deferred commit no other follows is durable once the linger runs out, which it does once")
+        void lone() throws Exception {
+            var disk = CrashFileSystem.create();
+            var directory = disk.getPath("/store");
+            var model = new TreeMap<String, String>();
+            seed(directory, WriteThrough.Mode.DSYNC, model);
+            try (var ledger = open(directory, WriteThrough.Mode.DSYNC)) {
+                var log = log(ledger);
+                var commit = ledger.commit(ledger.newBatch().put(NAMES, "a", "da"));
+                model.put("a", "da");
+                await(commit::isDurable, "a lone deferred commit was never made durable");
+                assertEquals(1, log.lingersForTests());
+                assertEquals(1, log.forces());
+                assertEquals(0, log.ledGroupsForTests());
+                Thread.sleep(50);
+                assertEquals(1, log.lingersForTests(), "the flush lingered again over a durable frame");
+                assertFalse(log.lingeringForTests());
+                survivesPowerLoss(disk, model);
+            }
+        }
+
+        @Test
+        @DisplayName("a durable commit that waits with a timeout, and so leaves its group to the flush, ends the linger")
+        void timedWait() throws Exception {
+            var disk = CrashFileSystem.create();
+            var directory = disk.getPath("/store");
+            var model = new TreeMap<String, String>();
+            seed(directory, WriteThrough.Mode.DSYNC, model);
+            try (var ledger = reopen(directory, WriteThrough.Mode.DSYNC, LONG_LINGER)) {
+                var log = log(ledger);
+                deferred(ledger, model, "a");
+                await(log::lingeringForTests, "the flush did not linger after the deferred commit");
+                var start = System.nanoTime();
+                assertTrue(ledger.commit(ledger.newBatch().put(NAMES, "b", "db")).awaitDurable(Duration.ofNanos(2 * LONG_LINGER)));
+                model.put("b", "db");
+                assertTrue(System.nanoTime() - start < WAIT_NANOS, "the timed wait waited out the linger");
+                assertEquals(1, log.forces(), "the two commits made more than one group");
+                assertEquals(0, log.ledGroupsForTests(), "a timed wait wrote its own group");
+                survivesPowerLoss(disk, model);
+            }
+        }
+
+        @Test
+        @DisplayName("the first large value after an open, whose epoch waits in the linger's queue, ends the linger")
+        void epochGate(@TempDir Path directory) throws Exception {
+            try (var ledger = openLarge(directory)) {
+                ledger.commit(ledger.newBatch().put(NAMES, "s", "s")).awaitDurable();
+            }
+            try (var ledger = openLarge(directory)) {
+                var log = log(ledger);
+                log.lingerNanos = LONG_LINGER;
+                ledger.commit(ledger.newBatch().put(NAMES, "a", "da"));
+                await(log::lingeringForTests, "the flush did not linger after the deferred commit");
+                var start = System.nanoTime();
+                ledger.commit(ledger.newBatch().put(NAMES, "large", "L".repeat(10_000))).awaitDurable();
+                assertTrue(System.nanoTime() - start < WAIT_NANOS, "the large value waited out the linger");
+                assertEquals(Optional.of("L".repeat(10_000)), ledger.get(NAMES, "large"));
+            }
+        }
+
+        @Test
+        @DisplayName("a close ends the linger and makes its frames durable")
+        void close() throws Exception {
+            var disk = CrashFileSystem.create();
+            var directory = disk.getPath("/store");
+            var model = new TreeMap<String, String>();
+            seed(directory, WriteThrough.Mode.DSYNC, model);
+            var ledger = reopen(directory, WriteThrough.Mode.DSYNC, LONG_LINGER);
+            var log = log(ledger);
+            deferred(ledger, model, "a");
+            await(log::lingeringForTests, "the flush did not linger after the deferred commit");
+            var start = System.nanoTime();
+            ledger.close();
+            assertTrue(System.nanoTime() - start < WAIT_NANOS, "the close waited out the linger");
+            assertEquals(1, log.forces());
+            survivesPowerLoss(disk, model);
+        }
+
+        @Test
+        @DisplayName("a loss of power during the linger keeps the commits before it, and one after the durable commit keeps both")
+        void powerLoss() throws Exception {
+            var disk = CrashFileSystem.create();
+            var directory = disk.getPath("/store");
+            var model = new TreeMap<String, String>();
+            seed(directory, WriteThrough.Mode.DSYNC, model);
+            try (var ledger = reopen(directory, WriteThrough.Mode.DSYNC, LONG_LINGER)) {
+                var log = log(ledger);
+                var before = new TreeMap<>(model);
+                deferred(ledger, model, "a");
+                await(log::lingeringForTests, "the flush did not linger after the deferred commit");
+                for (var seed = 0; seed < DRAWS; seed++) {
+                    try (var survivor = open(disk.afterPowerLoss(new Random(seed)).getPath("/store"), WriteThrough.Mode.OFF)) {
+                        assertEquals(before, contents(survivor), "seed " + seed);
+                    }
+                }
+                commit(ledger, model, "b");
+                survivesPowerLoss(disk, model);
+            }
+        }
+
+        @Test
+        @DisplayName("a stream of commits, durable or not, lingers at most once, before the open's first group, and writes a group per durable commit")
+        void steady() throws Exception {
+            var disk = CrashFileSystem.create();
+            var directory = disk.getPath("/store");
+            var model = new TreeMap<String, String>();
+            seed(directory, WriteThrough.Mode.DSYNC, model);
+            try (var ledger = open(directory, WriteThrough.Mode.DSYNC)) {
+                var log = log(ledger);
+                // The open's first group, after which a durable commit's group holds its frame alone
+                commit(ledger, model, "first");
+                var groups = log.groupsForTests();
+                for (var i = 0; i < 300; i++) {
+                    commit(ledger, model, "c" + i);
+                }
+                assertEquals(300, log.groupsForTests() - groups, "the durable commits did not make a group each");
+                for (var i = 0; i < 300; i++) {
+                    deferred(ledger, model, "d" + i);
+                }
+                ledger.awaitDurable();
+                assertTrue(log.lingersForTests() <= 1, log.lingersForTests() + " lingers in one open");
+                survivesPowerLoss(disk, model);
+            }
+        }
+
+        @Test
+        @DisplayName("once the open's first group is written, a commit after an idle spell, deferred or durable, never lingers")
+        void afterIdle() throws Exception {
+            var disk = CrashFileSystem.create();
+            var directory = disk.getPath("/store");
+            var model = new TreeMap<String, String>();
+            seed(directory, WriteThrough.Mode.DSYNC, model);
+            try (var ledger = open(directory, WriteThrough.Mode.DSYNC)) {
+                var log = log(ledger);
+                commit(ledger, model, "first");
+                var lingers = log.lingersForTests();
+                for (var i = 0; i < 20; i++) {
+                    Thread.sleep(Duration.ofNanos(4 * LogWriter.LINGER_NANOS));
+                    if (i % 2 == 0) {
+                        var commit = ledger.commit(ledger.newBatch().put(NAMES, "d" + i, "dd" + i));
+                        model.put("d" + i, "dd" + i);
+                        await(commit::isDurable, "a deferred commit after the first group was never made durable");
+                    } else {
+                        commit(ledger, model, "c" + i);
+                    }
+                    assertFalse(log.lingeringForTests(), "a flush lingered after the open's first group");
+                }
+                assertEquals(lingers, log.lingersForTests(), "a flush lingered after the open's first group");
+                survivesPowerLoss(disk, model);
             }
         }
     }

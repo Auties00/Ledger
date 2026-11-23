@@ -48,6 +48,18 @@ import java.util.zip.CRC32C;
 /// to come back than the force they save; a wait that runs out turns the next ones off for 2, then 4, up to 64 groups,
 /// and a close, a failure, a full queue or a task of another store waiting for the pool ends one at once.
 ///
+/// A flush of a lane of the process's flusher that finds, before the first group of an open, only frames no commit
+/// waits for, the last of them a commit's, small enough for one write, leaves the log for up to [#LINGER_NANOS]
+/// first: a commit that waits for its durability meanwhile writes its group itself, the earlier frames with it, so a
+/// deferred commit followed by a durable one, as a deferred removal and then a durable one are, costs one round trip
+/// to the device and not two. A commit that waits without writing its own group, a wait for frames, a full queue, a
+/// close, a failure and a group another flush publishes end the linger at once, and when it runs out the flush writes
+/// the frames as before; it lingers at most once an open. Only before the first group: the flush cannot tell a
+/// deferred commit from a durable one whose thread is still on its way to its wait, and leaving the group of such a
+/// commit to that thread would start its write later than the flush could have, so a store whose durable commits
+/// come apart, one at a time, would pay for every one of them. The first group of an open opens its segment, and the
+/// handle to write it through, before it takes the frames, so the frames queued meanwhile join it.
+///
 /// A flush of the pool whose store shares the pool writes one group at a time while a task of another store waits for
 /// a thread: it submits itself again behind that task, so the stores on a pool take turns a group each. A store whose
 /// queue never drains would otherwise hold a thread for as long as its commits keep coming. On a lane of the process's
@@ -248,6 +260,10 @@ final class LogWriter {
     /// The waits in a row that ran out past which waits are turned off no longer: after the n-th, the flush writes 2
     /// to the power of n groups without one.
     private static final int MAX_COHORT_MISSES = 6;
+    /// The longest a flush leaves the first group of an open to the commit that follows frames no commit waits for, in
+    /// nanoseconds: the durable removal that follows a deferred one when a chat is cleared comes 0.2 to 0.35 ms after
+    /// it.
+    static final long LINGER_NANOS = 500_000;
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
@@ -378,6 +394,20 @@ final class LogWriter {
     private long forceNanos;
     // The commits the last published group woke, its leader included; read by commits deciding whether to lead
     private volatile int lastGroupWaiters;
+    // Whether a group was durable since the writer opened, after which no flush lingers; owned by the flush task
+    private boolean grouped;
+    // The flush that lingers, which every wait for the log and every published group unparks, or null
+    private volatile Thread lingerer;
+    /// How long a linger lasts at most, in nanoseconds: [#LINGER_NANOS], or longer for tests that must see it end
+    /// early; set before the first commit.
+    volatile long lingerNanos = LINGER_NANOS;
+    // The threads waiting in awaitFrames; written holding the durability lock
+    private volatile int frameWaiters;
+    // The lingers begun and the groups a commit wrote for itself, for tests
+    private volatile long lingers;
+    private volatile long ledGroups;
+    // The groups made durable, for tests; written before durable, so a wait for durability sees the group that ended it
+    private long groups;
     // The commits the last published group woke and those queued behind it
     private int cohortSpan;
     // The commits the last published group woke that the next flush waits for, or 0; the registrations counted before
@@ -799,6 +829,7 @@ final class LogWriter {
     private void awaitRoom() {
         queueWaiters++;
         try {
+            wakeLingerer();
             queueDrained.awaitUninterruptibly();
         } finally {
             queueWaiters--;
@@ -920,12 +951,30 @@ final class LogWriter {
     void awaitFrames(long frames) {
         durabilityLock.lock();
         try {
-            while (written < frames) {
-                checkHealthy();
-                durabilityChanged.awaitUninterruptibly();
+            if (written >= frames) {
+                return;
+            }
+            frameWaiters++;
+            try {
+                wakeLingerer();
+                while (written < frames) {
+                    checkHealthy();
+                    durabilityChanged.awaitUninterruptibly();
+                }
+            } finally {
+                frameWaiters--;
             }
         } finally {
             durabilityLock.unlock();
+        }
+    }
+
+    /// Ends the linger of the flush that lingers, if one does, once a wait for the log is counted where its look before
+    /// it parks sees it.
+    private void wakeLingerer() {
+        var thread = lingerer;
+        if (thread != null) {
+            LockSupport.unpark(thread);
         }
     }
 
@@ -954,12 +1003,28 @@ final class LogWriter {
     /// stops, so the frames of a commit whose flush returned are never left behind. A flush for a commit hands what is
     /// queued after its group to the pool, as a flush of the pool does when a task of another store waits for its
     /// thread.
+    ///
+    /// A flush of a lane of the process's flusher lingers at most once, without [#running], so the commit it leaves the
+    /// log to can take it.
     private void flush(long until) {
+        var mayLinger = until == Long.MAX_VALUE && poolQueued == null;
         while (running.compareAndSet(false, true)) {
+            var linger = false;
+            var seen = 0L;
             try {
-                flushGroups(until);
+                linger = flushGroups(until, mayLinger);
+                if (linger) {
+                    // Before running is let go, so a commit that writes the group next sees the flush to wake
+                    seen = durable;
+                    lingerer = Thread.currentThread();
+                }
             } finally {
                 running.set(false);
+            }
+            if (linger) {
+                mayLinger = false;
+                linger(seen);
+                continue;
             }
             boolean empty;
             queueLock.lock();
@@ -978,6 +1043,81 @@ final class LogWriter {
                 schedule();
                 return;
             }
+        }
+    }
+
+    /// Parks the flush, which [#lingerer] names and which let go of [#running], for at most [#lingerNanos], until a
+    /// group past `seen` is durable or anything needs the queue written: a commit or a thread waiting for the log, a
+    /// commit waiting for room in the queue, a close, a failure, or an interrupt of the flush's thread.
+    ///
+    /// Each of those is counted before it reads [#lingerer] to wake it, and the flush looks at them after it named
+    /// itself there, so either it sees the one that came or that one unparks it.
+    private void linger(long seen) {
+        try {
+            lingers++;
+            var deadline = System.nanoTime() + lingerNanos;
+            while (durable == seen && waiters.isEmpty() && frameWaiters == 0 && queueWaiters == 0 && !closing
+                    && failure == null && !Thread.currentThread().isInterrupted()) {
+                var remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    return;
+                }
+                LockSupport.parkNanos(this, remaining);
+            }
+        } finally {
+            lingerer = null;
+        }
+    }
+
+    /// {@return whether a flush of a lane may leave the queue to the commit that follows it: no group was durable since
+    /// the writer opened, there is no commit window, and no commit or thread waits for the log, nor for room in it}
+    ///
+    /// Read before the queue lock, holding [#running]: every flush after the open's first group fails it at its first
+    /// field, with no lock taken and no clock read.
+    private boolean firstForLinger() {
+        return !grouped && commitWindowNanos == 0 && !closing && failure == null && queueWaiters == 0
+                && frameWaiters == 0 && waiters.isEmpty();
+    }
+
+    /// {@return the bytes the queued frames seal into, if the last of them is a commit's and they fit one write, or -1;
+    /// holding the queue lock and [#running], with the segment open}
+    ///
+    /// A queue of a catalog or an epoch alone never lingers: no commit follows the catalog of an open for certain, and
+    /// the epoch is queued alone only for the large value that waits for it.
+    private long lingerBytes() {
+        var type = queue.getLast().type();
+        if ((type != FrameBody.COMMIT && type != FrameBody.COMMIT_SPLIT) || !fitsOneWrite(queue)) {
+            return -1;
+        }
+        return sealedBytes(queue);
+    }
+
+    /// Opens the segment to write through, and sizes the buffer of the write, for a group that seals into `bytes`, if
+    /// it is written through: before the linger, so the commit that takes the group only seals and writes it, and the
+    /// set-up runs while that commit is still on its way.
+    private void prepareThrough(long bytes) {
+        if (!throughWanted || position != forcedPosition || !throughFits(bytes) || !openedThrough()) {
+            return;
+        }
+        try {
+            writeThrough.reserve((int) ((bytes + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT));
+        } catch (IOException _) {
+            // The write tries again, and a buffer it cannot have either moves the writer down a way, as it always does
+        }
+    }
+
+    /// Opens the first segment of the open on a flush of the executor, if frames are queued, before it takes them, so
+    /// the frames queued while the segment opens join the first group.
+    private void openFirst() throws IOException {
+        boolean queued;
+        queueLock.lock();
+        try {
+            queued = !queue.isEmpty();
+        } finally {
+            queueLock.unlock();
+        }
+        if (queued) {
+            rollover();
         }
     }
 
@@ -1046,17 +1186,21 @@ final class LogWriter {
     /// metadata written with it: the one write with forced unit access that makes a write through cheaper than a
     /// write and a force.
     private boolean writesThrough(List<Queued> group) {
-        if (!throughWanted || position != forcedPosition) {
-            return false;
-        }
-        var bytes = sealedBytes(group);
+        return throughWanted && position == forcedPosition && throughFits(sealedBytes(group)) && openedThrough();
+    }
+
+    /// {@return whether a group that seals into `bytes`, or -1 for more than one write, ends, padded, within the bytes
+    /// the segment had when it was prepared, written at the current position}
+    private boolean throughFits(long bytes) {
         if (bytes < 0) {
             return false;
         }
         var end = (position + bytes + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT;
-        if (end > valid || position + bytes + ALIGNMENT > segmentSize) {
-            return false;
-        }
+        return end <= valid && position + bytes + ALIGNMENT <= segmentSize;
+    }
+
+    /// {@return whether the current segment is open to write through, opening it if it is not and a way is left}
+    private boolean openedThrough() {
         if (throughFile == null) {
             throughFile = openThrough();
             throughWanted = throughFile != null;
@@ -1071,7 +1215,10 @@ final class LogWriter {
 
     /// Writes the queued groups until the queue is empty, the commit at `until` is durable or, on the pool, a task
     /// waits for this thread, holding [#running].
-    private void flushGroups(long until) {
+    ///
+    /// @param mayLinger whether the first look at the queue may leave it to the commit that follows ([#lingerBytes()])
+    /// @return whether it stopped to linger, with the queue as it found it
+    private boolean flushGroups(long until, boolean mayLinger) {
         leading = until != Long.MAX_VALUE;
         try {
             // A stopped writer writes nothing more: a group after one whose force failed would pass for durable while
@@ -1084,23 +1231,39 @@ final class LogWriter {
                     // group of their own
                     awaitCohort();
                 }
-                ArrayList<Queued> group;
-                long sequence;
-                long frames;
-                boolean units;
+                if (channel == null && !leading) {
+                    openFirst();
+                }
+                // Never two lingers at once, so the one a wait wakes is the one that lingers
+                var lingering = mayLinger && channel != null && firstForLinger() && lingerer == null;
+                mayLinger = false;
+                var lingerBytes = -1L;
+                ArrayList<Queued> group = null;
+                var sequence = 0L;
+                var frames = 0L;
+                var units = false;
                 queueLock.lock();
                 try {
                     if (queue.isEmpty() || (until != Long.MAX_VALUE && (lastQueued > until || !fitsOneWrite(queue)))) {
-                        return;
+                        return false;
                     }
-                    group = queue;
-                    sequence = lastQueued;
-                    frames = appended;
-                    units = queuedUnits;
-                    queuedUnits = false;
-                    queue = flushing;
+                    if (lingering) {
+                        lingerBytes = lingerBytes();
+                    }
+                    if (lingerBytes < 0) {
+                        group = queue;
+                        sequence = lastQueued;
+                        frames = appended;
+                        units = queuedUnits;
+                        queuedUnits = false;
+                        queue = flushing;
+                    }
                 } finally {
                     queueLock.unlock();
+                }
+                if (lingerBytes >= 0) {
+                    prepareThrough(lingerBytes);
+                    return true;
                 }
                 var bodies = write(group, units);
                 group.clear();
@@ -1130,8 +1293,10 @@ final class LogWriter {
                     }
                 }
                 publish(sequence, frames, roomy);
-                if (!leading && poolWanted()) {
-                    return;
+                if (leading) {
+                    ledGroups++;
+                } else if (poolWanted()) {
+                    return false;
                 }
             }
         } catch (IOException exception) {
@@ -1148,6 +1313,7 @@ final class LogWriter {
                 }
             }
         }
+        return false;
     }
 
     /// Waits, holding [#running], until the commits the last group woke wait again, their next frames queued, so the
@@ -1993,6 +2159,7 @@ final class LogWriter {
             cohortBase = registered.get();
             cohortArmed = true;
         }
+        groups++;
         durable = sequence;
         durabilityLock.lock();
         try {
@@ -2001,11 +2168,15 @@ final class LogWriter {
         } finally {
             durabilityLock.unlock();
         }
+        grouped = true;
         if (spills != null) {
             spills.durableAdvanced();
         }
         // A commit that wrote its own group comes back too
         var woken = wake(sequence) + (leading ? 1 : 0);
+        // A lane that left the group to the commit that wrote it has nothing left to wait for; after the commits the
+        // group made durable, which go on first
+        wakeLingerer();
         var span = woken + (int) Math.clamp(lastQueued - sequence, 0, Integer.MAX_VALUE);
         lastGroupWaiters = woken;
         cohortSpan = span;
@@ -2036,6 +2207,7 @@ final class LogWriter {
 
     private void stop(IOException cause) {
         failure = new LedgerIoException("The log could not be written: commits since the last force may be lost", cause);
+        wakeLingerer();
         durabilityLock.lock();
         try {
             durabilityChanged.signalAll();
@@ -2129,6 +2301,8 @@ final class LogWriter {
         }
         var waiter = new Waiter(Thread.currentThread(), sequence);
         waiters.add(waiter);
+        // A lane that lingers writes the group for a commit that does not write its own
+        wakeLingerer();
         if (cohortArmed) {
             registered.increment();
         }
@@ -2302,6 +2476,27 @@ final class LogWriter {
         return cohortsMissed;
     }
 
+    /// {@return the lingers begun so far, for tests}
+    long lingersForTests() {
+        return lingers;
+    }
+
+    /// {@return whether a flush lingers now, for tests}
+    boolean lingeringForTests() {
+        return lingerer != null;
+    }
+
+    /// {@return the groups made durable so far, for tests: read after a wait for durability, every group up to the one
+    /// that ended it}
+    long groupsForTests() {
+        return groups;
+    }
+
+    /// {@return the groups a commit wrote for itself so far, for tests}
+    long ledGroupsForTests() {
+        return ledGroups;
+    }
+
     /// {@return the rollovers so far, for tests}
     long rollovers() {
         return rollovers;
@@ -2318,6 +2513,7 @@ final class LogWriter {
     /// @throws LedgerIoException if the queued frames cannot be made durable
     void close() {
         closing = true;
+        wakeLingerer();
         long frames;
         queueLock.lock();
         try {
