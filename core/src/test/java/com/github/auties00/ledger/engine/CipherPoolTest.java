@@ -2,9 +2,11 @@ package com.github.auties00.ledger.engine;
 
 import com.github.auties00.ledger.Encryption;
 import com.github.auties00.ledger.KeyCodec;
+import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Keyspace;
 import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.ValueCodec;
+import com.github.auties00.ledger.View;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -14,16 +16,22 @@ import javax.crypto.Mac;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.List;
+import java.util.Queue;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -37,10 +45,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// ciphers back as they close: a cipher given back holds no store's key and nonce, so a store that seals under the
 /// key and nonce another store last used gets no refusal from the JDK's AES-GCM; the pool keeps at most its bound; a
 /// file's cipher gives back only what is idle, and a records opener once; a key derived at the first seal is derived
-/// once and seals what a key given at construction seals; HMACs of cloned instances are those of new ones; and a store
-/// reopened after another closed makes no cipher.
+/// once and seals what a key given at construction seals; HMACs of cloned instances are those of new ones; a store
+/// reopened after another closed makes no cipher; and stores under keys of their own that open, scan, checkpoint and
+/// close at once read back every value whole.
 class CipherPoolTest {
     private static final byte[] MASTER = new byte[32];
+    // The messages of the store the readers of concurrentStores scan
+    private static final int CHURNED = 300;
+    // The lengths of its values, from none past the threshold of large values
+    private static final int[] CHURNED_LENGTHS = {0, 12, 40, 120, 700, 3_000, 6_000, 20_000};
 
     @Test
     @DisplayName("a cipher taken again after it was given back seals under the key and nonce of its last seal")
@@ -235,6 +248,157 @@ class CipherPoolTest {
             ledger.commit(ledger.newBatch().put(keyspace, "k1", new byte[3]));
         }
         assertEquals(made, CipherPool.GCM.madeForTests());
+    }
+
+    @Test
+    @DisplayName("ciphers moving through the pool between encrypted stores that commit, scan, checkpoint, open and close at once never carry a key or a nonce across")
+    void concurrentStores(@TempDir Path root) throws Exception {
+        var paged = Keyspace.paged("paged", KeyCodec.bytes(), ValueCodec.bytes());
+        var resident = Keyspace.resident("resident", KeyCodec.bytes(), ValueCodec.bytes());
+        var errors = new ConcurrentLinkedQueue<String>();
+        var stop = new AtomicBoolean();
+        var generations = new AtomicInteger();
+        var threads = new ArrayList<Thread>();
+        var main = root.resolve("main");
+        try (var ledger = churned(main, 1, paged, resident)) {
+            var batch = ledger.newBatch();
+            for (var m = 0; m < CHURNED; m++) {
+                batch.put(paged, key(m), churnedValue(m, 0)).put(resident, key(m), churnedValue(m, 0));
+            }
+            ledger.commit(batch).awaitDurable();
+            ledger.checkpoint();
+            // Every page read decrypts, so the readers take ciphers as often as the writer and the checkpoints do
+            ((LiveLedger) ledger).pagesForTests().forceColdReadsForTests(true);
+            threads.add(Thread.ofPlatform().start(() -> {
+                try {
+                    for (var g = 1; !stop.get(); g++) {
+                        var writes = ledger.newBatch();
+                        for (var m = 0; m < CHURNED; m++) {
+                            writes.put(paged, key(m), churnedValue(m, g)).put(resident, key(m), churnedValue(m, g));
+                        }
+                        ledger.commit(writes);
+                        generations.set(g);
+                        if (g % 7 == 0) {
+                            ledger.checkpoint();
+                        }
+                    }
+                } catch (Throwable throwable) {
+                    errors.add("writer: " + throwable);
+                }
+            }));
+            for (var r = 0; r < 2; r++) {
+                var snapshot = r == 1;
+                threads.add(Thread.ofPlatform().start(() -> {
+                    try {
+                        while (!stop.get()) {
+                            if (snapshot) {
+                                try (var view = ledger.snapshot()) {
+                                    scanChurned(view, paged, CHURNED, errors);
+                                    scanChurned(view, resident, CHURNED, errors);
+                                }
+                            } else {
+                                scanChurned(ledger, paged, CHURNED, errors);
+                                scanChurned(ledger, resident, CHURNED, errors);
+                            }
+                        }
+                    } catch (Throwable throwable) {
+                        errors.add("reader: " + throwable);
+                    }
+                }));
+            }
+            // Stores under keys of their own, opened and closed over and over, so ciphers they give back reach the
+            // others through the pool
+            for (var c = 0; c < 2; c++) {
+                var directory = root.resolve("churn" + c);
+                var seed = 2 + c;
+                threads.add(Thread.ofPlatform().start(() -> {
+                    try {
+                        for (var round = 0; !stop.get(); round++) {
+                            try (var other = churned(directory, seed, paged, resident)) {
+                                var writes = other.newBatch();
+                                for (var m = 0; m < 40; m++) {
+                                    writes.put(paged, key(m), churnedValue(m, round));
+                                }
+                                other.commit(writes).awaitDurable();
+                                if (round % 3 == 0) {
+                                    other.checkpoint();
+                                }
+                                scanChurned(other, paged, 40, errors);
+                            }
+                        }
+                    } catch (Throwable throwable) {
+                        errors.add("churn: " + throwable);
+                    }
+                }));
+            }
+            Thread.sleep(4_000);
+            stop.set(true);
+            for (var thread : threads) {
+                thread.join(60_000);
+                assertFalse(thread.isAlive(), "a thread did not stop");
+            }
+            ((LiveLedger) ledger).closeWithoutCheckpoint();
+        }
+        // The tail of the log, recovered
+        try (var ledger = churned(main, 1, paged, resident)) {
+            scanChurned(ledger, paged, CHURNED, errors);
+            scanChurned(ledger, resident, CHURNED, errors);
+        }
+        var found = new ArrayList<>(errors);
+        assertEquals(List.of(), found.subList(0, Math.min(20, found.size())), "after " + generations.get() + " generations");
+    }
+
+    private static Ledger churned(Path directory, int seed, Keyspace<?, ?> paged, Keyspace<?, ?> resident) {
+        var key = new byte[32];
+        Arrays.fill(key, (byte) seed);
+        return ((LedgerBuilder) Ledger.builder().directory(directory)
+                .encryption(Encryption.key(key))
+                .keyspace(paged).keyspace(resident)
+                .pageCache(1 << 20)
+                .largeValues(12 << 10)
+                .commitWindow(Duration.ZERO))
+                .segmentSize(256 << 10)
+                .spillBudget(64 << 10)
+                .writeThrough(WriteThrough.Mode.OFF)
+                .build();
+    }
+
+    private static byte[] key(int message) {
+        return ByteBuffer.allocate(4).putInt(message).array();
+    }
+
+    // The value of `message` at `generation`: the generation, the message, then bytes of both
+    private static byte[] churnedValue(int message, int generation) {
+        var length = Math.max(8, CHURNED_LENGTHS[Math.floorMod(message * 3 + generation, CHURNED_LENGTHS.length)]);
+        var value = new byte[length];
+        ByteBuffer.wrap(value).putInt(generation).putInt(message);
+        for (var i = 8; i < length; i++) {
+            value[i] = (byte) (message * 31 + generation * 17 + i * 7);
+        }
+        return value;
+    }
+
+    /// Scans `keyspace` of `view` forward and checks it holds the `count` messages of one generation, each whole.
+    private static void scanChurned(View view, Keyspace<byte[], byte[]> keyspace, int count, Queue<String> errors) {
+        var seen = new int[1];
+        var generation = new int[]{-1};
+        view.forEach(keyspace, KeyRange.all(), (key, value) -> {
+            var message = ByteBuffer.wrap(key).getInt();
+            if (message != seen[0]) {
+                errors.add(keyspace.name() + ": message " + message + " in place of " + seen[0]);
+            }
+            if (generation[0] < 0) {
+                generation[0] = ByteBuffer.wrap(value).getInt();
+            }
+            if (!Arrays.equals(churnedValue(message, generation[0]), value)) {
+                errors.add(keyspace.name() + ": message " + message + " is not that of generation " + generation[0]);
+            }
+            seen[0]++;
+            return true;
+        });
+        if (seen[0] != count) {
+            errors.add(keyspace.name() + ": " + seen[0] + " messages of " + count);
+        }
     }
 
     private static Ledger store(Path directory, Keyspace<?, ?> keyspace) {
