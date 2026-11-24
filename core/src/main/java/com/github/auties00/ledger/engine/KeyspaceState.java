@@ -271,20 +271,22 @@ final class KeyspaceState {
         }
     }
 
-    /// Puts in memory the chain of `key`, whose only version is `head`, unless memory holds a chain of it; for the
-    /// loader of a resident key space, which no commit writes beside.
+    /// Puts in memory the chain of the `length` bytes at `from` of `array`, a key whose only version is `head`, unless
+    /// memory holds a chain of it; for the loader of a resident key space, which no commit writes beside, and which
+    /// installs the keys where they lie in its leaves.
     ///
     /// The chain has its version before it is in the index, so the sweep, which walks the index, never finds it empty.
-    void install(MemorySegment key, Version head) {
-        var hash = Segments.hash(key);
-        var chain = index.get(key, hash);
+    /// It holds a copy of the key, so `array` may go back to a pool once it returns.
+    void install(byte[] array, int from, int length, Version head) {
+        var hash = Segments.hash(array, from, length);
+        var chain = index.get(array, from, length, hash);
         if (chain != null) {
             if (!chain.released()) {
                 return;
             }
             index.remove(chain);
         }
-        var created = keys.chain(key, hash);
+        var created = keys.chain(array, from, length, hash);
         created.head = head;
         if (index.putIfAbsent(created) != null) {
             return;

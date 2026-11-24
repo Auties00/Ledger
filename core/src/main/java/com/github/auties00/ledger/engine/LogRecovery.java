@@ -388,6 +388,12 @@ final class LogRecovery {
                 }
             }
         }
+        // Every read-ahead is closed, so nothing uses the ciphers any more; a recovery that throws leaves its own to
+        // the collector, as a failure of the cipher may be what threw
+        spares.releaseCiphers();
+        if (cipher != null) {
+            CipherPool.GCM.giveBack(cipher);
+        }
         return new Result(last, lastSegment, empty, lastWritten);
     }
 
@@ -456,14 +462,7 @@ final class LogRecovery {
     }
 
     private static Cipher cipher(StoreKeys keys) {
-        if (!keys.encrypted()) {
-            return null;
-        }
-        try {
-            return Cipher.getInstance("AES/GCM/NoPadding");
-        } catch (GeneralSecurityException exception) {
-            throw new IllegalStateException("AES-GCM is unavailable", exception);
-        }
+        return keys.encrypted() ? CipherPool.GCM.take() : null;
     }
 
     /// {@return whether `header` is a whole segment header, of any version}

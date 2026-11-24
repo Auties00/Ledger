@@ -1084,5 +1084,6 @@ final class BlobFile implements AutoCloseable {
             // Every unit a commit relies on was forced with its log group
         }
         channels.close();
+        cipher.close();
     }
 }

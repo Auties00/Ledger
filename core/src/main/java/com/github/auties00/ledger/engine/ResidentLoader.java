@@ -390,30 +390,40 @@ final class ResidentLoader {
     /// keys at or after [#below].
     private void install(byte[][] leaves, MemorySegment from) {
         var values = state.keyspace.values();
-        MemorySegment last = null;
+        byte[] lastLeaf = null;
+        var lastEntry = 0;
         for (var leaf : leaves) {
             for (var i = 0; i < TreeNodes.count(leaf); i++) {
                 var offset = TreeNodes.entry(leaf, i);
-                var key = TreeNodes.leafKey(leaf, offset);
-                if (Segments.compare(key, from) < 0) {
+                var keyOffset = TreeNodes.leafKeyOffset(offset);
+                var keyLength = TreeNodes.leafKeyLength(leaf, offset);
+                if (Segments.compare(leaf, keyOffset, keyLength, from) < 0) {
                     continue;
                 }
-                var value = TreeSearch.value(pages, leaf, offset, false);
-                var decoded = values.decode(value);
                 // A version on an array of its own, not on the leaf, which would stay reachable while one of its
-                // entries does; the decoded array is the encoding, of which the version keeps one copy. The array must
-                // be a fresh one that no other version, page or cache holds: the open's replay writes a later value of
-                // the key into it in place (LiveLedger.Applier#replayedArray)
-                var version = decoded instanceof byte[] bytes && values == BuiltinCodecs.BYTES_VALUE
-                        ? new Version(stamp, bytes, decoded, null)
-                        : new Version(stamp, Segments.toBytes(value), decoded, null);
-                state.install(key, version);
-                last = key;
+                // entries does. The array must be a fresh one that no other version, page or cache holds: the open's
+                // replay writes a later value of the key into it in place (LiveLedger.Applier#replayedArray)
+                Version version;
+                if (values == BuiltinCodecs.BYTES_VALUE && TreeNodes.isInline(leaf, offset)) {
+                    // The decoded value is the encoding, one copy of the leaf's bytes, as the codec's decoding makes it
+                    var bytes = TreeNodes.inlineValueBytes(leaf, offset);
+                    version = new Version(stamp, bytes, bytes, null);
+                } else {
+                    var value = TreeSearch.value(pages, leaf, offset, false);
+                    var decoded = values.decode(value);
+                    version = decoded instanceof byte[] bytes && values == BuiltinCodecs.BYTES_VALUE
+                            ? new Version(stamp, bytes, decoded, null)
+                            : new Version(stamp, Segments.toBytes(value), decoded, null);
+                }
+                state.install(leaf, keyOffset, keyLength, version);
+                lastLeaf = leaf;
+                lastEntry = offset;
             }
         }
-        if (last != null) {
-            // Past the last key: a key between it and the next leaf's first has no entry
-            below = after(last);
+        if (lastLeaf != null) {
+            // Past the last key: a key between it and the next leaf's first has no entry. Made before the leaves go
+            // back to the pool
+            below = after(lastLeaf, TreeNodes.leafKeyOffset(lastEntry), TreeNodes.leafKeyLength(lastLeaf, lastEntry));
         }
     }
 
@@ -421,6 +431,13 @@ final class ResidentLoader {
     static MemorySegment after(MemorySegment key) {
         var next = new byte[Math.toIntExact(key.byteSize()) + 1];
         MemorySegment.copy(key, 0, MemorySegment.ofArray(next), 0, next.length - 1);
+        return MemorySegment.ofArray(next).asReadOnly();
+    }
+
+    /// {@return the key right after the `length` bytes at `from` of `array`, on an array of its own}
+    static MemorySegment after(byte[] array, int from, int length) {
+        var next = new byte[length + 1];
+        System.arraycopy(array, from, next, 0, length);
         return MemorySegment.ofArray(next).asReadOnly();
     }
 

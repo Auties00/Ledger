@@ -1074,6 +1074,7 @@ final class PageFile implements AutoCloseable {
         }
         readers.close();
         closeQuietly(writer);
+        cipher.close();
     }
 
     /// {@return the read channels open, held or idle, for tests}

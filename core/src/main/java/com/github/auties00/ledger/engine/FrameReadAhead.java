@@ -275,17 +275,26 @@ final class FrameReadAhead implements AutoCloseable {
             give(bodies, body);
         }
 
-        /// {@return an AES-GCM cipher, which goes back through [#giveCipher(Cipher)]}
-        ///
-        /// @throws GeneralSecurityException if the JDK has no AES-GCM
-        Cipher takeCipher() throws GeneralSecurityException {
+        /// {@return an AES-GCM cipher, which goes back through [#giveCipher(Cipher)]: an idle one of these spares, or
+        /// one of the process's ([CipherPool])}
+        Cipher takeCipher() {
             var cipher = ciphers.poll();
-            return cipher != null ? cipher : Cipher.getInstance("AES/GCM/NoPadding");
+            return cipher != null ? cipher : CipherPool.GCM.take();
         }
 
-        /// Gives back `cipher`, which [#takeCipher()] handed out.
+        /// Gives back `cipher`, which [#takeCipher()] handed out and whose last call did not fail other than by
+        /// authentication.
         void giveCipher(Cipher cipher) {
             ciphers.offer(cipher);
+        }
+
+        /// Gives the ciphers of these spares to the process's pool, once the recovery has closed every read-ahead and
+        /// takes none any more.
+        void releaseCiphers() {
+            Cipher cipher;
+            while ((cipher = ciphers.poll()) != null) {
+                CipherPool.GCM.giveBack(cipher);
+            }
         }
 
         /// {@return the arrays handed out again since the process started, by any recovery; for tests}
@@ -371,20 +380,26 @@ final class FrameReadAhead implements AutoCloseable {
                 }
                 var cipher = spares.takeCipher();
                 var body = spares.takeBody(sealedLength - LogWriter.TAG_BYTES);
+                var reusable = false;
                 try {
                     cipher.init(Cipher.DECRYPT_MODE, segmentKey, new GCMParameterSpec(LogWriter.TAG_BYTES * 8, LogWriter.nonce(position)));
                     cipher.updateAAD(header, 0, LogWriter.FRAME_HEADER);
                     // Out of place, into an array other than the sealed one, which keeps the combined intrinsic
                     var opened = new Opened(body, cipher.doFinal(sealed, 0, sealedLength, body, 0));
                     body = null;
+                    reusable = true;
                     return opened;
                 } catch (AEADBadTagException _) {
+                    reusable = true;
                     return new Opened(null, 0);
                 } finally {
                     if (body != null) {
                         spares.giveBody(body);
                     }
-                    spares.giveCipher(cipher);
+                    // A cipher that failed otherwise is left to the collector
+                    if (reusable) {
+                        spares.giveCipher(cipher);
+                    }
                 }
             } finally {
                 spares.giveSealed(sealed);

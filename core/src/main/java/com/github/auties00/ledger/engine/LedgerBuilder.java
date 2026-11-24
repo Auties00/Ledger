@@ -274,7 +274,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
                 blobFree = Catalog.decodeFreeList(pages.read(superblock.blobFreeList(), PageFormat.FREE_LIST, false), blobPages);
             }
             // The epoch is fixed once recovery has read those of the opens since the checkpoint
-            var blobs = BlobFile.open(directory, new PageCipher(opened.keys().blobKey()), pages.cache(), heap, blobPages, blobFree);
+            var blobs = BlobFile.open(directory, new PageCipher(opened.keys().encrypted(), opened.keys()::blobKey), pages.cache(), heap, blobPages, blobFree);
             pages.useBlobs(blobs);
             ledger.useBlobs(blobs, largeValues, largeValuesByKeyspace);
             var epochs = new int[]{superblock == null ? 0 : superblock.epoch()};
