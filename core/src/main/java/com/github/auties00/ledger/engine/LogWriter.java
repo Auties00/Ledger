@@ -24,6 +24,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
@@ -92,11 +93,13 @@ import java.util.zip.CRC32C;
 /// the writes through moves the writer to forces.
 ///
 /// A store just opened has such bytes only in the first block of its first segment, which its first group takes when
-/// one block holds it. The next segment is prepared without zeros, and written with them on a thread of its own once
-/// commits have waited for [#ZEROS_AFTER] groups: on Windows a force beside the zeros takes several times as long,
-/// which the few commits of a store that opens, writes and closes would pay and never gain from. The log moves to it between two groups as soon as it is ready, leaving the rest of the segment it was writing
-/// unused; until then each group is forced. So a run of commits reaches the path within the time of one preparation,
-/// whatever the size of a segment.
+/// one block holds it. On Windows a thread of [SegmentPreparers] opens the segment for that group as soon as the store
+/// has opened, where the process already knows the device's answer, so the group does not pay for the cold set-up of
+/// the way. The next segment is prepared without zeros, and written with them on a thread of its own once commits have
+/// waited for [#ZEROS_AFTER] groups: on Windows a force beside the zeros takes several times as long, which the few
+/// commits of a store that opens, writes and closes would pay and never gain from. The log moves to it between two
+/// groups as soon as it is ready, leaving the rest of the segment it was writing unused; until then each group is
+/// forced. So a run of commits reaches the path within the time of one preparation, whatever the size of a segment.
 ///
 /// A segment is a file of [#SEGMENT_HEADER] bytes of header followed by frames. Each use of it, the writing of one
 /// open, draws a random tag, and the key of the use derives from the segment's number, a random salt of its own and
@@ -308,6 +311,9 @@ final class LogWriter {
     private WriteThrough.Handle throughFile;
     // Whether groups of the current segment may be written through, once one fits the bytes it has
     private boolean throughWanted;
+    // The opening of the first segment to write through on a thread of SegmentPreparers, until the flush takes it or
+    // a rollover or the close discards it
+    private final AtomicReference<EarlyThrough> earlyThrough;
     // Whether a write succeeded in the way segments are opened in now; until one does, a failure moves one way down
     private boolean wayProven;
     // The bytes the current segment had when it was prepared, below which a write changes neither its size nor the
@@ -601,10 +607,15 @@ final class LogWriter {
         // The first group switches to it, as a rollover does
         this.segmentNumber = firstSegment - 1;
         this.currentSegment = firstSegment;
+        this.earlyThrough = new AtomicReference<>();
         if (empty != null) {
             var ready = new FutureTask<>(() -> empty);
             ready.run();
             this.next = ready;
+            // Its first group may be written through, as open decides for the first segment
+            if (writeThrough.opensEarly() && (empty.valid() > KEPT_LENGTH || empty.nameDurable())) {
+                earlyThrough.set(new EarlyThrough(writeThrough, empty));
+            }
         } else {
             prepareNext();
         }
@@ -639,6 +650,11 @@ final class LogWriter {
         this.view = spills == null ? null : spills.segment(segment.number(), segment.path(), segmentKey);
         this.next = null;
         this.throughFile = null;
+        // Left in place once discarded, so a close that follows waits for an opening still running
+        var early = earlyThrough.get();
+        if (early != null && early.segment != segment.number()) {
+            early.discard();
+        }
         // A segment of its header and first block holds at most one group through, which is worth a handle only as the
         // first of a store just opened, which may commit once
         this.throughWanted = valid > KEPT_LENGTH || (first && segment.nameDurable());
@@ -1382,13 +1398,62 @@ final class LogWriter {
         return end <= valid && position + bytes + ALIGNMENT <= segmentSize;
     }
 
-    /// {@return whether the current segment is open to write through, opening it if it is not and a way is left}
+    /// {@return whether the current segment is open to write through, taking the handle [EarlyThrough] opened for it or
+    /// opening it if it is not and a way is left}
     private boolean openedThrough() {
         if (throughFile == null) {
-            throughFile = openThrough();
+            var early = takeEarlyThrough();
+            throughFile = early != null ? early : openThrough();
             throughWanted = throughFile != null;
         }
         return throughWanted;
+    }
+
+    /// Starts opening the first segment to write through on a thread of [SegmentPreparers], where
+    /// [WriteThrough#opensEarly()] and its first group may be written through.
+    ///
+    /// Called once the store opened, so one that failed to open leaves no handle behind, which on Windows would keep
+    /// the file from being deleted.
+    void openEarly() {
+        var early = earlyThrough.get();
+        if (early != null) {
+            start(early);
+        }
+    }
+
+    /// {@return the current segment as [EarlyThrough] opened it, or `null` if it did not, or opened another}
+    ///
+    /// An opening not started yet runs here, and one running is waited for: it started before this group was
+    /// queued, so the group waits less than it would opening the segment itself, and a force in its place took longer
+    /// than the opening. One that failed or found no way leaves the group to [#openThrough()].
+    private WriteThrough.Handle takeEarlyThrough() {
+        var early = earlyThrough.get();
+        if (early == null || early.segment != segmentNumber || !earlyThrough.compareAndSet(early, null)) {
+            return null;
+        }
+        early.run();
+        while (true) {
+            try {
+                return early.get();
+            } catch (InterruptedException _) {
+                interruptedWrite = true;
+            } catch (ExecutionException _) {
+                return null;
+            }
+        }
+    }
+
+    /// Closes the handle [EarlyThrough] opened that no group took, before this returns.
+    ///
+    /// An opening still running is waited for, by an interrupted thread too, and one not started yet runs here and
+    /// opens nothing: a handle opened after the close would keep the segment open while the store's directory is
+    /// moved or deleted, which fails on Windows for a file without POSIX delete semantics. The close is no commit, so
+    /// it may wait the opening's time.
+    private void discardEarlyThrough() {
+        var early = earlyThrough.getAndSet(null);
+        if (early != null) {
+            early.discardAndAwait();
+        }
     }
 
     /// {@return whether a task waits for a thread of the pool this store shares}
@@ -2829,6 +2894,7 @@ final class LogWriter {
             }
         } finally {
             // The flush task has nothing left to write, or has stopped
+            discardEarlyThrough();
             closeChannel();
             keepNext();
         }
@@ -2965,4 +3031,82 @@ final class LogWriter {
         }
     }
 
+    /// The opening of the first segment of a store just opened to write through, on a thread of [SegmentPreparers]
+    /// from the end of the open ([#openEarly()]), so its first group finds the handle open.
+    ///
+    /// The opening names the volume under the store and opens the handle, which on Windows takes the first group of a
+    /// store 1.5 to 2 milliseconds of cold native calls. It asks no device
+    /// ([WriteThrough#openAnswered(Path, BooleanSupplier)]): a store the process knows nothing of the device of leaves
+    /// the question to its first group, so a store that only opens and reads sends the device nothing. A handle no
+    /// group takes, because the segment rolled over first, is closed by [#discard()], or by the opening itself once it
+    /// ends if that was still running; the close of the store closes it before it returns ([#discardAndAwait()]).
+    static final class EarlyThrough extends FutureTask<WriteThrough.Handle> {
+        // The segment the handle writes
+        private final long segment;
+        // Whether no group takes the handle; read by the opening before it starts and once it named the volume
+        private final AtomicBoolean discarded;
+        // Guards released, and is held while the handle closes
+        private final Object lock;
+        // Whether the handle was closed by a discard, so it is closed once; guarded by lock
+        private boolean released;
+
+        EarlyThrough(WriteThrough way, LogFiles.Prepared prepared) {
+            var discarded = new AtomicBoolean();
+            super(() -> discarded.get() ? null : way.openAnswered(prepared.path(), discarded::get));
+            this.discarded = discarded;
+            this.lock = new Object();
+            this.segment = prepared.number();
+        }
+
+        @Override
+        protected void done() {
+            if (discarded.get()) {
+                release();
+            }
+        }
+
+        /// Closes the handle once the opening ends, now if it has; an opening not started yet opens none.
+        void discard() {
+            discarded.set(true);
+            if (isDone()) {
+                release();
+            }
+        }
+
+        /// Closes the handle before this returns: an opening not started yet runs here and opens none, and one running
+        /// is waited for, by an interrupted thread too.
+        void discardAndAwait() {
+            discarded.set(true);
+            run();
+            var interrupted = false;
+            try {
+                while (true) {
+                    try {
+                        get();
+                        break;
+                    } catch (InterruptedException _) {
+                        interrupted = true;
+                    } catch (ExecutionException _) {
+                        break;
+                    }
+                }
+                // The waiters of a task are woken before its done() runs, so the handle is closed here too
+                release();
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        // Under the lock, so a release that finds the handle closing waits for the close to end
+        private void release() {
+            synchronized (lock) {
+                if (state() == State.SUCCESS && !released) {
+                    released = true;
+                    closeQuietly(resultNow());
+                }
+            }
+        }
+    }
 }

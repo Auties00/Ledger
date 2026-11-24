@@ -372,6 +372,7 @@ public final class LedgerBuilder implements Ledger.Builder, Ledger.EncryptionSta
             ledger.attach(log, catalog, checkpointer, pages, lock);
             // Once nothing can fail: a store that failed to open would count toward the process's budget
             checkpointer.open(ledger.replayedBytes(), ledger.replayedHeap());
+            log.openEarly();
             return ledger;
         } catch (IOException exception) {
             release(pages, lock);

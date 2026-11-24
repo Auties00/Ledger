@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.LongFunction;
+import java.util.function.Supplier;
 
 /// The writes of the log's groups through to stable storage, so a group that one write holds needs no force after it,
 /// used by default only where the write holds what the force would.
@@ -64,7 +65,9 @@ import java.util.function.LongFunction;
 /// written through a way is what tries it, with no durable write of its own first: a group it refuses is written again.
 /// Only the flush that holds the log writer writes through an instance, so one thread at a time; its buffer, aligned to
 /// [LogWriter#ALIGNMENT] as `O_DIRECT` and `FILE_FLAG_NO_BUFFERING` need, serves every segment of the writer. The thread
-/// preparing a segment may ask which way is left beside it, so the round trip of asking the device holds no commit up.
+/// preparing a segment may ask which way is left beside it, so the round trip of asking the device holds no commit up,
+/// and on Windows opens the first segment of a store just opened ([#opensEarly()]), which the first group then writes
+/// through without the cold set-up of the way.
 final class WriteThrough {
     private static final String OS = System.getProperty("os.name", "");
     /// The writes in a row taking at most half of the buffer after which it goes back to the size they took.
@@ -131,19 +134,38 @@ final class WriteThrough {
     // The writes in a row, up to SHRINK_AFTER, that took at most half of the buffer, and the most bytes one of them took
     private int smallWrites;
     private long smallPeak;
-    // The handles opened, for tests; written by the flush that holds the log writer
-    private volatile int opens;
+    // What answers the proof without asking a device, null where it would have to; null if nothing does
+    private final Supplier<Boolean> answered;
+    // The handles opened and closed, for tests: a handle may be opened beside the flush that writes through it
+    private final AtomicInteger opens;
+    private final AtomicInteger closes;
     /// Allocates the buffer in place of the arena, by its size; for tests that refuse it.
     LongFunction<MemorySegment> allocatorForTests;
+    /// Makes [#opensEarly()] answer `true` whatever the way, for tests of the opening on a file system other than
+    /// Windows' own.
+    volatile boolean opensEarlyForTests;
 
     /// Creates the way to write through that starts at `kind`, or forces if it is `null`.
     ///
     /// @param proof what must answer `true` before the first segment is opened through, asked once, on the thread of
     ///              the flush that needs it; or `null` if nothing need
     WriteThrough(Kind kind, BooleanSupplier proof) {
+        this(kind, proof, null);
+    }
+
+    /// Creates the way to write through that starts at `kind`, or forces if it is `null`.
+    ///
+    /// @param proof    what must answer `true` before the first segment is opened through, asked once; or `null` if
+    ///                 nothing need
+    /// @param answered what gives the answer of `proof` where it is known without asking a device, and `null` where
+    ///                 it is not, for [#openAnswered(Path, BooleanSupplier)]; or `null` if nothing does
+    WriteThrough(Kind kind, BooleanSupplier proof, Supplier<Boolean> answered) {
         this.lock = new Object();
         this.kind = kind;
         this.proof = proof;
+        this.answered = answered;
+        this.opens = new AtomicInteger();
+        this.closes = new AtomicInteger();
     }
 
     /// {@return how a store in `directory` writes through in `mode`}
@@ -152,7 +174,10 @@ final class WriteThrough {
     /// nothing.
     static WriteThrough of(Mode mode, Path directory) {
         var kind = kindOf(mode, directory.getFileSystem() == FileSystems.getDefault());
-        return new WriteThrough(kind, kind == Kind.UNBUFFERED && mode == Mode.AUTO ? () -> WriteCache.proves(directory) : null);
+        if (kind == Kind.UNBUFFERED && mode == Mode.AUTO) {
+            return new WriteThrough(kind, () -> WriteCache.proves(directory), () -> WriteCache.provesIfKnown(directory));
+        }
+        return new WriteThrough(kind, null);
     }
 
     private static Kind kindOf(Mode mode, boolean defaultFileSystem) {
@@ -218,7 +243,59 @@ final class WriteThrough {
 
     /// {@return the handles opened so far, for tests}
     int opensForTests() {
-        return opens;
+        return opens.get();
+    }
+
+    /// {@return the handles closed so far, for tests}
+    int closesForTests() {
+        return closes.get();
+    }
+
+    /// {@return whether a segment is opened to write through before its first group needs it, on the thread that
+    /// prepares segments: only unbuffered on Windows, where the first open of a store costs its first group more than
+    /// a write through takes}
+    ///
+    /// Before the first unbuffered write of a store, the volume under it is named and the handle opened, cold native
+    /// calls that held the first durable commit after an open for 1.5 to 2 milliseconds where the write itself takes a
+    /// tenth of one; a force in its place took 1 to 4.5. A channel opened with `O_DIRECT` takes 0.04 to 0.2.
+    boolean opensEarly() {
+        return kind() == Kind.UNBUFFERED || opensEarlyForTests;
+    }
+
+    /// Opens the segment at `path` to write through as [#open(Path)] does, if no device need be asked first and the
+    /// handle is still wanted once the volume is named.
+    ///
+    /// It runs beside the flush that holds the log writer: a proof still pending is answered only from what the
+    /// process already knows of the device, and the round trip of a question to it is left to the first group.
+    ///
+    /// @param unwanted whether no one will take the handle, asked again after the volume is named, the slow part of
+    ///                 the opening, so an opening given up meanwhile opens no file
+    /// @return the handle, or `null` if no way is left, the device would have to be asked or the handle is unwanted
+    /// @throws IOException if the segment cannot be opened the current way, native memory for its handle included
+    Handle openAnswered(Path path, BooleanSupplier unwanted) throws IOException {
+        BooleanSupplier pending;
+        synchronized (lock) {
+            if (kind == null) {
+                return null;
+            }
+            pending = proof;
+        }
+        if (pending != null) {
+            // Outside the lock: naming the volume is native calls, which a flush asking for the way must not wait on
+            var answer = answered == null ? null : answered.get();
+            if (answer == null) {
+                return null;
+            }
+            synchronized (lock) {
+                if (proof == pending) {
+                    proof = null;
+                    if (!answer) {
+                        kind = null;
+                    }
+                }
+            }
+        }
+        return !unwanted.getAsBoolean() && enabled() ? open(path) : null;
     }
 
     /// Opens the segment at `path` to write through, the current way.
@@ -229,7 +306,7 @@ final class WriteThrough {
         if (!enabled()) {
             throw new IllegalStateException("The log forces its groups");
         }
-        opens++;
+        opens.incrementAndGet();
         try {
             return switch (kind()) {
                 case UNBUFFERED -> UnbufferedHandle.open(path, this);
@@ -355,6 +432,9 @@ final class WriteThrough {
 
         @Override
         public void close() throws IOException {
+            if (channel.isOpen()) {
+                owner.closes.incrementAndGet();
+            }
             channel.close();
         }
     }
@@ -469,6 +549,7 @@ final class WriteThrough {
                 return;
             }
             open = false;
+            owner.closes.incrementAndGet();
             int closed;
             try {
                 closed = (int) Kernel32.CLOSE_HANDLE.invokeExact(state, handle);
@@ -536,6 +617,12 @@ final class WriteThrough {
         /// [lasts for it][#lastsForProcess()], and by each call otherwise.
         static boolean proves(Path directory) {
             return ANSWERS.proves(directory);
+        }
+
+        /// {@return what [#proves(Path)] answers for `directory`, where the process knows it without asking a device;
+        /// `null` where a device would have to be asked}
+        static Boolean provesIfKnown(Path directory) {
+            return ANSWERS.provesIfKnown(directory);
         }
 
         /// Forgets the answers of every volume, for tests that count the questions sent to devices.
@@ -680,6 +767,19 @@ final class WriteThrough {
                 answers.put(volume, answer);
             }
             return answer.provesWriteThrough();
+        }
+
+        /// {@return what [#proves(Path)] answers for `directory` where that sends no question to a device, `null` where
+        /// it would}
+        ///
+        /// The volume is still named, which takes no round trip to its device.
+        Boolean provesIfKnown(Path directory) {
+            var volume = volumes.apply(directory);
+            if (volume == null) {
+                return false;
+            }
+            var known = answers.get(volume);
+            return known == null ? null : known.provesWriteThrough();
         }
 
         /// Forgets every answer.
