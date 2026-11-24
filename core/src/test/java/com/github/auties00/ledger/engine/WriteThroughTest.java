@@ -1086,6 +1086,44 @@ class WriteThroughTest {
 
         @Test
         @EnabledOnOs(OS.LINUX)
+        @DisplayName("on Linux a channel that refuses a write once a descriptor took the way's writes moves the log to O_DSYNC, not to forces")
+        void linuxChannelRefusesAfterDescriptor(@TempDir Path directory) throws Exception {
+            assumeDescriptors(directory);
+            var model = new TreeMap<String, String>();
+            var released = new CountDownLatch(1);
+            var way = WriteThrough.of(WriteThrough.Mode.DIRECT, directory);
+            try (var pool = IoPool.create(1);
+                 var ledger = ((LedgerBuilder) Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(NAMES).ioPool(pool))
+                         .segmentSize(SEGMENT)
+                         .writeThrough(way)
+                         .build()) {
+                var log = log(ledger);
+                var commits = onVirtualThread(() -> reachDescriptor(ledger, model, pool, released));
+                assertEquals(WriteThrough.Kind.DIRECT, log.writeThroughKind());
+                // A file system whose reported block size is larger than the device's logical block refuses the
+                // channel's writes, which the writes of platform threads take
+                way.channelRefusesForTests = true;
+                released.countDown();
+                for (var i = 0; i < 400 && log.writeThroughKind() == WriteThrough.Kind.DIRECT; i++) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                assertEquals(WriteThrough.Kind.DSYNC, log.writeThroughKind(), "the refusal did not move the log one way down");
+                var through = log.writtenThrough();
+                for (var i = 0; i < 200 && log.writtenThrough() == through; i++) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                assertTrue(log.writtenThrough() > through, "the log forces its groups after the refusal");
+                assertEquals(WriteThrough.Kind.DSYNC, log.writeThroughKind());
+            } finally {
+                released.countDown();
+            }
+            try (var reopened = open(directory, WriteThrough.Mode.OFF)) {
+                assertEquals(model, contents(reopened));
+            }
+        }
+
+        @Test
+        @EnabledOnOs(OS.LINUX)
         @DisplayName("on Linux an interrupt of a virtual thread writing through a descriptor leaves its commit durable and the interrupt to the thread")
         void linuxDescriptorInterrupted(@TempDir Path directory) throws Exception {
             assumeDescriptors(directory);
@@ -1466,6 +1504,48 @@ class WriteThroughTest {
             assertFalse(through.enabled());
             assertEquals(1, asked.get());
             assertThrows(IllegalStateException.class, () -> through.open(Path.of("segment")));
+        }
+
+        @Test
+        @DisplayName("are refused by a descriptor handle's channel that fails a write before it took one, whatever the descriptor took, and not after")
+        void channelRefusal() throws Exception {
+            var disk = CrashFileSystem.create();
+            var refuse = new AtomicBoolean();
+            disk.intercept((path, kind) -> {
+                if (kind == ChangeInterceptor.ChangeKind.WRITE && refuse.get()) {
+                    throw new IOException("Invalid argument");
+                }
+            });
+            var file = disk.getPath("/segment");
+            Files.write(file, new byte[4 * LogWriter.ALIGNMENT]);
+            refuse.set(true);
+            var way = new WriteThrough(WriteThrough.Kind.DIRECT, null);
+            var block = new byte[LogWriter.ALIGNMENT];
+            // The test's own thread is a platform thread, which writes through the channel
+            var handle = new WriteThrough.PosixHandle(FileChannel.open(file, StandardOpenOption.WRITE), file, way);
+            try {
+                assertThrows(WriteThrough.Refused.class, () -> handle.write(block, block.length, 0));
+                refuse.set(false);
+                handle.write(block, block.length, 0);
+                refuse.set(true);
+                var failure = assertThrows(IOException.class, () -> handle.write(block, block.length, LogWriter.ALIGNMENT));
+                assertFalse(failure instanceof WriteThrough.Refused, "a channel that took a write refused the way");
+            } finally {
+                handle.close();
+            }
+            // The channel of the next segment's handle took a write of the way already
+            var next = new WriteThrough.PosixHandle(FileChannel.open(file, StandardOpenOption.WRITE), file, way);
+            try {
+                var failure = assertThrows(IOException.class, () -> next.write(block, block.length, 2L * LogWriter.ALIGNMENT));
+                assertFalse(failure instanceof WriteThrough.Refused, "a channel of a proven way refused it");
+                refuse.set(false);
+                assertThrows(ClosedChannelException.class, () -> {
+                    next.close();
+                    next.write(block, block.length, 0);
+                });
+            } finally {
+                next.close();
+            }
         }
 
         @Test

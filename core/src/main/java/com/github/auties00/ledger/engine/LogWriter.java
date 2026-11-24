@@ -2354,7 +2354,8 @@ final class LogWriter {
     /// makes each of its pages dirty again whatever the failed write left on the device, so a force that succeeds
     /// makes the group durable, and one that fails stops the writer as it always does. Until a write has succeeded in
     /// a way, a failure moves the writer one way down instead, and the next way writes the same bytes at the same
-    /// offsets.
+    /// offsets; so does a [WriteThrough.Refused] after one has, a channel refusing what the descriptor beside it
+    /// took.
     private void writeThrough() throws IOException {
         var start = position;
         lastDrainStart = start;
@@ -2370,11 +2371,12 @@ final class LogWriter {
                 return;
             } catch (ClosedByInterruptException _) {
                 reopen();
-            } catch (IOException _) {
-                if (wayProven) {
+            } catch (IOException exception) {
+                if (wayProven && !(exception instanceof WriteThrough.Refused)) {
                     break;
                 }
                 writeThrough.downgrade();
+                wayProven = false;
                 closeQuietly(throughFile);
                 throughFile = openThrough();
             }

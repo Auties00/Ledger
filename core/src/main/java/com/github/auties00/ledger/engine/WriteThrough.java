@@ -57,7 +57,9 @@ import java.util.function.Supplier;
 ///   scheduler of one carrier has none to spare, so there every virtual thread writes through the channel.
 ///   Through the descriptor the kernel checks the alignment of a write against the device's logical block, not against
 ///   the block size the file system reports as the channel does, so it may take a write the channel would refuse,
-///   durable all the same under `O_DSYNC`.
+///   durable all the same under `O_DSYNC`. A write the channel refuses before it has taken one of the writer's is
+///   therefore a refusal of the way, whatever the descriptor took ([Refused]): the writer moves down to `O_DSYNC`
+///   alone, which every thread writes through, rather than to forces.
 /// - on Windows with `FILE_FLAG_NO_BUFFERING` and `FILE_FLAG_WRITE_THROUGH`, through the Windows API, only while the
 ///   module has native access: for that pair Windows documents that it also requests a write-through of the drive's
 ///   cache, and for `FILE_FLAG_WRITE_THROUGH` alone it does not. It adds that not all hardware supports the request,
@@ -154,6 +156,9 @@ final class WriteThrough {
     // The writes in a row, up to SHRINK_AFTER, that took at most half of the buffer, and the most bytes one of them took
     private int smallWrites;
     private long smallPeak;
+    // Whether the channel of a PosixHandle of this way took a write, so a write it refuses afterwards fails as any
+    // other rather than as a refusal of the way; owned by the flush that holds the log writer
+    private boolean channelProven;
     // What answers the proof without asking a device, null where it would have to; null if nothing does
     private final Supplier<Boolean> answered;
     // The handles opened and closed, for tests: a handle may be opened beside the flush that writes through it
@@ -164,6 +169,9 @@ final class WriteThrough {
     /// Makes [#opensEarly()] answer `true` whatever the way, for tests of the opening on a file system other than
     /// Windows' own.
     volatile boolean opensEarlyForTests;
+    /// Makes the channel of every [PosixHandle] of this way refuse its writes as one that never took a write does, as on
+    /// a file system whose reported block size is larger than [LogWriter#ALIGNMENT], for tests.
+    volatile boolean channelRefusesForTests;
 
     /// Creates the way to write through that starts at `kind`, or forces if it is `null`.
     ///
@@ -415,6 +423,8 @@ final class WriteThrough {
         ///         left some, all or none of the bytes written; only the write of a channel is interruptible, which a
         ///         [PosixHandle] makes for a platform thread and for a virtual one past [Posix#LIMIT]
         /// @throws ClosedChannelException if the handle was closed before
+        /// @throws Refused if a [PosixHandle]'s channel failed the write before it took any of the way, which the way
+        ///                 then cannot be held to, whatever its descriptor took
         /// @throws IOException if the write failed, which may have left some of the bytes written, or if the buffer the
         ///                     bytes are copied into could not be allocated
         void write(byte[] bytes, int length, long position) throws IOException;
@@ -424,6 +434,18 @@ final class WriteThrough {
 
         /// Closes the handle.
         void close() throws IOException;
+    }
+
+    /// A write that a [PosixHandle]'s channel failed before the channel took any write of the way: the writer moves to
+    /// the next way down, as after a refusal of its first write, even when the descriptor took the writes before.
+    ///
+    /// The descriptor and the channel check the alignment of a write against different blocks, so a write through the
+    /// descriptor proves nothing of the channel, which the writes of platform threads, and of virtual threads past
+    /// [Posix#LIMIT], take.
+    static final class Refused extends IOException {
+        Refused(IOException cause) {
+            super("The channel of a log segment refused a write through", cause);
+        }
     }
 
     /// A channel opened with [StandardOpenOption#DSYNC], and `ExtendedOpenOption.DIRECT` where no [PosixHandle]
@@ -485,9 +507,10 @@ final class WriteThrough {
     /// the calls of the C library, which the first such write of the process starts on a thread of its own: until then
     /// the channel takes the writes. A descriptor that fails to open, or a write through it that fails, leaves the rest
     /// of the handle's writes to the channel, which writes the failed write's group again from its start, at the same
-    /// offsets. Only the flush that holds the log writer writes and closes a handle, so no write runs while its descriptor
-    /// closes; a handle dropped without a close has its descriptor closed by [Libc#CLEANER], and no descriptor is closed
-    /// twice, as a second close could close a file the number was given to since.
+    /// offsets. A write the channel fails before it took one of the way's throws [Refused]. Only the flush that holds
+    /// the log writer writes and closes a handle, so no write runs while its descriptor closes; a handle dropped without
+    /// a close has its descriptor closed by [Libc#CLEANER], and no descriptor is closed twice, as a second close could
+    /// close a file the number was given to since.
     static final class PosixHandle implements Handle {
         private static final int EINTR = 4;
         private final FileChannel channel;
@@ -537,7 +560,20 @@ final class WriteThrough {
                 }
                 channelWrites++;
             }
-            ChannelHandle.write(channel, owner, bytes, length, position);
+            if (owner.channelRefusesForTests) {
+                throw new Refused(new IOException("A channel that refuses every write, for tests"));
+            }
+            try {
+                ChannelHandle.write(channel, owner, bytes, length, position);
+            } catch (ClosedChannelException exception) {
+                throw exception;
+            } catch (IOException exception) {
+                if (!owner.channelProven) {
+                    throw new Refused(exception);
+                }
+                throw exception;
+            }
+            owner.channelProven = true;
         }
 
         /// {@return whether the descriptor is open, opening it the first time the calls are linked}
