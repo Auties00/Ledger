@@ -372,10 +372,16 @@ class ProcessFlusherTest {
 
     @Test
     @DisplayName("lets at most its places spin at once, none on fewer than four processors by default")
-    void spinnerPlaces() {
+    void spinnerPlaces() throws InterruptedException {
         ProcessFlusher.maxSpinnersForTests(-1);
         var processors = Runtime.getRuntime().availableProcessors();
         assertEquals(Math.min(2, processors / 4), ProcessFlusher.maxSpinners());
+        // The places are the process's: a thread of an earlier test, or a commit of one, may still spin for a moment
+        var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (ProcessFlusher.spinnersForTests() != 0) {
+            assertTrue(System.nanoTime() < deadline, "the spinners of earlier tests never stopped");
+            Thread.sleep(1);
+        }
         ProcessFlusher.maxSpinnersForTests(1);
         assertTrue(ProcessFlusher.takeSpinner());
         assertFalse(ProcessFlusher.takeSpinner());
@@ -385,6 +391,18 @@ class ProcessFlusherTest {
         ProcessFlusher.maxSpinnersForTests(0);
         assertFalse(ProcessFlusher.takeSpinner());
         assertEquals(0, ProcessFlusher.spinnersForTests());
+    }
+
+    @Test
+    @DisplayName("lets commits waiting for durability spin by default only on Windows, and wherever places are set for tests")
+    void waiterSpinners() {
+        ProcessFlusher.maxSpinnersForTests(-1);
+        var windows = System.getProperty("os.name", "").startsWith("Windows");
+        assertEquals(windows && ProcessFlusher.maxSpinners() > 0, ProcessFlusher.waitersSpin());
+        ProcessFlusher.maxSpinnersForTests(1);
+        assertTrue(ProcessFlusher.waitersSpin());
+        ProcessFlusher.maxSpinnersForTests(0);
+        assertFalse(ProcessFlusher.waitersSpin());
     }
 
     @Test

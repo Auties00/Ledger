@@ -31,7 +31,8 @@ import java.util.concurrent.locks.LockSupport;
 /// The caller that gives it a lane then unparks a running thread: on Linux that issues no system call, and on Windows
 /// it sets an event no thread waits on, so no thread is readied, where waking a parked thread took 6% of a lone
 /// durable commit's time on Linux and about 8 microseconds of its processor on Windows. At most [#maxSpinners()]
-/// threads of the process spin at once, none on fewer than four processors.
+/// threads of the process spin at once, none on fewer than four processors. On Windows the commits on platform threads
+/// that wait for a flush take the same places ([#waitersSpin()]).
 ///
 /// It is safe for concurrent use.
 final class ProcessFlusher {
@@ -49,6 +50,9 @@ final class ProcessFlusher {
     // The most threads that spin at once: a quarter of the processors the JVM started with, at most 2, so asking costs
     // no system call on the paths that ask for every task
     private static final int MAX_SPINNERS = Math.min(2, Runtime.getRuntime().availableProcessors() / 4);
+    // Whether the commits waiting for a flush take places among the spinners by default: only on Windows (see
+    // waitersSpin)
+    private static final boolean WAITERS_SPIN = System.getProperty("os.name", "").startsWith("Windows");
     // The most threads that spin at once for tests, or -1 for the default of maxSpinners()
     private static volatile int spinnersForTests = -1;
     // Guards process
@@ -102,8 +106,9 @@ final class ProcessFlusher {
         return new Lane(this);
     }
 
-    /// {@return the most threads that spin at once: those of the process's flushers waiting for a lane, and the
-    /// flushes of the log waiting for a commit to write its own group}
+    /// {@return the most threads that spin at once: those of the process's flushers waiting for a lane, the flushes of
+    /// the log waiting for a commit to write its own group and, where [#waitersSpin()], the commits waiting for a group
+    /// being written to be durable}
     ///
     /// A quarter of the processors, at most 2: a process holding many stores leaves the other processors to the
     /// application and to the checkpoints, and on fewer than four processors none spins, where a spinning thread would
@@ -113,7 +118,23 @@ final class ProcessFlusher {
         return forTests >= 0 ? forTests : MAX_SPINNERS;
     }
 
+    /// {@return whether the commits on platform threads waiting for a group being written to be durable may spin, each
+    /// taking a place among the [#maxSpinners()] while it does}
+    ///
+    /// Only on Windows, where a parked thread takes long enough to run again that skipping its wake pays, and only
+    /// where any thread spins; with a number of places set for tests, wherever that number is not 0. Linux runs a woken
+    /// thread again within microseconds, so a spinning commit saves next to nothing there, while the processor it holds
+    /// for a whole force is one the flush and the commits on their way back need once the forces are short enough to
+    /// keep every processor busy: 8 committers on 4 processors on Linux spent 35% more processor time per commit, all
+    /// of it in the committing threads, and committed 2.6% fewer, where Windows committed 6% more.
+    static boolean waitersSpin() {
+        var forTests = spinnersForTests;
+        return forTests >= 0 ? forTests > 0 : WAITERS_SPIN && MAX_SPINNERS > 0;
+    }
+
     /// {@return whether the caller may spin, which takes one of the [#maxSpinners()] places until [#releaseSpinner()]}
+    ///
+    /// It reads the count before it adds to it, so callers that find every place taken write nothing.
     static boolean takeSpinner() {
         var max = maxSpinners();
         while (true) {

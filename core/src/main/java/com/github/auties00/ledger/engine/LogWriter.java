@@ -6,6 +6,8 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
@@ -25,6 +27,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
@@ -285,6 +288,13 @@ final class LogWriter {
     /// What [#flushGroups(long, boolean)] returns when it leaves the group to the commit expected to lead
     /// ([#awaitLead()]).
     private static final int DEFERS = 2;
+    /// The longest a commit on a platform thread spins for its durability before it parks, in nanoseconds: it spins
+    /// for one and a half forces at most, while its frame is in the group being written or the flush waits for the
+    /// commits to come back, so a wait that outlasts that is one a wake costs little against.
+    private static final long MAX_DURABLE_SPIN = 300_000;
+    /// How long a commit spinning for its durability spins before it yields its processor between looks, in
+    /// nanoseconds: the commits on their way back to the next group may need that processor.
+    private static final long DURABLE_BUSY_SPIN = 20_000;
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
@@ -420,8 +430,9 @@ final class LogWriter {
     // The arrays the output grew into, for tests; written by the flush task only
     private volatile long outputAllocations;
     // How long the write and force of a group took, or its write through, a moving average in nanoseconds of the groups
-    // after the first, each at most four times the average before it, or 0 before the second group
-    private long forceNanos;
+    // after the first, each at most four times the average before it, or 0 before the second group; written by the
+    // flush task, read by the commits deciding whether to spin
+    private volatile long forceNanos;
     // The commits the last published group woke, its leader included; read by commits deciding whether to lead
     private volatile int lastGroupWaiters;
     // Whether a group was durable since the writer opened, after which no flush lingers; owned by the flush task
@@ -481,8 +492,10 @@ final class LogWriter {
     // The commits waiting for room in the queue; written under the queue lock
     private volatile int queueWaiters;
     private volatile long lastQueued;
-    // The sequence of the last frame of the group a flush took last, which a commit waiting for running to be free
-    // reads to tell a flush that writes its frame from one that gives it back
+    // The sequence of the last frame of the group a flush took last, written before it writes the group: a commit at or
+    // below it is in a group being written, or durable. A commit waiting for running to be free reads it to tell a
+    // flush that writes its frame from one that gives it back, and one deciding whether to spin for its durability to
+    // tell a wait for the group being written from a longer one
     private volatile long taken;
     // The sequence of the frame queued last if it was queued alone by the thread of the one commit the last group woke,
     // which is then expected to wait for it at once and write its group itself, so the flush of the lane waits for it
@@ -547,6 +560,25 @@ final class LogWriter {
     private final Condition durabilityChanged;
     private volatile long durable;
     private long written;
+    // The waiting commits wakes found durable, or failed, and the ones of them they unparked, the others having spun
+    // rather than parked, for tests; written by the flush task, and by a stop
+    private volatile long wokenWaiters;
+    private volatile long unparkedWaiters;
+    // The commits that spun until a wake found them durable, and the ones that parked after their spin, for tests
+    private final AtomicLong spinsWoken;
+    private final AtomicLong spinsParked;
+    /// Runs on the thread of a commit that may spin for its durability, after it found the commit not durable and
+    /// before it adds itself to the waiters; for tests that publish a group at that point.
+    volatile Runnable registerHookForTests;
+    /// Runs on the thread of a commit whose spin for its durability ended without a wake, before it announces that it
+    /// parks; for tests that publish a group at that point.
+    volatile Runnable spinEndHookForTests;
+    /// Runs on the thread of a waiting commit after it read the commit not durable and the writer healthy, before each
+    /// park; for tests that publish a group at that point.
+    volatile Runnable parkHookForTests;
+    /// How long a commit that may spin for its durability spins, in nanoseconds, in place of the budget of the force,
+    /// or -1 for that budget; for tests that need a spin to outlast a step of theirs, or to end at once.
+    volatile long spinBudgetForTests = -1;
     private volatile LedgerIoException failure;
 
     /// Prepares a segment to write frames to.
@@ -596,6 +628,8 @@ final class LogWriter {
         this.scheduled = new AtomicBoolean();
         this.running = new AtomicBoolean();
         this.waiters = new ConcurrentLinkedQueue<>();
+        this.spinsWoken = new AtomicLong();
+        this.spinsParked = new AtomicLong();
         this.durabilityLock = new ReentrantLock();
         this.durabilityChanged = durabilityLock.newCondition();
         this.durable = durable;
@@ -2471,20 +2505,34 @@ final class LogWriter {
         }
     }
 
-    /// Wakes the commits waiting for a sequence at or below `sequence`.
+    /// Wakes the commits waiting for a sequence at or below `sequence`, after [#durable] or [#failure] was written: it
+    /// unparks only those that park or are about to, while those that spin see [Waiter#woken] themselves.
     ///
-    /// @return the commits it woke
+    /// A commit that spins announces a park ([Waiter#parking]) before it reads `durable` and `failure` again, and the
+    /// wake reads the announcement after the caller wrote one of them: the two writes and the two reads are of
+    /// volatile fields, so either the commit sees what the caller wrote and does not park, or the wake sees the
+    /// announcement and unparks it.
+    ///
+    /// @return the commits it woke, unparked or not
     private int wake(long sequence) {
         var woken = 0;
+        var unparked = 0;
         for (var iterator = waiters.iterator(); iterator.hasNext(); ) {
             var waiter = iterator.next();
             if (waiter.sequence <= sequence) {
                 waiter.woken = true;
                 iterator.remove();
-                LockSupport.unpark(waiter.thread);
+                if (waiter.parking) {
+                    LockSupport.unpark(waiter.thread);
+                    unparked++;
+                }
                 lastWoken = waiter.thread;
                 woken++;
             }
+        }
+        if (woken > 0) {
+            wokenWaiters += woken;
+            unparkedWaiters += unparked;
         }
         return woken;
     }
@@ -2565,7 +2613,8 @@ final class LogWriter {
         }
     }
 
-    /// Parks the caller until the commit at `sequence` is durable, or `timeout` nanoseconds pass if it is not negative.
+    /// Parks the caller until the commit at `sequence` is durable, or `timeout` nanoseconds pass if it is not negative;
+    /// a wait with no timeout on a platform thread may spin first ([#spinBudget(long)]).
     ///
     /// A force wakes exactly the commits it made durable, each of which only reads [#durable]: no lock is handed from
     /// one waiter to the next, which with hundreds of waiters would cost more than the force.
@@ -2586,19 +2635,53 @@ final class LogWriter {
                 return true;
             }
         }
-        var waiter = new Waiter(Thread.currentThread(), sequence);
-        waiters.add(waiter);
-        // A lane that lingers writes the group for a commit that does not write its own
-        wakeLingerer();
-        if (cohortArmed) {
-            registered.increment();
+        var spinBudget = timeout < 0 ? spinBudget(sequence) : 0;
+        if (spinBudget > 0) {
+            var hook = registerHookForTests;
+            if (hook != null) {
+                hook.run();
+            }
         }
+        var waiter = new Waiter(Thread.currentThread(), sequence, spinBudget <= 0);
+        var spinning = false;
         try {
+            waiters.add(waiter);
+            // A lane that lingers writes the group for a commit that does not write its own
+            wakeLingerer();
+            if (cohortArmed) {
+                registered.increment();
+            }
+            if (spinBudget > 0) {
+                // A wake that ran before the add made durable visible and could not find the waiter: the commit is
+                // durable and spins for nothing; one that runs after the add finds it and counts it
+                if (durable < sequence && ProcessFlusher.takeSpinner()) {
+                    spinning = true;
+                    var woken = spin(waiter, spinBudget);
+                    ProcessFlusher.releaseSpinner();
+                    spinning = false;
+                    if (woken && durable >= sequence) {
+                        spinsWoken.incrementAndGet();
+                        return true;
+                    }
+                    var hook = spinEndHookForTests;
+                    if (hook != null) {
+                        hook.run();
+                    }
+                    spinsParked.incrementAndGet();
+                }
+                // Before the loop below reads durable and failure again, and before every park: a wake that missed this
+                // write is one whose durable or failure the loop reads (see wake)
+                waiter.parking = true;
+            }
             var deadline = timeout < 0 ? 0 : System.nanoTime() + timeout;
             while (durable < sequence) {
                 checkHealthy();
                 if (Thread.interrupted()) {
                     throw new InterruptedException();
+                }
+                var hook = parkHookForTests;
+                if (hook != null) {
+                    hook.run();
                 }
                 if (timeout < 0) {
                     LockSupport.park(this);
@@ -2612,6 +2695,9 @@ final class LogWriter {
             }
             return true;
         } finally {
+            if (spinning) {
+                ProcessFlusher.releaseSpinner();
+            }
             if (!waiter.woken) {
                 waiters.remove(waiter);
             }
@@ -2659,15 +2745,111 @@ final class LogWriter {
         }
     }
 
+    /// {@return how long the commit at `sequence`, waiting with no timeout, spins before it parks, in nanoseconds, or 0
+    /// if it parks at once}
+    ///
+    /// A commit on a platform thread spins while its wait is short: its frame is in the group being written, or the
+    /// flush waits for the commits the last group woke, its own among them, before it takes the next group. It spins
+    /// one and a half forces at most, and at most [#MAX_DURABLE_SPIN]. The flush then skips the wake of a thread
+    /// that, parked, takes a system call of the flush between two groups and the time the system takes to run the
+    /// thread again before its next commit joins the next group. A virtual thread parks at once: spinning, it would hold
+    /// a carrier the commits it waits for may need. Every commit parks at once where commits do not spin
+    /// ([ProcessFlusher#waitersSpin()]), as outside Windows, and one that finds every place among the process's
+    /// spinners taken parks after it joins the waiters.
+    private long spinBudget(long sequence) {
+        if (!ProcessFlusher.waitersSpin() || Thread.currentThread().isVirtual()
+                || (sequence > taken && !cohortArmed)) {
+            return 0;
+        }
+        var forTests = spinBudgetForTests;
+        if (forTests >= 0) {
+            return forTests;
+        }
+        var force = forceNanos;
+        return Math.min(force + force / 2, MAX_DURABLE_SPIN);
+    }
+
+    /// Spins until a wake finds `waiter` durable, the writer stops, the thread is interrupted or `budget` nanoseconds
+    /// pass, then yields between looks after [#DURABLE_BUSY_SPIN].
+    ///
+    /// It looks for the wake rather than for [#durable]: the wake counts the commits it finds, and the flush waits for
+    /// that many to come back before it takes the next group.
+    ///
+    /// @return whether a wake found it, which a stop does too
+    private boolean spin(Waiter waiter, long budget) {
+        var start = System.nanoTime();
+        while (!waiter.woken) {
+            if (failure != null || Thread.currentThread().isInterrupted()) {
+                return false;
+            }
+            var spun = System.nanoTime() - start;
+            if (spun >= budget) {
+                return false;
+            }
+            if (spun < DURABLE_BUSY_SPIN) {
+                Thread.onSpinWait();
+            } else {
+                Thread.yield();
+            }
+        }
+        return true;
+    }
+
+    /// {@return whether a flush holds [#running], for tests}
+    ///
+    /// A wake runs inside a flush that holds it and counts the commits it woke after it unparked them, so a test that
+    /// saw those commits return reads the counters once no flush holds it.
+    boolean flushRunningForTests() {
+        return running.get();
+    }
+
+    /// {@return the waiting commits wakes found durable since the writer opened, unparked or not, for tests}
+    long wokenWaitersForTests() {
+        return wokenWaiters;
+    }
+
+    /// {@return the waiting commits wakes unparked since the writer opened, for tests}
+    long unparkedWaitersForTests() {
+        return unparkedWaiters;
+    }
+
+    /// {@return the commits that spun until a wake found them durable, for tests}
+    long spinsWokenForTests() {
+        return spinsWoken.get();
+    }
+
+    /// {@return the commits that parked after a spin a wake did not end, for tests}
+    long spinsParkedForTests() {
+        return spinsParked.get();
+    }
+
     /// A commit waiting for durability.
     private static final class Waiter {
+        private static final VarHandle PARKING;
+
+        static {
+            try {
+                PARKING = MethodHandles.lookup().findVarHandle(Waiter.class, "parking", boolean.class);
+            } catch (ReflectiveOperationException exception) {
+                throw new ExceptionInInitializerError(exception);
+            }
+        }
+
         final Thread thread;
         final long sequence;
         volatile boolean woken;
+        // Whether the thread parks or is about to, written before it reads durable and failure again: a wake unparks
+        // only such a thread, as one that spins sees woken itself
+        volatile boolean parking;
 
-        Waiter(Thread thread, long sequence) {
+        /// Creates the waiter of a commit that parks at once, or that may spin first if not `parking`.
+        ///
+        /// The value is written without a fence of its own: the add to the waiters that publishes the waiter is one,
+        /// and a commit that parks at once writes it no more.
+        Waiter(Thread thread, long sequence, boolean parking) {
             this.thread = thread;
             this.sequence = sequence;
+            PARKING.set(this, parking);
         }
     }
 
