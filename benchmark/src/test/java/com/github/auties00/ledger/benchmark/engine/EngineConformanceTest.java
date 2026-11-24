@@ -152,6 +152,48 @@ class EngineConformanceTest {
 
     @ParameterizedTest(name = "{0}, sealed={1}")
     @MethodSource("engines")
+    @DisplayName("gets, read views and scans hand out arrays the caller owns, in every key space")
+    void callerOwnsArrays(EngineKind kind, boolean sealed, @TempDir Path directory) throws IOException {
+        try (var engine = open(kind, sealed, directory)) {
+            var batch = new WriteBatch();
+            for (var keyspace : Keyspace.values()) {
+                batch.put(keyspace, bytes(1), value("one"));
+                batch.put(keyspace, bytes(2), value("two"));
+            }
+            engine.write(batch, Durability.DURABLE);
+            for (var keyspace : Keyspace.values()) {
+                Arrays.fill(engine.get(keyspace, bytes(1)), (byte) 0);
+                assertArrayEquals(value("one"), engine.get(keyspace, bytes(1)), keyspace.name());
+                for (var descending : List.of(false, true)) {
+                    engine.scan(keyspace, bytes(0), bytes(3), descending, 100, (key, value) -> {
+                        Arrays.fill(key, (byte) 9);
+                        Arrays.fill(value, (byte) 0);
+                        return true;
+                    });
+                    var entries = new ArrayList<String>();
+                    engine.scan(keyspace, bytes(0), bytes(3), false, 100, (key, value) -> {
+                        entries.add(HexFormat.of().formatHex(key) + "=" + new String(value));
+                        return true;
+                    });
+                    assertEquals(List.of("01=one", "02=two"), entries, keyspace.name());
+                }
+                Engine.ReadView view;
+                try {
+                    view = engine.openReadView();
+                } catch (UnsupportedOperationException exception) {
+                    continue;
+                }
+                try (view) {
+                    Arrays.fill(view.get(keyspace, bytes(2)), (byte) 0);
+                    assertArrayEquals(value("two"), view.get(keyspace, bytes(2)), keyspace.name());
+                }
+                assertArrayEquals(value("two"), engine.get(keyspace, bytes(2)), keyspace.name());
+            }
+        }
+    }
+
+    @ParameterizedTest(name = "{0}, sealed={1}")
+    @MethodSource("engines")
     @DisplayName("a read view keeps seeing the version it opened on")
     void readViewIsolation(EngineKind kind, boolean sealed, @TempDir Path directory) throws IOException {
         try (var engine = open(kind, sealed, directory)) {

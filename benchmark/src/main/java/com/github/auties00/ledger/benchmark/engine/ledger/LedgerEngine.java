@@ -6,6 +6,7 @@ import com.github.auties00.ledger.KeyRange;
 import com.github.auties00.ledger.Ledger;
 import com.github.auties00.ledger.Snapshot;
 import com.github.auties00.ledger.ValueCodec;
+import com.github.auties00.ledger.View;
 import com.github.auties00.ledger.benchmark.engine.Durability;
 import com.github.auties00.ledger.benchmark.engine.Engine;
 import com.github.auties00.ledger.benchmark.engine.EngineSettings;
@@ -25,6 +26,11 @@ import java.util.Locale;
 ///
 /// A durable write commits and waits for its commit to be durable, so concurrent writers share forces; a deferred
 /// write only commits. Range deletes are Ledger's own, which records the range rather than visiting its keys.
+///
+/// Every read hands out arrays the caller owns, as [Engine] requires. A resident key space holds its values as the
+/// arrays that were put, which its typed reads return, so a get clones the value and a scan copies the encoded key
+/// and value, one copy each, as every other engine makes. A paged key space's typed reads already copy keys and values
+/// out of the leaf, blob or run that holds them.
 public final class LedgerEngine implements Engine {
     // Every store of the benchmark opens under the same key, so a template opens in the next run
     private static final byte[] KEY = new byte[32];
@@ -108,17 +114,40 @@ public final class LedgerEngine implements Engine {
 
     @Override
     public byte[] get(Keyspace keyspace, byte[] key) {
-        return ledger.get(keyspaces.get(keyspace), key).orElse(null);
+        return get(ledger, keyspaces.get(keyspace), key);
+    }
+
+    /// {@return the value `view` holds under `key`, in an array the caller owns, or `null` if there is none}
+    ///
+    /// A resident key space's value is cloned, as MVStore's map value is; a read of one whose loader has not reached
+    /// the key decodes it from the tree into a new array, which the clone then copies again.
+    private static byte[] get(View view, com.github.auties00.ledger.Keyspace<byte[], byte[]> keyspace, byte[] key) {
+        var value = view.get(keyspace, key).orElse(null);
+        return value != null && resident(keyspace) ? value.clone() : value;
+    }
+
+    /// {@return whether `keyspace` holds its values as the arrays that were put, which its typed reads hand out}
+    private static boolean resident(com.github.auties00.ledger.Keyspace<?, ?> keyspace) {
+        return keyspace.residency() == com.github.auties00.ledger.Keyspace.Residency.RESIDENT;
     }
 
     @Override
     public int scan(Keyspace keyspace, byte[] from, byte[] to, boolean descending, int limit, EntryVisitor visitor) {
-        var range = KeyRange.between(from, to);
+        var mapped = keyspaces.get(keyspace);
+        var range = descending ? KeyRange.between(from, to).reversed() : KeyRange.between(from, to);
         var visited = new int[1];
-        ledger.forEachEncoded(keyspaces.get(keyspace), descending ? range.reversed() : range, (key, value) -> {
-            visited[0]++;
-            return visitor.visit(bytes(key), bytes(value)) && visited[0] < limit;
-        });
+        if (resident(mapped)) {
+            ledger.forEachEncoded(mapped, range, (key, value) -> {
+                visited[0]++;
+                return visitor.visit(bytes(key), bytes(value)) && visited[0] < limit;
+            });
+        } else {
+            // The typed scan, as Cobalt's tables scan, which copies keys and values out of the store's own arrays
+            ledger.forEach(mapped, range, (key, value) -> {
+                visited[0]++;
+                return visitor.visit(key, value) && visited[0] < limit;
+            });
+        }
         return visited[0];
     }
 
@@ -166,7 +195,7 @@ public final class LedgerEngine implements Engine {
             implements ReadView {
         @Override
         public byte[] get(Keyspace keyspace, byte[] key) {
-            return snapshot.get(keyspaces.get(keyspace), key).orElse(null);
+            return LedgerEngine.get(snapshot, keyspaces.get(keyspace), key);
         }
 
         @Override
