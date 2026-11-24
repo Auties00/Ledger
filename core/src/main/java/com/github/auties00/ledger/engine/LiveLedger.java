@@ -1951,9 +1951,14 @@ public final class LiveLedger implements Ledger {
         do {
             commit = commit.next;
             if (commit.failure != null) {
+                // Its thread throws the failure rather than waiting for the frame
                 batch.add(FrameBody.COMMIT, commit.sequence, new FrameBody(), 0, 0, 0, false);
             } else {
+                var frames = batch.size();
                 commit.applier.queueFrame(batch);
+                if (batch.size() > frames) {
+                    batch.committedBy(commit.owner);
+                }
             }
         } while (commit != end);
         try {

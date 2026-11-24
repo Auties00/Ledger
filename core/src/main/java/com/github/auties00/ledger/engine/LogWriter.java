@@ -264,6 +264,24 @@ final class LogWriter {
     /// nanoseconds: the durable removal that follows a deferred one when a chat is cleared comes 0.2 to 0.35 ms after
     /// it.
     static final long LINGER_NANOS = 500_000;
+    /// The longest the flush of the store's lane waits for a commit expected to write its own group to start it, in
+    /// nanoseconds: such a commit is microseconds from its wait when its append hands the flush to a lane whose thread
+    /// was running or spinning, and a flush that took its group instead would leave it parked until the force, then
+    /// cost the wake of its thread.
+    static final long LEAD_WAIT = 50_000;
+    /// How long of [#LEAD_WAIT] a flush spins before it yields its processor between looks, in nanoseconds.
+    private static final long LEAD_SPIN = 5_000;
+    /// The waits for a commit to lead in a row that ran out past which they are turned off no longer: after the n-th,
+    /// 2 to the power of n groups are published with no commit expected to lead.
+    private static final int MAX_LEAD_MISSES = 6;
+    /// What [#flushGroups(long, boolean)] returns when it stopped for none of the reasons below: it wrote the groups it
+    /// could.
+    private static final int WROTE = 0;
+    /// What [#flushGroups(long, boolean)] returns when it stopped to linger ([#linger(long)]).
+    private static final int LINGERS = 1;
+    /// What [#flushGroups(long, boolean)] returns when it leaves the group to the commit expected to lead
+    /// ([#awaitLead()]).
+    private static final int DEFERS = 2;
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
@@ -275,6 +293,9 @@ final class LogWriter {
     // Whether a task waits for a thread of the pool, which a flush of the pool gives up its thread to, or null on a lane
     // of the process's flusher, where no task of another store waits
     private final BooleanSupplier poolQueued;
+    // The executor when it is a lane of the process's flusher, whose flush waits for a commit expected to lead; null
+    // on a pool, where the wait would hold a thread other stores share
+    private final ProcessFlusher.Lane lane;
     private final long commitWindowNanos;
     // How the flush task opens segments to write groups through; owned by it
     private final WriteThrough writeThrough;
@@ -325,6 +346,9 @@ final class LogWriter {
     /// Runs at the start of every flush the executor runs, before it looks for a group; for tests that hold it back, so
     /// a commit that waits alone writes its own group.
     volatile Runnable flushHookForTests;
+    /// Runs in a flush the executor runs, holding [#running], before each look at the queue for a group to take; for
+    /// tests that hold [#running] taken while a commit tries to write its own group.
+    volatile Runnable takeHookForTests;
     /// Runs on the thread of every force of the file of large values, before the file is forced; for tests that see
     /// where it runs or hold it.
     volatile Runnable unitForceHookForTests;
@@ -408,6 +432,11 @@ final class LogWriter {
     private volatile long ledGroups;
     // The groups made durable, for tests; written before durable, so a wait for durability sees the group that ended it
     private long groups;
+    // The thread of the one commit the last published group woke, its leader or a waiter; null if it woke none or
+    // several
+    private volatile Thread lastGroupThread;
+    // The thread of the last commit wake() woke; read by the flush that called it
+    private Thread lastWoken;
     // The commits the last published group woke and those queued behind it
     private int cohortSpan;
     // The commits the last published group woke that the next flush waits for, or 0; the registrations counted before
@@ -446,6 +475,32 @@ final class LogWriter {
     // The commits waiting for room in the queue; written under the queue lock
     private volatile int queueWaiters;
     private volatile long lastQueued;
+    // The sequence of the last frame of the group a flush took last, which a commit waiting for running to be free
+    // reads to tell a flush that writes its frame from one that gives it back
+    private volatile long taken;
+    // The sequence of the frame queued last if it was queued alone by the thread of the one commit the last group woke,
+    // which is then expected to wait for it at once and write its group itself, so the flush of the lane waits for it
+    // before taking the group; 0 for none. Written under the queue lock; a guess the flushes only wait on, never one
+    // that decides what is written
+    private volatile long leadHint;
+    // The waits for a commit to lead in a row that ran out, and the groups still to publish with no hint; heuristics
+    // the flush of the lane and the flush that publishes may both write
+    private volatile int leadMisses;
+    private volatile int leadSkips;
+    // The latest hint the flush of the lane waited for, so it waits once for each; owned by the flushes of the lane,
+    // one at a time
+    private long leadWaited;
+    // The waits for a commit to lead that ended with the commit leading, and those that ran out, for tests
+    private volatile long leadsTaken;
+    private volatile long leadsMissed;
+    // The commits expected to lead that found running taken and waited for it to be free, and those of them that
+    // wrote their group after the flush holding it gave it back, for tests
+    private volatile long retakeWaits;
+    private volatile long leadsRetaken;
+    // Whether the flush of the lane waits for a hinted commit whatever thread it found and with no place among the
+    // spinners, for tests; and the longest it waits, and a commit waits for it to give a group back, or 0 for LEAD_WAIT
+    volatile boolean leadWaitAlwaysForTests;
+    volatile long leadWaitForTests;
     // Frames queued since the writer opened; a catalog frame carries a sequence already durable, so close() waits on
     // frames rather than on sequences
     private long appended;
@@ -519,6 +574,7 @@ final class LogWriter {
         this.executor = executor;
         this.unitForces = unitForces;
         this.poolQueued = poolQueued;
+        this.lane = poolQueued == null && executor instanceof ProcessFlusher.Lane flusherLane ? flusherLane : null;
         this.commitWindowNanos = commitWindow.toNanos();
         this.writeThrough = writeThrough;
         this.maxCohort = COHORT_PER_PROCESSOR * Runtime.getRuntime().availableProcessors();
@@ -769,6 +825,7 @@ final class LogWriter {
             queue.add(new Queued(type, sequence, body));
             pendingBytes += length;
             lastQueued = sequence;
+            leadHint = leadHint(sequence, Thread.currentThread());
             frames = ++appended;
             appendedBytes += 13 + length + unitBytes;
             appendedHeap += heapOf(length, unitHeap, writes, sharesChunk);
@@ -810,6 +867,7 @@ final class LogWriter {
                 queue.addAll(frames);
                 pendingBytes += batch.bodyBytes;
                 lastQueued = frames.getLast().sequence();
+                leadHint = frames.size() == 1 ? leadHint(lastQueued, batch.committer) : 0;
                 appended += frames.size();
                 appendedBytes += batch.appendedBytes;
                 appendedHeap += batch.appendedHeap;
@@ -823,6 +881,22 @@ final class LogWriter {
         if (scheduled.compareAndSet(false, true)) {
             schedule();
         }
+    }
+
+    /// {@return `sequence`, if the frame just queued at it is the only one queued and its commit, by `committer`, is
+    /// expected to wait for it at once and write its own group, or 0}
+    ///
+    /// Such a commit is the one the last group woke, committing on the same thread, with no other waiting and no commit
+    /// window: what [#alone(long)] will find when it waits, as a thread that commits and waits in turn does. A commit
+    /// awaited by another thread, as a thread that acknowledges the commits of others does, is not, so its flush takes
+    /// the group at once. Only on a lane, and not for the groups a run of waits that ran out turned the hints off for.
+    /// Holding the queue lock.
+    ///
+    /// @param committer the thread that commits it, or `null` if unknown
+    private long leadHint(long sequence, Thread committer) {
+        return lane != null && leadSkips == 0 && commitWindowNanos == 0 && lastGroupWaiters == 1 && queue.size() == 1
+                && waiters.isEmpty() && durable < sequence && committer != null && committer == lastGroupThread
+                ? sequence : 0;
     }
 
     /// Waits, holding the queue lock, for a group to leave the queue, counted in [#queueWaiters] meanwhile.
@@ -862,6 +936,8 @@ final class LogWriter {
                 throw new IllegalStateException("The store is closed");
             }
             queueDeferred();
+            // A thread waits for the frame's durability, not for the commit's
+            leadHint = 0;
             frames = deferredFrame;
         } finally {
             queueLock.unlock();
@@ -996,6 +1072,95 @@ final class LogWriter {
         flush(Long.MAX_VALUE);
     }
 
+    /// {@return whether the flush of the lane leaves the group to the commit of the only frame queued, which is
+    /// expected to lead and which this flush has not waited for yet}
+    ///
+    /// The flush asks before it takes [#running], so the commit it waits for finds [#running] free, and again holding
+    /// the queue lock with [#running] taken, for a frame queued in between, as when its thread commits again right
+    /// after writing its last group itself; then it lets [#running] go before it waits ([#awaitLead()]), and a commit
+    /// that found [#running] taken meanwhile tries again once it is free ([#retakeLead(long)]).
+    private boolean defersLead() {
+        var hint = leadHint;
+        return lane != null && hint != 0 && hint == lastQueued && hint > leadWaited && durable < hint
+                && (leadWaitAlwaysForTests || (lane.handedHot() && ProcessFlusher.maxSpinners() > 0));
+    }
+
+    /// Waits, on the flush of the lane, up to [#LEAD_WAIT] for the commit of the frame [#leadHint] names to start
+    /// writing its group itself; then the flush goes on, writing that group if the commit did not take it.
+    ///
+    /// Only when the lane's thread was running or spinning as the flush was handed to it, which then starts within
+    /// microseconds of the commit's append, and with a place among the process's spinners
+    /// ([ProcessFlusher#maxSpinners()]): a thread woken from a park takes longer than the commit to reach its wait,
+    /// and on fewer than four processors no thread spins. It spins, then yields between looks, and holds no lock nor
+    /// [#running], so the commit that leads never waits for it.
+    ///
+    /// It ends as soon as the commit leads, another frame is queued, a commit waits for durability (as one that waits
+    /// with a timeout does, which never leads), a commit waits for room in the queue, the writer fails or a close
+    /// begins. A flush that finds the commit's group written already waits, in what is left of the time, for the next
+    /// commit expected to lead if its thread queued one meanwhile, whose group it would take otherwise. A wait that
+    /// runs out turns the hints off for the groups after the one it waited for, twice as many as the last wait that
+    /// ran out in a row did, from 2 to 64; one that ends with the commit leading resets that. A commit that is never
+    /// waited for is made durable at most [#LEAD_WAIT] later than without the wait.
+    private void awaitLead() {
+        var hint = leadHint;
+        if (hint == 0) {
+            return;
+        }
+        // Waited for once, even with no place to spin, so the flush then writes its group
+        leadWaited = Math.max(leadWaited, hint);
+        var always = leadWaitAlwaysForTests;
+        if (!always && !ProcessFlusher.takeSpinner()) {
+            return;
+        }
+        try {
+            var longest = leadWaitForTests > 0 ? leadWaitForTests : LEAD_WAIT;
+            var start = System.nanoTime();
+            while (true) {
+                if (running.get()) {
+                    // The commit took its group
+                    leadMisses = 0;
+                    leadsTaken++;
+                    return;
+                }
+                var current = leadHint;
+                if (durable >= hint) {
+                    // The commit wrote its group before this flush looked
+                    leadMisses = 0;
+                    leadsTaken++;
+                    if (current == hint || current == 0 || durable >= current) {
+                        return;
+                    }
+                    // Its thread committed again meanwhile, and this flush would take that group
+                    hint = current;
+                    leadWaited = Math.max(leadWaited, hint);
+                    continue;
+                }
+                if (current != hint || lastQueued != hint || !waiters.isEmpty() || queueWaiters > 0 || failure != null
+                        || closing) {
+                    return;
+                }
+                var waited = System.nanoTime() - start;
+                if (waited >= longest) {
+                    var misses = Math.min(leadMisses + 1, MAX_LEAD_MISSES);
+                    leadMisses = misses;
+                    // The group it waited for is published with the count already set
+                    leadSkips = (1 << misses) + 1;
+                    leadsMissed++;
+                    return;
+                }
+                if (waited < LEAD_SPIN) {
+                    Thread.onSpinWait();
+                } else {
+                    Thread.yield();
+                }
+            }
+        } finally {
+            if (!always) {
+                ProcessFlusher.releaseSpinner();
+            }
+        }
+    }
+
     /// Writes the queued groups until the queue is empty, or until the commit at `until` is durable, for a commit that
     /// waits for its group on its own thread rather than for a thread of the pool to wake, then for its own to be woken.
     ///
@@ -1005,15 +1170,27 @@ final class LogWriter {
     /// thread.
     ///
     /// A flush of a lane of the process's flusher lingers at most once, without [#running], so the commit it leaves the
-    /// log to can take it.
-    private void flush(long until) {
+    /// log to can take it, and first waits for a commit expected to write its own group to start it, holding nothing
+    /// ([#defersLead()]).
+    ///
+    /// @return whether it took [#running] at least once, so a flush for a commit that is still not durable returned
+    ///         for a reason of its own rather than because another flush was writing
+    private boolean flush(long until) {
         var mayLinger = until == Long.MAX_VALUE && poolQueued == null;
-        while (running.compareAndSet(false, true)) {
-            var linger = false;
+        var ran = false;
+        while (true) {
+            if (until == Long.MAX_VALUE && defersLead()) {
+                awaitLead();
+            }
+            if (!running.compareAndSet(false, true)) {
+                return ran;
+            }
+            ran = true;
+            var stopped = WROTE;
             var seen = 0L;
             try {
-                linger = flushGroups(until, mayLinger);
-                if (linger) {
+                stopped = flushGroups(until, mayLinger);
+                if (stopped == LINGERS) {
                     // Before running is let go, so a commit that writes the group next sees the flush to wake
                     seen = durable;
                     lingerer = Thread.currentThread();
@@ -1021,9 +1198,15 @@ final class LogWriter {
             } finally {
                 running.set(false);
             }
-            if (linger) {
+            if (stopped == LINGERS) {
                 mayLinger = false;
                 linger(seen);
+                continue;
+            }
+            if (stopped == DEFERS) {
+                // Wrote nothing: the commit of the only frame queued, queued after the flush looked, is expected to
+                // write it
+                awaitLead();
                 continue;
             }
             boolean empty;
@@ -1037,11 +1220,11 @@ final class LogWriter {
                 queueLock.unlock();
             }
             if (empty || failure != null) {
-                return;
+                return true;
             }
             if (until != Long.MAX_VALUE || poolWanted()) {
                 schedule();
-                return;
+                return true;
             }
         }
     }
@@ -1217,15 +1400,22 @@ final class LogWriter {
     /// waits for this thread, holding [#running].
     ///
     /// @param mayLinger whether the first look at the queue may leave it to the commit that follows ([#lingerBytes()])
-    /// @return whether it stopped to linger, with the queue as it found it
-    private boolean flushGroups(long until, boolean mayLinger) {
+    /// @return [#LINGERS] if it stopped to linger, with the queue as it found it; [#DEFERS] if the flush of the lane
+    ///         wrote nothing because the only frame queued is a commit's expected to write its own group, which it has
+    ///         not waited for yet ([#defersLead()]); [#WROTE] otherwise
+    private int flushGroups(long until, boolean mayLinger) {
         leading = until != Long.MAX_VALUE;
         try {
             // A stopped writer writes nothing more: a group after one whose force failed would pass for durable while
             // the failed one, maybe partly on disk, stands before it
             while (durable < until && failure == null) {
                 if (commitWindowNanos > 0) {
-                    LockSupport.parkNanos(commitWindowNanos);
+                    // The whole window: an unpark of the lane's thread while it spun, between flushes, leaves a permit
+                    // that would end one park early
+                    var end = System.nanoTime() + commitWindowNanos;
+                    for (long left; (left = end - System.nanoTime()) > 0 && !Thread.currentThread().isInterrupted(); ) {
+                        LockSupport.parkNanos(left);
+                    }
                 } else if (cohort > 0 && !leading) {
                     // With the queue empty too: had it returned, the next flush would take the first commits back as a
                     // group of their own
@@ -1242,10 +1432,17 @@ final class LogWriter {
                 var sequence = 0L;
                 var frames = 0L;
                 var units = false;
+                var hook = takeHookForTests;
+                if (hook != null && !leading) {
+                    hook.run();
+                }
                 queueLock.lock();
                 try {
                     if (queue.isEmpty() || (until != Long.MAX_VALUE && (lastQueued > until || !fitsOneWrite(queue)))) {
-                        return false;
+                        return WROTE;
+                    }
+                    if (until == Long.MAX_VALUE && defersLead()) {
+                        return DEFERS;
                     }
                     if (lingering) {
                         lingerBytes = lingerBytes();
@@ -1253,6 +1450,7 @@ final class LogWriter {
                     if (lingerBytes < 0) {
                         group = queue;
                         sequence = lastQueued;
+                        taken = sequence;
                         frames = appended;
                         units = queuedUnits;
                         queuedUnits = false;
@@ -1263,7 +1461,7 @@ final class LogWriter {
                 }
                 if (lingerBytes >= 0) {
                     prepareThrough(lingerBytes);
-                    return true;
+                    return LINGERS;
                 }
                 var bodies = write(group, units);
                 group.clear();
@@ -1296,7 +1494,7 @@ final class LogWriter {
                 if (leading) {
                     ledGroups++;
                 } else if (poolWanted()) {
-                    return false;
+                    return WROTE;
                 }
             }
         } catch (IOException exception) {
@@ -1313,7 +1511,7 @@ final class LogWriter {
                 }
             }
         }
-        return false;
+        return WROTE;
     }
 
     /// Waits, holding [#running], until the commits the last group woke wait again, their next frames queued, so the
@@ -2109,6 +2307,8 @@ final class LogWriter {
         private long appendedHeap;
         // Whether a commit of the batch wrote a unit of the file of large values
         private boolean units;
+        // The thread that commits the frame added last, or null if unknown
+        private Thread committer;
 
         Batch() {
             this.frames = new ArrayList<>();
@@ -2124,6 +2324,18 @@ final class LogWriter {
             appendedBytes += 13 + body.size() + unitBytes;
             appendedHeap += heapOf(body.size(), unitHeap, writes, sharesChunk);
             units |= unitBytes > 0;
+            committer = null;
+        }
+
+        /// {@return the frames added}
+        int size() {
+            return frames.size();
+        }
+
+        /// Records that the thread that commits the frame added last is `committer`, which waits for its durability if
+        /// anything does.
+        void committedBy(Thread committer) {
+            this.committer = committer;
         }
 
         /// Forgets every frame.
@@ -2133,6 +2345,7 @@ final class LogWriter {
             appendedBytes = 0;
             appendedHeap = 0;
             units = false;
+            committer = null;
         }
     }
 
@@ -2178,7 +2391,11 @@ final class LogWriter {
         // group made durable, which go on first
         wakeLingerer();
         var span = woken + (int) Math.clamp(lastQueued - sequence, 0, Integer.MAX_VALUE);
+        lastGroupThread = woken != 1 ? null : leading ? Thread.currentThread() : lastWoken;
         lastGroupWaiters = woken;
+        if (leadSkips > 0) {
+            leadSkips--;
+        }
         cohortSpan = span;
         if (arm && span <= maxCohort && (woken >= 2 || (woken == 1 && !waiters.isEmpty()))) {
             cohort = woken;
@@ -2199,6 +2416,7 @@ final class LogWriter {
                 waiter.woken = true;
                 iterator.remove();
                 LockSupport.unpark(waiter.thread);
+                lastWoken = waiter.thread;
                 woken++;
             }
         }
@@ -2208,6 +2426,7 @@ final class LogWriter {
     private void stop(IOException cause) {
         failure = new LedgerIoException("The log could not be written: commits since the last force may be lost", cause);
         wakeLingerer();
+        leadHint = 0;
         durabilityLock.lock();
         try {
             durabilityChanged.signalAll();
@@ -2294,7 +2513,9 @@ final class LogWriter {
         if (timeout < 0 && !Thread.currentThread().isInterrupted() && alone(sequence)) {
             // Writes the group itself if no flush is writing: a wait with a timeout, which a slow force would outlast,
             // leaves it to the pool
-            flush(sequence);
+            if (!flush(sequence) && durable < sequence) {
+                retakeLead(sequence);
+            }
             if (durable >= sequence) {
                 return true;
             }
@@ -2327,6 +2548,47 @@ final class LogWriter {
         } finally {
             if (!waiter.woken) {
                 waiters.remove(waiter);
+            }
+        }
+    }
+
+    /// Writes the group of the commit at `sequence`, expected to lead, whose flush found [#running] taken, once the
+    /// flush holding it lets it go without taking that commit's frame.
+    ///
+    /// The flush of the lane takes [#running] before it sees a frame queued meanwhile, then gives it back to leave the
+    /// group to the frame's commit ([#defersLead()]); a commit that tried in that moment would otherwise wait to be
+    /// woken after the force of the group the flush took once it saw that commit waiting. It spins, then yields, for
+    /// at most [#LEAD_WAIT], and stops as soon as the flush holding [#running] takes its frame, as one that writes it
+    /// does, or the thread is interrupted. Not on fewer than four processors, where the lane's flush never gives a
+    /// group back and the spin would keep it off its processor.
+    private void retakeLead(long sequence) {
+        if (leadHint != sequence || !(leadWaitAlwaysForTests || ProcessFlusher.maxSpinners() > 0)) {
+            return;
+        }
+        retakeWaits++;
+        var longest = leadWaitForTests > 0 ? leadWaitForTests : LEAD_WAIT;
+        var start = System.nanoTime();
+        while (durable < sequence) {
+            if (!running.get()) {
+                if (!alone(sequence)) {
+                    return;
+                }
+                if (flush(sequence)) {
+                    if (durable >= sequence) {
+                        leadsRetaken++;
+                    }
+                    return;
+                }
+                continue;
+            }
+            var waited = System.nanoTime() - start;
+            if (taken >= sequence || waited >= longest || Thread.currentThread().isInterrupted()) {
+                return;
+            }
+            if (waited < LEAD_SPIN) {
+                Thread.onSpinWait();
+            } else {
+                Thread.yield();
             }
         }
     }
@@ -2401,6 +2663,36 @@ final class LogWriter {
     /// {@return the groups written through so far, for tests}
     long writtenThrough() {
         return writtenThrough;
+    }
+
+    /// {@return the sequence of the frame whose commit the flush of the lane would wait for, or 0, for tests}
+    long leadHintForTests() {
+        return leadHint;
+    }
+
+    /// {@return the waits of the flush of the lane for a commit to lead that ended with it leading, for tests}
+    long leadsTakenForTests() {
+        return leadsTaken;
+    }
+
+    /// {@return the waits of the flush of the lane for a commit to lead that ran out, for tests}
+    long leadsMissedForTests() {
+        return leadsMissed;
+    }
+
+    /// {@return whether no flush of the store's lane runs or waits to, for tests; `true` on a pool}
+    boolean laneIdleForTests() {
+        return lane == null || lane.idleForTests();
+    }
+
+    /// {@return the commits expected to lead that found [#running] taken and waited for it to be free, for tests}
+    long retakeWaitsForTests() {
+        return retakeWaits;
+    }
+
+    /// {@return the commits that wrote their own group after the flush holding [#running] gave it back, for tests}
+    long leadsRetakenForTests() {
+        return leadsRetaken;
     }
 
     /// {@return the bytes of the output, for tests: read after a group returned, its size once that group was written}
@@ -2520,6 +2812,7 @@ final class LogWriter {
             // No frame followed it, so no commit needs it
             deferred = null;
             closed = true;
+            leadHint = 0;
             frames = appended;
         } finally {
             queueLock.unlock();

@@ -9,6 +9,7 @@ import com.github.auties00.ledger.LedgerIoException;
 import com.github.auties00.ledger.ValueCodec;
 import com.github.auties00.ledger.testkit.ChangeInterceptor;
 import com.github.auties00.ledger.testkit.CrashFileSystem;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -42,6 +43,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ProcessFlusherTest {
     private static final byte[] KEY = new byte[32];
     private static final Keyspace<String, String> NAMES = Keyspace.paged("names", KeyCodec.utf8(), ValueCodec.utf8());
+
+    @AfterEach
+    void restoreSpinners() {
+        ProcessFlusher.maxSpinnersForTests(-1);
+    }
 
     private static Ledger open(Path directory, ProcessFlusher flusher) {
         var builder = Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(NAMES);
@@ -362,5 +368,106 @@ class ProcessFlusherTest {
         awaitIdle(flusher);
         assertEquals(2, runs.get());
         assertEquals(1, flusher.threadsForTests());
+    }
+
+    @Test
+    @DisplayName("lets at most its places spin at once, none on fewer than four processors by default")
+    void spinnerPlaces() {
+        ProcessFlusher.maxSpinnersForTests(-1);
+        var processors = Runtime.getRuntime().availableProcessors();
+        assertEquals(Math.min(2, processors / 4), ProcessFlusher.maxSpinners());
+        ProcessFlusher.maxSpinnersForTests(1);
+        assertTrue(ProcessFlusher.takeSpinner());
+        assertFalse(ProcessFlusher.takeSpinner());
+        ProcessFlusher.releaseSpinner();
+        assertTrue(ProcessFlusher.takeSpinner());
+        ProcessFlusher.releaseSpinner();
+        ProcessFlusher.maxSpinnersForTests(0);
+        assertFalse(ProcessFlusher.takeSpinner());
+        assertEquals(0, ProcessFlusher.spinnersForTests());
+    }
+
+    @Test
+    @DisplayName("hands a lane given right after its last task to the thread still looking for one, which counts as waiting and ends once idle")
+    void spinningThread() throws Exception {
+        ProcessFlusher.maxSpinnersForTests(2);
+        var made = new AtomicInteger();
+        var flusher = new ProcessFlusher(counting(made));
+        var lane = (ProcessFlusher.Lane) flusher.lane();
+        var hot = new AtomicInteger();
+        var runs = new AtomicInteger();
+        var thread = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        Runnable task = () -> {
+            thread.set(Thread.currentThread());
+            if (lane.handedHot()) {
+                hot.incrementAndGet();
+            }
+            runs.incrementAndGet();
+        };
+        // Given within microseconds of the thread giving the lane up, so the thread learns to look before it parks
+        for (var i = 0; i < 2_000; i++) {
+            lane.execute(task);
+            var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (runs.get() <= i || flusher.idleForTests() != flusher.threadsForTests()) {
+                assertTrue(System.nanoTime() < deadline, "the task never ran");
+                Thread.onSpinWait();
+            }
+            // The thread looking for a lane waits for one, as a parked one does
+            assertEquals(1, flusher.threadsForTests());
+            assertEquals(1, flusher.idleForTests());
+        }
+        assertEquals(1, made.get());
+        assertTrue(hot.get() > 0, "no lane was handed to the thread while it looked for one");
+        // A thread that waits long enough parks, gives back its place, and is woken for the next lane
+        var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (thread.get().getState() != Thread.State.TIMED_WAITING || ProcessFlusher.spinnersForTests() != 0) {
+            assertTrue(System.nanoTime() < deadline, "the thread never parked");
+            Thread.sleep(1);
+        }
+        var before = hot.get();
+        lane.execute(task);
+        awaitIdle(flusher);
+        assertEquals(2_001, runs.get());
+        assertEquals(before, hot.get(), "a lane handed to a parked thread counted as handed to a running one");
+        assertEquals(1, made.get());
+        flusher.keepAliveForTests(20, TimeUnit.MILLISECONDS);
+        awaitThreads(flusher, 0);
+        // The places are the process's: a thread of another flusher may spin for a moment while it waits for a lane
+        var spun = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (ProcessFlusher.spinnersForTests() != 0) {
+            assertTrue(System.nanoTime() < spun, "a place was left taken");
+            Thread.sleep(1);
+        }
+    }
+
+    @Test
+    @DisplayName("parks a thread at once, with no place to spin, and hands it its lanes as before")
+    void noSpinners() throws Exception {
+        ProcessFlusher.maxSpinnersForTests(0);
+        var made = new AtomicInteger();
+        var flusher = new ProcessFlusher(counting(made));
+        var lane = (ProcessFlusher.Lane) flusher.lane();
+        var hot = new AtomicInteger();
+        var thread = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        Runnable task = () -> {
+            thread.set(Thread.currentThread());
+            if (lane.handedHot()) {
+                hot.incrementAndGet();
+            }
+        };
+        lane.execute(task);
+        awaitIdle(flusher);
+        for (var i = 0; i < 50; i++) {
+            var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (thread.get().getState() != Thread.State.TIMED_WAITING) {
+                assertTrue(System.nanoTime() < deadline, "the thread never parked");
+                Thread.onSpinWait();
+            }
+            lane.execute(task);
+            awaitIdle(flusher);
+        }
+        assertEquals(0, hot.get(), "a parked thread counted as running");
+        assertEquals(1, made.get());
+        assertEquals(0, ProcessFlusher.spinnersForTests());
     }
 }

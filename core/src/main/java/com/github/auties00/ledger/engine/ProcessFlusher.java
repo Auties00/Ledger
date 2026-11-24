@@ -7,6 +7,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 
 /// The flush threads the stores opened without a pool share: daemon platform threads named `ledger-io-N`, made as
@@ -25,10 +26,31 @@ import java.util.concurrent.locks.LockSupport;
 /// the caller's thread. A lane runs one task at a time, so the flusher holds a thread per lane busy at the same
 /// moment.
 ///
+/// A thread that runs out of tasks while its lanes have been giving it the next ones at short intervals keeps looking
+/// for its next lane for a while before it parks ([#SPIN_NANOS]), waiting for a lane meanwhile as a parked one does.
+/// The caller that gives it a lane then unparks a running thread: on Linux that issues no system call, and on Windows
+/// it sets an event no thread waits on, so no thread is readied, where waking a parked thread took 6% of a lone
+/// durable commit's time on Linux and about 8 microseconds of its processor on Windows. At most [#maxSpinners()]
+/// threads of the process spin at once, none on fewer than four processors.
+///
 /// It is safe for concurrent use.
 final class ProcessFlusher {
     /// How long a thread waits for a lane before it ends.
     static final long KEEP_ALIVE_SECONDS = 60;
+    /// The longest a thread that ran out of tasks looks for its next lane before it parks, in nanoseconds. It looks
+    /// for twice the average time its lanes took to give it the next task, while that average is below this: a lone
+    /// durable commit's lane is given a task every write and force of a group, 85 to 150 microseconds apart on the
+    /// runners measured, so it finds the thread running.
+    static final long SPIN_NANOS = 200_000;
+    /// How long of [#SPIN_NANOS] a thread spins before it yields its processor between looks, in nanoseconds.
+    private static final long BUSY_SPIN_NANOS = 20_000;
+    // The threads that spin now, of every flusher of the process and of the flushes that wait for a commit to lead
+    private static final AtomicInteger SPINNERS = new AtomicInteger();
+    // The most threads that spin at once: a quarter of the processors the JVM started with, at most 2, so asking costs
+    // no system call on the paths that ask for every task
+    private static final int MAX_SPINNERS = Math.min(2, Runtime.getRuntime().availableProcessors() / 4);
+    // The most threads that spin at once for tests, or -1 for the default of maxSpinners()
+    private static volatile int spinnersForTests = -1;
     // Guards process
     private static final Object PROCESS_LOCK = new Object();
     // The flusher of the stores opened without a pool, made at the first open; never ended
@@ -78,6 +100,46 @@ final class ProcessFlusher {
     /// writes its own group.
     Executor lane() {
         return new Lane(this);
+    }
+
+    /// {@return the most threads that spin at once: those of the process's flushers waiting for a lane, and the
+    /// flushes of the log waiting for a commit to write its own group}
+    ///
+    /// A quarter of the processors, at most 2: a process holding many stores leaves the other processors to the
+    /// application and to the checkpoints, and on fewer than four processors none spins, where a spinning thread would
+    /// keep the one it waits for off its processor.
+    static int maxSpinners() {
+        var forTests = spinnersForTests;
+        return forTests >= 0 ? forTests : MAX_SPINNERS;
+    }
+
+    /// {@return whether the caller may spin, which takes one of the [#maxSpinners()] places until [#releaseSpinner()]}
+    static boolean takeSpinner() {
+        var max = maxSpinners();
+        while (true) {
+            var spinners = SPINNERS.get();
+            if (spinners >= max) {
+                return false;
+            }
+            if (SPINNERS.compareAndSet(spinners, spinners + 1)) {
+                return true;
+            }
+        }
+    }
+
+    /// Gives back the place a [#takeSpinner()] that returned `true` took.
+    static void releaseSpinner() {
+        SPINNERS.decrementAndGet();
+    }
+
+    /// Sets how many threads may spin at once, or `-1` for the default, for tests.
+    static void maxSpinnersForTests(int spinners) {
+        spinnersForTests = spinners;
+    }
+
+    /// {@return the threads that spin now, for tests}
+    static int spinnersForTests() {
+        return SPINNERS.get();
     }
 
     /// {@return the threads alive, running a lane or waiting for one, for tests}
@@ -140,7 +202,7 @@ final class ProcessFlusher {
 
     /// The executor of one store's flushes, or of the forces of its file of large values: a count of the tasks given
     /// since its thread last looked, 0 while it holds no thread.
-    private static final class Lane implements Executor {
+    static final class Lane implements Executor {
         private static final VarHandle REQUESTS;
 
         static {
@@ -156,6 +218,9 @@ final class ProcessFlusher {
         private volatile int requests;
         // The task the next run runs, the last one given, written before the add that publishes it
         private volatile Runnable task;
+        // Whether the task running was given to a thread that was running or spinning; written and read on the lane's
+        // thread only
+        private boolean handedHot;
 
         private Lane(ProcessFlusher flusher) {
             this.flusher = flusher;
@@ -177,15 +242,31 @@ final class ProcessFlusher {
             }
         }
 
+        /// {@return whether the lane holds no thread, with no task running or left to run, for tests}
+        boolean idleForTests() {
+            return requests == 0;
+        }
+
+        /// {@return whether the task running, which alone may ask, was given to a thread that was running or spinning
+        /// rather than one parked or made for it}
+        ///
+        /// Such a thread starts the task within microseconds of its caller giving it, where a parked or new one takes
+        /// the time of a wake or a start, which leaves the caller time to go on first.
+        boolean handedHot() {
+            return handedHot;
+        }
+
         /// Runs the lane's task until no task given since the last run is left, on the lane's thread, then gives the
         /// lane up holding the flusher's lock, so a task given from then on finds the thread waiting or takes another.
         ///
         /// @param worker the thread's worker, queued to wait for a lane once this one has no task left
-        private void drain(Worker worker) {
+        /// @param hot whether the thread was running or spinning when the lane was handed to it
+        private void drain(Worker worker, boolean hot) {
             var seen = requests;
             while (true) {
                 // Nothing should interrupt a flush thread; an interrupt left by a task does not reach the next one
                 Thread.interrupted();
+                handedHot = hot;
                 try {
                     task.run();
                 } catch (Throwable throwable) {
@@ -196,10 +277,13 @@ final class ProcessFlusher {
                     seen = (int) REQUESTS.getAndAdd(this, -seen) - seen;
                     if (seen == 0) {
                         worker.lane = null;
+                        worker.drained = System.nanoTime();
                         flusher.idle.addLast(worker);
                         return;
                     }
                 }
+                // Given while the task ran: the thread runs it next
+                hot = true;
             }
         }
     }
@@ -211,32 +295,76 @@ final class ProcessFlusher {
         private Thread thread;
         // The lane to run next, handed under the lock while the worker waits; null while it waits for one
         private volatile Lane lane;
+        // When the last lane the worker ran gave it up, written under the lock as it does so; read by the worker
+        private long drained;
+        // A moving average of the time from a lane giving the worker up to the next lane being handed to it, each
+        // counted as at most twice SPIN_NANOS, in nanoseconds; owned by the worker
+        private long gap;
+        // Whether the last wait spun out without a lane, so the next one parks at once; owned by the worker
+        private boolean missed;
+        // Whether the lane the last wait returned was handed to the worker while it was running or spinning
+        private boolean hot;
 
         private Worker(Lane first) {
             this.lane = first;
+            this.drained = System.nanoTime();
+            this.gap = SPIN_NANOS;
         }
 
         @Override
         public void run() {
+            // The lane the thread was made for, whose caller went on while the thread started
+            var next = handed(lane, false);
             while (true) {
-                var next = await();
+                next.drain(this, hot);
+                // A closed store's lane, and its log, are not kept for as long as the thread waits for the next one
+                next = null;
+                next = await();
                 if (next == null) {
                     return;
                 }
-                next.drain(this);
-                // A closed store's lane, and its log, are not kept for as long as the thread waits for the next one
-                next = null;
             }
         }
 
         /// {@return the lane handed to this worker while it waited, or `null` once it waited too long and left the
         /// flusher}
+        ///
+        /// While its lanes gave it their next tasks within [#SPIN_NANOS] on average, it first looks for a lane for
+        /// twice that average, at most [#SPIN_NANOS], holding a place of [#maxSpinners()]: it spins, then yields
+        /// between looks. A wait that spun out parks at once the next time, so tasks that come just too late for the
+        /// spin pay for it every other wait at most. A lane handed while the worker spins unparks it all the same, so
+        /// a later park may return at once on the permit left; the wait looks again, as after any park.
         private Lane await() {
             var since = System.nanoTime();
+            var window = missed || gap >= SPIN_NANOS ? 0 : Math.min(SPIN_NANOS, 2 * gap);
+            missed = false;
+            if (window > 0 && lane == null && takeSpinner()) {
+                try {
+                    while (true) {
+                        var handed = lane;
+                        if (handed != null) {
+                            return handed(handed, true);
+                        }
+                        var spun = System.nanoTime() - since;
+                        if (spun >= window) {
+                            break;
+                        }
+                        if (spun < BUSY_SPIN_NANOS) {
+                            Thread.onSpinWait();
+                        } else {
+                            Thread.yield();
+                        }
+                    }
+                } finally {
+                    releaseSpinner();
+                }
+                missed = true;
+            }
+            var parked = false;
             while (true) {
                 var handed = lane;
                 if (handed != null) {
-                    return handed;
+                    return handed(handed, !parked);
                 }
                 var left = since + keepAliveNanos - System.nanoTime();
                 if (left <= 0) {
@@ -251,7 +379,19 @@ final class ProcessFlusher {
                 }
                 Thread.interrupted();
                 LockSupport.parkNanos(this, left);
+                parked = true;
             }
+        }
+
+        /// {@return `lane`, just handed to the worker, once the time since the last lane gave the worker up is counted
+        /// in the average}
+        ///
+        /// @param running whether the worker was running or spinning when the lane was handed to it
+        private Lane handed(Lane lane, boolean running) {
+            var took = Math.clamp(System.nanoTime() - drained, 0, 2 * SPIN_NANOS);
+            gap += (took - gap) >> 3;
+            hot = running;
+            return lane;
         }
     }
 }
