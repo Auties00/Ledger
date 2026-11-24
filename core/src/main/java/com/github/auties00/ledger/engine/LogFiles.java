@@ -105,20 +105,49 @@ final class LogFiles {
         return numbers;
     }
 
-    /// {@return the spares, with their lengths}
-    private List<Spare> spares() throws IOException {
-        var spares = new ArrayList<Spare>();
+    /// {@return the spares}
+    private List<Path> sparePaths() throws IOException {
+        var spares = new ArrayList<Path>();
         try (var files = Files.list(directory)) {
             for (var file : (Iterable<Path>) files::iterator) {
                 if (file.getFileName().toString().endsWith(SPARE)) {
-                    var length = length(file);
-                    if (length >= 0) {
-                        spares.add(new Spare(file, length));
-                    }
+                    spares.add(file);
                 }
             }
         }
         return spares;
+    }
+
+    /// {@return the spares, with their lengths}
+    private List<Spare> spares() throws IOException {
+        var spares = new ArrayList<Spare>();
+        for (var path : sparePaths()) {
+            var length = length(path);
+            if (length >= 0) {
+                spares.add(new Spare(path, length));
+            }
+        }
+        return spares;
+    }
+
+    /// {@return the first spare of at least `length` bytes, else the longest spare, or `null` if there is none}
+    ///
+    /// The lengths are read only up to a spare of the full length, which retirement makes nearly every spare, so a
+    /// preparation reads one length rather than one per spare of a pool that may hold dozens.
+    private Path longestSpare(long length) throws IOException {
+        Path longest = null;
+        var longestLength = -1L;
+        for (var path : sparePaths()) {
+            var size = length(path);
+            if (size >= length) {
+                return path;
+            }
+            if (size > longestLength) {
+                longest = path;
+                longestLength = size;
+            }
+        }
+        return longest;
     }
 
     /// {@return the length of `file`, or -1 if it is gone}
@@ -165,25 +194,15 @@ final class LogFiles {
     Prepared prepare(long number, long length, boolean zeros, boolean writesThrough, BooleanSupplier stopFill) throws IOException {
         synchronized (lock) {
             var target = segment(number);
-            var spares = spares();
+            // The longest: a group is written through only below the bytes its segment has
+            var source = longestSpare(length);
             // A new file grows as its first use writes it: setting its length would allocate nothing on most
             // file systems and cost a slow allocation on NTFS, while a spare has its blocks already
-            Path source;
-            var fresh = spares.isEmpty();
-            if (fresh) {
+            if (source == null) {
                 freshPreparations++;
                 source = directory.resolve("%016x".formatted(number) + PREPARING);
                 Files.deleteIfExists(source);
                 Files.createFile(source);
-            } else {
-                // The longest: a group is written through only below the bytes its segment has
-                var longest = spares.getFirst();
-                for (var spare : spares) {
-                    if (spare.length() > longest.length()) {
-                        longest = spare;
-                    }
-                }
-                source = longest.path();
             }
             var salt = new byte[LogWriter.SALT_BYTES];
             SALTS.nextBytes(salt);
