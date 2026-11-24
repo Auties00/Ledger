@@ -31,8 +31,19 @@ import java.util.concurrent.locks.LockSupport;
 /// The caller that gives it a lane then unparks a running thread: on Linux that issues no system call, and on Windows
 /// it sets an event no thread waits on, so no thread is readied, where waking a parked thread took 6% of a lone
 /// durable commit's time on Linux and about 8 microseconds of its processor on Windows. At most [#maxSpinners()]
-/// threads of the process spin at once, none on fewer than four processors. On Windows the commits on platform threads
-/// that wait for a flush take the same places ([#waitersSpin()]).
+/// threads of the process spin at once, none on fewer than four processors: the flusher's threads, the flushes of a
+/// store's lane waiting for a commit expected to write its own group and the commits retaking a group such a flush gave
+/// back take the same places, and so, on Windows, do the commits on platform threads that wait for a flush
+/// ([#waitersSpin()]). A lane's flush waiting for a commit and that commit retaking the group are the two ends of one
+/// hand-off of the store's writer, and take one place between them: the commit holds a place whenever it spins, and
+/// the flush waits without a place of its own only while that commit retakes, from its first look at the writer to
+/// its try at it, so the two spin together only from the flush letting the writer go to the commit taking it.
+/// Outside these places spins only a flush that holds its store's writer while the commits the last group woke come
+/// back, for a few microseconds before it yields its processor and for three quarters of a force at most: one thread
+/// per store whose commits are on their way to it, which is what it waits for.
+///
+/// Each of these waits spins for a few microseconds, then yields its processor between looks
+/// ([#pause(long, long)]), so a thread it waits for that needs the processor gets it.
 ///
 /// It is safe for concurrent use.
 final class ProcessFlusher {
@@ -43,7 +54,8 @@ final class ProcessFlusher {
     /// durable commit's lane is given a task every write and force of a group, 85 to 150 microseconds apart on the
     /// runners measured, so it finds the thread running.
     static final long SPIN_NANOS = 200_000;
-    /// How long of [#SPIN_NANOS] a thread spins before it yields its processor between looks, in nanoseconds.
+    /// How long of [#SPIN_NANOS] a thread spins before it yields its processor between looks, in nanoseconds: a tenth
+    /// of it, so for most of the window the threads that give the next task, which may need the processor, run.
     private static final long BUSY_SPIN_NANOS = 20_000;
     // The threads that spin now, of every flusher of the process and of the flushes that wait for a commit to lead
     private static final AtomicInteger SPINNERS = new AtomicInteger();
@@ -107,8 +119,8 @@ final class ProcessFlusher {
     }
 
     /// {@return the most threads that spin at once: those of the process's flushers waiting for a lane, the flushes of
-    /// the log waiting for a commit to write its own group and, where [#waitersSpin()], the commits waiting for a group
-    /// being written to be durable}
+    /// the log waiting for a commit to write its own group, the commits retaking the group such a flush gave back and,
+    /// where [#waitersSpin()], the commits waiting for a group being written to be durable}
     ///
     /// A quarter of the processors, at most 2: a process holding many stores leaves the other processors to the
     /// application and to the checkpoints, and on fewer than four processors none spins, where a spinning thread would
@@ -151,6 +163,16 @@ final class ProcessFlusher {
     /// Gives back the place a [#takeSpinner()] that returned `true` took.
     static void releaseSpinner() {
         SPINNERS.decrementAndGet();
+    }
+
+    /// Waits for the next look of a spinning wait that has spun `spun` nanoseconds: spins once while that is below
+    /// `busy`, and yields the processor from then on, so a thread the wait is for that needs the processor runs.
+    static void pause(long spun, long busy) {
+        if (spun < busy) {
+            Thread.onSpinWait();
+        } else {
+            Thread.yield();
+        }
     }
 
     /// Sets how many threads may spin at once, or `-1` for the default, for tests.
@@ -370,11 +392,7 @@ final class ProcessFlusher {
                         if (spun >= window) {
                             break;
                         }
-                        if (spun < BUSY_SPIN_NANOS) {
-                            Thread.onSpinWait();
-                        } else {
-                            Thread.yield();
-                        }
+                        pause(spun, BUSY_SPIN_NANOS);
                     }
                 } finally {
                     releaseSpinner();

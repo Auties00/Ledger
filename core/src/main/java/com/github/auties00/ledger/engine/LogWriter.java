@@ -275,7 +275,9 @@ final class LogWriter {
     /// was running or spinning, and a flush that took its group instead would leave it parked until the force, then
     /// cost the wake of its thread.
     static final long LEAD_WAIT = 50_000;
-    /// How long of [#LEAD_WAIT] a flush spins before it yields its processor between looks, in nanoseconds.
+    /// How long of [#LEAD_WAIT] a flush, or a commit retaking a group, spins before it yields its processor between
+    /// looks, in nanoseconds: the thread it waits for is a few microseconds from what it waits for when the wait pays at
+    /// all, and may need the processor once it is not.
     private static final long LEAD_SPIN = 5_000;
     /// The waits for a commit to lead in a row that ran out past which they are turned off no longer: after the n-th,
     /// 2 to the power of n groups are published with no commit expected to lead.
@@ -516,8 +518,11 @@ final class LogWriter {
     // wrote their group after the flush holding it gave it back, for tests
     private volatile long retakeWaits;
     private volatile long leadsRetaken;
+    // The sequence of the commit retaking the group the flush of the lane gave back while it does, from its first look
+    // at running to its try at the group, so that flush's wait for it shares its place among the spinners; 0 for none
+    private volatile long retaking;
     // Whether the flush of the lane waits for a hinted commit whatever thread it found and with no place among the
-    // spinners, for tests; and the longest it waits, and a commit waits for it to give a group back, or 0 for LEAD_WAIT
+    // spinners, and a commit retakes a group with none, for tests; and the longest it waits, and a commit waits for it to give a group back, or 0 for LEAD_WAIT
     volatile boolean leadWaitAlwaysForTests;
     volatile long leadWaitForTests;
     // Frames queued since the writer opened; a catalog frame carries a sequence already durable, so close() waits on
@@ -871,7 +876,7 @@ final class LogWriter {
             queue.add(new Queued(type, sequence, body));
             pendingBytes += length;
             lastQueued = sequence;
-            leadHint = leadHint(sequence, Thread.currentThread());
+            setLeadHint(leadHint(sequence, Thread.currentThread()));
             frames = ++appended;
             appendedBytes += 13 + length + unitBytes;
             appendedHeap += heapOf(length, unitHeap, writes, sharesChunk);
@@ -913,7 +918,7 @@ final class LogWriter {
                 queue.addAll(frames);
                 pendingBytes += batch.bodyBytes;
                 lastQueued = frames.getLast().sequence();
-                leadHint = frames.size() == 1 ? leadHint(lastQueued, batch.committer) : 0;
+                setLeadHint(frames.size() == 1 ? leadHint(lastQueued, batch.committer) : 0);
                 appended += frames.size();
                 appendedBytes += batch.appendedBytes;
                 appendedHeap += batch.appendedHeap;
@@ -943,6 +948,15 @@ final class LogWriter {
         return lane != null && leadSkips == 0 && commitWindowNanos == 0 && lastGroupWaiters == 1 && queue.size() == 1
                 && waiters.isEmpty() && durable < sequence && committer != null && committer == lastGroupThread
                 ? sequence : 0;
+    }
+
+    /// Sets [#leadHint] to `hint`, holding the queue lock, unless it holds it already: every append sets it, and most to
+    /// 0, which on a pool it always is, so the store of the volatile field and its fence are left to the appends that
+    /// change it.
+    private void setLeadHint(long hint) {
+        if (leadHint != hint) {
+            leadHint = hint;
+        }
     }
 
     /// Waits, holding the queue lock, for a group to leave the queue, counted in [#queueWaiters] meanwhile.
@@ -1137,8 +1151,10 @@ final class LogWriter {
     /// Only when the lane's thread was running or spinning as the flush was handed to it, which then starts within
     /// microseconds of the commit's append, and with a place among the process's spinners
     /// ([ProcessFlusher#maxSpinners()]): a thread woken from a park takes longer than the commit to reach its wait,
-    /// and on fewer than four processors no thread spins. It spins, then yields between looks, and holds no lock nor
-    /// [#running], so the commit that leads never waits for it.
+    /// and on fewer than four processors no thread spins. A flush that finds no place left waits all the same while
+    /// the commit retakes the group ([#retakeLead(long)]), which holds the place the two share, and stops once it no
+    /// longer does. It spins, then yields between looks, and holds no lock nor [#running], so the commit that leads
+    /// never waits for it.
     ///
     /// It ends as soon as the commit leads, another frame is queued, a commit waits for durability (as one that waits
     /// with a timeout does, which never leads), a commit waits for room in the queue, the writer fails or a close
@@ -1155,7 +1171,10 @@ final class LogWriter {
         // Waited for once, even with no place to spin, so the flush then writes its group
         leadWaited = Math.max(leadWaited, hint);
         var always = leadWaitAlwaysForTests;
-        if (!always && !ProcessFlusher.takeSpinner()) {
+        var placed = !always && ProcessFlusher.takeSpinner();
+        // Without a place of its own, only while the commit retakes the group, holding the place the two share
+        var shared = !always && !placed;
+        if (shared && retaking != hint) {
             return;
         }
         try {
@@ -1182,7 +1201,7 @@ final class LogWriter {
                     continue;
                 }
                 if (current != hint || lastQueued != hint || !waiters.isEmpty() || queueWaiters > 0 || failure != null
-                        || closing) {
+                        || closing || (shared && retaking != hint)) {
                     return;
                 }
                 var waited = System.nanoTime() - start;
@@ -1194,14 +1213,10 @@ final class LogWriter {
                     leadsMissed++;
                     return;
                 }
-                if (waited < LEAD_SPIN) {
-                    Thread.onSpinWait();
-                } else {
-                    Thread.yield();
-                }
+                ProcessFlusher.pause(waited, LEAD_SPIN);
             }
         } finally {
-            if (!always) {
+            if (placed) {
                 ProcessFlusher.releaseSpinner();
             }
         }
@@ -1616,10 +1631,11 @@ final class LogWriter {
     /// next group takes them beside the frames queued during the last force; or until three quarters of a force, at
     /// most [#MAX_COHORT_WAIT], have passed since the last group was published.
     ///
-    /// It spins, then yields between looks. A close, a failure, a commit waiting for room in the queue, or a task of
-    /// another store waiting for the pool ends it at once. A wait that runs out while a frame waits in the queue turns
-    /// the next ones off for twice as many groups as the last that ran out did, from 2 to 64; one that ends with all of
-    /// them back resets that.
+    /// It spins, then yields between looks, with no place among the process's spinners
+    /// ([ProcessFlusher#maxSpinners()]): it holds the store's writer, and the threads it waits for are on their way to
+    /// it. A close, a failure, a commit waiting for room in the queue, or a task of another store waiting for the pool
+    /// ends it at once. A wait that runs out while a frame waits in the queue turns the next ones off for twice as many
+    /// groups as the last that ran out did, from 2 to 64; one that ends with all of them back resets that.
     private void awaitCohort() {
         var target = cohort;
         cohort = 0;
@@ -1642,11 +1658,7 @@ final class LogWriter {
                     return;
                 }
                 looked = true;
-                if (waited < COHORT_SPIN) {
-                    Thread.onSpinWait();
-                } else {
-                    Thread.yield();
-                }
+                ProcessFlusher.pause(waited, COHORT_SPIN);
             }
             cohortMisses = 0;
             cohortsGathered++;
@@ -2712,18 +2724,40 @@ final class LogWriter {
     /// The flush of the lane takes [#running] before it sees a frame queued meanwhile, then gives it back to leave the
     /// group to the frame's commit ([#defersLead()]); a commit that tried in that moment would otherwise wait to be
     /// woken after the force of the group the flush took once it saw that commit waiting. It spins, then yields, for
-    /// at most [#LEAD_WAIT], and stops as soon as the flush holding [#running] takes its frame, as one that writes it
-    /// does, or the thread is interrupted. Not on fewer than four processors, where the lane's flush never gives a
-    /// group back and the spin would keep it off its processor.
+    /// at most [#LEAD_WAIT], holding a place among the process's spinners ([ProcessFlusher#maxSpinners()]) that the
+    /// flush waiting for it shares ([#awaitLead()]), and none while it writes; it stops as soon as the flush holding
+    /// [#running] takes its frame, as one that writes it does, or the thread is interrupted, and at once if no place
+    /// is left. Not on fewer than four processors, where the lane's flush never gives a group back and the spin would
+    /// keep it off its processor.
     private void retakeLead(long sequence) {
-        if (leadHint != sequence || !(leadWaitAlwaysForTests || ProcessFlusher.maxSpinners() > 0)) {
+        var always = leadWaitAlwaysForTests;
+        if (leadHint != sequence || !(always || ProcessFlusher.maxSpinners() > 0)) {
             return;
         }
-        retakeWaits++;
         var longest = leadWaitForTests > 0 ? leadWaitForTests : LEAD_WAIT;
         var start = System.nanoTime();
-        while (durable < sequence) {
-            if (!running.get()) {
+        var counted = false;
+        retaking = sequence;
+        try {
+            while (durable < sequence) {
+                if (running.get()) {
+                    if (!always && !ProcessFlusher.takeSpinner()) {
+                        return;
+                    }
+                    try {
+                        if (!counted) {
+                            counted = true;
+                            retakeWaits++;
+                        }
+                        if (!awaitRunningFree(sequence, start, longest)) {
+                            return;
+                        }
+                    } finally {
+                        if (!always) {
+                            ProcessFlusher.releaseSpinner();
+                        }
+                    }
+                }
                 if (!alone(sequence)) {
                     return;
                 }
@@ -2733,18 +2767,25 @@ final class LogWriter {
                     }
                     return;
                 }
-                continue;
             }
-            var waited = System.nanoTime() - start;
-            if (taken >= sequence || waited >= longest || Thread.currentThread().isInterrupted()) {
-                return;
-            }
-            if (waited < LEAD_SPIN) {
-                Thread.onSpinWait();
-            } else {
-                Thread.yield();
-            }
+        } finally {
+            retaking = 0;
         }
+    }
+
+    /// {@return whether [#running] was let go before the commit at `sequence` is durable, its frame taken, the thread
+    /// interrupted or `longest` nanoseconds since `start` passed}
+    ///
+    /// It spins, then yields between looks, on the place [#retakeLead(long)] holds.
+    private boolean awaitRunningFree(long sequence, long start, long longest) {
+        while (running.get()) {
+            var waited = System.nanoTime() - start;
+            if (durable >= sequence || taken >= sequence || waited >= longest || Thread.currentThread().isInterrupted()) {
+                return false;
+            }
+            ProcessFlusher.pause(waited, LEAD_SPIN);
+        }
+        return true;
     }
 
     /// {@return how long the commit at `sequence`, waiting with no timeout, spins before it parks, in nanoseconds, or 0
@@ -2788,11 +2829,7 @@ final class LogWriter {
             if (spun >= budget) {
                 return false;
             }
-            if (spun < DURABLE_BUSY_SPIN) {
-                Thread.onSpinWait();
-            } else {
-                Thread.yield();
-            }
+            ProcessFlusher.pause(spun, DURABLE_BUSY_SPIN);
         }
         return true;
     }

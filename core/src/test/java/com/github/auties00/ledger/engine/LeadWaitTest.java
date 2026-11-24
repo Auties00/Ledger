@@ -389,6 +389,17 @@ class LeadWaitTest {
         }
     }
 
+    /// Waits until no place among the process's spinners is taken, failing if one stays taken: a flusher thread that
+    /// waits for its next lane spins holding a place for a bounded time, so one may be taken just after the test gave
+    /// its own back.
+    private static void awaitNoSpinners() throws InterruptedException {
+        var deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        while (ProcessFlusher.spinnersForTests() != 0) {
+            assertTrue(System.nanoTime() < deadline, "a place was left taken");
+            Thread.sleep(1);
+        }
+    }
+
     /// Waits until the lane's flush saw at least `taken` commits lead, for at most `nanos`.
     private static void awaitLeadsTaken(LogWriter log, long taken, long nanos) throws InterruptedException {
         var deadline = System.nanoTime() + nanos;
@@ -490,6 +501,35 @@ class LeadWaitTest {
             }
             assertEquals(0, log.leadsTakenForTests() + log.leadsMissedForTests(), "a flush waited with no place");
             assertEquals(0, ProcessFlusher.spinnersForTests());
+            assertEquals(model, contents(ledger));
+        }
+    }
+
+    @Test
+    @DisplayName("retakes a group given back only with a place among the process's spinners, and parks when none is left")
+    void retakeTakesAPlace() throws Exception {
+        var disk = CrashFileSystem.create();
+        var model = new TreeMap<String, String>();
+        var held = new AtomicBoolean();
+        ProcessFlusher.maxSpinnersForTests(1);
+        try (var ledger = open(disk.getPath("/store"), flusher())) {
+            var log = log(ledger);
+            gate(log, held);
+            log.leadWaitForTests = TimeUnit.MINUTES.toNanos(1);
+            var committer = Thread.currentThread();
+            // The only place, as another store's spinning flush thread holds it
+            assertTrue(ProcessFlusher.takeSpinner());
+            try {
+                for (var i = 0; i < 10; i++) {
+                    var waits = log.retakeWaitsForTests();
+                    holdingRunning(ledger, model, held, log, "led" + i, "k" + i,
+                            () -> committer.getState() == Thread.State.WAITING);
+                    assertEquals(waits, log.retakeWaitsForTests(), "a commit retook a group with no place left");
+                }
+            } finally {
+                ProcessFlusher.releaseSpinner();
+            }
+            awaitNoSpinners();
             assertEquals(model, contents(ledger));
         }
     }
