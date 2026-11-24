@@ -30,6 +30,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -44,10 +45,13 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -59,6 +63,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /// The log's writes through: a group that one write holds is durable once the write returns, with no force after
 /// it, on the file system that simulates failures and on the real one; an interrupt of the write has it written
@@ -689,13 +694,18 @@ class WriteThroughTest {
         }
 
         @Test
-        @DisplayName("a way nothing refuses stays the way the log writes through in as segments roll")
+        @DisplayName("a way nothing refuses stays the way the log writes through in as segments roll, through a channel on a file system other than the default one")
         void keepsWay() throws Exception {
             var disk = CrashFileSystem.create();
             var model = new TreeMap<String, String>();
             try (var ledger = open(disk.getPath("/store"), new WriteThrough(WriteThrough.Kind.DIRECT, null))) {
-                reachWriteThrough(ledger, model);
+                var commits = reachWriteThrough(ledger, model);
                 assertEquals(WriteThrough.Kind.DIRECT, log(ledger).writeThroughKind());
+                for (var i = 0; i < 200 && log(ledger).throughHandleForTests() == null; i++) {
+                    commit(ledger, model, "w" + commits++);
+                }
+                assertTrue(log(ledger).throughHandleForTests() instanceof WriteThrough.ChannelHandle,
+                        "the segment of another file system is not written through a channel");
             }
             survivesPowerLoss(disk, model);
         }
@@ -1025,6 +1035,295 @@ class WriteThroughTest {
             }
         }
 
+        @Test
+        @EnabledOnOs(OS.LINUX)
+        @DisplayName("on Linux a virtual thread that leads writes its groups through the C library's descriptor, opened with O_DIRECT and O_DSYNC, and they survive a close")
+        void linuxDescriptor(@TempDir Path directory) throws Exception {
+            assumeDescriptors(directory);
+            var model = new TreeMap<String, String>();
+            var released = new CountDownLatch(1);
+            try (var pool = IoPool.create(1); var ledger = openPooled(directory, pool)) {
+                var log = log(ledger);
+                onVirtualThread(() -> {
+                    var commits = reachWriteThrough(ledger, model);
+                    // A commit writes its own group only if it starts the flush before the pool's thread does
+                    hold(pool, released);
+                    var checked = false;
+                    for (var attempt = 0; attempt < 200 && !checked; attempt++) {
+                        var through = log.writtenThrough();
+                        var segment = log.currentSegment();
+                        commit(ledger, model, "w" + commits++);
+                        if (log.writtenThrough() > through && log.currentSegment() == segment
+                                && log.throughHandleForTests() instanceof WriteThrough.PosixHandle handle && handle.descriptorForTests() >= 0) {
+                            var before = handle.channelWritesForTests();
+                            var written = log.writtenThrough();
+                            for (var i = 0; i < 4 && log.currentSegment() == segment; i++) {
+                                commit(ledger, model, "w" + commits++);
+                            }
+                            if (log.currentSegment() == segment) {
+                                assertEquals(before, handle.channelWritesForTests(), "a virtual leader wrote through the channel");
+                                assertTrue(log.writtenThrough() > written, "no group was written through");
+                                var file = directory.resolve("log").resolve(LogWriter.segmentName(segment));
+                                var flags = openFlags(file);
+                                assertTrue(flags.stream().filter(open -> (open & oDirect()) != 0 && (open & O_DSYNC) != 0).count() >= 2,
+                                        "the channel and the descriptor are not both open with O_DIRECT and O_DSYNC: " + flags);
+                                checked = true;
+                            }
+                        }
+                    }
+                    assertTrue(checked, "no group was written through a descriptor");
+                    released.countDown();
+                    return null;
+                });
+                assertEquals(WriteThrough.Kind.DIRECT, log.writeThroughKind(), "the log left O_DIRECT");
+            } finally {
+                released.countDown();
+            }
+            try (var reopened = open(directory, WriteThrough.Mode.OFF)) {
+                assertEquals(model, contents(reopened));
+            }
+        }
+
+        @Test
+        @EnabledOnOs(OS.LINUX)
+        @DisplayName("on Linux an interrupt of a virtual thread writing through a descriptor leaves its commit durable and the interrupt to the thread")
+        void linuxDescriptorInterrupted(@TempDir Path directory) throws Exception {
+            assumeDescriptors(directory);
+            var model = new TreeMap<String, String>();
+            var released = new CountDownLatch(1);
+            var armed = new AtomicBoolean();
+            var interrupts = new AtomicInteger();
+            WriteThrough.Posix.writingForTests = _ -> {
+                if (armed.compareAndSet(true, false)) {
+                    Thread.currentThread().interrupt();
+                    interrupts.incrementAndGet();
+                }
+            };
+            try (var pool = IoPool.create(1); var ledger = openPooled(directory, pool)) {
+                var log = log(ledger);
+                onVirtualThread(() -> {
+                    var commits = reachDescriptor(ledger, model, pool, released);
+                    for (var i = 0; i < 4; i++) {
+                        var key = "w" + commits++;
+                        var value = "v".repeat(500) + key;
+                        var through = log.writtenThrough();
+                        var before = interrupts.get();
+                        armed.set(true);
+                        var commit = ledger.commit(ledger.newBatch().put(NAMES, key, value));
+                        commit.awaitDurable();
+                        assertTrue(commit.isDurable(), "the commit is not durable");
+                        model.put(key, value);
+                        armed.set(false);
+                        assertTrue(Thread.interrupted(), "the interrupt was lost");
+                        assertEquals(before + 1, interrupts.get(), "the group was not written through a descriptor");
+                        assertEquals(through + 1, log.writtenThrough(), "the interrupt left the group to a force");
+                    }
+                    var through = log.writtenThrough();
+                    for (var i = 0; i < 20 && log.writtenThrough() == through; i++) {
+                        commit(ledger, model, "w" + commits++);
+                    }
+                    assertTrue(log.writtenThrough() > through, "the interrupts moved the log to forces");
+                    released.countDown();
+                    return null;
+                });
+            } finally {
+                WriteThrough.Posix.writingForTests = null;
+                released.countDown();
+            }
+            try (var reopened = open(directory, WriteThrough.Mode.OFF)) {
+                assertEquals(model, contents(reopened));
+            }
+        }
+
+        @Test
+        @EnabledOnOs(OS.LINUX)
+        @DisplayName("on Linux at most the limit of virtual threads write through descriptors at a time, and the next writes through its channel")
+        void linuxDescriptorLimit(@TempDir Path directory) throws Exception {
+            assumeDescriptors(directory);
+            var limit = WriteThrough.Posix.LIMIT;
+            var pools = new ArrayList<IoPool>();
+            var ledgers = new ArrayList<Ledger>();
+            var released = new CountDownLatch(1);
+            var held = new CountDownLatch(1);
+            var arrivals = new AtomicInteger();
+            var most = new AtomicInteger();
+            try {
+                for (var i = 0; i <= limit; i++) {
+                    var pool = IoPool.create(1);
+                    pools.add(pool);
+                    var ledger = openPooled(directory.resolve("store" + i), pool);
+                    ledgers.add(ledger);
+                    onVirtualThread(() -> reachDescriptor(ledger, new TreeMap<>(), pool, released));
+                }
+                WriteThrough.Posix.writingForTests = writing -> {
+                    most.accumulateAndGet(writing, Math::max);
+                    if (arrivals.incrementAndGet() <= limit) {
+                        try {
+                            held.await(1, TimeUnit.MINUTES);
+                        } catch (InterruptedException exception) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                };
+                var writers = new ArrayList<Thread>();
+                for (var i = 0; i < limit; i++) {
+                    var ledger = ledgers.get(i);
+                    writers.add(Thread.ofVirtual().start(() -> {
+                        try {
+                            ledger.commit(ledger.newBatch().put(NAMES, "held", "v".repeat(500))).awaitDurable();
+                        } catch (InterruptedException exception) {
+                            throw new RuntimeException(exception);
+                        }
+                    }));
+                }
+                for (var i = 0; i < 600 && arrivals.get() < limit; i++) {
+                    Thread.sleep(100);
+                }
+                assertEquals(limit, arrivals.get(), "the held writes did not all reach their descriptors");
+                var last = ledgers.get(limit);
+                var log = log(last);
+                onVirtualThread(() -> {
+                    var handle = (WriteThrough.PosixHandle) log.throughHandleForTests();
+                    var channelWrites = handle.channelWritesForTests();
+                    var through = log.writtenThrough();
+                    last.commit(last.newBatch().put(NAMES, "next", "v".repeat(500))).awaitDurable();
+                    assertEquals(through + 1, log.writtenThrough(), "the group past the limit was not written through");
+                    if (log.throughHandleForTests() == handle) {
+                        assertEquals(channelWrites + 1, handle.channelWritesForTests(), "the group past the limit did not go through the channel");
+                    }
+                    return null;
+                });
+                assertEquals(limit, arrivals.get(), "a virtual thread past the limit wrote through a descriptor");
+                held.countDown();
+                for (var writer : writers) {
+                    writer.join();
+                }
+                assertTrue(most.get() <= limit, "more virtual threads than the limit wrote through descriptors: " + most.get());
+            } finally {
+                WriteThrough.Posix.writingForTests = null;
+                held.countDown();
+                released.countDown();
+                for (var ledger : ledgers) {
+                    ledger.close();
+                }
+                for (var pool : pools) {
+                    pool.close();
+                }
+            }
+        }
+
+        @Test
+        @EnabledOnOs(OS.LINUX)
+        @DisplayName("on Linux a handle whose descriptor is closed refuses a write, and one dropped without a close has its descriptor closed")
+        void linuxDescriptorClosed(@TempDir Path directory) throws Exception {
+            assumeDescriptors(directory);
+            var file = directory.resolve("segment");
+            Files.write(file, new byte[16_384]);
+            var target = file.toRealPath();
+            var through = WriteThrough.of(WriteThrough.Mode.DIRECT, directory);
+            var first = new byte[4_096];
+            Arrays.fill(first, (byte) 7);
+            var second = new byte[4_096];
+            Arrays.fill(second, (byte) 9);
+            var handle = (WriteThrough.PosixHandle) through.open(file);
+            onVirtualThread(() -> {
+                handle.write(first, first.length, 0);
+                assertTrue(handle.descriptorForTests() >= 0, "the virtual thread opened no descriptor");
+                handle.close();
+                assertFalse(handle.isOpen());
+                assertThrows(ClosedChannelException.class, () -> handle.write(second, second.length, 4_096));
+                return null;
+            });
+            assertEquals(List.of(), openFlags(file), "the closed handle left a descriptor open");
+            var written = Files.readAllBytes(file);
+            assertEquals(7, written[4_095]);
+            assertEquals(0, written[4_096], "a write after the close reached the file");
+            var number = onVirtualThread(() -> {
+                var dropped = (WriteThrough.PosixHandle) through.open(file);
+                dropped.write(second, second.length, 4_096);
+                return dropped.descriptorForTests();
+            });
+            assertTrue(number >= 0, "the virtual thread opened no descriptor");
+            var link = Path.of("/proc/self/fd/" + number);
+            var closed = false;
+            for (var i = 0; i < 200 && !closed; i++) {
+                System.gc();
+                Thread.sleep(50);
+                try {
+                    closed = !Files.readSymbolicLink(link).equals(target);
+                } catch (IOException _) {
+                    closed = true;
+                }
+            }
+            assertTrue(closed, "the descriptor of a dropped handle stayed open");
+        }
+
+        /// Skips the test unless this process writes through descriptors of the C library into `directory`, linking
+        /// their calls first.
+        private static void assumeDescriptors(Path directory) {
+            Assumptions.assumeTrue(WriteThrough.Posix.ELIGIBLE, "the process cannot write through descriptors of the C library");
+            Assumptions.assumeTrue(acceptsDirect(directory), "the file system refuses O_DIRECT");
+            assertTrue(WriteThrough.Posix.link(), "the calls of the C library did not link");
+        }
+
+        private static Ledger openPooled(Path directory, IoPool pool) {
+            return ((LedgerBuilder) Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(NAMES).ioPool(pool))
+                    .segmentSize(SEGMENT)
+                    .writeThrough(WriteThrough.Mode.DIRECT)
+                    .build();
+        }
+
+        /// Commits on the calling virtual thread until a group is written through the descriptor of a segment, with
+        /// the thread of `pool` held until `released` opens so that each commit writes its own group.
+        ///
+        /// @return the commits made, whose keys are `w0` onwards
+        private static int reachDescriptor(Ledger ledger, Map<String, String> model, IoPool pool, CountDownLatch released) throws Exception {
+            var log = log(ledger);
+            var commits = reachWriteThrough(ledger, model);
+            hold(pool, released);
+            for (var attempt = 0; attempt < 400; attempt++) {
+                commit(ledger, model, "w" + commits++);
+                if (log.throughHandleForTests() instanceof WriteThrough.PosixHandle handle && handle.descriptorForTests() >= 0
+                        && log.groupEnd() < SEGMENT / 2) {
+                    return commits;
+                }
+            }
+            return fail("no segment was written through a descriptor");
+        }
+
+        /// Keeps the only thread of `pool` from any other task until `released` opens, and returns once it runs, with
+        /// every task queued before it done; for five minutes at most, so a commit that left its group to the pool fails
+        /// an assertion rather than hanging the test.
+        private static void hold(IoPool pool, CountDownLatch released) throws InterruptedException {
+            var occupied = new CountDownLatch(1);
+            ((PlatformIoPool) pool).executor().execute(() -> {
+                occupied.countDown();
+                try {
+                    released.await(5, TimeUnit.MINUTES);
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            occupied.await();
+        }
+
+        /// {@return what `work` returns, run on a virtual thread}
+        ///
+        /// @throws Exception what `work` throws
+        private static <T> T onVirtualThread(Callable<T> work) throws Exception {
+            var task = new FutureTask<>(work);
+            Thread.ofVirtual().start(task);
+            try {
+                return task.get(5, TimeUnit.MINUTES);
+            } catch (ExecutionException exception) {
+                switch (exception.getCause()) {
+                    case Exception cause -> throw cause;
+                    case Error cause -> throw cause;
+                    case null, default -> throw exception;
+                }
+            }
+        }
+
         // The octal values of <fcntl.h>, as /proc/<pid>/fdinfo prints them
         private static final long O_DSYNC = 0_10000;
 
@@ -1167,6 +1466,16 @@ class WriteThroughTest {
             assertFalse(through.enabled());
             assertEquals(1, asked.get());
             assertThrows(IllegalStateException.class, () -> through.open(Path.of("segment")));
+        }
+
+        @Test
+        @DisplayName("leave a carrier free of descriptor writes, so a scheduler of one carrier writes every group through the channel")
+        void descriptorLimit() {
+            assertEquals(0, WriteThrough.Posix.limitOf(1));
+            assertEquals(1, WriteThrough.Posix.limitOf(2));
+            assertEquals(3, WriteThrough.Posix.limitOf(4));
+            assertTrue(WriteThrough.Posix.LIMIT > 0 || !WriteThrough.Posix.ELIGIBLE,
+                    "a process with no carrier to spare writes through descriptors");
         }
     }
 

@@ -1346,8 +1346,11 @@ final class LogWriter {
     /// Only without a commit window, which the pool's flush waits out for the commits that join the group. A virtual
     /// thread leads too: its force lends the carrier's place to another, as the JDK does for a force, and only the write
     /// of the group into the file's cache holds the carrier; a commit of one virtual thread at a time made a fifth more
-    /// commits a second where it did. On Windows the write of a group through to stable storage holds the carrier too,
-    /// one at a time as only one flush runs, while the other carriers go on.
+    /// commits a second where it did. On Windows, and on Linux with native access, the write of a group through to
+    /// stable storage holds the carrier for its round trip to the device instead, one at a time in a store as only one
+    /// flush runs, while the other carriers go on: lending the carrier for a write wakes a carrier to take its place,
+    /// which finds nothing to do once the write returns. On Linux at most [WriteThrough.Posix#LIMIT] virtual threads of
+    /// the process hold their carriers so, none on a scheduler of one carrier, and the next lend theirs.
     private boolean alone(long sequence) {
         return commitWindowNanos == 0 && lastGroupWaiters <= 1 && waiters.isEmpty() && lastQueued == sequence
                 && durable < sequence;
@@ -1632,6 +1635,8 @@ final class LogWriter {
             channel = FileChannel.open(segmentPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
         }
         if (throughFile != null && !throughFile.isOpen()) {
+            // What the interrupt left open of the handle, a descriptor beside its channel
+            closeQuietly(throughFile);
             try {
                 throughFile = writeThrough.open(segmentPath);
             } catch (IOException | RuntimeException | LinkageError _) {
@@ -2821,6 +2826,12 @@ final class LogWriter {
     /// {@return the way later segments are opened to write through, or `null` if their groups are forced, for tests}
     WriteThrough.Kind writeThroughKind() {
         return writeThrough.kind();
+    }
+
+    /// {@return the current segment's handle to write through, or `null` if none is open, for tests that read it
+    /// between commits}
+    WriteThrough.Handle throughHandleForTests() {
+        return throughFile;
     }
 
     /// {@return the waits for the commits a force woke that ended with all of them back, for tests}
