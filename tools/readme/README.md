@@ -28,11 +28,11 @@ python tools/readme/charts.py
    README writes none of them out again: each row's title gives Ledger's result, each bar its ratio to Ledger's
    ("4.7x", or "+8%" under 1.1x; the side of the 1x line gives the direction), drawn pale with a `~` when the run does
    not settle it (two times within their 99.9% confidence intervals, or two memory results, which carry no interval,
-   within 10%), and each bar's tooltip, shown when the SVG is opened on its own, the engine's absolute result. The
-   header of each SVG names the runs, commit and rounds it draws from. The charts are 600 wide and shown at that size,
-   with 12 to 14 px text, so that a phone scales them down no further than its width. An `exclude` line of
-   `charts.tsv` replaces a metric's bars on one OS with its reason. A chart of an OS without data is left out, and its
-   old SVGs are deleted.
+   within 10%), and each bar's tooltip the engine's absolute result (GitHub shows a README's images without their
+   tooltips, so the README points to `benchmarks.tsv` for those). The header of each SVG names the runs, commit and
+   rounds it draws from. The charts are 600 wide and shown at that size, with 12 to 14 px text, so that a phone scales
+   them down no further than its width. An `exclude` line of `charts.tsv` replaces a metric's bars on one OS with its
+   reason. A chart of an OS without data is left out, and its old SVGs are deleted.
 
 `python tools/readme/charts.py --check` exits 1 when a committed SVG or the README block is stale. Both scripts need
 Python 3 and its standard library only; `fetch.py` also needs the GitHub CLI (`gh`), logged in.

@@ -13,8 +13,8 @@ inverse of its throughput, or the bytes a counter measured. On the logarithmic a
 costs more than Ledger and left when it costs less, and its label gives the factor ("4.7x") or, under 1.1x, the signed
 percentage ("+8%"). A result the run does not settle is drawn pale with a "~" before its label: a time whose 99.9%
 confidence interval overlaps Ledger's, or a memory result within 10% of Ledger's, since memory results carry no
-interval. Each row's title carries Ledger's own result; every engine's absolute result is in the tooltip of its bar
-(shown when the SVG is opened on its own) and in benchmarks.tsv.
+interval. Each row's title carries Ledger's own result; every engine's absolute result is in benchmarks.tsv and in
+the tooltip of its bar, which a browser shows when it opens the SVG itself but GitHub does not in a README.
 """
 import math
 import os
