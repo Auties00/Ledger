@@ -459,11 +459,11 @@ class LogOutputSizeTest {
         disk.intercept((path, kind) -> {
             if (kind == ChangeInterceptor.ChangeKind.FORCE && path.toString().endsWith(".log")
                     && Thread.currentThread() == committer && armed.compareAndSet(true, false)) {
+                // Not waited for with a join, which the interrupt ends while the interrupter may still be closing the
+                // channel, so that interrupt could reach a later operation of the thread, the opening of a survivor
                 var interrupter = Thread.ofPlatform().start(committer::interrupt);
-                try {
-                    interrupter.join();
-                } catch (InterruptedException _) {
-                    Thread.currentThread().interrupt();
+                while (interrupter.isAlive()) {
+                    Thread.onSpinWait();
                 }
                 interrupts.incrementAndGet();
             }

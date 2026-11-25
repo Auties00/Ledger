@@ -336,15 +336,19 @@ class DurableLedgerTest {
                 // Only while the committing thread forces its own group, or waits for the file of large values
                 var leading = large || Thread.currentThread() == committer;
                 if (kind == ChangeInterceptor.ChangeKind.FORCE && target && leading && armed.compareAndSet(true, false)) {
+                    // Not waited for with a join, which on the committer the interrupt ends while the interrupter may
+                    // still be closing the channel, so that interrupt could reach a later operation of the thread
                     var interrupter = Thread.ofPlatform().start(committer::interrupt);
-                    try {
-                        interrupter.join();
-                        if (large) {
-                            // Long enough for the committer to take the interrupt in its wait
+                    while (interrupter.isAlive()) {
+                        Thread.onSpinWait();
+                    }
+                    if (large) {
+                        // Long enough for the committer to take the interrupt in its wait
+                        try {
                             Thread.sleep(20);
+                        } catch (InterruptedException _) {
+                            Thread.currentThread().interrupt();
                         }
-                    } catch (InterruptedException _) {
-                        Thread.currentThread().interrupt();
                     }
                     interrupts.incrementAndGet();
                 }
