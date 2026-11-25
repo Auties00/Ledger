@@ -368,7 +368,8 @@ numbers on your own device to differ.
 > A bar shows an engine's cost divided by Ledger's (encrypted, the reference line at 1x): its time per operation, the
 > inverse of its throughput, or the bytes or memory it took. It runs **right** when the engine is slower or takes more
 > than Ledger and **left** when it is faster or takes less, whatever the unit, on a logarithmic axis. Each chart's text
-> list has the absolute numbers, with the half-width of JMH's 99.9% confidence interval. The numbers live in
+> list has the absolute numbers, with the half-width of JMH's 99.9% confidence interval over the round's measurement
+> iterations, which is wide for the workloads that measure only a few. The numbers live in
 > [`tools/readme/benchmarks.tsv`](tools/readme/benchmarks.tsv), which names the run, commit and runner behind every one,
 > and [`tools/readme/charts.tsv`](tools/readme/charts.tsv) picks what the charts show. To measure again, run the
 > Benchmark workflow (`gh workflow run benchmark.yml -f os=all -f group=all -f rounds=3`), then
@@ -399,7 +400,7 @@ No other engine costs less than Ledger in any row of this chart in these runs.
 <summary>Durable commits on Linux: the numbers as text</summary>
 
 - **One durable 1.5 KB write, latency.** Ledger: 89.7 +- 0.562 us/op
-  - ledger-plain: 90.2 +- 0.41 us/op, 1.0x slower than Ledger
+  - ledger-plain: 90.2 +- 0.41 us/op, 1% slower than Ledger
   - mvstore: 420 +- 7.52 us/op, 4.7x slower than Ledger
   - mvstore-encrypted: 614 +- 6.05 us/op, 6.8x slower than Ledger
   - rocksdb: 234 +- 1.24 us/op, 2.6x slower than Ledger
@@ -425,7 +426,7 @@ No other engine costs less than Ledger in any row of this chart in these runs.
   - berkeley-je: 4,075 +- 1,614 ops/s, 2.6x slower than Ledger
   - floor (device bound): 4,249 +- 615 ops/s, 2.5x slower than Ledger
 - **Durable writes per second, 8 concurrent committers.** Ledger: 42,470 +- 110,148 ops/s
-  - ledger-plain: 42,980 +- 47,929 ops/s, 1.0x faster than Ledger
+  - ledger-plain: 42,980 +- 47,929 ops/s, 1% faster than Ledger
   - mvstore: 1,995 +- 608 ops/s, 21x slower than Ledger
   - mvstore-encrypted: 1,391 +- 363 ops/s, 31x slower than Ledger
   - rocksdb: 9,458 +- 6,338 ops/s, 4.5x slower than Ledger
@@ -434,7 +435,7 @@ No other engine costs less than Ledger in any row of this chart in these runs.
   - berkeley-je: 11,411 +- 8,166 ops/s, 3.7x slower than Ledger
   - floor (device bound): 12,900 +- 1,120 ops/s, 3.3x slower than Ledger
 - **Durable writes per second, 256 concurrent committers.** Ledger: 286,988 +- 112,324 ops/s
-  - ledger-plain: 279,401 +- 61,977 ops/s, 1.0x slower than Ledger
+  - ledger-plain: 279,401 +- 61,977 ops/s, 3% slower than Ledger
   - mvstore: 1,990 +- 1,008 ops/s, 144x slower than Ledger
   - mvstore-encrypted: 1,410 +- 390 ops/s, 203x slower than Ledger
   - rocksdb: 9,619 +- 6,209 ops/s, 30x slower than Ledger
@@ -443,7 +444,7 @@ No other engine costs less than Ledger in any row of this chart in these runs.
   - berkeley-je: 53,561 +- 31,085 ops/s, 5.4x slower than Ledger
   - floor (device bound): 17,195 +- 3,814 ops/s, 17x slower than Ledger
 - **Webhook deliveries stored durably and removed once handled, 4 at a time.** Ledger: 24,697 +- 14,518 ops/s
-  - ledger-plain: 24,082 +- 13,423 ops/s, 1.0x slower than Ledger
+  - ledger-plain: 24,082 +- 13,423 ops/s, 3% slower than Ledger
   - mvstore: 1,656 +- 1,459 ops/s, 15x slower than Ledger
   - mvstore-encrypted: 1,032 +- 106 ops/s, 24x slower than Ledger
   - rocksdb: 6,036 +- 2,151 ops/s, 4.1x slower than Ledger
@@ -477,7 +478,7 @@ No other engine costs less than Ledger in any row of this chart in these runs.
   - berkeley-je: 142 +- 0.694 us/op, 1.9x slower than Ledger
   - floor (device bound): 128 +- 0.508 us/op, 1.7x slower than Ledger
 - **One received message stored durably (body, id index, session, chat), latency.** Ledger: 88.2 +- 2.99 us/op
-  - ledger-plain: 89.9 +- 6.29 us/op, 1.0x slower than Ledger
+  - ledger-plain: 89.9 +- 6.29 us/op, 2% slower than Ledger
   - mvstore: 485 +- 16.6 us/op, 5.5x slower than Ledger
   - mvstore-encrypted: 945 +- 28.2 us/op, 11x slower than Ledger
   - rocksdb: 172 +- 4.05 us/op, 2.0x slower than Ledger
@@ -485,7 +486,7 @@ No other engine costs less than Ledger in any row of this chart in these runs.
   - sqlite: 569 +- 43.2 us/op, 6.5x slower than Ledger
   - berkeley-je: 172 +- 10.9 us/op, 2.0x slower than Ledger
 - **Durable writes per second, 1 committer.** Ledger: 12,825 +- 8,820 ops/s
-  - ledger-plain: 12,930 +- 7,549 ops/s, 1.0x faster than Ledger
+  - ledger-plain: 12,930 +- 7,549 ops/s, 1% faster than Ledger
   - mvstore: 3,133 +- 426 ops/s, 4.1x slower than Ledger
   - mvstore-encrypted: 2,134 +- 211 ops/s, 6.0x slower than Ledger
   - rocksdb: 7,361 +- 5,891 ops/s, 1.7x slower than Ledger
@@ -494,7 +495,7 @@ No other engine costs less than Ledger in any row of this chart in these runs.
   - berkeley-je: 6,599 +- 1,978 ops/s, 1.9x slower than Ledger
   - floor (device bound): 7,403 +- 746 ops/s, 1.7x slower than Ledger
 - **Durable writes per second, 8 concurrent committers.** Ledger: 48,269 +- 70,338 ops/s
-  - ledger-plain: 48,962 +- 53,730 ops/s, 1.0x faster than Ledger
+  - ledger-plain: 48,962 +- 53,730 ops/s, 1% faster than Ledger
   - mvstore: 3,130 +- 1,218 ops/s, 15x slower than Ledger
   - mvstore-encrypted: 2,122 +- 643 ops/s, 23x slower than Ledger
   - rocksdb: 13,664 +- 12,552 ops/s, 3.5x slower than Ledger
@@ -503,7 +504,7 @@ No other engine costs less than Ledger in any row of this chart in these runs.
   - berkeley-je: 19,517 +- 4,823 ops/s, 2.5x slower than Ledger
   - floor (device bound): 6,753 +- 2,860 ops/s, 7.1x slower than Ledger
 - **Durable writes per second, 256 concurrent committers.** Ledger: 186,238 +- 174,662 ops/s
-  - ledger-plain: 178,726 +- 167,607 ops/s, 1.0x slower than Ledger
+  - ledger-plain: 178,726 +- 167,607 ops/s, 4% slower than Ledger
   - mvstore: 3,129 +- 637 ops/s, 60x slower than Ledger
   - mvstore-encrypted: 2,137 +- 243 ops/s, 87x slower than Ledger
   - rocksdb: 13,634 +- 8,006 ops/s, 14x slower than Ledger
@@ -529,7 +530,7 @@ No other engine costs less than Ledger in any row of this chart in these runs.
 <summary>Every other result of the commit workloads on Linux</summary>
 
 - **GroupCommitBenchmark.commitConcurrently (committers=64, sealed=true).** Ledger: 169,320 +- 153,884 ops/s
-  - ledger-plain: 170,373 +- 42,760 ops/s, 1.0x faster than Ledger
+  - ledger-plain: 170,373 +- 42,760 ops/s, 1% faster than Ledger
   - mvstore: 2,010 +- 663 ops/s, 84x slower than Ledger
   - mvstore-encrypted: 1,401 +- 307 ops/s, 121x slower than Ledger
   - rocksdb: 9,682 +- 13,666 ops/s, 17x slower than Ledger
@@ -544,7 +545,7 @@ No other engine costs less than Ledger in any row of this chart in these runs.
 <summary>Every other result of the commit workloads on Windows</summary>
 
 - **GroupCommitBenchmark.commitConcurrently (committers=64, sealed=true).** Ledger: 149,357 +- 145,996 ops/s
-  - ledger-plain: 146,200 +- 149,654 ops/s, 1.0x slower than Ledger
+  - ledger-plain: 146,200 +- 149,654 ops/s, 2% slower than Ledger
   - mvstore: 3,132 +- 1,270 ops/s, 48x slower than Ledger
   - mvstore-encrypted: 2,134 +- 417 ops/s, 70x slower than Ledger
   - rocksdb: 13,605 +- 5,567 ops/s, 11x slower than Ledger
@@ -564,7 +565,7 @@ A whole history sync of 200,000 messages, an app-state snapshot applied atomical
 Where another engine costs less than Ledger in these runs:
 
 - Linux, history sync, bytes written to the device: berkeley-je (1.4x less)
-- Linux, history sync, size on disk afterwards: berkeley-je (1.4x less), lmdb (1.1x less), sqlite (1.1x less)
+- Linux, history sync, size on disk afterwards: berkeley-je (1.4x less), lmdb (1.1x less), sqlite (6% less)
 - Linux, clearing the most active chat of a 200,000-message history, time: rocksdb (2.6x faster)
 - Windows, history sync, bytes written to the device: berkeley-je (1.3x less)
 - Windows, clearing the most active chat of a 200,000-message history, time: rocksdb (3.8x faster)
@@ -580,7 +581,7 @@ Where another engine costs less than Ledger in these runs:
 <summary>Bulk writes on Linux: the numbers as text</summary>
 
 - **History sync of 200,000 messages in batches of 1,000, time.** Ledger: 1,323 +- 646 ms/op
-  - ledger-plain: 1,335 +- 651 ms/op, 1.0x slower than Ledger
+  - ledger-plain: 1,335 +- 651 ms/op, 1% slower than Ledger
   - mvstore: 8,551 +- 1,745 ms/op, 6.5x slower than Ledger
   - mvstore-encrypted: 15,996 +- 2,038 ms/op, 12x slower than Ledger
   - rocksdb: 2,658 +- 1,176 ms/op, 2.0x slower than Ledger
@@ -589,21 +590,21 @@ Where another engine costs less than Ledger in these runs:
   - berkeley-je: 3,374 +- 2,444 ms/op, 2.6x slower than Ledger
   - floor (device bound): 2,550 +- 1,819 ms/op, 1.9x slower than Ledger
 - **History sync, bytes written to the device.** Ledger: 528.1 MiB for 288.7 MiB of payload
-  - ledger-plain: 555.4 MiB, 1.1x Ledger's
-  - mvstore: 1.1 GiB, 2.1x Ledger's
-  - mvstore-encrypted: 1.1 GiB, 2.1x Ledger's
-  - rocksdb: 555.3 MiB, 1.1x Ledger's
-  - lmdb: 1.1 GiB, 2.1x Ledger's
-  - sqlite: 2.7 GiB, 5.3x Ledger's
+  - ledger-plain: 555.4 MiB, 5% more than Ledger
+  - mvstore: 1.1 GiB, 2.1x more than Ledger
+  - mvstore-encrypted: 1.1 GiB, 2.1x more than Ledger
+  - rocksdb: 555.3 MiB, 5% more than Ledger
+  - lmdb: 1.1 GiB, 2.1x more than Ledger
+  - sqlite: 2.7 GiB, 5.3x more than Ledger
   - berkeley-je: 381.7 MiB, 1.4x less than Ledger
   - floor (device bound): 302.8 MiB, 1.7x less than Ledger
 - **History sync, size on disk afterwards.** Ledger: 528.0 MiB
-  - ledger-plain: 555.7 MiB, 1.1x Ledger's
-  - mvstore: 1.1 GiB, 2.1x Ledger's
-  - mvstore-encrypted: 1.1 GiB, 2.1x Ledger's
-  - rocksdb: 555.4 MiB, 1.1x Ledger's
+  - ledger-plain: 555.7 MiB, 5% more than Ledger
+  - mvstore: 1.1 GiB, 2.1x more than Ledger
+  - mvstore-encrypted: 1.1 GiB, 2.1x more than Ledger
+  - rocksdb: 555.4 MiB, 5% more than Ledger
   - lmdb: 482.2 MiB, 1.1x less than Ledger
-  - sqlite: 497.6 MiB, 1.1x less than Ledger
+  - sqlite: 497.6 MiB, 6% less than Ledger
   - berkeley-je: 381.7 MiB, 1.4x less than Ledger
   - floor (device bound): 302.8 MiB, 1.7x less than Ledger
 - **App-state snapshot of 20,000 entries applied atomically, time.** Ledger: 28.2 +- 11.2 ms/op
@@ -616,7 +617,7 @@ Where another engine costs less than Ledger in these runs:
   - berkeley-je: 146 +- 171 ms/op, 5.2x slower than Ledger
   - floor (device bound): 62.4 +- 38.2 ms/op, 2.2x slower than Ledger
 - **Small app-state patch over those entries, latency.** Ledger: 203 +- 7.81 us/op
-  - ledger-plain: 216 +- 8.36 us/op, 1.1x slower than Ledger
+  - ledger-plain: 216 +- 8.36 us/op, 6% slower than Ledger
   - mvstore: 2,014 +- 54.8 us/op, 9.9x slower than Ledger
   - mvstore-encrypted: 4,219 +- 62.3 us/op, 21x slower than Ledger
   - rocksdb: 560 +- 7.07 us/op, 2.8x slower than Ledger
@@ -649,7 +650,7 @@ Where another engine costs less than Ledger in these runs:
 <summary>Bulk writes on Windows: the numbers as text</summary>
 
 - **History sync of 200,000 messages in batches of 1,000, time.** Ledger: 1,198 +- 552 ms/op
-  - ledger-plain: 1,221 +- 258 ms/op, 1.0x slower than Ledger
+  - ledger-plain: 1,221 +- 258 ms/op, 2% slower than Ledger
   - mvstore: 6,037 +- 9,874 ms/op, 5.0x slower than Ledger
   - mvstore-encrypted: 9,607 +- 2,996 ms/op, 8.0x slower than Ledger
   - rocksdb: 2,422 +- 1,124 ms/op, 2.0x slower than Ledger
@@ -658,23 +659,23 @@ Where another engine costs less than Ledger in these runs:
   - berkeley-je: 2,970 +- 2,848 ms/op, 2.5x slower than Ledger
   - floor (device bound): 1,790 +- 4,843 ms/op, 1.5x slower than Ledger
 - **History sync, bytes written to the device.** Ledger: 496.2 MiB for 288.7 MiB of payload
-  - ledger-plain: 533.4 MiB, 1.1x Ledger's
-  - mvstore: 1.1 GiB, 2.2x Ledger's
-  - mvstore-encrypted: 1.1 GiB, 2.2x Ledger's
-  - rocksdb: 556.7 MiB, 1.1x Ledger's
-  - lmdb: 1.1 GiB, 2.2x Ledger's
-  - sqlite: 2.7 GiB, 5.6x Ledger's
+  - ledger-plain: 533.4 MiB, 8% more than Ledger
+  - mvstore: 1.1 GiB, 2.2x more than Ledger
+  - mvstore-encrypted: 1.1 GiB, 2.2x more than Ledger
+  - rocksdb: 556.7 MiB, 1.1x more than Ledger
+  - lmdb: 1.1 GiB, 2.2x more than Ledger
+  - sqlite: 2.7 GiB, 5.6x more than Ledger
   - berkeley-je: 381.4 MiB, 1.3x less than Ledger
   - floor (device bound): 302.8 MiB, 1.6x less than Ledger
 - **History sync, size on disk afterwards.** Ledger: 290.6 MiB
-  - ledger-plain: 301.3 MiB, 1.0x Ledger's
-  - mvstore: 1.1 GiB, 3.8x Ledger's
-  - mvstore-encrypted: 1.1 GiB, 3.8x Ledger's
-  - rocksdb: 492.5 MiB, 1.7x Ledger's
-  - lmdb: 482.2 MiB, 1.7x Ledger's
-  - sqlite: 497.6 MiB, 1.7x Ledger's
-  - berkeley-je: 378.2 MiB, 1.3x Ledger's
-  - floor (device bound): 302.8 MiB, 1.0x Ledger's
+  - ledger-plain: 301.3 MiB, 4% more than Ledger
+  - mvstore: 1.1 GiB, 3.8x more than Ledger
+  - mvstore-encrypted: 1.1 GiB, 3.8x more than Ledger
+  - rocksdb: 492.5 MiB, 1.7x more than Ledger
+  - lmdb: 482.2 MiB, 1.7x more than Ledger
+  - sqlite: 497.6 MiB, 1.7x more than Ledger
+  - berkeley-je: 378.2 MiB, 1.3x more than Ledger
+  - floor (device bound): 302.8 MiB, 4% more than Ledger
 - **App-state snapshot of 20,000 entries applied atomically, time.** Ledger: 25.8 +- 19.5 ms/op
   - ledger-plain: 45.5 +- 55.0 ms/op, 1.8x slower than Ledger
   - mvstore: 61.3 +- 38.9 ms/op, 2.4x slower than Ledger
@@ -685,7 +686,7 @@ Where another engine costs less than Ledger in these runs:
   - berkeley-je: 112 +- 143 ms/op, 4.3x slower than Ledger
   - floor (device bound): 50.5 +- 34.8 ms/op, 2.0x slower than Ledger
 - **Small app-state patch over those entries, latency.** Ledger: 106 +- 6.3 us/op
-  - ledger-plain: 110 +- 6.27 us/op, 1.0x slower than Ledger
+  - ledger-plain: 110 +- 6.27 us/op, 4% slower than Ledger
   - mvstore: 1,371 +- 47.7 us/op, 13x slower than Ledger
   - mvstore-encrypted: 3,143 +- 55.3 us/op, 30x slower than Ledger
   - rocksdb: 239 +- 2.48 us/op, 2.3x slower than Ledger
@@ -694,7 +695,7 @@ Where another engine costs less than Ledger in these runs:
   - berkeley-je: 239 +- 1.04 us/op, 2.3x slower than Ledger
   - floor (device bound): 182 +- 0.754 us/op, 1.7x slower than Ledger
 - **Clearing the most active chat of a 200,000-message history, time.** Ledger: 2.78 +- 3.92 ms/op
-  - ledger-plain: 2.65 +- 3.95 ms/op, 1.0x faster than Ledger
+  - ledger-plain: 2.65 +- 3.95 ms/op, 5% faster than Ledger
   - mvstore: 467 +- 195 ms/op, 168x slower than Ledger
   - mvstore-encrypted: 921 +- 558 ms/op, 331x slower than Ledger
   - rocksdb: 0.732 +- 0.0975 ms/op, 3.8x faster than Ledger
@@ -710,11 +711,11 @@ Where another engine costs less than Ledger in these runs:
 <summary>Every other result of the ingest workloads on Linux</summary>
 
 - **HistoryIngestBenchmark.ingest (batchSize=10000, messages=200000, sealed=true).** Ledger: 1,405 +- 704 ms/op
-  - ledger-plain: 1,480 +- 1,390 ms/op, 1.1x slower than Ledger
+  - ledger-plain: 1,480 +- 1,390 ms/op, 5% slower than Ledger
   - mvstore: 6,369 +- 583 ms/op, 4.5x slower than Ledger
   - mvstore-encrypted: 11,239 +- 721 ms/op, 8.0x slower than Ledger
   - rocksdb: 2,950 +- 951 ms/op, 2.1x slower than Ledger
-  - lmdb: 1,537 +- 2,766 ms/op, 1.1x slower than Ledger
+  - lmdb: 1,537 +- 2,766 ms/op, 9% slower than Ledger
   - sqlite: 14,558 +- 2,490 ms/op, 10x slower than Ledger
   - berkeley-je: 3,595 +- 3,460 ms/op, 2.6x slower than Ledger
   - floor: 2,612 +- 3,494 ms/op, 1.9x slower than Ledger
@@ -729,7 +730,7 @@ Where another engine costs less than Ledger in these runs:
   - mvstore: 4,323 +- 1,815 ms/op, 2.6x slower than Ledger
   - mvstore-encrypted: 8,980 +- 702 ms/op, 5.5x slower than Ledger
   - rocksdb: 2,593 +- 395 ms/op, 1.6x slower than Ledger
-  - lmdb: 1,680 +- 2,054 ms/op, 1.0x slower than Ledger
+  - lmdb: 1,680 +- 2,054 ms/op, 2% slower than Ledger
   - sqlite: 12,314 +- 502 ms/op, 7.5x slower than Ledger
   - berkeley-je: 3,080 +- 2,951 ms/op, 1.9x slower than Ledger
   - floor: 1,404 +- 2,106 ms/op, 1.2x faster than Ledger
@@ -790,7 +791,7 @@ Where another engine costs less than Ledger in these runs:
   - sqlite: 23.9 +- 0.033 us/op, 13x slower than Ledger
   - berkeley-je: 5.83 +- 0.195 us/op, 3.2x slower than Ledger
 - **Reopen the store and list the chats, time.** Ledger: 25.4 +- 73.6 ms/op
-  - ledger-plain: 24.1 +- 39.8 ms/op, 1.1x faster than Ledger
+  - ledger-plain: 24.1 +- 39.8 ms/op, 5% faster than Ledger
   - mvstore: 22.5 +- 41.9 ms/op, 1.1x faster than Ledger
   - mvstore-encrypted: 54.0 +- 27.2 ms/op, 2.1x slower than Ledger
   - rocksdb: 59.6 +- 183 ms/op, 2.3x slower than Ledger
@@ -799,11 +800,11 @@ Where another engine costs less than Ledger in these runs:
   - berkeley-je: 78.4 +- 103 ms/op, 3.1x slower than Ledger
 - **Reopen the store and show the first chat, time.** Ledger: 13.6 +- 5.72 ms/op
   - ledger-plain: 11.5 +- 11.2 ms/op, 1.2x faster than Ledger
-  - mvstore: 12.9 +- 11.6 ms/op, 1.1x faster than Ledger
+  - mvstore: 12.9 +- 11.6 ms/op, 5% faster than Ledger
   - mvstore-encrypted: 19.6 +- 23.4 ms/op, 1.4x slower than Ledger
   - rocksdb: 18.9 +- 20.3 ms/op, 1.4x slower than Ledger
   - lmdb: 8.04 +- 2.84 ms/op, 1.7x faster than Ledger
-  - sqlite: 13.1 +- 13.3 ms/op, 1.0x faster than Ledger
+  - sqlite: 13.1 +- 13.3 ms/op, 4% faster than Ledger
   - berkeley-je: 58.1 +- 80.7 ms/op, 4.3x slower than Ledger
 
 </details>
@@ -854,7 +855,7 @@ Where another engine costs less than Ledger in these runs:
   - sqlite: 85.8 +- 0.866 us/op, 33x slower than Ledger
   - berkeley-je: 8.27 +- 0.222 us/op, 3.2x slower than Ledger
 - **Reopen the store and list the chats, time.** Ledger: 42.2 +- 98.6 ms/op
-  - ledger-plain: 41.0 +- 33.0 ms/op, 1.0x faster than Ledger
+  - ledger-plain: 41.0 +- 33.0 ms/op, 3% faster than Ledger
   - mvstore: 107 +- 63.4 ms/op, 2.5x slower than Ledger
   - mvstore-encrypted: 152 +- 52.9 ms/op, 3.6x slower than Ledger
   - rocksdb: 57.0 +- 28.0 ms/op, 1.4x slower than Ledger
@@ -942,21 +943,21 @@ Where another engine costs less than Ledger in these runs:
 <summary>Workloads Ledger is not built for on Linux: the numbers as text</summary>
 
 - **Random overwrites of 2,000,000 keys, writes per second.** Ledger: 526,742 +- 64,584 ops/s
-  - ledger-plain: 513,853 +- 302,687 ops/s, 1.0x slower than Ledger
+  - ledger-plain: 513,853 +- 302,687 ops/s, 3% slower than Ledger
   - mvstore: 16,203 +- 102,202 ops/s, 33x slower than Ledger
   - rocksdb: 363,731 +- 144,312 ops/s, 1.4x slower than Ledger
   - lmdb: 104,308 +- 3,897 ops/s, 5.0x slower than Ledger
   - sqlite: 19,316 +- 584 ops/s, 27x slower than Ledger
   - berkeley-je: 152,973 +- 56,908 ops/s, 3.4x slower than Ledger
 - **Random overwrites of 2,000,000 keys, size on disk afterwards.** Ledger: 2.1 GiB
-  - ledger-plain: 2.2 GiB, 1.1x Ledger's
-  - mvstore: 8.7 GiB, 4.2x Ledger's
+  - ledger-plain: 2.2 GiB, 8% more than Ledger
+  - mvstore: 8.7 GiB, 4.2x more than Ledger
   - rocksdb: 1.2 GiB, 1.7x less than Ledger
   - lmdb: 917.6 MiB, 2.3x less than Ledger
   - sqlite: 647.3 MiB, 3.3x less than Ledger
   - berkeley-je: 1.6 GiB, 1.3x less than Ledger
 - **Eight threads writing at once, writes per second.** Ledger: 703,759 +- 1,177,530 ops/s
-  - ledger-plain: 729,350 +- 1,635,350 ops/s, 1.0x faster than Ledger
+  - ledger-plain: 729,350 +- 1,635,350 ops/s, 4% faster than Ledger
   - mvstore: 4,785 +- 5,043 ops/s, 147x slower than Ledger
   - rocksdb: 81,459 +- 23,869 ops/s, 8.6x slower than Ledger
   - lmdb: 58,663 +- 22,834 ops/s, 12x slower than Ledger
@@ -977,21 +978,21 @@ Where another engine costs less than Ledger in these runs:
   - rocksdb: 101 +- 8.8 ms/op, 2.5x slower than Ledger
   - lmdb: 40.8 +- 1.73 ms/op, the same as Ledger
   - sqlite: 55.0 +- 6.53 ms/op, 1.4x slower than Ledger
-  - berkeley-je: 41.0 +- 0.707 ms/op, 1.0x slower than Ledger
+  - berkeley-je: 41.0 +- 0.707 ms/op, 1% slower than Ledger
   - floor (device bound): 40.7 +- 0.227 ms/op, the same as Ledger
 - **Read of a 16 MiB value, time.** Ledger: 1.5 +- 0.373 ms/op
-  - ledger-plain: 1.61 +- 0.236 ms/op, 1.1x slower than Ledger
+  - ledger-plain: 1.61 +- 0.236 ms/op, 7% slower than Ledger
   - mvstore: 1.74 +- 4.09 ms/op, 1.2x slower than Ledger
   - rocksdb: 4.85 +- 0.911 ms/op, 3.2x slower than Ledger
   - lmdb: 2.21 +- 2.51 ms/op, 1.5x slower than Ledger
   - sqlite: 59.5 +- 11.0 ms/op, 40x slower than Ledger
-  - berkeley-je: 1.63 +- 2.7 ms/op, 1.1x slower than Ledger
+  - berkeley-je: 1.63 +- 2.7 ms/op, 9% slower than Ledger
   - floor (device bound): 1.67 +- 2.87 ms/op, 1.1x slower than Ledger
 - **Size on disk after overwrites while a reader pins an old version.** Ledger: 90.5 MiB
   - ledger-plain: 90.5 MiB, the same as Ledger
-  - mvstore: 526.0 MiB, 5.8x Ledger's
+  - mvstore: 526.0 MiB, 5.8x more than Ledger
   - rocksdb: 18.2 MiB, 5.0x less than Ledger
-  - lmdb: 383.1 MiB, 4.2x Ledger's
+  - lmdb: 383.1 MiB, 4.2x more than Ledger
   - sqlite: 72.3 MiB, 1.3x less than Ledger
 
 </details>
@@ -1010,21 +1011,21 @@ Where another engine costs less than Ledger in these runs:
 <summary>Workloads Ledger is not built for on Windows: the numbers as text</summary>
 
 - **Random overwrites of 2,000,000 keys, writes per second.** Ledger: 351,755 +- 302,997 ops/s
-  - ledger-plain: 346,567 +- 130,231 ops/s, 1.0x slower than Ledger
+  - ledger-plain: 346,567 +- 130,231 ops/s, 1% slower than Ledger
   - mvstore: 20,678 +- 37,419 ops/s, 17x slower than Ledger
-  - rocksdb: 327,609 +- 97,908 ops/s, 1.1x slower than Ledger
+  - rocksdb: 327,609 +- 97,908 ops/s, 7% slower than Ledger
   - lmdb: 42,595 +- 357,280 ops/s, 8.3x slower than Ledger
   - sqlite: 6,050 +- 20,918 ops/s, 58x slower than Ledger
   - berkeley-je: 99,981 +- 29,840 ops/s, 3.5x slower than Ledger
 - **Random overwrites of 2,000,000 keys, size on disk afterwards.** Ledger: 2.5 GiB
-  - ledger-plain: 2.5 GiB, 1.0x Ledger's
+  - ledger-plain: 2.5 GiB, 1% more than Ledger
   - mvstore: 2.0 GiB, 1.2x less than Ledger
   - rocksdb: 1.2 GiB, 2.1x less than Ledger
   - lmdb: 917.6 MiB, 2.8x less than Ledger
   - sqlite: 647.3 MiB, 3.9x less than Ledger
   - berkeley-je: 1.7 GiB, 1.5x less than Ledger
 - **Eight threads writing at once, writes per second.** Ledger: 664,273 +- 1,792,910 ops/s
-  - ledger-plain: 723,607 +- 569,947 ops/s, 1.1x faster than Ledger
+  - ledger-plain: 723,607 +- 569,947 ops/s, 9% faster than Ledger
   - mvstore: 3,233 +- 2,982 ops/s, 205x slower than Ledger
   - rocksdb: 62,230 +- 8,255 ops/s, 11x slower than Ledger
   - lmdb: 19,665 +- 18,959 ops/s, 34x slower than Ledger
@@ -1048,18 +1049,18 @@ Where another engine costs less than Ledger in these runs:
   - berkeley-je: 41.3 +- 1 ms/op, the same as Ledger
   - floor (device bound): 41.1 +- 1.95 ms/op, the same as Ledger
 - **Read of a 16 MiB value, time.** Ledger: 1.34 +- 0.0299 ms/op
-  - ledger-plain: 1.32 +- 0.286 ms/op, 1.0x faster than Ledger
-  - mvstore: 1.41 +- 2.13 ms/op, 1.1x slower than Ledger
+  - ledger-plain: 1.32 +- 0.286 ms/op, 1% faster than Ledger
+  - mvstore: 1.41 +- 2.13 ms/op, 5% slower than Ledger
   - rocksdb: 6.55 +- 1.75 ms/op, 4.9x slower than Ledger
   - lmdb: 1.84 +- 0.509 ms/op, 1.4x slower than Ledger
   - sqlite: 51.3 +- 8.01 ms/op, 38x slower than Ledger
-  - berkeley-je: 1.37 +- 1.37 ms/op, 1.0x slower than Ledger
-  - floor (device bound): 1.36 +- 1.42 ms/op, 1.0x slower than Ledger
+  - berkeley-je: 1.37 +- 1.37 ms/op, 3% slower than Ledger
+  - floor (device bound): 1.36 +- 1.42 ms/op, 2% slower than Ledger
 - **Size on disk after overwrites while a reader pins an old version.** Ledger: 90.6 MiB
   - ledger-plain: 90.5 MiB, the same as Ledger
-  - mvstore: 526.1 MiB, 5.8x Ledger's
+  - mvstore: 526.1 MiB, 5.8x more than Ledger
   - rocksdb: 18.1 MiB, 5.0x less than Ledger
-  - lmdb: 383.1 MiB, 4.2x Ledger's
+  - lmdb: 383.1 MiB, 4.2x more than Ledger
   - sqlite: 72.3 MiB, 1.3x less than Ledger
 
 </details>
@@ -1080,23 +1081,23 @@ Where another engine costs less than Ledger in these runs:
 - **CallerThreadsReadBenchmark.findById (callers=platform, messages=200000, threads=8).** Ledger: 1,593,090 +- 924,319 ops/s
 - **CallerThreadsReadBenchmark.findById (callers=virtual, messages=200000, threads=8).** Ledger: 1,630,320 +- 2,575,330 ops/s
 - **LargeValueBenchmark.readValue (largeValues=1048576, valueSize=1048576).** Ledger: 0.0831 +- 0.0153 ms/op
-  - ledger-plain: 0.0864 +- 0.0298 ms/op, 1.0x slower than Ledger
-  - mvstore: 0.0857 +- 0.0482 ms/op, 1.0x slower than Ledger
+  - ledger-plain: 0.0864 +- 0.0298 ms/op, 4% slower than Ledger
+  - mvstore: 0.0857 +- 0.0482 ms/op, 3% slower than Ledger
   - rocksdb: 0.171 +- 0.28 ms/op, 2.1x slower than Ledger
   - lmdb: 0.117 +- 0.169 ms/op, 1.4x slower than Ledger
   - sqlite: 1.01 +- 0.523 ms/op, 12x slower than Ledger
-  - berkeley-je: 0.085 +- 0.0114 ms/op, 1.0x slower than Ledger
-  - floor: 0.0793 +- 0.0207 ms/op, 1.0x faster than Ledger
+  - berkeley-je: 0.085 +- 0.0114 ms/op, 2% slower than Ledger
+  - floor: 0.0793 +- 0.0207 ms/op, 5% faster than Ledger
 - **LargeValueBenchmark.writeValue (largeValues=1048576, valueSize=1048576).** Ledger: 2.6 +- 0.132 ms/op
   - ledger-plain: 2.59 +- 0.11 ms/op, the same as Ledger
-  - mvstore: 2.64 +- 0.0628 ms/op, 1.0x slower than Ledger
+  - mvstore: 2.64 +- 0.0628 ms/op, 2% slower than Ledger
   - rocksdb: 2.99 +- 0.179 ms/op, 1.2x slower than Ledger
   - lmdb: 2.6 +- 0.0564 ms/op, the same as Ledger
   - sqlite: 5.18 +- 0.0321 ms/op, 2.0x slower than Ledger
-  - berkeley-je: 2.62 +- 0.062 ms/op, 1.0x slower than Ledger
-  - floor: 2.61 +- 0.18 ms/op, 1.0x slower than Ledger
+  - berkeley-je: 2.62 +- 0.062 ms/op, 1% slower than Ledger
+  - floor: 2.61 +- 0.18 ms/op, 1% slower than Ledger
 - **PinnedReaderBenchmark.overwrite (pinned=false).** Ledger: 108 +- 296 us/op
-  - ledger-plain: 102 +- 123 us/op, 1.1x faster than Ledger
+  - ledger-plain: 102 +- 123 us/op, 6% faster than Ledger
   - mvstore: 477 +- 230 us/op, 4.4x slower than Ledger
   - rocksdb: 228 +- 112 us/op, 2.1x slower than Ledger
   - lmdb: 274 +- 43.4 us/op, 2.5x slower than Ledger
@@ -1111,9 +1112,9 @@ Where another engine costs less than Ledger in these runs:
   - sqlite: 1,065 +- 13,092 ops/s
   - lmdb: 1,079 +- 7,133 ops/s
 - **SqlIndexQueryBenchmark.query (messages=200000).**
-  - (no engine parameter): 18.5 +- 0.0326 us/op
+  - the workload's only engine: 18.5 +- 0.0326 us/op
 - **SqlIndexQueryBenchmark.createIndex (messages=200000).**
-  - (no engine parameter): 172 +- 5.65 ms/op
+  - the workload's only engine: 172 +- 5.65 ms/op
 
 </details>
 
@@ -1132,22 +1133,22 @@ Where another engine costs less than Ledger in these runs:
 - **CallerThreadsReadBenchmark.findById (callers=virtual, messages=200000, threads=8).** Ledger: 1,170,910 +- 405,050 ops/s
 - **LargeValueBenchmark.readValue (largeValues=1048576, valueSize=1048576).** Ledger: 0.0752 +- 0.00417 ms/op
   - ledger-plain: 0.0755 +- 0.00583 ms/op, the same as Ledger
-  - mvstore: 0.0767 +- 0.0264 ms/op, 1.0x slower than Ledger
+  - mvstore: 0.0767 +- 0.0264 ms/op, 2% slower than Ledger
   - rocksdb: 0.673 +- 0.052 ms/op, 8.9x slower than Ledger
   - lmdb: 0.117 +- 0.0061 ms/op, 1.6x slower than Ledger
   - sqlite: 3.21 +- 0.664 ms/op, 43x slower than Ledger
-  - berkeley-je: 0.0762 +- 0.00431 ms/op, 1.0x slower than Ledger
+  - berkeley-je: 0.0762 +- 0.00431 ms/op, 1% slower than Ledger
   - floor: 0.0755 +- 0.0166 ms/op, the same as Ledger
 - **LargeValueBenchmark.writeValue (largeValues=1048576, valueSize=1048576).** Ledger: 2.59 +- 0.0706 ms/op
   - ledger-plain: 2.59 +- 0.191 ms/op, the same as Ledger
-  - mvstore: 2.62 +- 0.0432 ms/op, 1.0x slower than Ledger
+  - mvstore: 2.62 +- 0.0432 ms/op, 1% slower than Ledger
   - rocksdb: 3.04 +- 0.12 ms/op, 1.2x slower than Ledger
-  - lmdb: 2.64 +- 0.0157 ms/op, 1.0x slower than Ledger
+  - lmdb: 2.64 +- 0.0157 ms/op, 2% slower than Ledger
   - sqlite: 9.62 +- 1.28 ms/op, 3.7x slower than Ledger
   - berkeley-je: 2.6 +- 0.043 ms/op, the same as Ledger
   - floor: 2.59 +- 0.0955 ms/op, the same as Ledger
 - **PinnedReaderBenchmark.overwrite (pinned=false).** Ledger: 147 +- 506 us/op
-  - ledger-plain: 146 +- 325 us/op, 1.0x faster than Ledger
+  - ledger-plain: 146 +- 325 us/op, 1% faster than Ledger
   - mvstore: 587 +- 115 us/op, 4.0x slower than Ledger
   - rocksdb: 304 +- 90.4 us/op, 2.1x slower than Ledger
   - lmdb: 737 +- 55.8 us/op, 5.0x slower than Ledger
@@ -1162,9 +1163,9 @@ Where another engine costs less than Ledger in these runs:
   - sqlite: 549 +- 4,910 ops/s
   - lmdb: 308 +- 205 ops/s
 - **SqlIndexQueryBenchmark.query (messages=200000).**
-  - (no engine parameter): 20.4 +- 0.0242 us/op
+  - the workload's only engine: 20.4 +- 0.0242 us/op
 - **SqlIndexQueryBenchmark.createIndex (messages=200000).**
-  - (no engine parameter): 168 +- 15.4 ms/op
+  - the workload's only engine: 168 +- 15.4 ms/op
 
 </details>
 
@@ -1177,7 +1178,7 @@ The resident memory of the process that the store and the operation added: the r
 Where another engine costs less than Ledger in these runs:
 
 - Linux, checkpoint under load, peak: sqlite (1.4x less), rocksdb (1.2x less)
-- Linux, recovery after a crash, peak: sqlite (7.2x less), mvstore (5.7x less), lmdb (3.2x less), mvstore-encrypted (2.4x less), rocksdb (1.1x less)
+- Linux, recovery after a crash, peak: sqlite (7.2x less), mvstore (5.7x less), lmdb (3.2x less), mvstore-encrypted (2.4x less), rocksdb (9% less)
 
 **Linux** (ubuntu-latest; run [44858981131](https://github.com/Auties00/Ledger/actions/runs/44858981131), commit d26087c, 3 rounds)
 
@@ -1190,68 +1191,68 @@ Where another engine costs less than Ledger in these runs:
 <summary>Memory on Linux: the numbers as text</summary>
 
 - **A client session over 200,000 messages, held at the end.** Ledger: 105.7 MiB
-  - ledger-plain: 146.1 MiB, 1.4x Ledger's
-  - mvstore: 322.7 MiB, 3.1x Ledger's
-  - mvstore-encrypted: 368.3 MiB, 3.5x Ledger's
-  - rocksdb: 131.4 MiB, 1.2x Ledger's
-  - lmdb: 458.1 MiB, 4.3x Ledger's
-  - sqlite: 146.7 MiB, 1.4x Ledger's
-  - berkeley-je: 243.5 MiB, 2.3x Ledger's
+  - ledger-plain: 146.1 MiB, 1.4x more than Ledger
+  - mvstore: 322.7 MiB, 3.1x more than Ledger
+  - mvstore-encrypted: 368.3 MiB, 3.5x more than Ledger
+  - rocksdb: 131.4 MiB, 1.2x more than Ledger
+  - lmdb: 458.1 MiB, 4.3x more than Ledger
+  - sqlite: 146.7 MiB, 1.4x more than Ledger
+  - berkeley-je: 243.5 MiB, 2.3x more than Ledger
 - **A client session over 1,000,000 messages, held at the end.** Ledger: 96.3 MiB
-  - ledger-plain: 137.6 MiB, 1.4x Ledger's
-  - mvstore: 266.1 MiB, 2.8x Ledger's
-  - mvstore-encrypted: 500.2 MiB, 5.2x Ledger's
-  - rocksdb: 183.9 MiB, 1.9x Ledger's
-  - lmdb: 929.6 MiB, 9.7x Ledger's
-  - sqlite: 179.5 MiB, 1.9x Ledger's
-  - berkeley-je: 211.4 MiB, 2.2x Ledger's
+  - ledger-plain: 137.6 MiB, 1.4x more than Ledger
+  - mvstore: 266.1 MiB, 2.8x more than Ledger
+  - mvstore-encrypted: 500.2 MiB, 5.2x more than Ledger
+  - rocksdb: 183.9 MiB, 1.9x more than Ledger
+  - lmdb: 929.6 MiB, 9.7x more than Ledger
+  - sqlite: 179.5 MiB, 1.9x more than Ledger
+  - berkeley-je: 211.4 MiB, 2.2x more than Ledger
 - **Messages arriving steadily, held at the end.** Ledger: 233.7 MiB
-  - ledger-plain: 282.3 MiB, 1.2x Ledger's
-  - mvstore: 532.6 MiB, 2.3x Ledger's
-  - mvstore-encrypted: 653.7 MiB, 2.8x Ledger's
-  - rocksdb: 260.0 MiB, 1.1x Ledger's
-  - lmdb: 580.5 MiB, 2.5x Ledger's
-  - sqlite: 374.9 MiB, 1.6x Ledger's
-  - berkeley-je: 622.7 MiB, 2.7x Ledger's
+  - ledger-plain: 282.3 MiB, 1.2x more than Ledger
+  - mvstore: 532.6 MiB, 2.3x more than Ledger
+  - mvstore-encrypted: 653.7 MiB, 2.8x more than Ledger
+  - rocksdb: 260.0 MiB, 1.1x more than Ledger
+  - lmdb: 580.5 MiB, 2.5x more than Ledger
+  - sqlite: 374.9 MiB, 1.6x more than Ledger
+  - berkeley-je: 622.7 MiB, 2.7x more than Ledger
 - **History sync of 200,000 messages, peak.** Ledger: 628.2 MiB
-  - ledger-plain: 931.0 MiB, 1.5x Ledger's
-  - mvstore: 1.5 GiB, 2.5x Ledger's
-  - mvstore-encrypted: 1.3 GiB, 2.1x Ledger's
-  - rocksdb: 765.3 MiB, 1.2x Ledger's
-  - lmdb: 1.2 GiB, 2.0x Ledger's
-  - sqlite: 919.4 MiB, 1.5x Ledger's
-  - berkeley-je: 1.7 GiB, 2.7x Ledger's
+  - ledger-plain: 931.0 MiB, 1.5x more than Ledger
+  - mvstore: 1.5 GiB, 2.5x more than Ledger
+  - mvstore-encrypted: 1.3 GiB, 2.1x more than Ledger
+  - rocksdb: 765.3 MiB, 1.2x more than Ledger
+  - lmdb: 1.2 GiB, 2.0x more than Ledger
+  - sqlite: 919.4 MiB, 1.5x more than Ledger
+  - berkeley-je: 1.7 GiB, 2.7x more than Ledger
 - **Checkpoint under load, peak.** Ledger: 264.8 MiB
-  - ledger-plain: 460.4 MiB, 1.7x Ledger's
-  - mvstore: 536.3 MiB, 2.0x Ledger's
-  - mvstore-encrypted: 1.0 GiB, 4.0x Ledger's
+  - ledger-plain: 460.4 MiB, 1.7x more than Ledger
+  - mvstore: 536.3 MiB, 2.0x more than Ledger
+  - mvstore-encrypted: 1.0 GiB, 4.0x more than Ledger
   - rocksdb: 214.8 MiB, 1.2x less than Ledger
-  - lmdb: 385.0 MiB, 1.5x Ledger's
+  - lmdb: 385.0 MiB, 1.5x more than Ledger
   - sqlite: 187.3 MiB, 1.4x less than Ledger
-  - berkeley-je: 337.4 MiB, 1.3x Ledger's
+  - berkeley-je: 337.4 MiB, 1.3x more than Ledger
 - **App-state snapshot of 100,000 entries, peak.** Ledger: 88.1 MiB
-  - ledger-plain: 148.9 MiB, 1.7x Ledger's
-  - mvstore: 218.1 MiB, 2.5x Ledger's
-  - mvstore-encrypted: 273.8 MiB, 3.1x Ledger's
-  - rocksdb: 163.0 MiB, 1.9x Ledger's
-  - lmdb: 170.9 MiB, 1.9x Ledger's
-  - sqlite: 177.9 MiB, 2.0x Ledger's
-  - berkeley-je: 230.4 MiB, 2.6x Ledger's
+  - ledger-plain: 148.9 MiB, 1.7x more than Ledger
+  - mvstore: 218.1 MiB, 2.5x more than Ledger
+  - mvstore-encrypted: 273.8 MiB, 3.1x more than Ledger
+  - rocksdb: 163.0 MiB, 1.9x more than Ledger
+  - lmdb: 170.9 MiB, 1.9x more than Ledger
+  - sqlite: 177.9 MiB, 2.0x more than Ledger
+  - berkeley-je: 230.4 MiB, 2.6x more than Ledger
 - **Recovery after a crash, peak.** Ledger: 73.0 MiB
-  - ledger-plain: 70.3 MiB, 1.0x less than Ledger
+  - ledger-plain: 70.3 MiB, 4% less than Ledger
   - mvstore: 12.9 MiB, 5.7x less than Ledger
   - mvstore-encrypted: 30.6 MiB, 2.4x less than Ledger
-  - rocksdb: 67.3 MiB, 1.1x less than Ledger
+  - rocksdb: 67.3 MiB, 9% less than Ledger
   - lmdb: 22.9 MiB, 3.2x less than Ledger
   - sqlite: 10.2 MiB, 7.2x less than Ledger
-  - berkeley-je: 81.5 MiB, 1.1x Ledger's
+  - berkeley-je: 81.5 MiB, 1.1x more than Ledger
 - **Values of 16 MiB, peak.** Ledger: 302.8 MiB
   - ledger-plain: 268.4 MiB, 1.1x less than Ledger
-  - mvstore: 606.5 MiB, 2.0x Ledger's
-  - rocksdb: 441.2 MiB, 1.5x Ledger's
-  - lmdb: 540.1 MiB, 1.8x Ledger's
-  - sqlite: 441.6 MiB, 1.5x Ledger's
-  - berkeley-je: 499.0 MiB, 1.6x Ledger's
+  - mvstore: 606.5 MiB, 2.0x more than Ledger
+  - rocksdb: 441.2 MiB, 1.5x more than Ledger
+  - lmdb: 540.1 MiB, 1.8x more than Ledger
+  - sqlite: 441.6 MiB, 1.5x more than Ledger
+  - berkeley-je: 499.0 MiB, 1.6x more than Ledger
 
 </details>
 
@@ -1271,32 +1272,32 @@ Where another engine costs less than Ledger in these runs:
   - mvstore: 65.2 +- 82.1 ms/op, the same as Ledger
   - mvstore-encrypted: 56.7 +- 17.7 ms/op, 1.2x faster than Ledger
   - rocksdb: 75.0 +- 86.5 ms/op, 1.1x slower than Ledger
-  - lmdb: 70.8 +- 36.6 ms/op, 1.1x slower than Ledger
+  - lmdb: 70.8 +- 36.6 ms/op, 8% slower than Ledger
   - sqlite: 74.7 +- 70.2 ms/op, 1.1x slower than Ledger
   - berkeley-je: 103 +- 7.36 ms/op, 1.6x slower than Ledger
 - **OpenStoreMemoryBenchmark.open (contents=empty, sealed=true, stores=8).** Ledger: 95.7 +- 45.6 ms/op
   - ledger-plain: 119 +- 17.1 ms/op, 1.2x slower than Ledger
-  - mvstore: 104 +- 138 ms/op, 1.1x slower than Ledger
+  - mvstore: 104 +- 138 ms/op, 9% slower than Ledger
   - mvstore-encrypted: 111 +- 25.2 ms/op, 1.2x slower than Ledger
   - rocksdb: 168 +- 145 ms/op, 1.7x slower than Ledger
   - lmdb: 87.3 +- 51.1 ms/op, 1.1x faster than Ledger
   - sqlite: 119 +- 38.7 ms/op, 1.2x slower than Ledger
   - berkeley-je: 236 +- 179 ms/op, 2.5x slower than Ledger
 - **OpenStoreMemoryBenchmark.open (contents=tiny, sealed=true, stores=1).** Ledger: 55.7 +- 26.7 ms/op
-  - ledger-plain: 51.6 +- 16.2 ms/op, 1.1x faster than Ledger
+  - ledger-plain: 51.6 +- 16.2 ms/op, 8% faster than Ledger
   - mvstore: 43.0 +- 53.1 ms/op, 1.3x faster than Ledger
-  - mvstore-encrypted: 54.6 +- 31.9 ms/op, 1.0x faster than Ledger
-  - rocksdb: 51.4 +- 75.7 ms/op, 1.1x faster than Ledger
+  - mvstore-encrypted: 54.6 +- 31.9 ms/op, 2% faster than Ledger
+  - rocksdb: 51.4 +- 75.7 ms/op, 8% faster than Ledger
   - lmdb: 44.1 +- 51.8 ms/op, 1.3x faster than Ledger
   - sqlite: 48.8 +- 24.2 ms/op, 1.1x faster than Ledger
   - berkeley-je: 89.7 +- 57.0 ms/op, 1.6x slower than Ledger
 - **OpenStoreMemoryBenchmark.open (contents=tiny, sealed=true, stores=8).** Ledger: 95.4 +- 104 ms/op
-  - ledger-plain: 88.0 +- 28.3 ms/op, 1.1x faster than Ledger
+  - ledger-plain: 88.0 +- 28.3 ms/op, 8% faster than Ledger
   - mvstore: 86.5 +- 82.9 ms/op, 1.1x faster than Ledger
   - mvstore-encrypted: 127 +- 122 ms/op, 1.3x slower than Ledger
   - rocksdb: 171 +- 35.3 ms/op, 1.8x slower than Ledger
   - lmdb: 54.5 +- 49.7 ms/op, 1.8x faster than Ledger
-  - sqlite: 87.2 +- 41.9 ms/op, 1.1x faster than Ledger
+  - sqlite: 87.2 +- 41.9 ms/op, 9% faster than Ledger
   - berkeley-je: 261 +- 115 ms/op, 2.7x slower than Ledger
 - **OperationMemoryBenchmark.largeValues (valueSize=262144).** Ledger: 949 +- 1,264 ms/op
   - ledger-plain: 734 +- 640 ms/op, 1.3x faster than Ledger

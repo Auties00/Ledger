@@ -159,12 +159,15 @@ def shown_ratio(ratio):
 
 
 def verdict(ratio, metric):
-    if metric != 'score':
-        return 'the same as Ledger' if 0.995 <= ratio <= 1.005 else \
-            f'{factor(ratio)} Ledger\'s' if ratio >= 1 else f'{factor(1 / ratio)} less than Ledger'
-    if 0.995 <= ratio <= 1.005:
+    """How an engine compares with Ledger in words: a percentage below 1.1x either way, a factor above."""
+    more, less = ('slower', 'faster') if metric == 'score' else ('more', 'less')
+    factor_ = ratio if ratio >= 1 else 1 / ratio
+    if factor_ < 1.005:
         return 'the same as Ledger'
-    return f'{factor(ratio)} slower than Ledger' if ratio > 1 else f'{factor(1 / ratio)} faster than Ledger'
+    word = more if ratio > 1 else less
+    if factor_ < 1.095:
+        return f'{(factor_ - 1) * 100:.0f}% {word} than Ledger'
+    return f'{factor(factor_)} {word} than Ledger'
 
 
 def score_text(result):
@@ -286,9 +289,10 @@ def draw(chart, system, rows, theme):
     for t in ticks:
         tx = x(t)
         reference = t == 1
+        weight = ' font-weight="600"' if reference else ''
         o.append(f'<text x="{tx:.1f}" y="{axis_y}" font-size="11" text-anchor="middle" '
                  f'fill="{c["ink"] if reference else c["muted"]}"'
-                 f'{" font-weight=\"600\"" if reference else ""}>{tick_label(t)}</text>')
+                 f'{weight}>{tick_label(t)}</text>')
 
     y = top
     for index, (row, reference, others) in enumerate(rows):
@@ -389,7 +393,8 @@ def other_results(system, groups, charted, index):
             mine, theirs = metric_value(result, 'score'), metric_value(reference, 'score') if reference else None
             if mine and theirs:
                 tail = f', {verdict(mine / theirs, "score")}'
-            o.append(f'  - {engine or "(no engine parameter)"}: {score_text(result)}{tail}')
+            name = engine or "the workload's only engine"
+            o.append(f'  - {name}: {score_text(result)}{tail}')
     return o
 
 
