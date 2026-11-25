@@ -389,28 +389,6 @@ Random overwrites of a data set larger than the cache, a question no key space i
 
 ## Design
 
-```mermaid
-%%{init: {"flowchart": {"htmlLabels": false}}}%%
-flowchart LR
-    commit["commit(batch)"] --> memory["Writes since the last checkpoint, in memory"]
-    commit --> group["Group commit: seal the frames, one write, one force"]
-    commit -. "large values, 1 MiB and more by default" .-> blobs[("ledger.blobs")]
-    group --> log[("log/*.log segments")]
-    memory --> checkpoint["Checkpoint: copy-on-write B+trees"]
-    checkpoint --> data[("ledger.data: 4 KiB pages, two superblocks")]
-    checkpoint -. "retires the segments it holds" .-> log
-    data --> cache["Page cache, shared by the stores of the process"]
-    memory --> reads["get, range, forEach, snapshot"]
-    cache --> reads
-
-    classDef write fill:#E3F2F8,stroke:#2A87A8,color:#061823
-    classDef durable fill:#2A87A8,stroke:#174F66,color:#FFFFFF
-    classDef read fill:#FFF4DE,stroke:#C98A1B,color:#3D2A05
-    class commit,memory,checkpoint write
-    class group,log,data,blobs durable
-    class cache,reads read
-```
-
 A commit is visible once it is applied in memory and journaled to the log, in 16 MiB segments each sealed under a key
 of its own. A checkpoint later folds the writes since the last one into the copy-on-write trees of the data file, and
 only then are the log segments it holds retired. A read takes each key space's tree under the writes still in memory,
