@@ -1,0 +1,58 @@
+# What the Performance section of the root README charts: tools/readme/charts.py reads this file and benchmarks.tsv.
+# Tab separated. Two kinds of line:
+#
+#   chart <id> <heading> <caption>
+#     A chart, drawn once per OS that has data for it, to .github/assets/bench-<id>-<os>-{light,dark}.svg, in the
+#     order of these lines.
+#
+#   row <chart> <group> <benchmark> <params> <metric> <label>
+#     A row of a chart: the results of <benchmark> (Class.method) with exactly <params> (as benchmarks.tsv writes them,
+#     the engine left out), measured by the workflow group <group>. <metric> is what the row compares: score (the JMH
+#     score: an engine's time per operation, or the inverse of its throughput), a counter of benchmarks.tsv (bytes,
+#     lower is better), or the difference of two counters, a-b. <label> is the row's title.
+#
+# Every result of a group that no row charts is still listed in the README, under "Other results"; benchmark/README.md
+# describes every workload.
+
+chart	commit	Durable commits	Writes that are on stable storage when the call returns: a session stored before a message is sent, a received message stored before it is acknowledged, a webhook delivery stored before it is answered.
+row	commit	commit	DurableCommitBenchmark.storeSession	sealed=true	score	One durable 1.5 KB write, latency
+row	commit	commit	OfflineDrainBenchmark.receiveMessage	messages=200000,sealed=true	score	One received message stored durably (body, id index, session, chat), latency
+row	commit	commit	GroupCommitBenchmark.commitConcurrently	committers=1,sealed=true	score	Durable writes per second, 1 committer
+row	commit	commit	GroupCommitBenchmark.commitConcurrently	committers=8,sealed=true	score	Durable writes per second, 8 concurrent committers
+row	commit	commit	GroupCommitBenchmark.commitConcurrently	committers=256,sealed=true	score	Durable writes per second, 256 concurrent committers
+row	commit	commit	WebhookInboxBenchmark.deliver	sealed=true	score	Webhook deliveries stored durably and removed once handled, 4 at a time
+
+chart	ingest	Bulk writes	A whole history sync of 200,000 messages, an app-state snapshot applied atomically, and the removal of the most active chat.
+row	ingest	ingest	HistoryIngestBenchmark.ingest	batchSize=1000,messages=200000,sealed=true	score	History sync of 200,000 messages in batches of 1,000, time
+row	ingest	ingest	HistoryIngestBenchmark.ingest	batchSize=1000,messages=200000,sealed=true	bytesWritten	History sync, bytes written to the device
+row	ingest	ingest	HistoryIngestBenchmark.ingest	batchSize=1000,messages=200000,sealed=true	sizeOnDisk	History sync, size on disk afterwards
+row	ingest	ingest	AppStateSyncBenchmark.applySnapshot	entries=20000,sealed=true	score	App-state snapshot of 20,000 entries applied atomically, time
+row	ingest	ingest	AppStateSyncBenchmark.applyPatch	entries=20000,sealed=true	score	Small app-state patch over those entries, latency
+row	ingest	ingest	ChatDeleteBenchmark.clearChat	messages=200000,sealed=true	score	Clearing the most active chat of a 200,000-message history, time
+
+chart	read	Reads	Pages of a chat, lookups by id and reopening a store over a history of 200,000 messages.
+row	read	read	ChatPageBenchmark.newestPage	backgroundWrites=0,messages=200000,sealed=true	score	Newest page of a chat, latency
+row	read	read	ChatPageBenchmark.newestPage	backgroundWrites=100,messages=200000,sealed=true	score	Newest page of a chat while 100 messages a second arrive, latency
+row	read	read	ChatPageBenchmark.olderPage	backgroundWrites=0,messages=200000,sealed=true	score	A page deeper in a chat's history, latency
+row	read	read	MessageLookupBenchmark.findById	messages=200000,sealed=true	score	A message found by id anywhere in the history, latency
+row	read	read	ReopenBenchmark.openAndListChats	messages=200000,sealed=true	score	Reopen the store and list the chats, time
+row	read	read	ReopenBenchmark.openAndShowFirstChat	messages=200000,sealed=true	score	Reopen the store and show the first chat, time
+
+chart	limits	Workloads Ledger is not built for	Random overwrites of a data set larger than the cache, eight writers at once, a question no key space indexes, values of 16 MiB and a reader that pins an old version.
+row	limits	limits-write	RandomOverwriteBenchmark.overwrite	keys=2000000	score	Random overwrites of 2,000,000 keys, writes per second
+row	limits	limits-write	RandomOverwriteBenchmark.overwrite	keys=2000000	sizeOnDisk	Random overwrites of 2,000,000 keys, size on disk afterwards
+row	limits	limits-write	ParallelWritersBenchmark.write	(none)	score	Eight threads writing at once, writes per second
+row	limits	limits-query	AdHocQueryBenchmark.newestStarred	messages=200000,sealed=true	score	Newest starred message, by scanning every message, time
+row	limits	limits-write	LargeValueBenchmark.writeValue	largeValues=1048576,valueSize=16777216	score	Durable write of a 16 MiB value, time
+row	limits	limits-write	LargeValueBenchmark.readValue	largeValues=1048576,valueSize=16777216	score	Read of a 16 MiB value, time
+row	limits	limits-write	PinnedReaderBenchmark.overwrite	pinned=true	sizeOnDisk	Size on disk after overwrites while a reader pins an old version
+
+chart	memory	Memory	The resident memory of the process that the store and the operation added: the resident memory at the end, or at its peak, less the resident memory before the store opened. Resident memory counts the Java heap, native memory and the pages of a memory map alike.
+row	memory	memory	SessionMemoryBenchmark.session	messages=200000,sealed=true	residentBytes-residentBytesFloor	A client session over 200,000 messages, held at the end
+row	memory	memory	SessionMemoryBenchmark.session	messages=1000000,sealed=true	residentBytes-residentBytesFloor	A client session over 1,000,000 messages, held at the end
+row	memory	memory	SteadyWritesMemoryBenchmark.write	messages=200000,sealed=true	residentBytes-residentBytesFloor	Messages arriving steadily, held at the end
+row	memory	memory	OperationMemoryBenchmark.ingest	batchSize=10000,messages=200000,sealed=true	residentBytesPeak-residentBytesFloor	History sync of 200,000 messages, peak
+row	memory	memory	OperationMemoryBenchmark.checkpointUnderLoad	messages=200000,sealed=true	residentBytesPeak-residentBytesFloor	Checkpoint under load, peak
+row	memory	memory	OperationMemoryBenchmark.applySnapshot	entries=100000,sealed=true	residentBytesPeak-residentBytesFloor	App-state snapshot of 100,000 entries, peak
+row	memory	memory	OperationMemoryBenchmark.recoverAfterCrash	messages=200000,sealed=true	residentBytesPeak-residentBytesFloor	Recovery after a crash, peak
+row	memory	memory	OperationMemoryBenchmark.largeValues	valueSize=16777216	residentBytesPeak-residentBytesFloor	Values of 16 MiB, peak

@@ -78,11 +78,25 @@ jobs:
       - name: Build
         run: mvn -B -ntp package -DskipTests
 
+      # runner.txt goes into the artifact, so tools/readme/fetch.py can name the hardware behind every number
       - name: Describe the runner
         run: |
+          case "$RUNNER_OS" in
+            Linux) CPU_MODEL=$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//') ;;
+            macOS) CPU_MODEL=$(sysctl -n machdep.cpu.brand_string) ;;
+            Windows) CPU_MODEL=$(powershell -NoProfile -Command '(Get-CimInstance Win32_Processor | Select-Object -First 1).Name' | tr -d '\r' | sed 's/ *$//') ;;
+          esac
+          mkdir -p results
+          {
+            echo "CPU model: ${CPU_MODEL:-unknown}"
+            echo "CPUs: $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")"
+            echo "Image: ${ImageOS:-unknown} ${ImageVersion:-}"
+            echo "Java: $(java -version 2>&1 | head -1)"
+          } > results/runner.txt
           {
             echo "## ${{ matrix.group }} on ${{ matrix.os }}"
             echo
+            echo "- CPU: ${CPU_MODEL:-unknown}"
             echo "- CPUs: $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")"
             echo "- Java: $(java -version 2>&1 | head -1)"
             echo "- Disk: $(df -h "$RUNNER_TEMP" 2>/dev/null | tail -1)"
