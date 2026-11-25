@@ -62,8 +62,10 @@ def describe(run_id, repo):
                         'workflowName,headSha,headBranch,displayTitle,status,conclusion,createdAt,jobs'))
     if run['workflowName'] != WORKFLOW:
         raise SystemExit(f'run {run_id} is a run of {run["workflowName"]}, not of {WORKFLOW}')
-    if run['status'] != 'completed':
-        raise SystemExit(f'run {run_id} is still {run["status"]}; wait for it to complete')
+    # The report job only summarizes; the artifacts are complete once every measuring job is
+    running = [job['name'] for job in run.get('jobs', []) if job['name'] != 'report' and job.get('status') != 'completed']
+    if running or (run['status'] != 'completed' and not run.get('jobs')):
+        raise SystemExit(f'run {run_id} is still {run["status"]} ({", ".join(running)}); wait for it to complete')
     return run
 
 
@@ -188,7 +190,7 @@ def main():
              f'# Ledger commits measured: {", ".join(commits)}' + (' (the runs measured different commits: compare engines '
                                                                    'within one run, not one run with another)' if len(commits) > 1 else ''),
              *header,
-             f'# No data: {"; ".join(missing)}' if missing else '# Every group has data on every OS.',
+             f'# No data: {"; ".join(missing)} (no run given to fetch.py measured them)' if missing else '# Every group has data on every OS.',
              '# One row per OS, group, workload, parameter set and engine. score and error (the half-width of JMH\'s 99.9%',
              '# confidence interval) are those of the round with the median score; rounds lists every round\'s score. The counters',
              '# are bytes per measurement iteration, divided back as .github/scripts/summarize.py divides them; empty when the',

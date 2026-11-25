@@ -22,7 +22,7 @@ row	commit	commit	GroupCommitBenchmark.commitConcurrently	committers=8,sealed=tr
 row	commit	commit	GroupCommitBenchmark.commitConcurrently	committers=256,sealed=true	score	Durable writes per second, 256 concurrent committers
 row	commit	commit	WebhookInboxBenchmark.deliver	sealed=true	score	Webhook deliveries stored durably and removed once handled, 4 at a time
 
-chart	ingest	Bulk writes	A whole history sync of 200,000 messages, an app-state snapshot applied atomically, and the removal of the most active chat.
+chart	ingest	Bulk writes	A whole history sync of 200,000 messages, an app-state snapshot applied atomically, and the removal of the most active chat. On macOS the bytes written are those that reached the disk rather than those passed to write calls, so they do not compare with the other systems' figures (see benchmark/README.md).
 row	ingest	ingest	HistoryIngestBenchmark.ingest	batchSize=1000,messages=200000,sealed=true	score	History sync of 200,000 messages in batches of 1,000, time
 row	ingest	ingest	HistoryIngestBenchmark.ingest	batchSize=1000,messages=200000,sealed=true	bytesWritten	History sync, bytes written to the device
 row	ingest	ingest	HistoryIngestBenchmark.ingest	batchSize=1000,messages=200000,sealed=true	sizeOnDisk	History sync, size on disk afterwards
