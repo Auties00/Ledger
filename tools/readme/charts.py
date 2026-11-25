@@ -5,14 +5,16 @@
     python tools/readme/charts.py --check  # exit 1 when a committed file is stale
 
 For every chart of charts.tsv and every OS with data for it, it writes .github/assets/bench-<chart>-<os>-light.svg and
--dark.svg, and it rewrites the block between the "bench:begin" and "bench:end" markers of README.md: the <picture>
-elements that pick a variant by color scheme, the numbers of each chart as a text list, every result no chart shows,
-and every comparison of those results that another engine wins. Standard library only.
+-dark.svg, and it rewrites the block between the "bench:begin" and "bench:end" markers of README.md: per chart its
+heading and caption, the Linux chart, the Windows and macOS charts in one <details>, and, under the charts that have
+"loss" lines, the list of where another engine costs less than Ledger. Standard library only.
 
-Every row compares each engine's cost with Ledger's (encrypted, the reference at 1.0x): its time per operation, the
+Every row compares each engine's cost with Ledger's (encrypted, the reference at 1x): its time per operation, the
 inverse of its throughput, or the bytes a counter measured. On the logarithmic axis a bar runs right when the engine
-costs more than Ledger, so it is slower or takes more, and left when it costs less, whatever the unit. A time whose
-99.9% confidence interval overlaps Ledger's is reported with that caveat, since the run does not settle which is lower.
+costs more than Ledger and left when it costs less, and its label says by how much ("4.7x slower"). A time whose
+99.9% confidence interval overlaps Ledger's is drawn pale with a "~" before its label, since the run does not settle
+which is lower. Each row's title carries Ledger's own result; every engine's absolute result is in the tooltip of its
+bar and in benchmarks.tsv.
 """
 import math
 import os
@@ -44,44 +46,37 @@ ENGINES = {
 }
 FLOOR = 'floor'
 FLOOR_NAME = 'floor (device bound)'
-# Left out of every comparison of other engines with Ledger: Ledger's own variant and the floor, which is no engine
+# Left out of the lists of where another engine costs less than Ledger: Ledger's own variant and the floor, no engine
 NOT_COMPARED = (FLOOR, 'ledger-plain')
-# The metrics an uncharted result is listed and compared by, when it records them: (metric, what it is)
-LISTED_METRICS = [
-    ('score', None),
-    ('bytesWritten', 'bytes written'),
-    ('sizeOnDisk', 'size on disk'),
-    ('residentBytesPeak-residentBytesFloor', 'peak resident memory added'),
-    ('residentBytes-residentBytesFloor', 'resident memory added, at the end'),
-    ('residentBytesPerStore', 'resident memory per store'),
-    ('heapBytesPerStore', 'heap per store'),
-]
-# Listed only when the result has no floor to subtract
-UNFLOORED_METRICS = [('residentBytes', 'resident memory', 'residentBytesFloor'), ('heapBytes', 'heap', 'heapBytesFloor')]
 UNKNOWN_ENGINE = '#8b949e'
 SYSTEMS = {'ubuntu-latest': 'Linux', 'windows-latest': 'Windows', 'macos-latest': 'macOS'}
+# The OS whose chart the README shows first; the others go in one <details> per chart
+MAIN_SYSTEM = 'ubuntu-latest'
+UNITS = {'ns/op': 'ns', 'us/op': 'us', 'ms/op': 'ms', 's/op': 's'}
 
 THEMES = {
-    'light': dict(ink='#1f2328', muted='#59636e', grid='#d8dee4', axis='#59636e'),
-    'dark': dict(ink='#f0f6fc', muted='#9198a1', grid='#3d444d', axis='#9198a1'),
+    'light': dict(ink='#1f2328', muted='#59636e', grid='#d8dee4'),
+    'dark': dict(ink='#f0f6fc', muted='#9198a1', grid='#3d444d'),
 }
 
-WIDTH = 960
+WIDTH = 800
 LABEL_X = 8
-NAME_X = 20           # engine names
-PLOT_L, PLOT_R = 236, 872
-TITLE_H = 26          # a row's title line
+NAME_X = 16           # engine names
+NAMES_END = 128       # the right end of the longest engine name
+PLOT_L, PLOT_R = 150, 690
+TITLE_H = 24          # a row's title line
 BAR_PITCH = 13
 BAR = 9
 ROW_GAP = 12
+PALE = 0.35           # the opacity of a bar inside Ledger's 99.9% interval
+CHAR_W = 6.3          # the average width of a character at 11-12px, to place labels
 FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif"
 POWERS_OF_TWO = [2 ** n for n in range(-6, 7)]
 DECADES = [10.0 ** n for n in range(-4, 5)]
 
 
-
 def read_config():
-    charts, rows, excluded = {}, [], {}
+    charts, rows, excluded, losses = {}, [], {}, []
     with open(CONFIG, encoding='utf-8') as f:
         for n, line in enumerate(f, 1):
             line = line.rstrip('\n')
@@ -92,18 +87,20 @@ def read_config():
                 charts[p[1]] = dict(id=p[1], heading=p[2], caption=p[3])
             elif p[0] == 'exclude' and len(p) == 4:
                 excluded[(p[1], p[2])] = p[3]
-            elif p[0] == 'row' and len(p) == 7:
+            elif p[0] in ('row', 'loss') and len(p) == 7:
                 if p[1] not in charts:
-                    raise SystemExit(f'{CONFIG}:{n}: row of an unknown chart "{p[1]}"')
-                rows.append(dict(chart=p[1], group=p[2], benchmark=p[3], params='' if p[4] == '(none)' else p[4],
-                                 metric=p[5], label=p[6]))
+                    raise SystemExit(f'{CONFIG}:{n}: {p[0]} of an unknown chart "{p[1]}"')
+                (rows if p[0] == 'row' else losses).append(
+                    dict(chart=p[1], group=p[2], benchmark=p[3], params='' if p[4] == '(none)' else p[4],
+                         metric=p[5], label=p[6]))
             else:
-                raise SystemExit(f'{CONFIG}:{n}: expected "chart" with 3 fields, "row" with 6 or "exclude" with 3')
-    return charts, rows, excluded
+                raise SystemExit(f'{CONFIG}:{n}: expected "chart" with 3 fields, "row" or "loss" with 6, '
+                                 f'or "exclude" with 3')
+    return charts, rows, excluded, losses
 
 
 def read_data():
-    results, runs, notes = [], {}, []
+    results, runs = [], {}
     with open(DATA, encoding='utf-8') as f:
         columns = None
         for line in f:
@@ -112,8 +109,6 @@ def read_data():
                 m = re.match(r'# run (\d+): (\S+) on (\S+), (\d+) rounds?, commit (\w+)', line)
                 if m:
                     runs[(m[3], m[2])] = dict(id=m[1], rounds=m[4], commit=m[5])
-                elif line.startswith('# No data:'):
-                    notes.append(line[2:])
                 continue
             if not line.strip():
                 continue
@@ -122,7 +117,7 @@ def read_data():
                 columns = fields
                 continue
             results.append(dict(zip(columns, fields)))
-    return results, runs, notes
+    return results, runs
 
 
 def num(text):
@@ -141,7 +136,6 @@ def metric_value(result, metric):
     if any(value is None for value in values):
         return None
     return values[0] - sum(values[1:])
-
 
 
 def number(value):
@@ -171,11 +165,6 @@ def factor(ratio):
     return f'{ratio:.1f}x'
 
 
-def shown_ratio(ratio):
-    """The ratio as a bar's label: how many times more or less the engine costs than Ledger."""
-    return factor(ratio if ratio >= 1 else 1 / ratio)
-
-
 def same(ratio):
     """Whether a ratio rounds to no difference at all."""
     return (ratio if ratio >= 1 else 1 / ratio) < 1.005
@@ -191,38 +180,44 @@ def overlaps(result, reference, metric):
     return abs(float(result['score']) - float(reference['score'])) <= a + b
 
 
-def verdict(ratio, metric, overlap=False):
-    """How an engine compares with Ledger in words: a percentage below 1.1x either way, a factor above."""
-    more, less = ('slower', 'faster') if metric == 'score' else ('more', 'less')
-    factor_ = ratio if ratio >= 1 else 1 / ratio
-    if same(ratio):
-        return 'the same as Ledger'
-    word = more if ratio > 1 else less
-    if factor_ < 1.095:
-        text = f'{(factor_ - 1) * 100:.0f}% {word} than Ledger'
-    else:
-        text = f'{factor(factor_)} {word} than Ledger'
-    return text + (', though the 99.9% intervals overlap' if overlap else '')
-
-
-def score_text(result):
-    error = num(result['error'])
-    text = number(float(result['score']))
-    if error and error > 0:
-        text += f' +- {number(error)}'
-    return f'{text} {result["unit"]}'
-
-
-def metric_text(result, metric):
+def words(metric):
+    """What a cost above and below Ledger's is called."""
     if metric == 'score':
-        return score_text(result)
+        return 'slower', 'faster'
+    if metric == 'sizeOnDisk':
+        return 'larger', 'smaller'
+    return 'more', 'less'
+
+
+def comparison(ratio, metric):
+    """How an engine compares with Ledger, short: a percentage below 1.1x either way, a factor above."""
+    if same(ratio):
+        return 'same'
+    more, less = words(metric)
+    factor_ = ratio if ratio >= 1 else 1 / ratio
+    word = more if ratio > 1 else less
+    return f'{(factor_ - 1) * 100:.0f}% {word}' if factor_ < 1.095 else f'{factor(factor_)} {word}'
+
+
+def score_text(result, interval=True):
+    error = num(result['error'])
+    unit = result['unit']
+    text = number(float(result['score']))
+    if interval and error and error > 0:
+        text += f' +- {number(error)}'
+    return f'{text} {unit if interval else UNITS.get(unit, unit)}'
+
+
+def metric_text(result, metric, interval=True):
+    if metric == 'score':
+        return score_text(result, interval)
     value = metric_value(result, metric)
     return size(value) if value is not None else '-'
 
 
 def reference_text(reference, metric):
-    """Ledger's own figure for a row's title, with the payload when the row counts the bytes written."""
-    text = metric_text(reference, metric)
+    """Ledger's own result for a row's title, with the payload when the row counts the bytes written."""
+    text = metric_text(reference, metric, interval=False)
     payload = num(reference.get('payloadBytes'))
     if metric == 'bytesWritten' and payload:
         text += f' for {size(payload)} of payload'
@@ -233,6 +228,9 @@ def engine_order(engines):
     known = [engine for engine in ENGINES if engine in engines]
     return known + sorted(engine for engine in engines if engine not in ENGINES and engine != REFERENCE)
 
+
+def engine_name(engine):
+    return FLOOR_NAME if engine == FLOOR else engine
 
 
 def domain(ratios):
@@ -268,9 +266,26 @@ def tick_label(t):
     return f'{value:,.0f}x' if value >= 1 else f'{value:g}x'
 
 
-def draw(chart, system, rows, theme):
-    """rows: [(row, reference result, {engine: (result, ratio or None)})] with a reference for every row."""
+def source_text(system, groups, runs):
+    """The runs a chart of one OS draws from, by commit and number of rounds."""
+    by_source = {}
+    for group in groups:
+        run = runs.get((system, group))
+        if run:
+            by_source.setdefault((run['commit'][:7], run['rounds']), set()).add(run['id'])
+    parts = []
+    for (commit, rounds), ids in sorted(by_source.items()):
+        ids = sorted(ids)
+        name = 'run ' + ids[0] if len(ids) == 1 else 'runs ' + ', '.join(ids)
+        parts.append(f'{name} of {commit}, {rounds} {"round" if rounds == "1" else "rounds"}')
+    return f'{SYSTEMS.get(system, system)} ({system}): ' + '; '.join(parts)
+
+
+def draw(chart, system, entries, source, theme):
+    """entries: [(row, reference result, {engine: (result, ratio or None)})] in the order of charts.tsv, and
+    [(row, None, None)] for a row whose metric is excluded on this OS, which shows the exclusion's reason instead."""
     c = THEMES[theme]
+    rows = [entry for entry in entries if entry[1] is not None]
     engines = engine_order({engine for _, _, others in rows for engine in others})
     ratios = [ratio for _, _, others in rows for _, ratio in others.values() if ratio]
     dmin, dmax, ticks = domain(ratios)
@@ -280,9 +295,26 @@ def draw(chart, system, rows, theme):
         v = min(max(v, dmin), dmax)
         return PLOT_L + (PLOT_R - PLOT_L) * math.log(v / dmin) / span
 
-    legend_rows = 2 if len(engines) > 5 else 1
-    top = 26 + 20 * legend_rows + 40
-    height = top + sum(TITLE_H + BAR_PITCH * len(engines) + ROW_GAP for _ in rows) + 4
+    # Legend items, flowed into lines of the chart's width
+    items = [('reference', 'Ledger (1x)')] + [(engine, engine_name(engine)) for engine in engines]
+    if any(overlaps(result, reference, row['metric']) for row, reference, others in rows
+           for result, ratio in others.values() if ratio):
+        items.append(('pale', '~ pale: within the 99.9% intervals'))
+    lines, line, lx = [], [], LABEL_X
+    for kind, text in items:
+        width = 17 + CHAR_W * len(text) + 16
+        if line and lx + width > WIDTH - 8:
+            lines.append(line)
+            line, lx = [], LABEL_X
+        line.append((kind, text, lx))
+        lx += width
+    lines.append(line)
+
+    header_y = 16
+    legend_y = header_y + 12
+    top = legend_y + 20 * len(lines) + 38
+    height = (top + sum(TITLE_H + BAR_PITCH * len(engines) + ROW_GAP for _ in rows)
+              + (TITLE_H + 6) * (len(entries) - len(rows)) + 4)
     heading = f'{chart["heading"]} on {SYSTEMS.get(system, system)}'
     o = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {WIDTH} {height}" width="{WIDTH}" height="{height}" '
          f'font-family="{FONT}" role="img" aria-label="{escape(heading)}: each engine\'s cost relative to Ledger">',
@@ -292,29 +324,33 @@ def draw(chart, system, rows, theme):
          f'<pattern id="hatch" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">'
          f'<rect width="5" height="5" fill="{ENGINES[FLOOR]}" fill-opacity="0.25"/>'
          f'<line x1="0" y1="0" x2="0" y2="5" stroke="{ENGINES[FLOOR]}" stroke-width="2.5"/></pattern>',
-         '</defs>']
+         '</defs>',
+         f'<text x="{LABEL_X}" y="{header_y}" font-size="13" font-weight="600" fill="{c["ink"]}">'
+         f'{escape(SYSTEMS.get(system, system))}<tspan font-weight="400" fill="{c["muted"]}">'
+         f'{escape(source[len(SYSTEMS.get(system, system)):])}</tspan></text>']
 
-    # Legend: the reference line, then one swatch per engine
-    ly = 12
-    o.append(f'<line x1="{LABEL_X + 6}" y1="{ly}" x2="{LABEL_X + 6}" y2="{ly + 12}" stroke="{c["ink"]}" stroke-width="2"/>')
-    o.append(f'<text x="{LABEL_X + 16}" y="{ly + 10.5}" font-size="12" fill="{c["muted"]}">Ledger, the reference (1x)</text>')
-    lx, row_y = LABEL_X + 200, ly
-    for i, engine in enumerate(engines):
-        if legend_rows == 2 and i == math.ceil(len(engines) / 2):
-            lx, row_y = LABEL_X + 200, ly + 20
-        fill = 'url(#hatch)' if engine == FLOOR else ENGINES.get(engine, UNKNOWN_ENGINE)
-        stroke = f' stroke="{ENGINES[FLOOR]}" stroke-width="1"' if engine == FLOOR else ''
-        o.append(f'<rect x="{lx}" y="{row_y}" width="12" height="12" rx="2" fill="{fill}"{stroke}/>')
-        name = FLOOR_NAME if engine == FLOOR else engine
-        o.append(f'<text x="{lx + 17}" y="{row_y + 10.5}" font-size="12" fill="{c["muted"]}">{escape(name)}</text>')
-        lx += 17 + 7.2 * len(name) + 22
+    for i, line in enumerate(lines):
+        ly = legend_y + 20 * i
+        for kind, text, lx in line:
+            if kind == 'reference':
+                o.append(f'<line x1="{lx + 6}" y1="{ly}" x2="{lx + 6}" y2="{ly + 12}" stroke="{c["ink"]}" '
+                         f'stroke-width="2"/>')
+            elif kind == 'pale':
+                o.append(f'<rect x="{lx}" y="{ly}" width="12" height="12" rx="2" fill="{c["muted"]}" '
+                         f'fill-opacity="{PALE}"/>')
+            else:
+                fill = 'url(#hatch)' if kind == FLOOR else ENGINES.get(kind, UNKNOWN_ENGINE)
+                stroke = f' stroke="{ENGINES[FLOOR]}" stroke-width="1"' if kind == FLOOR else ''
+                o.append(f'<rect x="{lx}" y="{ly}" width="12" height="12" rx="2" fill="{fill}"{stroke}/>')
+            o.append(f'<text x="{lx + 17}" y="{ly + 10.5}" font-size="12" fill="{c["muted"]}">{escape(text)}</text>')
 
     # Axis: the halves, the ticks and the reference line
     axis_y = top - 12
     x1 = x(1)
     o.append(f'<text x="{x1 - 8:.1f}" y="{axis_y - 16}" font-size="11" text-anchor="end" fill="{c["muted"]}">'
-             f'faster or smaller than Ledger</text>')
-    o.append(f'<text x="{x1 + 8:.1f}" y="{axis_y - 16}" font-size="11" fill="{c["muted"]}">slower or larger than Ledger</text>')
+             f'&lt; faster or smaller</text>')
+    o.append(f'<text x="{x1 + 8:.1f}" y="{axis_y - 16}" font-size="11" fill="{c["muted"]}">slower or larger &gt;</text>')
+
     def grid(y0, y1):
         for t in ticks:
             o.append(f'<line x1="{x(t):.1f}" y1="{y0:.1f}" x2="{x(t):.1f}" y2="{y1:.1f}" '
@@ -322,21 +358,25 @@ def draw(chart, system, rows, theme):
 
     grid(axis_y + 4, top)
     for t in ticks:
-        tx = x(t)
-        reference = t == 1
-        weight = ' font-weight="600"' if reference else ''
-        o.append(f'<text x="{tx:.1f}" y="{axis_y}" font-size="11" text-anchor="middle" '
-                 f'fill="{c["ink"] if reference else c["muted"]}"'
-                 f'{weight}>{tick_label(t)}</text>')
+        weight = ' font-weight="600"' if t == 1 else ''
+        o.append(f'<text x="{x(t):.1f}" y="{axis_y}" font-size="11" text-anchor="middle" '
+                 f'fill="{c["ink"] if t == 1 else c["muted"]}"{weight}>{tick_label(t)}</text>')
 
     y = top
-    for index, (row, reference, others) in enumerate(rows):
+    for index, (row, reference, others) in enumerate(entries):
         if index:
             o.append(f'<line x1="{LABEL_X}" y1="{y - ROW_GAP / 2:.1f}" x2="{WIDTH - 8}" y2="{y - ROW_GAP / 2:.1f}" '
                      f'stroke="{c["grid"]}" stroke-width="1" stroke-dasharray="1 4"/>')
-        title = row['label']
-        o.append(f'<text x="{LABEL_X}" y="{y + 15}" font-size="13" font-weight="600" fill="{c["ink"]}">{escape(title)}'
-                 f'<tspan font-weight="400" fill="{c["muted"]}">  Ledger: {escape(reference_text(reference, row["metric"]))}'
+        if reference is None:
+            o.append(f'<text x="{LABEL_X}" y="{y + 15}" font-size="13" font-weight="600" fill="{c["ink"]}">'
+                     f'{escape(row["label"])}<tspan font-weight="400" font-style="italic" fill="{c["muted"]}">  '
+                     f'{escape(row["excluded"])}</tspan></text>')
+            y += TITLE_H + 6
+            continue
+        metric = row['metric']
+        o.append(f'<text x="{LABEL_X}" y="{y + 15}" font-size="13" font-weight="600" fill="{c["ink"]}">'
+                 f'<title>Ledger: {escape(metric_text(reference, metric))}</title>{escape(row["label"])}'
+                 f'<tspan font-weight="400" fill="{c["muted"]}">  Ledger {escape(reference_text(reference, metric))}'
                  f'</tspan></text>')
         y += TITLE_H
         grid(y - 2, y + BAR_PITCH * len(engines) + 2)
@@ -351,48 +391,31 @@ def draw(chart, system, rows, theme):
                 y += BAR_PITCH
                 continue
             result, ratio = entry
+            pale = overlaps(result, reference, metric)
             xe = x(ratio)
-            by = mid - BAR / 2
-            tip = (f'{engine}: {metric_text(result, row["metric"])}, '
-                   f'{verdict(ratio, row["metric"], overlaps(result, reference, row["metric"]))}')
+            label = ('~' if pale else '') + comparison(ratio, metric)
+            tip = f'{engine}: {metric_text(result, metric)}, {label} than Ledger ({metric_text(reference, metric)})'
             if engine == FLOOR:
                 paint = f'fill="url(#hatch)" stroke="{ENGINES[FLOOR]}" stroke-width="1"'
             else:
                 paint = f'fill="{ENGINES.get(engine, UNKNOWN_ENGINE)}"'
+            if pale:
+                paint += f' fill-opacity="{PALE}"'
             if abs(xe - x1) < 1.5:
                 o.append(f'<circle cx="{x1:.1f}" cy="{mid:.1f}" r="3.5" {paint}><title>{escape(tip)}</title></circle>')
             else:
-                o.append(f'<path d="{bar_path(x1, xe, by, BAR)}" {paint}><title>{escape(tip)}</title></path>')
-            label = escape(shown_ratio(ratio))
-            if ratio >= 1:
-                o.append(f'<text x="{max(xe, x1) + 5:.1f}" y="{mid + 4:.1f}" font-size="11" font-weight="600" '
-                         f'fill="{c["ink"]}">{label}</text>')
+                o.append(f'<path d="{bar_path(x1, xe, mid - BAR / 2, BAR)}" {paint}><title>{escape(tip)}</title></path>')
+            width = CHAR_W * len(label)
+            if ratio >= 1 or min(xe, x1) - 5 - width < NAMES_END:
+                lx = max(xe, x1) + 5
+                o.append(f'<text x="{lx:.1f}" y="{mid + 4:.1f}" font-size="11" fill="{c["ink"]}">{escape(label)}</text>')
             else:
-                o.append(f'<text x="{min(xe, x1) - 5:.1f}" y="{mid + 4:.1f}" font-size="11" font-weight="600" '
-                         f'text-anchor="end" fill="{c["ink"]}">{label}</text>')
+                o.append(f'<text x="{min(xe, x1) - 5:.1f}" y="{mid + 4:.1f}" font-size="11" text-anchor="end" '
+                         f'fill="{c["ink"]}">{escape(label)}</text>')
             y += BAR_PITCH
         y += ROW_GAP
     o.append('</svg>')
     return '\n'.join(o) + '\n'
-
-
-
-def chart_rows(chart_id, system, config_rows, index, excluded):
-    """The rows of a chart on one OS that have a Ledger result and a comparable metric, with every engine's ratio,
-    and the rows left out of it for their metric."""
-    out, left_out = [], []
-    for row in config_rows:
-        if row['chart'] != chart_id:
-            continue
-        results = index.get((system, row['group'], row['benchmark'], row['params']), {})
-        reference = results.get(REFERENCE)
-        if reference is None:
-            continue
-        if (system, row['metric']) in excluded:
-            left_out.append(row)
-            continue
-        out.append((row, reference, comparisons(results, reference, row['metric'])))
-    return out, left_out
 
 
 def comparisons(results, reference, metric):
@@ -408,171 +431,112 @@ def comparisons(results, reference, metric):
     return others
 
 
-def engine_name(engine):
-    return FLOOR_NAME if engine == FLOOR else (engine or "the workload's only engine")
-
-
-def comparison_lines(reference, others, metric, indent='  '):
-    o = []
-    for engine in engine_order(others):
-        result, ratio = others[engine]
-        tail = f', {verdict(ratio, metric, overlaps(result, reference, metric))}' if ratio else ''
-        o.append(f'{indent}- {engine_name(engine)}: {metric_text(result, metric)}{tail}')
-    return o
-
-
-def text_list(rows):
-    o = []
-    for row, reference, others in rows:
-        o.append(f'- **{row["label"]}.** Ledger: {reference_text(reference, row["metric"])}')
-        o += comparison_lines(reference, others, row['metric'])
-    return o
-
-
-def listed_metrics(results):
-    """The metrics an uncharted result is listed by: every counter some engine of it recorded, and its score unless it
-    records memory, as a workload that measures memory does not measure its time."""
-    recorded = lambda name: any(num(result.get(name)) is not None for result in results.values())
-    measures_memory = recorded('residentBytes') or recorded('heapBytes')
-    per_store = recorded('residentBytesPerStore')
-    metrics = []
-    for metric, what in LISTED_METRICS:
-        if metric == 'score' and measures_memory:
-            continue
-        if metric == 'residentBytes-residentBytesFloor' and per_store:
-            continue
-        if all(recorded(name) for name in metric.split('-')):
-            metrics.append((metric, what))
-    for metric, what, floor in UNFLOORED_METRICS:
-        if recorded(metric) and not recorded(floor):
-            metrics.append((metric, what))
-    return metrics
-
-
-def uncharted(system, groups, charted, index, excluded):
-    """[(title, results, [(metric, what)])] for every result of `groups` on `system` that no chart row shows."""
+def chart_rows(chart_id, system, config_rows, index, excluded):
+    """The rows of a chart on one OS that have a Ledger result, with every engine's ratio, in order; a row whose metric
+    is excluded on that OS comes as (row with its reason, None, None)."""
     out = []
-    for (sys_, group, benchmark, params), results in index.items():
-        if sys_ != system or group not in groups or (group, benchmark, params) in charted:
+    for row in config_rows:
+        if row['chart'] != chart_id:
             continue
-        title = benchmark + (f' ({params.replace(",", ", ")})' if params else '')
-        metrics = [(metric, what) for metric, what in listed_metrics(results) if (system, metric) not in excluded]
-        out.append((title, results, metrics))
+        results = index.get((system, row['group'], row['benchmark'], row['params']), {})
+        reference = results.get(REFERENCE)
+        if reference is None:
+            continue
+        if (system, row['metric']) in excluded:
+            out.append((dict(row, excluded=excluded[(system, row['metric'])]), None, None))
+            continue
+        out.append((row, reference, comparisons(results, reference, row['metric'])))
     return out
 
 
-def metric_name(metric, what, results):
-    if what:
-        return what
-    modes = {result['mode'] for result in results.values()}
-    return 'throughput' if modes == {'thrpt'} else 'time'
-
-
-def other_results(entries):
-    """The uncharted results as a text list, each with every metric it records."""
-    o = []
-    for title, results, metrics in entries:
-        reference = results.get(REFERENCE)
-        if reference is None:
-            values = {engine: '; '.join(f'{metric_name(m, w, results)} {metric_text(results[engine], m)}'
-                                        for m, w in metrics) for engine in results}
-            if list(values) == ['']:
-                o.append(f'- **{title}.** {values[""]}')
+def loss_lines(chart_id, losses, index, excluded, systems):
+    """The loss lines of a chart as a list ranked by the largest factor: for each, every engine (not Ledger's own
+    variant, not the floor) that costs less than Ledger on some OS by more than the 99.9% intervals, with the range of
+    its factors and the OSes it wins on when not all of them."""
+    items = []
+    for loss in losses:
+        if loss['chart'] != chart_id:
+            continue
+        metric = loss['metric']
+        wins, measured = {}, []
+        for system in systems:
+            results = index.get((system, loss['group'], loss['benchmark'], loss['params']), {})
+            reference = results.get(REFERENCE)
+            if reference is None or (system, metric) in excluded:
                 continue
-            o.append(f'- **{title}.**')
-            o += [f'  - {engine_name(engine)}: {text}' for engine, text in values.items()]
+            measured.append(system)
+            for engine, (result, ratio) in comparisons(results, reference, metric).items():
+                if (engine in NOT_COMPARED or not ratio or ratio >= 1 or same(ratio)
+                        or overlaps(result, reference, metric)):
+                    continue
+                wins.setdefault(engine, []).append((1 / ratio, system))
+        if not wins:
+            print(f'charts.tsv: no engine costs less than Ledger in "{loss["label"]}" any more', file=sys.stderr)
             continue
-        if len(metrics) == 1:
-            metric, what = metrics[0]
-            o.append(f'- **{title}.** Ledger: {metric_text(reference, metric)}')
-            o += comparison_lines(reference, comparisons(results, reference, metric), metric)
-            continue
-        o.append(f'- **{title}.**')
-        for metric, what in metrics:
-            o.append(f'  - {metric_name(metric, what, results)[0].upper() + metric_name(metric, what, results)[1:]}. '
-                     f'Ledger: {metric_text(reference, metric)}')
-            o += comparison_lines(reference, comparisons(results, reference, metric), metric, indent='    ')
-    return o
-
-
-def losses(system, rows, entries):
-    """Every comparison on `system`, charted or not, in which an engine (not Ledger's own variant, not the floor) costs
-    less than Ledger, as a text list."""
-    found = [(row['label'][0].lower() + row['label'][1:], reference, others, row['metric'])
-             for row, reference, others in rows]
-    for title, results, metrics in entries:
-        reference = results.get(REFERENCE)
-        if reference is None:
-            continue
-        for metric, what in metrics:
-            found.append((f'{title}, {metric_name(metric, what, results)}', reference,
-                          comparisons(results, reference, metric), metric))
-    o = []
-    for label, reference, others, metric in found:
-        better = sorted((ratio, engine, result) for engine, (result, ratio) in others.items()
-                        if ratio and ratio < 1 and not same(ratio) and engine not in NOT_COMPARED)
-        if better:
-            engines = ', '.join(
-                f'{engine} ({verdict(ratio, metric, overlaps(result, reference, metric)).replace(" than Ledger", "")})'
-                for ratio, engine, result in better)
-            o.append(f'- {SYSTEMS[system]}, {label}: {engines}')
-    return o
+        ranked = sorted(wins.items(), key=lambda item: -max(f for f, _ in item[1]))
+        where = {engine: [s for s in systems if s in {s for _, s in found}] for engine, found in ranked}
+        # The OSes every listed engine wins on, when that is not every OS measured, go after the label once
+        common = set.intersection(*(set(w) for w in where.values()))
+        shared = len(common) < len(measured) and all(set(w) == common for w in where.values())
+        label = loss['label'] + (f' (on {", ".join(SYSTEMS[s] for s in systems if s in common)})' if shared else '')
+        parts = []
+        for i, (engine, found) in enumerate(ranked[:4]):
+            lo, hi = min(f for f, _ in found), max(f for f, _ in found)
+            text = f'{engine} {factor(lo)}' if factor(lo) == factor(hi) else f'{engine} {factor(lo)[:-1]}-{factor(hi)}'
+            if i == 0:
+                text += ' ' + words(metric)[1]
+            if not shared and len(found) < len(measured):
+                text += f' ({", ".join(SYSTEMS[s] for s in where[engine])})'
+            parts.append(text)
+        if len(ranked) > 4:
+            parts.append(f'and {len(ranked) - 4} more {"engine" if len(ranked) == 5 else "engines"}')
+        items.append((max(f for f, _ in ranked[0][1]), f'- {label}: {", ".join(parts)}.'))
+    return [text for _, text in sorted(items, key=lambda item: -item[0])]
 
 
 def picture(base, alt):
-    return ['<picture>',
-            f'  <source media="(prefers-color-scheme: dark)" srcset="{base}-dark.svg">',
-            f'  <img src="{base}-light.svg" width="100%" alt="{escape(alt)}">',
-            '</picture>']
+    return [f'<picture><source media="(prefers-color-scheme: dark)" srcset="{base}-dark.svg">'
+            f'<img src="{base}-light.svg" width="100%" alt="{escape(alt)}"></picture>']
 
 
-def readme_block(charts, config_rows, index, runs, excluded):
+def readme_block(charts, config_rows, index, runs, excluded, losses):
     o = [BEGIN, '<!-- Generated by tools/readme/charts.py from tools/readme/benchmarks.tsv and tools/readme/charts.tsv; '
                 'do not edit by hand. -->', '']
     systems = [s for s in SYSTEMS if any(key[0] == s for key in index)]
-    charted = {(row['group'], row['benchmark'], row['params']) for row in config_rows}
     files = {}
     for chart in charts.values():
         groups = sorted({row['group'] for row in config_rows if row['chart'] == chart['id']})
         drawn = []
         for system in systems:
-            rows, left_out = chart_rows(chart['id'], system, config_rows, index, excluded)
-            if rows:
-                drawn.append((system, rows, left_out, uncharted(system, groups, charted, index, excluded)))
+            rows = chart_rows(chart['id'], system, config_rows, index, excluded)
+            if any(reference is not None for _, reference, _ in rows):
+                drawn.append(system)
+                base = f'.github/assets/bench-{chart["id"]}-{system.split("-")[0]}'
+                source = source_text(system, groups, runs)
+                for theme in THEMES:
+                    files[os.path.join(ROOT, f'{base}-{theme}.svg')] = draw(chart, system, rows, source,
+                                                                            theme)
         if not drawn:
             continue
         o += [f'### {chart["heading"]}', '', chart['caption'], '']
-        lost = [line for system, rows, _, rest in drawn for line in losses(system, rows, rest)]
-        scope = ('every result of these workloads, charted or not, with Ledger\'s own variant and the floor left out; '
-                 '"though the 99.9% intervals overlap" marks a difference of times the run does not settle')
-        o += ([f'Where another engine costs less than Ledger in these runs ({scope}):', ''] + lost + [''] if lost else
-              [f'No other engine costs less than Ledger in these runs ({scope}).', ''])
-        for position, (system, rows, left_out, _) in enumerate(drawn):
+        first = MAIN_SYSTEM if MAIN_SYSTEM in drawn else drawn[0]
+        rest = [system for system in drawn if system != first]
+
+        def chart_picture(system):
             name = SYSTEMS[system]
-            base = f'.github/assets/bench-{chart["id"]}-{system.split("-")[0]}'
-            for theme in THEMES:
-                files[os.path.join(ROOT, f'{base}-{theme}.svg')] = draw(chart, system, rows, theme)
-            sources = sorted({(runs[(system, g)]['id'], runs[(system, g)]['commit'][:7], runs[(system, g)]['rounds'])
-                              for g in groups if (system, g) in runs})
-            source = '; '.join(f'run [{run}](https://github.com/Auties00/Ledger/actions/runs/{run}), commit {commit}, '
-                               f'{rounds} {"round" if rounds == "1" else "rounds"}' for run, commit, rounds in sources)
-            alt = (f'{chart["heading"]} on {name}: bar chart of each engine\'s cost relative to Ledger\'s; '
-                   f'the numbers follow as text.')
-            notes = [f'Left out on {name}: {row["label"][0].lower() + row["label"][1:]}. '
-                     f'{excluded[(system, row["metric"])]}' for row in left_out]
-            body = ([f'**{name}** ({system}; {source})', ''] + picture(base, alt) + ['']
-                    + [line for note in notes for line in (note, '')]
-                    + ['<details>', f'<summary>{chart["heading"]} on {name}: the numbers as text</summary>', '']
-                    + text_list(rows) + ['', '</details>', ''])
-            if position == 0:
-                o += body
-            else:
-                o += ['<details>', f'<summary><b>{chart["heading"]} on {name}</b></summary>', ''] + body + ['</details>', '']
-        for system, _, _, rest in drawn:
-            if rest:
-                o += ['<details>', f'<summary>Every other result of the {", ".join(groups)} workloads on '
-                                   f'{SYSTEMS[system]}</summary>', ''] + other_results(rest) + ['', '</details>', '']
-        missing = [SYSTEMS[s] for s in SYSTEMS if s not in {system for system, *_ in drawn}]
+            return picture(f'.github/assets/bench-{chart["id"]}-{system.split("-")[0]}',
+                           f'{chart["heading"]} on {name}: each engine\'s cost relative to Ledger\'s')
+
+        o += chart_picture(first) + ['']
+        if rest:
+            o += ['<details>', f'<summary>{" and ".join(SYSTEMS[s] for s in rest)}</summary>', '']
+            for system in rest:
+                o += chart_picture(system)
+            o += ['', '</details>', '']
+        lost = loss_lines(chart['id'], losses, index, excluded, systems)
+        if lost:
+            o += ['Where another engine costs less than Ledger, by more than the 99.9% intervals:', ''] + lost + ['']
+        missing = [SYSTEMS[s] for s in SYSTEMS if s not in drawn]
         if missing:
             o += [f'No {" or ".join(missing)} results for this chart yet.', '']
     o.append(END)
@@ -581,13 +545,13 @@ def readme_block(charts, config_rows, index, runs, excluded):
 
 def main():
     check = '--check' in sys.argv
-    charts, config_rows, excluded = read_config()
-    results, runs, _ = read_data()
+    charts, config_rows, excluded, losses = read_config()
+    results, runs = read_data()
     index = {}
     for result in results:
         key = (result['os'], result['group'], result['benchmark'], result['params'])
         index.setdefault(key, {})[result['engine']] = result
-    block, files = readme_block(charts, config_rows, index, runs, excluded)
+    block, files = readme_block(charts, config_rows, index, runs, excluded, losses)
     with open(README, encoding='utf-8') as f:
         readme = f.read()
     a, b = readme.find(BEGIN), readme.find(END)

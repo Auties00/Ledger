@@ -256,7 +256,6 @@ class ReadmeExamplesTest {
         Ledger.builder().directory(directory.resolve("key")).encryption(withKey).keyspace(notes).build().close();
         Ledger.builder().directory(directory).encryption(withPassphrase).keyspace(notes).build().close();
         var printed = printed(() -> {
-            // readme:wrong-key
             try (var ledger = Ledger.builder()
                     .directory(directory)
                     .encryption(Encryption.passphrase("not the passphrase".toCharArray()))
@@ -266,7 +265,6 @@ class ReadmeExamplesTest {
             } catch (LedgerKeyException wrongKey) {
                 System.err.println(wrongKey.getMessage()); // a wrong secret, never reported as damage
             }
-            // readme:end
         });
         var wrongKey = assertThrows(LedgerKeyException.class, () -> Ledger.builder().directory(directory)
                 .encryption(Encryption.passphrase("not the passphrase".toCharArray())).keyspace(notes).build());
@@ -303,13 +301,11 @@ class ReadmeExamplesTest {
         var notes = Keyspace.paged("notes", KeyCodec.utf8(), ValueCodec.utf8());
         try (var ledger = Ledger.builder().directory(directory).encryption(Encryption.none()).keyspace(notes).build()) {
             var printed = printed(() -> {
-                // readme:locked
                 try (var second = Ledger.builder().directory(directory).encryption(Encryption.none()).keyspace(notes).build()) {
                     second.size(notes);
                 } catch (LedgerLockedException locked) {
                     System.err.println(locked.directory() + " is open in another store");
                 }
-                // readme:end
             });
             var locked = assertThrows(LedgerLockedException.class, () -> Ledger.builder().directory(directory)
                     .encryption(Encryption.none()).keyspace(notes).build());
