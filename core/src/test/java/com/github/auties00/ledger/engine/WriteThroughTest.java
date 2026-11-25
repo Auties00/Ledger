@@ -2043,7 +2043,7 @@ class WriteThroughTest {
             var model = new TreeMap<String, String>();
             try (var ledger = open(disk.getPath("/store"), encrypted, WriteThrough.Mode.DSYNC)) {
                 var log = log(ledger);
-                log.keepSpareForTests = true;
+                log.probe().keepSpare = true;
                 var fills = 0;
                 while (log.currentSegment() < 4) {
                     commitBatch(ledger, model, "f" + fills++ + "-", 64, 4_000, 0);
@@ -2161,7 +2161,7 @@ class WriteThroughTest {
 
         private static Ledger reopen(Path directory, WriteThrough.Mode mode, long linger) {
             var ledger = open(directory, mode);
-            log(ledger).lingerNanos = linger;
+            log(ledger).probe().lingerNanos = linger;
             return ledger;
         }
 
@@ -2271,7 +2271,7 @@ class WriteThroughTest {
             }
             try (var ledger = openLarge(directory)) {
                 var log = log(ledger);
-                log.lingerNanos = LONG_LINGER;
+                log.probe().lingerNanos = LONG_LINGER;
                 ledger.commit(ledger.newBatch().put(NAMES, "a", "da"));
                 await(log::lingeringForTests, "the flush did not linger after the deferred commit");
                 var start = System.nanoTime();

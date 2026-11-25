@@ -265,7 +265,7 @@ class LogOutputSizeTest {
         try (var ledger = openLarge(disk.getPath("/store"), encrypted, null)) {
             var log = log(ledger);
             // Held strongly too, so a collection between two groups does not take the array the test follows
-            log.keepSpareForTests = true;
+            log.probe().keepSpare = true;
             commit(ledger, model, "first", 500);
             // 300 values of 4 KB: a group of 1.2 MB, more than one write takes
             commitBatch(ledger, model, "a", 300, 4_000);
@@ -320,7 +320,7 @@ class LogOutputSizeTest {
         var model = new TreeMap<String, String>();
         try (var ledger = openLarge(disk.getPath("/store"), encrypted, null)) {
             var log = log(ledger);
-            log.keepSpareForTests = true;
+            log.probe().keepSpare = true;
             commit(ledger, model, "first", 500);
             commitBatch(ledger, model, "a", 300, 4_000);
             assertEquals(LogWriter.ALIGNMENT, log.outputLength());
@@ -360,7 +360,7 @@ class LogOutputSizeTest {
         var model = new TreeMap<String, String>();
         try (var ledger = openLarge(disk.getPath("/store"), encrypted, null)) {
             var log = log(ledger);
-            log.keepSpareForTests = true;
+            log.probe().keepSpare = true;
             commit(ledger, model, "first", 500);
             commitBatch(ledger, model, "a", 300, 4_000);
             assertEquals(LogWriter.ALIGNMENT, log.outputLength());
@@ -408,7 +408,7 @@ class LogOutputSizeTest {
         });
         try (var ledger = openLarge(disk.getPath("/store"), encrypted, null)) {
             var log = log(ledger);
-            log.keepSpareForTests = true;
+            log.probe().keepSpare = true;
             commit(ledger, model, "first", 500);
             var allocations = log.outputAllocationsForTests();
             holding.set(true);
@@ -521,7 +521,7 @@ class LogOutputSizeTest {
         CrashFileSystem survivor;
         try {
             var log = log(ledger);
-            log.keepSpareForTests = true;
+            log.probe().keepSpare = true;
             commitBatch(ledger, model, "a", 300, 4_000);
             assertEquals(LogWriter.ALIGNMENT, log.outputLength());
             var spare = log.spareOutputForTests();
@@ -611,7 +611,7 @@ class LogOutputSizeTest {
         };
         try (var ledger = open(disk.getPath("/store"), encrypted, way)) {
             var log = log(ledger);
-            log.keepSpareForTests = keep;
+            log.probe().keepSpare = keep;
             commit(ledger, model, "first", 500);
             var commits = 0;
             // Segments enough for a checkpoint to leave spares, which groups are written through into

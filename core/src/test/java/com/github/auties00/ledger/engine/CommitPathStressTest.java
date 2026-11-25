@@ -161,13 +161,13 @@ class CommitPathStressTest {
             way.opensEarlyForTests = true;
             try (var ledger = open(path, way)) {
                 var log = ((LiveLedger) ledger).log();
-                log.leadWaitAlwaysForTests = leadAlways;
-                log.spinBudgetForTests = spinBudget;
+                log.probe().leadWaitAlways = leadAlways;
+                log.probe().spinBudget = spinBudget;
                 // The first group of the open as a cleared chat makes it: a commit no one waits for, then a durable one,
                 // which the flush lingers for in two cycles of three
                 var shape = cycle % 3;
                 if (shape != 0) {
-                    log.lingerNanos = 50_000_000;
+                    log.probe().lingerNanos = 50_000_000;
                 }
                 var unawaited = "c" + cycle + "-unawaited";
                 var first = ledger.commit(ledger.newBatch().put(NAMES, unawaited, "u" + cycle));
@@ -242,9 +242,9 @@ class CommitPathStressTest {
             way.opensEarlyForTests = true;
             var ledger = open(disk.getPath("/store"), way);
             var log = ((LiveLedger) ledger).log();
-            log.leadWaitAlwaysForTests = leadAlways;
-            log.spinBudgetForTests = spinBudget;
-            log.lingerNanos = 20_000_000;
+            log.probe().leadWaitAlways = leadAlways;
+            log.probe().spinBudget = spinBudget;
+            log.probe().lingerNanos = 20_000_000;
             var threads = new ArrayList<Thread>();
             for (var id = 0; id < COMMITTERS; id++) {
                 var seed = random.nextLong();

@@ -67,7 +67,7 @@ class LeadWaitTest {
 
     /// Holds every flush of the lane of `log` at its start while `held` is set.
     private static void gate(LogWriter log, AtomicBoolean held) {
-        log.flushHookForTests = () -> {
+        log.probe().flushHook = () -> {
             var deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(1);
             while (held.get() && System.nanoTime() < deadline) {
                 Thread.onSpinWait();
@@ -179,8 +179,8 @@ class LeadWaitTest {
             var log = log(ledger);
             gate(log, held);
             // The flush waits for the commit however long it takes to lead, whatever thread the lane found
-            log.leadWaitForTests = TimeUnit.MINUTES.toNanos(1);
-            log.leadWaitAlwaysForTests = true;
+            log.probe().leadWait = TimeUnit.MINUTES.toNanos(1);
+            log.probe().leadWaitAlways = true;
             lead(ledger, model, held, "first");
             counting.set(true);
             // Enough that a lane's flush taking running in the moment the commit tries, before it sees the frame it
@@ -218,8 +218,8 @@ class LeadWaitTest {
         try (var ledger = open(disk.getPath("/store"), flusher())) {
             var log = log(ledger);
             gate(log, held);
-            log.leadWaitForTests = TimeUnit.MINUTES.toNanos(1);
-            log.leadWaitAlwaysForTests = true;
+            log.probe().leadWait = TimeUnit.MINUTES.toNanos(1);
+            log.probe().leadWaitAlways = true;
             for (var i = 0; i < 20; i++) {
                 var forces = laneForces.get();
                 var retaken = log.leadsRetakenForTests();
@@ -276,7 +276,7 @@ class LeadWaitTest {
         }
         var entered = new AtomicBoolean();
         var after = new AtomicLong(Long.MAX_VALUE);
-        log.takeHookForTests = () -> {
+        log.probe().takeHook = () -> {
             if (!Thread.currentThread().getName().startsWith(LANE_THREADS) || !entered.compareAndSet(false, true)) {
                 return;
             }
@@ -304,7 +304,7 @@ class LeadWaitTest {
             commit.awaitDurable();
         } finally {
             held.set(false);
-            log.takeHookForTests = null;
+            log.probe().takeHook = null;
         }
     }
 
@@ -317,8 +317,8 @@ class LeadWaitTest {
         try (var ledger = open(disk.getPath("/store"), flusher())) {
             var log = log(ledger);
             gate(log, held);
-            log.leadWaitForTests = TimeUnit.MINUTES.toNanos(2);
-            log.leadWaitAlwaysForTests = true;
+            log.probe().leadWait = TimeUnit.MINUTES.toNanos(2);
+            log.probe().leadWaitAlways = true;
             lead(ledger, model, held, "first");
             for (var i = 0; i < 20; i++) {
                 var commit = put(ledger, model, "k" + i);
@@ -341,7 +341,7 @@ class LeadWaitTest {
         try (var ledger = open(disk.getPath("/store"), flusher())) {
             var log = log(ledger);
             gate(log, held);
-            log.leadWaitAlwaysForTests = true;
+            log.probe().leadWaitAlways = true;
             lead(ledger, model, held, "first");
             for (var round = 1; round <= 3; round++) {
                 var commit = put(ledger, model, "unawaited" + round);
@@ -352,7 +352,7 @@ class LeadWaitTest {
             }
             // A commit that leads while the flush waits for it resets the count
             var taken = log.leadsTakenForTests();
-            log.leadWaitForTests = TimeUnit.MINUTES.toNanos(1);
+            log.probe().leadWait = TimeUnit.MINUTES.toNanos(1);
             // The flush sees the lead only if its thread reaches the queue before the commit's group is durable, which
             // a loaded machine can delay past it: commit again until it does
             var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
@@ -361,7 +361,7 @@ class LeadWaitTest {
                 put(ledger, model, "led" + led).awaitDurable();
                 awaitLeadsTaken(log, taken + 1, TimeUnit.MILLISECONDS.toNanos(200));
             }
-            log.leadWaitForTests = 0;
+            log.probe().leadWait = 0;
             var commit = put(ledger, model, "unawaited");
             assertNotEquals(0, log.leadHintForTests());
             awaitDurable(commit);
@@ -417,7 +417,7 @@ class LeadWaitTest {
         try (var ledger = open(disk.getPath("/store"), flusher())) {
             var log = log(ledger);
             gate(log, held);
-            log.leadWaitAlwaysForTests = true;
+            log.probe().leadWaitAlways = true;
             for (var i = 0; i < 20; i++) {
                 lead(ledger, model, held, "led" + i);
                 var commit = put(ledger, model, "k" + i);
@@ -444,8 +444,8 @@ class LeadWaitTest {
         try {
             var log = log(ledger);
             gate(log, held);
-            log.leadWaitForTests = TimeUnit.MINUTES.toNanos(2);
-            log.leadWaitAlwaysForTests = true;
+            log.probe().leadWait = TimeUnit.MINUTES.toNanos(2);
+            log.probe().leadWaitAlways = true;
             lead(ledger, model, held, "first");
             var commit = put(ledger, model, "unawaited");
             assertNotEquals(0, log.leadHintForTests());
@@ -515,7 +515,7 @@ class LeadWaitTest {
         try (var ledger = open(disk.getPath("/store"), flusher())) {
             var log = log(ledger);
             gate(log, held);
-            log.leadWaitForTests = TimeUnit.MINUTES.toNanos(1);
+            log.probe().leadWait = TimeUnit.MINUTES.toNanos(1);
             var committer = Thread.currentThread();
             // The only place, as another store's spinning flush thread holds it
             assertTrue(ProcessFlusher.takeSpinner());

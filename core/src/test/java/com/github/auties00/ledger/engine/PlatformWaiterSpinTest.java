@@ -45,7 +45,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /// no acknowledged commit.
 ///
 /// The tests that need a commit spinning at a given step hold the flush in the force of its group on the in-memory
-/// file system, and set the spin's length through [LogWriter#spinBudgetForTests].
+/// file system, and set the spin's length through [LogWriter.Probe#spinBudget].
 @Timeout(120)
 class PlatformWaiterSpinTest {
     private static final byte[] KEY = new byte[32];
@@ -188,11 +188,11 @@ class PlatformWaiterSpinTest {
             var commit = commitHeld(ledger, forces, "held");
             var spinEnded = new CountDownLatch(1);
             var durableAtEnd = new AtomicBoolean(true);
-            log.spinEndHookForTests = () -> {
+            log.probe().spinEndHook = () -> {
                 durableAtEnd.set(commit.isDurable());
                 spinEnded.countDown();
             };
-            log.spinBudgetForTests = 1_000;
+            log.probe().spinBudget = 1_000;
             var parkedBefore = log.spinsParkedForTests();
             var unparkedBefore = log.unparkedWaitersForTests();
             var ended = new AtomicReference<Throwable>();
@@ -226,7 +226,7 @@ class PlatformWaiterSpinTest {
             var hookFailure = new AtomicReference<Throwable>();
             // The spin ends at once; the group is published and its wake runs before the commit announces its park,
             // so the wake finds a commit that does not park and skips it
-            log.spinEndHookForTests = () -> {
+            log.probe().spinEndHook = () -> {
                 try {
                     forces.release();
                     var deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
@@ -238,7 +238,7 @@ class PlatformWaiterSpinTest {
                     hookFailure.set(throwable);
                 }
             };
-            log.spinBudgetForTests = 1;
+            log.probe().spinBudget = 1;
             var ended = new AtomicReference<Throwable>();
             var waiter = awaitOnPlatform(commit, ended);
             assertEnds(waiter);
@@ -267,7 +267,7 @@ class PlatformWaiterSpinTest {
             var ran = new AtomicBoolean();
             // The group is published, and its wake finds no waiter, after the commit found itself not durable and
             // before it joins the waiters: a commit that spun then would look for a wake that already ran
-            log.registerHookForTests = () -> {
+            log.probe().registerHook = () -> {
                 if (!ran.compareAndSet(false, true)) {
                     return;
                 }
@@ -283,7 +283,7 @@ class PlatformWaiterSpinTest {
                 }
             };
             var budget = Duration.ofSeconds(20);
-            log.spinBudgetForTests = budget.toNanos();
+            log.probe().spinBudget = budget.toNanos();
             var ended = new AtomicReference<Throwable>();
             var start = System.nanoTime();
             var waiter = awaitOnPlatform(commit, ended);
@@ -316,7 +316,7 @@ class PlatformWaiterSpinTest {
             var ran = new AtomicBoolean();
             // The spin ends at once, and the group's wake runs after the commit read durable for the last time: it
             // unparks the commit only if the commit announced its park before that read
-            log.parkHookForTests = () -> {
+            log.probe().parkHook = () -> {
                 if (!ran.compareAndSet(false, true)) {
                     return;
                 }
@@ -331,7 +331,7 @@ class PlatformWaiterSpinTest {
                     hookFailure.set(throwable);
                 }
             };
-            log.spinBudgetForTests = 1;
+            log.probe().spinBudget = 1;
             var ended = new AtomicReference<Throwable>();
             var waiter = awaitOnPlatform(commit, ended);
             assertEnds(waiter);
@@ -357,7 +357,7 @@ class PlatformWaiterSpinTest {
         try {
             var log = log(ledger);
             var commit = commitHeld(ledger, forces, "held");
-            log.spinBudgetForTests = Duration.ofMinutes(5).toNanos();
+            log.probe().spinBudget = Duration.ofMinutes(5).toNanos();
             var ended = new AtomicReference<Throwable>();
             var waiter = awaitOnPlatform(commit, ended);
             awaitSpinners(1);
@@ -385,7 +385,7 @@ class PlatformWaiterSpinTest {
         try (var ledger = open(disk.getPath("/store"), WriteThrough.Mode.OFF)) {
             var log = log(ledger);
             var commit = commitHeld(ledger, forces, "held");
-            log.spinBudgetForTests = Duration.ofMinutes(5).toNanos();
+            log.probe().spinBudget = Duration.ofMinutes(5).toNanos();
             var ended = new AtomicReference<Throwable>();
             var waiter = awaitOnPlatform(commit, ended);
             awaitSpinners(1);

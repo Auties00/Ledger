@@ -1231,7 +1231,7 @@ class LogRunTest {
             // The first group starts preparing the next segment on a thread of its own: held here and run once the
             // interceptor is armed, its writes, to another file, must leave the failing write to the current segment
             var held = Collections.synchronizedList(new ArrayList<FutureTask<?>>());
-            log.writer.starterForTests = held::add;
+            log.writer.probe().starter = held::add;
             try {
                 log.group(5, 100);
                 // The next group's first write queues one body and defers the other behind it, then fails

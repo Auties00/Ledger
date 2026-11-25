@@ -207,7 +207,7 @@ class SegmentPreparersTest {
             try (var ledger = open(disk.getPath("/store"))) {
                 var log = log(ledger);
                 awaitTrue(log::nextSettled, "the preparation of the open never settled");
-                log.starterForTests = held::add;
+                log.probe().starter = held::add;
                 var commits = 0;
                 while (log.currentSegment() < 6) {
                     commit(ledger, model, "w" + commits++);
@@ -242,7 +242,7 @@ class SegmentPreparersTest {
                 try (var ledger = open(disk.getPath("/store"))) {
                     var log = log(ledger);
                     awaitTrue(log::nextSettled, "the preparation of the open never settled");
-                    log.starterForTests = held::add;
+                    log.probe().starter = held::add;
                     var commits = 0;
                     var segment = log.currentSegment();
                     while (log.currentSegment() == segment) {
@@ -298,7 +298,7 @@ class SegmentPreparersTest {
                 unpreparedBefore = log.unpreparedRollovers();
                 // Each preparation runs as the log starts it, so a rollover finds its segment unprepared only if the
                 // log had not started its preparation by then, whatever the threads of the preparers are doing
-                log.starterForTests = preparation -> {
+                log.probe().starter = preparation -> {
                     started.add(preparation);
                     preparation.run();
                 };

@@ -168,7 +168,7 @@ class BusyCarriersTest {
     private static AutoCloseable holdFlushes(Ledger ledger) {
         var log = ((LiveLedger) ledger).logForTests();
         var released = new CountDownLatch(1);
-        log.flushHookForTests = () -> {
+        log.probe().flushHook = () -> {
             try {
                 // Bounded, so a commit that does wait for the executor fails its test where it would hang it
                 released.await(2, TimeUnit.MINUTES);
@@ -177,7 +177,7 @@ class BusyCarriersTest {
             }
         };
         return () -> {
-            log.flushHookForTests = null;
+            log.probe().flushHook = null;
             released.countDown();
         };
     }
@@ -186,7 +186,7 @@ class BusyCarriersTest {
     /// starts}
     private static Queue<Thread> recordUnitForces(Ledger ledger) {
         var threads = new ConcurrentLinkedQueue<Thread>();
-        ((LiveLedger) ledger).logForTests().unitForceHookForTests = () -> threads.add(Thread.currentThread());
+        ((LiveLedger) ledger).logForTests().probe().unitForceHook = () -> threads.add(Thread.currentThread());
         return threads;
     }
 
@@ -250,7 +250,7 @@ class BusyCarriersTest {
             var forcing = new CountDownLatch(1);
             var release = new CountDownLatch(1);
             var forcedOn = new AtomicReference<Thread>();
-            log.unitForceHookForTests = () -> {
+            log.probe().unitForceHook = () -> {
                 forcedOn.compareAndSet(null, Thread.currentThread());
                 forcing.countDown();
                 try {
@@ -288,7 +288,7 @@ class BusyCarriersTest {
                 }
                 committer.join();
             }
-            log.unitForceHookForTests = null;
+            log.probe().unitForceHook = null;
             assertNull(failure.get());
             assertTrue(interruptKept.get(), "the interrupt was not given back");
             assertEquals(led + 1, log.ledUnitForcesForTests());

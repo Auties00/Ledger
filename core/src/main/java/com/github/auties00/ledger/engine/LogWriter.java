@@ -308,6 +308,9 @@ final class LogWriter {
         }
     }
 
+    /// Whether writers keep a [Probe], the counters and hooks of the tests: only with assertions enabled for this
+    /// class, as the tests run, so a store in production carries none of their fields and does none of their writes.
+    static final boolean PROBED = LogWriter.class.desiredAssertionStatus();
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
@@ -364,28 +367,9 @@ final class LogWriter {
     private long useTag;
     // The segment close kept for the next open, or -1
     private volatile long kept = -1;
-    // The end of the last group's frames, before its padding, for tests
-    private volatile long groupEnd;
-    // Where the frames of the last group start, for tests
-    private volatile long groupStart;
     // The preparation of the segment after the current one, run on a thread of SegmentPreparers, or by whichever of
     // the flush task and a close needs it first
     private FutureTask<LogFiles.Prepared> next;
-    /// Starts the preparations of later segments in place of [SegmentPreparers#start(FutureTask)], for tests that hold
-    /// them or start them late; the one the writer's construction starts is not passed to it.
-    volatile Consumer<FutureTask<?>> starterForTests;
-    /// Runs at the start of every flush the executor runs, before it looks for a group; for tests that hold it back, so
-    /// a commit that waits alone writes its own group.
-    volatile Runnable flushHookForTests;
-    /// Runs in a flush the executor runs, holding [#running], before each look at the queue for a group to take; for
-    /// tests that hold [#running] taken while a commit tries to write its own group.
-    volatile Runnable takeHookForTests;
-    /// Runs on the thread of every force of the file of large values, before the file is forced; for tests that see
-    /// where it runs or hold it.
-    volatile Runnable unitForceHookForTests;
-    // The forces of the file of large values a commit that writes its own group started, for tests; written holding
-    // running
-    private volatile int ledUnitForces;
     // Whether zeros were asked for the segment of next, by its preparation or after it; owned by the flush task
     private boolean nextZeroed;
     // When the current segment opened, and how long the one before it took to fill, or -1; owned by the flush task
@@ -421,10 +405,6 @@ final class LogWriter {
     // Whether a group found the spare output taken by the collector and no group has grown the output to OUTPUT since:
     // the loss counts once the output grows that far, the megabyte it then allocates
     private boolean spareLost;
-    // The spare output held strongly too, for tests that check which array a group takes back
-    private byte[] keptSpareForTests;
-    // Whether a spare output given back is held strongly too, for tests
-    volatile boolean keepSpareForTests;
     // The buffer over the whole of output that drains write it through, made again only when output is replaced, so a
     // drain allocates nothing whatever the compiler inlines
     private ByteBuffer outputBuffer;
@@ -439,11 +419,6 @@ final class LogWriter {
     // The most bytes the group being written may ask the output for, at most OUTPUT: what its frames seal into, joined
     // into runs, the room the cipher's last call asks for past them and the padding to a block
     private int groupNeed;
-    // The times the output grew for the group being written, and the most it grew for one group, for tests
-    private int groupGrowths;
-    private volatile int mostGroupGrowths;
-    // The arrays the output grew into, for tests; written by the flush task only
-    private volatile long outputAllocations;
     // How long the write and force of a group took, or its write through, a moving average in nanoseconds of the groups
     // after the first, each at most four times the average before it, or 0 before the second group; written by the
     // flush task, read by the commits deciding whether to spin
@@ -454,16 +429,8 @@ final class LogWriter {
     private boolean grouped;
     // The flush that lingers, which every wait for the log and every published group unparks, or null
     private volatile Thread lingerer;
-    /// How long a linger lasts at most, in nanoseconds: [#LINGER_NANOS], or longer for tests that must see it end
-    /// early; set before the first commit.
-    volatile long lingerNanos = LINGER_NANOS;
     // The threads waiting in awaitFrames; written holding the durability lock
     private volatile int frameWaiters;
-    // The lingers begun and the groups a commit wrote for itself, for tests
-    private volatile long lingers;
-    private volatile long ledGroups;
-    // The groups made durable, for tests; written before durable, so a wait for durability sees the group that ended it
-    private long groups;
     // The thread of the one commit the last published group woke, its leader or a waiter; null if it woke none or
     // several
     private volatile Thread lastGroupThread;
@@ -482,19 +449,10 @@ final class LogWriter {
     // Whether commits count their registrations as waiters, for a flush that waits for its cohort
     private volatile boolean cohortArmed;
     private final Padded.Count registered;
-    // The waits for a cohort that ended with all of it back and that ran out, for tests
-    private volatile long cohortsGathered;
-    private volatile long cohortsMissed;
-    // The rollovers and the ones that found the preparation of their segment unfinished, or none started, so that the
-    // flush ran or waited for it, for tests; written by the flush task only
-    private volatile long rollovers;
-    private volatile long unpreparedRollovers;
     // The emptied queue, which the next swap reuses
     private ArrayList<Queued> flushing;
     // Written by the flush task only
     private volatile long forces;
-    // The groups written through, of the forces; written by the flush task only
-    private volatile long writtenThrough;
     // The segment the flush task writes, for a checkpoint to read
     private volatile long currentSegment;
 
@@ -524,20 +482,9 @@ final class LogWriter {
     // The latest hint the flush of the lane waited for, so it waits once for each; owned by the flushes of the lane,
     // one at a time
     private long leadWaited;
-    // The waits for a commit to lead that ended with the commit leading, and those that ran out, for tests
-    private volatile long leadsTaken;
-    private volatile long leadsMissed;
-    // The commits expected to lead that found running taken and waited for it to be free, and those of them that
-    // wrote their group after the flush holding it gave it back, for tests
-    private volatile long retakeWaits;
-    private volatile long leadsRetaken;
     // The sequence of the commit retaking the group the flush of the lane gave back while it does, from its first look
     // at running to its try at the group, so that flush's wait for it shares its place among the spinners; 0 for none
     private volatile long retaking;
-    // Whether the flush of the lane waits for a hinted commit whatever thread it found and with no place among the
-    // spinners, and a commit retakes a group with none, for tests; and the longest it waits, and a commit waits for it to give a group back, or 0 for LEAD_WAIT
-    volatile boolean leadWaitAlwaysForTests;
-    volatile long leadWaitForTests;
     // Frames queued since the writer opened; a catalog frame carries a sequence already durable, so close() waits on
     // frames rather than on sequences
     private long appended;
@@ -578,26 +525,9 @@ final class LogWriter {
     private final Condition durabilityChanged;
     private volatile long durable;
     private long written;
-    // The waiting commits wakes found durable, or failed, and the ones of them they unparked, the others having spun
-    // rather than parked, for tests; written by the flush task, and by a stop
-    private volatile long wokenWaiters;
-    private volatile long unparkedWaiters;
-    // The commits that spun until a wake found them durable, and the ones that parked after their spin, for tests
-    private final AtomicLong spinsWoken;
-    private final AtomicLong spinsParked;
-    /// Runs on the thread of a commit that may spin for its durability, after it found the commit not durable and
-    /// before it adds itself to the waiters; for tests that publish a group at that point.
-    volatile Runnable registerHookForTests;
-    /// Runs on the thread of a commit whose spin for its durability ended without a wake, before it announces that it
-    /// parks; for tests that publish a group at that point.
-    volatile Runnable spinEndHookForTests;
-    /// Runs on the thread of a waiting commit after it read the commit not durable and the writer healthy, before each
-    /// park; for tests that publish a group at that point.
-    volatile Runnable parkHookForTests;
-    /// How long a commit that may spin for its durability spins, in nanoseconds, in place of the budget of the force,
-    /// or -1 for that budget; for tests that need a spin to outlast a step of theirs, or to end at once.
-    volatile long spinBudgetForTests = -1;
     private volatile LedgerIoException failure;
+    // What the tests read and set, or null where assertions are off (see PROBED)
+    private final Probe probe = PROBED ? new Probe() : null;
 
     /// Prepares a segment to write frames to.
     ///
@@ -650,8 +580,6 @@ final class LogWriter {
         this.scheduled = new AtomicBoolean();
         this.running = new AtomicBoolean();
         this.waiters = new ConcurrentLinkedQueue<>();
-        this.spinsWoken = new AtomicLong();
-        this.spinsParked = new AtomicLong();
         this.durabilityLock = new ReentrantLock();
         this.durabilityChanged = durabilityLock.newCondition();
         this.durable = durable;
@@ -694,7 +622,6 @@ final class LogWriter {
         // Its preparation forced the header. A name no force made durable has the first group forced, which makes it so
         this.forcedPosition = segment.nameDurable() ? SEGMENT_HEADER : -1;
         this.valid = segment.valid();
-        this.groupEnd = SEGMENT_HEADER;
         this.segmentTag = ByteBuffer.wrap(segment.salt()).getLong();
         this.useTag = TAGS.nextLong();
         this.segmentKey = keys.encrypted() ? keys.segmentKey(storeId, segment.number(), segment.salt(), useTag) : null;
@@ -761,7 +688,7 @@ final class LogWriter {
 
     /// Starts `work` on the segment after the current one, on a thread of [SegmentPreparers] unless a test holds it.
     private void start(FutureTask<?> work) {
-        var starter = starterForTests;
+        var starter = PROBED ? probe.starter : null;
         if (starter != null) {
             starter.accept(work);
         } else {
@@ -832,9 +759,11 @@ final class LogWriter {
     private void rollover() throws IOException {
         // Prepared here, with no thread of its own
         var preparation = next != null ? next : preparation();
-        rollovers++;
-        if (!preparation.isDone()) {
-            unpreparedRollovers++;
+        if (PROBED) {
+            probe.rollovers++;
+            if (!preparation.isDone()) {
+                probe.unpreparedRollovers++;
+            }
         }
         // Runs it on this thread unless it started elsewhere, so a rollover never waits on a thread yet to start
         preparation.run();
@@ -1141,9 +1070,8 @@ final class LogWriter {
     }
 
     private void flush() {
-        var hook = flushHookForTests;
-        if (hook != null) {
-            hook.run();
+        if (PROBED) {
+            Probe.run(probe.flushHook);
         }
         flush(Long.MAX_VALUE);
     }
@@ -1158,7 +1086,7 @@ final class LogWriter {
     private boolean defersLead() {
         var hint = leadHint;
         return lane != null && hint != 0 && hint == lastQueued && hint > leadWaited && durable < hint
-                && (leadWaitAlwaysForTests || (lane.handedHot() && ProcessFlusher.maxSpinners() > 0));
+                && (leadWaitAlways() || (lane.handedHot() && ProcessFlusher.maxSpinners() > 0));
     }
 
     /// Waits, on the flush of the lane, up to [#LEAD_WAIT] for the commit of the frame [#leadHint] names to start
@@ -1186,7 +1114,7 @@ final class LogWriter {
         }
         // Waited for once, even with no place to spin, so the flush then writes its group
         leadWaited = Math.max(leadWaited, hint);
-        var always = leadWaitAlwaysForTests;
+        var always = leadWaitAlways();
         var placed = !always && ProcessFlusher.takeSpinner();
         // Without a place of its own, only while the commit retakes the group, holding the place the two share
         var shared = !always && !placed;
@@ -1194,20 +1122,24 @@ final class LogWriter {
             return;
         }
         try {
-            var longest = leadWaitForTests > 0 ? leadWaitForTests : LEAD_WAIT;
+            var longest = leadWait();
             var start = System.nanoTime();
             while (true) {
                 if (running.get()) {
                     // The commit took its group
                     leadMisses = 0;
-                    leadsTaken++;
+                    if (PROBED) {
+                        probe.leadsTaken++;
+                    }
                     return;
                 }
                 var current = leadHint;
                 if (durable >= hint) {
                     // The commit wrote its group before this flush looked
                     leadMisses = 0;
-                    leadsTaken++;
+                    if (PROBED) {
+                        probe.leadsTaken++;
+                    }
                     if (current == hint || current == 0 || durable >= current) {
                         return;
                     }
@@ -1226,7 +1158,9 @@ final class LogWriter {
                     leadMisses = misses;
                     // The group it waited for is published with the count already set
                     leadSkips = (1 << misses) + 1;
-                    leadsMissed++;
+                    if (PROBED) {
+                        probe.leadsMissed++;
+                    }
                     return;
                 }
                 ProcessFlusher.pause(waited, LEAD_SPIN);
@@ -1306,16 +1240,21 @@ final class LogWriter {
         }
     }
 
-    /// Parks the flush, which [#lingerer] names and which let go of [#running], for at most [#lingerNanos], until a
-    /// group past `seen` is durable or anything needs the queue written: a commit or a thread waiting for the log, a
-    /// commit waiting for room in the queue, a close, a failure, or an interrupt of the flush's thread.
+    /// Parks the flush, which [#lingerer] names and which let go of [#running], for at most [#LINGER_NANOS] (or
+    /// [Probe#lingerNanos] in tests), until a group past `seen` is durable or anything needs the queue written: a commit
+    /// or a thread waiting for the log, a commit waiting for room in the queue, a close, a failure, or an interrupt of
+    /// the flush's thread.
     ///
     /// Each of those is counted before it reads [#lingerer] to wake it, and the flush looks at them after it named
     /// itself there, so either it sees the one that came or that one unparks it.
     private void linger(long seen) {
         try {
-            lingers++;
-            var deadline = System.nanoTime() + lingerNanos;
+            var longest = LINGER_NANOS;
+            if (PROBED) {
+                probe.lingers++;
+                longest = probe.lingerNanos;
+            }
+            var deadline = System.nanoTime() + longest;
             while (durable == seen && waiters.isEmpty() && frameWaiters == 0 && queueWaiters == 0 && !closing
                     && failure == null && !Thread.currentThread().isInterrupted()) {
                 var remaining = deadline - System.nanoTime();
@@ -1561,9 +1500,8 @@ final class LogWriter {
                 var sequence = 0L;
                 var frames = 0L;
                 var units = false;
-                var hook = takeHookForTests;
-                if (hook != null && !leading) {
-                    hook.run();
+                if (PROBED && !leading) {
+                    Probe.run(probe.takeHook);
                 }
                 queueLock.lock();
                 try {
@@ -1621,7 +1559,9 @@ final class LogWriter {
                 }
                 publish(sequence, frames, roomy);
                 if (leading) {
-                    ledGroups++;
+                    if (PROBED) {
+                        probe.ledGroups++;
+                    }
                 } else if (poolWanted()) {
                     return WROTE;
                 }
@@ -1666,7 +1606,9 @@ final class LogWriter {
                     if (looked && lastQueued > durable) {
                         cohortMisses = Math.min(cohortMisses + 1, MAX_COHORT_MISSES);
                         skippedGroups = 1 << cohortMisses;
-                        cohortsMissed++;
+                        if (PROBED) {
+                            probe.cohortsMissed++;
+                        }
                     }
                     return;
                 }
@@ -1677,7 +1619,9 @@ final class LogWriter {
                 ProcessFlusher.pause(waited, COHORT_SPIN);
             }
             cohortMisses = 0;
-            cohortsGathered++;
+            if (PROBED) {
+                probe.cohortsGathered++;
+            }
         } finally {
             cohortArmed = false;
         }
@@ -1751,7 +1695,9 @@ final class LogWriter {
         }
         var count = group.size();
         groupNeed = groupBound(group);
-        groupGrowths = 0;
+        if (PROBED) {
+            probe.groupGrowths = 0;
+        }
         for (var index = 0; index < count; ) {
             var frame = group.get(index);
             var body = frame.body();
@@ -1819,8 +1765,10 @@ final class LogWriter {
         if (unitForce != null) {
             await(unitForce);
         }
-        this.groupStart = start;
-        groupEnd = end;
+        if (PROBED) {
+            probe.groupStart = start;
+            probe.groupEnd = end;
+        }
         if (next == null) {
             prepareNext();
         } else {
@@ -2192,16 +2140,16 @@ final class LogWriter {
     /// flush ends: an interrupt that comes during that force closes the file's channel and stops the log.
     private FutureTask<Void> forceUnits() {
         var file = blobs;
+        var probe = this.probe;
         var task = new FutureTask<Void>(() -> {
-            var hook = unitForceHookForTests;
-            if (hook != null) {
-                hook.run();
+            if (PROBED) {
+                Probe.run(probe.unitForceHook);
             }
             file.force();
             return null;
         });
-        if (leading) {
-            ledUnitForces++;
+        if (PROBED && leading) {
+            probe.ledUnitForces++;
         }
         try {
             unitForces.execute(task);
@@ -2222,7 +2170,7 @@ final class LogWriter {
 
     /// {@return the forces of the file of large values a commit that writes its own group started, for tests}
     int ledUnitForcesForTests() {
-        return ledUnitForces;
+        return probe().ledUnitForces;
     }
 
     /// Waits for `task`, the force of the file of large values; a flush the executor runs, on a thread of the pool or of
@@ -2288,8 +2236,8 @@ final class LogWriter {
     /// collector took keeps the largest output from being given back for the next [#HOLD_GROUPS] groups or more,
     /// counted once the output grows to [#OUTPUT] again, which a group that needs less never does.
     private void grow(int need) {
-        if (++groupGrowths > mostGroupGrowths) {
-            mostGroupGrowths = groupGrowths;
+        if (PROBED && ++probe.groupGrowths > probe.mostGroupGrowths) {
+            probe.mostGroupGrowths = probe.groupGrowths;
         }
         var kept = spareOutput;
         var spare = kept == null ? null : kept.get();
@@ -2306,7 +2254,9 @@ final class LogWriter {
         var size = need <= groupNeed ? Math.max(groupNeed, length + (length >> 2)) : Math.max(2L * length, need);
         var bound = size > OUTPUT / 2 ? (size + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT : Long.highestOneBit(size - 1) << 1;
         output = Arrays.copyOf(output, (int) Math.min(OUTPUT, bound));
-        outputAllocations++;
+        if (PROBED) {
+            probe.outputAllocations++;
+        }
         if (spareLost && output.length == OUTPUT) {
             spareLost = false;
             if (groupsSinceHold > HOLD_GROUPS) {
@@ -2341,8 +2291,8 @@ final class LogWriter {
         if (kept == null || kept.get() != spare) {
             spareOutput = new WeakReference<>(spare);
         }
-        if (keepSpareForTests) {
-            keptSpareForTests = spare;
+        if (PROBED && probe.keepSpare) {
+            probe.keptSpare = spare;
         }
     }
 
@@ -2407,7 +2357,9 @@ final class LogWriter {
                 position = start + used;
                 used = 0;
                 forcedPosition = position;
-                writtenThrough++;
+                if (PROBED) {
+                    probe.writtenThrough++;
+                }
                 wayProven = true;
                 return;
             } catch (ClosedByInterruptException _) {
@@ -2515,7 +2467,9 @@ final class LogWriter {
             cohortBase = registered.get();
             cohortArmed = true;
         }
-        groups++;
+        if (PROBED) {
+            probe.groups++;
+        }
         durable = sequence;
         durabilityLock.lock();
         try {
@@ -2565,7 +2519,7 @@ final class LogWriter {
             if (waiter.sequence <= sequence) {
                 waiter.woken = true;
                 iterator.remove();
-                if (waiter.parking) {
+                if (!waiter.spins || waiter.parking) {
                     LockSupport.unpark(waiter.thread);
                     unparked++;
                 }
@@ -2573,9 +2527,9 @@ final class LogWriter {
                 woken++;
             }
         }
-        if (woken > 0) {
-            wokenWaiters += woken;
-            unparkedWaiters += unparked;
+        if (PROBED && woken > 0) {
+            probe.wokenWaiters += woken;
+            probe.unparkedWaiters += unparked;
         }
         return woken;
     }
@@ -2679,13 +2633,10 @@ final class LogWriter {
             }
         }
         var spinBudget = timeout < 0 ? spinBudget(sequence) : 0;
-        if (spinBudget > 0) {
-            var hook = registerHookForTests;
-            if (hook != null) {
-                hook.run();
-            }
+        if (PROBED && spinBudget > 0) {
+            Probe.run(probe.registerHook);
         }
-        var waiter = new Waiter(Thread.currentThread(), sequence, spinBudget <= 0);
+        var waiter = new Waiter(Thread.currentThread(), sequence, spinBudget > 0);
         var spinning = false;
         try {
             waiters.add(waiter);
@@ -2703,14 +2654,15 @@ final class LogWriter {
                     ProcessFlusher.releaseSpinner();
                     spinning = false;
                     if (woken && durable >= sequence) {
-                        spinsWoken.incrementAndGet();
+                        if (PROBED) {
+                            probe.spinsWoken.incrementAndGet();
+                        }
                         return true;
                     }
-                    var hook = spinEndHookForTests;
-                    if (hook != null) {
-                        hook.run();
+                    if (PROBED) {
+                        Probe.run(probe.spinEndHook);
+                        probe.spinsParked.incrementAndGet();
                     }
-                    spinsParked.incrementAndGet();
                 }
                 // Before the loop below reads durable and failure again, and before every park: a wake that missed this
                 // write is one whose durable or failure the loop reads (see wake)
@@ -2722,9 +2674,8 @@ final class LogWriter {
                 if (Thread.interrupted()) {
                     throw new InterruptedException();
                 }
-                var hook = parkHookForTests;
-                if (hook != null) {
-                    hook.run();
+                if (PROBED) {
+                    Probe.run(probe.parkHook);
                 }
                 if (timeout < 0) {
                     LockSupport.park(this);
@@ -2759,11 +2710,11 @@ final class LogWriter {
     /// is left. Not on fewer than four processors, where the lane's flush never gives a group back and the spin would
     /// keep it off its processor.
     private void retakeLead(long sequence) {
-        var always = leadWaitAlwaysForTests;
+        var always = leadWaitAlways();
         if (leadHint != sequence || !(always || ProcessFlusher.maxSpinners() > 0)) {
             return;
         }
-        var longest = leadWaitForTests > 0 ? leadWaitForTests : LEAD_WAIT;
+        var longest = leadWait();
         var start = System.nanoTime();
         var counted = false;
         retaking = sequence;
@@ -2776,7 +2727,9 @@ final class LogWriter {
                     try {
                         if (!counted) {
                             counted = true;
-                            retakeWaits++;
+                            if (PROBED) {
+                                probe.retakeWaits++;
+                            }
                         }
                         if (!awaitRunningFree(sequence, start, longest)) {
                             return;
@@ -2791,8 +2744,8 @@ final class LogWriter {
                     return;
                 }
                 if (flush(sequence)) {
-                    if (durable >= sequence) {
-                        leadsRetaken++;
+                    if (PROBED && durable >= sequence) {
+                        probe.leadsRetaken++;
                     }
                     return;
                 }
@@ -2833,7 +2786,7 @@ final class LogWriter {
                 || (sequence > taken && !cohortArmed)) {
             return 0;
         }
-        var forTests = spinBudgetForTests;
+        var forTests = PROBED ? probe.spinBudget : -1;
         if (forTests >= 0) {
             return forTests;
         }
@@ -2871,53 +2824,157 @@ final class LogWriter {
         return running.get();
     }
 
+    /// {@return whether the flush of the lane waits for a hinted commit whatever thread it found and with no place
+    /// among the spinners, and a commit retakes a group with none: only for tests ([Probe#leadWaitAlways])}
+    private boolean leadWaitAlways() {
+        return PROBED && probe.leadWaitAlways;
+    }
+
+    /// {@return the longest the flush of the lane waits for a hinted commit, and a commit waits for it to give a group
+    /// back, in nanoseconds: [#LEAD_WAIT], or what a test set ([Probe#leadWait])}
+    private long leadWait() {
+        return PROBED && probe.leadWait > 0 ? probe.leadWait : LEAD_WAIT;
+    }
+
+    /// {@return the counters and hooks of the tests}
+    ///
+    /// @throws IllegalStateException if writers keep none, as with assertions off for this class ([#PROBED])
+    Probe probe() {
+        if (probe == null) {
+            throw new IllegalStateException("LogWriter keeps a probe only with assertions enabled");
+        }
+        return probe;
+    }
+
     /// {@return the waiting commits wakes found durable since the writer opened, unparked or not, for tests}
     long wokenWaitersForTests() {
-        return wokenWaiters;
+        return probe().wokenWaiters;
     }
 
     /// {@return the waiting commits wakes unparked since the writer opened, for tests}
     long unparkedWaitersForTests() {
-        return unparkedWaiters;
+        return probe().unparkedWaiters;
     }
 
     /// {@return the commits that spun until a wake found them durable, for tests}
     long spinsWokenForTests() {
-        return spinsWoken.get();
+        return probe().spinsWoken.get();
     }
 
     /// {@return the commits that parked after a spin a wake did not end, for tests}
     long spinsParkedForTests() {
-        return spinsParked.get();
+        return probe().spinsParked.get();
     }
 
     /// A commit waiting for durability.
     private static final class Waiter {
-        private static final VarHandle PARKING;
-
-        static {
-            try {
-                PARKING = MethodHandles.lookup().findVarHandle(Waiter.class, "parking", boolean.class);
-            } catch (ReflectiveOperationException exception) {
-                throw new ExceptionInInitializerError(exception);
-            }
-        }
-
         final Thread thread;
         final long sequence;
+        // Whether the commit may spin before it parks; a wake unparks a commit that parks at once whatever parking holds
+        final boolean spins;
         volatile boolean woken;
-        // Whether the thread parks or is about to, written before it reads durable and failure again: a wake unparks
-        // only such a thread, as one that spins sees woken itself
+        // Whether the commit that may spin parks or is about to, written before it reads durable and failure again: a
+        // wake unparks only such a commit, as one that spins sees woken itself
         volatile boolean parking;
 
-        /// Creates the waiter of a commit that parks at once, or that may spin first if not `parking`.
+        /// Creates the waiter of a commit that parks at once, or that may spin first if `spins`.
         ///
-        /// The value is written without a fence of its own: the add to the waiters that publishes the waiter is one,
-        /// and a commit that parks at once writes it no more.
-        Waiter(Thread thread, long sequence, boolean parking) {
+        /// Every field it writes is final or keeps its default, so it writes no volatile and needs no fence of its
+        /// own: the add to the waiters that publishes the waiter is one.
+        Waiter(Thread thread, long sequence, boolean spins) {
             this.thread = thread;
             this.sequence = sequence;
-            PARKING.set(this, parking);
+            this.spins = spins;
+        }
+    }
+
+    /// The counters the tests read and the hooks and bounds they set, which a writer keeps only where [#PROBED].
+    ///
+    /// A counter is written by the thread that makes the event it counts, under the locks that event holds, so a test
+    /// reads the volatile ones after the event and the plain ones after a wait that orders them, as their accessors on
+    /// the writer state. A hook or a bound is set before the commits it is for.
+    static final class Probe {
+        /// Starts the preparations of later segments in place of [SegmentPreparers#start(FutureTask)], for tests that
+        /// hold them or start them late; the one the writer's construction starts is not passed to it.
+        volatile Consumer<FutureTask<?>> starter;
+        /// Runs at the start of every flush the executor runs, before it looks for a group; for tests that hold it
+        /// back, so a commit that waits alone writes its own group.
+        volatile Runnable flushHook;
+        /// Runs in a flush the executor runs, holding [LogWriter#running], before each look at the queue for a group
+        /// to take; for tests that hold it taken while a commit tries to write its own group.
+        volatile Runnable takeHook;
+        /// Runs on the thread of every force of the file of large values, before the file is forced; for tests that
+        /// see where it runs or hold it.
+        volatile Runnable unitForceHook;
+        /// Runs on the thread of a commit that may spin for its durability, after it found the commit not durable and
+        /// before it adds itself to the waiters; for tests that publish a group at that point.
+        volatile Runnable registerHook;
+        /// Runs on the thread of a commit whose spin for its durability ended without a wake, before it announces that
+        /// it parks; for tests that publish a group at that point.
+        volatile Runnable spinEndHook;
+        /// Runs on the thread of a waiting commit after it read the commit not durable and the writer healthy, before
+        /// each park; for tests that publish a group at that point.
+        volatile Runnable parkHook;
+        /// Whether a spare output given back is held strongly too ([#keptSpare]).
+        volatile boolean keepSpare;
+        /// Whether the flush of the lane waits for a hinted commit whatever thread it found and with no place among
+        /// the spinners, and a commit retakes a group with none.
+        volatile boolean leadWaitAlways;
+        /// The longest the flush of the lane waits for a hinted commit, and a commit waits for it to give a group
+        /// back, in nanoseconds, or 0 for [LogWriter#LEAD_WAIT].
+        volatile long leadWait;
+        /// How long a linger lasts at most, in nanoseconds: [LogWriter#LINGER_NANOS], or longer for tests that must
+        /// see it end early; set before the first commit.
+        volatile long lingerNanos = LINGER_NANOS;
+        /// How long a commit that may spin for its durability spins, in nanoseconds, in place of the budget of the
+        /// force, or -1 for that budget; for tests that need a spin to outlast a step of theirs, or to end at once.
+        volatile long spinBudget = -1;
+        // The spare output held strongly too, for tests that check which array a group takes back
+        byte[] keptSpare;
+        // The end of the last group's frames, before their padding, and where they start
+        volatile long groupEnd = SEGMENT_HEADER;
+        volatile long groupStart;
+        // The forces of the file of large values a commit that writes its own group started; written holding running
+        volatile int ledUnitForces;
+        // The times the output grew for the group being written, and the most it grew for one group
+        int groupGrowths;
+        volatile int mostGroupGrowths;
+        // The arrays the output grew into; written by the flush task only
+        volatile long outputAllocations;
+        // The lingers begun and the groups a commit wrote for itself
+        volatile long lingers;
+        volatile long ledGroups;
+        // The groups made durable; written before durable, so a wait for durability sees the group that ended it
+        long groups;
+        // The waits for a cohort that ended with all of it back and that ran out
+        volatile long cohortsGathered;
+        volatile long cohortsMissed;
+        // The rollovers and the ones that found the preparation of their segment unfinished, or none started, so that
+        // the flush ran or waited for it; written by the flush task only
+        volatile long rollovers;
+        volatile long unpreparedRollovers;
+        // The groups written through, of the forces; written by the flush task only
+        volatile long writtenThrough;
+        // The waits for a commit to lead that ended with the commit leading, and those that ran out
+        volatile long leadsTaken;
+        volatile long leadsMissed;
+        // The commits expected to lead that found running taken and waited for it to be free, and those of them that
+        // wrote their group after the flush holding it gave it back
+        volatile long retakeWaits;
+        volatile long leadsRetaken;
+        // The waiting commits wakes found durable, or failed, and the ones of them they unparked, the others having
+        // spun rather than parked; written by the flush task, and by a stop
+        volatile long wokenWaiters;
+        volatile long unparkedWaiters;
+        // The commits that spun until a wake found them durable, and the ones that parked after their spin
+        final AtomicLong spinsWoken = new AtomicLong();
+        final AtomicLong spinsParked = new AtomicLong();
+
+        /// Runs `hook` if it is set.
+        static void run(Runnable hook) {
+            if (hook != null) {
+                hook.run();
+            }
         }
     }
 
@@ -2957,12 +3014,12 @@ final class LogWriter {
 
     /// {@return the offset in the current segment where the frames of the last group end, before their padding}
     long groupEnd() {
-        return groupEnd;
+        return probe().groupEnd;
     }
 
     /// {@return the offset in the current segment where the frames of the last group start, a block boundary}
     long groupStart() {
-        return groupStart;
+        return probe().groupStart;
     }
 
     /// {@return the forces made so far, a group written through counting as one}
@@ -2988,7 +3045,7 @@ final class LogWriter {
 
     /// {@return the groups written through so far, for tests}
     long writtenThrough() {
-        return writtenThrough;
+        return probe().writtenThrough;
     }
 
     /// {@return whether an opening of the first segment to write through waits for a group to take it, for tests}
@@ -3003,12 +3060,12 @@ final class LogWriter {
 
     /// {@return the waits of the flush of the lane for a commit to lead that ended with it leading, for tests}
     long leadsTakenForTests() {
-        return leadsTaken;
+        return probe().leadsTaken;
     }
 
     /// {@return the waits of the flush of the lane for a commit to lead that ran out, for tests}
     long leadsMissedForTests() {
-        return leadsMissed;
+        return probe().leadsMissed;
     }
 
     /// {@return whether no flush of the store's lane runs or waits to, for tests; `true` on a pool}
@@ -3018,12 +3075,12 @@ final class LogWriter {
 
     /// {@return the commits expected to lead that found [#running] taken and waited for it to be free, for tests}
     long retakeWaitsForTests() {
-        return retakeWaits;
+        return probe().retakeWaits;
     }
 
     /// {@return the commits that wrote their own group after the flush holding [#running] gave it back, for tests}
     long leadsRetakenForTests() {
-        return leadsRetaken;
+        return probe().leadsRetaken;
     }
 
     /// {@return the bytes of the output, for tests: read after a group returned, its size once that group was written}
@@ -3033,7 +3090,7 @@ final class LogWriter {
 
     /// {@return the arrays the output grew into since the writer opened, for tests}
     long outputAllocationsForTests() {
-        return outputAllocations;
+        return probe().outputAllocations;
     }
 
     /// {@return the most bytes the last group written asked the output for, for tests: read after it is durable}
@@ -3060,12 +3117,12 @@ final class LogWriter {
 
     /// {@return the times the output grew while the last group was written, for tests: read after it is durable}
     int groupGrowthsForTests() {
-        return groupGrowths;
+        return probe().groupGrowths;
     }
 
     /// {@return the most times the output grew while one group was written, for tests}
     int mostGroupGrowthsForTests() {
-        return mostGroupGrowths;
+        return probe().mostGroupGrowths;
     }
 
     /// {@return the output given back once the queue was empty, or `null` if there is none or the collector took it, for
@@ -3081,7 +3138,7 @@ final class LogWriter {
         if (spare != null) {
             spare.clear();
         }
-        keptSpareForTests = null;
+        probe().keptSpare = null;
     }
 
     /// {@return the way later segments are opened to write through, or `null` if their groups are forced, for tests}
@@ -3097,17 +3154,17 @@ final class LogWriter {
 
     /// {@return the waits for the commits a force woke that ended with all of them back, for tests}
     long cohortsGathered() {
-        return cohortsGathered;
+        return probe().cohortsGathered;
     }
 
     /// {@return the waits for the commits a force woke that ran out, for tests}
     long cohortsMissed() {
-        return cohortsMissed;
+        return probe().cohortsMissed;
     }
 
     /// {@return the lingers begun so far, for tests}
     long lingersForTests() {
-        return lingers;
+        return probe().lingers;
     }
 
     /// {@return whether a flush lingers now, for tests}
@@ -3118,23 +3175,23 @@ final class LogWriter {
     /// {@return the groups made durable so far, for tests: read after a wait for durability, every group up to the one
     /// that ended it}
     long groupsForTests() {
-        return groups;
+        return probe().groups;
     }
 
     /// {@return the groups a commit wrote for itself so far, for tests}
     long ledGroupsForTests() {
-        return ledGroups;
+        return probe().ledGroups;
     }
 
     /// {@return the rollovers so far, for tests}
     long rollovers() {
-        return rollovers;
+        return probe().rollovers;
     }
 
     /// {@return the rollovers that found the preparation of their segment unfinished or never made, and ran or waited
     /// for it on the flush, for tests}
     long unpreparedRollovers() {
-        return unpreparedRollovers;
+        return probe().unpreparedRollovers;
     }
 
     /// Makes everything queued durable, then closes the segment.
