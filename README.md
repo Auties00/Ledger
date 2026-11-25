@@ -80,8 +80,8 @@ try (var ledger = Ledger.builder()
 
 ## Guide
 
-Every example is a test, [`ReadmeExamplesTest`](core/src/test/java/com/github/auties00/ledger/ReadmeExamplesTest.java),
-which also checks that this page prints it as it runs.
+Every example is run by [`ReadmeExamplesTest`](core/src/test/java/com/github/auties00/ledger/ReadmeExamplesTest.java),
+which also checks that this page shows it verbatim.
 
 ### Open a store
 
@@ -180,8 +180,7 @@ ledger.update(transaction -> {
 
 ### Choose the durability
 
-When `commit` returns the batch is atomic and visible, but a crash of the process or a loss of power can still lose it
-(never part of it) until it is durable. Concurrent commits share the forces that make them durable.
+Concurrent commits share the forces that make them durable.
 
 ```java
 // Deferred: atomic and visible when commit returns; a crash before it is durable can lose it
@@ -200,8 +199,7 @@ On macOS a force also empties the drive's cache (`F_FULLFSYNC`), so durable mean
 
 ### Take snapshots, scan and remove ranges
 
-A snapshot reads one state, unchanged by later commits, until it is closed; `deleteRange` costs the same however many
-entries it removes.
+A snapshot reads one state, unchanged by later commits, until it is closed.
 
 ```java
 try (var snapshot = ledger.snapshot()) {
@@ -223,8 +221,7 @@ the files grow while it stays open.
 ### Encrypt with a key or a passphrase
 
 Every log frame, page and header is sealed with AES-256-GCM under a key per file derived from the master key, which is
-never written to disk. A store reopens only with the encryption it was created with, and throws
-`LedgerKeyException` for a wrong secret, never reporting it as damage.
+never written to disk. A store reopens only with the encryption and the secret it was created with.
 
 ```java
 var withKey = Encryption.key(masterKey());                       // a 256-bit key the application keeps
@@ -257,11 +254,11 @@ try (var ledger = Ledger.builder().memory().keyspace(notes).build()) {
 Every failure is an unchecked `LedgerException`; misuse, such as a closed store, throws `IllegalStateException` or
 `IllegalArgumentException` instead.
 
-- `LedgerIoException`: a read, write or force failed. After a failed write or force the store **stops**: every later
-  commit and wait for durability throws, reads keep working, and the next open recovers every durable commit. A failed
-  checkpoint the store started on its own does not stop it: it goes to `onBackgroundFailure` and is retried.
+- `LedgerIoException`: a read, write or force failed. A failed write or force **stops** the store; a failed checkpoint
+  the store started on its own does not: it goes to `onBackgroundFailure` and is retried.
 - `LedgerCorruptedException`: data failed authentication or its checksum beyond what recovery repairs.
-- `LedgerKeyException`: the store was opened with another encryption than the one it was created with.
+- `LedgerKeyException`: the store was opened with another encryption or secret than it was created with; a wrong secret
+  is never reported as damage.
 - `LedgerLockedException`: another store, in this process or another, holds the directory.
 
 ### Testing what your code survives
@@ -272,7 +269,11 @@ process at a chosen write or force, take a state a power cut or a crash could le
 ```java
 var disk = CrashFileSystem.create();
 var notes = Keyspace.paged("notes", KeyCodec.utf8(), ValueCodec.utf8());
-var ledger = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.none()).keyspace(notes).build();
+var ledger = Ledger.builder()
+        .directory(disk.getPath("/store"))
+        .encryption(Encryption.none())
+        .keyspace(notes)
+        .build();
 ledger.commit(ledger.newBatch().put(notes, "a", "durable")).awaitDurable();
 
 disk.stopAtForce(0); // the next force fails, and the simulated process stops there
@@ -285,9 +286,13 @@ try {
 
 // What a power cut at that moment could leave; the same seed draws the same state
 var afterCut = disk.afterPowerLoss(new Random(42));
-try (var recovered = Ledger.builder().directory(afterCut.getPath("/store")).encryption(Encryption.none()).keyspace(notes).build()) {
-    System.out.println(recovered.get(notes, "a")); // Optional[durable]: every durable commit is back
-    System.out.println(recovered.get(notes, "b")); // never durable: a power cut may keep the batch or drop it, never half of it
+try (var recovered = Ledger.builder()
+        .directory(afterCut.getPath("/store"))
+        .encryption(Encryption.none())
+        .keyspace(notes)
+        .build()) {
+    System.out.println(recovered.get(notes, "a")); // Optional[durable]
+    System.out.println(recovered.get(notes, "b")); // Optional[visible] or Optional.empty, never half a batch
 }
 ```
 
@@ -304,22 +309,24 @@ channels, file locks and atomic renames, not memory mapping. Ledger's own crash 
 ## Performance
 
 The [benchmark](benchmark/README.md) compares Ledger with H2 MVStore, RocksDB, LMDB, SQLite and Berkeley DB Java
-Edition on workloads modelled on what [Cobalt](https://github.com/Auties00/Cobalt) asks of its store, and on workloads
-Ledger is not built for, with the same contract, 256 MiB cache and durability levels for every engine. The Cobalt
-workloads seal values with AES-GCM before they reach any engine but `ledger`, which authenticates its own files;
-`ledger-plain` is Ledger without encryption, and the `floor` an append-only file with an index in memory: what the
-device charges for the same bytes. The numbers come from the [Benchmark workflow](.github/workflows/benchmark.yml) on
-GitHub's hosted runners, with shared hardware and virtual disks: compare engines within a chart, not with your own
-device. The memory charts measure 0b950d6, which differs from 123417b only in the Berkeley DB adapter.
+Edition, each with the same contract, 256 MiB cache and durability, on workloads modelled on what
+[Cobalt](https://github.com/Auties00/Cobalt) asks of its store and on workloads Ledger is not built for. The numbers
+come from the [Benchmark workflow](.github/workflows/benchmark.yml) on GitHub's hosted runners, whose hardware is
+shared and whose disks are virtual: compare engines within a chart, not with your own device.
+
+- `ledger`, the 1x of every chart, is Ledger encrypted: it seals and authenticates its own files.
+- `ledger-plain` is Ledger unencrypted. In the Cobalt workloads it and every other engine store values the workload
+  sealed with AES-GCM itself.
+- `floor` is a plain file appended and forced per batch, with its index in memory. It is not an engine, and not a
+  bound either: Ledger beats it in most durable workloads.
 
 > [!NOTE]
 > A bar is an engine's cost divided by Ledger's, on a logarithmic axis: right of the 1x line it is slower or takes
-> more, left of it faster or takes less, and its label says by how much. A pale bar with a `~` is within the two
-> results' 99.9% confidence intervals, so the run does not settle it. A row's title gives Ledger's result; hover a bar
-> for the engine's, or read every result in [`benchmarks.tsv`](tools/readme/benchmarks.tsv).
-
-[tools/readme/README.md](tools/readme/README.md) regenerates the charts; [Reading the
-numbers](benchmark/README.md#reading-the-numbers) has the methodology and its caveats.
+> more, left of it faster or takes less, by the factor its label gives. A pale bar with a `~` is one the run does not
+> settle: a time within the two results' 99.9% confidence intervals, or a memory result, which has no interval, within
+> 10%. A row's title gives Ledger's result. Click a chart to open it on its own, then hover a bar for the engine's
+> result, or read every result in [`benchmarks.tsv`](tools/readme/benchmarks.tsv); [Reading the
+> numbers](benchmark/README.md#reading-the-numbers) has the methodology and its caveats.
 
 <!-- bench:begin -->
 <!-- Generated by tools/readme/charts.py from tools/readme/benchmarks.tsv and tools/readme/charts.tsv; do not edit by hand. -->
@@ -328,80 +335,51 @@ numbers](benchmark/README.md#reading-the-numbers) has the methodology and its ca
 
 Writes on stable storage when the call returns: a session stored before a message is sent, a received message before it is acknowledged.
 
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-commit-ubuntu-dark.svg"><img src=".github/assets/bench-commit-ubuntu-light.svg" width="100%" alt="Durable commits on Linux: each engine's cost relative to Ledger's"></picture>
-
-<details>
-<summary>Windows and macOS</summary>
-
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-commit-windows-dark.svg"><img src=".github/assets/bench-commit-windows-light.svg" width="100%" alt="Durable commits on Windows: each engine's cost relative to Ledger's"></picture>
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-commit-macos-dark.svg"><img src=".github/assets/bench-commit-macos-light.svg" width="100%" alt="Durable commits on macOS: each engine's cost relative to Ledger's"></picture>
-
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-commit-ubuntu-dark.svg"><img src=".github/assets/bench-commit-ubuntu-light.svg" width="600" alt="Durable commits on Linux: each engine's cost relative to Ledger's"></picture>
+<details><summary>Windows and macOS</summary>
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-commit-windows-dark.svg"><img src=".github/assets/bench-commit-windows-light.svg" width="600" alt="Durable commits on Windows: each engine's cost relative to Ledger's"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-commit-macos-dark.svg"><img src=".github/assets/bench-commit-macos-light.svg" width="600" alt="Durable commits on macOS: each engine's cost relative to Ledger's"></picture>
 </details>
 
 ### Bulk writes
 
 A history sync of 200,000 messages, an app-state snapshot applied atomically, and clearing the most active chat.
 
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-ingest-ubuntu-dark.svg"><img src=".github/assets/bench-ingest-ubuntu-light.svg" width="100%" alt="Bulk writes on Linux: each engine's cost relative to Ledger's"></picture>
-
-<details>
-<summary>Windows and macOS</summary>
-
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-ingest-windows-dark.svg"><img src=".github/assets/bench-ingest-windows-light.svg" width="100%" alt="Bulk writes on Windows: each engine's cost relative to Ledger's"></picture>
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-ingest-macos-dark.svg"><img src=".github/assets/bench-ingest-macos-light.svg" width="100%" alt="Bulk writes on macOS: each engine's cost relative to Ledger's"></picture>
-
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-ingest-ubuntu-dark.svg"><img src=".github/assets/bench-ingest-ubuntu-light.svg" width="600" alt="Bulk writes on Linux: each engine's cost relative to Ledger's"></picture>
+<details><summary>Windows and macOS</summary>
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-ingest-windows-dark.svg"><img src=".github/assets/bench-ingest-windows-light.svg" width="600" alt="Bulk writes on Windows: each engine's cost relative to Ledger's"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-ingest-macos-dark.svg"><img src=".github/assets/bench-ingest-macos-light.svg" width="600" alt="Bulk writes on macOS: each engine's cost relative to Ledger's"></picture>
 </details>
 
 ### Reads
 
-Pages of a chat, lookups by id and reopening a store, over a history of 200,000 messages.
+Pages of a chat, lookups by id and reopening a store, over a history of 200,000 messages. Every engine but `ledger`, `ledger-plain` included, also decrypts each value the workload sealed.
 
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-read-ubuntu-dark.svg"><img src=".github/assets/bench-read-ubuntu-light.svg" width="100%" alt="Reads on Linux: each engine's cost relative to Ledger's"></picture>
-
-<details>
-<summary>Windows and macOS</summary>
-
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-read-windows-dark.svg"><img src=".github/assets/bench-read-windows-light.svg" width="100%" alt="Reads on Windows: each engine's cost relative to Ledger's"></picture>
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-read-macos-dark.svg"><img src=".github/assets/bench-read-macos-light.svg" width="100%" alt="Reads on macOS: each engine's cost relative to Ledger's"></picture>
-
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-read-ubuntu-dark.svg"><img src=".github/assets/bench-read-ubuntu-light.svg" width="600" alt="Reads on Linux: each engine's cost relative to Ledger's"></picture>
+<details><summary>Windows and macOS</summary>
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-read-windows-dark.svg"><img src=".github/assets/bench-read-windows-light.svg" width="600" alt="Reads on Windows: each engine's cost relative to Ledger's"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-read-macos-dark.svg"><img src=".github/assets/bench-read-macos-light.svg" width="600" alt="Reads on macOS: each engine's cost relative to Ledger's"></picture>
 </details>
 
 ### Memory
 
 The resident memory the store and the operation added to the process (Java heap, native memory and mapped pages alike): at the end, or at its peak.
 
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-memory-ubuntu-dark.svg"><img src=".github/assets/bench-memory-ubuntu-light.svg" width="100%" alt="Memory on Linux: each engine's cost relative to Ledger's"></picture>
-
-<details>
-<summary>Windows and macOS</summary>
-
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-memory-windows-dark.svg"><img src=".github/assets/bench-memory-windows-light.svg" width="100%" alt="Memory on Windows: each engine's cost relative to Ledger's"></picture>
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-memory-macos-dark.svg"><img src=".github/assets/bench-memory-macos-light.svg" width="100%" alt="Memory on macOS: each engine's cost relative to Ledger's"></picture>
-
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-memory-ubuntu-dark.svg"><img src=".github/assets/bench-memory-ubuntu-light.svg" width="600" alt="Memory on Linux: each engine's cost relative to Ledger's"></picture>
+<details><summary>Windows and macOS</summary>
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-memory-windows-dark.svg"><img src=".github/assets/bench-memory-windows-light.svg" width="600" alt="Memory on Windows: each engine's cost relative to Ledger's"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-memory-macos-dark.svg"><img src=".github/assets/bench-memory-macos-light.svg" width="600" alt="Memory on macOS: each engine's cost relative to Ledger's"></picture>
 </details>
 
 ### Workloads Ledger is not built for
 
-Random overwrites of a data set larger than the cache, eight writers at once, a question no key space indexes, 16 MiB values, and a reader that pins an old version.
+Random overwrites of a data set larger than the cache, a question no key space indexes, 16 MiB values, and a reader that pins an old version.
 
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-limits-ubuntu-dark.svg"><img src=".github/assets/bench-limits-ubuntu-light.svg" width="100%" alt="Workloads Ledger is not built for on Linux: each engine's cost relative to Ledger's"></picture>
-
-<details>
-<summary>Windows and macOS</summary>
-
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-limits-windows-dark.svg"><img src=".github/assets/bench-limits-windows-light.svg" width="100%" alt="Workloads Ledger is not built for on Windows: each engine's cost relative to Ledger's"></picture>
-<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-limits-macos-dark.svg"><img src=".github/assets/bench-limits-macos-light.svg" width="100%" alt="Workloads Ledger is not built for on macOS: each engine's cost relative to Ledger's"></picture>
-
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-limits-ubuntu-dark.svg"><img src=".github/assets/bench-limits-ubuntu-light.svg" width="600" alt="Workloads Ledger is not built for on Linux: each engine's cost relative to Ledger's"></picture>
+<details><summary>Windows and macOS</summary>
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-limits-windows-dark.svg"><img src=".github/assets/bench-limits-windows-light.svg" width="600" alt="Workloads Ledger is not built for on Windows: each engine's cost relative to Ledger's"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset=".github/assets/bench-limits-macos-dark.svg"><img src=".github/assets/bench-limits-macos-light.svg" width="600" alt="Workloads Ledger is not built for on macOS: each engine's cost relative to Ledger's"></picture>
 </details>
-
-Where another engine costs less than Ledger, by more than the 99.9% intervals:
-
-- Clearing a chat, bytes written: rocksdb 132-264x less.
-- Durable overwrites of 512-byte entries, bytes written: rocksdb 13x less, sqlite 1.8x.
-- An open store holding 100 messages, resident memory: sqlite 1.1-7.9x less, lmdb 1.2-4.3x (Windows, macOS), rocksdb 1.3x (Linux), mvstore 1.1x (Windows).
-- Recovery after a crash, peak memory: sqlite 5.9-7.0x less, mvstore 4.3-5.4x, lmdb 3.0-3.9x, mvstore-encrypted 1.7-2.3x, and 1 more engine.
-- Random overwrites of 2,000,000 keys, size on disk: sqlite 3.3-3.9x smaller, lmdb 2.2-2.8x, rocksdb 1.7-2.1x, berkeley-je 1.3-1.5x, and 1 more engine.
-- One durable 1.5 KB write (on macOS): lmdb 1.7x faster, sqlite 1.2x, berkeley-je 1.1x, rocksdb 1.1x.
 
 <!-- bench:end -->
 
@@ -412,7 +390,7 @@ Where another engine costs less than Ledger, by more than the 99.9% intervals:
 flowchart LR
     commit["commit(batch)"] --> memory["Writes since the last checkpoint, in memory"]
     commit --> group["Group commit: seal the frames, one write, one force"]
-    commit -. "values of 1 MiB and more" .-> blobs[("ledger.blobs")]
+    commit -. "large values, 1 MiB and more by default" .-> blobs[("ledger.blobs")]
     group --> log[("log/*.log segments")]
     memory --> checkpoint["Checkpoint: copy-on-write B+trees"]
     checkpoint --> data[("ledger.data: 4 KiB pages, two superblocks")]
@@ -432,8 +410,8 @@ flowchart LR
 A commit is visible once it is applied in memory and journaled to the log, in 16 MiB segments each sealed under a key
 of its own. A checkpoint later folds the writes since the last one into the copy-on-write trees of the data file, and
 only then are the log segments it holds retired. A read takes each key space's tree under the writes still in memory,
-so it never waits for a writer. Values of 1 MiB and more are written once, to `ledger.blobs`, rather than to the log
-and again to a checkpoint.
+so it never waits for a writer. Values of at least `Options.largeValues` (1 MiB by default) are written once, to
+`ledger.blobs`, rather than to the log and again to a checkpoint.
 
 <details>
 <summary><b>How a commit becomes durable</b></summary>
@@ -470,7 +448,7 @@ never part of a batch, and repairs a log whose tail a crash tore. Damage anywher
 - One process writes a store at a time, where SQLite and LMDB let several (`MultiProcessWritersBenchmark`).
 - There is no query language and no secondary index: keep your own index as a key space, written in the same batch.
   A question no key space orders by is a scan, which an index SQLite builds on the spot answers far faster.
-- Values below the large-value threshold reach the device twice, in the log and again in a checkpoint.
+- Values below `Options.largeValues` reach the device twice, in the log and again in a checkpoint.
 - Keys are at most 1,024 bytes, values at most 1 GiB, and a transaction's writes at most a little under 2 GiB of log.
 
 </details>

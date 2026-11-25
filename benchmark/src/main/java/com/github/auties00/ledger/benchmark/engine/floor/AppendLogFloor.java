@@ -17,12 +17,13 @@ import java.util.EnumMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.locks.ReentrantLock;
 
-/// The cost floor: appends every batch to one file and keeps the whole index in memory.
+/// The floor: appends every batch to one file and keeps the whole index in memory.
 ///
 /// A durable write forces the file after its append, outside the append lock, so concurrent durable writers can
 /// share a force where the OS allows it. Nothing is ever read back, compacted or recovered, and reads are served from
-/// memory: the numbers bound what the device charges for the bytes and forces of a workload, not what an engine can
-/// do. A reopened floor is empty.
+/// memory: the numbers show what appending and forcing the bytes of a workload costs through a plain `FileChannel`,
+/// not a bound, since an engine that writes through to the device or gathers commits into one force can do better. A reopened
+/// floor is empty.
 public final class AppendLogFloor implements Engine {
     private final Path directory;
     private final FileChannel log;

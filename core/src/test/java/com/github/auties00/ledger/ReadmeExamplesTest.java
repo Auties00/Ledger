@@ -320,7 +320,11 @@ class ReadmeExamplesTest {
         // readme:crash
         var disk = CrashFileSystem.create();
         var notes = Keyspace.paged("notes", KeyCodec.utf8(), ValueCodec.utf8());
-        var ledger = Ledger.builder().directory(disk.getPath("/store")).encryption(Encryption.none()).keyspace(notes).build();
+        var ledger = Ledger.builder()
+                .directory(disk.getPath("/store"))
+                .encryption(Encryption.none())
+                .keyspace(notes)
+                .build();
         ledger.commit(ledger.newBatch().put(notes, "a", "durable")).awaitDurable();
 
         disk.stopAtForce(0); // the next force fails, and the simulated process stops there
@@ -333,9 +337,13 @@ class ReadmeExamplesTest {
 
         // What a power cut at that moment could leave; the same seed draws the same state
         var afterCut = disk.afterPowerLoss(new Random(42));
-        try (var recovered = Ledger.builder().directory(afterCut.getPath("/store")).encryption(Encryption.none()).keyspace(notes).build()) {
-            System.out.println(recovered.get(notes, "a")); // Optional[durable]: every durable commit is back
-            System.out.println(recovered.get(notes, "b")); // never durable: a power cut may keep the batch or drop it, never half of it
+        try (var recovered = Ledger.builder()
+                .directory(afterCut.getPath("/store"))
+                .encryption(Encryption.none())
+                .keyspace(notes)
+                .build()) {
+            System.out.println(recovered.get(notes, "a")); // Optional[durable]
+            System.out.println(recovered.get(notes, "b")); // Optional[visible] or Optional.empty, never half a batch
         }
         // readme:end
         assertTrue(disk.stopped());

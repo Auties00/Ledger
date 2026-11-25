@@ -15,7 +15,7 @@ JMH workloads that compare Ledger with other embedded storage engines. Some work
 | `lmdb` | LMDB 0.9.33 through lmdbjava: a copy-on-write B+tree read through a memory map | no |
 | `sqlite` | SQLite 3.54 through the xerial driver, WAL mode, one `WITHOUT ROWID` table per key space | no |
 | `berkeley-je` | Berkeley DB Java Edition 18.3.12: a B+tree inside an append-only log, with group commit | yes |
-| `floor` | Not an engine: an append-only file with the index in memory. It bounds what the device charges for the same bytes and forces | yes |
+| `floor` | Not an engine: a plain file appended and forced per batch, with the index in memory. A reference for what appending and forcing the same bytes costs, not a bound: Ledger's log, written through to the device and gathering concurrent commits into one write and one force, beats it in most durable workloads | yes |
 
 Every engine gets the same contract (`engine.Engine`):
 - byte-ordered key spaces;
@@ -98,6 +98,8 @@ The JMH options that matter:
 - `-prof jfr:configName=benchmark/src/main/resources/ledger.jfc` records the measurement iterations with JFR, at the settings the file's header lists (the path is relative to the directory the benchmark runs in; in a compare, `-prof jfr:configName=head/benchmark/src/main/resources/ledger.jfc;dir=@OUT@` gives each side and round its own recording, as the header explains).
 
 A full run takes several hours. A quick pass to check that everything works: `-wi 0 -i 1 -r 1s -p messages=20000`.
+
+[tools/readme](../tools/readme/README.md) charts the workflow's results in the root README.
 
 On GitHub, the Benchmark workflow runs the full suite on Linux, Windows and macOS. Start it from the Actions tab, or with `gh workflow run benchmark.yml`; its inputs pick the runners and add JMH arguments. Each job's summary has its results, the report job's summary compares the runners, and the JSON is kept as artifacts for 90 days. Every push also runs each workload once on small data (the CI workflow), to catch breakage.
 

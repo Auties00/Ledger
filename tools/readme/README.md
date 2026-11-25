@@ -24,17 +24,20 @@ python tools/readme/charts.py
 3. `charts.py` reads `benchmarks.tsv` and [`charts.tsv`](charts.tsv), which picks the rows each chart shows, writes
    `.github/assets/bench-<chart>-<os>-light.svg` and `-dark.svg` for every chart and OS with data, and rewrites the
    block between `<!-- bench:begin -->` and `<!-- bench:end -->` of the root README: per chart its heading, caption
-   and Linux chart, the Windows and macOS charts in one `<details>`, and, under a chart with `loss` lines, the list of
-   where another engine costs less than Ledger. The charts carry their own numbers: each row's title gives Ledger's
-   result, each bar its ratio to Ledger's ("4.7x slower"), drawn pale with a `~` when the two times are within their
-   99.9% confidence intervals, and each bar's tooltip the engine's absolute result. The header of each SVG names the
-   runs, commit and rounds it draws from. An `exclude` line of `charts.tsv` replaces a metric's bars on one OS with
-   its reason. A chart of an OS without data is left out, and its old SVGs are deleted.
+   and Linux chart, and the Windows and macOS charts in one `<details>`. The charts carry their own numbers, and the
+   README writes none of them out again: each row's title gives Ledger's result, each bar its ratio to Ledger's
+   ("4.7x", or "+8%" under 1.1x; the side of the 1x line gives the direction), drawn pale with a `~` when the run does
+   not settle it (two times within their 99.9% confidence intervals, or two memory results, which carry no interval,
+   within 10%), and each bar's tooltip, shown when the SVG is opened on its own, the engine's absolute result. The
+   header of each SVG names the runs, commit and rounds it draws from. The charts are 600 wide and shown at that size,
+   with 12 to 14 px text, so that a phone scales them down no further than its width. An `exclude` line of
+   `charts.tsv` replaces a metric's bars on one OS with its reason. A chart of an OS without data is left out, and its
+   old SVGs are deleted.
 
 `python tools/readme/charts.py --check` exits 1 when a committed SVG or the README block is stale. Both scripts need
 Python 3 and its standard library only; `fetch.py` also needs the GitHub CLI (`gh`), logged in.
 
 To chart another workload, add a `row` line to `charts.tsv` with its benchmark, its parameters as `benchmarks.tsv`
 writes them and the metric to compare (`score`, a counter, or the difference of two counters such as
-`residentBytesPeak-residentBytesFloor`); a `loss` line names a result the same way to list where Ledger loses on it.
-`charts.tsv`'s header explains the format. Every result, charted or not, stays in `benchmarks.tsv`.
+`residentBytesPeak-residentBytesFloor`). A result where Ledger loses that a reader choosing an engine should see is
+charted as a row too, never listed as text. `charts.tsv`'s header explains the format. Every result, charted or not, stays in `benchmarks.tsv`.

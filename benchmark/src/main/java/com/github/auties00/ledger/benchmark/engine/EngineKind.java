@@ -81,8 +81,10 @@ public enum EngineKind {
             return BerkeleyJeEngine.open(directory, settings);
         }
     },
-    /// Not an engine: an append-only file with the whole index in memory, no recovery and no compaction. It shows
-    /// what the device charges for writing and forcing the same bytes, the bound every engine pays on top of.
+    /// Not an engine: a plain file appended and forced per batch, with the whole index in memory, no recovery and no
+    /// compaction. It shows what appending and forcing the same bytes costs through a plain `FileChannel`, which is no
+    /// bound: an engine that writes through to the device and gathers concurrent commits into one write and one force
+    /// beats it.
     FLOOR("floor", false) {
         @Override
         public Engine open(Path directory, EngineSettings settings) throws IOException {
