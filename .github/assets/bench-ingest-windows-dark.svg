@@ -40,28 +40,28 @@
 <line x1="713.0" y1="130.0" x2="713.0" y2="238.0" stroke="#3d444d" stroke-width="1"/>
 <line x1="872.0" y1="130.0" x2="872.0" y2="238.0" stroke="#3d444d" stroke-width="1"/>
 <text x="20" y="142.5" font-size="11" fill="#9198a1">ledger-plain</text>
-<circle cx="395.0" cy="138.5" r="3.5" fill="#2f7fd8"><title>ledger-plain: 1,221 +- 258 ms/op, 2% slower than Ledger</title></circle>
+<circle cx="395.0" cy="138.5" r="3.5" fill="#2f7fd8"><title>ledger-plain: 1,221 +- 258 ms/op, 2% slower than Ledger, though the 99.9% intervals overlap</title></circle>
 <text x="401.3" y="142.5" font-size="11" font-weight="600" fill="#f0f6fc">1.0x</text>
 <text x="20" y="155.5" font-size="11" fill="#9198a1">mvstore</text>
-<path d="M395.0,147.0H503.7a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#e0702a"><title>mvstore: 6,037 +- 9,874 ms/op, 5.0x slower than Ledger</title></path>
+<path d="M395.0,147.0H503.7a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#e0702a"><title>mvstore: 6,037 +- 9,874 ms/op, 5.0x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="511.7" y="155.5" font-size="11" font-weight="600" fill="#f0f6fc">5.0x</text>
 <text x="20" y="168.5" font-size="11" fill="#9198a1">mvstore-encrypted</text>
 <path d="M395.0,160.0H535.8a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#9a520e"><title>mvstore-encrypted: 9,607 +- 2,996 ms/op, 8.0x slower than Ledger</title></path>
 <text x="543.8" y="168.5" font-size="11" font-weight="600" fill="#f0f6fc">8.0x</text>
 <text x="20" y="181.5" font-size="11" fill="#9198a1">rocksdb</text>
-<path d="M395.0,173.0H440.6a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#0f9d82"><title>rocksdb: 2,422 +- 1,124 ms/op, 2.0x slower than Ledger</title></path>
+<path d="M395.0,173.0H440.6a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#0f9d82"><title>rocksdb: 2,422 +- 1,124 ms/op, 2.0x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="448.6" y="181.5" font-size="11" font-weight="600" fill="#f0f6fc">2.0x</text>
 <text x="20" y="194.5" font-size="11" fill="#9198a1">lmdb</text>
-<path d="M395.0,186.0H425.8a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#8a63d2"><title>lmdb: 1,954 +- 1,137 ms/op, 1.6x slower than Ledger</title></path>
+<path d="M395.0,186.0H425.8a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#8a63d2"><title>lmdb: 1,954 +- 1,137 ms/op, 1.6x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="433.8" y="194.5" font-size="11" font-weight="600" fill="#f0f6fc">1.6x</text>
 <text x="20" y="207.5" font-size="11" fill="#9198a1">sqlite</text>
 <path d="M395.0,199.0H583.7a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#d1478a"><title>sqlite: 19,241 +- 2,120 ms/op, 16x slower than Ledger</title></path>
 <text x="591.7" y="207.5" font-size="11" font-weight="600" fill="#f0f6fc">16x</text>
 <text x="20" y="220.5" font-size="11" fill="#9198a1">berkeley-je</text>
-<path d="M395.0,212.0H454.7a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#5f8f1f"><title>berkeley-je: 2,970 +- 2,848 ms/op, 2.5x slower than Ledger</title></path>
+<path d="M395.0,212.0H454.7a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#5f8f1f"><title>berkeley-je: 2,970 +- 2,848 ms/op, 2.5x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="462.7" y="220.5" font-size="11" font-weight="600" fill="#f0f6fc">2.5x</text>
 <text x="20" y="233.5" font-size="11" fill="#9198a1">floor</text>
-<path d="M395.0,225.0H419.7a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="url(#hatch)" stroke="#8b949e" stroke-width="1"><title>floor: 1,790 +- 4,843 ms/op, 1.5x slower than Ledger</title></path>
+<path d="M395.0,225.0H419.7a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="url(#hatch)" stroke="#8b949e" stroke-width="1"><title>floor: 1,790 +- 4,843 ms/op, 1.5x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="427.7" y="233.5" font-size="11" font-weight="600" fill="#f0f6fc">1.5x</text>
 <line x1="8" y1="242.0" x2="952" y2="242.0" stroke="#3d444d" stroke-width="1" stroke-dasharray="1 4"/>
 <text x="8" y="263" font-size="13" font-weight="600" fill="#f0f6fc">History sync, bytes written to the device<tspan font-weight="400" fill="#9198a1">  Ledger: 496.2 MiB for 288.7 MiB of payload</tspan></text>
@@ -133,16 +133,16 @@
 <line x1="713.0" y1="556.0" x2="713.0" y2="664.0" stroke="#3d444d" stroke-width="1"/>
 <line x1="872.0" y1="556.0" x2="872.0" y2="664.0" stroke="#3d444d" stroke-width="1"/>
 <text x="20" y="568.5" font-size="11" fill="#9198a1">ledger-plain</text>
-<path d="M395.0,560.0H431.0a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#2f7fd8"><title>ledger-plain: 45.5 +- 55.0 ms/op, 1.8x slower than Ledger</title></path>
+<path d="M395.0,560.0H431.0a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#2f7fd8"><title>ledger-plain: 45.5 +- 55.0 ms/op, 1.8x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="439.0" y="568.5" font-size="11" font-weight="600" fill="#f0f6fc">1.8x</text>
 <text x="20" y="581.5" font-size="11" fill="#9198a1">mvstore</text>
-<path d="M395.0,573.0H451.7a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#e0702a"><title>mvstore: 61.3 +- 38.9 ms/op, 2.4x slower than Ledger</title></path>
+<path d="M395.0,573.0H451.7a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#e0702a"><title>mvstore: 61.3 +- 38.9 ms/op, 2.4x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="459.7" y="581.5" font-size="11" font-weight="600" fill="#f0f6fc">2.4x</text>
 <text x="20" y="594.5" font-size="11" fill="#9198a1">mvstore-encrypted</text>
-<path d="M395.0,586.0H480.3a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#9a520e"><title>mvstore-encrypted: 92.8 +- 49.5 ms/op, 3.6x slower than Ledger</title></path>
+<path d="M395.0,586.0H480.3a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#9a520e"><title>mvstore-encrypted: 92.8 +- 49.5 ms/op, 3.6x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="488.3" y="594.5" font-size="11" font-weight="600" fill="#f0f6fc">3.6x</text>
 <text x="20" y="607.5" font-size="11" fill="#9198a1">rocksdb</text>
-<path d="M395.0,599.0H450.1a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#0f9d82"><title>rocksdb: 59.9 +- 36.4 ms/op, 2.3x slower than Ledger</title></path>
+<path d="M395.0,599.0H450.1a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#0f9d82"><title>rocksdb: 59.9 +- 36.4 ms/op, 2.3x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="458.1" y="607.5" font-size="11" font-weight="600" fill="#f0f6fc">2.3x</text>
 <text x="20" y="620.5" font-size="11" fill="#9198a1">lmdb</text>
 <path d="M395.0,612.0H467.0a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#8a63d2"><title>lmdb: 76.5 +- 26.4 ms/op, 3.0x slower than Ledger</title></path>
@@ -151,10 +151,10 @@
 <path d="M395.0,625.0H524.0a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#d1478a"><title>sqlite: 175 +- 33.3 ms/op, 6.8x slower than Ledger</title></path>
 <text x="532.0" y="633.5" font-size="11" font-weight="600" fill="#f0f6fc">6.8x</text>
 <text x="20" y="646.5" font-size="11" fill="#9198a1">berkeley-je</text>
-<path d="M395.0,638.0H493.4a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#5f8f1f"><title>berkeley-je: 112 +- 143 ms/op, 4.3x slower than Ledger</title></path>
+<path d="M395.0,638.0H493.4a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#5f8f1f"><title>berkeley-je: 112 +- 143 ms/op, 4.3x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="501.4" y="646.5" font-size="11" font-weight="600" fill="#f0f6fc">4.3x</text>
 <text x="20" y="659.5" font-size="11" fill="#9198a1">floor</text>
-<path d="M395.0,651.0H438.3a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="url(#hatch)" stroke="#8b949e" stroke-width="1"><title>floor: 50.5 +- 34.8 ms/op, 2.0x slower than Ledger</title></path>
+<path d="M395.0,651.0H438.3a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="url(#hatch)" stroke="#8b949e" stroke-width="1"><title>floor: 50.5 +- 34.8 ms/op, 2.0x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="446.3" y="659.5" font-size="11" font-weight="600" fill="#f0f6fc">2.0x</text>
 <line x1="8" y1="668.0" x2="952" y2="668.0" stroke="#3d444d" stroke-width="1" stroke-dasharray="1 4"/>
 <text x="8" y="689" font-size="13" font-weight="600" fill="#f0f6fc">Small app-state patch over those entries, latency<tspan font-weight="400" fill="#9198a1">  Ledger: 106 +- 6.3 us/op</tspan></text>
@@ -164,7 +164,7 @@
 <line x1="713.0" y1="698.0" x2="713.0" y2="806.0" stroke="#3d444d" stroke-width="1"/>
 <line x1="872.0" y1="698.0" x2="872.0" y2="806.0" stroke="#3d444d" stroke-width="1"/>
 <text x="20" y="710.5" font-size="11" fill="#9198a1">ledger-plain</text>
-<path d="M395.0,702.0h2.8v9h-2.8z" fill="#2f7fd8"><title>ledger-plain: 110 +- 6.27 us/op, 4% slower than Ledger</title></path>
+<path d="M395.0,702.0h2.8v9h-2.8z" fill="#2f7fd8"><title>ledger-plain: 110 +- 6.27 us/op, 4% slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="402.8" y="710.5" font-size="11" font-weight="600" fill="#f0f6fc">1.0x</text>
 <text x="20" y="723.5" font-size="11" fill="#9198a1">mvstore</text>
 <path d="M395.0,715.0H568.8a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#e0702a"><title>mvstore: 1,371 +- 47.7 us/op, 13x slower than Ledger</title></path>
@@ -195,7 +195,7 @@
 <line x1="713.0" y1="840.0" x2="713.0" y2="948.0" stroke="#3d444d" stroke-width="1"/>
 <line x1="872.0" y1="840.0" x2="872.0" y2="948.0" stroke="#3d444d" stroke-width="1"/>
 <text x="20" y="852.5" font-size="11" fill="#9198a1">ledger-plain</text>
-<path d="M391.7,844.0h3.3v9h-3.3z" fill="#2f7fd8"><title>ledger-plain: 2.65 +- 3.95 ms/op, 5% faster than Ledger</title></path>
+<path d="M391.7,844.0h3.3v9h-3.3z" fill="#2f7fd8"><title>ledger-plain: 2.65 +- 3.95 ms/op, 5% faster than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="386.7" y="852.5" font-size="11" font-weight="600" text-anchor="end" fill="#f0f6fc">1.0x</text>
 <text x="20" y="865.5" font-size="11" fill="#9198a1">mvstore</text>
 <path d="M395.0,857.0H745.9a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#e0702a"><title>mvstore: 467 +- 195 ms/op, 168x slower than Ledger</title></path>
@@ -204,16 +204,16 @@
 <path d="M395.0,870.0H792.8a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#9a520e"><title>mvstore-encrypted: 921 +- 558 ms/op, 331x slower than Ledger</title></path>
 <text x="800.8" y="878.5" font-size="11" font-weight="600" fill="#f0f6fc">331x</text>
 <text x="20" y="891.5" font-size="11" fill="#9198a1">rocksdb</text>
-<path d="M395.0,883.0H305.9a3,3 0 0 0 -3,3v3a3,3 0 0 0 3,3H395.0z" fill="#0f9d82"><title>rocksdb: 0.732 +- 0.0975 ms/op, 3.8x faster than Ledger</title></path>
+<path d="M395.0,883.0H305.9a3,3 0 0 0 -3,3v3a3,3 0 0 0 3,3H395.0z" fill="#0f9d82"><title>rocksdb: 0.732 +- 0.0975 ms/op, 3.8x faster than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="297.9" y="891.5" font-size="11" font-weight="600" text-anchor="end" fill="#f0f6fc">3.8x</text>
 <text x="20" y="904.5" font-size="11" fill="#9198a1">lmdb</text>
-<path d="M395.0,896.0H751.7a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#8a63d2"><title>lmdb: 508 +- 2,401 ms/op, 183x slower than Ledger</title></path>
+<path d="M395.0,896.0H751.7a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#8a63d2"><title>lmdb: 508 +- 2,401 ms/op, 183x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="759.7" y="904.5" font-size="11" font-weight="600" fill="#f0f6fc">183x</text>
 <text x="20" y="917.5" font-size="11" fill="#9198a1">sqlite</text>
 <path d="M395.0,909.0H830.2a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#d1478a"><title>sqlite: 1,583 +- 880 ms/op, 570x slower than Ledger</title></path>
 <text x="838.2" y="917.5" font-size="11" font-weight="600" fill="#f0f6fc">570x</text>
 <text x="20" y="930.5" font-size="11" fill="#9198a1">berkeley-je</text>
-<path d="M395.0,922.0H744.2a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#5f8f1f"><title>berkeley-je: 456 +- 2,132 ms/op, 164x slower than Ledger</title></path>
+<path d="M395.0,922.0H744.2a3,3 0 0 1 3,3v3a3,3 0 0 1 -3,3H395.0z" fill="#5f8f1f"><title>berkeley-je: 456 +- 2,132 ms/op, 164x slower than Ledger, though the 99.9% intervals overlap</title></path>
 <text x="752.2" y="930.5" font-size="11" font-weight="600" fill="#f0f6fc">164x</text>
 <text x="20" y="943.5" font-size="11" fill="#9198a1">floor</text>
 <text x="403.0" y="943.5" font-size="10.5" font-style="italic" fill="#9198a1">not run</text>

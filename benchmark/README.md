@@ -28,7 +28,7 @@ Each engine also gets the same cache budget, 256 MiB.
 
 Durability means the same thing everywhere:
 
-- **`DEFERRED`**: atomic and visible, and it survives a crash of the process, but not necessarily a power loss.
+- **`DEFERRED`**: atomic and visible when the call returns, but not necessarily durable. Whether a crash of the process before it is durable keeps it depends on the engine: the others hand it to the OS before they return, so a crash of the process keeps it and only a loss of power can take it, while Ledger may still hold its log frames in the process for its writer, so a crash of the process can take it too.
 - **`DURABLE`**: on stable storage when the call returns.
 
 How each engine implements both levels is documented on its adapter. Cobalt seals everything it stores, so the Cobalt workloads seal values with AES-GCM (`sealed=true`) before they reach engines that cannot; `ledger` authenticates every frame and page itself and is not sealed again, while `ledger-plain` is. `-p sealed=false` measures the engines bare.
@@ -106,6 +106,6 @@ On GitHub, the Benchmark workflow runs the full suite on Linux, Windows and macO
 - **Results move with the device and the OS.** A force on a consumer NVMe drive costs about a millisecond on Windows and less on Linux. Compare engines within one machine.
 - **On macOS, every engine's durable write empties the drive's cache.** The Java engines (Ledger, MVStore, Berkeley DB, the floor) force through `FileChannel.force`, which the JDK implements with `fcntl(F_FULLFSYNC)` there; LMDB and RocksDB call it themselves, and SQLite does with its `fullfsync` pragmas, which the adapter sets.
 - **JMH adds the secondary counters up over the measurement iterations.** In JMH's own output and JSON, `bytesWritten`, `payloadBytes`, `sizeOnDisk` and every `heapBytes` and `residentBytes` counter are the sum of the iterations; the workflow summaries divide them back to their value per iteration.
-- **`bytesWritten` is not measured the same way on each OS.** On Windows and Linux it counts the bytes passed to write calls; on macOS, the bytes written to disk. See `support.ProcessProbe`.
+- **`bytesWritten` is not measured the same way on each OS.** On Windows and Linux it counts the bytes passed to write calls; on macOS, the bytes the kernel charges to the process as written to disk, which for some engines is far less than their files hold afterwards (LMDB's history sync), so it does not compare engines there. See `support.ProcessProbe`.
 - **`ReopenBenchmark` measures a warm start on Linux and macOS.** The files it opens were just copied, so they are in the OS page cache. On Windows the reads after the copy reach the drive, as the profiles of the hosted runners show, so the start there is closer to a cold one.
 - **LMDB's `sizeOnDisk` counts the pages in use.** On Windows, LMDB 0.9 creates its data file at the full map size, which the adapter sets to twice the data a workload expects.

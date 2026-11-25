@@ -3,3 +3,6 @@ bench-data/
 .idea/
 *.iml
 jmh-result*.json
+.flattened-pom.xml
+__pycache__/
+*.pyc

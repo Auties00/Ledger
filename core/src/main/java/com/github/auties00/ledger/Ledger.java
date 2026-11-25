@@ -41,9 +41,10 @@ import java.util.function.Consumer;
 /// cache keeps the values read more than once.
 ///
 /// The writes since the last checkpoint stay in memory until the next one. When commits come faster than
-/// checkpoints can write them, and the log holds three checkpoint intervals ([Options#checkpointEvery(long)]) the
-/// files do not, a commit waits for the running checkpoint before it applies: memory stays bounded, at the cost of
-/// throughput.
+/// checkpoints can write them, a commit waits for the running checkpoint before it applies once the log holds more
+/// than six checkpoint intervals ([Options#checkpointEvery(long)]) the files do not, or more than two while the writes
+/// the files of every open store of the process lack hold more than half the heap's maximum size: memory stays
+/// bounded, at the cost of throughput.
 ///
 /// # Reads
 /// Reads never wait for writes and never see part of a batch. The read methods of this interface read the latest
@@ -51,8 +52,9 @@ import java.util.function.Consumer;
 ///
 /// # Durability
 /// A durable commit survives a crash of the process and a loss of power. A commit that is visible but not yet
-/// durable survives a crash of the process only. When the store opens it recovers every durable commit and drops
-/// the rest; it never recovers part of a batch.
+/// durable may not have reached the log's file yet, since its frames wait in the process for the writer to take
+/// them, so a crash of the process can lose it as a loss of power can. When the store opens it recovers every durable
+/// commit and may drop the rest; it never recovers part of a batch.
 ///
 /// A failed force leaves the store unable to tell which commits reached stable storage, so it stops: every later
 /// commit, and every wait for durability, throws [LedgerIoException]. Reopen the store to recover.

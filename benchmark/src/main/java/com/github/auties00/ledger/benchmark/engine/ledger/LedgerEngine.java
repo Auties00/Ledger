@@ -25,7 +25,9 @@ import java.util.Locale;
 /// (sessions, chats) and paged key spaces for the rest.
 ///
 /// A durable write commits and waits for its commit to be durable, so concurrent writers share forces; a deferred
-/// write only commits. Range deletes are Ledger's own, which records the range rather than visiting its keys.
+/// write only commits, so until the store's writer has written its log frames a crash of the process can lose it,
+/// where the other engines have handed a deferred write to the OS when it returns. Range deletes are Ledger's own,
+/// which records the range rather than visiting its keys.
 ///
 /// Every read hands out arrays the caller owns, as [Engine] requires. A resident key space holds its values as the
 /// arrays that were put, which its typed reads return, so a get clones the value and a scan copies the encoded key

@@ -1,5 +1,5 @@
 # What the Performance section of the root README charts: tools/readme/charts.py reads this file and benchmarks.tsv.
-# Tab separated. Two kinds of line:
+# Tab separated. Three kinds of line:
 #
 #   chart <id> <heading> <caption>
 #     A chart, drawn once per OS that has data for it, to .github/assets/bench-<id>-<os>-{light,dark}.svg, in the
@@ -11,8 +11,16 @@
 #     score: an engine's time per operation, or the inverse of its throughput), a counter of benchmarks.tsv (bytes,
 #     lower is better), or the difference of two counters, a-b. <label> is the row's title.
 #
-# Every result of a group that no row charts is still listed in the README, under "Other results"; benchmark/README.md
-# describes every workload.
+#   exclude <os> <metric> <reason>
+#     <metric> does not compare engines on <os> (ubuntu-latest, windows-latest or macos-latest): the rows that chart it
+#     are left out of that OS's charts, with <reason> printed in their place, and no comparison uses it there.
+#
+# Every result of a group that no row charts is still listed in the README, under "Every other result of the <groups>
+# workloads on <OS>", by its score and every counter it records (a workload that records memory by its counters only:
+# each says its time is not what it measures); the lists of where another engine costs less than Ledger cover those
+# results too. benchmark/README.md describes every workload.
+
+exclude	macos-latest	bytesWritten	macOS counts the bytes the kernel charges to the process as written to disk, not the bytes passed to write calls, and it charges some engines far less than their files hold afterwards: LMDB is credited with a small fraction of the pages a history sync leaves in use. The counter does not compare engines there.
 
 chart	commit	Durable commits	Writes that are on stable storage when the call returns: a session stored before a message is sent, a received message stored before it is acknowledged, a webhook delivery stored before it is answered.
 row	commit	commit	DurableCommitBenchmark.storeSession	sealed=true	score	One durable 1.5 KB write, latency
@@ -22,7 +30,7 @@ row	commit	commit	GroupCommitBenchmark.commitConcurrently	committers=8,sealed=tr
 row	commit	commit	GroupCommitBenchmark.commitConcurrently	committers=256,sealed=true	score	Durable writes per second, 256 concurrent committers
 row	commit	commit	WebhookInboxBenchmark.deliver	sealed=true	score	Webhook deliveries stored durably and removed once handled, 4 at a time
 
-chart	ingest	Bulk writes	A whole history sync of 200,000 messages, an app-state snapshot applied atomically, and the removal of the most active chat. On macOS the bytes written are those that reached the disk rather than those passed to write calls, so they do not compare with the other systems' figures (see benchmark/README.md).
+chart	ingest	Bulk writes	A whole history sync of 200,000 messages, an app-state snapshot applied atomically, and the removal of the most active chat. The bytes written are those passed to write calls, on Linux and Windows; macOS does not count them in a way that compares engines, so its chart leaves them out.
 row	ingest	ingest	HistoryIngestBenchmark.ingest	batchSize=1000,messages=200000,sealed=true	score	History sync of 200,000 messages in batches of 1,000, time
 row	ingest	ingest	HistoryIngestBenchmark.ingest	batchSize=1000,messages=200000,sealed=true	bytesWritten	History sync, bytes written to the device
 row	ingest	ingest	HistoryIngestBenchmark.ingest	batchSize=1000,messages=200000,sealed=true	sizeOnDisk	History sync, size on disk afterwards
@@ -42,7 +50,7 @@ chart	limits	Workloads Ledger is not built for	Random overwrites of a data set l
 row	limits	limits-write	RandomOverwriteBenchmark.overwrite	keys=2000000	score	Random overwrites of 2,000,000 keys, writes per second
 row	limits	limits-write	RandomOverwriteBenchmark.overwrite	keys=2000000	sizeOnDisk	Random overwrites of 2,000,000 keys, size on disk afterwards
 row	limits	limits-write	ParallelWritersBenchmark.write	(none)	score	Eight threads writing at once, writes per second
-row	limits	limits-query	AdHocQueryBenchmark.newestStarred	messages=200000,sealed=true	score	Newest starred message, by scanning every message, time
+row	limits	limits-query	AdHocQueryBenchmark.newestStarred	messages=200000,sealed=true	score	The 50 newest starred messages, by scanning every message, time
 row	limits	limits-write	LargeValueBenchmark.writeValue	largeValues=1048576,valueSize=16777216	score	Durable write of a 16 MiB value, time
 row	limits	limits-write	LargeValueBenchmark.readValue	largeValues=1048576,valueSize=16777216	score	Read of a 16 MiB value, time
 row	limits	limits-write	PinnedReaderBenchmark.overwrite	pinned=true	sizeOnDisk	Size on disk after overwrites while a reader pins an old version

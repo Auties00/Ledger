@@ -3,19 +3,26 @@
 
     python tools/readme/fetch.py RUN_ID...
     python tools/readme/fetch.py --downloads D:/ci-downloads RUN_ID...
+    python tools/readme/fetch.py 45540330996:commit,ingest,read 45542882209
 
 Every run must be a run of the Benchmark workflow (.github/workflows/benchmark.yml); pass one run per OS and group of
-workloads, for example the ten runs of a dispatch per group and OS, or one run dispatched with group=all. Each run's
-artifacts (results-<os>-<group>) are downloaded with gh into <downloads>/<run id>, a new temporary directory unless
---downloads names one; a run already downloaded there is not downloaded again.
+workloads, for example the ten runs of a dispatch per group and OS, or one run dispatched with group=all. RUN_ID:GROUPS
+takes only the comma-separated groups of a run, so a later run can measure the others. Each run's artifacts
+(results-<os>-<group>) are downloaded with gh into <downloads>/<run id>, a new temporary directory unless --downloads
+names one; a run already downloaded there is not downloaded again.
+
+A run dispatched with JMH arguments (the workflow's jmh-args input: -e, -p engine=..., -f, a profiler) measured only
+part of the suite, or measured it differently, so fetch.py refuses it unless --partial is given; the header records
+every run's arguments either way.
 
 Each artifact holds <os>.json, the merged result of the job's rounds: for every workload, mode and parameter set, the
 round with the median primary score (.github/scripts/merge_rounds.py). An artifact with rounds but no merged file is
 merged here by that same script. The secondary counters are divided by the measurement iterations, as
 .github/scripts/summarize.py divides them, so every counter in the output is its value per iteration.
 
-The header of the output names, for every run, its commit, branch, rounds, the runner and its CPU model (from the
-runner.txt the workflow writes; a run that predates that file says so), and which OS has no data for which group.
+The header of the output names, for every run, its commit, branch, rounds, JMH arguments, the runner and its CPU model
+(from the runner.txt the workflow writes; a run that predates that file says so), and which OS has no data for which
+group.
 Standard library and the gh command only.
 """
 import argparse
@@ -46,6 +53,8 @@ COUNTERS = ['bytesWritten', 'payloadBytes', 'sizeOnDisk',
 COLUMNS = ['os', 'group', 'benchmark', 'params', 'engine', 'mode', 'score', 'unit', 'error', 'rounds', 'run'] + COUNTERS
 
 ARTIFACT = re.compile(r'^results-(?P<os>[a-z]+-latest)-(?P<group>[a-z-]+)$')
+# The run name the workflow gives a dispatch: "Benchmark <group> on <os> <jmh args> (<n> rounds)"
+TITLE = re.compile(r'^Benchmark \S+ on \S+ (?P<args>.*?) ?\(\d+ rounds?\)$')
 
 
 def gh(*arguments):
@@ -55,6 +64,15 @@ def gh(*arguments):
         raise SystemExit('fetch.py needs the GitHub CLI (gh) on the PATH')
     except subprocess.CalledProcessError as failure:
         raise SystemExit(f'gh {" ".join(arguments)} failed: {failure.stderr.strip()}')
+
+
+def jmh_arguments(run):
+    """The JMH arguments the run was dispatched with, from its name; empty for the full suite."""
+    match = TITLE.match(run.get('displayTitle', ''))
+    if match is None:
+        raise SystemExit(f'cannot read the JMH arguments of run {run.get("displayTitle")!r}: expected '
+                         f'"Benchmark <group> on <os> <arguments> (<n> rounds)"')
+    return match['args'].strip()
 
 
 def describe(run_id, repo):
@@ -134,7 +152,10 @@ def rows_of(results, system, group, run_id):
 
 def main():
     parser = argparse.ArgumentParser(description='Writes tools/readme/benchmarks.tsv from Benchmark workflow runs.')
-    parser.add_argument('runs', nargs='+', metavar='RUN_ID', help='Benchmark workflow run ids')
+    parser.add_argument('runs', nargs='+', metavar='RUN_ID[:GROUPS]',
+                        help='Benchmark workflow run ids, each optionally limited to comma-separated groups')
+    parser.add_argument('--partial', action='store_true',
+                        help='accept runs dispatched with JMH arguments, which measured part of the suite')
     parser.add_argument('--downloads', type=Path, help='directory for the artifacts, one subdirectory per run')
     parser.add_argument('--repo', default=REPO, help=f'repository of the runs (default {REPO})')
     parser.add_argument('--output', type=Path, default=OUTPUT, help='file to write (default tools/readme/benchmarks.tsv)')
@@ -145,10 +166,16 @@ def main():
     rows = []
     sources = {}
     commits = set()
-    for run_id in dict.fromkeys(arguments.runs):
-        if not run_id.isdigit():
-            raise SystemExit(f'not a run id: {run_id}')
+    for spec in dict.fromkeys(arguments.runs):
+        run_id, _, wanted = spec.partition(':')
+        wanted = set(filter(None, wanted.split(','))) or None
+        if not run_id.isdigit() or (wanted and not wanted <= set(GROUPS)):
+            raise SystemExit(f'not a run id, or a run id and some of the groups {", ".join(GROUPS)}: {spec}')
         run = describe(run_id, arguments.repo)
+        jmh = jmh_arguments(run)
+        if jmh and not arguments.partial:
+            raise SystemExit(f'run {run_id} was dispatched with the JMH arguments "{jmh}", so it may not have measured '
+                             f'the whole suite as the README charts it; pass --partial to take it anyway')
         jobs = {job['name']: job.get('conclusion') or job.get('status') for job in run.get('jobs', [])}
         directory = download(run_id, arguments.repo, downloads)
         artifacts = sorted(path for path in directory.iterdir() if path.is_dir() and ARTIFACT.match(path.name))
@@ -157,6 +184,8 @@ def main():
         for artifact in artifacts:
             match = ARTIFACT.match(artifact.name)
             system, group = match['os'], match['group']
+            if wanted and group not in wanted:
+                continue
             if (system, group) in sources:
                 raise SystemExit(f'runs {sources[(system, group)]} and {run_id} both measured {group} on {system}; pass one')
             results = merged_results(artifact, system)
@@ -165,14 +194,17 @@ def main():
             sources[(system, group)] = run_id
             commits.add(run['headSha'])
             rounds = len(list((artifact / 'rounds').glob(f'{system}-*.json'))) or 1
+            if jmh:
+                print(f'warning: run {run_id} ({group} on {system}) was dispatched with the JMH arguments "{jmh}"',
+                      file=sys.stderr)
             runner = runner_info(artifact)
             cpu = runner.get('CPU model', 'not recorded (the run predates runner.txt)')
             cpus = runner.get('CPUs')
             jdk = results[0].get('vmVersion', results[0].get('jdkVersion', '?'))
             conclusion = jobs.get(f'{group} on {system}', 'unknown')
-            header.append(f'# run {run_id}: {group} on {system}, {rounds} rounds, commit {run["headSha"]} '
-                          f'({run["headBranch"]}), started {run["createdAt"]}, job {conclusion}; '
-                          f'CPU {cpu}{f", {cpus} CPUs" if cpus else ""}; JDK {jdk}')
+            header.append(f'# run {run_id}: {group} on {system}, {rounds} {"round" if rounds == 1 else "rounds"}, '
+                          f'commit {run["headSha"]} ({run["headBranch"]}), started {run["createdAt"]}, job {conclusion}; '
+                          f'JMH arguments: {jmh or "none"}; CPU {cpu}{f", {cpus} CPUs" if cpus else ""}; JDK {jdk}')
             rows += rows_of(results, system, group, run_id)
     if not rows:
         raise SystemExit('the runs hold no results')

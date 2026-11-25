@@ -48,6 +48,7 @@
         <jmh.version>1.37</jmh.version>
         <junit.version>5.11.4</junit.version>
         <maven.surefire.plugin.version>3.5.2</maven.surefire.plugin.version>
+        <flatten.plugin.version>1.6.0</flatten.plugin.version>
     </properties>
 
     <build>
@@ -100,5 +101,34 @@
                 </plugin>
             </plugins>
         </pluginManagement>
+        <plugins>
+            <!-- Installs and deploys every POM with ${revision} resolved, so a project that depends on a module can read
+                 its parent -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>flatten-maven-plugin</artifactId>
+                <version>${flatten.plugin.version}</version>
+                <configuration>
+                    <updatePomFile>true</updatePomFile>
+                    <flattenMode>resolveCiFriendliesOnly</flattenMode>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>flatten</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>flatten</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>flatten-clean</id>
+                        <phase>clean</phase>
+                        <goals>
+                            <goal>clean</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
     </build>
 </project>

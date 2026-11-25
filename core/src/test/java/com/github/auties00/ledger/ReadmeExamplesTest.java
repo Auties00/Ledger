@@ -5,7 +5,9 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.PrintStream;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -29,32 +31,65 @@ class ReadmeExamplesTest {
     private static final Path SOURCE = Path.of("src/test/java/com/github/auties00/ledger/ReadmeExamplesTest.java");
     private static final Path README = Path.of("../README.md");
 
+    private static final String NL = System.lineSeparator();
+
     @TempDir
     Path directory;
 
+    // An example, run with System.out and System.err captured
+    @FunctionalInterface
+    private interface Example {
+        void run() throws Exception;
+    }
+
+    private record Printed(String out, String err) {
+    }
+
+    private static Printed printed(Example example) throws Exception {
+        var out = new ByteArrayOutputStream();
+        var err = new ByteArrayOutputStream();
+        var console = System.out;
+        var errors = System.err;
+        System.setOut(new PrintStream(out, true, StandardCharsets.UTF_8));
+        System.setErr(new PrintStream(err, true, StandardCharsets.UTF_8));
+        try {
+            example.run();
+        } finally {
+            System.setOut(console);
+            System.setErr(errors);
+        }
+        return new Printed(out.toString(StandardCharsets.UTF_8), err.toString(StandardCharsets.UTF_8));
+    }
+
     @Test
     @DisplayName("the quick start stores two entries durably and reads one back")
-    void quickStart() throws InterruptedException {
-        // readme:quick-start
+    void quickStart() throws Exception {
+        var printed = printed(() -> {
+            // readme:quick-start
+            var settings = Keyspace.resident("settings", KeyCodec.utf8(), ValueCodec.utf8());
+            var messages = Keyspace.paged("messages", KeyCodec.int64(), ValueCodec.utf8());
+            try (var ledger = Ledger.builder()
+                    .directory(directory)
+                    .encryption(Encryption.passphrase("correct horse battery staple".toCharArray()))
+                    .keyspace(settings)
+                    .keyspace(messages)
+                    .build()) {
+                var commit = ledger.commit(ledger.newBatch()
+                        .put(messages, 1L, "Hello")
+                        .put(settings, "theme", "dark"));
+                commit.awaitDurable(); // on stable storage from here on
+                System.out.println(ledger.get(messages, 1L).orElseThrow()); // Hello
+            }
+            // readme:end
+        });
+        assertEquals("Hello" + NL, printed.out());
         var settings = Keyspace.resident("settings", KeyCodec.utf8(), ValueCodec.utf8());
         var messages = Keyspace.paged("messages", KeyCodec.int64(), ValueCodec.utf8());
-        try (var ledger = Ledger.builder()
-                .directory(directory)
-                .encryption(Encryption.passphrase("correct horse battery staple".toCharArray()))
-                .keyspace(settings)
-                .keyspace(messages)
-                .build()) {
-            var commit = ledger.commit(ledger.newBatch()
-                    .put(messages, 1L, "Hello")
-                    .put(settings, "theme", "dark"));
-            commit.awaitDurable(); // on stable storage from here on
-            System.out.println(ledger.get(messages, 1L).orElseThrow()); // Hello
-        }
-        // readme:end
         try (var ledger = Ledger.builder().directory(directory)
                 .encryption(Encryption.passphrase("correct horse battery staple".toCharArray()))
                 .keyspace(settings).keyspace(messages).build()) {
             assertEquals(Optional.of("dark"), ledger.get(settings, "theme"));
+            assertEquals(Optional.of("Hello"), ledger.get(messages, 1L));
         }
     }
 
@@ -164,7 +199,7 @@ class ReadmeExamplesTest {
     void durability() throws InterruptedException {
         try (var ledger = openMessages()) {
             // readme:durability
-            // Deferred: atomic and visible when commit returns; survives a crash of the process, not a loss of power
+            // Deferred: atomic and visible when commit returns; a crash before it is durable can lose it
             var commit = ledger.commit(ledger.newBatch().put(MESSAGES, new MessageKey(7, 4), "Received"));
 
             // Durable: wait before acting on it, for example before acknowledging the message to its sender
@@ -182,35 +217,37 @@ class ReadmeExamplesTest {
 
     @Test
     @DisplayName("a snapshot keeps reading one state while range removals and scans run")
-    void snapshotsAndScans() {
+    void snapshotsAndScans() throws Exception {
         try (var ledger = openMessages()) {
-            var fill = ledger.newBatch();
-            for (var sequence = 1; sequence <= 3; sequence++) {
-                fill.put(MESSAGES, new MessageKey(7, sequence), "message " + sequence);
-                fill.put(MESSAGES, new MessageKey(8, sequence), "message " + sequence);
-            }
-            ledger.commit(fill);
-            // readme:snapshot
-            try (var snapshot = ledger.snapshot()) {
-                // Clear a chat: the cost does not grow with the number of entries removed
-                ledger.commit(ledger.newBatch().deleteRange(MESSAGES, MessageKey.chat(7)));
+            // The messages the read-and-write and durability examples leave in chat 7
+            ledger.commit(ledger.newBatch()
+                    .put(MESSAGES, new MessageKey(7, 2), "Dinner at eight?")
+                    .put(MESSAGES, new MessageKey(7, 3), "Yes")
+                    .put(MESSAGES, new MessageKey(7, 4), "Received"));
+            var printed = printed(() -> {
+                // readme:snapshot
+                try (var snapshot = ledger.snapshot()) {
+                    // Clear a chat: the cost does not grow with the number of entries removed
+                    ledger.commit(ledger.newBatch().deleteRange(MESSAGES, MessageKey.chat(7)));
 
-                // The snapshot still reads the state before the removal
-                long visited = snapshot.forEach(MESSAGES, MessageKey.chat(7), (key, text) -> {
-                    System.out.println(key.sequence() + ": " + text);
-                    return true; // false stops the scan
-                });
-                System.out.println(visited + " " + snapshot.size(MESSAGES) + " " + ledger.size(MESSAGES)); // 3 6 3
-            }
-            // readme:end
-            assertEquals(3, ledger.size(MESSAGES));
+                    // The snapshot still reads the state before the removal
+                    long visited = snapshot.forEach(MESSAGES, MessageKey.chat(7), (key, text) -> {
+                        System.out.println(key.sequence() + ": " + text);
+                        return true; // false stops the scan
+                    });
+                    System.out.println(visited + " " + snapshot.size(MESSAGES) + " " + ledger.size(MESSAGES)); // 3 3 0
+                }
+                // readme:end
+            });
+            assertEquals("2: Dinner at eight?" + NL + "3: Yes" + NL + "4: Received" + NL + "3 3 0" + NL, printed.out());
+            assertEquals(0, ledger.size(MESSAGES));
             assertTrue(ledger.range(MESSAGES, MessageKey.chat(7), 1).isEmpty());
         }
     }
 
     @Test
     @DisplayName("a store refuses a wrong passphrase, and no encryption, with LedgerKeyException")
-    void encryption() {
+    void encryption() throws Exception {
         var notes = Keyspace.paged("notes", KeyCodec.utf8(), ValueCodec.utf8());
         // readme:encryption
         var withKey = Encryption.key(masterKey());                       // a 256-bit key the application keeps
@@ -218,17 +255,22 @@ class ReadmeExamplesTest {
         // readme:end
         Ledger.builder().directory(directory.resolve("key")).encryption(withKey).keyspace(notes).build().close();
         Ledger.builder().directory(directory).encryption(withPassphrase).keyspace(notes).build().close();
-        // readme:wrong-key
-        try (var ledger = Ledger.builder()
-                .directory(directory)
-                .encryption(Encryption.passphrase("not the passphrase".toCharArray()))
-                .keyspace(notes)
-                .build()) {
-            ledger.get(notes, "a");
-        } catch (LedgerKeyException wrongKey) {
-            System.err.println(wrongKey.getMessage()); // a wrong secret, never reported as damage
-        }
-        // readme:end
+        var printed = printed(() -> {
+            // readme:wrong-key
+            try (var ledger = Ledger.builder()
+                    .directory(directory)
+                    .encryption(Encryption.passphrase("not the passphrase".toCharArray()))
+                    .keyspace(notes)
+                    .build()) {
+                ledger.get(notes, "a");
+            } catch (LedgerKeyException wrongKey) {
+                System.err.println(wrongKey.getMessage()); // a wrong secret, never reported as damage
+            }
+            // readme:end
+        });
+        var wrongKey = assertThrows(LedgerKeyException.class, () -> Ledger.builder().directory(directory)
+                .encryption(Encryption.passphrase("not the passphrase".toCharArray())).keyspace(notes).build());
+        assertEquals(wrongKey.getMessage() + NL, printed.err());
         assertThrows(LedgerKeyException.class, () -> Ledger.builder().directory(directory)
                 .encryption(Encryption.none()).keyspace(notes).build());
     }
@@ -257,16 +299,21 @@ class ReadmeExamplesTest {
 
     @Test
     @DisplayName("a second store of a directory fails with LedgerLockedException")
-    void locked() {
+    void locked() throws Exception {
         var notes = Keyspace.paged("notes", KeyCodec.utf8(), ValueCodec.utf8());
         try (var ledger = Ledger.builder().directory(directory).encryption(Encryption.none()).keyspace(notes).build()) {
-            // readme:locked
-            try (var second = Ledger.builder().directory(directory).encryption(Encryption.none()).keyspace(notes).build()) {
-                second.size(notes);
-            } catch (LedgerLockedException locked) {
-                System.err.println(locked.directory() + " is open in another store");
-            }
-            // readme:end
+            var printed = printed(() -> {
+                // readme:locked
+                try (var second = Ledger.builder().directory(directory).encryption(Encryption.none()).keyspace(notes).build()) {
+                    second.size(notes);
+                } catch (LedgerLockedException locked) {
+                    System.err.println(locked.directory() + " is open in another store");
+                }
+                // readme:end
+            });
+            var locked = assertThrows(LedgerLockedException.class, () -> Ledger.builder().directory(directory)
+                    .encryption(Encryption.none()).keyspace(notes).build());
+            assertEquals(locked.directory() + " is open in another store" + NL, printed.err());
             assertEquals(0, ledger.size(notes));
         }
     }
