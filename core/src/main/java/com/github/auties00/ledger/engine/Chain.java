@@ -217,24 +217,6 @@ sealed class Chain permits Chain.Inline8 {
         return new Inline32(length, hash, k0, k1, k2, Segments.word(key, 3 * Long.BYTES, length));
     }
 
-    /// {@return the chain of a copy of the `length` bytes at `from` of `array`, at most [#INLINE], in words of its own,
-    /// whose hash is `hash`: the chain [#inline(MemorySegment, int)] makes of a segment of the same bytes}
-    static Chain inline(byte[] array, int from, int length, int hash) {
-        var k0 = Segments.word(array, from, 0, length);
-        if (length <= Long.BYTES) {
-            return new Inline8(length, hash, k0);
-        }
-        var k1 = Segments.word(array, from, Long.BYTES, length);
-        if (length <= 2 * Long.BYTES) {
-            return new Inline16(length, hash, k0, k1);
-        }
-        var k2 = Segments.word(array, from, 2 * Long.BYTES, length);
-        if (length <= 3 * Long.BYTES) {
-            return new Inline24(length, hash, k0, k1, k2);
-        }
-        return new Inline32(length, hash, k0, k1, k2, Segments.word(array, from, 3 * Long.BYTES, length));
-    }
-
     /// {@return the key, a read-only segment made for the call}
     ///
     /// For a key in words of the chain, it copies the key into an array of its own: a caller that only compares the

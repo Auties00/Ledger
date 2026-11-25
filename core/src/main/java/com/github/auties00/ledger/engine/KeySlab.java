@@ -82,29 +82,6 @@ final class KeySlab {
         }
     }
 
-    /// {@return the chain of a read-only copy of the `length` bytes at `from` of `array`, whose hash is `hash`: the
-    /// chain [#chain(MemorySegment, int)] makes of a segment of the same bytes}
-    ///
-    /// The bytes are copied before it returns, so the caller may reuse `array`.
-    Chain chain(byte[] array, int from, int length, int hash) {
-        if (length <= Chain.INLINE) {
-            return Chain.inline(array, from, length, hash);
-        }
-        if (length > LARGEST) {
-            return new Chain(MemorySegment.ofArray(Segments.toBytes(array, from, length)).asReadOnly(), hash);
-        }
-        var stripe = contended ? stripe() : 0;
-        while (true) {
-            var chunk = room(stripe);
-            var start = (int) USED.getVolatile(chunk);
-            if (start + length <= chunk.array.length && USED.compareAndSet(chunk, start, start + length)) {
-                System.arraycopy(array, from, chunk.array, start, length);
-                return new Chain(chunk.view, start, length, hash);
-            }
-            stripe = retry(stripe, chunk, start, length);
-        }
-    }
-
     /// {@return the key of `chain`, a read-only segment the ordered map may keep as long as it holds the chain}
     ///
     /// For a chain whose key is in a segment, a view of that segment; for one whose key is in its own words, a copy

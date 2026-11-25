@@ -655,18 +655,6 @@ final class SpillQueue {
             homesHead = Long.MAX_VALUE;
         }
         retireAll();
-        releaseCiphers();
-    }
-
-    /// Gives the ciphers of the holders no caller has taken to the process's pool, as the store closes: a holder a
-    /// caller still holds keeps its own, and goes back to a queue no caller takes from once the store is closed.
-    private void releaseCiphers() {
-        for (var i = 0; i < cryptos.length(); i++) {
-            var crypto = cryptos.getPlain(i);
-            if (crypto != null && cryptos.compareAndSet(i, crypto, null)) {
-                crypto.releaseCiphers();
-            }
-        }
     }
 
     /// {@return the bytes of values the queued records the budget counts list; for tests}
@@ -1233,18 +1221,6 @@ final class SpillQueue {
             return powers;
         }
 
-        /// Gives its ciphers, none of which failed other than by authentication, to the process's pool, and makes new
-        /// ones at its next use, if it has one.
-        void releaseCiphers() {
-            for (var slot = 0; slot < KEPT_KEYS; slot++) {
-                CipherPool.CTR.giveBack(ctrs[slot]);
-                ctrs[slot] = null;
-                ctrKeys[slot] = null;
-            }
-            CipherPool.GCM.giveBack(gcm);
-            gcm = null;
-        }
-
         /// {@return an array of at least `length` bytes, which only this holder uses until it is given back}
         byte[] scratch(int length) {
             var array = scratch;
@@ -1408,7 +1384,7 @@ final class SpillQueue {
             try {
                 var cipher = gcm;
                 if (cipher == null) {
-                    cipher = CipherPool.GCM.take();
+                    cipher = Cipher.getInstance("AES/GCM/NoPadding");
                     gcm = cipher;
                 }
                 cipher.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(LogWriter.TAG_BYTES * 8, LogWriter.nonce(frameOffset)));
@@ -1434,7 +1410,11 @@ final class SpillQueue {
             var slot = nextKey;
             nextKey = (slot + 1) % KEPT_KEYS;
             if (ctrs[slot] == null) {
-                ctrs[slot] = CipherPool.CTR.take();
+                try {
+                    ctrs[slot] = Cipher.getInstance("AES/CTR/NoPadding");
+                } catch (GeneralSecurityException exception) {
+                    throw new IllegalStateException("AES is not available", exception);
+                }
             }
             ctrKeys[slot] = key;
             return slot;

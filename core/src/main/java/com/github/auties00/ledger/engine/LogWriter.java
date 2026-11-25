@@ -633,7 +633,11 @@ final class LogWriter {
         this.writeThrough = writeThrough;
         this.maxCohort = COHORT_PER_PROCESSOR * Runtime.getRuntime().availableProcessors();
         this.registered = new Padded.Count();
-        this.cipher = keys.encrypted() ? CipherPool.GCM.take() : null;
+        try {
+            this.cipher = keys.encrypted() ? Cipher.getInstance("AES/GCM/NoPadding") : null;
+        } catch (GeneralSecurityException exception) {
+            throw new IllegalStateException("AES-GCM is unavailable", exception);
+        }
         this.crc = new CRC32C();
         this.smallOutput = new byte[MIN_OUTPUT];
         this.output = smallOutput;
@@ -3145,21 +3149,11 @@ final class LogWriter {
             } finally {
                 durabilityLock.unlock();
             }
-            releaseCipher();
         } finally {
             // The flush task has nothing left to write, or has stopped
             discardEarlyThrough();
             closeChannel();
             keepNext();
-        }
-    }
-
-    /// Gives the cipher to the process's pool once everything queued is durable and no flush runs, and keeps any flush
-    /// from running from then on: the flush seals with it. A writer that failed, or whose flush still runs, leaves it to
-    /// the collector.
-    private void releaseCipher() {
-        if (cipher != null && failure == null && running.compareAndSet(false, true)) {
-            CipherPool.GCM.giveBack(cipher);
         }
     }
 

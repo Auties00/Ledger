@@ -8,16 +8,13 @@ import java.io.IOException;
 import java.security.GeneralSecurityException;
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.function.Supplier;
 import java.util.zip.CRC32C;
 
 /// Seals and opens the units of the store's files, as [PageFormat] lays them out: AES-256-GCM under the key of the
 /// file, or a CRC-32C for a store without encryption.
 ///
-/// It is safe for concurrent use: each call takes a cipher from a pool of its own, since a cipher is not. A pool that
-/// has none idle takes one of the process's ([CipherPool]), and [#close()] gives the idle ones back to it, so a store
-/// opened after another closed looks no cipher up. It is left open to subclasses only for the tests that watch which
-/// threads seal.
+/// It is safe for concurrent use: each call takes a cipher from a pool, since a cipher is not. It is left open to
+/// subclasses only for the tests that watch which threads seal.
 class PageCipher {
     /// The content a streamed unit passes to the cipher in one call: small enough to stay out of the way of the
     /// cipher's intrinsic, which a cold JVM reaches only through calls that are not too large.
@@ -42,50 +39,19 @@ class PageCipher {
     /// [PageFormat#RECORDS] goes: the unit's own nonce keeps those bits zero.
     static final int RECORD_SHIFT = 48;
 
-    private final boolean encrypts;
-    // Derives the key at its first use, or null for a key given at construction
-    private final Supplier<SecretKeySpec> derive;
-    private final Object keyLock;
-    // The key of the units once known, one instance for the life of the cipher; null without encryption, and before
-    // the first use of a key derived then
-    private volatile SecretKeySpec key;
+    private final SecretKeySpec key;
     private final ConcurrentLinkedQueue<Cipher> ciphers;
 
     /// Creates the cipher of a store that encrypts under `key`, or of one that does not if `key` is `null`.
     PageCipher(SecretKeySpec key) {
-        this(key != null, null);
         this.key = key;
-    }
-
-    /// Creates the cipher of a store that encrypts if `encrypts` holds, under the key `derive` gives at the first seal
-    /// or open: a file of large values most opens never touch costs them no derivation.
-    PageCipher(boolean encrypts, Supplier<SecretKeySpec> derive) {
-        this.encrypts = encrypts;
-        this.derive = derive;
-        this.keyLock = new Object();
         this.ciphers = new ConcurrentLinkedQueue<>();
     }
 
     /// {@return whether the store encrypts its units: without encryption, a unit is its plaintext followed by a
     /// CRC-32C of it}
     boolean encrypts() {
-        return encrypts;
-    }
-
-    /// {@return the key of the units, derived at the first call if it was not given; only for a store that encrypts}
-    private SecretKeySpec key() {
-        var known = key;
-        if (known != null) {
-            return known;
-        }
-        synchronized (keyLock) {
-            known = key;
-            if (known == null) {
-                known = derive.get();
-                key = known;
-            }
-            return known;
-        }
+        return key != null;
     }
 
     /// Seals the unit of `pages` pages in `plain`, whose header and content are filled in, into `out` at `offset`.
@@ -108,7 +74,7 @@ class PageCipher {
         // The bytes of plain sealed as they are; zeros follow up to the tag
         var filled = Math.min(plain.length, tag);
         System.arraycopy(plain, 0, out, offset, PageFormat.HEADER);
-        if (!encrypts) {
+        if (key == null) {
             System.arraycopy(plain, PageFormat.HEADER, out, offset + PageFormat.HEADER, filled - PageFormat.HEADER);
             // The arrays of the pool come back with the bytes of their last use
             Arrays.fill(out, offset + filled, offset + tag, (byte) 0);
@@ -119,18 +85,14 @@ class PageCipher {
             return;
         }
         var cipher = take();
-        var reusable = false;
         try {
-            cipher.init(Cipher.ENCRYPT_MODE, key(), new GCMParameterSpec(PageFormat.TAG * 8, plain, PageFormat.NONCE, 12));
+            cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, plain, PageFormat.NONCE, 12));
             cipher.updateAAD(plain, 0, PageFormat.HEADER);
             Sealing.encrypt(cipher, plain, PageFormat.HEADER, filled - PageFormat.HEADER, tag - filled, out, offset + PageFormat.HEADER);
-            reusable = true;
         } catch (GeneralSecurityException exception) {
             throw new IllegalStateException("A unit could not be sealed", exception);
         } finally {
-            if (reusable) {
-                ciphers.offer(cipher);
-            }
+            ciphers.offer(cipher);
         }
     }
 
@@ -165,7 +127,7 @@ class PageCipher {
             throw new IllegalArgumentException("A unit of " + pages + " pages cannot hold " + content + " bytes of content");
         }
         checkTagAtEnd(unit, offset);
-        if (!encrypts) {
+        if (key == null) {
             var crc = new CRC32C();
             crc.update(unit, offset, tag);
             Bytes.i32(unit, offset + tag, (int) crc.getValue());
@@ -173,9 +135,8 @@ class PageCipher {
             return;
         }
         var cipher = take();
-        var reusable = false;
         try {
-            cipher.init(Cipher.ENCRYPT_MODE, key(), new GCMParameterSpec(PageFormat.TAG * 8, unit, offset + PageFormat.NONCE, 12));
+            cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, unit, offset + PageFormat.NONCE, 12));
             cipher.updateAAD(unit, offset, PageFormat.HEADER);
             // Slices of whole blocks, each written over itself; were the cipher to hold some back, its output would
             // only trail its input, which it encrypts in place as well
@@ -187,13 +148,10 @@ class PageCipher {
                 consumed += SLICE;
             }
             cipher.doFinal(unit, consumed, end - consumed, unit, written);
-            reusable = true;
         } catch (GeneralSecurityException exception) {
             throw new IllegalStateException("A unit could not be sealed", exception);
         } finally {
-            if (reusable) {
-                ciphers.offer(cipher);
-            }
+            ciphers.offer(cipher);
         }
     }
 
@@ -233,14 +191,14 @@ class PageCipher {
             throw new IllegalArgumentException("A unit of " + pages + " pages holds at most " + PageFormat.capacity(pages) + " bytes");
         }
         var closeTag = header[PageFormat.FORMAT] == PageFormat.CLOSE_TAG;
-        if (closeTag && !encrypts) {
+        if (closeTag && key == null) {
             throw new IllegalArgumentException("A unit of format " + PageFormat.CLOSE_TAG + " needs a store that encrypts");
         }
         System.arraycopy(header, 0, buffer, 0, PageFormat.HEADER);
         var used = PageFormat.HEADER;
         // The padding of a unit whose tag follows its content goes out after the tag, as zeros
         var total = closeTag ? contentLength : contentLength + padding;
-        if (!encrypts) {
+        if (key == null) {
             var crc = new CRC32C();
             crc.update(header, 0, PageFormat.HEADER);
             for (var offset = 0L; offset < total; ) {
@@ -268,9 +226,8 @@ class PageCipher {
             return;
         }
         var cipher = take();
-        var reusable = false;
         try {
-            cipher.init(Cipher.ENCRYPT_MODE, key(), new GCMParameterSpec(PageFormat.TAG * 8, header, PageFormat.NONCE, 12));
+            cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, header, PageFormat.NONCE, 12));
             cipher.updateAAD(header, 0, PageFormat.HEADER);
             var sliceLength = Math.min(SLICE, buffer.length / 2);
             byte[] last = null;
@@ -319,13 +276,10 @@ class PageCipher {
                 }
             }
             out.write(buffer, used);
-            reusable = true;
         } catch (GeneralSecurityException exception) {
             throw new IllegalStateException("A unit could not be sealed", exception);
         } finally {
-            if (reusable) {
-                ciphers.offer(cipher);
-            }
+            ciphers.offer(cipher);
         }
     }
 
@@ -348,7 +302,7 @@ class PageCipher {
     /// @throws IOException if `out` fails
     void sealRecords(byte[] header, byte[] content, int contentOffset, int contentLength, int pages, byte[] buffer, Output out)
             throws IOException {
-        if (!encrypts || header[PageFormat.FORMAT] != PageFormat.RECORDS) {
+        if (key == null || header[PageFormat.FORMAT] != PageFormat.RECORDS) {
             throw new IllegalArgumentException("A unit of format " + PageFormat.RECORDS + " needs a store that encrypts and a header of its format");
         }
         if (!PageFormat.fits(PageFormat.RECORDS, pages, contentLength)) {
@@ -364,7 +318,6 @@ class PageCipher {
         var unitEnd = (long) pages * PageFormat.SIZE;
         var nonce = new byte[NONCE_BYTES];
         var cipher = take();
-        var reusable = false;
         try {
             for (var record = 0; record < records; record++) {
                 var used = 0;
@@ -375,7 +328,7 @@ class PageCipher {
                 var start = PageFormat.recordContent(record);
                 var length = PageFormat.recordLength(record, contentLength);
                 recordNonce(header, record, nonce);
-                cipher.init(Cipher.ENCRYPT_MODE, key(), new GCMParameterSpec(PageFormat.TAG * 8, nonce));
+                cipher.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, nonce));
                 cipher.updateAAD(header, 0, PageFormat.HEADER);
                 // Whole blocks per update, so the cipher holds nothing back and each slice's output is its length
                 var consumed = 0;
@@ -404,13 +357,10 @@ class PageCipher {
                 }
                 out.write(buffer, used);
             }
-            reusable = true;
         } catch (GeneralSecurityException exception) {
             throw new IllegalStateException("A unit could not be sealed", exception);
         } finally {
-            if (reusable) {
-                ciphers.offer(cipher);
-            }
+            ciphers.offer(cipher);
         }
     }
 
@@ -426,20 +376,17 @@ class PageCipher {
     ///
     /// @throws IllegalStateException if the store does not encrypt
     Records records() {
-        if (!encrypts) {
+        if (key == null) {
             throw new IllegalStateException("A store without encryption has no units of records");
         }
         return new Records(take());
     }
 
     /// Opens the records of units of format [PageFormat#RECORDS], one at a time, with one cipher of the pool, which
-    /// [#close()] gives back, once, unless an open failed other than by authentication. It is used by one thread at a
-    /// time.
+    /// [#close()] gives back. It is used by one thread at a time.
     final class Records implements AutoCloseable {
         private final Cipher cipher;
         private final byte[] nonce;
-        // Whether the cipher went back to the pool, or failed and is left to the collector
-        private boolean done;
 
         private Records(Cipher cipher) {
             this.cipher = cipher;
@@ -465,24 +412,20 @@ class PageCipher {
             }
             recordNonce(header, record, nonce);
             try {
-                cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(PageFormat.TAG * 8, nonce));
+                cipher.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, nonce));
                 cipher.updateAAD(header, 0, PageFormat.HEADER);
                 cipher.doFinal(sealed, sealedOffset, length + PageFormat.TAG, plain, plainOffset);
                 return true;
             } catch (AEADBadTagException _) {
                 return false;
             } catch (GeneralSecurityException exception) {
-                done = true;
                 throw new IllegalStateException("A record could not be opened", exception);
             }
         }
 
         @Override
         public void close() {
-            if (!done) {
-                done = true;
-                ciphers.offer(cipher);
-            }
+            ciphers.offer(cipher);
         }
     }
 
@@ -501,7 +444,7 @@ class PageCipher {
         var length = pages * PageFormat.SIZE;
         var tag = length - PageFormat.TAG;
         System.arraycopy(sealed, offset, plain, 0, PageFormat.HEADER);
-        if (!encrypts) {
+        if (key == null) {
             if (!checksumMatches(sealed, offset, tag)) {
                 return false;
             }
@@ -509,22 +452,17 @@ class PageCipher {
             return true;
         }
         var cipher = take();
-        var reusable = false;
         try {
-            cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(PageFormat.TAG * 8, sealed, offset + PageFormat.NONCE, 12));
+            cipher.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, sealed, offset + PageFormat.NONCE, 12));
             cipher.updateAAD(sealed, offset, PageFormat.HEADER);
             cipher.doFinal(sealed, offset + PageFormat.HEADER, length - PageFormat.HEADER, plain, PageFormat.HEADER);
-            reusable = true;
             return true;
         } catch (AEADBadTagException _) {
-            reusable = true;
             return false;
         } catch (GeneralSecurityException exception) {
             throw new IllegalStateException("A unit could not be opened", exception);
         } finally {
-            if (reusable) {
-                ciphers.offer(cipher);
-            }
+            ciphers.offer(cipher);
         }
     }
 
@@ -542,26 +480,21 @@ class PageCipher {
         if (plain == sealed) {
             throw new IllegalArgumentException("A unit opens out of place");
         }
-        if (!encrypts || sealed[offset + PageFormat.FORMAT] != PageFormat.CLOSE_TAG) {
+        if (key == null || sealed[offset + PageFormat.FORMAT] != PageFormat.CLOSE_TAG) {
             return false;
         }
         var cipher = take();
-        var reusable = false;
         try {
-            cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(PageFormat.TAG * 8, sealed, offset + PageFormat.NONCE, 12));
+            cipher.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(PageFormat.TAG * 8, sealed, offset + PageFormat.NONCE, 12));
             cipher.updateAAD(sealed, offset, PageFormat.HEADER);
             cipher.doFinal(sealed, offset + PageFormat.HEADER, content + PageFormat.TAG, plain, plainOffset);
-            reusable = true;
             return true;
         } catch (AEADBadTagException _) {
-            reusable = true;
             return false;
         } catch (GeneralSecurityException exception) {
             throw new IllegalStateException("A unit could not be opened", exception);
         } finally {
-            if (reusable) {
-                ciphers.offer(cipher);
-            }
+            ciphers.offer(cipher);
         }
     }
 
@@ -586,7 +519,7 @@ class PageCipher {
         if (keep < PageFormat.HEADER || keep > tag) {
             throw new IllegalArgumentException("A unit of " + pages + " pages cannot be kept to " + keep + " bytes");
         }
-        if (!encrypts) {
+        if (key == null) {
             return checksumMatches(sealed, offset, tag) ? Arrays.copyOfRange(sealed, offset, offset + keep) : null;
         }
         var scratch = pool.acquire(tag);
@@ -625,22 +558,15 @@ class PageCipher {
         }
     }
 
-    /// Gives the idle ciphers of the pool to the process's, once the file is closed: a call still running gives its
-    /// cipher back to this pool, which no call takes from once the file is closed, and is left to the collector.
-    void close() {
-        Cipher cipher;
-        while ((cipher = ciphers.poll()) != null) {
-            CipherPool.GCM.giveBack(cipher);
-        }
-    }
-
-    /// {@return the idle ciphers of its pool; for tests}
-    int idleForTests() {
-        return ciphers.size();
-    }
-
     private Cipher take() {
         var cipher = ciphers.poll();
-        return cipher != null ? cipher : CipherPool.GCM.take();
+        if (cipher != null) {
+            return cipher;
+        }
+        try {
+            return Cipher.getInstance("AES/GCM/NoPadding");
+        } catch (GeneralSecurityException exception) {
+            throw new IllegalStateException("AES-GCM is unavailable", exception);
+        }
     }
 }

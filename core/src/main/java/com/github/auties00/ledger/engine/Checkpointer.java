@@ -81,9 +81,6 @@ final class Checkpointer implements IdleTicker.Watched {
     // The checkpointers of the open stores of the process, whose writes the trees lack share one heap budget: a budget
     // of half the heap for each store let a process of several busy stores buffer more than the heap
     private static final Set<Checkpointer> OPEN = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
-    // Draws the first 8 bytes of the nonces of each checkpoint's units, once per checkpoint: one source for the
-    // process, so an open does not look the default algorithm up among the security providers
-    private static final SecureRandom NONCES = new SecureRandom();
     // The epoch of the file of large values the last durable superblock records; guarded by the lock
     private int durableEpoch;
     // The highest epoch an earlier open used that only its log segments record, if above durableEpoch
@@ -107,6 +104,7 @@ final class Checkpointer implements IdleTicker.Watched {
     private final AtomicBoolean scheduled;
     // Whether a thread is finishing the sweep of the store
     private final AtomicBoolean sweeping;
+    private final SecureRandom random;
     // The number of the last durable checkpoint, guarded by the lock
     private long number;
     // The log's queued bytes at the last cut
@@ -186,6 +184,7 @@ final class Checkpointer implements IdleTicker.Watched {
         this.lock = new ReentrantLock();
         this.scheduled = new AtomicBoolean();
         this.sweeping = new AtomicBoolean();
+        this.random = new SecureRandom();
         this.failures = failures;
         this.durableEpoch = durableEpoch;
         this.loggedEpoch = loggedEpoch;
@@ -527,7 +526,7 @@ final class Checkpointer implements IdleTicker.Watched {
             BooleanSupplier lagging = () -> log.appendedBytes() - cutBytes > every;
             // No checkpoint follows the one of a close, whose cache closes with the store
             var followed = !closing && endedSaturated;
-            var writer = pages.writer(NONCES.nextLong(), lagging, closing ? () -> false : () -> followed || saturated());
+            var writer = pages.writer(random.nextLong(), lagging, closing ? () -> false : () -> followed || saturated());
             space.rewindRuns();
             var update = new TreeUpdate(pages, writer, space);
             TreeRoot[] roots;

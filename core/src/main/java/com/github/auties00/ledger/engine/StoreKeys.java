@@ -67,7 +67,7 @@ final class StoreKeys {
 
     private static byte[] hmac(byte[] key, byte[]... parts) {
         try {
-            var mac = Prototype.mac();
+            var mac = Mac.getInstance("HmacSHA256");
             mac.init(new SecretKeySpec(key, "HmacSHA256"));
             for (var part : parts) {
                 mac.update(part);
@@ -75,43 +75,6 @@ final class StoreKeys {
             return mac.doFinal();
         } catch (GeneralSecurityException exception) {
             throw new IllegalStateException("HMAC-SHA256 is unavailable", exception);
-        }
-    }
-
-    /// The HMAC-SHA256 the process clones for each HMAC: `Mac.getInstance` looks the algorithm up among the security
-    /// providers and the first initialization of each instance chooses the provider by reflection, which a clone of an
-    /// instance whose provider is chosen skips. Loaded at the first HMAC, so a process whose stores do not encrypt
-    /// never makes it.
-    ///
-    /// The prototype is initialized under a key of zeros, never updated, and only cloned: a clone copies its state, and
-    /// each HMAC initializes its clone under its own key.
-    private static final class Prototype {
-        // Null if the JDK has no HMAC-SHA256, or its instances cannot be cloned
-        private static final Mac MAC = initialized();
-
-        private static Mac initialized() {
-            try {
-                var mac = Mac.getInstance("HmacSHA256");
-                mac.init(new SecretKeySpec(new byte[32], "HmacSHA256"));
-                return mac;
-            } catch (GeneralSecurityException exception) {
-                return null;
-            }
-        }
-
-        /// {@return an instance of HMAC-SHA256, which the caller initializes}
-        ///
-        /// @throws GeneralSecurityException if the JDK has none
-        static Mac mac() throws GeneralSecurityException {
-            var prototype = MAC;
-            if (prototype != null) {
-                try {
-                    return (Mac) prototype.clone();
-                } catch (CloneNotSupportedException _) {
-                    // A provider whose instances cannot be cloned: one of its own
-                }
-            }
-            return Mac.getInstance("HmacSHA256");
         }
     }
 

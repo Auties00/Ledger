@@ -1,7 +1,6 @@
 package com.github.auties00.ledger.engine;
 
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -483,16 +482,12 @@ final class TreeNodes {
 
     /// Writes `entry` at `position` of `unit`, in the form a leaf or a delta record holds it.
     ///
-    /// It copies from segments straight into `unit`, with no segment of `unit`: such a segment costs a memory session
-    /// of its own, and both are allocated whenever the JIT compiler leaves the copy out of the method it compiles,
-    /// which depends on what ran before: the checkpoint that follows the recovery of 200,000 messages allocated 2 to
-    /// 12 MB of them, by what the open had run first.
-    ///
     /// @return the position past it
     static int writeEntry(byte[] unit, int position, LeafEntry entry) {
+        var target = MemorySegment.ofArray(unit);
         var keyLength = (int) entry.key().byteSize();
         Bytes.u16(unit, position, keyLength);
-        MemorySegment.copy(entry.key(), ValueLayout.JAVA_BYTE, 0, unit, position + 2, keyLength);
+        MemorySegment.copy(entry.key(), 0, target, position + 2, keyLength);
         position += 2 + keyLength;
         if (entry.isRemoved()) {
             unit[position] = REMOVED;
@@ -508,7 +503,7 @@ final class TreeNodes {
             } else if (entry.held() instanceof byte[] array) {
                 System.arraycopy(array, 0, unit, position + 3, entry.length());
             } else {
-                MemorySegment.copy((MemorySegment) entry.held(), ValueLayout.JAVA_BYTE, 0, unit, position + 3, entry.length());
+                MemorySegment.copy(entry.value(), 0, target, position + 3, entry.length());
             }
             return position + 3 + entry.length();
         }
