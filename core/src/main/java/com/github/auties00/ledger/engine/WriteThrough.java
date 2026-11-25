@@ -54,7 +54,11 @@ import java.util.function.Supplier;
 ///   holds the carrier for the one round trip to the device, where the channel's would lend the carrier to another by
 ///   waking a carrier that then finds nothing to do. At most [Posix#LIMIT] virtual threads of the process hold their
 ///   carriers so at a time, so a slow or hung device never holds every carrier; the next writes through the channel. A
-///   scheduler of one carrier has none to spare, so there every virtual thread writes through the channel.
+///   scheduler of one carrier has none to spare, so there every virtual thread writes through the channel. A store
+///   opens its segments so once a virtual thread first writes one of its groups through
+///   ([#descriptorsFor(Handle, Path, boolean)]): until then, and for good in a store whose groups only platform threads
+///   write, a segment is the channel alone, and the store never asks whether a descriptor would serve it, which
+///   initializes [Posix] and loads [PosixHandle].
 ///   Through the descriptor the kernel checks the alignment of a write against the device's logical block, not against
 ///   the block size the file system reports as the channel does, so it may take a write the channel would refuse,
 ///   durable all the same under `O_DSYNC`. A write the channel refuses before it has taken one of the writer's is
@@ -136,9 +140,9 @@ final class WriteThrough {
     enum Kind {
         /// `FILE_FLAG_NO_BUFFERING` and `FILE_FLAG_WRITE_THROUGH` through the Windows API.
         UNBUFFERED,
-        /// A channel opened with [StandardOpenOption#DSYNC] and `ExtendedOpenOption.DIRECT`, and where
-        /// [Posix#serves(Path)] a descriptor the C library opened with `O_DIRECT` and `O_DSYNC` beside it, for the
-        /// writes of virtual threads.
+        /// A channel opened with [StandardOpenOption#DSYNC] and `ExtendedOpenOption.DIRECT`, and, once a virtual
+        /// thread wrote a group of the store through and where [Posix#serves(Path)], a descriptor the C library opened
+        /// with `O_DIRECT` and `O_DSYNC` beside it, for the writes of virtual threads.
         DIRECT,
         /// A channel opened with [StandardOpenOption#DSYNC].
         DSYNC
@@ -159,6 +163,9 @@ final class WriteThrough {
     // Whether the channel of a PosixHandle of this way took a write, so a write it refuses afterwards fails as any
     // other rather than as a refusal of the way; owned by the flush that holds the log writer
     private boolean channelProven;
+    // Whether a virtual thread wrote a group through, after which segments of the DIRECT way are opened as a
+    // PosixHandle where Posix serves them; read by an opening beside the flush too
+    private volatile boolean descriptors;
     // What answers the proof without asking a device, null where it would have to; null if nothing does
     private final Supplier<Boolean> answered;
     // The handles opened and closed, for tests; guarded by the lock, as a handle may be opened beside the flush that
@@ -367,14 +374,50 @@ final class WriteThrough {
             return switch (kind()) {
                 case UNBUFFERED -> UnbufferedHandle.open(path, this);
                 case DIRECT -> {
-                    var channel = FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC, ExtendedOpenOption.DIRECT);
-                    yield Posix.serves(path) ? new PosixHandle(channel, path, this) : new ChannelHandle(channel, this);
+                    var channel = openDirect(path);
+                    yield descriptors && Posix.serves(path) ? new PosixHandle(channel, path, this) : new ChannelHandle(channel, this);
                 }
                 case DSYNC -> new ChannelHandle(FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC), this);
             };
         } catch (OutOfMemoryError exception) {
             throw new IOException("A log segment could not be opened to write through", exception);
         }
+    }
+
+    /// {@return the segment at `path` opened as the channel of the [Kind#DIRECT] way}
+    private static FileChannel openDirect(Path path) throws IOException {
+        return FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.DSYNC, ExtendedOpenOption.DIRECT);
+    }
+
+    /// Opens later segments of the [Kind#DIRECT] way with a descriptor beside their channel where [Posix#serves(Path)],
+    /// for a virtual thread about to write a group of the store through for the first time, and {@return the handle
+    /// that takes the writes of the segment at `path`, whose handle is `current`}
+    ///
+    /// The handle is `current` itself if it is no channel of that way alone, or if no descriptor serves the segment or
+    /// its channel cannot be opened again; otherwise it is a [PosixHandle] of the segment, `current` being left open for
+    /// the caller to close. Only the flush that holds the log writer calls it, before the write.
+    ///
+    /// @param current the handle of the segment, or `null` for none
+    /// @param proven  whether `current` took a write of the way, which then proves the channel of the handle returned
+    Handle descriptorsFor(Handle current, Path path, boolean proven) {
+        descriptors = true;
+        if (!(current instanceof ChannelHandle) || kind() != Kind.DIRECT || !Posix.serves(path)) {
+            return current;
+        }
+        FileChannel channel;
+        try {
+            channel = openDirect(path);
+        } catch (IOException | RuntimeException | OutOfMemoryError _) {
+            // The channel alone takes the writes, as it did
+            return current;
+        }
+        synchronized (lock) {
+            opens++;
+        }
+        if (proven) {
+            channelProven = true;
+        }
+        return new PosixHandle(channel, path, this);
     }
 
     /// {@return the buffer holding the first `length` bytes of `bytes`, a multiple of [LogWriter#ALIGNMENT], aligned to
@@ -477,8 +520,8 @@ final class WriteThrough {
     }
 
     /// A channel opened with [StandardOpenOption#DSYNC], and `ExtendedOpenOption.DIRECT` where no [PosixHandle]
-    /// serves the segment: off Linux, without native access, on an architecture whose flags are not known, or on a
-    /// file system other than the JDK's default one.
+    /// serves the segment: before a virtual thread wrote a group of the store through, off Linux, without native
+    /// access, on an architecture whose flags are not known, or on a file system other than the JDK's default one.
     ///
     /// The JDK lends a virtual thread's carrier to another for the write of such a channel, as it does for a force.
     static final class ChannelHandle implements Handle {

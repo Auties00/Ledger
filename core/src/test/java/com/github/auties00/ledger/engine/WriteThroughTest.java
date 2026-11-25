@@ -1086,6 +1086,56 @@ class WriteThroughTest {
 
         @Test
         @EnabledOnOs(OS.LINUX)
+        @DisplayName("on Linux the segments of a store whose groups only platform threads write are channels alone, and the first group a virtual thread writes through opens its segment with a descriptor in place of the channel")
+        void linuxDescriptorOnFirstVirtualWrite(@TempDir Path directory) throws Exception {
+            assumeDescriptors(directory);
+            var model = new TreeMap<String, String>();
+            var released = new CountDownLatch(1);
+            var way = WriteThrough.of(WriteThrough.Mode.DIRECT, directory);
+            try (var pool = IoPool.create(1);
+                 var ledger = ((LedgerBuilder) Ledger.builder().directory(directory).encryption(Encryption.key(KEY)).keyspace(NAMES).ioPool(pool))
+                         .segmentSize(SEGMENT)
+                         .writeThrough(way)
+                         .build()) {
+                var log = log(ledger);
+                var commits = reachWriteThrough(ledger, model);
+                var through = log.writtenThrough();
+                var segment = log.currentSegment();
+                for (var i = 0; i < 400 && (log.writtenThrough() < through + 20 || log.currentSegment() < segment + 2); i++) {
+                    commit(ledger, model, "w" + commits++);
+                    assertFalse(log.throughHandleForTests() instanceof WriteThrough.PosixHandle,
+                            "a segment that only platform threads wrote was opened with a descriptor");
+                }
+                assertTrue(log.writtenThrough() >= through + 20 && log.currentSegment() >= segment + 2,
+                        "the platform threads wrote too few groups through");
+                assertTrue(way.opensForTests() - way.closesForTests() <= 1, "a handle of a segment left behind is open");
+                var from = commits;
+                onVirtualThread(() -> {
+                    // A commit writes its own group only if it starts the flush before the pool's thread does
+                    hold(pool, released);
+                    var next = from;
+                    var described = false;
+                    for (var attempt = 0; attempt < 400 && !described; attempt++) {
+                        commit(ledger, model, "w" + next++);
+                        described = log.throughHandleForTests() instanceof WriteThrough.PosixHandle handle && handle.descriptorForTests() >= 0;
+                    }
+                    assertTrue(described, "no group of the virtual thread was written through a descriptor");
+                    assertEquals(1, way.opensForTests() - way.closesForTests(), "the channel the descriptor replaced is open");
+                    released.countDown();
+                    return null;
+                });
+                assertEquals(WriteThrough.Kind.DIRECT, log.writeThroughKind(), "the log left O_DIRECT");
+            } finally {
+                released.countDown();
+            }
+            assertEquals(way.opensForTests(), way.closesForTests(), "the close left a handle open");
+            try (var reopened = open(directory, WriteThrough.Mode.OFF)) {
+                assertEquals(model, contents(reopened));
+            }
+        }
+
+        @Test
+        @EnabledOnOs(OS.LINUX)
         @DisplayName("on Linux a channel that refuses a write once a descriptor took the way's writes moves the log to O_DSYNC, not to forces")
         void linuxChannelRefusesAfterDescriptor(@TempDir Path directory) throws Exception {
             assumeDescriptors(directory);
@@ -1263,7 +1313,10 @@ class WriteThroughTest {
             Arrays.fill(first, (byte) 7);
             var second = new byte[4_096];
             Arrays.fill(second, (byte) 9);
-            var handle = (WriteThrough.PosixHandle) through.open(file);
+            var alone = through.open(file);
+            assertTrue(alone instanceof WriteThrough.ChannelHandle, "a segment was opened with a descriptor before a virtual thread wrote");
+            var handle = (WriteThrough.PosixHandle) through.descriptorsFor(alone, file, false);
+            alone.close();
             onVirtualThread(() -> {
                 handle.write(first, first.length, 0);
                 assertTrue(handle.descriptorForTests() >= 0, "the virtual thread opened no descriptor");

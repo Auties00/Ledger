@@ -339,6 +339,8 @@ final class LogWriter {
     private volatile EarlyThrough earlyThrough;
     // Whether a write succeeded in the way segments are opened in now; until one does, a failure moves one way down
     private boolean wayProven;
+    // Whether a virtual thread wrote a group through, which writeThrough was told of; owned by the flush task
+    private boolean virtualWrote;
     // The bytes the current segment had when it was prepared, below which a write changes neither its size nor the
     // length of its data
     private long valid;
@@ -2382,10 +2384,23 @@ final class LogWriter {
     /// a way, a failure moves the writer one way down instead, and the next way writes the same bytes at the same
     /// offsets; so does a [WriteThrough.Refused] after one has, a channel refusing what the descriptor beside it
     /// took.
+    ///
+    /// The first group a virtual thread writes through opens the segment again with a descriptor beside its channel,
+    /// where the way has one for virtual threads
+    /// ([WriteThrough#descriptorsFor(WriteThrough.Handle, java.nio.file.Path, boolean)]), and the later segments are
+    /// opened so; a store whose groups only platform threads write keeps the channel alone.
     private void writeThrough() throws IOException {
         var start = position;
         lastDrainStart = start;
         lastDrainLength = used;
+        if (!virtualWrote && throughFile != null && Thread.currentThread().isVirtual()) {
+            virtualWrote = true;
+            var described = writeThrough.descriptorsFor(throughFile, segmentPath, wayProven);
+            if (described != throughFile) {
+                closeQuietly(throughFile);
+                throughFile = described;
+            }
+        }
         while (throughFile != null) {
             try {
                 throughFile.write(output, used, start);
