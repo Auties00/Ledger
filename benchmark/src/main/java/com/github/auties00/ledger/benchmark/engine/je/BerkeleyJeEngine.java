@@ -31,6 +31,13 @@ import java.util.Locale;
 /// `COMMIT_SYNC`, and JE groups concurrent forces. JE locks records rather than the whole store, so writers run
 /// concurrently; a write that loses a lock conflict is retried.
 ///
+/// A transaction takes its write locks as it applies its writes and holds them until it commits, so two batches that
+/// write the same keys in different orders deadlock, and JE aborts one of them. [#write(WriteBatch, Durability)]
+/// therefore applies a batch's writes in key space and key order, the order every JE application that writes from
+/// several threads has to keep. Applying each batch in its own order, the four writers of `OperationMemoryBenchmark.checkpointUnderLoad`,
+/// which share chats and sessions, had about 29,000 transactions aborted as deadlock victims in one 100 s operation
+/// that every other engine finished in 2 to 8 s.
+///
 /// JE has no snapshot reads, so [#openReadView()] is unsupported.
 public final class BerkeleyJeEngine implements Engine {
     private final Path directory;
@@ -74,10 +81,11 @@ public final class BerkeleyJeEngine implements Engine {
     @Override
     public void write(WriteBatch batch, Durability durability) {
         var config = durability == Durability.DURABLE ? durableTransactions : deferredTransactions;
+        var order = lockOrder(batch);
         while (true) {
             var transaction = environment.beginTransaction(null, config);
             try {
-                for (var i = 0; i < batch.size(); i++) {
+                for (var i : order) {
                     var database = databases.get(batch.keyspace(i));
                     var key = new DatabaseEntry(batch.key(i));
                     var value = batch.value(i);
@@ -96,6 +104,19 @@ public final class BerkeleyJeEngine implements Engine {
                 throw exception;
             }
         }
+    }
+
+    // A stable sort, so that writes of one key keep their order in the batch and the last one wins
+    private static Integer[] lockOrder(WriteBatch batch) {
+        var order = new Integer[batch.size()];
+        for (var i = 0; i < order.length; i++) {
+            order[i] = i;
+        }
+        Arrays.sort(order, (left, right) -> {
+            var keyspaces = batch.keyspace(left).compareTo(batch.keyspace(right));
+            return keyspaces != 0 ? keyspaces : Arrays.compareUnsigned(batch.key(left), batch.key(right));
+        });
+        return order;
     }
 
     @Override

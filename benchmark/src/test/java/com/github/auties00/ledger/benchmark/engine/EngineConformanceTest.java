@@ -13,10 +13,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 /// Checks every engine, sealed and plain, against the contract of [Engine]: a benchmark that compares engines is
@@ -227,6 +229,47 @@ class EngineConformanceTest {
         try (var engine = open(kind, sealed, directory)) {
             assertEquals(hex(ORDERED_KEYS), scan(engine, bytes(0x00), bytes(0xFF, 0xFF, 0xFF), false, 100));
             assertArrayEquals(value("v0"), engine.get(Keyspace.GENERIC, ORDERED_KEYS.getFirst()));
+        }
+    }
+
+    @ParameterizedTest(name = "{0}, sealed={1}")
+    @MethodSource("engines")
+    @DisplayName("concurrent batches writing the same keys in opposite orders each apply whole")
+    void concurrentOverlappingBatches(EngineKind kind, boolean sealed, @TempDir Path directory) throws Exception {
+        var keys = 16;
+        var writers = 4;
+        var rounds = 50;
+        try (var engine = open(kind, sealed, directory)) {
+            var failure = new AtomicReference<Throwable>();
+            var threads = new ArrayList<Thread>();
+            for (var writer = 0; writer < writers; writer++) {
+                var descending = writer % 2 == 1;
+                var id = writer;
+                threads.add(Thread.ofPlatform().start(() -> {
+                    try {
+                        for (var round = 0; round < rounds; round++) {
+                            var batch = new WriteBatch();
+                            var written = value(id + "-" + round);
+                            for (var i = 0; i < keys; i++) {
+                                batch.put(Keyspace.GENERIC, bytes(descending ? keys - 1 - i : i), written);
+                            }
+                            engine.write(batch, Durability.DEFERRED);
+                        }
+                    } catch (Throwable throwable) {
+                        failure.compareAndSet(null, throwable);
+                    }
+                }));
+            }
+            for (var thread : threads) {
+                thread.join();
+            }
+            assertNull(failure.get());
+            // Atomic batches leave every key with the value of the batch that committed last
+            var last = engine.get(Keyspace.GENERIC, bytes(0));
+            assertNotNull(last);
+            for (var i = 1; i < keys; i++) {
+                assertArrayEquals(last, engine.get(Keyspace.GENERIC, bytes(i)));
+            }
         }
     }
 }
