@@ -117,9 +117,10 @@ class ReadmeExamplesTest {
 
     // readme:keyspaces
     record MessageKey(long chat, long sequence) {
-        static final ValueLayout.OfLong BIG_ENDIAN = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+        static final ValueLayout.OfLong BIG_ENDIAN =
+                ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
 
-        // Big-endian with the sign bit flipped, so the bytes sort as the numbers do: by chat, then by sequence
+        // Big-endian, sign bit flipped: the bytes sort as the numbers do, by chat, then by sequence
         static final KeyCodec<MessageKey> CODEC = KeyCodec.of(
                 key -> 16,
                 (key, target) -> {
@@ -131,14 +132,17 @@ class ReadmeExamplesTest {
                         source.get(BIG_ENDIAN, 8) ^ Long.MIN_VALUE));
 
         static KeyRange<MessageKey> chat(long chat) {
-            return KeyRange.between(new MessageKey(chat, Long.MIN_VALUE), new MessageKey(chat + 1, Long.MIN_VALUE));
+            return KeyRange.between(
+                    new MessageKey(chat, Long.MIN_VALUE), new MessageKey(chat + 1, Long.MIN_VALUE));
         }
     }
 
     // Small and read often: every entry held in memory, decoded
-    static final Keyspace<String, String> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
+    static final Keyspace<String, String> CHATS =
+            Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
     // Larger than memory should hold: read through the page cache
-    static final Keyspace<MessageKey, String> MESSAGES = Keyspace.paged("messages", MessageKey.CODEC, ValueCodec.utf8());
+    static final Keyspace<MessageKey, String> MESSAGES =
+            Keyspace.paged("messages", MessageKey.CODEC, ValueCodec.utf8());
     // readme:end
 
     private Ledger openMessages() {
@@ -250,8 +254,8 @@ class ReadmeExamplesTest {
     void encryption() throws Exception {
         var notes = Keyspace.paged("notes", KeyCodec.utf8(), ValueCodec.utf8());
         // readme:encryption
-        var withKey = Encryption.key(masterKey());                       // a 256-bit key the application keeps
-        var withPassphrase = Encryption.passphrase(passphrase());        // PBKDF2-HMAC-SHA256, 600,000 iterations
+        var withKey = Encryption.key(masterKey());               // a 256-bit key the application keeps
+        var withPassphrase = Encryption.passphrase(passphrase()); // PBKDF2-HMAC-SHA256, 600,000 iterations
         // readme:end
         Ledger.builder().directory(directory.resolve("key")).encryption(withKey).keyspace(notes).build().close();
         Ledger.builder().directory(directory).encryption(withPassphrase).keyspace(notes).build().close();
@@ -287,7 +291,8 @@ class ReadmeExamplesTest {
         var notes = Keyspace.paged("notes", KeyCodec.utf8(), ValueCodec.utf8());
         // readme:memory
         try (var ledger = Ledger.builder().memory().keyspace(notes).build()) {
-            ledger.commit(ledger.newBatch().put(notes, "draft", "Remember the milk")).awaitDurable(); // returns at once
+            // Durable once applied: awaitDurable() returns at once
+            ledger.commit(ledger.newBatch().put(notes, "draft", "Remember the milk")).awaitDurable();
         }
         // readme:end
         try (var ledger = Ledger.builder().memory().keyspace(notes).build()) {
@@ -343,7 +348,7 @@ class ReadmeExamplesTest {
                 .keyspace(notes)
                 .build()) {
             System.out.println(recovered.get(notes, "a")); // Optional[durable]
-            System.out.println(recovered.get(notes, "b")); // Optional[visible] or Optional.empty, never half a batch
+            System.out.println(recovered.get(notes, "b")); // Optional[visible] or Optional.empty
         }
         // readme:end
         assertTrue(disk.stopped());

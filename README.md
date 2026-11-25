@@ -110,9 +110,10 @@ key lays its fields one after the other.
 
 ```java
 record MessageKey(long chat, long sequence) {
-    static final ValueLayout.OfLong BIG_ENDIAN = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+    static final ValueLayout.OfLong BIG_ENDIAN =
+            ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
 
-    // Big-endian with the sign bit flipped, so the bytes sort as the numbers do: by chat, then by sequence
+    // Big-endian, sign bit flipped: the bytes sort as the numbers do, by chat, then by sequence
     static final KeyCodec<MessageKey> CODEC = KeyCodec.of(
             key -> 16,
             (key, target) -> {
@@ -124,14 +125,17 @@ record MessageKey(long chat, long sequence) {
                     source.get(BIG_ENDIAN, 8) ^ Long.MIN_VALUE));
 
     static KeyRange<MessageKey> chat(long chat) {
-        return KeyRange.between(new MessageKey(chat, Long.MIN_VALUE), new MessageKey(chat + 1, Long.MIN_VALUE));
+        return KeyRange.between(
+                new MessageKey(chat, Long.MIN_VALUE), new MessageKey(chat + 1, Long.MIN_VALUE));
     }
 }
 
 // Small and read often: every entry held in memory, decoded
-static final Keyspace<String, String> CHATS = Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
+static final Keyspace<String, String> CHATS =
+        Keyspace.resident("chats", KeyCodec.utf8(), ValueCodec.utf8());
 // Larger than memory should hold: read through the page cache
-static final Keyspace<MessageKey, String> MESSAGES = Keyspace.paged("messages", MessageKey.CODEC, ValueCodec.utf8());
+static final Keyspace<MessageKey, String> MESSAGES =
+        Keyspace.paged("messages", MessageKey.CODEC, ValueCodec.utf8());
 ```
 
 <details>
@@ -224,8 +228,8 @@ Every log frame, page and header is sealed with AES-256-GCM under a key per file
 never written to disk. A store reopens only with the encryption and the secret it was created with.
 
 ```java
-var withKey = Encryption.key(masterKey());                       // a 256-bit key the application keeps
-var withPassphrase = Encryption.passphrase(passphrase());        // PBKDF2-HMAC-SHA256, 600,000 iterations
+var withKey = Encryption.key(masterKey());               // a 256-bit key the application keeps
+var withPassphrase = Encryption.passphrase(passphrase()); // PBKDF2-HMAC-SHA256, 600,000 iterations
 ```
 
 <details>
@@ -245,7 +249,8 @@ data is gone when it closes.
 
 ```java
 try (var ledger = Ledger.builder().memory().keyspace(notes).build()) {
-    ledger.commit(ledger.newBatch().put(notes, "draft", "Remember the milk")).awaitDurable(); // returns at once
+    // Durable once applied: awaitDurable() returns at once
+    ledger.commit(ledger.newBatch().put(notes, "draft", "Remember the milk")).awaitDurable();
 }
 ```
 
@@ -292,7 +297,7 @@ try (var recovered = Ledger.builder()
         .keyspace(notes)
         .build()) {
     System.out.println(recovered.get(notes, "a")); // Optional[durable]
-    System.out.println(recovered.get(notes, "b")); // Optional[visible] or Optional.empty, never half a batch
+    System.out.println(recovered.get(notes, "b")); // Optional[visible] or Optional.empty
 }
 ```
 
