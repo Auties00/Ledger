@@ -12,6 +12,7 @@ import java.lang.ref.WeakReference;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.FileChannel;
+import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
@@ -19,6 +20,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
@@ -26,7 +28,6 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.LockSupport;
@@ -297,6 +298,16 @@ final class LogWriter {
     /// How long a commit spinning for its durability spins before it yields its processor between looks, in
     /// nanoseconds: the commits on their way back to the next group may need that processor.
     private static final long DURABLE_BUSY_SPIN = 20_000;
+    private static final VarHandle EARLY_THROUGH;
+
+    static {
+        try {
+            EARLY_THROUGH = MethodHandles.lookup().findVarHandle(LogWriter.class, "earlyThrough", EarlyThrough.class);
+        } catch (ReflectiveOperationException exception) {
+            throw new ExceptionInInitializerError(exception);
+        }
+    }
+
     private final LogFiles files;
     private final StoreKeys keys;
     private final byte[] storeId;
@@ -324,8 +335,8 @@ final class LogWriter {
     // Whether groups of the current segment may be written through, once one fits the bytes it has
     private boolean throughWanted;
     // The opening of the first segment to write through on a thread of SegmentPreparers, until the flush takes it or
-    // a rollover or the close discards it
-    private final AtomicReference<EarlyThrough> earlyThrough;
+    // a rollover or the close discards it; taken and discarded through EARLY_THROUGH
+    private volatile EarlyThrough earlyThrough;
     // Whether a write succeeded in the way segments are opened in now; until one does, a failure moves one way down
     private boolean wayProven;
     // The bytes the current segment had when it was prepared, below which a write changes neither its size nor the
@@ -642,14 +653,13 @@ final class LogWriter {
         // The first group switches to it, as a rollover does
         this.segmentNumber = firstSegment - 1;
         this.currentSegment = firstSegment;
-        this.earlyThrough = new AtomicReference<>();
         if (empty != null) {
             var ready = new FutureTask<>(() -> empty);
             ready.run();
             this.next = ready;
             // Its first group may be written through, as open decides for the first segment
             if (writeThrough.opensEarly() && (empty.valid() > KEPT_LENGTH || empty.nameDurable())) {
-                earlyThrough.set(new EarlyThrough(writeThrough, empty));
+                this.earlyThrough = new EarlyThrough(writeThrough, empty);
             }
         } else {
             prepareNext();
@@ -686,7 +696,7 @@ final class LogWriter {
         this.next = null;
         this.throughFile = null;
         // Left in place once discarded, so a close that follows waits for an opening still running
-        var early = earlyThrough.get();
+        var early = earlyThrough;
         if (early != null && early.segment != segment.number()) {
             early.discard();
         }
@@ -1463,7 +1473,7 @@ final class LogWriter {
     /// Called once the store opened, so one that failed to open leaves no handle behind, which on Windows would keep
     /// the file from being deleted.
     void openEarly() {
-        var early = earlyThrough.get();
+        var early = earlyThrough;
         if (early != null) {
             start(early);
         }
@@ -1475,8 +1485,8 @@ final class LogWriter {
     /// queued, so the group waits less than it would opening the segment itself, and a force in its place took longer
     /// than the opening. One that failed or found no way leaves the group to [#openThrough()].
     private WriteThrough.Handle takeEarlyThrough() {
-        var early = earlyThrough.get();
-        if (early == null || early.segment != segmentNumber || !earlyThrough.compareAndSet(early, null)) {
+        var early = earlyThrough;
+        if (early == null || early.segment != segmentNumber || !EARLY_THROUGH.compareAndSet(this, early, null)) {
             return null;
         }
         early.run();
@@ -1498,7 +1508,7 @@ final class LogWriter {
     /// moved or deleted, which fails on Windows for a file without POSIX delete semantics. The close is no commit, so
     /// it may wait the opening's time.
     private void discardEarlyThrough() {
-        var early = earlyThrough.getAndSet(null);
+        var early = (EarlyThrough) EARLY_THROUGH.getAndSet(this, null);
         if (early != null) {
             early.discardAndAwait();
         }
@@ -2962,6 +2972,11 @@ final class LogWriter {
         return writtenThrough;
     }
 
+    /// {@return whether an opening of the first segment to write through waits for a group to take it, for tests}
+    boolean earlyThroughForTests() {
+        return earlyThrough != null;
+    }
+
     /// {@return the sequence of the frame whose commit the flush of the lane would wait for, or 0, for tests}
     long leadHintForTests() {
         return leadHint;
@@ -3291,31 +3306,31 @@ final class LogWriter {
     static final class EarlyThrough extends FutureTask<WriteThrough.Handle> {
         // The segment the handle writes
         private final long segment;
-        // Whether no group takes the handle; read by the opening before it starts and once it named the volume
-        private final AtomicBoolean discarded;
+        // What the task runs, which holds whether no group takes the handle
+        private final Opening opening;
         // Guards released, and is held while the handle closes
         private final Object lock;
         // Whether the handle was closed by a discard, so it is closed once; guarded by lock
         private boolean released;
 
         EarlyThrough(WriteThrough way, LogFiles.Prepared prepared) {
-            var discarded = new AtomicBoolean();
-            super(() -> discarded.get() ? null : way.openAnswered(prepared.path(), discarded::get));
-            this.discarded = discarded;
+            var opening = new Opening(way, prepared.path());
+            super(opening);
+            this.opening = opening;
             this.lock = new Object();
             this.segment = prepared.number();
         }
 
         @Override
         protected void done() {
-            if (discarded.get()) {
+            if (opening.discarded) {
                 release();
             }
         }
 
         /// Closes the handle once the opening ends, now if it has; an opening not started yet opens none.
         void discard() {
-            discarded.set(true);
+            opening.discarded = true;
             if (isDone()) {
                 release();
             }
@@ -3324,7 +3339,7 @@ final class LogWriter {
         /// Closes the handle before this returns: an opening not started yet runs here and opens none, and one running
         /// is waited for, by an interrupted thread too.
         void discardAndAwait() {
-            discarded.set(true);
+            opening.discarded = true;
             run();
             var interrupted = false;
             try {
@@ -3354,6 +3369,30 @@ final class LogWriter {
                     released = true;
                     closeQuietly(resultNow());
                 }
+            }
+        }
+
+        /// The opening an [EarlyThrough] runs, which is also what it asks whether the handle is still wanted once the
+        /// volume is named: one named class for both, so the first reopen of a process links no lambda for them.
+        private static final class Opening implements Callable<WriteThrough.Handle>, BooleanSupplier {
+            private final WriteThrough way;
+            private final Path path;
+            // Whether no group takes the handle; read before the opening starts and once it named the volume
+            private volatile boolean discarded;
+
+            Opening(WriteThrough way, Path path) {
+                this.way = way;
+                this.path = path;
+            }
+
+            @Override
+            public WriteThrough.Handle call() throws IOException {
+                return discarded ? null : way.openAnswered(path, this);
+            }
+
+            @Override
+            public boolean getAsBoolean() {
+                return discarded;
             }
         }
     }

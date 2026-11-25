@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -276,8 +277,11 @@ class EarlyThroughTest {
             var fresh = early();
             var model = new TreeMap<String, String>();
             try (var ledger = open(disk.getPath("/store"), fresh)) {
-                assertEquals(0, fresh.opensForTests());
+                // The open's own first group may already have opened the segment through, as any group does, so the
+                // test reads whether an opening was armed rather than how many handles were opened
+                assertFalse(log(ledger).earlyThroughForTests(), "a store whose first segment is new opened it early");
                 commit(ledger, model, "first", 500);
+                assertEquals(1, fresh.opensForTests());
             }
             var late = new WriteThrough(WriteThrough.Kind.DSYNC, null);
             try (var ledger = open(disk.getPath("/store"), late)) {
@@ -389,6 +393,20 @@ class EarlyThroughTest {
         }
 
         @Test
+        @DisplayName("is wanted only of the unbuffered way, and with a proof pending only where something may answer it without the device")
+        void wanted() {
+            assertTrue(new WriteThrough(WriteThrough.Kind.UNBUFFERED, null).opensEarly());
+            assertTrue(new WriteThrough(WriteThrough.Kind.UNBUFFERED, () -> true, () -> true).opensEarly());
+            assertTrue(!new WriteThrough(WriteThrough.Kind.UNBUFFERED, () -> true).opensEarly(), "nothing answers the proof early");
+            assertTrue(!new WriteThrough(WriteThrough.Kind.DIRECT, null).opensEarly());
+            assertTrue(!new WriteThrough(WriteThrough.Kind.DSYNC, null).opensEarly());
+            assertTrue(!new WriteThrough(null, null).opensEarly());
+            var given = new WriteThrough(WriteThrough.Kind.UNBUFFERED, () -> false);
+            assertTrue(!given.enabled());
+            assertTrue(!given.opensEarly(), "a way given up opens early");
+        }
+
+        @Test
         @DisplayName("asks no device: a proof the process cannot answer yet leaves the segment to the first group")
         void asksNoDevice() throws Exception {
             var disk = CrashFileSystem.create();
@@ -456,6 +474,46 @@ class EarlyThroughTest {
             }
             assertEquals(asks, WriteThrough.WriteCache.asksForTests(), "a device was asked again");
             assertEquals(way.opensForTests(), way.closesForTests());
+            try (var ledger = open(directory, WriteThrough.Mode.OFF)) {
+                assertEquals(model, contents(ledger));
+            }
+        }
+
+        @Test
+        @EnabledOnOs(OS.WINDOWS)
+        @DisplayName("on Windows a store reopened before the process kept any device's answer opens nothing early, its first group asks and writes through, and the next reopen opens early")
+        void windowsFirstOfProcess(@TempDir Path directory) throws Exception {
+            Assumptions.assumeTrue(WriteThrough.class.getModule().isNativeAccessEnabled(), "the tests run without native access");
+            var model = new TreeMap<String, String>();
+            try (var ledger = open(directory, WriteThrough.Mode.DIRECT)) {
+                commit(ledger, model, "before", 500);
+            }
+            var cache = WriteThrough.WriteCache.of(directory);
+            Assumptions.assumeTrue(cache != null && cache.lastsForProcess(), "the device under the temporary directory gives no lasting answer");
+            WriteThrough.WriteCache.clearForTests();
+            var first = WriteThrough.of(WriteThrough.Mode.AUTO, directory);
+            assertTrue(!first.opensEarly(), "a store of a process that kept no answer opens early");
+            var asks = WriteThrough.WriteCache.asksForTests();
+            try (var ledger = open(directory, first)) {
+                Thread.sleep(20);
+                assertEquals(0, first.opensForTests(), "the segment was opened before the first group");
+                assertEquals(asks, WriteThrough.WriteCache.asksForTests(), "the open asked the device");
+                commit(ledger, model, "first", 500);
+                assertEquals(asks + 1, WriteThrough.WriteCache.asksForTests());
+                assertEquals(cache.provesWriteThrough() ? 1 : 0, log(ledger).writtenThrough());
+            }
+            var next = WriteThrough.of(WriteThrough.Mode.AUTO, directory);
+            assertTrue(next.opensEarly(), "the answer the first group kept does not reach the next store");
+            try (var ledger = open(directory, next)) {
+                if (cache.provesWriteThrough()) {
+                    awaitTrue(() -> next.opensForTests() == 1, "the segment was not opened before a commit");
+                } else {
+                    awaitTrue(() -> next.kind() == null, "the known answer was not taken");
+                }
+                commit(ledger, model, "second", 500);
+                assertEquals(cache.provesWriteThrough() ? 1 : 0, log(ledger).writtenThrough());
+            }
+            assertEquals(asks + 1, WriteThrough.WriteCache.asksForTests(), "a device was asked again");
             try (var ledger = open(directory, WriteThrough.Mode.OFF)) {
                 assertEquals(model, contents(ledger));
             }

@@ -161,9 +161,10 @@ final class WriteThrough {
     private boolean channelProven;
     // What answers the proof without asking a device, null where it would have to; null if nothing does
     private final Supplier<Boolean> answered;
-    // The handles opened and closed, for tests: a handle may be opened beside the flush that writes through it
-    private final AtomicInteger opens;
-    private final AtomicInteger closes;
+    // The handles opened and closed, for tests; guarded by the lock, as a handle may be opened beside the flush that
+    // writes through it
+    private int opens;
+    private int closes;
     /// Allocates the buffer in place of the arena, by its size; for tests that refuse it.
     LongFunction<MemorySegment> allocatorForTests;
     /// Makes [#opensEarly()] answer `true` whatever the way, for tests of the opening on a file system other than
@@ -192,8 +193,6 @@ final class WriteThrough {
         this.kind = kind;
         this.proof = proof;
         this.answered = answered;
-        this.opens = new AtomicInteger();
-        this.closes = new AtomicInteger();
     }
 
     /// {@return how a store in `directory` writes through in `mode`}
@@ -203,7 +202,8 @@ final class WriteThrough {
     static WriteThrough of(Mode mode, Path directory) {
         var kind = kindOf(mode, directory.getFileSystem() == FileSystems.getDefault());
         if (kind == Kind.UNBUFFERED && mode == Mode.AUTO) {
-            return new WriteThrough(kind, () -> WriteCache.proves(directory), () -> WriteCache.provesIfKnown(directory));
+            var device = new DeviceProof(directory);
+            return new WriteThrough(kind, device, device);
         }
         return new WriteThrough(kind, null);
     }
@@ -271,23 +271,49 @@ final class WriteThrough {
 
     /// {@return the handles opened so far, for tests}
     int opensForTests() {
-        return opens.get();
+        synchronized (lock) {
+            return opens;
+        }
     }
 
     /// {@return the handles closed so far, for tests}
     int closesForTests() {
-        return closes.get();
+        synchronized (lock) {
+            return closes;
+        }
+    }
+
+    /// Counts a handle of this way closed, for tests.
+    private void closed() {
+        synchronized (lock) {
+            closes++;
+        }
     }
 
     /// {@return whether a segment is opened to write through before its first group needs it, on the thread that
     /// prepares segments: only unbuffered on Windows, where the first open of a store costs its first group more than
-    /// a write through takes}
+    /// a write through takes, and only where the opening can end in a handle, so a device that must prove the way has
+    /// answered a store of this process before}
     ///
     /// Before the first unbuffered write of a store, the volume under it is named and the handle opened, cold native
     /// calls that held the first durable commit after an open for 1.5 to 2 milliseconds where the write itself takes a
-    /// tenth of one; a force in its place took 1 to 4.5. A channel opened with `O_DIRECT` takes 0.04 to 0.2.
+    /// tenth of one; a force in its place took 1 to 4.5. A channel opened with `O_DIRECT` takes 0.04 to 0.2. The
+    /// opening asks no device ([#openAnswered(Path, BooleanSupplier)]), so in a process that keeps no answer it could
+    /// only name the volume and link the native calls, which the first group then does anyway to ask the device: about
+    /// 330 classes loaded and 5 MB allocated beside the open, on a thread started for it, that end in no handle.
     boolean opensEarly() {
-        return kind() == Kind.UNBUFFERED || opensEarlyForTests;
+        if (opensEarlyForTests) {
+            return true;
+        }
+        synchronized (lock) {
+            if (kind != Kind.UNBUFFERED) {
+                return false;
+            }
+            if (proof == null) {
+                return true;
+            }
+            return answered instanceof DeviceProof device ? device.mayBeKnown() : answered != null;
+        }
     }
 
     /// Opens the segment at `path` to write through as [#open(Path)] does, if no device need be asked first and the
@@ -334,7 +360,9 @@ final class WriteThrough {
         if (!enabled()) {
             throw new IllegalStateException("The log forces its groups");
         }
-        opens.incrementAndGet();
+        synchronized (lock) {
+            opens++;
+        }
         try {
             return switch (kind()) {
                 case UNBUFFERED -> UnbufferedHandle.open(path, this);
@@ -487,7 +515,7 @@ final class WriteThrough {
         @Override
         public void close() throws IOException {
             if (channel.isOpen()) {
-                owner.closes.incrementAndGet();
+                owner.closed();
             }
             channel.close();
         }
@@ -681,7 +709,7 @@ final class WriteThrough {
                 return;
             }
             open = false;
-            owner.closes.incrementAndGet();
+            owner.closed();
             var close = closing;
             try {
                 dropDescriptor();
@@ -1021,7 +1049,7 @@ final class WriteThrough {
                 return;
             }
             open = false;
-            owner.closes.incrementAndGet();
+            owner.closed();
             int closed;
             try {
                 closed = (int) Kernel32.CLOSE_HANDLE.invokeExact(state, handle);
@@ -1095,6 +1123,12 @@ final class WriteThrough {
         /// `null` where a device would have to be asked}
         static Boolean provesIfKnown(Path directory) {
             return ANSWERS.provesIfKnown(directory);
+        }
+
+        /// {@return whether the process keeps the answer of any device, without which [#provesIfKnown(Path)] answers
+        /// `null`; it names no volume}
+        static boolean anyKnown() {
+            return ANSWERS.anyKnown();
         }
 
         /// Forgets the answers of every volume, for tests that count the questions sent to devices.
@@ -1197,6 +1231,31 @@ final class WriteThrough {
         }
     }
 
+    /// The proof of the unbuffered way of a store in `directory`: what its device answers ([WriteCache#proves(Path)]),
+    /// which the first group that writes through asks, and the answer the process already keeps
+    /// ([WriteCache#provesIfKnown(Path)]), which the opening of the first segment beside the open takes.
+    ///
+    /// One named object serves as both, so a store links no lambda for either.
+    ///
+    /// @param directory the directory of the store's log
+    private record DeviceProof(Path directory) implements BooleanSupplier, Supplier<Boolean> {
+        @Override
+        public boolean getAsBoolean() {
+            return WriteCache.proves(directory);
+        }
+
+        @Override
+        public Boolean get() {
+            return WriteCache.provesIfKnown(directory);
+        }
+
+        /// {@return whether [#get()] may answer anything but `null`, as it does once the process keeps the answer of
+        /// some device}
+        boolean mayBeKnown() {
+            return WriteCache.anyKnown();
+        }
+    }
+
     /// The answers of the devices under the stores of the process, by the name of their volume, each kept for the rest
     /// of the process if it [lasts for it][WriteCache#lastsForProcess()].
     ///
@@ -1244,14 +1303,23 @@ final class WriteThrough {
         /// {@return what [#proves(Path)] answers for `directory` where that sends no question to a device, `null` where
         /// it would}
         ///
-        /// The volume is still named, which takes no round trip to its device.
+        /// The volume is named only while some answer is kept: naming it takes no round trip to its device, but the
+        /// first time in a process links the native calls that name it.
         Boolean provesIfKnown(Path directory) {
+            if (answers.isEmpty()) {
+                return null;
+            }
             var volume = volumes.apply(directory);
             if (volume == null) {
                 return false;
             }
             var known = answers.get(volume);
             return known == null ? null : known.provesWriteThrough();
+        }
+
+        /// {@return whether the answer of any device is kept}
+        boolean anyKnown() {
+            return !answers.isEmpty();
         }
 
         /// Forgets every answer.

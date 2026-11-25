@@ -1698,6 +1698,27 @@ class WriteThroughTest {
         }
 
         @Test
+        @DisplayName("know nothing without asking, and name no volume for it, until some answer is kept")
+        void knownWithoutAsking() {
+            var named = new AtomicInteger();
+            var answers = new WriteThrough.Answers(directory -> {
+                named.incrementAndGet();
+                return directory.getName(0).toString();
+            }, volume -> volume.equals("fua") ? FUA : null);
+            assertFalse(answers.anyKnown());
+            assertNull(answers.provesIfKnown(Path.of("fua", "store")));
+            assertEquals(0, named.get(), "a volume was named while no answer was kept");
+            assertEquals(0, answers.asks());
+            assertTrue(answers.proves(Path.of("fua", "store")));
+            assertTrue(answers.anyKnown());
+            assertEquals(Boolean.TRUE, answers.provesIfKnown(Path.of("fua", "other")));
+            assertNull(answers.provesIfKnown(Path.of("silent", "store")));
+            assertEquals(1, answers.asks());
+            answers.clear();
+            assertFalse(answers.anyKnown());
+        }
+
+        @Test
         @DisplayName("keep each volume's answer apart, and ask again once they are forgotten")
         void perVolume() {
             var counted = answers(Map.of("fua", FUA, "volatile", VOLATILE));
