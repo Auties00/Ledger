@@ -44,20 +44,25 @@ jobs:
         with:
           python-version: '3.x'
 
-      # A build that runs past 20 minutes (it takes a few) has a hung test. The watchdog then records the threads of
-      # every JVM into results/, each dump cut off after a minute since a JVM that cannot reach a safepoint never
-      # answers one (macOS adds native stacks, which need no safepoint), and kills the JVMs so the build fails and the
-      # log step uploads results/. A safepoint that takes longer than 30 seconds aborts its JVM, whose crash report
-      # names the thread that does not stop.
+      # A build that runs past its limit has a hung test: 40 minutes on Windows, whose builds took 15 to 21 (median 18,
+      # 34 runs up to run 45862251156), and 30 elsewhere (ubuntu up to 12, macOS up to 17). The watchdog then records the
+      # threads of every JVM into results/, each dump cut off after a minute since a JVM that cannot reach a safepoint
+      # never answers one (macOS adds native stacks, which need no safepoint), and kills the JVMs so the build fails and
+      # the log step uploads results/. It goes by the clock rather than by counting one-second sleeps, which drift on
+      # Windows, and kills nothing once the build has ended, so a build that finishes during the dumps cannot take the
+      # smoke run's JVM with it. A safepoint that takes longer than 30 seconds aborts its JVM, whose crash report names
+      # the thread that does not stop.
       - name: Build
         run: |
           mkdir -p results
+          if [ "$RUNNER_OS" = Windows ]; then limit=40; else limit=30; fi
           (
-            for _ in $(seq 1 1200); do
-              sleep 1
+            end=$((SECONDS + limit * 60))
+            while [ "$SECONDS" -lt "$end" ]; do
+              sleep 5
               [ -f results/.built ] && exit 0
             done
-            echo "The build ran past 20 minutes"
+            echo "The build ran past $limit minutes"
             for pid in $(jps -q); do
               name=$(jps -l | grep "^$pid " || true)
               if command -v sample > /dev/null; then
@@ -66,16 +71,18 @@ jobs:
               { echo "=== $name"; jcmd "$pid" Thread.print; } > "results/threads-$pid.txt" 2>&1 &
             done
             sleep 60
+            [ -f results/.built ] && { echo "The build ended during the dumps; nothing killed"; exit 0; }
             if command -v taskkill > /dev/null; then taskkill //F //IM java.exe; else pkill -9 java; fi
           ) > results/watchdog.log 2>&1 &
+          watchdog=$!
           set +e
-          mvn -B -ntp package \
-            "-Dledger.test.jvm=-XX:+IgnoreUnrecognizedVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+SafepointTimeout -XX:SafepointTimeoutDelay=30000 -XX:+AbortVMOnSafepointTimeout" \
-            2>&1 | tee results/build.log
+          mvn -B -ntp package             "-Dledger.test.jvm=-XX:+IgnoreUnrecognizedVMOptions -XX:+UnlockDiagnosticVMOptions -XX:+SafepointTimeout -XX:SafepointTimeoutDelay=30000 -XX:+AbortVMOnSafepointTimeout"             2>&1 | tee results/build.log
           status=${PIPESTATUS[0]}
           touch results/.built
+          wait "$watchdog"
           if [ -s results/watchdog.log ]; then
-            echo "The build ran past 20 minutes; thread dumps are in the uploaded results/" >&2
+            echo "The build ran past $limit minutes; thread dumps are in the uploaded results/" >&2
+            cat results/watchdog.log >&2
           fi
           exit "$status"
 

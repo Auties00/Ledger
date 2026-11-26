@@ -75,16 +75,15 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
 
-      - name: Build
-        run: mvn -B -ntp package -DskipTests
-
-      # runner.txt goes into the artifact, so tools/readme/fetch.py can name the hardware behind every number
+      # runner.txt goes into the artifact, so tools/readme/fetch.py can name the hardware behind every number. It is
+      # written before the build, so a job that fails still names its runner, and a probe that fails leaves the model
+      # unknown instead of failing the job (the step runs under bash -e -o pipefail)
       - name: Describe the runner
         run: |
           case "$RUNNER_OS" in
-            Linux) CPU_MODEL=$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//') ;;
-            macOS) CPU_MODEL=$(sysctl -n machdep.cpu.brand_string) ;;
-            Windows) CPU_MODEL=$(powershell -NoProfile -Command '(Get-CimInstance Win32_Processor | Select-Object -First 1).Name' | tr -d '\r' | sed 's/ *$//') ;;
+            Linux) CPU_MODEL=$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//' || true) ;;
+            macOS) CPU_MODEL=$(sysctl -n machdep.cpu.brand_string || true) ;;
+            Windows) CPU_MODEL=$(powershell -NoProfile -Command '(Get-CimInstance Win32_Processor | Select-Object -First 1).Name' | tr -d '\r' | sed 's/ *$//' || true) ;;
           esac
           mkdir -p results
           {
@@ -102,6 +101,9 @@ jobs:
             echo "- Disk: $(df -h "$RUNNER_TEMP" 2>/dev/null | tail -1)"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build
+        run: mvn -B -ntp package -DskipTests
 
       # A failing workload does not stop the others (-foe false); the last step fails the job if any did.
       - name: Run the workloads
