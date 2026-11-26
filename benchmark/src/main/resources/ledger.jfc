@@ -19,7 +19,7 @@
      was 0.99x on ubuntu and 1.02x on windows.
      Use with JMH's JFR profiler, which records only the measurement iterations:
        -prof jfr:configName=<path to this file>
-     In a compare (ci-data's compare.yml), pass
+     In a compare (.github/workflows/compare.yml), pass
        -prof jfr:configName=head/benchmark/src/main/resources/ledger.jfc;dir=@OUT@
      in jmh-args (both sides; the path is relative to the job's workspace, which holds the base/ and head/ checkouts,
      so the base side reads the head's copy) or in head-jmh-args (head only). compare.yml replaces @OUT@ with a

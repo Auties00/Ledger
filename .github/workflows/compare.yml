@@ -1,9 +1,26 @@
-# Measures two refs on the same runner, in alternating rounds (base, head, base, head, ...). Hosted runners' hardware
-# and disks differ enough between runs to move every engine's score several times over, so two runs of the benchmark
-# workflow cannot tell a change apart from the runner; within one job, both refs meet the same machine. The summary
-# gives each workload's median on both refs, the range of their rounds, and the ratio.
+# Measures two refs on the same runner, in rounds of both. Hosted runners' hardware and disks differ enough between
+# runs to move every engine's score several times over, so two runs of the benchmark workflow cannot tell a change
+# apart from the runner; within one job, both refs meet the same machine. By default the rounds
+# alternate base, head, base, head. With warmup-round on (ci_compare.sh turns it on unless WARMUP=false) a discarded
+# round 0 of each ref comes first (it builds the store templates, whose JVM measures differently), then the judged rounds
+# in ABBA order (base, head, head, base, base, head, ...). With an even number of rounds, round 0 runs head first, so
+# that each side follows itself equally often and base's first judged round follows its own round 0; with an odd number
+# base runs one slot earlier on average, so judged compares use an even number of rounds. With fresh-templates on
+# (ci_compare.sh turns it on unless FRESH=false) each ref's store templates are deleted before every round, so every
+# round reads a build of its own: two builds of one template differ (every checkpoint draws its own nonces, and the heap
+# of a store opened from them differs by a fixed amount), and a ref that read one build in all its rounds would carry
+# that build's offset into every round, which the analyzer would read as a difference between the refs.
+# The summary gives each workload's median on both refs, the range of their rounds, and the ratio. results/runner.txt
+# names the runner's CPU model, results/probe.txt fingerprints the runner (CPU model, cores, kernel or OS build, whether
+# a PMU is present) and results/meta.json records the inputs in full, the CPU model and the order the rounds ran in.
+#
+# Hosted runners land on several CPU models (AMD EPYC 7763, 9V74, 9V45, Intel Xeon 8370C, 8573C, 6975P-C, ...). One run
+# is consistent, since both refs meet the same machine, but runs pooled into one verdict must share a model. With
+# cpu-model set, the job reads its CPU before anything else and, on another model, fails at once in the step "Stop on
+# another CPU model" (the only step that fails that way), uploading results/runner.txt and results/meta.json and
+# building nothing; tools/bench/ci_compare.sh dispatches it again until it lands on the model.
 name: Compare
-run-name: Compare ${{ inputs.base }} and ${{ inputs.head || github.ref_name }} on ${{ inputs.os }} ${{ inputs.pattern }} ${{ inputs.jmh-args }}
+run-name: Compare ${{ inputs.base }} and ${{ inputs.head || github.ref_name }} on ${{ inputs.os }} ${{ inputs.tag && format('tag {0}', inputs.tag) || format('{0} {1}{2}', inputs.pattern, inputs.jmh-args, inputs.head-jmh-args && format(' head+ {0}', inputs.head-jmh-args) || '') }}
 
 on:
   workflow_dispatch:
@@ -30,15 +47,41 @@ on:
         type: string
         default: '3'
       jmh-args:
-        description: 'Extra JMH arguments, for example: -p engine=ledger,ledger-plain'
+        description: 'Extra JMH arguments, for example: -p engine=ledger,ledger-plain. @OUT@ becomes a directory of its own per side and round (results/prof-<side>-<round>), for profiler output such as -prof jfr:dir=@OUT@'
+        type: string
+        default: ''
+      head-jmh-args:
+        description: 'JMH arguments added to the head rounds only, for example a profiler whose overhead to measure against the same ref'
+        type: string
+        default: ''
+      tag:
+        description: 'Short name of the run, used in its title and concurrency group instead of the pattern and arguments (long titles fail the dispatch); results/meta.json keeps them in full'
+        type: string
+        default: ''
+      warmup-round:
+        description: 'Run a discarded round 0 of each ref (results/warmup/, not a judged round) and the judged rounds in ABBA order (base, head, head, base, ...); off: alternating base, head rounds'
+        type: boolean
+        default: false
+      fresh-templates:
+        description: 'Delete each ref''s store templates before every round, so that each round builds and reads its own (the rounds are then independent for the workloads that read a template, at the cost of the builds); off: each ref builds them once and reads that build in every round'
+        type: boolean
+        default: false
+      profile:
+        description: 'Ubuntu only (ignored elsewhere): async-profiler 4.6 at 10 ms on both sides, output to results/ap-<side>-<round> and results/warmup/ap-<side>-0; the events, for example cpu,alloc, lock or wall;threads=true. JMH keeps only the last fork of each workload: pass -f 1. Empty: no profiler'
+        type: string
+        default: ''
+      cpu-model:
+        description: 'Measure only on this CPU model, for example the model of the run a rerun is pooled with: a case-insensitive substring of the runner''s model with (R), (TM) and CPU removed, such as "EPYC 7763" or "Xeon Platinum 8370C". On another model the job stops before building. Empty: any model'
         type: string
         default: ''
 
 permissions:
   contents: read
 
+# Each pair of refs gets its own group: hosted runners are separate machines, so runs of different heads can measure
+# side by side, while a second run of the same pair and workloads waits for the first
 concurrency:
-  group: compare-${{ inputs.os }}
+  group: compare-${{ inputs.os }}-${{ inputs.base }}-${{ inputs.head || github.sha }}-${{ inputs.tag || (inputs.head-jmh-args && format('{0}-{1}-{2}', inputs.pattern, inputs.jmh-args, inputs.head-jmh-args)) || format('{0}-{1}', inputs.pattern, inputs.jmh-args) }}
   cancel-in-progress: false
 
 defaults:
@@ -55,6 +98,62 @@ jobs:
       matrix:
         os: ${{ fromJSON(inputs.os == 'all' && '["ubuntu-latest","windows-latest","macos-latest"]' || format('["{0}"]', inputs.os)) }}
     steps:
+      # Before anything else, so a runner on another model is let go within seconds. The model is normalised as
+      # tools/bench/verdict.py does: (R), (TM) and " CPU" removed, runs of spaces collapsed
+      - name: Read the runner CPU
+        id: cpu
+        env:
+          WANT: ${{ inputs.cpu-model }}
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          set +e
+          case "$RUNNER_OS" in
+            Linux) model=$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2-) ;;
+            macOS) model=$(sysctl -n machdep.cpu.brand_string) ;;
+            Windows) model=$(powershell -NoProfile -Command '(Get-CimInstance Win32_Processor | Select-Object -First 1).Name' | tr -d '\r') ;;
+          esac
+          # BSD sed on macOS has no \| alternation, hence one expression per rule
+          norm() { printf '%s\n' "$1" | sed -e 's/(R)//g' -e 's/(TM)//g' -e 's/[[:space:]][[:space:]]*/ /g' -e 's/ CPU / /g' -e 's/ CPU$//' -e 's/^ //' -e 's/ $//'; }
+          model=$(norm "$model")
+          want=$(norm "$WANT")
+          # A case-insensitive substring, compared in the shell: Git Bash's grep -iF aborts on some hosts
+          lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+          match=true
+          if [ -n "$want" ]; then
+            case "$(lower "$model")" in
+              *"$(lower "$want")"*) [ -n "$model" ] || match=false ;;
+              *) match=false ;;
+            esac
+          fi
+          mkdir -p results
+          {
+            echo "CPU model: ${model:-unknown}"
+            echo "CPUs: $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")"
+            echo "Image: ${ImageOS:-unknown} ${ImageVersion:-}"
+            if [ -n "$want" ]; then echo "Wanted CPU model: $want ($([ "$match" = true ] && echo matched || echo not matched))"; fi
+          } > results/runner.txt
+          {
+            echo "cpu_model=$model"
+            echo "match=$match"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$match" = false ]; then
+            # The full meta.json comes later, from Python; this one only needs to name the runner and the input
+            json() { printf '%s' "$1" | sed -e 's/\\/\\\\/g; s/"/\\"/g'; }
+            printf '{\n  "os": "%s",\n  "cpu_model": "%s",\n  "cpu_model_wanted": "%s",\n  "cpu_mismatch": true,\n  "run_id": "%s",\n  "run_attempt": "%s"\n}\n' \
+              "$(json "$MATRIX_OS")" "$(json "$model")" "$(json "$want")" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > results/meta.json
+          fi
+          echo "- Runner CPU: ${model:-unknown}${want:+ (wanted: $want)}" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Stop on another CPU model
+        if: steps.cpu.outputs.match == 'false'
+        env:
+          WANT: ${{ inputs.cpu-model }}
+          MODEL: ${{ steps.cpu.outputs.cpu_model }}
+        run: |
+          echo "::error title=CPU mismatch::The runner has ${MODEL:-an unknown CPU}, not $WANT; nothing was measured"
+          exit 1
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.base }}
@@ -90,36 +189,253 @@ jobs:
 
       - name: Describe the runner
         run: |
+          echo "Java: $(java -version 2>&1 | head -1)" >> results/runner.txt
           {
             echo "## ${{ inputs.base }} against ${{ inputs.head || github.ref_name }} on ${{ matrix.os }}"
             echo
             echo "- Base: $(git -C base rev-parse --short HEAD), head: $(git -C head rev-parse --short HEAD)"
+            echo "- CPU: ${{ steps.cpu.outputs.cpu_model }}"
             echo "- CPUs: $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")"
             echo "- Java: $(java -version 2>&1 | head -1)"
-            echo "- Rounds: ${{ inputs.rounds }} of each ref, alternating"
+            if [ "${{ inputs.warmup-round }}" = false ]; then
+              echo "- Rounds: ${{ inputs.rounds }} of each ref, alternating"
+            else
+              echo "- Rounds: ${{ inputs.rounds }} of each ref in ABBA order, after a discarded round 0 of each"
+            fi
+            if [ "${{ inputs.fresh-templates }}" = true ]; then
+              echo "- Store templates: rebuilt for every round"
+            else
+              echo "- Store templates: built once per ref"
+            fi
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Each ref keeps its own store templates, which the two builds might lay out differently
+      # Runner fingerprint: verdicts have flipped with the CPU model, so the analyzer groups compares by it
+      - name: Fingerprint the runner
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p results
+          set +e
+          if [ "$RUNNER_OS" = Linux ]; then
+            model=$(lscpu | sed -n 's/^Model name: *//p' | head -1)
+            cores=$(lscpu -p=core,socket | grep -v '^#' | sort -u | wc -l)
+            build=$(. /etc/os-release && echo "$PRETTY_NAME")
+            # The kernel registers the cpu event source only where it has a PMU driver; most hosted guests have none
+            if [ -d /sys/bus/event_source/devices/cpu ]; then pmu=yes; else pmu=no; fi
+          else
+            model=$(sysctl -n machdep.cpu.brand_string)
+            cores=$(sysctl -n hw.physicalcpu)
+            build="$(sw_vers -productName) $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+            pmu=unknown
+          fi
+          {
+            echo "cpu_model=$model"
+            echo "cores=$cores"
+            echo "logical_cpus=$(getconf _NPROCESSORS_ONLN)"
+            echo "kernel=$(uname -sr)"
+            echo "os_build=$build"
+            echo "pmu=$pmu"
+            if [ "$RUNNER_OS" = Linux ]; then
+              echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid)"
+              echo "event_sources=$(ls /sys/bus/event_source/devices | tr '\n' ' ')"
+              echo "kernel_perf_line=$(sudo dmesg 2> /dev/null | grep -m1 'Performance Events' | sed 's/^\[[^]]*\] //')"
+              echo
+              lscpu
+            else
+              # The lscpu form too, for analyzers that read only that
+              echo "Model name: $model"
+            fi
+          } > results/probe.txt
+          echo "- Runner: $model, $cores cores, $(uname -sr), PMU $pmu" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Fingerprint the runner (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # A diagnostic file must not fail the compare: GitHub runs pwsh with $ErrorActionPreference = 'stop'
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force results | Out-Null
+          $cpu = $null; $os = $null
+          try { $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1 } catch { }
+          try { $os = Get-CimInstance Win32_OperatingSystem } catch { }
+          # xperf lists the profile sources the hypervisor exposes; Timer alone means no hardware counters
+          $pmu = 'unknown'
+          $sources = ''
+          try {
+            $xperf = (Get-Command xperf -ErrorAction SilentlyContinue).Source
+            $kit = 'C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe'
+            if (-not $xperf -and (Test-Path $kit)) { $xperf = $kit }
+            if ($xperf) {
+              $names = @(& $xperf -pmcsources 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -match '^\s*\d+\s+\S' } | ForEach-Object { ($_.Trim() -split '\s+')[1] })
+              $sources = $names -join ' '
+              if ($names.Count -gt 0) { $pmu = if (@($names | Where-Object { $_ -ne 'Timer' }).Count -gt 0) { 'yes' } else { 'no' } }
+            }
+          } catch { $pmu = 'unknown'; $sources = '' }
+          $model = if ($cpu) { "$($cpu.Name)".Trim() } else { '' }
+          $lines = @(
+            "cpu_model=$model",
+            "cores=$(if ($cpu) { $cpu.NumberOfCores })",
+            "logical_cpus=$(if ($cpu) { $cpu.NumberOfLogicalProcessors })",
+            "kernel=Windows NT $(if ($os) { $os.Version })",
+            "os_build=$(if ($os) { "$($os.Caption) $($os.Version) build $($os.BuildNumber)" })",
+            "pmu=$pmu",
+            "profile_sources=$sources"
+          )
+          # The lscpu form too, for analyzers that read only that
+          if ($model) { $lines += "Model name: $model" }
+          try { $lines | Set-Content -Path results/probe.txt -Encoding utf8 } catch { }
+          try { "- Runner: $model, $(if ($cpu) { $cpu.NumberOfCores }) cores, Windows $(if ($os) { $os.Version }), PMU $pmu" | Add-Content -Path $env:GITHUB_STEP_SUMMARY } catch { }
+          exit 0
+
+      # async-profiler for a profiling compare; the sysctl lets it record kernel frames
+      - name: Install async-profiler
+        if: inputs.profile != '' && runner.os == 'Linux'
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/ap.tgz" https://github.com/async-profiler/async-profiler/releases/download/v4.6/async-profiler-4.6-linux-x64.tar.gz
+          echo "1e79ed54d8952889a2e74f993d22ee925e3322460d4f37a2ed95bfb88585da36  $RUNNER_TEMP/ap.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/ap" && tar -xzf "$RUNNER_TEMP/ap.tgz" -C "$RUNNER_TEMP/ap" --strip-components=1
+          sudo sysctl kernel.perf_event_paranoid=1 kernel.kptr_restrict=0
+          echo "PROFILER_LIB=$RUNNER_TEMP/ap/lib/libasyncProfiler.so" >> "$GITHUB_ENV"
+
+      # Each ref keeps its own store templates, which the two builds might lay out differently; with fresh-templates on
+      # they are deleted before every round
       - name: Run the workloads
         env:
           PATTERN: ${{ inputs.pattern }}
           ROUNDS: ${{ inputs.rounds }}
           JMH_ARGS: ${{ inputs.jmh-args }}
+          HEAD_JMH_ARGS: ${{ inputs.head-jmh-args }}
+          TAG: ${{ inputs.tag }}
+          WARMUP: ${{ inputs.warmup-round }}
+          FRESH: ${{ inputs.fresh-templates }}
+          PROFILE: ${{ inputs.profile }}
+          BASE_REF: ${{ inputs.base }}
+          HEAD_REF: ${{ inputs.head || github.sha }}
+          MATRIX_OS: ${{ matrix.os }}
+          CPU_MODEL: ${{ steps.cpu.outputs.cpu_model }}
+          CPU_WANTED: ${{ inputs.cpu-model }}
         run: |
           mkdir -p results
+          # Round 0 of each ref is discarded (the JVM that builds a template measures differently), then the judged
+          # rounds run in ABBA order; with an even number of rounds round 0 runs head first, which balances how often
+          # each side follows itself (page cache and writeback carry-over) and puts base's own round 0 before its first
+          # judged round. With warmup-round off, alternating base, head rounds as before
+          plan=""
+          if [ "$WARMUP" != false ]; then
+            if [ $((ROUNDS % 2)) -eq 0 ]; then plan="0:head 0:base"; else plan="0:base 0:head"; fi
+          fi
           for round in $(seq 1 "$ROUNDS"); do
-            for side in base head; do
-              echo "::group::$side, round $round"
-              # JMH_ARGS is split into words on purpose
-              LEDGER_BENCH_DIR="$RUNNER_TEMP/bench-$side" java -jar "$side/benchmark/target/benchmarks.jar" "$PATTERN" \
-                -foe false -rf json -rff "results/$side-$round.json" $JMH_ARGS 2>&1 | tee -a "results/$side.log"
-              echo "::endgroup::"
-            done
+            if [ "$WARMUP" != false ] && [ $((round % 2)) -eq 0 ]; then plan="$plan $round:head $round:base"; else plan="$plan $round:base $round:head"; fi
           done
+          # The profiler's JMH option: the first event other than alloc and lock samples every 10 ms; alloc and lock are
+          # secondary events (a bare alloc every 512 KiB). With only alloc and lock events the first of them is the main
+          # event, at its own interval (alloc every 512 KiB, lock at the profiler's default). What follows the first ';'
+          # of the input passes through (threads=true)
+          profiler=""
+          if [ -n "$PROFILE" ] && [ -n "${PROFILER_LIB:-}" ]; then
+            # JMH takes the interval as a plain number: 512k -> 524288, 1m -> 1048576, 1ms -> 1000000 (ns)
+            number() {
+              case "$1" in
+                *[kK]) echo $(( ${1%?} * 1024 )) ;;
+                *[mM]) echo $(( ${1%?} * 1048576 )) ;;
+                *[gG]) echo $(( ${1%?} * 1073741824 )) ;;
+                *us) echo $(( ${1%us} * 1000 )) ;;
+                *ms) echo $(( ${1%ms} * 1000000 )) ;;
+                *ns) echo "${1%ns}" ;;
+                *s) echo $(( ${1%s} * 1000000000 )) ;;
+                *) echo "$1" ;;
+              esac
+            }
+            events=${PROFILE%%;*}; rest=""
+            case "$PROFILE" in *";"*) rest=";${PROFILE#*;}" ;; esac
+            main=""; secondary=""
+            for event in $(echo "$events" | tr ',' ' '); do
+              case "$event" in
+                alloc) secondary="$secondary;alloc=512k" ;;
+                alloc=*|lock|lock=*) secondary="$secondary;$event" ;;
+                *) if [ -z "$main" ]; then main=$event; fi ;;
+              esac
+            done
+            if [ -n "$main" ]; then
+              profiler="libPath=$PROFILER_LIB;event=$main;interval=10000000;output=jfr$secondary$rest"
+            elif [ -n "$secondary" ]; then
+              first=${secondary#;}; first=${first%%;*}; others=${secondary#;"$first"}
+              name=${first%%=*}; interval=""
+              case "$first" in *=*) interval=";interval=$(number "${first#*=}")" ;; esac
+              profiler="libPath=$PROFILER_LIB;event=$name$interval;output=jfr$others$rest"
+            else
+              echo "profile '$PROFILE' names no event" >&2; exit 1
+            fi
+            echo "- Profiler: -prof async:$profiler (JMH keeps the last fork of each workload)" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "$PROFILE" ]; then
+            echo "- Profile $PROFILE ignored on $MATRIX_OS: async-profiler runs on ubuntu only" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # The inputs in full and the order of the rounds, for the analyzer
+          PLAN=$plan PROFILER=$profiler BASE_SHA=$(git -C base rev-parse HEAD) HEAD_SHA=$(git -C head rev-parse HEAD) python - <<'META'
+          import json, os
+          env = os.environ
+          meta = {
+              "base": env["BASE_REF"], "head": env["HEAD_REF"], "base_sha": env["BASE_SHA"], "head_sha": env["HEAD_SHA"],
+              "os": env["MATRIX_OS"], "tag": env.get("TAG", ""), "pattern": env["PATTERN"],
+              "jmh_args": env.get("JMH_ARGS", ""), "head_jmh_args": env.get("HEAD_JMH_ARGS", ""),
+              "rounds": int(env["ROUNDS"]), "warmup_round": env.get("WARMUP") != "false",
+              "fresh_templates": env.get("FRESH") == "true",
+              "profile": env.get("PROFILE", ""), "profiler": env.get("PROFILER", ""),
+              "cpu_model": env.get("CPU_MODEL", ""), "cpu_model_wanted": env.get("CPU_WANTED", ""), "cpu_mismatch": False,
+              "order": env["PLAN"].split(), "run_id": env.get("GITHUB_RUN_ID"), "run_attempt": env.get("GITHUB_RUN_ATTEMPT"),
+          }
+          with open("results/meta.json", "w") as out:
+              json.dump(meta, out, indent=2)
+          META
+          # A workload that prints nothing for 30 minutes has hung: record the threads of every JVM into results/ and
+          # kill the benchmark's fork, so that JMH goes on to the next workload and the job still reports the others.
+          (
+            # bash -e would end this watchdog at the first grep that matches nothing, such as jps looking at itself
+            set +e
+            size=-1; still=0
+            while [ ! -f results/.done ]; do
+              sleep 60
+              now=$(cat results/*.log results/warmup/*.log 2>/dev/null | wc -c)
+              if [ "$now" = "$size" ]; then still=$((still + 1)); else still=0; size=$now; fi
+              if [ "$still" -ge 30 ]; then
+                still=0
+                stamp=$(date +%H%M%S)
+                echo "No output for 30 minutes at $stamp" >> results/watchdog.txt
+                for pid in $(jps -q); do
+                  { jps -l | grep "^$pid " ; timeout 60 jcmd "$pid" Thread.print; } > "results/threads-$stamp-$pid.txt" 2>&1
+                done
+                for pid in $(jps -l | grep -i forkedmain | cut -d' ' -f1); do
+                  if command -v taskkill > /dev/null; then taskkill //F //PID "$pid"; else kill -9 "$pid"; fi
+                done >> results/watchdog.txt 2>&1
+              fi
+            done
+          ) &
+          for step in $plan; do
+            round=${step%%:*}; side=${step#*:}
+            out=results
+            if [ "$round" = 0 ]; then out=results/warmup; mkdir -p "$out"; fi
+            echo "::group::$side, round $round"
+            if [ "$FRESH" = true ]; then rm -rf "${RUNNER_TEMP:?}/bench-$side/templates"; fi
+            extra=""
+            if [ "$side" = head ]; then extra="$HEAD_JMH_ARGS"; fi
+            if [ -n "$profiler" ]; then
+              mkdir -p "$out/ap-$side-$round"
+              extra="$extra -prof async:$profiler;dir=$out/ap-$side-$round"
+            fi
+            # @OUT@ in the arguments is this side's and round's own directory, so that profiler output (-prof jfr:dir=@OUT@)
+            # of one run does not overwrite another's
+            args="$JMH_ARGS $extra"
+            case "$args" in *@OUT@*) mkdir -p "$out/prof-$side-$round"; args=${args//@OUT@/$out/prof-$side-$round} ;; esac
+            # JMH_ARGS, HEAD_JMH_ARGS and the profiler option are split into words on purpose
+            LEDGER_BENCH_DIR="$RUNNER_TEMP/bench-$side" java -jar "$side/benchmark/target/benchmarks.jar" "$PATTERN" \
+              -foe false -rf json -rff "$out/$side-$round.json" $args 2>&1 | tee -a "$out/$side.log"
+            echo "::endgroup::"
+          done
+          touch results/.done
 
       - name: Summarize
-        if: always() && hashFiles('results/*.json') != ''
+        if: always() && hashFiles('results/base-*.json', 'results/head-*.json') != ''
         run: python head/.github/scripts/compare.py results >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the results
