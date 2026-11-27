@@ -18,6 +18,10 @@
     <properties>
         <maven.deploy.skip>true</maven.deploy.skip>
         <maven.install.skip>true</maven.install.skip>
+        <!-- Nothing of it reaches Central, so the release profile neither documents nor signs it -->
+        <maven.source.skip>true</maven.source.skip>
+        <maven.javadoc.skip>true</maven.javadoc.skip>
+        <gpg.skip>true</gpg.skip>
         <!-- More arguments of the test JVM, as in the core module -->
         <ledger.test.jvm></ledger.test.jvm>
     </properties>
@@ -26,7 +30,7 @@
         <dependency>
             <groupId>com.github.auties00</groupId>
             <artifactId>ledger</artifactId>
-            <version>${revision}</version>
+            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>org.openjdk.jmh</groupId>

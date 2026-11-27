@@ -4,6 +4,7 @@
 
 <br/>
 
+[![Maven Central](https://img.shields.io/maven-central/v/com.github.auties00/ledger?style=for-the-badge&label=MAVEN%20CENTRAL&labelColor=061823&color=2a87a8)](https://central.sonatype.com/artifact/com.github.auties00/ledger)
 [![CI](https://img.shields.io/github/actions/workflow/status/Auties00/Ledger/ci.yml?branch=master&style=for-the-badge&label=CI&labelColor=061823)](https://github.com/Auties00/Ledger/actions/workflows/ci.yml)
 [![Java 26](https://img.shields.io/badge/JAVA-26-f89820?style=for-the-badge&logo=openjdk&logoColor=white&labelColor=061823)](https://openjdk.org/projects/jdk/26/)
 [![License: MIT](https://img.shields.io/badge/LICENSE-MIT-2a87a8?style=for-the-badge&labelColor=061823)](LICENSE)
@@ -26,24 +27,33 @@ encrypted and ordered. It is pure Java, with no dependency.
   test kit simulates the crashes in between.
 
 > [!IMPORTANT]
-> Ledger has no release yet, and its API may still change. It requires **Java 26**: its commits park a thread with a
-> timeout and then without one, which could leave a virtual thread parked for good on the first builds of Java 25.
+> Ledger requires **Java 26**: its commits park a thread with a timeout and then without one, which could leave a
+> virtual thread parked for good on the first builds of Java 25.
 
 **Contents:** [Install](#install) | [Quick start](#quick-start) | [Guide](#guide) | [Performance](#performance) |
 [Design](#design) | [Building](#building)
 
 ## Install
 
-Until the first release, build Ledger from source (`mvn install -DskipTests` in a clone of this repository), then
-depend on it, and on `ledger-testkit` at test scope to test what your own code survives:
+Ledger is on Maven Central. Depend on `ledger`, and on `ledger-testkit` at test scope to test what your own code
+survives:
 
 ```xml
 <dependency>
     <groupId>com.github.auties00</groupId>
     <artifactId>ledger</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>1.0.0</version>
+</dependency>
+<dependency>
+    <groupId>com.github.auties00</groupId>
+    <artifactId>ledger-testkit</artifactId>
+    <version>1.0.0</version>
+    <scope>test</scope>
 </dependency>
 ```
+
+With Gradle: `implementation("com.github.auties00:ledger:1.0.0")` and
+`testImplementation("com.github.auties00:ledger-testkit:1.0.0")`.
 
 <details>
 <summary><b>Module and JVM flags</b></summary>
@@ -438,5 +448,7 @@ never part of a batch, and repairs a log whose tail a crash tore. Damage anywher
 ## Building
 
 `mvn verify` runs the engine's tests, its crash tests on the test kit's file system among them, and builds the
-benchmark; [benchmark/README.md](benchmark/README.md) explains how to run it. Ledger is released under the
+benchmark; [benchmark/README.md](benchmark/README.md) explains how to run it. `mvn -Prelease deploy` signs `ledger`,
+`ledger-testkit` and their parent and publishes them to Maven Central through the Central Portal (the `central` server
+of `settings.xml` holds the Portal token). Ledger is released under the
 [MIT License](LICENSE).

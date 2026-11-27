@@ -33,8 +33,19 @@
         </license>
     </licenses>
 
+    <scm>
+        <url>https://github.com/Auties00/Ledger</url>
+        <connection>scm:git:https://github.com/Auties00/Ledger.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/Auties00/Ledger.git</developerConnection>
+    </scm>
+
+    <issueManagement>
+        <system>GitHub</system>
+        <url>https://github.com/Auties00/Ledger/issues</url>
+    </issueManagement>
+
     <properties>
-        <revision>0.1.0-SNAPSHOT</revision>
+        <revision>1.0.0</revision>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <java.version>26</java.version>
         <maven.compiler.plugin.version>3.15.0</maven.compiler.plugin.version>
@@ -48,7 +59,11 @@
         <jmh.version>1.37</jmh.version>
         <junit.version>5.11.4</junit.version>
         <maven.surefire.plugin.version>3.5.2</maven.surefire.plugin.version>
-        <flatten.plugin.version>1.6.0</flatten.plugin.version>
+        <flatten.plugin.version>1.10.0</flatten.plugin.version>
+        <maven.enforcer.plugin.version>3.7.0</maven.enforcer.plugin.version>
+        <maven.source.plugin.version>3.4.0</maven.source.plugin.version>
+        <maven.gpg.plugin.version>3.2.8</maven.gpg.plugin.version>
+        <central.publishing.plugin.version>0.12.0</central.publishing.plugin.version>
     </properties>
 
     <build>
@@ -131,4 +146,104 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- Publishes ledger-parent, ledger and ledger-testkit to Maven Central with their sources, javadoc and
+             signatures, uploaded to the Central Portal and published once it validates them: mvn -Prelease deploy.
+             A dry run without signing or upload: mvn -Prelease -Dgpg.skip -DskipTests verify -->
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-enforcer-plugin</artifactId>
+                        <version>${maven.enforcer.plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>enforce-release</id>
+                                <goals>
+                                    <goal>enforce</goal>
+                                </goals>
+                                <configuration>
+                                    <rules>
+                                        <!-- The Central publishing plugin does not run on Maven 4 -->
+                                        <requireMavenVersion>
+                                            <version>[3.9,4)</version>
+                                        </requireMavenVersion>
+                                        <requireJavaVersion>
+                                            <version>[${java.version},)</version>
+                                        </requireJavaVersion>
+                                        <requireReleaseVersion/>
+                                        <requireReleaseDeps/>
+                                    </rules>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <version>${maven.source.plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>${maven.gpg.plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                                <configuration>
+                                    <!-- The key every com.github.auties00 release has been signed with, published on
+                                         keyserver.ubuntu.com. The passphrase comes from gpg-agent or
+                                         MAVEN_GPG_PASSPHRASE, never from a POM or settings.xml -->
+                                    <keyname>32B2CBA8EF9C09DD</keyname>
+                                    <bestPractices>true</bestPractices>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>${central.publishing.plugin.version}</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <deploymentName>Ledger ${project.version}</deploymentName>
+                            <autoPublish>true</autoPublish>
+                            <waitUntil>published</waitUntil>
+                            <excludeArtifacts>
+                                <artifact>ledger-benchmark</artifact>
+                            </excludeArtifacts>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
